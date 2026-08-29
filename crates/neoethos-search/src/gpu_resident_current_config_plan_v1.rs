@@ -328,9 +328,11 @@ pub struct FullResidentDiscoveryDeadlineReceiptV1 {
     _not_minted_in_slice2: core::convert::Infallible,
 }
 
+#[cfg(test)]
 pub(crate) const CURRENT_CONFIG_RESIDENT_SEARCH_SLICE2_PLAN_SEMANTICS_V2: &str =
     "neoethos.current-config-resident-search-slice2-plan.v2";
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CurrentConfigResidentSearchSlice2PlanFactsV2 {
     population: u64,
@@ -389,29 +391,36 @@ pub(crate) struct CurrentConfigResidentSearchSlice2PlanFactsV2 {
     binary64_tolerance_identity_sha256: [u8; 32],
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2 {
     _identity_sha256: [u8; 32],
 }
 
+#[cfg(test)]
 impl CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2 {
     pub(crate) const fn identity_sha256(&self) -> [u8; 32] {
         self._identity_sha256
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CurrentConfigResidentSearchSlice2PlanErrorV2 {
     ImplementationPending,
     IdentityReceiptMismatch,
+    ArithmeticOverflow,
+    CurrentConfigExtentMismatch,
 }
 
+#[cfg(test)]
 mod slice2_plan_seal_v2 {
     pub(super) struct Marker {
         _private: (),
     }
 }
 
+#[cfg(test)]
 pub(crate) struct SealedCurrentConfigResidentSearchSlice2PlanV2 {
     base: SealedCurrentConfigResidentSearchPlanV1,
     facts: CurrentConfigResidentSearchSlice2PlanFactsV2,
@@ -419,6 +428,7 @@ pub(crate) struct SealedCurrentConfigResidentSearchSlice2PlanV2 {
     _seal: slice2_plan_seal_v2::Marker,
 }
 
+#[cfg(test)]
 impl SealedCurrentConfigResidentSearchSlice2PlanV2 {
     pub(crate) fn facts_v2(&self) -> &CurrentConfigResidentSearchSlice2PlanFactsV2 {
         let _ = &self.base;
@@ -439,6 +449,7 @@ impl SealedCurrentConfigResidentSearchSlice2PlanV2 {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn seal_current_config_resident_search_slice2_plan_v2(
     base_v1: SealedCurrentConfigResidentSearchPlanV1,
     facts_v2: CurrentConfigResidentSearchSlice2PlanFactsV2,

@@ -627,13 +627,15 @@ fn require_current_config_slice2_v2(
 fn assert_slice2_facts_rejected_before_allocation(
     label: &str,
     facts_v2: CurrentConfigResidentSearchSlice2PlanFactsV2,
+    expected_error: CurrentConfigResidentSearchSlice2PlanErrorV2,
 ) {
     match seal_current_config_slice2_v2(facts_v2) {
-        Ok(_) => panic!("{label}: invalid Slice2 facts reached a sealed pre-allocation plan"),
-        Err(error) => assert_ne!(
-            error,
-            CurrentConfigResidentSearchSlice2PlanErrorV2::ImplementationPending,
-            "{label}: rejection remains the declaration-only RED"
+        Ok(_) => panic!(
+            "{label}: invalid Slice2 facts yielded the sealed authority required for allocation"
+        ),
+        Err(error) => assert_eq!(
+            error, expected_error,
+            "{label}: invalid Slice2 facts returned the wrong fail-closed error"
         ),
     }
 }
@@ -854,7 +856,11 @@ fn slice2_checked_overflow_fails_before_allocation() {
 
     let mut neighbor_overflow = baseline;
     neighbor_overflow.permanent_archive_capacity = u64::MAX;
-    assert_slice2_facts_rejected_before_allocation("neighbor extent overflow", neighbor_overflow);
+    assert_slice2_facts_rejected_before_allocation(
+        "neighbor extent overflow",
+        neighbor_overflow,
+        CurrentConfigResidentSearchSlice2PlanErrorV2::ArithmeticOverflow,
+    );
 
     let mut rational_overflow = baseline;
     rational_overflow.maximum_terms_per_gene = u64::MAX;
@@ -863,17 +869,26 @@ fn slice2_checked_overflow_fails_before_allocation() {
     assert_slice2_facts_rejected_before_allocation(
         "rational cross-product overflow",
         rational_overflow,
+        CurrentConfigResidentSearchSlice2PlanErrorV2::ArithmeticOverflow,
     );
 
     let mut work_overflow = baseline;
     work_overflow.maximum_archive_knn_distance_count = u64::MAX;
     work_overflow.maximum_archive_knn_popcount_word_count = u64::MAX;
-    assert_slice2_facts_rejected_before_allocation("work-rate scaling overflow", work_overflow);
+    assert_slice2_facts_rejected_before_allocation(
+        "work-rate scaling overflow",
+        work_overflow,
+        CurrentConfigResidentSearchSlice2PlanErrorV2::ArithmeticOverflow,
+    );
 
     let mut layout_overflow = baseline;
     layout_overflow.archive_gene_scalars_bytes = u64::MAX;
     layout_overflow.slice2_replacement_subtotal_bytes = u64::MAX;
-    assert_slice2_facts_rejected_before_allocation("layout subtotal overflow", layout_overflow);
+    assert_slice2_facts_rejected_before_allocation(
+        "layout subtotal overflow",
+        layout_overflow,
+        CurrentConfigResidentSearchSlice2PlanErrorV2::ArithmeticOverflow,
+    );
 }
 
 #[test]
@@ -885,7 +900,11 @@ fn slice2_every_current_config_numeric_extent_drift_fails_before_allocation() {
         ($label:literal, $field:ident, $replacement:expr) => {{
             let mut changed = baseline;
             changed.$field = $replacement;
-            assert_slice2_facts_rejected_before_allocation($label, changed);
+            assert_slice2_facts_rejected_before_allocation(
+                $label,
+                changed,
+                CurrentConfigResidentSearchSlice2PlanErrorV2::CurrentConfigExtentMismatch,
+            );
         }};
     }
 
