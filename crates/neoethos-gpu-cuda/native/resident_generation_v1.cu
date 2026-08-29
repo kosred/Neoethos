@@ -3240,17 +3240,17 @@ extern "C" std::int32_t enqueue_full_population_scored_generation_advance_v2(
   if (status != NEO_SCORING_STATUS_OK_V1) {
     return status;
   }
-  if (cudaStreamWaitEvent(generation->admitted_run_stream,
-                          scored.scoring_novelty_ready_event, 0) != cudaSuccess) {
-    return NEO_RESIDENT_STATUS_CUDA_ERROR_V1;
-  }
-  ++generation->same_stream_enqueue_count;
   resident_generation_v2::NeoResidentGenerationGeneViewV2 retained_view{};
   status = resident_generation_v2::export_current_resident_gene_view_v2(
       generation, dependency, &retained_view);
   if (status != NEO_RESIDENT_STATUS_OK_V1) {
     return status;
   }
+  if (cudaStreamWaitEvent(generation->admitted_run_stream,
+                          scored.scoring_novelty_ready_event, 0) != cudaSuccess) {
+    return NEO_RESIDENT_STATUS_CUDA_ERROR_V1;
+  }
+  ++generation->same_stream_enqueue_count;
   const resident_generation_v2_internal::ResidentGenerationScoredRowsV2
       generation_rows{
           &scored, scored.resident_decision_keys_device, &retained_view};

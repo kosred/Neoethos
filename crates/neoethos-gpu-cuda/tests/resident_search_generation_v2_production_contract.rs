@@ -645,8 +645,8 @@ fn e_nonfinite_scoring_fault_precedes_rank_consumers_and_conditional_commit() {
         wrapper,
         &[
             "bind_and_seal_resident_scoring_v2",
-            "cudaStreamWaitEvent",
             "export_current_resident_gene_view_v2",
+            "cudaStreamWaitEvent",
             "enqueue_resident_generation_offspring_from_scored_rows_v2",
             "publish_one_generation_commit_kernel_v2",
         ],
