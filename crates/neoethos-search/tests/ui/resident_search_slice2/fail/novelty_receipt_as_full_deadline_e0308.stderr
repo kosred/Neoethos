@@ -1,0 +1,14 @@
+error[E0308]: mismatched types
+  --> fail/novelty_receipt_as_full_deadline_e0308.rs:11:27
+   |
+11 |     require_full_deadline(calibration());
+   |     --------------------- ^^^^^^^^^^^^^ expected `FullResidentDiscoveryDeadlineReceiptV1`, found `ResidentArchiveKnnCalibrationReceiptV2`
+   |     |
+   |     arguments to this function are incorrect
+   |
+note: function defined here
+  --> fail/novelty_receipt_as_full_deadline_e0308.rs:8:4
+   |
+ 8 | fn require_full_deadline(_: FullResidentDiscoveryDeadlineReceiptV1) {}
+   |    ^^^^^^^^^^^^^^^^^^^^^ -----------------------------------------
+

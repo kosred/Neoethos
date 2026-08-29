@@ -39,7 +39,11 @@ mod prefilter_schema_v1;
 // lands later, reintroduce a fresh helper at that time.
 
 pub mod backend;
-#[cfg(any(test, feature = "gpu-b-adapter"))]
+#[cfg(any(
+    test,
+    feature = "gpu-b-adapter",
+    feature = "resident-search-slice2-compile-contract"
+))]
 mod canonical_discovery_config_digest_v1;
 mod canonical_native_discovery_request_v1;
 mod canonical_native_discovery_run_v1;
@@ -64,8 +68,26 @@ mod exact_resident_dataset_authority_v1_contract;
 pub mod engine_identity;
 pub mod eval;
 pub mod eval_telemetry;
-#[cfg(any(test, feature = "gpu-b-adapter"))]
+#[cfg(any(
+    test,
+    feature = "gpu-b-adapter",
+    feature = "resident-search-slice2-compile-contract"
+))]
 pub mod gpu_resident_current_config_plan_v1;
+#[cfg(any(
+    feature = "gpu-b-native",
+    feature = "resident-search-slice2-compile-contract"
+))]
+pub mod resident_search_slice2_v3 {
+    pub use crate::gpu_resident_current_config_plan_v1::FullResidentDiscoveryDeadlineReceiptV1;
+    pub use neoethos_gpu_cuda::resident_search_slice2_v3::{
+        ResidentArchiveKnnCalibrationReceiptV2, ResidentSearchArchiveStagedV3,
+        ResidentSearchGenerationChainV3, ResidentSearchRankEnqueuedV3,
+        ResidentSearchRejectedAuthorityV3, ResidentSearchTerminalPendingV3,
+        ResidentSearchTerminalReceiptV3, ResidentSearchTransitionErrorV3,
+        ResidentSearchTryCompleteV3,
+    };
+}
 #[cfg(feature = "gpu-b-native")]
 #[path = "gpu_full_discovery/gpu_resident_trim_prefilter_view_v1.rs"]
 pub mod gpu_resident_trim_prefilter_view_v1;

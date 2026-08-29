@@ -1,0 +1,13 @@
+error[E0624]: associated function `from_ranked_v3` is private
+  --> fail/call_staged_constructor_e0624.rs:8:44
+   |
+ 8 |       let _ = ResidentSearchArchiveStagedV3::from_ranked_v3(ranked());
+   |                                              ^^^^^^^^^^^^^^ private associated function
+   |
+  ::: $REPO/crates/neoethos-gpu-cuda/src/resident_search_slice2_v3.rs:76:5
+   |
+76 | /     pub(crate) fn from_ranked_v3(
+77 | |         ranked: ResidentSearchRankEnqueuedV3,
+78 | |     ) -> ResidentSearchArchiveStagedV3 {
+   | |______________________________________- private associated function defined here
+

@@ -1,0 +1,18 @@
+error[E0432]: unresolved import `neoethos_search::resident_search_slice2_v3`
+  --> fail/feature_gate_off_e0432.rs:1:22
+   |
+ 1 | use neoethos_search::resident_search_slice2_v3::ResidentSearchGenerationChainV3 as _;
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^ could not find `resident_search_slice2_v3` in `neoethos_search`
+   |
+note: found an item that was configured out
+  --> $REPO/crates/neoethos-search/src/lib.rs:81:9
+   |
+77 |   #[cfg(any(
+   |  __________-
+78 | |     feature = "gpu-b-native",
+79 | |     feature = "resident-search-slice2-compile-contract"
+80 | | ))]
+   | |_- the item is gated here
+81 |   pub mod resident_search_slice2_v3 {
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^
+

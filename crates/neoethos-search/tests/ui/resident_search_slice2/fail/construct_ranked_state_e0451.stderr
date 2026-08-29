@@ -1,0 +1,6 @@
+error[E0451]: field `inner` of struct `ResidentSearchRankEnqueuedV3` is private
+ --> fail/construct_ranked_state_e0451.rs:8:46
+  |
+8 |     let _ = ResidentSearchRankEnqueuedV3 { ..ranked() };
+  |                                              ^^^^^^^^ field `inner` is private
+

@@ -1,0 +1,6 @@
+error[E0616]: field `inner` of struct `ResidentSearchArchiveStagedV3` is private
+ --> fail/read_staged_inner_e0616.rs:8:21
+  |
+8 |     let _ = value().inner;
+  |                     ^^^^^ private field
+
