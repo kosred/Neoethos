@@ -1234,6 +1234,25 @@ fn archive_candidate(
     }
 }
 
+fn archive_candidate_with_metric_row(
+    exact_gene: [u64; 2],
+    gene_identity: u64,
+    population_ordinal: u32,
+    score: f64,
+    metrics: [f64; METRIC_COUNT],
+) -> AdmissionCandidate {
+    assert!(metrics.iter().all(|metric| metric.is_finite()));
+    assert!(metrics[NET_METRIC_SLOT] > 0.0);
+    assert!(metrics[TRADE_COUNT_METRIC_SLOT] > 0.0);
+    AdmissionCandidate {
+        exact_gene: ExactGene(exact_gene),
+        gene_identity,
+        population_ordinal,
+        score,
+        metrics,
+    }
+}
+
 fn archive_record_keys(records: &[ArchiveRecord]) -> Vec<(ExactGene, u64, u32, u32)> {
     records
         .iter()
@@ -1252,11 +1271,17 @@ fn archive_metric_bits(record: &ArchiveRecord) -> [u64; METRIC_COUNT] {
     record.metric_bits
 }
 
-fn expected_archive_metric_bits(net_bits: u64, trade_count_bits: u64) -> [u64; METRIC_COUNT] {
-    let mut metric_bits = [0x3ff0_0000_0000_0000_u64; METRIC_COUNT];
-    metric_bits[NET_METRIC_SLOT] = net_bits;
-    metric_bits[TRADE_COUNT_METRIC_SLOT] = trade_count_bits;
-    metric_bits
+fn metric_row_bits(metrics: [f64; METRIC_COUNT]) -> [u64; METRIC_COUNT] {
+    metrics.map(f64::to_bits)
+}
+
+fn assert_record_metric_row(
+    record: &ArchiveRecord,
+    exact_gene: ExactGene,
+    metrics: [f64; METRIC_COUNT],
+) {
+    assert_eq!(record.exact_gene, exact_gene);
+    assert_eq!(archive_metric_bits(record), metric_row_bits(metrics));
 }
 
 fn assert_stage_receipt(
@@ -1484,6 +1509,7 @@ fn r3_nonfinite_metric_faults_the_whole_transaction_before_staging() {
     for (metric_slot, nonfinite, invalid_trade_count) in [
         (10_usize, canonical_quiet_nan, 2.0_f64),
         (7_usize, f64::INFINITY, 0.0_f64),
+        (9_usize, f64::NEG_INFINITY, 2.0_f64),
     ] {
         let mut archive = ReferenceArchive::new(4);
         let committed_prefix = archive_candidate([10, 100], 10, 9, 40.0, 2.0, 2.0);
@@ -1545,10 +1571,26 @@ fn r3_nonfinite_metric_faults_the_whole_transaction_before_staging() {
 
 #[test]
 fn r3_rank_first_seen_duplicates_preserve_authority_without_consuming_capacity() {
-    let later_ranked_duplicate = archive_candidate([10, 100], 5, 1, 20.0, 4.0, 7.0);
-    let other_unique = archive_candidate([20, 200], 20, 2, 10.0, 2.0, 2.0);
-    let one_field_different_gene = archive_candidate([10, 101], 10, 4, 15.0, 1.0, 1.0);
-    let first_ranked_gene = archive_candidate([10, 100], 100, 9, 30.0, 2.0, 2.0);
+    let first_ranked_metrics = [
+        2.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 2.0, 19.0, 20.0,
+    ];
+    let later_ranked_duplicate_metrics = [
+        4.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 7.0, 29.0, 30.0,
+    ];
+    let other_unique_metrics = [
+        2.0, 31.0, 32.0, 33.0, 34.0, 35.0, 36.0, 37.0, 2.0, 39.0, 40.0,
+    ];
+    let one_field_different_metrics = [
+        1.0, 41.0, 42.0, 43.0, 44.0, 45.0, 46.0, 47.0, 1.0, 49.0, 50.0,
+    ];
+    let later_ranked_duplicate =
+        archive_candidate_with_metric_row([10, 100], 5, 1, 20.0, later_ranked_duplicate_metrics);
+    let other_unique =
+        archive_candidate_with_metric_row([20, 200], 20, 2, 10.0, other_unique_metrics);
+    let one_field_different_gene =
+        archive_candidate_with_metric_row([10, 101], 10, 4, 15.0, one_field_different_metrics);
+    let first_ranked_gene =
+        archive_candidate_with_metric_row([10, 100], 100, 9, 30.0, first_ranked_metrics);
     let mut archive = ReferenceArchive::new(4);
 
     let generation_zero = archive
@@ -1573,28 +1615,57 @@ fn r3_rank_first_seen_duplicates_preserve_authority_without_consuming_capacity()
             (ExactGene([20, 200]), 20, 2, 0),
         ],
     );
-    assert_eq!(generation_zero.records[0].exact_gene, ExactGene([10, 100]));
-    assert_eq!(
-        archive_metric_bits(&generation_zero.records[0]),
-        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+    assert_record_metric_row(
+        &generation_zero.records[0],
+        ExactGene([10, 100]),
+        first_ranked_metrics,
+    );
+    assert_record_metric_row(
+        &generation_zero.records[1],
+        ExactGene([10, 101]),
+        one_field_different_metrics,
+    );
+    assert_record_metric_row(
+        &generation_zero.records[2],
+        ExactGene([20, 200]),
+        other_unique_metrics,
     );
     assert_ne!(
         archive_metric_bits(&generation_zero.records[0]),
-        expected_archive_metric_bits(0x4010_0000_0000_0000, 0x401c_0000_0000_0000)
+        metric_row_bits(later_ranked_duplicate_metrics)
     );
     archive.combined_commit(0).unwrap();
-    assert_eq!(
-        archive.committed_records()[0].exact_gene,
-        ExactGene([10, 100])
+    assert_record_metric_row(
+        &archive.committed_records()[0],
+        ExactGene([10, 100]),
+        first_ranked_metrics,
     );
-    assert_eq!(
-        archive_metric_bits(&archive.committed_records()[0]),
-        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+    assert_record_metric_row(
+        &archive.committed_records()[1],
+        ExactGene([10, 101]),
+        one_field_different_metrics,
+    );
+    assert_record_metric_row(
+        &archive.committed_records()[2],
+        ExactGene([20, 200]),
+        other_unique_metrics,
     );
 
-    let committed_duplicate = archive_candidate([10, 100], 1, 0, 100.0, 99.0, 11.0);
-    let first_new_unique = archive_candidate([30, 300], 30, 5, 90.0, 2.0, 2.0);
-    let staged_duplicate = archive_candidate([30, 300], 2, 1, 80.0, 7.0, 8.0);
+    let committed_duplicate_metrics = [
+        99.0, 51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 11.0, 59.0, 60.0,
+    ];
+    let first_new_unique_metrics = [
+        2.0, 61.0, 62.0, 63.0, 64.0, 65.0, 66.0, 67.0, 2.0, 69.0, 70.0,
+    ];
+    let staged_duplicate_metrics = [
+        7.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0, 77.0, 8.0, 79.0, 80.0,
+    ];
+    let committed_duplicate =
+        archive_candidate_with_metric_row([10, 100], 1, 0, 100.0, committed_duplicate_metrics);
+    let first_new_unique =
+        archive_candidate_with_metric_row([30, 300], 30, 5, 90.0, first_new_unique_metrics);
+    let staged_duplicate =
+        archive_candidate_with_metric_row([30, 300], 2, 1, 80.0, staged_duplicate_metrics);
     let generation_one = archive
         .stage_ranked_admissions(
             1,
@@ -1608,14 +1679,14 @@ fn r3_rank_first_seen_duplicates_preserve_authority_without_consuming_capacity()
         4,
         &[(ExactGene([30, 300]), 30, 5, 1)],
     );
-    assert_eq!(generation_one.records[0].exact_gene, ExactGene([30, 300]));
-    assert_eq!(
-        archive_metric_bits(&generation_one.records[0]),
-        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+    assert_record_metric_row(
+        &generation_one.records[0],
+        ExactGene([30, 300]),
+        first_new_unique_metrics,
     );
     assert_ne!(
         archive_metric_bits(&generation_one.records[0]),
-        expected_archive_metric_bits(0x401c_0000_0000_0000, 0x4020_0000_0000_0000)
+        metric_row_bits(staged_duplicate_metrics)
     );
     archive.combined_commit(1).unwrap();
 
@@ -1628,41 +1699,49 @@ fn r3_rank_first_seen_duplicates_preserve_authority_without_consuming_capacity()
             (ExactGene([30, 300]), 30, 5, 1),
         ]
     );
-    assert_eq!(
-        archive.committed_records()[0].exact_gene,
-        ExactGene([10, 100])
+    assert_record_metric_row(
+        &archive.committed_records()[0],
+        ExactGene([10, 100]),
+        first_ranked_metrics,
     );
-    assert_eq!(
-        archive_metric_bits(&archive.committed_records()[0]),
-        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+    assert_record_metric_row(
+        &archive.committed_records()[1],
+        ExactGene([10, 101]),
+        one_field_different_metrics,
+    );
+    assert_record_metric_row(
+        &archive.committed_records()[2],
+        ExactGene([20, 200]),
+        other_unique_metrics,
+    );
+    assert_record_metric_row(
+        &archive.committed_records()[3],
+        ExactGene([30, 300]),
+        first_new_unique_metrics,
     );
     assert_ne!(
         archive_metric_bits(&archive.committed_records()[0]),
-        expected_archive_metric_bits(0x4058_c000_0000_0000, 0x4026_0000_0000_0000)
-    );
-    assert_eq!(
-        archive.committed_records()[3].exact_gene,
-        ExactGene([30, 300])
-    );
-    assert_eq!(
-        archive_metric_bits(&archive.committed_records()[3]),
-        expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+        metric_row_bits(committed_duplicate_metrics)
     );
     assert_ne!(
         archive_metric_bits(&archive.committed_records()[3]),
-        expected_archive_metric_bits(0x401c_0000_0000_0000, 0x4020_0000_0000_0000)
+        metric_row_bits(staged_duplicate_metrics)
     );
 }
 
 #[test]
 fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() {
+    let cap_prefix_metrics = [
+        3.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 4.0, 109.0, 110.0,
+    ];
+    let cap_prefix_metric_bits = metric_row_bits(cap_prefix_metrics);
     let committed_prefix = (0_u64..49_999)
         .map(|ordinal| ArchiveRecord {
             exact_gene: ExactGene([ordinal, 1_000_000 + ordinal]),
             gene_identity: 100_000 + ordinal,
             population_ordinal: (ordinal % 200) as u32,
             admitted_generation: (ordinal / 200) as u32,
-            metric_bits: [0x3ff0_0000_0000_0000; METRIC_COUNT],
+            metric_bits: cap_prefix_metric_bits,
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1672,7 +1751,7 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
             gene_identity: 100_000,
             population_ordinal: 0,
             admitted_generation: 0,
-            metric_bits: [0x3ff0_0000_0000_0000; METRIC_COUNT],
+            metric_bits: cap_prefix_metric_bits,
         })
     );
     assert_eq!(
@@ -1682,16 +1761,47 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
             gene_identity: 149_998,
             population_ordinal: 198,
             admitted_generation: 249,
-            metric_bits: [0x3ff0_0000_0000_0000; METRIC_COUNT],
+            metric_bits: cap_prefix_metric_bits,
         })
     );
     let mut archive =
         ReferenceArchive::from_committed_fixture(50_000, 250, committed_prefix.clone());
     assert_eq!(archive.committed_count(), 49_999);
 
-    let later_eligible = archive_candidate([60_000, 1_060_000], 300, 3, 80.0, 2.0, 2.0);
-    let committed_duplicate = archive_candidate([0, 1_000_000], 1, 199, 100.0, 9.0, 9.0);
-    let earliest_eligible = archive_candidate([50_000, 1_050_000], 200, 2, 90.0, 2.0, 2.0);
+    let later_eligible_metrics = [
+        5.0, 201.0, 202.0, 203.0, 204.0, 205.0, 206.0, 207.0, 6.0, 209.0, 210.0,
+    ];
+    let committed_duplicate_metrics = [
+        9.0, 211.0, 212.0, 213.0, 214.0, 215.0, 216.0, 217.0, 10.0, 219.0, 220.0,
+    ];
+    let earliest_eligible_metrics = [
+        2.0, 221.0, 222.0, 223.0, 224.0, 225.0, 226.0, 227.0, 2.0, 229.0, 230.0,
+    ];
+    let later_eligible = archive_candidate_with_metric_row(
+        [60_000, 1_060_000],
+        300,
+        3,
+        80.0,
+        later_eligible_metrics,
+    );
+    let committed_duplicate = archive_candidate_with_metric_row(
+        [0, 1_000_000],
+        1,
+        199,
+        100.0,
+        committed_duplicate_metrics,
+    );
+    let earliest_eligible = archive_candidate_with_metric_row(
+        [50_000, 1_050_000],
+        200,
+        2,
+        90.0,
+        earliest_eligible_metrics,
+    );
+    assert_ne!(
+        metric_row_bits(committed_duplicate_metrics),
+        cap_prefix_metric_bits
+    );
     let cap_minus_one = archive
         .stage_ranked_admissions(
             250,
@@ -1704,6 +1814,11 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
         49_999,
         50_000,
         &[(ExactGene([50_000, 1_050_000]), 200, 2, 250)],
+    );
+    assert_record_metric_row(
+        &cap_minus_one.records[0],
+        ExactGene([50_000, 1_050_000]),
+        earliest_eligible_metrics,
     );
     assert_eq!(archive.committed_count(), 49_999);
     assert_eq!(archive.committed_records(), committed_prefix);
@@ -1725,21 +1840,28 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
             gene_identity: 200,
             population_ordinal: 2,
             admitted_generation: 250,
-            metric_bits: expected_archive_metric_bits(0x4000_0000_0000_0000, 0x4000_0000_0000_0000,),
+            metric_bits: metric_row_bits(earliest_eligible_metrics),
         })
+    );
+    assert_record_metric_row(
+        archive.committed_records().last().unwrap(),
+        ExactGene([50_000, 1_050_000]),
+        earliest_eligible_metrics,
     );
     let full_archive = archive.committed_records().to_vec();
 
+    let full_cap_candidate_metrics = [
+        7.0, 231.0, 232.0, 233.0, 234.0, 235.0, 236.0, 237.0, 8.0, 239.0, 240.0,
+    ];
     let full_stage = archive
         .stage_ranked_admissions(
             251,
-            &[archive_candidate(
+            &[archive_candidate_with_metric_row(
                 [70_000, 1_070_000],
                 400,
                 5,
                 100.0,
-                2.0,
-                2.0,
+                full_cap_candidate_metrics,
             )],
         )
         .unwrap();
