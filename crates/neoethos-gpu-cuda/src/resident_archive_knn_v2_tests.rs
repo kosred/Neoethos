@@ -911,13 +911,14 @@ mod archive_reference {
     pub const NET_METRIC_SLOT: usize = 0;
     pub const TRADE_COUNT_METRIC_SLOT: usize = 8;
 
-    /// Canonical full-gene bytes after normalization. Hashes are deliberately absent until R4.
+    /// Canonical full-gene bytes after normalization.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ExactGene(pub [u64; 2]);
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct AdmissionCandidate {
         pub exact_gene: ExactGene,
+        pub full_gene_hash: u64,
         pub gene_identity: u64,
         pub population_ordinal: u32,
         pub score: f64,
@@ -927,6 +928,7 @@ mod archive_reference {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ArchiveRecord {
         pub exact_gene: ExactGene,
+        pub full_gene_hash: u64,
         pub gene_identity: u64,
         pub population_ordinal: u32,
         pub admitted_generation: u32,
@@ -944,6 +946,7 @@ mod archive_reference {
         pub generation: u32,
         pub committed_count_at_start: usize,
         pub target_committed_count: usize,
+        pub full_gene_hash_collision_count: u64,
         pub records: Vec<ArchiveRecord>,
     }
 
@@ -979,6 +982,7 @@ mod archive_reference {
     #[derive(Debug)]
     struct PendingArchive {
         generation: u32,
+        target_full_gene_hash_collision_count: u64,
         records: Vec<ArchiveRecord>,
     }
 
@@ -987,6 +991,7 @@ mod archive_reference {
         capacity: usize,
         current_generation: u32,
         committed: Vec<ArchiveRecord>,
+        committed_full_gene_hash_collision_count: u64,
         pending: Option<PendingArchive>,
         faulted_generation: Option<u32>,
     }
@@ -997,6 +1002,7 @@ mod archive_reference {
                 capacity,
                 current_generation: 0,
                 committed: Vec::new(),
+                committed_full_gene_hash_collision_count: 0,
                 pending: None,
                 faulted_generation: None,
             }
@@ -1012,6 +1018,7 @@ mod archive_reference {
                 capacity,
                 current_generation,
                 committed,
+                committed_full_gene_hash_collision_count: 0,
                 pending: None,
                 faulted_generation: None,
             }
@@ -1027,6 +1034,10 @@ mod archive_reference {
 
         pub fn committed_records(&self) -> &[ArchiveRecord] {
             &self.committed
+        }
+
+        pub fn committed_full_gene_hash_collision_count(&self) -> u64 {
+            self.committed_full_gene_hash_collision_count
         }
 
         pub fn staged_count(&self) -> usize {
@@ -1084,7 +1095,10 @@ mod archive_reference {
 
             let available_slots = self.capacity.saturating_sub(self.committed.len());
             let mut consumed_slots = 0_usize;
-            let mut staged = Vec::with_capacity(available_slots.min(ranked.len()));
+            let mut target_full_gene_hash_collision_count =
+                self.committed_full_gene_hash_collision_count;
+            let mut staged: Vec<ArchiveRecord> =
+                Vec::with_capacity(available_slots.min(ranked.len()));
             for candidate in ranked {
                 let positive_trade_count = candidate.metrics[TRADE_COUNT_METRIC_SLOT] > 0.0;
                 let positive_net = candidate.metrics[NET_METRIC_SLOT] > 0.0;
@@ -1092,11 +1106,20 @@ mod archive_reference {
                     continue;
                 }
 
-                let already_first_seen = self
-                    .committed
-                    .iter()
-                    .chain(staged.iter())
-                    .any(|record| record.exact_gene == candidate.exact_gene);
+                let mut already_first_seen = false;
+                let mut same_hash_unequal_gene_count = 0_u64;
+                for record in self.committed.iter().chain(staged.iter()) {
+                    if record.full_gene_hash != candidate.full_gene_hash {
+                        continue;
+                    }
+                    if record.exact_gene == candidate.exact_gene {
+                        already_first_seen = true;
+                    } else {
+                        same_hash_unequal_gene_count = same_hash_unequal_gene_count
+                            .checked_add(1)
+                            .expect("R4 fixture same-hash bucket count must not overflow");
+                    }
+                }
                 if already_first_seen {
                     continue;
                 }
@@ -1104,8 +1127,13 @@ mod archive_reference {
                     break;
                 }
 
+                target_full_gene_hash_collision_count = target_full_gene_hash_collision_count
+                    .checked_add(same_hash_unequal_gene_count)
+                    .expect("R4 fixture collision counter must not overflow");
+
                 staged.push(ArchiveRecord {
                     exact_gene: candidate.exact_gene,
+                    full_gene_hash: candidate.full_gene_hash,
                     gene_identity: candidate.gene_identity,
                     population_ordinal: candidate.population_ordinal,
                     admitted_generation: generation,
@@ -1120,10 +1148,12 @@ mod archive_reference {
                 generation,
                 committed_count_at_start,
                 target_committed_count,
+                full_gene_hash_collision_count: target_full_gene_hash_collision_count,
                 records: staged.clone(),
             };
             self.pending = Some(PendingArchive {
                 generation,
+                target_full_gene_hash_collision_count,
                 records: staged,
             });
             Ok(receipt)
@@ -1180,6 +1210,8 @@ mod archive_reference {
                 .take()
                 .expect("the pending archive was checked above");
             self.committed.extend(pending.records);
+            self.committed_full_gene_hash_collision_count =
+                pending.target_full_gene_hash_collision_count;
             self.current_generation = next_generation;
             Ok(CommitReceipt {
                 completed_generation: generation,
@@ -1227,6 +1259,7 @@ fn archive_candidate(
     metrics[TRADE_COUNT_METRIC_SLOT] = trade_count;
     AdmissionCandidate {
         exact_gene: ExactGene(exact_gene),
+        full_gene_hash: exact_gene[0],
         gene_identity,
         population_ordinal,
         score,
@@ -1246,6 +1279,28 @@ fn archive_candidate_with_metric_row(
     assert!(metrics[TRADE_COUNT_METRIC_SLOT] > 0.0);
     AdmissionCandidate {
         exact_gene: ExactGene(exact_gene),
+        full_gene_hash: exact_gene[0],
+        gene_identity,
+        population_ordinal,
+        score,
+        metrics,
+    }
+}
+
+fn archive_candidate_with_forced_full_gene_hash(
+    exact_gene: [u64; 2],
+    full_gene_hash: u64,
+    gene_identity: u64,
+    population_ordinal: u32,
+    score: f64,
+    metrics: [f64; METRIC_COUNT],
+) -> AdmissionCandidate {
+    assert!(metrics.iter().all(|metric| metric.is_finite()));
+    assert!(metrics[NET_METRIC_SLOT] > 0.0);
+    assert!(metrics[TRADE_COUNT_METRIC_SLOT] > 0.0);
+    AdmissionCandidate {
+        exact_gene: ExactGene(exact_gene),
+        full_gene_hash,
         gene_identity,
         population_ordinal,
         score,
@@ -1738,6 +1793,7 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
     let committed_prefix = (0_u64..49_999)
         .map(|ordinal| ArchiveRecord {
             exact_gene: ExactGene([ordinal, 1_000_000 + ordinal]),
+            full_gene_hash: ordinal,
             gene_identity: 100_000 + ordinal,
             population_ordinal: (ordinal % 200) as u32,
             admitted_generation: (ordinal / 200) as u32,
@@ -1748,6 +1804,7 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
         committed_prefix.first(),
         Some(&ArchiveRecord {
             exact_gene: ExactGene([0, 1_000_000]),
+            full_gene_hash: 0,
             gene_identity: 100_000,
             population_ordinal: 0,
             admitted_generation: 0,
@@ -1758,6 +1815,7 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
         committed_prefix.last(),
         Some(&ArchiveRecord {
             exact_gene: ExactGene([49_998, 1_049_998]),
+            full_gene_hash: 49_998,
             gene_identity: 149_998,
             population_ordinal: 198,
             admitted_generation: 249,
@@ -1837,6 +1895,7 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
         archive.committed_records().last(),
         Some(&ArchiveRecord {
             exact_gene: ExactGene([50_000, 1_050_000]),
+            full_gene_hash: 50_000,
             gene_identity: 200,
             population_ordinal: 2,
             admitted_generation: 250,
@@ -1880,4 +1939,335 @@ fn r3_cap_minus_one_admits_only_the_earliest_unique_and_full_cap_is_immutable() 
     assert_eq!(archive.current_generation(), 252);
     assert_eq!(archive.committed_count(), 50_000);
     assert_eq!(archive.committed_records(), full_archive);
+}
+
+#[test]
+fn r4_equal_hash_uses_exact_gene_and_preserves_rank_first_authority() {
+    const FORCED_COLLISION_HASH: u64 = 0x0ddb_a11a_5eed_c011;
+    const UNEQUAL_HASH: u64 = 0xcafe_babe_0000_0002;
+    const CAPACITY_WITH_ONE_SPARE_SLOT: usize = 3;
+
+    let first_generation_metrics = [
+        2.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 3.0, 19.0, 20.0,
+    ];
+    let colliding_unique_metrics = [
+        4.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 5.0, 29.0, 30.0,
+    ];
+    let later_duplicate_metrics = [
+        6.0, 31.0, 32.0, 33.0, 34.0, 35.0, 36.0, 37.0, 7.0, 39.0, 40.0,
+    ];
+    let unequal_hash_metrics = [
+        8.0, 41.0, 42.0, 43.0, 44.0, 45.0, 46.0, 47.0, 9.0, 49.0, 50.0,
+    ];
+    let first_generation = archive_candidate_with_forced_full_gene_hash(
+        [0x1111_2222_3333_4444, 0xaaaa_bbbb_cccc_dddd],
+        FORCED_COLLISION_HASH,
+        100,
+        4,
+        30.0,
+        first_generation_metrics,
+    );
+    let colliding_unique = archive_candidate_with_forced_full_gene_hash(
+        [0x1111_2222_3333_4444, 0xaaaa_bbbb_cccc_ddde],
+        FORCED_COLLISION_HASH,
+        200,
+        7,
+        40.0,
+        colliding_unique_metrics,
+    );
+    let later_duplicate = archive_candidate_with_forced_full_gene_hash(
+        [0x1111_2222_3333_4444, 0xaaaa_bbbb_cccc_ddde],
+        FORCED_COLLISION_HASH,
+        1,
+        0,
+        20.0,
+        later_duplicate_metrics,
+    );
+    let unequal_hash_control = archive_candidate_with_forced_full_gene_hash(
+        [0x5555_6666_7777_8888, 0xeeee_ffff_0000_1111],
+        UNEQUAL_HASH,
+        300,
+        8,
+        10.0,
+        unequal_hash_metrics,
+    );
+
+    assert_ne!(first_generation.exact_gene, colliding_unique.exact_gene);
+    assert_eq!(
+        first_generation.full_gene_hash,
+        colliding_unique.full_gene_hash
+    );
+    assert_eq!(colliding_unique.exact_gene, later_duplicate.exact_gene);
+    assert_eq!(
+        colliding_unique.full_gene_hash,
+        later_duplicate.full_gene_hash
+    );
+    assert_ne!(colliding_unique.exact_gene, unequal_hash_control.exact_gene);
+    assert_ne!(
+        colliding_unique.full_gene_hash,
+        unequal_hash_control.full_gene_hash
+    );
+    assert_ne!(
+        colliding_unique.gene_identity,
+        later_duplicate.gene_identity
+    );
+    assert_ne!(
+        colliding_unique.population_ordinal,
+        later_duplicate.population_ordinal
+    );
+    assert_ne!(
+        colliding_unique.score.to_bits(),
+        later_duplicate.score.to_bits()
+    );
+    assert!(
+        metric_row_bits(colliding_unique_metrics)
+            .iter()
+            .zip(metric_row_bits(later_duplicate_metrics))
+            .all(|(rank_first, duplicate)| rank_first != &duplicate)
+    );
+
+    let generation_one_orders = [
+        vec![later_duplicate.clone(), colliding_unique.clone()],
+        vec![colliding_unique.clone(), later_duplicate.clone()],
+    ];
+    let mut committed_orders = Vec::with_capacity(generation_one_orders.len());
+    for generation_one_candidates in generation_one_orders {
+        let mut archive = ReferenceArchive::new(CAPACITY_WITH_ONE_SPARE_SLOT);
+        let first_stage = archive
+            .stage_ranked_admissions(0, std::slice::from_ref(&first_generation))
+            .unwrap();
+        assert_stage_receipt(
+            &first_stage,
+            0,
+            0,
+            1,
+            &[(first_generation.exact_gene, 100, 4, 0)],
+        );
+        assert_eq!(first_stage.full_gene_hash_collision_count, 0);
+        assert_eq!(archive.faulted_generation(), None);
+        assert_eq!(
+            archive.combined_commit(0),
+            Ok(CommitReceipt {
+                completed_generation: 0,
+                next_generation: 1,
+                previous_committed_count: 0,
+                committed_count: 1,
+            })
+        );
+        assert_eq!(archive.committed_full_gene_hash_collision_count(), 0);
+        let committed_first_generation = archive.committed_records()[0].clone();
+        assert_eq!(
+            committed_first_generation.full_gene_hash,
+            FORCED_COLLISION_HASH
+        );
+        assert_record_metric_row(
+            &committed_first_generation,
+            first_generation.exact_gene,
+            first_generation_metrics,
+        );
+        let generation_one_snapshot = archive.neighbor_snapshot_at_generation_start(1).unwrap();
+        assert_eq!(
+            generation_one_snapshot.records,
+            vec![committed_first_generation.clone()]
+        );
+
+        let collision_stage = archive
+            .stage_ranked_admissions(1, &generation_one_candidates)
+            .unwrap();
+        assert_stage_receipt(
+            &collision_stage,
+            1,
+            1,
+            2,
+            &[(colliding_unique.exact_gene, 200, 7, 1)],
+        );
+        assert_eq!(collision_stage.records.len(), 1);
+        assert_eq!(archive.staged_count(), 1);
+        assert_eq!(collision_stage.full_gene_hash_collision_count, 1);
+        assert_eq!(archive.committed_full_gene_hash_collision_count(), 0);
+        assert_eq!(archive.committed_count(), 1);
+        assert_eq!(
+            archive.committed_records(),
+            std::slice::from_ref(&committed_first_generation)
+        );
+        assert_eq!(
+            archive
+                .neighbor_snapshot_at_generation_start(1)
+                .unwrap()
+                .records,
+            vec![committed_first_generation.clone()]
+        );
+        assert_eq!(archive.faulted_generation(), None);
+        assert_eq!(
+            collision_stage.records[0].full_gene_hash,
+            FORCED_COLLISION_HASH
+        );
+        assert_record_metric_row(
+            &collision_stage.records[0],
+            colliding_unique.exact_gene,
+            colliding_unique_metrics,
+        );
+        assert_ne!(
+            archive_metric_bits(&collision_stage.records[0]),
+            metric_row_bits(later_duplicate_metrics)
+        );
+
+        assert_eq!(
+            archive.combined_commit(1),
+            Ok(CommitReceipt {
+                completed_generation: 1,
+                next_generation: 2,
+                previous_committed_count: 1,
+                committed_count: 2,
+            })
+        );
+        assert_eq!(archive.current_generation(), 2);
+        assert_eq!(archive.committed_count(), 2);
+        assert_eq!(archive.committed_full_gene_hash_collision_count(), 1);
+        assert_eq!(archive.faulted_generation(), None);
+        assert_eq!(archive.committed_records()[0], committed_first_generation);
+        assert_eq!(
+            archive_record_keys(archive.committed_records()),
+            vec![
+                (first_generation.exact_gene, 100, 4, 0),
+                (colliding_unique.exact_gene, 200, 7, 1),
+            ]
+        );
+        assert_eq!(CAPACITY_WITH_ONE_SPARE_SLOT - archive.committed_count(), 1);
+        assert_eq!(
+            archive.committed_records()[1].full_gene_hash,
+            FORCED_COLLISION_HASH
+        );
+        assert_record_metric_row(
+            &archive.committed_records()[1],
+            colliding_unique.exact_gene,
+            colliding_unique_metrics,
+        );
+        assert_ne!(
+            archive_metric_bits(&archive.committed_records()[1]),
+            metric_row_bits(later_duplicate_metrics)
+        );
+        assert_eq!(
+            archive
+                .neighbor_snapshot_at_generation_start(2)
+                .unwrap()
+                .records,
+            archive.committed_records().to_vec()
+        );
+
+        let unequal_hash_stage = archive
+            .stage_ranked_admissions(2, std::slice::from_ref(&unequal_hash_control))
+            .unwrap();
+        assert_stage_receipt(
+            &unequal_hash_stage,
+            2,
+            2,
+            3,
+            &[(unequal_hash_control.exact_gene, 300, 8, 2)],
+        );
+        assert_eq!(unequal_hash_stage.full_gene_hash_collision_count, 1);
+        assert_eq!(archive.committed_full_gene_hash_collision_count(), 1);
+        assert_eq!(archive.committed_count(), 2);
+        assert_eq!(archive.staged_count(), 1);
+        assert_eq!(archive.faulted_generation(), None);
+        assert_eq!(
+            archive
+                .neighbor_snapshot_at_generation_start(2)
+                .unwrap()
+                .records,
+            archive.committed_records().to_vec()
+        );
+        assert_eq!(
+            archive.combined_commit(2),
+            Ok(CommitReceipt {
+                completed_generation: 2,
+                next_generation: 3,
+                previous_committed_count: 2,
+                committed_count: 3,
+            })
+        );
+        assert_eq!(archive.committed_full_gene_hash_collision_count(), 1);
+        assert_eq!(archive.faulted_generation(), None);
+        assert_eq!(archive.committed_count(), 3);
+        assert_eq!(archive.committed_records()[2].full_gene_hash, UNEQUAL_HASH);
+        assert_record_metric_row(
+            &archive.committed_records()[2],
+            unequal_hash_control.exact_gene,
+            unequal_hash_metrics,
+        );
+        committed_orders.push(archive.committed_records().to_vec());
+    }
+
+    assert_eq!(committed_orders[0], committed_orders[1]);
+}
+
+#[test]
+fn r4_unequal_hash_admits_without_incrementing_the_collision_counter() {
+    const FIRST_HASH: u64 = 0x0123_4567_89ab_cdef;
+    const UNEQUAL_HASH: u64 = 0xfedc_ba98_7654_3210;
+    let first_metrics = [
+        2.0, 41.0, 42.0, 43.0, 44.0, 45.0, 46.0, 47.0, 3.0, 49.0, 50.0,
+    ];
+    let unequal_hash_metrics = [
+        4.0, 51.0, 52.0, 53.0, 54.0, 55.0, 56.0, 57.0, 5.0, 59.0, 60.0,
+    ];
+    let first = archive_candidate_with_forced_full_gene_hash(
+        [0x1000, 0x2000],
+        FIRST_HASH,
+        10,
+        0,
+        20.0,
+        first_metrics,
+    );
+    let unequal_hash = archive_candidate_with_forced_full_gene_hash(
+        [0x3000, 0x4000],
+        UNEQUAL_HASH,
+        20,
+        1,
+        10.0,
+        unequal_hash_metrics,
+    );
+    assert_ne!(first.exact_gene, unequal_hash.exact_gene);
+    assert_ne!(first.full_gene_hash, unequal_hash.full_gene_hash);
+
+    let mut archive = ReferenceArchive::new(3);
+    let first_stage = archive
+        .stage_ranked_admissions(0, std::slice::from_ref(&first))
+        .unwrap();
+    assert_eq!(first_stage.full_gene_hash_collision_count, 0);
+    archive.combined_commit(0).unwrap();
+    assert_eq!(archive.committed_full_gene_hash_collision_count(), 0);
+
+    let unequal_hash_stage = archive
+        .stage_ranked_admissions(1, std::slice::from_ref(&unequal_hash))
+        .unwrap();
+    assert_stage_receipt(
+        &unequal_hash_stage,
+        1,
+        1,
+        2,
+        &[(unequal_hash.exact_gene, 20, 1, 1)],
+    );
+    assert_eq!(unequal_hash_stage.full_gene_hash_collision_count, 0);
+    assert_eq!(archive.committed_full_gene_hash_collision_count(), 0);
+    assert_eq!(archive.faulted_generation(), None);
+    assert_eq!(
+        archive.combined_commit(1),
+        Ok(CommitReceipt {
+            completed_generation: 1,
+            next_generation: 2,
+            previous_committed_count: 1,
+            committed_count: 2,
+        })
+    );
+    assert_eq!(archive.committed_full_gene_hash_collision_count(), 0);
+    assert_eq!(archive.faulted_generation(), None);
+    assert_eq!(archive.committed_count(), 2);
+    assert_eq!(archive.committed_records()[0].full_gene_hash, FIRST_HASH);
+    assert_eq!(archive.committed_records()[1].full_gene_hash, UNEQUAL_HASH);
+    assert_record_metric_row(
+        &archive.committed_records()[1],
+        unequal_hash.exact_gene,
+        unequal_hash_metrics,
+    );
 }
