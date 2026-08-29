@@ -103,6 +103,53 @@ pub(crate) struct RawResidentArchiveKnnTerminalV2 {
     pub(super) validator_digest: u64,
 }
 
+#[cfg(feature = "cuda")]
+impl RawResidentArchiveKnnTerminalV2 {
+    pub(crate) fn validates_committed_v2(
+        &self,
+        pending: &RawResidentArchiveKnnPendingV2,
+        binding: &RawResidentArchiveKnnBindV2,
+        ready: &RawReadyEventV1,
+    ) -> bool {
+        let generation = (self.packed_commit_word >> 1) & 0xffff;
+        let archive_count = (self.packed_commit_word >> 17) & 0xffff;
+        let mut digest = 1_469_598_103_934_665_603_u64;
+        for lane in [
+            self.packed_commit_word,
+            self.collision_count,
+            binding.run_identity,
+            u64::from(self.device_fault_word),
+        ] {
+            for byte in lane.to_le_bytes() {
+                digest ^= u64::from(byte);
+                digest = digest.wrapping_mul(1_099_511_628_211);
+            }
+        }
+        self.abi_version == 2
+            && self.terminal_status == 1
+            && self.device_fault_word == 0
+            && self.validation_fault_word == 0
+            && self.receipt_identity == pending.terminal_host_receipt_identity
+            && self.run_identity == binding.run_identity
+            && self.run_identity == pending.run_identity
+            && archive_count <= binding.archive_capacity
+            && self.compact_async_d2h_count == 1
+            && self.compact_async_d2h_bytes == std::mem::size_of::<Self>() as u64
+            && self.completion_event_query_count != 0
+            && self.completion_stream_synchronize_count == 0
+            && self.same_stream_enqueue_count == pending.same_stream_enqueue_count
+            && self.completion_event_identity == pending.completion_event_identity
+            && self.validator_digest == digest
+            && ready.abi_version == 1
+            && ready.reserved == 0
+            && ready.event_id == pending.completion_event_identity
+            && ready.generation_index == generation
+            && ready.same_stream_enqueue_count == pending.same_stream_enqueue_count
+            && ready.intermediate_host_wait_count == 0
+            && ready.intermediate_readback_count == 0
+    }
+}
+
 const _: [(); 16] = [(); std::mem::size_of::<RawResidentArchiveKnnArenaRegionV2>()];
 const _: [(); 384] = [(); std::mem::size_of::<RawResidentArchiveKnnBindV2>()];
 const _: [(); 72] = [(); std::mem::size_of::<RawResidentArchiveKnnPendingV2>()];

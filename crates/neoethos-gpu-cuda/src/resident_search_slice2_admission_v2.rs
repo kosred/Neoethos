@@ -451,20 +451,22 @@ impl ResidentSearchSlice2ValidatedAdmissionV2 {
 }
 
 impl ResidentSearchSlice2AdmissionOwnerV2 {
-    pub(crate) fn queue_generation_v2(
-        self,
-        _ordinal: u64,
-        _allocator: &mut dyn ResidentSearchSlice2AllocationFacadeV2,
-    ) -> Result<Self, ResidentSearchSlice2AdmissionErrorV2> {
-        Ok(self)
-    }
-
     #[cfg(feature = "cuda")]
     pub(crate) fn into_calibration_receipt_v2(
         self,
+        plan: crate::resident_generation_v1::SealedResidentGenerationPlanV1,
+        smc_weights: [f64; 11],
+        smc_gate_disabled: bool,
+        settings: crate::NeoPopulationSettings,
+        scenarios: Box<[crate::ScenarioDescriptor]>,
     ) -> crate::resident_search_slice2_v3::ResidentArchiveKnnCalibrationReceiptV2 {
         crate::resident_search_slice2_v3::seal_resident_archive_knn_calibration_receipt_v2(
             self.runtime_authority,
+            plan,
+            smc_weights,
+            smc_gate_disabled,
+            settings,
+            scenarios,
         )
     }
 }

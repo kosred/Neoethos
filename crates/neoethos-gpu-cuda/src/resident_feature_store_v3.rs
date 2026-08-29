@@ -3784,6 +3784,7 @@ impl ResidentFeatureStoreImportV3 {
             population_session,
             resident_import: Some(self),
             consumer_lease: None,
+            slice2_population_detached: false,
             admission_identity_sha256,
             canonical_content_merkle: compact_hashes.canonical_content_merkle,
             device_identity,
@@ -3849,6 +3850,7 @@ pub struct ResidentPopulationSessionV3 {
     population_session: PopulationSession,
     resident_import: Option<ResidentFeatureStoreImportV3>,
     consumer_lease: Option<ResidentFeatureStoreConsumerLeaseV3>,
+    slice2_population_detached: bool,
     admission_identity_sha256: [u8; SHA256_BYTES],
     canonical_content_merkle: [u8; SHA256_BYTES],
     device_identity: CudaPrimaryContextBuildIdentityV3,
@@ -3952,6 +3954,35 @@ impl ResidentFeatureStoreSearchRunV2 {
 }
 
 impl ResidentPopulationSessionV3 {
+    pub(crate) fn take_population_session_for_slice2_v3(
+        &mut self,
+    ) -> Result<PopulationSession, ResidentFeatureStoreCudaErrorV3> {
+        if self.slice2_population_detached
+            || self.resident_import.is_none()
+            || self.consumer_lease.is_some()
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident Slice2 population owner is not available".into(),
+            ));
+        }
+        self.slice2_population_detached = true;
+        Ok(self
+            .population_session
+            .take_for_resident_consumer_lease_v3())
+    }
+
+    pub(crate) fn restore_population_session_from_slice2_v3(
+        &mut self,
+        session: PopulationSession,
+    ) -> Result<(), PopulationSession> {
+        if !self.slice2_population_detached {
+            return Err(session);
+        }
+        self.population_session = session;
+        self.slice2_population_detached = false;
+        Ok(())
+    }
+
     #[allow(dead_code)] // First bounded production owner seam; next chunk calls it.
     pub(crate) fn consume_into_resident_search_run_v2(
         mut self,
@@ -4246,6 +4277,11 @@ impl ResidentPopulationSessionV3 {
     pub fn record_consumer_completion(
         mut self,
     ) -> Result<ResidentFeatureStoreConsumerLeaseV3, ResidentFeatureStoreCudaErrorV3> {
+        if self.slice2_population_detached {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident Slice2 population owner was not restored".into(),
+            ));
+        }
         let resident_import = self.resident_import.take().ok_or_else(|| {
             ResidentFeatureStoreCudaErrorV3::InvalidInput(
                 "resident population import was already consumed".into(),

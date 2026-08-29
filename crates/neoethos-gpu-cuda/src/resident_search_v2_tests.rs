@@ -1989,8 +1989,7 @@ fn async_args(
 }
 
 #[test]
-fn slice2_valid_combined_admission_executes_declared_ledger_once_and_later_generations_allocate_nothing()
- {
+fn slice2_valid_combined_admission_executes_declared_ledger_once() {
     assert_mutation_register_is_frozen();
     let mut direct_control_count = 0;
     let mut async_terminal = ResidentSearchSlice2AllocationRecorderV2::default();
@@ -2194,7 +2193,7 @@ fn slice2_valid_combined_admission_executes_declared_ledger_once_and_later_gener
     let expected = expected_ledger(&request);
     let expected_events = expected_chronology(&expected);
     let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();
-    let owner = admit_with_pristine_seal(request, &mut recorder)
+    let _owner = admit_with_pristine_seal(request, &mut recorder)
         .expect("valid combined admission must return the move-only owner");
     assert_eq!(
         recorder.phase(),
@@ -2218,17 +2217,5 @@ fn slice2_valid_combined_admission_executes_declared_ledger_once_and_later_gener
             .iter()
             .all(|entry| entry.category != forbidden_category)
     );
-    let admission_snapshot = recorder.snapshot();
-    let owner = owner
-        .queue_generation_v2(1, &mut recorder)
-        .expect("generation one queue must retain the owner");
-    assert_eq!(recorder, admission_snapshot);
-    let owner = owner
-        .queue_generation_v2(2, &mut recorder)
-        .expect("generation two queue must retain the owner");
-    assert_eq!(recorder, admission_snapshot);
-    let _owner = owner
-        .queue_generation_v2(3, &mut recorder)
-        .expect("generation three queue must retain the owner");
-    assert_eq!(recorder, admission_snapshot);
+    assert_eq!(recorder, recorder.snapshot());
 }

@@ -2231,6 +2231,37 @@ pub(crate) struct ResidentSearchPopulationCompletionLeaseV2 {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) struct ResidentSearchPopulationEnqueueRejectedV2 {
+    error: CudaPopulationError,
+    session: PopulationSession,
+}
+
+#[cfg(feature = "cuda")]
+impl ResidentSearchPopulationEnqueueRejectedV2 {
+    pub(crate) fn into_parts_v2(self) -> (CudaPopulationError, PopulationSession) {
+        (self.error, self.session)
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct ResidentSearchPopulationFinishRejectedV2 {
+    error: CudaPopulationError,
+    lease: ResidentSearchPopulationCompletionLeaseV2,
+}
+
+#[cfg(feature = "cuda")]
+impl ResidentSearchPopulationFinishRejectedV2 {
+    pub(crate) fn into_parts_v2(
+        self,
+    ) -> (
+        CudaPopulationError,
+        ResidentSearchPopulationCompletionLeaseV2,
+    ) {
+        (self.error, self.lease)
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl ResidentSearchPopulationCompletionLeaseV2 {
     pub(crate) const fn raw_source_v2(&self) -> &RawResidentScoringPopulationSourceV2 {
         &self.raw
@@ -2243,11 +2274,13 @@ impl ResidentSearchPopulationCompletionLeaseV2 {
 
     pub(crate) fn finish_device_consume_v2(
         mut self,
-    ) -> Result<PopulationSession, CudaPopulationError> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| invalid("resident Search completion lease lost its session"))?;
+    ) -> Result<PopulationSession, ResidentSearchPopulationFinishRejectedV2> {
+        let Some(session) = self.session.as_mut() else {
+            return Err(ResidentSearchPopulationFinishRejectedV2 {
+                error: invalid("resident Search completion lease lost its session"),
+                lease: self,
+            });
+        };
         // SAFETY: the exact boxed receipt and its native session remain owned
         // here until the terminal completion event has been proven Ready.
         let status = unsafe {
@@ -2258,10 +2291,10 @@ impl ResidentSearchPopulationCompletionLeaseV2 {
         };
         if status != STATUS_OK {
             session.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
-            return Err(CudaPopulationError::native(
-                "finish_resident_scoring_source_v2",
-                status,
-            ));
+            return Err(ResidentSearchPopulationFinishRejectedV2 {
+                error: CudaPopulationError::native("finish_resident_scoring_source_v2", status),
+                lease: self,
+            });
         }
         session.strict_resident_state = StrictResidentSessionStateV1::StrictIdle;
         session.pending_event = None;
@@ -2269,9 +2302,13 @@ impl ResidentSearchPopulationCompletionLeaseV2 {
         #[cfg(feature = "cuda")]
         session.authorize_resident_session_destroy_v3();
         self.consumed = true;
-        self.session
-            .take()
-            .ok_or_else(|| invalid("resident Search completion lease lost its session"))
+        match self.session.take() {
+            Some(session) => Ok(session),
+            None => Err(ResidentSearchPopulationFinishRejectedV2 {
+                error: invalid("resident Search completion lease lost its session"),
+                lease: self,
+            }),
+        }
     }
 
     pub(crate) fn poison_without_reuse_v2(&mut self) {
@@ -3621,8 +3658,14 @@ impl PopulationSession {
         expected_feature_count: u64,
         expected_max_terms: u32,
         expected_full_discovery_reserve_bytes: u64,
-    ) -> Result<ResidentSearchPopulationCompletionLeaseV2, CudaPopulationError> {
-        self.require_strict_idle_v1("enqueue_resident_gene_metrics_owned_v2")?;
+    ) -> Result<ResidentSearchPopulationCompletionLeaseV2, ResidentSearchPopulationEnqueueRejectedV2>
+    {
+        if let Err(error) = self.require_strict_idle_v1("enqueue_resident_gene_metrics_owned_v2") {
+            return Err(ResidentSearchPopulationEnqueueRejectedV2 {
+                error,
+                session: self,
+            });
+        }
         if !self.scenarios_uploaded
             || self.gene_batch_identity_sha256.is_none()
             || logical_population_count == 0
@@ -3631,19 +3674,31 @@ impl PopulationSession {
             || self.population as u64 != logical_population_count
             || expected_full_discovery_reserve_bytes == 0
         {
-            return Err(invalid(
-                "owned resident scoring requires one immutable full-population chunk",
-            ));
+            return Err(ResidentSearchPopulationEnqueueRejectedV2 {
+                error: invalid(
+                    "owned resident scoring requires one immutable full-population chunk",
+                ),
+                session: self,
+            });
         }
         if settings.month_capacity == 0 || settings.month_capacity > i32::MAX as u32 {
-            return Err(invalid(
-                "month_capacity must be non-zero and fit the native signed extent",
-            ));
+            return Err(ResidentSearchPopulationEnqueueRejectedV2 {
+                error: invalid("month_capacity must be non-zero and fit the native signed extent"),
+                session: self,
+            });
         }
-        let plan = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(
+        let plan = match PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(
             self.scenario_count,
             settings.month_capacity,
-        )?;
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(ResidentSearchPopulationEnqueueRejectedV2 {
+                    error,
+                    session: self,
+                });
+            }
+        };
         let mut receipt = Box::new(RawResidentPopulationMetricsHandleV1::default());
         let mut counters = NeoPopulationCounters::default();
         // SAFETY: `self` is moved into the returned lease, so the native session
@@ -3661,10 +3716,13 @@ impl PopulationSession {
             if !strict_enqueue_failure_is_known_prelaunch_v1(status) {
                 self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
             }
-            return Err(CudaPopulationError::native(
-                "enqueue_resident_gene_metrics_owned_v2",
-                status,
-            ));
+            return Err(ResidentSearchPopulationEnqueueRejectedV2 {
+                error: CudaPopulationError::native(
+                    "enqueue_resident_gene_metrics_owned_v2",
+                    status,
+                ),
+                session: self,
+            });
         }
         self.strict_resident_state = StrictResidentSessionStateV1::InFlight;
         self.emitted_events = 0;
@@ -3680,7 +3738,10 @@ impl PopulationSession {
                     receipt.as_ref(),
                 )
             };
-            return Err(error);
+            return Err(ResidentSearchPopulationEnqueueRejectedV2 {
+                error,
+                session: self,
+            });
         }
         let mut raw = RawResidentScoringPopulationSourceV2::default();
         // SAFETY: the source is minted from the same stable receipt retained by
@@ -3722,10 +3783,14 @@ impl PopulationSession {
                     receipt.as_ref(),
                 )
             };
-            return Err(if status == STATUS_OK {
+            let error = if status == STATUS_OK {
                 invalid("native owned resident scoring source identity mismatch")
             } else {
                 CudaPopulationError::native("export_resident_scoring_source_v2", status)
+            };
+            return Err(ResidentSearchPopulationEnqueueRejectedV2 {
+                error,
+                session: self,
             });
         }
         Ok(ResidentSearchPopulationCompletionLeaseV2 {

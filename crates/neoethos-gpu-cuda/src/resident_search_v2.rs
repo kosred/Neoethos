@@ -985,7 +985,9 @@ impl ResidentSearchSlice2NativeOwnerV3 {
                 .map_or(0, |admission| admission.full_discovery_reserve_bytes),
         ) {
             Ok(source) => source,
-            Err(error) => {
+            Err(rejected) => {
+                let (error, session) = rejected.into_parts_v2();
+                run.session = Some(session);
                 run.state = ResidentSearchStateV2::Poisoned;
                 self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
                 return Err(ResidentSearchSlice2NativeRejectedV3 {
@@ -1055,12 +1057,23 @@ impl ResidentSearchSlice2NativeOwnerV3 {
             .expect("ranked Slice2 owner retains population source");
         match source.finish_device_consume_v2() {
             Ok(session) => {
-                self.run
-                    .as_mut()
-                    .expect("Slice2 owner retains Search run")
-                    .session = Some(session);
+                let run = self.run.as_mut().expect("Slice2 owner retains Search run");
+                let Some(next_generation) = run.view.expected_generation_index.checked_add(1)
+                else {
+                    run.session = Some(session);
+                    return Err(self.reject_state_v3());
+                };
+                let Some(next_epoch) = run.view.expected_store_epoch.checked_add(1) else {
+                    run.session = Some(session);
+                    return Err(self.reject_state_v3());
+                };
+                run.view.expected_generation_index = next_generation;
+                run.view.expected_store_epoch = next_epoch;
+                run.session = Some(session);
             }
-            Err(error) => {
+            Err(rejected) => {
+                let (error, source) = rejected.into_parts_v2();
+                self.population_source = Some(source);
                 self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
                 return Err(ResidentSearchSlice2NativeRejectedV3 {
                     error: ResidentSearchSlice2NativeErrorV3::Search(error.into()),
@@ -1099,7 +1112,7 @@ impl ResidentSearchSlice2NativeOwnerV3 {
         if self.state != ResidentSearchSlice2NativeStateV3::TerminalPending {
             return Err(self.reject_state_v3());
         }
-        let mut committed = RawReadyEventV1::default();
+        let mut committed = Box::new(RawReadyEventV1::default());
         let mut terminal = RawResidentArchiveKnnTerminalV2::default();
         let status = unsafe {
             try_complete_resident_archive_terminal_v2(
@@ -1107,7 +1120,7 @@ impl ResidentSearchSlice2NativeOwnerV3 {
                 self.pending
                     .as_deref()
                     .expect("pending owner retains stable receipt"),
-                &mut committed,
+                committed.as_mut(),
                 &mut terminal,
             )
         };
@@ -1117,13 +1130,21 @@ impl ResidentSearchSlice2NativeOwnerV3 {
         if status != STATUS_OK {
             return Err(self.reject_v3("try_complete_resident_archive_terminal_v2", status));
         }
-        let run = self.run.as_mut().expect("Slice2 owner retains Search run");
-        run.ready_receipt_address = 0;
-        run.ready = Some(Box::new(committed));
-        run.ready_receipt_address = run
-            .ready
+        let pending = self
+            .pending
             .as_deref()
-            .map_or(0, |ready| std::ptr::from_ref(ready) as usize);
+            .expect("terminal owner retains pending receipt");
+        let binding = self
+            .bind_authority
+            .as_ref()
+            .expect("Slice2 owner retains bind authority")
+            .raw_v2();
+        if !terminal.validates_committed_v2(pending, binding, committed.as_ref()) {
+            return Err(self.reject_v3("validate_resident_archive_terminal_v2", -6));
+        }
+        let run = self.run.as_mut().expect("Slice2 owner retains Search run");
+        run.ready_receipt_address = std::ptr::from_ref(committed.as_ref()) as usize;
+        run.ready = Some(committed);
         self.terminal = Some(terminal);
         self.state = ResidentSearchSlice2NativeStateV3::TerminalComplete;
         Ok(ResidentSearchSlice2NativeTryCompleteV3::Complete(self))
@@ -1131,22 +1152,23 @@ impl ResidentSearchSlice2NativeOwnerV3 {
 
     pub(crate) fn release_terminal_v3(
         mut self,
-    ) -> Result<PopulationSession, ResidentSearchSlice2NativeErrorV3> {
+    ) -> Result<PopulationSession, ResidentSearchSlice2NativeRejectedV3> {
         if self.state != ResidentSearchSlice2NativeStateV3::TerminalComplete {
-            return Err(ResidentSearchSlice2NativeErrorV3::StateViolation);
+            return Err(self.reject_state_v3());
         }
-        let run = self
-            .run
-            .as_mut()
-            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let Some(run) = self.run.as_mut() else {
+            return Err(self.reject_state_v3());
+        };
         let session_handle = run
             .session
             .as_ref()
-            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?
-            .resident_search_native_handle_v2();
-        let archive = self
-            .archive
-            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+            .map(PopulationSession::resident_search_native_handle_v2);
+        let Some(session_handle) = session_handle else {
+            return Err(self.reject_state_v3());
+        };
+        let Some(archive) = self.archive else {
+            return Err(self.reject_state_v3());
+        };
         let status = unsafe {
             neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2(
                 session_handle,
@@ -1154,21 +1176,30 @@ impl ResidentSearchSlice2NativeOwnerV3 {
             )
         };
         if status != STATUS_OK {
-            self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
-            return Err(ResidentSearchSlice2NativeErrorV3::Native {
-                operation: "neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2",
+            return Err(self.reject_v3(
+                "neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2",
                 status,
-            });
+            ));
         }
         self.archive = None;
         self.pending = None;
         self.bind_authority = None;
         self.state = ResidentSearchSlice2NativeStateV3::Released;
-        self.run
+        let run = self
+            .run
             .take()
-            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?
-            .close_v2()
-            .map_err(Into::into)
+            .expect("validated Slice2 owner retains Search run");
+        match run.close_preserving_v3() {
+            Ok(session) => Ok(session),
+            Err((error, run)) => {
+                self.run = Some(run);
+                self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+                Err(ResidentSearchSlice2NativeRejectedV3 {
+                    error: error.into(),
+                    owner: self,
+                })
+            }
+        }
     }
 }
 
@@ -1350,6 +1381,24 @@ impl ResidentSearchRunV2 {
         self.session
             .take()
             .ok_or(ResidentSearchV2Error::StateViolation)
+    }
+
+    fn close_preserving_v3(mut self) -> Result<PopulationSession, (ResidentSearchV2Error, Self)> {
+        if !matches!(
+            self.state,
+            ResidentSearchStateV2::Active | ResidentSearchStateV2::AdvancedOnce
+        ) {
+            return Err((ResidentSearchV2Error::StateViolation, self));
+        }
+        if let Err(error) = self.release_search_resources_v2() {
+            return Err((error, self));
+        }
+        self.ready = None;
+        self.state = ResidentSearchStateV2::Consumed;
+        match self.session.take() {
+            Some(session) => Ok(session),
+            None => Err((ResidentSearchV2Error::StateViolation, self)),
+        }
     }
 
     #[cfg(feature = "cuda-device-fixtures")]

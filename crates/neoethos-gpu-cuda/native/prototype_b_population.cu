@@ -2006,6 +2006,9 @@ struct NeoCudaPopulationSession {
   bool resident_search_runtime_reserved_v2 = false;
   neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2
       resident_search_runtime_facts_v2{};
+  bool resident_search_slice2_binding_sealed_v3 = false;
+  neoethos::resident_archive_knn_v2::NeoResidentArchiveKnnBindV2
+      resident_search_slice2_binding_v3{};
   int bars = 0;
   int parent_rows = 0;
   int feature_count = 0;
@@ -3868,6 +3871,8 @@ neoethos_gpu_cuda_population_reserve_resident_search_runtime_v2(
   if (session == nullptr) {
     return NEO_POPULATION_STATUS_NULL_SESSION;
   }
+  session->resident_search_slice2_binding_sealed_v3 = false;
+  session->resident_search_slice2_binding_v3 = {};
   if (facts == nullptr || session->resident_search_runtime_reserved_v2 ||
       session->resident_generation_run_v2 != nullptr ||
       session->resident_scoring_run_v2 != nullptr ||
@@ -4051,6 +4056,8 @@ neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
   admission->scoring = scoring;
   admission->scoring_device_bytes = scoring.total_device_bytes;
   admission->total_device_bytes = total_device_bytes;
+  session->resident_search_slice2_binding_v3 = *binding;
+  session->resident_search_slice2_binding_sealed_v3 = true;
   return NEO_POPULATION_STATUS_OK;
 }
 
@@ -4116,6 +4123,11 @@ static std::int32_t create_resident_search_combined_impl_v3(
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
   }
   if (slice2_binding != nullptr) {
+    if (!session->resident_search_slice2_binding_sealed_v3 ||
+        std::memcmp(&session->resident_search_slice2_binding_v3,
+                    slice2_binding, sizeof(*slice2_binding)) != 0) {
+      return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+    }
     NeoResidentScoringAdmissionV2 preflight_scoring{};
     preflight_scoring.abi_version = 2u;
     preflight_scoring.selected_cuda_ordinal =
@@ -4337,6 +4349,8 @@ static std::int32_t create_resident_search_combined_impl_v3(
   session->resident_planned_population_v2 =
       static_cast<int>(generation_plan->logical_population_count);
   session->population = session->resident_planned_population_v2;
+  session->resident_search_slice2_binding_sealed_v3 = false;
+  session->resident_search_slice2_binding_v3 = {};
   return NEO_POPULATION_STATUS_OK;
 }
 

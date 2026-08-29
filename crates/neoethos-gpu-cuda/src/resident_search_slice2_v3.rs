@@ -1,25 +1,49 @@
 #[cfg(feature = "cuda")]
+use crate::resident_feature_store_v3::ResidentFeatureStoreConsumerLeaseV3;
+#[cfg(feature = "cuda")]
+use crate::resident_generation_v1::SealedResidentGenerationPlanV1;
+#[cfg(feature = "cuda")]
 use crate::resident_search_slice2_admission_v2::ResidentSearchSlice2ValidatedRuntimeAuthorityV2;
 #[cfg(feature = "cuda")]
+use crate::resident_search_v2::{
+    ResidentSearchSlice2NativeErrorV3, ResidentSearchSlice2NativeOwnerV3,
+    ResidentSearchSlice2NativeTryCompleteV3,
+};
+#[cfg(feature = "cuda")]
 use crate::resident_trim_prefilter_v1::ResidentTrimmedPopulationSessionV1;
+#[cfg(feature = "cuda")]
+use crate::{NeoPopulationSettings, ScenarioDescriptor};
+
+#[cfg(feature = "cuda")]
+struct ResidentSearchStartAuthorityV3 {
+    runtime: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,
+    plan: SealedResidentGenerationPlanV1,
+    smc_weights: [f64; 11],
+    smc_gate_disabled: bool,
+    settings: NeoPopulationSettings,
+    scenarios: Box<[ScenarioDescriptor]>,
+}
 
 #[cfg(feature = "cuda")]
 struct ResidentSearchAuthorityStateV3 {
-    session: ResidentTrimmedPopulationSessionV1,
-    calibration: ResidentArchiveKnnCalibrationReceiptV2,
+    session: Option<ResidentTrimmedPopulationSessionV1>,
+    calibration: Option<ResidentArchiveKnnCalibrationReceiptV2>,
+    native: Option<ResidentSearchSlice2NativeOwnerV3>,
+    settings: Option<NeoPopulationSettings>,
+    completion: Option<ResidentFeatureStoreConsumerLeaseV3>,
+    poisoned: bool,
 }
 
 #[cfg(feature = "cuda")]
 enum ResidentSearchRejectedTransitionV3 {
-    ScoreAndRank,
-    TerminalSeal,
-    StageArchiveFromRank,
-    EvolveAndPublish,
+    Native(ResidentSearchSlice2NativeErrorV3),
+    MissingAuthority,
+    TrimLifetime,
 }
 
 pub struct ResidentArchiveKnnCalibrationReceiptV2 {
     #[cfg(feature = "cuda")]
-    inner: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,
+    inner: Option<ResidentSearchStartAuthorityV3>,
     #[cfg(not(feature = "cuda"))]
     #[allow(dead_code)]
     inner: core::convert::Infallible,
@@ -69,6 +93,8 @@ pub enum ResidentSearchTryCompleteV3 {
 pub struct ResidentSearchTransitionErrorV3 {
     #[cfg(feature = "cuda")]
     inner: ResidentSearchRejectedTransitionV3,
+    #[cfg(feature = "cuda")]
+    retained_terminal_authority: Option<ResidentSearchAuthorityStateV3>,
     #[cfg(not(feature = "cuda"))]
     #[allow(dead_code)]
     inner: core::convert::Infallible,
@@ -85,11 +111,85 @@ impl ResidentSearchGenerationChainV3 {
     ) -> Result<ResidentSearchRankEnqueuedV3, ResidentSearchRejectedAuthorityV3<Self>> {
         #[cfg(feature = "cuda")]
         {
-            let _ = (&self.inner.session, &self.inner.calibration);
-            Err(reject_resident_search_transition_v3(
-                self,
-                ResidentSearchRejectedTransitionV3::ScoreAndRank,
-            ))
+            let mut state = self.inner;
+            if state.poisoned {
+                return Err(reject_resident_search_transition_v3(
+                    ResidentSearchGenerationChainV3 { inner: state },
+                    ResidentSearchRejectedTransitionV3::MissingAuthority,
+                ));
+            }
+            if state.native.is_none() {
+                let Some(mut calibration) = state.calibration.take() else {
+                    return Err(reject_resident_search_transition_v3(
+                        ResidentSearchGenerationChainV3 { inner: state },
+                        ResidentSearchRejectedTransitionV3::MissingAuthority,
+                    ));
+                };
+                let Some(start) = calibration.inner.take() else {
+                    return Err(reject_resident_search_transition_v3(
+                        ResidentSearchGenerationChainV3 { inner: state },
+                        ResidentSearchRejectedTransitionV3::MissingAuthority,
+                    ));
+                };
+                let Some(session) = state.session.as_mut() else {
+                    return Err(reject_resident_search_transition_v3(
+                        ResidentSearchGenerationChainV3 { inner: state },
+                        ResidentSearchRejectedTransitionV3::MissingAuthority,
+                    ));
+                };
+                let population = match session.take_population_session_for_slice2_v3() {
+                    Ok(population) => population,
+                    Err(_) => {
+                        state.poisoned = true;
+                        return Err(reject_resident_search_transition_v3(
+                            ResidentSearchGenerationChainV3 { inner: state },
+                            ResidentSearchRejectedTransitionV3::TrimLifetime,
+                        ));
+                    }
+                };
+                let mut native = match population.begin_resident_search_slice2_native_v3(
+                    start.plan,
+                    start.smc_weights,
+                    start.smc_gate_disabled,
+                    start.runtime.into_native_bind_authority_v2(),
+                ) {
+                    Ok(native) => native,
+                    Err(error) => {
+                        state.poisoned = true;
+                        return Err(reject_resident_search_transition_v3(
+                            ResidentSearchGenerationChainV3 { inner: state },
+                            ResidentSearchRejectedTransitionV3::Native(error),
+                        ));
+                    }
+                };
+                if let Err(error) = native.upload_resident_scenarios_v3(&start.scenarios) {
+                    state.native = Some(native);
+                    state.poisoned = true;
+                    return Err(reject_resident_search_transition_v3(
+                        ResidentSearchGenerationChainV3 { inner: state },
+                        ResidentSearchRejectedTransitionV3::Native(error),
+                    ));
+                }
+                state.settings = Some(start.settings);
+                state.native = Some(native);
+            }
+            let native = state.native.take().expect("validated Slice2 native owner");
+            let settings = state.settings.expect("validated Slice2 settings");
+            match native.enqueue_score_and_rank_v3(&settings) {
+                Ok(native) => {
+                    state.native = Some(native);
+                    Ok(ResidentSearchRankEnqueuedV3 { inner: state })
+                }
+                Err(rejected) => {
+                    let (error, native) = rejected.into_parts_v3();
+                    state.native = Some(native);
+                    state.poisoned = true;
+                    Err(reject_resident_search_transition_v3(
+                        ResidentSearchGenerationChainV3 { inner: state },
+                        ResidentSearchRejectedTransitionV3::Native(error),
+                    ))
+                }
+            }
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -102,11 +202,28 @@ impl ResidentSearchGenerationChainV3 {
     ) -> Result<ResidentSearchTerminalPendingV3, ResidentSearchRejectedAuthorityV3<Self>> {
         #[cfg(feature = "cuda")]
         {
-            let _ = (&self.inner.session, &self.inner.calibration);
-            Err(reject_resident_search_transition_v3(
-                self,
-                ResidentSearchRejectedTransitionV3::TerminalSeal,
-            ))
+            let mut state = self.inner;
+            let Some(native) = state.native.take() else {
+                return Err(reject_resident_search_transition_v3(
+                    ResidentSearchGenerationChainV3 { inner: state },
+                    ResidentSearchRejectedTransitionV3::MissingAuthority,
+                ));
+            };
+            match native.enqueue_terminal_seal_v3() {
+                Ok(native) => {
+                    state.native = Some(native);
+                    Ok(ResidentSearchTerminalPendingV3 { inner: state })
+                }
+                Err(rejected) => {
+                    let (error, native) = rejected.into_parts_v3();
+                    state.native = Some(native);
+                    state.poisoned = true;
+                    Err(reject_resident_search_transition_v3(
+                        ResidentSearchGenerationChainV3 { inner: state },
+                        ResidentSearchRejectedTransitionV3::Native(error),
+                    ))
+                }
+            }
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -121,11 +238,28 @@ impl ResidentSearchRankEnqueuedV3 {
     ) -> Result<ResidentSearchArchiveStagedV3, ResidentSearchRejectedAuthorityV3<Self>> {
         #[cfg(feature = "cuda")]
         {
-            let _ = (&self.inner.session, &self.inner.calibration);
-            Err(reject_resident_search_transition_v3(
-                self,
-                ResidentSearchRejectedTransitionV3::StageArchiveFromRank,
-            ))
+            let mut state = self.inner;
+            let Some(native) = state.native.take() else {
+                return Err(reject_resident_search_transition_v3(
+                    ResidentSearchRankEnqueuedV3 { inner: state },
+                    ResidentSearchRejectedTransitionV3::MissingAuthority,
+                ));
+            };
+            match native.enqueue_stage_archive_from_rank_v3() {
+                Ok(native) => {
+                    state.native = Some(native);
+                    Ok(ResidentSearchArchiveStagedV3 { inner: state })
+                }
+                Err(rejected) => {
+                    let (error, native) = rejected.into_parts_v3();
+                    state.native = Some(native);
+                    state.poisoned = true;
+                    Err(reject_resident_search_transition_v3(
+                        ResidentSearchRankEnqueuedV3 { inner: state },
+                        ResidentSearchRejectedTransitionV3::Native(error),
+                    ))
+                }
+            }
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -140,11 +274,28 @@ impl ResidentSearchArchiveStagedV3 {
     ) -> Result<ResidentSearchGenerationChainV3, ResidentSearchRejectedAuthorityV3<Self>> {
         #[cfg(feature = "cuda")]
         {
-            let _ = (&self.inner.session, &self.inner.calibration);
-            Err(reject_resident_search_transition_v3(
-                self,
-                ResidentSearchRejectedTransitionV3::EvolveAndPublish,
-            ))
+            let mut state = self.inner;
+            let Some(native) = state.native.take() else {
+                return Err(reject_resident_search_transition_v3(
+                    ResidentSearchArchiveStagedV3 { inner: state },
+                    ResidentSearchRejectedTransitionV3::MissingAuthority,
+                ));
+            };
+            match native.enqueue_evolve_and_publish_v3() {
+                Ok(native) => {
+                    state.native = Some(native);
+                    Ok(ResidentSearchGenerationChainV3 { inner: state })
+                }
+                Err(rejected) => {
+                    let (error, native) = rejected.into_parts_v3();
+                    state.native = Some(native);
+                    state.poisoned = true;
+                    Err(reject_resident_search_transition_v3(
+                        ResidentSearchArchiveStagedV3 { inner: state },
+                        ResidentSearchRejectedTransitionV3::Native(error),
+                    ))
+                }
+            }
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -188,8 +339,65 @@ impl ResidentSearchTerminalPendingV3 {
     ) -> Result<ResidentSearchTryCompleteV3, ResidentSearchTransitionErrorV3> {
         #[cfg(feature = "cuda")]
         {
-            let _ = (&self.inner.session, &self.inner.calibration);
-            Ok(ResidentSearchTryCompleteV3::NotReady(self))
+            let mut state = self.inner;
+            let Some(native) = state.native.take() else {
+                return Err(ResidentSearchTransitionErrorV3 {
+                    inner: ResidentSearchRejectedTransitionV3::MissingAuthority,
+                    retained_terminal_authority: Some(state),
+                });
+            };
+            match native.try_complete_terminal_v3() {
+                Ok(ResidentSearchSlice2NativeTryCompleteV3::NotReady(native)) => {
+                    state.native = Some(native);
+                    Ok(ResidentSearchTryCompleteV3::NotReady(
+                        ResidentSearchTerminalPendingV3 { inner: state },
+                    ))
+                }
+                Ok(ResidentSearchSlice2NativeTryCompleteV3::Complete(native)) => {
+                    let population = match native.release_terminal_v3() {
+                        Ok(population) => population,
+                        Err(rejected) => {
+                            let (error, native) = rejected.into_parts_v3();
+                            state.native = Some(native);
+                            state.poisoned = true;
+                            return Err(ResidentSearchTransitionErrorV3 {
+                                inner: ResidentSearchRejectedTransitionV3::Native(error),
+                                retained_terminal_authority: Some(state),
+                            });
+                        }
+                    };
+                    let Some(session) = state.session.take() else {
+                        return Err(ResidentSearchTransitionErrorV3 {
+                            inner: ResidentSearchRejectedTransitionV3::MissingAuthority,
+                            retained_terminal_authority: Some(state),
+                        });
+                    };
+                    match session.complete_resident_search_slice2_v3(population) {
+                        Ok(completion) => {
+                            state.completion = Some(completion);
+                            Ok(ResidentSearchTryCompleteV3::Complete(
+                                ResidentSearchTerminalReceiptV3 { inner: state },
+                            ))
+                        }
+                        Err(_) => {
+                            state.poisoned = true;
+                            Err(ResidentSearchTransitionErrorV3 {
+                                inner: ResidentSearchRejectedTransitionV3::TrimLifetime,
+                                retained_terminal_authority: Some(state),
+                            })
+                        }
+                    }
+                }
+                Err(rejected) => {
+                    let (error, native) = rejected.into_parts_v3();
+                    state.native = Some(native);
+                    state.poisoned = true;
+                    Err(ResidentSearchTransitionErrorV3 {
+                        inner: ResidentSearchRejectedTransitionV3::Native(error),
+                        retained_terminal_authority: Some(state),
+                    })
+                }
+            }
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -209,8 +417,22 @@ impl<A> ResidentSearchRejectedAuthorityV3<A> {
 #[cfg(feature = "cuda")]
 pub(crate) fn seal_resident_archive_knn_calibration_receipt_v2(
     authority: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,
+    plan: SealedResidentGenerationPlanV1,
+    smc_weights: [f64; 11],
+    smc_gate_disabled: bool,
+    settings: NeoPopulationSettings,
+    scenarios: Box<[ScenarioDescriptor]>,
 ) -> ResidentArchiveKnnCalibrationReceiptV2 {
-    ResidentArchiveKnnCalibrationReceiptV2 { inner: authority }
+    ResidentArchiveKnnCalibrationReceiptV2 {
+        inner: Some(ResidentSearchStartAuthorityV3 {
+            runtime: authority,
+            plan,
+            smc_weights,
+            smc_gate_disabled,
+            settings,
+            scenarios,
+        }),
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -220,8 +442,12 @@ pub(crate) fn start_resident_search_slice2_v3(
 ) -> ResidentSearchGenerationChainV3 {
     ResidentSearchGenerationChainV3 {
         inner: ResidentSearchAuthorityStateV3 {
-            session,
-            calibration,
+            session: Some(session),
+            calibration: Some(calibration),
+            native: None,
+            settings: None,
+            completion: None,
+            poisoned: false,
         },
     }
 }
@@ -232,7 +458,10 @@ fn reject_resident_search_transition_v3<A>(
     inner: ResidentSearchRejectedTransitionV3,
 ) -> ResidentSearchRejectedAuthorityV3<A> {
     ResidentSearchRejectedAuthorityV3 {
-        error: ResidentSearchTransitionErrorV3 { inner },
+        error: ResidentSearchTransitionErrorV3 {
+            inner,
+            retained_terminal_authority: None,
+        },
         authority,
     }
 }
@@ -240,7 +469,7 @@ fn reject_resident_search_transition_v3<A>(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn cuda_authority_state_is_private_move_only_and_fail_closed() {
+    fn cuda_authority_state_is_private_move_only_and_native_wired() {
         let source = include_str!("resident_search_slice2_v3.rs");
         let trim_source = include_str!("resident_trim_prefilter_v1.rs");
 
@@ -253,21 +482,33 @@ mod tests {
                 .count(),
             7
         );
-        assert_eq!(
-            source
-                .matches(concat!("inner: ResidentSearchAuthority", "StateV3,"))
-                .count(),
-            5
-        );
         assert!(source.contains("struct ResidentSearchAuthorityStateV3 {"));
-        assert!(source.contains("session: ResidentTrimmedPopulationSessionV1,"));
-        assert!(source.contains("calibration: ResidentArchiveKnnCalibrationReceiptV2,"));
+        assert!(source.contains("session: Option<ResidentTrimmedPopulationSessionV1>,"));
+        assert!(source.contains("native: Option<ResidentSearchSlice2NativeOwnerV3>,"));
+        assert!(source.contains("settings: Option<NeoPopulationSettings>,"));
         assert!(source.contains("pub(crate) fn start_resident_search_slice2_v3("));
-        assert_eq!(
-            source.matches(concat!("                ", "self,")).count(),
-            4
-        );
-        assert!(source.contains("Ok(ResidentSearchTryCompleteV3::NotReady(self))"));
+        for native_transition in [
+            "native.enqueue_score_and_rank_v3(&settings)",
+            "native.enqueue_stage_archive_from_rank_v3()",
+            "native.enqueue_evolve_and_publish_v3()",
+            "native.enqueue_terminal_seal_v3()",
+            "native.try_complete_terminal_v3()",
+            "native.release_terminal_v3()",
+        ] {
+            assert!(
+                source.contains(native_transition),
+                "missing {native_transition}"
+            );
+        }
+        assert!(source.contains("ResidentSearchSlice2NativeTryCompleteV3::NotReady(native)"));
+        assert!(!source.contains(concat!(
+            "ResidentSearchRejectedTransitionV3::",
+            "ScoreAndRank"
+        )));
+        assert!(!source.contains(concat!(
+            "Ok(ResidentSearchTryCompleteV3::",
+            "NotReady(self))"
+        )));
         assert!(trim_source.contains("pub fn begin_resident_search_slice2_v3("));
     }
 
@@ -279,9 +520,8 @@ mod tests {
         let calibration_receipt = concat!(
             "pub ",
             "struct ResidentArchiveKnnCalibrationReceiptV2",
-            " {\n    #[cfg(feature = \"cuda\")]\n    inner: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,"
+            " {\n    #[cfg(feature = \"cuda\")]\n    inner: Option<ResidentSearchStartAuthorityV3>,"
         );
-        let authority_state = "struct ResidentSearchAuthorityStateV3 {\n    session: ResidentTrimmedPopulationSessionV1,\n    calibration: ResidentArchiveKnnCalibrationReceiptV2,\n}";
         let private_start = "pub(crate) fn start_resident_search_slice2_v3(\n    session: ResidentTrimmedPopulationSessionV1,\n    calibration: ResidentArchiveKnnCalibrationReceiptV2,\n) -> ResidentSearchGenerationChainV3";
         let public_start = "pub fn begin_resident_search_slice2_v3(\n        self,\n        calibration: crate::resident_search_slice2_v3::ResidentArchiveKnnCalibrationReceiptV2,\n    ) -> crate::resident_search_slice2_v3::ResidentSearchGenerationChainV3";
 
@@ -289,10 +529,20 @@ mod tests {
             "use crate::resident_search_slice2_admission_v2::ResidentSearchSlice2ValidatedRuntimeAuthorityV2;"
         ));
         assert!(source.contains(calibration_receipt));
-        assert!(source.contains(authority_state));
         assert!(source.contains(private_start));
         assert!(trim_source.contains(public_start));
-        assert!(source.contains("ResidentSearchAuthorityStateV3 {\n            session,\n            calibration,\n        }"));
+        for retained in [
+            "plan: SealedResidentGenerationPlanV1,",
+            "smc_weights: [f64; 11],",
+            "smc_gate_disabled: bool,",
+            "settings: NeoPopulationSettings,",
+            "scenarios: Box<[ScenarioDescriptor]>,",
+        ] {
+            assert!(
+                source.contains(retained),
+                "missing retained start authority {retained}"
+            );
+        }
         assert!(trim_source.contains("start_resident_search_slice2_v3(self, calibration)"));
 
         assert!(!source.contains(
@@ -300,13 +550,6 @@ mod tests {
         ));
         assert!(
             !trim_source.contains("pub fn begin_resident_search_slice2_v3(\n        self,\n    )")
-        );
-        assert_eq!(
-            source
-                .matches(concat!("ResidentArchiveKnnCalibrationReceiptV2", " {"))
-                .count(),
-            4,
-            "only the declaration, private sealer signature/body, and Drop impl may open this receipt"
         );
         assert!(source.contains("pub(crate) fn seal_resident_archive_knn_calibration_receipt_v2("));
         assert!(source.contains("authority: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,"));

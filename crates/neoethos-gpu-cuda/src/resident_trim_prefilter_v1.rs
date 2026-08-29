@@ -4,8 +4,10 @@
 //! can only be minted by the future resident-store/session bridge. No pointer,
 //! event, selected count or selected-column list is exposed outside gpu-cuda.
 
+use crate::PopulationSession;
 use crate::resident_feature_store_v3::{
-    ResidentFeatureStoreCudaErrorV3, ResidentFeatureStoreImportV3, ResidentPopulationSessionV3,
+    ResidentFeatureStoreConsumerLeaseV3, ResidentFeatureStoreCudaErrorV3,
+    ResidentFeatureStoreImportV3, ResidentPopulationSessionV3,
 };
 use sha2::{Digest, Sha256};
 use std::any::Any;
@@ -1174,6 +1176,52 @@ pub struct ResidentTrimmedPopulationSessionV1 {
 }
 
 impl ResidentTrimmedPopulationSessionV1 {
+    pub(crate) fn take_population_session_for_slice2_v3(
+        &mut self,
+    ) -> Result<PopulationSession, ResidentTrimPrefilterDeviceErrorV1> {
+        self.population_session
+            .as_mut()
+            .ok_or(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation)?
+            .take_population_session_for_slice2_v3()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn restore_population_session_from_slice2_v3(
+        &mut self,
+        session: PopulationSession,
+    ) -> Result<(), PopulationSession> {
+        match self.population_session.as_mut() {
+            Some(owner) => owner.restore_population_session_from_slice2_v3(session),
+            None => Err(session),
+        }
+    }
+
+    pub(crate) fn complete_resident_search_slice2_v3(
+        mut self,
+        session: PopulationSession,
+    ) -> Result<ResidentFeatureStoreConsumerLeaseV3, ResidentTrimPrefilterDeviceErrorV1> {
+        self.restore_population_session_from_slice2_v3(session)
+            .map_err(|_| ResidentTrimPrefilterDeviceErrorV1::RunStateViolation)?;
+        let status =
+            unsafe { enqueue_resident_trim_prefilter_release_v1(self.trim_native.as_ptr()) };
+        require_native_ok_v1("enqueue_resident_trim_prefilter_release_v1", status)?;
+        let population = self
+            .population_session
+            .take()
+            .ok_or(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation)?;
+        self.armed = false;
+        if let Some(owner) = self.parent_import.take() {
+            mem::forget(owner);
+        }
+        if let Some(owner) = self.sealed_schema.take() {
+            mem::forget(owner);
+        }
+        if let Some(owner) = self.full_admission.take() {
+            mem::forget(owner);
+        }
+        population.record_consumer_completion().map_err(Into::into)
+    }
+
     /// Move the complete trim/population authority and a separately minted
     /// calibration receipt into the fail-closed Slice 2 Search chain. No raw
     /// CUDA handle or detached child owner is exposed.
