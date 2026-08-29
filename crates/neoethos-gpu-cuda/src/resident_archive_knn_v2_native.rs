@@ -2,6 +2,16 @@ use super::{
     ResidentSearchSlice2AllocationCategoryV2, ResidentSearchSlice2AsyncAllocationArgsV2,
     ResidentSearchSlice2CalibrationBindingV2, ResidentSearchSlice2ScoringArchiveReceiptV2,
 };
+#[cfg(feature = "cuda")]
+use crate::population::RawResidentScoringPopulationSourceV2;
+#[cfg(feature = "cuda")]
+use crate::resident_generation_v1::{NativeResidentGenerationRunV1, RawReadyEventV1};
+#[cfg(feature = "cuda")]
+use crate::resident_scoring_v2::NativeResidentScoringRunV2;
+#[cfg(feature = "cuda")]
+use crate::resident_search_v2::RawResidentGenerationGeneViewV2;
+#[cfg(feature = "cuda")]
+use std::ffi::c_void;
 
 const SCORING_ARCHIVE_ALIGNMENT_BYTES_V2: u64 = 256;
 const FITNESS_SCORE_BYTES_V2: u64 = 1_792;
@@ -55,8 +65,91 @@ pub(super) struct RawResidentArchiveKnnBindV2 {
     pub(super) post_trim_receipt_identity: u64,
 }
 
+pub(super) enum NativeResidentArchiveKnnOwnerV2 {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct RawResidentArchiveKnnPendingV2 {
+    pub(super) abi_version: u32,
+    pub(super) flags: u32,
+    pub(super) source_packed_commit_word: u64,
+    pub(super) terminal_device_receipt_identity: u64,
+    pub(super) run_identity: u64,
+    pub(super) boxed_receipt_identity: u64,
+    pub(super) staged_dependency_identity: u64,
+    pub(super) same_stream_enqueue_count: u64,
+    pub(super) completion_event_identity: u64,
+    pub(super) terminal_host_receipt_identity: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct RawResidentArchiveKnnTerminalV2 {
+    pub(super) abi_version: u32,
+    pub(super) terminal_status: u32,
+    pub(super) device_fault_word: u32,
+    pub(super) validation_fault_word: u32,
+    pub(super) receipt_identity: u64,
+    pub(super) run_identity: u64,
+    pub(super) packed_commit_word: u64,
+    pub(super) collision_count: u64,
+    pub(super) compact_async_d2h_count: u64,
+    pub(super) compact_async_d2h_bytes: u64,
+    pub(super) completion_event_query_count: u64,
+    pub(super) completion_stream_synchronize_count: u64,
+    pub(super) same_stream_enqueue_count: u64,
+    pub(super) completion_event_identity: u64,
+    pub(super) validator_digest: u64,
+}
+
 const _: [(); 16] = [(); std::mem::size_of::<RawResidentArchiveKnnArenaRegionV2>()];
 const _: [(); 384] = [(); std::mem::size_of::<RawResidentArchiveKnnBindV2>()];
+const _: [(); 72] = [(); std::mem::size_of::<RawResidentArchiveKnnPendingV2>()];
+const _: [(); 8] = [(); std::mem::align_of::<RawResidentArchiveKnnPendingV2>()];
+const _: [(); 104] = [(); std::mem::size_of::<RawResidentArchiveKnnTerminalV2>()];
+const _: [(); 8] = [(); std::mem::align_of::<RawResidentArchiveKnnTerminalV2>()];
+
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    pub(super) fn bind_preallocated_resident_archive_knn_v2(
+        scoring: *mut NativeResidentScoringRunV2,
+        generation: *mut NativeResidentGenerationRunV1,
+        genes: *const RawResidentGenerationGeneViewV2,
+        binding: *const RawResidentArchiveKnnBindV2,
+        owner: *mut *mut NativeResidentArchiveKnnOwnerV2,
+    ) -> i32;
+
+    pub(super) fn enqueue_resident_archive_score_and_rank_v2(
+        owner: *mut NativeResidentArchiveKnnOwnerV2,
+        population: *const RawResidentScoringPopulationSourceV2,
+        dependency: *const RawReadyEventV1,
+    ) -> i32;
+
+    pub(super) fn enqueue_resident_archive_stage_from_rank_v2(
+        owner: *mut NativeResidentArchiveKnnOwnerV2,
+    ) -> i32;
+
+    pub(super) fn enqueue_resident_archive_evolve_and_publish_v2(
+        owner: *mut NativeResidentArchiveKnnOwnerV2,
+    ) -> i32;
+
+    pub(super) fn enqueue_resident_archive_terminal_seal_v2(
+        owner: *mut NativeResidentArchiveKnnOwnerV2,
+        pending: *mut RawResidentArchiveKnnPendingV2,
+    ) -> i32;
+
+    pub(super) fn try_complete_resident_archive_terminal_v2(
+        owner: *mut NativeResidentArchiveKnnOwnerV2,
+        pending: *const RawResidentArchiveKnnPendingV2,
+        committed_ready: *mut RawReadyEventV1,
+        terminal_copy: *mut RawResidentArchiveKnnTerminalV2,
+    ) -> i32;
+
+    pub(super) fn neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2(
+        session: *mut c_void,
+        owner: *mut NativeResidentArchiveKnnOwnerV2,
+    ) -> i32;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScoringArchiveArenaRegionV2 {
@@ -542,6 +635,73 @@ mod tests {
     const ARCHIVE_ABI_SOURCE_V2: &str = include_str!("../native/resident_archive_knn_v2_abi.cuh");
     const ARCHIVE_CUDA_SOURCE_V2: &str = include_str!("../native/resident_archive_knn_v2.cu");
     const CUDA_BUILD_SOURCE_V2: &str = include_str!("../build.rs");
+
+    #[test]
+    fn rust_archive_knn_v2_receipt_layouts_match_the_frozen_native_abi() {
+        assert_eq!(std::mem::size_of::<RawResidentArchiveKnnPendingV2>(), 72);
+        assert_eq!(std::mem::align_of::<RawResidentArchiveKnnPendingV2>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(RawResidentArchiveKnnPendingV2, source_packed_commit_word),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                RawResidentArchiveKnnPendingV2,
+                terminal_host_receipt_identity
+            ),
+            64
+        );
+
+        assert_eq!(std::mem::size_of::<RawResidentArchiveKnnTerminalV2>(), 104);
+        assert_eq!(std::mem::align_of::<RawResidentArchiveKnnTerminalV2>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(RawResidentArchiveKnnTerminalV2, receipt_identity),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(RawResidentArchiveKnnTerminalV2, validator_digest),
+            96
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn rust_archive_knn_v2_ffi_signatures_match_the_frozen_native_abi() {
+        use crate::population::RawResidentScoringPopulationSourceV2;
+        use crate::resident_generation_v1::{NativeResidentGenerationRunV1, RawReadyEventV1};
+        use crate::resident_scoring_v2::NativeResidentScoringRunV2;
+        use crate::resident_search_v2::RawResidentGenerationGeneViewV2;
+        use std::ffi::c_void;
+
+        let _: unsafe extern "C" fn(
+            *mut NativeResidentScoringRunV2,
+            *mut NativeResidentGenerationRunV1,
+            *const RawResidentGenerationGeneViewV2,
+            *const RawResidentArchiveKnnBindV2,
+            *mut *mut NativeResidentArchiveKnnOwnerV2,
+        ) -> i32 = bind_preallocated_resident_archive_knn_v2;
+        let _: unsafe extern "C" fn(
+            *mut NativeResidentArchiveKnnOwnerV2,
+            *const RawResidentScoringPopulationSourceV2,
+            *const RawReadyEventV1,
+        ) -> i32 = enqueue_resident_archive_score_and_rank_v2;
+        let _: unsafe extern "C" fn(*mut NativeResidentArchiveKnnOwnerV2) -> i32 =
+            enqueue_resident_archive_stage_from_rank_v2;
+        let _: unsafe extern "C" fn(*mut NativeResidentArchiveKnnOwnerV2) -> i32 =
+            enqueue_resident_archive_evolve_and_publish_v2;
+        let _: unsafe extern "C" fn(
+            *mut NativeResidentArchiveKnnOwnerV2,
+            *mut RawResidentArchiveKnnPendingV2,
+        ) -> i32 = enqueue_resident_archive_terminal_seal_v2;
+        let _: unsafe extern "C" fn(
+            *mut NativeResidentArchiveKnnOwnerV2,
+            *const RawResidentArchiveKnnPendingV2,
+            *mut RawReadyEventV1,
+            *mut RawResidentArchiveKnnTerminalV2,
+        ) -> i32 = try_complete_resident_archive_terminal_v2;
+        let _: unsafe extern "C" fn(*mut c_void, *mut NativeResidentArchiveKnnOwnerV2) -> i32 =
+            neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2;
+    }
 
     fn source_occurrences_v2(source: &str, needle: &str) -> usize {
         source.match_indices(needle).count()
