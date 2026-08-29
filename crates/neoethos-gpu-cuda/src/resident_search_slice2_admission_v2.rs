@@ -308,6 +308,28 @@ pub(crate) struct ResidentSearchSlice2AdmissionOwnerV2 {
     _move_only: (),
 }
 
+pub(crate) struct ResidentSearchSlice2ValidatedAdmissionV2 {
+    terminal_host_receipt: ResidentSearchSlice2HostAllocationArgsV2,
+    generation_arena: ResidentSearchSlice2AsyncAllocationArgsV2,
+    scoring_archive_arena: ResidentSearchSlice2AsyncAllocationArgsV2,
+}
+
+impl ResidentSearchSlice2ValidatedAdmissionV2 {
+    pub(crate) fn into_allocation_calls_v2(
+        self,
+    ) -> (
+        ResidentSearchSlice2HostAllocationArgsV2,
+        ResidentSearchSlice2AsyncAllocationArgsV2,
+        ResidentSearchSlice2AsyncAllocationArgsV2,
+    ) {
+        (
+            self.terminal_host_receipt,
+            self.generation_arena,
+            self.scoring_archive_arena,
+        )
+    }
+}
+
 impl ResidentSearchSlice2AdmissionOwnerV2 {
     pub(crate) fn queue_generation_v2(
         self,
@@ -386,17 +408,12 @@ fn validate_reserve_authority_v2(
     Ok(())
 }
 
-fn validate_and_seal_slice2_combined_v2(
-    request: &ResidentSearchSlice2AdmissionRequestV2,
-    trusted_seal: &ResidentSearchSlice2TrustedReserveSealV2,
-) -> Result<
-    (
-        ResidentSearchSlice2HostAllocationArgsV2,
-        ResidentSearchSlice2AsyncAllocationArgsV2,
-        ResidentSearchSlice2AsyncAllocationArgsV2,
-    ),
-    ResidentSearchSlice2AdmissionErrorV2,
-> {
+pub(crate) fn validate_and_seal_slice2_combined_v2(
+    request: ResidentSearchSlice2AdmissionRequestV2,
+    trusted_seal: ResidentSearchSlice2TrustedReserveSealV2,
+) -> Result<ResidentSearchSlice2ValidatedAdmissionV2, ResidentSearchSlice2AdmissionErrorV2> {
+    let request = &request;
+    let trusted_seal = &trusted_seal;
     if !request.archive_arena_present {
         return Err(ResidentSearchSlice2AdmissionErrorV2::MissingArchiveArena);
     }
@@ -717,8 +734,8 @@ fn validate_and_seal_slice2_combined_v2(
         return Err(ResidentSearchSlice2AdmissionErrorV2::ForeignCalibration { axis });
     }
 
-    Ok((
-        ResidentSearchSlice2HostAllocationArgsV2 {
+    Ok(ResidentSearchSlice2ValidatedAdmissionV2 {
+        terminal_host_receipt: ResidentSearchSlice2HostAllocationArgsV2 {
             ordinal: 0,
             category: ResidentSearchSlice2AllocationCategoryV2::TerminalHostReceipt,
             requested_bytes: request.terminal_host_receipt_bytes,
@@ -726,7 +743,7 @@ fn validate_and_seal_slice2_combined_v2(
             alignment_bytes: request.terminal_host_alignment_bytes,
             flags: request.terminal_host_flags,
         },
-        ResidentSearchSlice2AsyncAllocationArgsV2 {
+        generation_arena: ResidentSearchSlice2AsyncAllocationArgsV2 {
             ordinal: 1,
             category: ResidentSearchSlice2AllocationCategoryV2::GenerationArena,
             requested_bytes: generation.total_device_bytes,
@@ -736,7 +753,7 @@ fn validate_and_seal_slice2_combined_v2(
             stream_identity: calibration.search_stream_identity,
             pool_identity: calibration.active_pool_identity,
         },
-        ResidentSearchSlice2AsyncAllocationArgsV2 {
+        scoring_archive_arena: ResidentSearchSlice2AsyncAllocationArgsV2 {
             ordinal: 2,
             category: ResidentSearchSlice2AllocationCategoryV2::ScoringArchiveArena,
             requested_bytes: scoring.total_device_bytes,
@@ -746,7 +763,7 @@ fn validate_and_seal_slice2_combined_v2(
             stream_identity: calibration.search_stream_identity,
             pool_identity: calibration.active_pool_identity,
         },
-    ))
+    })
 }
 
 pub(crate) fn admit_slice2_combined_fixture_v2(
@@ -754,8 +771,9 @@ pub(crate) fn admit_slice2_combined_fixture_v2(
     _trusted_seal: ResidentSearchSlice2TrustedReserveSealV2,
     allocator: &mut dyn ResidentSearchSlice2AllocationFacadeV2,
 ) -> Result<ResidentSearchSlice2AdmissionOwnerV2, ResidentSearchSlice2AdmissionErrorV2> {
+    let validated = validate_and_seal_slice2_combined_v2(request, _trusted_seal)?;
     let (host_receipt, generation_arena, scoring_archive_arena) =
-        validate_and_seal_slice2_combined_v2(&request, &_trusted_seal)?;
+        validated.into_allocation_calls_v2();
     allocator.begin_native_create();
     allocator.cuda_host_alloc(host_receipt);
     allocator.cuda_malloc_async(generation_arena);
