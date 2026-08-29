@@ -328,99 +328,91 @@ pub struct FullResidentDiscoveryDeadlineReceiptV1 {
     _not_minted_in_slice2: core::convert::Infallible,
 }
 
-#[cfg(test)]
 pub(crate) const CURRENT_CONFIG_RESIDENT_SEARCH_SLICE2_PLAN_SEMANTICS_V2: &str =
     "neoethos.current-config-resident-search-slice2-plan.v2";
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CurrentConfigResidentSearchSlice2PlanFactsV2 {
-    population: u64,
-    maximum_generations: u64,
-    maximum_runtime_millis: u64,
-    maximum_terms_per_gene: u64,
-    gene_signature_word_count: u64,
-    novelty_weight_bits: u64,
-    novelty_neighbors: u64,
-    permanent_archive_capacity: u64,
-    calibration_active_count: u64,
-    maximum_jaccard_union: u32,
-    maximum_jaccard_cross_product: u64,
-    maximum_archive_knn_distance_count: u64,
-    maximum_archive_knn_popcount_word_count: u64,
-    required_archive_knn_distance_items_per_second: u64,
-    required_archive_knn_popcount_words_per_second: u64,
-    layout_alignment_bytes: u64,
-    archive_gene_scalars_bytes: u64,
-    archive_term_indices_bytes: u64,
-    archive_term_weights_bytes: u64,
-    archive_metric_rows_bytes: u64,
-    archive_signatures_bytes: u64,
-    archive_hashes_bytes: u64,
-    current_population_signatures_bytes: u64,
-    novelty_scores_bytes: u64,
-    exact_top_k_keys_bytes: u64,
-    admission_flags_bytes: u64,
-    admission_offsets_bytes: u64,
-    archive_control_and_seal_bytes: u64,
-    control_subtotal_bytes: u64,
-    slice2_replacement_subtotal_bytes: u64,
-    replaced_v1_scoring_bytes: u64,
-    slice2_net_additional_bytes: u64,
-    current_source_kind_wire: u8,
-    archive_source_kind_wire: u8,
-    current_ordinal_exclusive_end: u64,
-    archive_ordinal_exclusive_end: u64,
-    binary64_operation_sequence_wire: u8,
-    binary64_math_mode_wire: u8,
-    binary64_tolerance_policy_wire: u8,
-    binary64_absolute_tolerance_bits: u64,
-    binary64_relative_tolerance_bits: u64,
-    binary64_max_ulp_distance: u64,
-    novelty_semantics_identity_sha256: [u8; 32],
-    archive_capacity_identity_sha256: [u8; 32],
-    calibration_active_count_identity_sha256: [u8; 32],
-    layout_identity_sha256: [u8; 32],
-    calibration_identity_sha256: [u8; 32],
-    source_kind_encoding_identity_sha256: [u8; 32],
-    current_ordinal_domain_identity_sha256: [u8; 32],
-    archive_ordinal_domain_identity_sha256: [u8; 32],
-    tie_order_identity_sha256: [u8; 32],
-    binary64_operation_sequence_identity_sha256: [u8; 32],
-    binary64_math_mode_identity_sha256: [u8; 32],
-    binary64_tolerance_identity_sha256: [u8; 32],
+    pub(crate) population: u64,
+    pub(crate) maximum_generations: u64,
+    pub(crate) maximum_runtime_millis: u64,
+    pub(crate) maximum_terms_per_gene: u64,
+    pub(crate) gene_signature_word_count: u64,
+    pub(crate) novelty_weight_bits: u64,
+    pub(crate) novelty_neighbors: u64,
+    pub(crate) permanent_archive_capacity: u64,
+    pub(crate) calibration_active_count: u64,
+    pub(crate) maximum_jaccard_union: u32,
+    pub(crate) maximum_jaccard_cross_product: u64,
+    pub(crate) maximum_archive_knn_distance_count: u64,
+    pub(crate) maximum_archive_knn_popcount_word_count: u64,
+    pub(crate) required_archive_knn_distance_items_per_second: u64,
+    pub(crate) required_archive_knn_popcount_words_per_second: u64,
+    pub(crate) layout_alignment_bytes: u64,
+    pub(crate) archive_gene_scalars_bytes: u64,
+    pub(crate) archive_term_indices_bytes: u64,
+    pub(crate) archive_term_weights_bytes: u64,
+    pub(crate) archive_metric_rows_bytes: u64,
+    pub(crate) archive_signatures_bytes: u64,
+    pub(crate) archive_hashes_bytes: u64,
+    pub(crate) current_population_signatures_bytes: u64,
+    pub(crate) novelty_scores_bytes: u64,
+    pub(crate) exact_top_k_keys_bytes: u64,
+    pub(crate) admission_flags_bytes: u64,
+    pub(crate) admission_offsets_bytes: u64,
+    pub(crate) archive_control_and_seal_bytes: u64,
+    pub(crate) control_subtotal_bytes: u64,
+    pub(crate) slice2_replacement_subtotal_bytes: u64,
+    pub(crate) replaced_v1_scoring_bytes: u64,
+    pub(crate) slice2_net_additional_bytes: u64,
+    pub(crate) current_source_kind_wire: u8,
+    pub(crate) archive_source_kind_wire: u8,
+    pub(crate) current_ordinal_exclusive_end: u64,
+    pub(crate) archive_ordinal_exclusive_end: u64,
+    pub(crate) binary64_operation_sequence_wire: u8,
+    pub(crate) binary64_math_mode_wire: u8,
+    pub(crate) binary64_tolerance_policy_wire: u8,
+    pub(crate) binary64_absolute_tolerance_bits: u64,
+    pub(crate) binary64_relative_tolerance_bits: u64,
+    pub(crate) binary64_max_ulp_distance: u64,
+    pub(crate) novelty_semantics_identity_sha256: [u8; 32],
+    pub(crate) archive_capacity_identity_sha256: [u8; 32],
+    pub(crate) calibration_active_count_identity_sha256: [u8; 32],
+    pub(crate) layout_identity_sha256: [u8; 32],
+    pub(crate) calibration_identity_sha256: [u8; 32],
+    pub(crate) source_kind_encoding_identity_sha256: [u8; 32],
+    pub(crate) current_ordinal_domain_identity_sha256: [u8; 32],
+    pub(crate) archive_ordinal_domain_identity_sha256: [u8; 32],
+    pub(crate) tie_order_identity_sha256: [u8; 32],
+    pub(crate) binary64_operation_sequence_identity_sha256: [u8; 32],
+    pub(crate) binary64_math_mode_identity_sha256: [u8; 32],
+    pub(crate) binary64_tolerance_identity_sha256: [u8; 32],
 }
 
-#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2 {
     _identity_sha256: [u8; 32],
 }
 
-#[cfg(test)]
 impl CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2 {
     pub(crate) const fn identity_sha256(&self) -> [u8; 32] {
         self._identity_sha256
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CurrentConfigResidentSearchSlice2PlanErrorV2 {
-    ImplementationPending,
     IdentityReceiptMismatch,
     ArithmeticOverflow,
     CurrentConfigExtentMismatch,
 }
 
-#[cfg(test)]
 mod slice2_plan_seal_v2 {
     pub(super) struct Marker {
-        _private: (),
+        pub(super) _private: (),
     }
 }
 
-#[cfg(test)]
 pub(crate) struct SealedCurrentConfigResidentSearchSlice2PlanV2 {
     base: SealedCurrentConfigResidentSearchPlanV1,
     facts: CurrentConfigResidentSearchSlice2PlanFactsV2,
@@ -428,7 +420,6 @@ pub(crate) struct SealedCurrentConfigResidentSearchSlice2PlanV2 {
     _seal: slice2_plan_seal_v2::Marker,
 }
 
-#[cfg(test)]
 impl SealedCurrentConfigResidentSearchSlice2PlanV2 {
     pub(crate) fn facts_v2(&self) -> &CurrentConfigResidentSearchSlice2PlanFactsV2 {
         let _ = &self.base;
@@ -443,13 +434,16 @@ impl SealedCurrentConfigResidentSearchSlice2PlanV2 {
 
     pub(crate) fn validate_identity_receipt_v2(
         &self,
-        _receipt: &CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2,
+        receipt: &CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2,
     ) -> Result<(), CurrentConfigResidentSearchSlice2PlanErrorV2> {
-        Err(CurrentConfigResidentSearchSlice2PlanErrorV2::ImplementationPending)
+        if self.identity == *receipt {
+            Ok(())
+        } else {
+            Err(CurrentConfigResidentSearchSlice2PlanErrorV2::IdentityReceiptMismatch)
+        }
     }
 }
 
-#[cfg(test)]
 pub(crate) fn seal_current_config_resident_search_slice2_plan_v2(
     base_v1: SealedCurrentConfigResidentSearchPlanV1,
     facts_v2: CurrentConfigResidentSearchSlice2PlanFactsV2,
@@ -457,8 +451,231 @@ pub(crate) fn seal_current_config_resident_search_slice2_plan_v2(
     SealedCurrentConfigResidentSearchSlice2PlanV2,
     CurrentConfigResidentSearchSlice2PlanErrorV2,
 > {
-    let _ = (base_v1, facts_v2);
-    Err(CurrentConfigResidentSearchSlice2PlanErrorV2::ImplementationPending)
+    validate_current_config_resident_search_slice2_facts_v2(&base_v1, &facts_v2)?;
+    let identity_sha256 = current_config_resident_search_slice2_identity_v2(&base_v1, &facts_v2);
+    Ok(SealedCurrentConfigResidentSearchSlice2PlanV2 {
+        base: base_v1,
+        facts: facts_v2,
+        identity: CurrentConfigResidentSearchSlice2PlanIdentityReceiptV2 {
+            _identity_sha256: identity_sha256,
+        },
+        _seal: slice2_plan_seal_v2::Marker { _private: () },
+    })
+}
+
+fn validate_current_config_resident_search_slice2_facts_v2(
+    base_v1: &SealedCurrentConfigResidentSearchPlanV1,
+    facts: &CurrentConfigResidentSearchSlice2PlanFactsV2,
+) -> Result<(), CurrentConfigResidentSearchSlice2PlanErrorV2> {
+    let arithmetic_overflow = CurrentConfigResidentSearchSlice2PlanErrorV2::ArithmeticOverflow;
+
+    let maximum_jaccard_union = facts
+        .maximum_terms_per_gene
+        .checked_mul(2)
+        .ok_or(arithmetic_overflow)?;
+    let maximum_jaccard_cross_product = maximum_jaccard_union
+        .checked_mul(maximum_jaccard_union)
+        .ok_or(arithmetic_overflow)?;
+    let neighbors_per_candidate = facts
+        .population
+        .checked_sub(1)
+        .and_then(|population_peers| {
+            facts
+                .permanent_archive_capacity
+                .checked_add(population_peers)
+        })
+        .ok_or(arithmetic_overflow)?;
+    let distances_per_generation = facts
+        .population
+        .checked_mul(neighbors_per_candidate)
+        .ok_or(arithmetic_overflow)?;
+    let maximum_archive_knn_distance_count = distances_per_generation
+        .checked_mul(facts.maximum_generations)
+        .ok_or(arithmetic_overflow)?;
+    let maximum_archive_knn_popcount_word_count = facts
+        .maximum_archive_knn_distance_count
+        .checked_mul(facts.gene_signature_word_count)
+        .ok_or(arithmetic_overflow)?;
+    let runtime_rounding_addend = facts
+        .maximum_runtime_millis
+        .checked_sub(1)
+        .ok_or(arithmetic_overflow)?;
+    let required_archive_knn_distance_items_per_second = facts
+        .maximum_archive_knn_distance_count
+        .checked_mul(1_000)
+        .and_then(|scaled| scaled.checked_add(runtime_rounding_addend))
+        .map(|rounded| rounded / facts.maximum_runtime_millis)
+        .ok_or(arithmetic_overflow)?;
+    let required_archive_knn_popcount_words_per_second = facts
+        .maximum_archive_knn_popcount_word_count
+        .checked_mul(1_000)
+        .and_then(|scaled| scaled.checked_add(runtime_rounding_addend))
+        .map(|rounded| rounded / facts.maximum_runtime_millis)
+        .ok_or(arithmetic_overflow)?;
+    let slice2_replacement_subtotal_bytes = [
+        facts.archive_gene_scalars_bytes,
+        facts.archive_term_indices_bytes,
+        facts.archive_term_weights_bytes,
+        facts.archive_metric_rows_bytes,
+        facts.archive_signatures_bytes,
+        facts.archive_hashes_bytes,
+        facts.current_population_signatures_bytes,
+        facts.novelty_scores_bytes,
+        facts.exact_top_k_keys_bytes,
+        facts.admission_flags_bytes,
+        facts.admission_offsets_bytes,
+        facts.archive_control_and_seal_bytes,
+    ]
+    .into_iter()
+    .try_fold(0_u64, u64::checked_add)
+    .ok_or(arithmetic_overflow)?;
+    let control_subtotal_bytes = facts
+        .admission_flags_bytes
+        .checked_add(facts.admission_offsets_bytes)
+        .and_then(|subtotal| subtotal.checked_add(facts.archive_control_and_seal_bytes))
+        .ok_or(arithmetic_overflow)?;
+    let slice2_net_additional_bytes = facts
+        .slice2_replacement_subtotal_bytes
+        .checked_sub(facts.replaced_v1_scoring_bytes)
+        .ok_or(arithmetic_overflow)?;
+
+    let base_population = u64::try_from(base_v1.population()).map_err(|_| arithmetic_overflow)?;
+    let base_maximum_generations =
+        u64::try_from(base_v1.maximum_generations()).map_err(|_| arithmetic_overflow)?;
+    let base_maximum_terms_per_gene =
+        u64::try_from(base_v1.maximum_terms_per_gene()).map_err(|_| arithmetic_overflow)?;
+    let base_gene_signature_word_count =
+        u64::try_from(base_v1.gene_signature_word_count()).map_err(|_| arithmetic_overflow)?;
+    let base_novelty_neighbors =
+        u64::try_from(base_v1.novelty_neighbors()).map_err(|_| arithmetic_overflow)?;
+    let base_permanent_archive_capacity =
+        u64::try_from(base_v1.permanent_archive_capacity()).map_err(|_| arithmetic_overflow)?;
+
+    let exact_current_config = facts.population == base_population
+        && facts.maximum_generations == base_maximum_generations
+        && facts.maximum_runtime_millis == base_v1.maximum_runtime_millis()
+        && facts.maximum_terms_per_gene == base_maximum_terms_per_gene
+        && facts.gene_signature_word_count == base_gene_signature_word_count
+        && facts.novelty_weight_bits == base_v1.novelty_weight().to_bits()
+        && facts.novelty_neighbors == base_novelty_neighbors
+        && facts.permanent_archive_capacity == base_permanent_archive_capacity
+        && facts.calibration_active_count == base_permanent_archive_capacity
+        && u64::from(facts.maximum_jaccard_union) == maximum_jaccard_union
+        && facts.maximum_jaccard_cross_product == maximum_jaccard_cross_product
+        && facts.maximum_archive_knn_distance_count == maximum_archive_knn_distance_count
+        && facts.maximum_archive_knn_popcount_word_count == maximum_archive_knn_popcount_word_count
+        && facts.required_archive_knn_distance_items_per_second
+            == required_archive_knn_distance_items_per_second
+        && facts.required_archive_knn_popcount_words_per_second
+            == required_archive_knn_popcount_words_per_second
+        && facts.required_archive_knn_popcount_words_per_second
+            == base_v1.required_archive_knn_popcount_words_per_second()
+        && facts.layout_alignment_bytes == 256
+        && facts.archive_gene_scalars_bytes == 3_600_128
+        && facts.archive_term_indices_bytes == 6_400_000
+        && facts.archive_term_weights_bytes == 6_400_000
+        && facts.archive_metric_rows_bytes == 5_200_128
+        && facts.archive_signatures_bytes == 1_600_000
+        && facts.archive_hashes_bytes == 400_128
+        && facts.current_population_signatures_bytes == 6_400
+        && facts.novelty_scores_bytes == 1_792
+        && facts.exact_top_k_keys_bytes == 96_000
+        && facts.admission_flags_bytes == 1_024
+        && facts.admission_offsets_bytes == 1_792
+        && facts.archive_control_and_seal_bytes == 256
+        && facts.control_subtotal_bytes == control_subtotal_bytes
+        && facts.control_subtotal_bytes == 3_072
+        && facts.slice2_replacement_subtotal_bytes == slice2_replacement_subtotal_bytes
+        && facts.slice2_replacement_subtotal_bytes == 23_707_648
+        && facts.replaced_v1_scoring_bytes == 8_448
+        && facts.slice2_net_additional_bytes == slice2_net_additional_bytes
+        && facts.slice2_net_additional_bytes == 23_699_200
+        && facts.current_source_kind_wire == 0
+        && facts.archive_source_kind_wire == 1
+        && facts.current_ordinal_exclusive_end == facts.population
+        && facts.archive_ordinal_exclusive_end == facts.permanent_archive_capacity
+        && facts.binary64_operation_sequence_wire == 1
+        && facts.binary64_math_mode_wire == 1
+        && facts.binary64_tolerance_policy_wire == 1
+        && facts.binary64_absolute_tolerance_bits == 2.0_f64.powi(-50).to_bits()
+        && facts.binary64_relative_tolerance_bits == 2.0_f64.powi(-48).to_bits()
+        && facts.binary64_max_ulp_distance == 4;
+    if !exact_current_config {
+        return Err(CurrentConfigResidentSearchSlice2PlanErrorV2::CurrentConfigExtentMismatch);
+    }
+    Ok(())
+}
+
+fn current_config_resident_search_slice2_identity_v2(
+    base_v1: &SealedCurrentConfigResidentSearchPlanV1,
+    facts: &CurrentConfigResidentSearchSlice2PlanFactsV2,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(CURRENT_CONFIG_RESIDENT_SEARCH_SLICE2_PLAN_SEMANTICS_V2.as_bytes());
+    hash.update(base_v1.plan_identity_sha256());
+    hash.update(facts.population.to_le_bytes());
+    hash.update(facts.maximum_generations.to_le_bytes());
+    hash.update(facts.maximum_runtime_millis.to_le_bytes());
+    hash.update(facts.maximum_terms_per_gene.to_le_bytes());
+    hash.update(facts.gene_signature_word_count.to_le_bytes());
+    hash.update(facts.novelty_weight_bits.to_le_bytes());
+    hash.update(facts.novelty_neighbors.to_le_bytes());
+    hash.update(facts.permanent_archive_capacity.to_le_bytes());
+    hash.update(facts.calibration_active_count.to_le_bytes());
+    hash.update(facts.maximum_jaccard_union.to_le_bytes());
+    hash.update(facts.maximum_jaccard_cross_product.to_le_bytes());
+    hash.update(facts.maximum_archive_knn_distance_count.to_le_bytes());
+    hash.update(facts.maximum_archive_knn_popcount_word_count.to_le_bytes());
+    hash.update(
+        facts
+            .required_archive_knn_distance_items_per_second
+            .to_le_bytes(),
+    );
+    hash.update(
+        facts
+            .required_archive_knn_popcount_words_per_second
+            .to_le_bytes(),
+    );
+    hash.update(facts.layout_alignment_bytes.to_le_bytes());
+    hash.update(facts.archive_gene_scalars_bytes.to_le_bytes());
+    hash.update(facts.archive_term_indices_bytes.to_le_bytes());
+    hash.update(facts.archive_term_weights_bytes.to_le_bytes());
+    hash.update(facts.archive_metric_rows_bytes.to_le_bytes());
+    hash.update(facts.archive_signatures_bytes.to_le_bytes());
+    hash.update(facts.archive_hashes_bytes.to_le_bytes());
+    hash.update(facts.current_population_signatures_bytes.to_le_bytes());
+    hash.update(facts.novelty_scores_bytes.to_le_bytes());
+    hash.update(facts.exact_top_k_keys_bytes.to_le_bytes());
+    hash.update(facts.admission_flags_bytes.to_le_bytes());
+    hash.update(facts.admission_offsets_bytes.to_le_bytes());
+    hash.update(facts.archive_control_and_seal_bytes.to_le_bytes());
+    hash.update(facts.control_subtotal_bytes.to_le_bytes());
+    hash.update(facts.slice2_replacement_subtotal_bytes.to_le_bytes());
+    hash.update(facts.replaced_v1_scoring_bytes.to_le_bytes());
+    hash.update(facts.slice2_net_additional_bytes.to_le_bytes());
+    hash.update([facts.current_source_kind_wire]);
+    hash.update([facts.archive_source_kind_wire]);
+    hash.update(facts.current_ordinal_exclusive_end.to_le_bytes());
+    hash.update(facts.archive_ordinal_exclusive_end.to_le_bytes());
+    hash.update([facts.binary64_operation_sequence_wire]);
+    hash.update([facts.binary64_math_mode_wire]);
+    hash.update([facts.binary64_tolerance_policy_wire]);
+    hash.update(facts.binary64_absolute_tolerance_bits.to_le_bytes());
+    hash.update(facts.binary64_relative_tolerance_bits.to_le_bytes());
+    hash.update(facts.binary64_max_ulp_distance.to_le_bytes());
+    hash.update(facts.novelty_semantics_identity_sha256);
+    hash.update(facts.archive_capacity_identity_sha256);
+    hash.update(facts.calibration_active_count_identity_sha256);
+    hash.update(facts.layout_identity_sha256);
+    hash.update(facts.calibration_identity_sha256);
+    hash.update(facts.source_kind_encoding_identity_sha256);
+    hash.update(facts.current_ordinal_domain_identity_sha256);
+    hash.update(facts.archive_ordinal_domain_identity_sha256);
+    hash.update(facts.tie_order_identity_sha256);
+    hash.update(facts.binary64_operation_sequence_identity_sha256);
+    hash.update(facts.binary64_math_mode_identity_sha256);
+    hash.update(facts.binary64_tolerance_identity_sha256);
+    hash.finalize().into()
 }
 
 /// Seal the current headless config into one immutable resident trim/Search
