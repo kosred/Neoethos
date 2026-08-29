@@ -34,6 +34,18 @@ pub mod resident_regime_v3;
 pub mod resident_robust_normalization_v2;
 #[cfg(feature = "cuda")]
 mod resident_scoring_v2;
+#[cfg(any(
+    feature = "cuda",
+    all(test, feature = "resident-search-slice2-host-contract")
+))]
+#[cfg_attr(
+    all(
+        feature = "cuda",
+        not(all(test, feature = "resident-search-slice2-host-contract"))
+    ),
+    allow(dead_code)
+)]
+mod resident_search_slice2_admission_v2;
 #[cfg(feature = "cuda")]
 pub mod resident_search_v2;
 #[cfg(feature = "cuda")]

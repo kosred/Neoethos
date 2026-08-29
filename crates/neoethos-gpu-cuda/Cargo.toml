@@ -7,6 +7,7 @@ build = "build.rs"
 
 [features]
 default = []
+resident-search-slice2-host-contract = []
 cuda = ["dep:cust", "dep:vector-ta"]
 cuda-device-fixtures = ["cuda"]
 
