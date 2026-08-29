@@ -14,6 +14,10 @@ use crate::resident_generation_v1::{
     SealedResidentGenerationPlanV1, SurvivorSelectionPolicyV1,
     discovery_generation_semantics_sha256_v1, seal_resident_generation_plan_v1,
 };
+use crate::resident_scoring_v2::{
+    ResidentScoringObjectiveV2, novelty_disabled_semantics_sha256_v2, rank_semantics_sha256_v2,
+    scoring_semantics_sha256_v2,
+};
 #[cfg(feature = "cuda-device-fixtures")]
 use crate::resident_search_v2::resident_search_v2_production_readiness;
 use crate::resident_smc_v3::{
@@ -55,10 +59,12 @@ fn fixture_search_plan() -> SealedResidentGenerationPlanV1 {
         generation_semantics_sha256: discovery_generation_semantics_sha256_v1(),
         run_identity_sha256: [0x71; 32],
         strategy_gene_schema_sha256: [0x72; 32],
-        rank_semantics_sha256: [0x73; 32],
+        rank_semantics_sha256: rank_semantics_sha256_v2(),
         metric_semantics_sha256: [0x74; 32],
-        scoring_semantics_sha256: [0x75; 32],
-        novelty_semantics_sha256: [0x76; 32],
+        scoring_semantics_sha256: scoring_semantics_sha256_v2(
+            ResidentScoringObjectiveV2::PropFirmV4,
+        ),
+        novelty_semantics_sha256: novelty_disabled_semantics_sha256_v2(),
         scenario_order_semantics_sha256: [0x77; 32],
         cuda_build_manifest_sha256: [0x78; 32],
         rng_mapping_sha256: [0x79; 32],
