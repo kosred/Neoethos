@@ -4197,6 +4197,7 @@ mod tests {
         ) -> *mut c_void = neoethos_gpu_cuda_population_bind_resident_feature_store_v3;
         let _: unsafe extern "C" fn(*mut c_void, *const RawEvaluationViewV1) -> i32 =
             neoethos_gpu_cuda_population_bind_view_v1;
+        #[cfg(feature = "cuda")]
         let _: unsafe extern "C" fn(
             *mut c_void,
             *const RawEvaluationViewV1,
@@ -4259,7 +4260,7 @@ mod tests {
             "static_assert(offsetof(NeoGeneDescriptor, reserved) == 64);",
             "static_assert(sizeof(NeoPopulationDatasetView) == 232);",
             "static_assert(sizeof(NeoPopulationParentDatasetV1) == 216);",
-            "static_assert(sizeof(NeoPopulationResidentFeatureStoreV3) == 216);",
+            "static_assert(sizeof(NeoPopulationResidentFeatureStoreV3) == 256);",
             "static_assert(sizeof(NeoPopulationEvaluationViewV1) == 72);",
             "static_assert(sizeof(NeoResidentAdaptiveBaseRequestV1) == 96);",
             "static_assert(sizeof(NeoPopulationResidencyCountersV1) == 144);",
