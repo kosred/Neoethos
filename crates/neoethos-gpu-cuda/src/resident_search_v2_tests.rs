@@ -1633,13 +1633,11 @@ fn slice2_combined_admission_rejects_insufficient_reserve_before_allocation() {
 
     let request = valid_request();
     assert_eq!(requested_device_sum(&request), REQUESTED_DEVICE_SUM_BYTES);
+    let expected = expected_ledger(&request);
     let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();
-    let actual = admit_with_pristine_seal(request, &mut recorder);
-    assert_eq!(
-        actual.expect_err("the exact-fit RED path must remain pending"),
-        ResidentSearchSlice2AdmissionErrorV2::ImplementationPending
-    );
-    assert_zero_before_native_create(&recorder);
+    let _owner = admit_with_pristine_seal(request, &mut recorder)
+        .expect("the exact-fit control must admit without unlabelled slack");
+    assert_eq!(recorder.observed(), expected.as_slice());
     control_count += 1;
     let mut request = valid_request();
     let mut seal = mint_r6_trusted_reserve_seal_for_fixture_v2();
