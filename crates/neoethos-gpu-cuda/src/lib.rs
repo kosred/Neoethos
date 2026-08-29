@@ -36,13 +36,11 @@ pub mod resident_robust_normalization_v2;
 mod resident_scoring_v2;
 #[cfg(any(
     feature = "cuda",
+    feature = "resident-search-slice2-compile-contract",
     all(test, feature = "resident-search-slice2-host-contract")
 ))]
 #[cfg_attr(
-    all(
-        feature = "cuda",
-        not(all(test, feature = "resident-search-slice2-host-contract"))
-    ),
+    not(all(test, feature = "resident-search-slice2-host-contract")),
     allow(dead_code)
 )]
 mod resident_search_slice2_admission_v2;

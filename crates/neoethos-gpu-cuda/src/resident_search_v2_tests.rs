@@ -11,9 +11,10 @@ use super::{
     ResidentSearchSlice2ObservedReserveSetV2, ResidentSearchSlice2ReceiptArithmeticV2,
     ResidentSearchSlice2ReceiptTotalAxisV2, ResidentSearchSlice2ReserveArithmeticV2,
     ResidentSearchSlice2ReserveAuthorityKindV2, ResidentSearchSlice2ReserveRelationV2,
-    ResidentSearchSlice2ScoringArchiveReceiptV2, ResidentSearchSlice2TrustedReserveAuthorityV2,
-    ResidentSearchSlice2TrustedReserveSealV2, ResidentSearchSlice2TrustedReserveSetV2,
-    admit_slice2_combined_fixture_v2,
+    ResidentSearchSlice2ScoringArchiveReceiptV2, ResidentSearchSlice2ShapeAxisV2,
+    ResidentSearchSlice2TrustedReserveAuthorityV2, ResidentSearchSlice2TrustedReserveSealV2,
+    ResidentSearchSlice2TrustedReserveSetV2, admit_slice2_combined_fixture_v2,
+    validate_and_seal_slice2_combined_v2,
 };
 
 const POPULATION_COUNT: u64 = 200;
@@ -1181,6 +1182,58 @@ fn slice2_combined_admission_rejects_missing_or_zero_archive_arena_before_alloca
         ResidentSearchSlice2AdmissionErrorV2::ZeroArchiveArenaBytes
     );
     assert_zero_before_native_create(&recorder);
+
+    for axis in [
+        ResidentSearchSlice2ShapeAxisV2::PopulationCount,
+        ResidentSearchSlice2ShapeAxisV2::ArchiveCapacity,
+        ResidentSearchSlice2ShapeAxisV2::SignatureWordCount,
+        ResidentSearchSlice2ShapeAxisV2::NoveltyNeighborCount,
+        ResidentSearchSlice2ShapeAxisV2::MaxTermsPerGene,
+    ] {
+        let mut request = valid_request();
+        let (expected, observed) = match axis {
+            ResidentSearchSlice2ShapeAxisV2::PopulationCount => {
+                request.population_count += 1;
+                (POPULATION_COUNT, request.population_count)
+            }
+            ResidentSearchSlice2ShapeAxisV2::ArchiveCapacity => {
+                request.archive_capacity += 1;
+                (ARCHIVE_CAPACITY, request.archive_capacity)
+            }
+            ResidentSearchSlice2ShapeAxisV2::SignatureWordCount => {
+                request.signature_word_count += 1;
+                (
+                    u64::from(SIGNATURE_WORD_COUNT),
+                    u64::from(request.signature_word_count),
+                )
+            }
+            ResidentSearchSlice2ShapeAxisV2::NoveltyNeighborCount => {
+                request.novelty_neighbor_count += 1;
+                (
+                    u64::from(NOVELTY_NEIGHBOR_COUNT),
+                    u64::from(request.novelty_neighbor_count),
+                )
+            }
+            ResidentSearchSlice2ShapeAxisV2::MaxTermsPerGene => {
+                request.max_terms_per_gene += 1;
+                (
+                    u64::from(MAX_TERMS_PER_GENE),
+                    u64::from(request.max_terms_per_gene),
+                )
+            }
+        };
+        let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();
+        let actual = admit_with_pristine_seal(request, &mut recorder);
+        assert_eq!(
+            actual.expect_err("shape drift must fail before authority mint"),
+            ResidentSearchSlice2AdmissionErrorV2::ShapeMismatch {
+                axis,
+                expected,
+                observed,
+            }
+        );
+        assert_zero_before_native_create(&recorder);
+    }
 }
 
 #[test]
@@ -1855,6 +1908,88 @@ fn slice2_valid_combined_admission_executes_declared_ledger_once_and_later_gener
             .replacement_subtotal_bytes,
         REPLACEMENT_SUBTOTAL_BYTES
     );
+
+    let pristine_seal = mint_r6_trusted_reserve_seal_for_fixture_v2();
+    assert_r6_trusted_reserve_seal_fixture_v2(&pristine_seal);
+    let validated = validate_and_seal_slice2_combined_v2(request, pristine_seal)
+        .expect("valid admission must mint runtime authority");
+    let (_, _, _, runtime_authority) = validated.into_parts_v2();
+    assert_eq!(runtime_authority.calibration, valid_calibration());
+    assert_eq!(runtime_authority.observed_reserve, valid_observed_reserve());
+    assert_eq!(
+        runtime_authority.sealed_full_workspace_receipt_identity,
+        FULL_WORKSPACE_RECEIPT_IDENTITY
+    );
+    assert_eq!(
+        runtime_authority.sealed_post_trim_receipt_identity,
+        POST_TRIM_RECEIPT_IDENTITY
+    );
+    assert_eq!(runtime_authority.population_count, POPULATION_COUNT);
+    assert_eq!(runtime_authority.archive_capacity, ARCHIVE_CAPACITY);
+    assert_eq!(runtime_authority.signature_word_count, SIGNATURE_WORD_COUNT);
+    assert_eq!(
+        runtime_authority.novelty_neighbor_count,
+        NOVELTY_NEIGHBOR_COUNT
+    );
+    assert_eq!(runtime_authority.max_terms_per_gene, MAX_TERMS_PER_GENE);
+    assert_eq!(
+        runtime_authority
+            .scoring_archive_layout
+            .test_archive_gene_scalars_v2(),
+        (69_120, 3_600_128)
+    );
+    assert_eq!(
+        runtime_authority
+            .scoring_archive_layout
+            .test_total_device_bytes_v2(),
+        SCORING_ARCHIVE_TOTAL_BYTES
+    );
+
+    let mut dynamic_request = valid_request();
+    let dynamic_delta = 65_536;
+    dynamic_request.scoring_archive_receipt.cub_scratch_bytes += dynamic_delta;
+    dynamic_request.scoring_archive_receipt.total_device_bytes += dynamic_delta;
+    dynamic_request
+        .observed_reserve
+        .remaining_search_allocation_after_trim
+        .bytes += dynamic_delta;
+    dynamic_request
+        .observed_reserve
+        .full_workspace_authority
+        .bytes += dynamic_delta;
+    dynamic_request.observed_reserve.same_context_free.bytes += dynamic_delta;
+    let mut dynamic_seal = mint_r6_trusted_reserve_seal_for_fixture_v2();
+    assert_r6_trusted_reserve_seal_fixture_v2(&dynamic_seal);
+    dynamic_seal
+        .trusted_reserve
+        .remaining_search_allocation_after_trim
+        .expected_bytes += dynamic_delta;
+    dynamic_seal
+        .trusted_reserve
+        .full_workspace_authority
+        .expected_bytes += dynamic_delta;
+    dynamic_seal
+        .trusted_reserve
+        .same_context_free
+        .expected_bytes += dynamic_delta;
+    let dynamic_validated = validate_and_seal_slice2_combined_v2(dynamic_request, dynamic_seal)
+        .expect("runtime CUB size must remain dynamic");
+    let (_, _, _, dynamic_authority) = dynamic_validated.into_parts_v2();
+    assert_eq!(dynamic_authority.calibration, valid_calibration());
+    assert_eq!(
+        dynamic_authority
+            .scoring_archive_layout
+            .test_archive_gene_scalars_v2(),
+        (134_656, 3_600_128)
+    );
+    assert_eq!(
+        dynamic_authority
+            .scoring_archive_layout
+            .test_total_device_bytes_v2(),
+        23_842_304
+    );
+
+    let request = valid_request();
     let expected = expected_ledger(&request);
     let expected_events = expected_chronology(&expected);
     let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();

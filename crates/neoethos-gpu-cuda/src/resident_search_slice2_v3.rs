@@ -1,5 +1,5 @@
 #[cfg(feature = "cuda")]
-use crate::resident_search_slice2_admission_v2::ResidentSearchSlice2CalibrationBindingV2;
+use crate::resident_search_slice2_admission_v2::ResidentSearchSlice2ValidatedRuntimeAuthorityV2;
 #[cfg(feature = "cuda")]
 use crate::resident_trim_prefilter_v1::ResidentTrimmedPopulationSessionV1;
 
@@ -19,7 +19,7 @@ enum ResidentSearchRejectedTransitionV3 {
 
 pub struct ResidentArchiveKnnCalibrationReceiptV2 {
     #[cfg(feature = "cuda")]
-    inner: ResidentSearchSlice2CalibrationBindingV2,
+    inner: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,
     #[cfg(not(feature = "cuda"))]
     #[allow(dead_code)]
     inner: core::convert::Infallible,
@@ -207,6 +207,13 @@ impl<A> ResidentSearchRejectedAuthorityV3<A> {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) fn seal_resident_archive_knn_calibration_receipt_v2(
+    authority: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,
+) -> ResidentArchiveKnnCalibrationReceiptV2 {
+    ResidentArchiveKnnCalibrationReceiptV2 { inner: authority }
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn start_resident_search_slice2_v3(
     session: ResidentTrimmedPopulationSessionV1,
     calibration: ResidentArchiveKnnCalibrationReceiptV2,
@@ -272,14 +279,14 @@ mod tests {
         let calibration_receipt = concat!(
             "pub ",
             "struct ResidentArchiveKnnCalibrationReceiptV2",
-            " {\n    #[cfg(feature = \"cuda\")]\n    inner: ResidentSearchSlice2CalibrationBindingV2,"
+            " {\n    #[cfg(feature = \"cuda\")]\n    inner: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,"
         );
         let authority_state = "struct ResidentSearchAuthorityStateV3 {\n    session: ResidentTrimmedPopulationSessionV1,\n    calibration: ResidentArchiveKnnCalibrationReceiptV2,\n}";
         let private_start = "pub(crate) fn start_resident_search_slice2_v3(\n    session: ResidentTrimmedPopulationSessionV1,\n    calibration: ResidentArchiveKnnCalibrationReceiptV2,\n) -> ResidentSearchGenerationChainV3";
         let public_start = "pub fn begin_resident_search_slice2_v3(\n        self,\n        calibration: crate::resident_search_slice2_v3::ResidentArchiveKnnCalibrationReceiptV2,\n    ) -> crate::resident_search_slice2_v3::ResidentSearchGenerationChainV3";
 
         assert!(source.contains(
-            "use crate::resident_search_slice2_admission_v2::ResidentSearchSlice2CalibrationBindingV2;"
+            "use crate::resident_search_slice2_admission_v2::ResidentSearchSlice2ValidatedRuntimeAuthorityV2;"
         ));
         assert!(source.contains(calibration_receipt));
         assert!(source.contains(authority_state));
@@ -298,9 +305,11 @@ mod tests {
             source
                 .matches(concat!("ResidentArchiveKnnCalibrationReceiptV2", " {"))
                 .count(),
-            2,
-            "only the type declaration and Drop impl may open this opaque receipt"
+            4,
+            "only the declaration, private sealer signature/body, and Drop impl may open this receipt"
         );
+        assert!(source.contains("pub(crate) fn seal_resident_archive_knn_calibration_receipt_v2("));
+        assert!(source.contains("authority: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,"));
         for forbidden in [
             concat!("impl ResidentArchiveKnn", "CalibrationReceiptV2"),
             concat!("Clone for ResidentArchiveKnn", "CalibrationReceiptV2"),

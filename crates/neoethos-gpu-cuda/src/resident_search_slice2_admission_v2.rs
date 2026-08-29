@@ -1,3 +1,17 @@
+#[path = "resident_archive_knn_v2_native.rs"]
+mod resident_archive_knn_v2_native;
+
+use self::resident_archive_knn_v2_native::{
+    ResidentScoringArchiveArenaLayoutV2, ScoringArchiveArenaLayoutErrorV2,
+    validate_scoring_archive_arena_layout_v2,
+};
+
+const SLICE2_POPULATION_COUNT_V2: u64 = 200;
+const SLICE2_ARCHIVE_CAPACITY_V2: u64 = 50_000;
+const SLICE2_SIGNATURE_WORD_COUNT_V2: u32 = 4;
+const SLICE2_NOVELTY_NEIGHBOR_COUNT_V2: u32 = 15;
+const SLICE2_MAX_TERMS_PER_GENE_V2: u32 = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResidentSearchSlice2AlignedFieldV2 {
     ArchiveGeneScalars,
@@ -82,9 +96,24 @@ pub(crate) enum ResidentSearchSlice2CalibrationAxisV2 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidentSearchSlice2ShapeAxisV2 {
+    PopulationCount,
+    ArchiveCapacity,
+    SignatureWordCount,
+    NoveltyNeighborCount,
+    MaxTermsPerGene,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResidentSearchSlice2AdmissionErrorV2 {
     MissingArchiveArena,
     ZeroArchiveArenaBytes,
+    ShapeMismatch {
+        axis: ResidentSearchSlice2ShapeAxisV2,
+        expected: u64,
+        observed: u64,
+    },
+    ScoringArchiveLayout(ScoringArchiveArenaLayoutErrorV2),
     AlignedLayoutFieldMismatch {
         field: ResidentSearchSlice2AlignedFieldV2,
         expected_aligned_bytes: u64,
@@ -305,27 +334,44 @@ pub(crate) struct ResidentSearchSlice2AdmissionRequestV2 {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ResidentSearchSlice2AdmissionOwnerV2 {
-    _move_only: (),
+    runtime_authority: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResidentSearchSlice2ValidatedRuntimeAuthorityV2 {
+    scoring_archive_layout: ResidentScoringArchiveArenaLayoutV2,
+    calibration: ResidentSearchSlice2CalibrationBindingV2,
+    observed_reserve: ResidentSearchSlice2ObservedReserveSetV2,
+    sealed_full_workspace_receipt_identity: u64,
+    sealed_post_trim_receipt_identity: u64,
+    population_count: u64,
+    archive_capacity: u64,
+    signature_word_count: u32,
+    novelty_neighbor_count: u32,
+    max_terms_per_gene: u32,
 }
 
 pub(crate) struct ResidentSearchSlice2ValidatedAdmissionV2 {
     terminal_host_receipt: ResidentSearchSlice2HostAllocationArgsV2,
     generation_arena: ResidentSearchSlice2AsyncAllocationArgsV2,
     scoring_archive_arena: ResidentSearchSlice2AsyncAllocationArgsV2,
+    runtime_authority: ResidentSearchSlice2ValidatedRuntimeAuthorityV2,
 }
 
 impl ResidentSearchSlice2ValidatedAdmissionV2 {
-    pub(crate) fn into_allocation_calls_v2(
+    pub(crate) fn into_parts_v2(
         self,
     ) -> (
         ResidentSearchSlice2HostAllocationArgsV2,
         ResidentSearchSlice2AsyncAllocationArgsV2,
         ResidentSearchSlice2AsyncAllocationArgsV2,
+        ResidentSearchSlice2ValidatedRuntimeAuthorityV2,
     ) {
         (
             self.terminal_host_receipt,
             self.generation_arena,
             self.scoring_archive_arena,
+            self.runtime_authority,
         )
     }
 }
@@ -337,6 +383,15 @@ impl ResidentSearchSlice2AdmissionOwnerV2 {
         _allocator: &mut dyn ResidentSearchSlice2AllocationFacadeV2,
     ) -> Result<Self, ResidentSearchSlice2AdmissionErrorV2> {
         Ok(self)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn into_calibration_receipt_v2(
+        self,
+    ) -> crate::resident_search_slice2_v3::ResidentArchiveKnnCalibrationReceiptV2 {
+        crate::resident_search_slice2_v3::seal_resident_archive_knn_calibration_receipt_v2(
+            self.runtime_authority,
+        )
     }
 }
 
@@ -419,6 +474,42 @@ pub(crate) fn validate_and_seal_slice2_combined_v2(
     }
     if request.archive_arena_bytes == 0 {
         return Err(ResidentSearchSlice2AdmissionErrorV2::ZeroArchiveArenaBytes);
+    }
+
+    for (axis, expected, observed) in [
+        (
+            ResidentSearchSlice2ShapeAxisV2::PopulationCount,
+            SLICE2_POPULATION_COUNT_V2,
+            request.population_count,
+        ),
+        (
+            ResidentSearchSlice2ShapeAxisV2::ArchiveCapacity,
+            SLICE2_ARCHIVE_CAPACITY_V2,
+            request.archive_capacity,
+        ),
+        (
+            ResidentSearchSlice2ShapeAxisV2::SignatureWordCount,
+            u64::from(SLICE2_SIGNATURE_WORD_COUNT_V2),
+            u64::from(request.signature_word_count),
+        ),
+        (
+            ResidentSearchSlice2ShapeAxisV2::NoveltyNeighborCount,
+            u64::from(SLICE2_NOVELTY_NEIGHBOR_COUNT_V2),
+            u64::from(request.novelty_neighbor_count),
+        ),
+        (
+            ResidentSearchSlice2ShapeAxisV2::MaxTermsPerGene,
+            u64::from(SLICE2_MAX_TERMS_PER_GENE_V2),
+            u64::from(request.max_terms_per_gene),
+        ),
+    ] {
+        if observed != expected {
+            return Err(ResidentSearchSlice2AdmissionErrorV2::ShapeMismatch {
+                axis,
+                expected,
+                observed,
+            });
+        }
     }
 
     let expected_layout = &request.expected_slice2_layout;
@@ -734,34 +825,54 @@ pub(crate) fn validate_and_seal_slice2_combined_v2(
         return Err(ResidentSearchSlice2AdmissionErrorV2::ForeignCalibration { axis });
     }
 
+    let terminal_host_receipt = ResidentSearchSlice2HostAllocationArgsV2 {
+        ordinal: 0,
+        category: ResidentSearchSlice2AllocationCategoryV2::TerminalHostReceipt,
+        requested_bytes: request.terminal_host_receipt_bytes,
+        aligned_bytes: request.terminal_host_receipt_bytes,
+        alignment_bytes: request.terminal_host_alignment_bytes,
+        flags: request.terminal_host_flags,
+    };
+    let generation_arena = ResidentSearchSlice2AsyncAllocationArgsV2 {
+        ordinal: 1,
+        category: ResidentSearchSlice2AllocationCategoryV2::GenerationArena,
+        requested_bytes: generation.total_device_bytes,
+        aligned_bytes: generation.total_device_bytes,
+        alignment_bytes: request.device_alignment_bytes,
+        flags: 0,
+        stream_identity: calibration.search_stream_identity,
+        pool_identity: calibration.active_pool_identity,
+    };
+    let scoring_archive_arena = ResidentSearchSlice2AsyncAllocationArgsV2 {
+        ordinal: 2,
+        category: ResidentSearchSlice2AllocationCategoryV2::ScoringArchiveArena,
+        requested_bytes: scoring.total_device_bytes,
+        aligned_bytes: scoring.total_device_bytes,
+        alignment_bytes: request.device_alignment_bytes,
+        flags: 0,
+        stream_identity: calibration.search_stream_identity,
+        pool_identity: calibration.active_pool_identity,
+    };
+    let scoring_archive_layout =
+        validate_scoring_archive_arena_layout_v2(scoring_archive_arena, *scoring)
+            .map_err(ResidentSearchSlice2AdmissionErrorV2::ScoringArchiveLayout)?;
+
     Ok(ResidentSearchSlice2ValidatedAdmissionV2 {
-        terminal_host_receipt: ResidentSearchSlice2HostAllocationArgsV2 {
-            ordinal: 0,
-            category: ResidentSearchSlice2AllocationCategoryV2::TerminalHostReceipt,
-            requested_bytes: request.terminal_host_receipt_bytes,
-            aligned_bytes: request.terminal_host_receipt_bytes,
-            alignment_bytes: request.terminal_host_alignment_bytes,
-            flags: request.terminal_host_flags,
-        },
-        generation_arena: ResidentSearchSlice2AsyncAllocationArgsV2 {
-            ordinal: 1,
-            category: ResidentSearchSlice2AllocationCategoryV2::GenerationArena,
-            requested_bytes: generation.total_device_bytes,
-            aligned_bytes: generation.total_device_bytes,
-            alignment_bytes: request.device_alignment_bytes,
-            flags: 0,
-            stream_identity: calibration.search_stream_identity,
-            pool_identity: calibration.active_pool_identity,
-        },
-        scoring_archive_arena: ResidentSearchSlice2AsyncAllocationArgsV2 {
-            ordinal: 2,
-            category: ResidentSearchSlice2AllocationCategoryV2::ScoringArchiveArena,
-            requested_bytes: scoring.total_device_bytes,
-            aligned_bytes: scoring.total_device_bytes,
-            alignment_bytes: request.device_alignment_bytes,
-            flags: 0,
-            stream_identity: calibration.search_stream_identity,
-            pool_identity: calibration.active_pool_identity,
+        terminal_host_receipt,
+        generation_arena,
+        scoring_archive_arena,
+        runtime_authority: ResidentSearchSlice2ValidatedRuntimeAuthorityV2 {
+            scoring_archive_layout,
+            calibration: *calibration,
+            observed_reserve: *observed_reserve,
+            sealed_full_workspace_receipt_identity: trusted_seal
+                .sealed_full_workspace_receipt_identity,
+            sealed_post_trim_receipt_identity: trusted_seal.sealed_post_trim_receipt_identity,
+            population_count: request.population_count,
+            archive_capacity: request.archive_capacity,
+            signature_word_count: request.signature_word_count,
+            novelty_neighbor_count: request.novelty_neighbor_count,
+            max_terms_per_gene: request.max_terms_per_gene,
         },
     })
 }
@@ -772,13 +883,13 @@ pub(crate) fn admit_slice2_combined_fixture_v2(
     allocator: &mut dyn ResidentSearchSlice2AllocationFacadeV2,
 ) -> Result<ResidentSearchSlice2AdmissionOwnerV2, ResidentSearchSlice2AdmissionErrorV2> {
     let validated = validate_and_seal_slice2_combined_v2(request, _trusted_seal)?;
-    let (host_receipt, generation_arena, scoring_archive_arena) =
-        validated.into_allocation_calls_v2();
+    let (host_receipt, generation_arena, scoring_archive_arena, runtime_authority) =
+        validated.into_parts_v2();
     allocator.begin_native_create();
     allocator.cuda_host_alloc(host_receipt);
     allocator.cuda_malloc_async(generation_arena);
     allocator.cuda_malloc_async(scoring_archive_arena);
-    Ok(ResidentSearchSlice2AdmissionOwnerV2 { _move_only: () })
+    Ok(ResidentSearchSlice2AdmissionOwnerV2 { runtime_authority })
 }
 
 #[cfg(all(test, feature = "resident-search-slice2-host-contract"))]
