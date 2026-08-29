@@ -1174,6 +1174,14 @@ pub struct ResidentTrimmedPopulationSessionV1 {
 }
 
 impl ResidentTrimmedPopulationSessionV1 {
+    /// Move the complete trim/population authority into the fail-closed Slice 2
+    /// Search chain. No raw CUDA handle or detached child owner is exposed.
+    pub fn begin_resident_search_slice2_v3(
+        self,
+    ) -> crate::resident_search_slice2_v3::ResidentSearchGenerationChainV3 {
+        crate::resident_search_slice2_v3::start_resident_search_slice2_v3(self)
+    }
+
     pub const fn selected_compact_to_parent_columns_device(&self) -> bool {
         !self
             .views
