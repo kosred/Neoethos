@@ -19,6 +19,8 @@ process to manage — the desktop app links the whole engine in-process.
 | Desktop (dev, hot-reload) | `cd desktop && npx tauri dev` | runs the app against the Vite dev server |
 | Terminal UI (TUI) | `cargo run --release -p neoethos-cli` | live candlesticks, discovery, logs in your terminal |
 | Headless engine checks | `cargo build --release -p neoethos-app` | the in-process API/engine library + binary |
+| CPU host build | `./scripts/build-host.sh build --release -p neoethos-cli` | logical threads minus two; no NVIDIA variables retained on a CPU-only host |
+| NVIDIA host build | `./scripts/build-host.sh build --release -p neoethos-cli --features gpu-nvidia` | CUDA images matched to every visible card plus embedded host-build evidence |
 
 The desktop bundle is self-contained: `npx tauri build` first runs the frontend
 build (`npm run build`) and then compiles the Rust binary with the web assets
@@ -51,11 +53,9 @@ Notes from real-world experience:
 - **Dense timeframes (M1–M5) are data-volume-bound**: on 6 cores a full M5
   history run can take ~13 h. Use `Max rows` in Settings to cap it, or
   federate.
-- **GPU**: CPU is the default and the reliable path. A *dedicated* NVIDIA
-  card under **Linux + CUDA** accelerates discovery evaluation; the
-  Windows Vulkan GPU lane is currently blocked by an upstream `wgpu`
-  incompatibility — leave compute on `auto`/`cpu` on Windows. **Never** pick
-  `gpu` on a shared-RAM integrated GPU (it competes with the engine's RAM).
+- **GPU**: CPU-only operation remains supported. GPU execution in this release
+  targets dedicated NVIDIA cards through CUDA; integrated, WGPU/Vulkan, ROCm,
+  Metal, and software adapters are not supported execution backends.
 - **Laptops are fine** for running/trading; sustained discovery runs hot —
   a desktop/mini-PC with decent airflow is kinder for multi-hour searches.
 
@@ -63,7 +63,9 @@ Notes from real-world experience:
 
 ## 2. Prerequisites (all platforms)
 
-- **Rust** — stable toolchain, recent enough for the **2024 edition** (Rust **1.85+**). Install via [rustup](https://rustup.rs/). On Windows use the **MSVC** toolchain (`x86_64-pc-windows-msvc`), not GNU.
+- **Rust** — install [rustup](https://rustup.rs/); the repository's
+  `rust-toolchain.toml` selects the pinned nightly automatically. On Windows use
+  the **MSVC** host (`x86_64-pc-windows-msvc`), not GNU.
 - **Node.js 20+** (Node 20.19+ or 22.12+ — required by Vite 8) and npm. [nodejs.org](https://nodejs.org/) or nvm.
 - **CMake 3.28+** and a **C/C++ compiler** — several native crates (e.g. `lightgbm3-sys`, `polars`) build C/C++ at compile time.
 - **Git**.
@@ -166,15 +168,25 @@ The app auto-prunes old installer bundles (keeping the latest) so `target/releas
 
 ## 8. GPU acceleration (optional, advanced)
 
-A standard build runs the ML ensemble and genetic discovery on **CPU** out of the
-box — nothing special is required. GPU acceleration is selected at **runtime**
-(Settings → compute mode: auto/cpu/gpu), not via a build feature flag, and is
-auto-detected where available.
+A standard build runs on **CPU** and needs no card probe. For a CUDA build, use
+the shared host entry point instead of setting a card architecture by hand:
 
-Heavy CUDA acceleration (dedicated NVIDIA cards, CUDA toolchain, VPS
-deployment) is an advanced topic with its own environment requirements and is not
-needed to build or run the app locally. If you have a shared-RAM integrated GPU,
-prefer CPU or `auto` — a discovery run can otherwise exhaust shared memory.
+```sh
+./scripts/build-host.sh build --release -p neoethos-cli --features gpu-nvidia
+```
+
+On Windows, run `./scripts/build-host.ps1` with the same Cargo arguments. The
+preflight uses the logical parallelism visible to the process, reserves two
+threads, inventories every visible NVIDIA UUID/PCI/name/compute capability, and
+passes one canonical architecture set to vector-ta, native search, XGBoost,
+and LightGBM. CubeCL is different: its exact 0.10 source queries the selected
+device and compiles PTX with NVRTC at runtime. Candle 0.10.2 still delegates to
+CudaForge's independent single-architecture detection, so its CUDA lane is not
+yet licensed as a canonical multi-card build and remains fail-closed for strict
+production selection until that dependency consumes the same typed plan.
+Runtime CPU/one-card/multi-card selection is separate from compilation and may
+use only device/artifact paths that passed their own real-card validation; a
+compiled image alone is not a profitability or support claim.
 
 ---
 
