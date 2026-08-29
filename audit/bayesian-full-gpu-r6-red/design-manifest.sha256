@@ -1,0 +1,14 @@
+# neoethos.bayesian-full-gpu-r6-red.design-manifest.v1
+# status=docs-and-test-plan-only
+# authority_commit=7824e191c04b4eb78e547728ad7cdb78f915a2af
+# authority_tree=e5c9cc23b1e97c6955d379d584f6fe555fe701dc
+# branch=codex/bayes-logit-full-gpu-r6-red
+# protected_pathspec=:(glob)**/src/**
+# protected_diff_count=0
+# independent_review=P0:0,P1:0,P2:0,APPROVE
+# prohibited_actions_observed=none(Cargo,GPU,network,VPS,registry,production-edit)
+# canonical_bytes=exact Git blob bytes; LF only; no CR; checkout EOL conversion is non-authoritative
+# hash_scope=the two document blobs below; this manifest excludes itself
+# columns=sha256 byte_count git_blob_oid path
+19cfff3e6966e77e1370670d96fb1462758211d0f5cc3379ddcd5aec7386cff3 25234 142794f7660ed1fb2596ff199580b48a7b2219e6 docs/superpowers/specs/2026-08-28-bayesian-full-gpu-r6-red-design.md
+e645293a7acebf87ccccb994c5c3a4d51a97ae4beeab0ca314c543f15301060f 47825 54a95f022a3658c8fc72d5a310e538d00b4e680e docs/superpowers/plans/2026-08-28-bayesian-full-gpu-r6-red.md
