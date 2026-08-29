@@ -46,6 +46,8 @@ mod resident_scoring_v2;
     allow(dead_code)
 )]
 mod resident_search_slice2_admission_v2;
+#[cfg(any(feature = "cuda", feature = "resident-search-slice2-compile-contract"))]
+pub mod resident_search_slice2_v3;
 #[cfg(feature = "cuda")]
 pub mod resident_search_v2;
 #[cfg(feature = "cuda")]
