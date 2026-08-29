@@ -14,6 +14,7 @@ use crate::resident_generation_v1::{
     SealedResidentGenerationPlanV1, SurvivorSelectionPolicyV1,
     discovery_generation_semantics_sha256_v1, seal_resident_generation_plan_v1,
 };
+#[cfg(feature = "cuda-device-fixtures")]
 use crate::resident_search_v2::resident_search_v2_production_readiness;
 use crate::resident_smc_v3::{
     RESIDENT_SMC_COLUMN_NAMES_V3, begin_resident_smc_store_v3, prepare_resident_smc_parent_v3,
@@ -748,6 +749,7 @@ fn resident_store_v3_terminal_metrics_only_path_is_one_session_and_leak_free()
     Ok(())
 }
 
+#[cfg(feature = "cuda-device-fixtures")]
 #[test]
 fn resident_store_v3_moves_into_search_v2_and_enqueues_on_real_cuda()
 -> Result<(), Box<dyn std::error::Error>> {
