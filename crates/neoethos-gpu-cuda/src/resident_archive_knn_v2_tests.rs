@@ -2271,3 +2271,796 @@ fn r4_unequal_hash_admits_without_incrementing_the_collision_counter() {
         unequal_hash_metrics,
     );
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetricValueClass {
+    QNaN,
+    PosInf,
+}
+
+impl MetricValueClass {
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::QNaN => 0,
+            Self::PosInf => 1,
+        }
+    }
+
+    const fn bits(self) -> u64 {
+        match self {
+            Self::QNaN => 0x7ff8_0000_0000_0000,
+            Self::PosInf => 0x7ff0_0000_0000_0000,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MetricFaultCase {
+    case_ordinal: u8,
+    metric_slot: u8,
+    value_class: MetricValueClass,
+}
+
+const R8_METRIC_FAULT_CASES: [MetricFaultCase; 22] = [
+    MetricFaultCase {
+        case_ordinal: 0,
+        metric_slot: 0,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 1,
+        metric_slot: 0,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 2,
+        metric_slot: 1,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 3,
+        metric_slot: 1,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 4,
+        metric_slot: 2,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 5,
+        metric_slot: 2,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 6,
+        metric_slot: 3,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 7,
+        metric_slot: 3,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 8,
+        metric_slot: 4,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 9,
+        metric_slot: 4,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 10,
+        metric_slot: 5,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 11,
+        metric_slot: 5,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 12,
+        metric_slot: 6,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 13,
+        metric_slot: 6,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 14,
+        metric_slot: 7,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 15,
+        metric_slot: 7,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 16,
+        metric_slot: 8,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 17,
+        metric_slot: 8,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 18,
+        metric_slot: 9,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 19,
+        metric_slot: 9,
+        value_class: MetricValueClass::PosInf,
+    },
+    MetricFaultCase {
+        case_ordinal: 20,
+        metric_slot: 10,
+        value_class: MetricValueClass::QNaN,
+    },
+    MetricFaultCase {
+        case_ordinal: 21,
+        metric_slot: 10,
+        value_class: MetricValueClass::PosInf,
+    },
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructuralFaultCase {
+    SignatureWordCountLow {
+        ordinal: u8,
+        expected: u32,
+        observed: u32,
+    },
+    SignatureWordCountHigh {
+        ordinal: u8,
+        expected: u32,
+        observed: u32,
+    },
+    ZeroUnion {
+        ordinal: u8,
+        observed: u32,
+        allowed_min: u32,
+        sealed_max: u32,
+    },
+    ArchiveCountOverflow {
+        ordinal: u8,
+        sealed_capacity: u32,
+        observed: u32,
+    },
+    BoxedReceiptTokenMismatch {
+        ordinal: u8,
+        observed_xor_mask: u64,
+    },
+    ComparatorBoundMismatch {
+        ordinal: u8,
+        sealed_union_max: u64,
+        sealed_cross_product_max: u64,
+        observed_union_max: u64,
+        observed_cross_product_max: u64,
+    },
+}
+
+impl StructuralFaultCase {
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::SignatureWordCountLow { ordinal, .. }
+            | Self::SignatureWordCountHigh { ordinal, .. }
+            | Self::ZeroUnion { ordinal, .. }
+            | Self::ArchiveCountOverflow { ordinal, .. }
+            | Self::BoxedReceiptTokenMismatch { ordinal, .. }
+            | Self::ComparatorBoundMismatch { ordinal, .. } => ordinal as usize,
+        }
+    }
+}
+
+const R8_STRUCTURAL_FAULT_CASES: [StructuralFaultCase; 6] = [
+    StructuralFaultCase::SignatureWordCountLow {
+        ordinal: 0,
+        expected: 4,
+        observed: 3,
+    },
+    StructuralFaultCase::SignatureWordCountHigh {
+        ordinal: 1,
+        expected: 4,
+        observed: 5,
+    },
+    StructuralFaultCase::ZeroUnion {
+        ordinal: 2,
+        observed: 0,
+        allowed_min: 1,
+        sealed_max: 32,
+    },
+    StructuralFaultCase::ArchiveCountOverflow {
+        ordinal: 3,
+        sealed_capacity: 50_000,
+        observed: 50_001,
+    },
+    StructuralFaultCase::BoxedReceiptTokenMismatch {
+        ordinal: 4,
+        observed_xor_mask: 1_u64,
+    },
+    StructuralFaultCase::ComparatorBoundMismatch {
+        ordinal: 5,
+        sealed_union_max: 32,
+        sealed_cross_product_max: 1_024,
+        observed_union_max: 33,
+        observed_cross_product_max: 1_024,
+    },
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R8TypedFaultV10 {
+    Metric(MetricFaultCase),
+    Structural(StructuralFaultCase),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R8FirstFaultContractV10 {
+    primary: R8TypedFaultV10,
+    later_overwrite_probe: R8TypedFaultV10,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct R8AtomicNonPublicationContractV10 {
+    commit_word_unchanged: bool,
+    generation_unchanged: bool,
+    current_store_unchanged: bool,
+    commit_epoch_unchanged: bool,
+    archive_count_unchanged: bool,
+    staged_tail_unreachable: bool,
+    allocation_ledger_unchanged: bool,
+}
+
+const R8_ATOMIC_NON_PUBLICATION: R8AtomicNonPublicationContractV10 =
+    R8AtomicNonPublicationContractV10 {
+        commit_word_unchanged: true,
+        generation_unchanged: true,
+        current_store_unchanged: true,
+        commit_epoch_unchanged: true,
+        archive_count_unchanged: true,
+        staged_tail_unreachable: true,
+        allocation_ledger_unchanged: true,
+    };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MetricFaultContractV10 {
+    cases: [MetricFaultCase; 22],
+    atomic: R8AtomicNonPublicationContractV10,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StructuralFaultContractV10 {
+    cases: [StructuralFaultCase; 6],
+    atomic: R8AtomicNonPublicationContractV10,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupStepV10 {
+    ScoringArchiveArena,
+    GenerationArena,
+    PopulationEvaluatorSessionWorkspace,
+    TrimMapCountEventArena,
+    RetainedParentImportSchemaFullAdmissionOwners,
+}
+
+const R8_CLEANUP_ORDER: [CleanupStepV10; 5] = [
+    CleanupStepV10::ScoringArchiveArena,
+    CleanupStepV10::GenerationArena,
+    CleanupStepV10::PopulationEvaluatorSessionWorkspace,
+    CleanupStepV10::TrimMapCountEventArena,
+    CleanupStepV10::RetainedParentImportSchemaFullAdmissionOwners,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupStateContractV10 {
+    EventProvedSemanticFault {
+        fault: R8TypedFaultV10,
+        cleanup_order: [CleanupStepV10; 5],
+        native_ack_before_disarm_drop: bool,
+        cleanup_calls: u8,
+        second_cleanup_rejected: bool,
+        reuse_rejected: bool,
+    },
+    NotReady {
+        polls: u8,
+        same_pending_owner: bool,
+        same_run_token: bool,
+        same_boxed_receipt_identity: bool,
+        same_allocation_identities: bool,
+        cleanup_delta: u8,
+        poisoned: bool,
+        tombstoned: bool,
+    },
+    UnknownCudaOutcome {
+        whole_owner_poisoned: bool,
+        whole_owner_retained: bool,
+        detached_child_count: u8,
+        cleanup_delta: u8,
+        reusable: bool,
+    },
+    UnprovedEvent {
+        plausible_terminal_bytes_ignored: bool,
+        exact_event_proof: bool,
+        whole_owner_poisoned: bool,
+        whole_owner_retained: bool,
+        cleanup_delta: u8,
+        reusable: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CleanupContractV10 {
+    states: [CleanupStateContractV10; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R8FaultIdentityV10 {
+    Metric(u8),
+    Structural(u8),
+}
+
+const R8_FRESH_RUN_IDENTITIES: [R8FaultIdentityV10; 28] = [
+    R8FaultIdentityV10::Metric(0),
+    R8FaultIdentityV10::Metric(1),
+    R8FaultIdentityV10::Metric(2),
+    R8FaultIdentityV10::Metric(3),
+    R8FaultIdentityV10::Metric(4),
+    R8FaultIdentityV10::Metric(5),
+    R8FaultIdentityV10::Metric(6),
+    R8FaultIdentityV10::Metric(7),
+    R8FaultIdentityV10::Metric(8),
+    R8FaultIdentityV10::Metric(9),
+    R8FaultIdentityV10::Metric(10),
+    R8FaultIdentityV10::Metric(11),
+    R8FaultIdentityV10::Metric(12),
+    R8FaultIdentityV10::Metric(13),
+    R8FaultIdentityV10::Metric(14),
+    R8FaultIdentityV10::Metric(15),
+    R8FaultIdentityV10::Metric(16),
+    R8FaultIdentityV10::Metric(17),
+    R8FaultIdentityV10::Metric(18),
+    R8FaultIdentityV10::Metric(19),
+    R8FaultIdentityV10::Metric(20),
+    R8FaultIdentityV10::Metric(21),
+    R8FaultIdentityV10::Structural(0),
+    R8FaultIdentityV10::Structural(1),
+    R8FaultIdentityV10::Structural(2),
+    R8FaultIdentityV10::Structural(3),
+    R8FaultIdentityV10::Structural(4),
+    R8FaultIdentityV10::Structural(5),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreshRunIdentityContractV10 {
+    run_token_distinct: bool,
+    boxed_receipt_identity_distinct: bool,
+    every_allocation_identity_distinct: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreshRunContractV10 {
+    executed_identities: [R8FaultIdentityV10; 28],
+    expected_fault_run_count: u8,
+    expected_fresh_admission_count: u8,
+    expected_successful_fresh_publication_count: u8,
+    identity: FreshRunIdentityContractV10,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R8ContractRequestV10 {
+    MetricFaults(MetricFaultContractV10),
+    StructuralFaults(StructuralFaultContractV10),
+    Cleanup(CleanupContractV10),
+    FreshRuns(FreshRunContractV10),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R8ContractErrorV10 {
+    R8ImplementationPending,
+}
+
+fn require_r8_required_card_v10() {
+    assert!(
+        std::env::var("NEOETHOS_REQUIRE_GPU").as_deref() == Ok("1"),
+        "R8 required-card contract requires NEOETHOS_REQUIRE_GPU=1 and never skips"
+    );
+}
+
+fn metric_fault_contract_v10() -> MetricFaultContractV10 {
+    MetricFaultContractV10 {
+        cases: R8_METRIC_FAULT_CASES,
+        atomic: R8_ATOMIC_NON_PUBLICATION,
+    }
+}
+
+fn structural_fault_contract_v10() -> StructuralFaultContractV10 {
+    StructuralFaultContractV10 {
+        cases: R8_STRUCTURAL_FAULT_CASES,
+        atomic: R8_ATOMIC_NON_PUBLICATION,
+    }
+}
+
+fn cleanup_contract_v10() -> CleanupContractV10 {
+    CleanupContractV10 {
+        states: [
+            CleanupStateContractV10::EventProvedSemanticFault {
+                fault: R8TypedFaultV10::Structural(StructuralFaultCase::ZeroUnion {
+                    ordinal: 2,
+                    observed: 0,
+                    allowed_min: 1,
+                    sealed_max: 32,
+                }),
+                cleanup_order: R8_CLEANUP_ORDER,
+                native_ack_before_disarm_drop: true,
+                cleanup_calls: 1,
+                second_cleanup_rejected: true,
+                reuse_rejected: true,
+            },
+            CleanupStateContractV10::NotReady {
+                polls: 2,
+                same_pending_owner: true,
+                same_run_token: true,
+                same_boxed_receipt_identity: true,
+                same_allocation_identities: true,
+                cleanup_delta: 0,
+                poisoned: false,
+                tombstoned: false,
+            },
+            CleanupStateContractV10::UnknownCudaOutcome {
+                whole_owner_poisoned: true,
+                whole_owner_retained: true,
+                detached_child_count: 0,
+                cleanup_delta: 0,
+                reusable: false,
+            },
+            CleanupStateContractV10::UnprovedEvent {
+                plausible_terminal_bytes_ignored: true,
+                exact_event_proof: false,
+                whole_owner_poisoned: true,
+                whole_owner_retained: true,
+                cleanup_delta: 0,
+                reusable: false,
+            },
+        ],
+    }
+}
+
+fn fresh_run_contract_v10() -> FreshRunContractV10 {
+    FreshRunContractV10 {
+        executed_identities: R8_FRESH_RUN_IDENTITIES,
+        expected_fault_run_count: 28,
+        expected_fresh_admission_count: 28,
+        expected_successful_fresh_publication_count: 28,
+        identity: FreshRunIdentityContractV10 {
+            run_token_distinct: true,
+            boxed_receipt_identity_distinct: true,
+            every_allocation_identity_distinct: true,
+        },
+    }
+}
+
+fn validate_atomic_non_publication_v10(contract: R8AtomicNonPublicationContractV10) {
+    assert!(contract.commit_word_unchanged);
+    assert!(contract.generation_unchanged);
+    assert!(contract.current_store_unchanged);
+    assert!(contract.commit_epoch_unchanged);
+    assert!(contract.archive_count_unchanged);
+    assert!(contract.staged_tail_unreachable);
+    assert!(contract.allocation_ledger_unchanged);
+}
+
+fn validate_metric_case_v10(case: MetricFaultCase) {
+    assert!((case.metric_slot as usize) < 11);
+    assert_eq!(
+        case.case_ordinal as usize,
+        2 * case.metric_slot as usize + case.value_class.ordinal()
+    );
+    assert_eq!(
+        case.value_class.bits(),
+        match case.value_class {
+            MetricValueClass::QNaN => 0x7ff8_0000_0000_0000,
+            MetricValueClass::PosInf => 0x7ff0_0000_0000_0000,
+        }
+    );
+}
+
+fn validate_structural_case_v10(case: StructuralFaultCase) {
+    match case {
+        StructuralFaultCase::SignatureWordCountLow {
+            ordinal,
+            expected,
+            observed,
+        } => assert_eq!((ordinal, expected, observed), (0, 4, 3)),
+        StructuralFaultCase::SignatureWordCountHigh {
+            ordinal,
+            expected,
+            observed,
+        } => assert_eq!((ordinal, expected, observed), (1, 4, 5)),
+        StructuralFaultCase::ZeroUnion {
+            ordinal,
+            observed,
+            allowed_min,
+            sealed_max,
+        } => assert_eq!((ordinal, observed, allowed_min, sealed_max), (2, 0, 1, 32)),
+        StructuralFaultCase::ArchiveCountOverflow {
+            ordinal,
+            sealed_capacity,
+            observed,
+        } => assert_eq!((ordinal, sealed_capacity, observed), (3, 50_000, 50_001)),
+        StructuralFaultCase::BoxedReceiptTokenMismatch {
+            ordinal,
+            observed_xor_mask,
+        } => assert_eq!((ordinal, observed_xor_mask), (4, 1_u64)),
+        StructuralFaultCase::ComparatorBoundMismatch {
+            ordinal,
+            sealed_union_max,
+            sealed_cross_product_max,
+            observed_union_max,
+            observed_cross_product_max,
+        } => assert_eq!(
+            (
+                ordinal,
+                sealed_union_max,
+                sealed_cross_product_max,
+                observed_union_max,
+                observed_cross_product_max,
+            ),
+            (5, 32, 1_024, 33, 1_024)
+        ),
+    }
+}
+
+fn validate_typed_fault_v10(fault: R8TypedFaultV10) {
+    match fault {
+        R8TypedFaultV10::Metric(case) => validate_metric_case_v10(case),
+        R8TypedFaultV10::Structural(case) => validate_structural_case_v10(case),
+    }
+}
+
+fn first_fault_contract_v10(primary: R8TypedFaultV10) -> R8FirstFaultContractV10 {
+    let later_overwrite_probe = match primary {
+        R8TypedFaultV10::Structural(StructuralFaultCase::ZeroUnion { .. }) => {
+            R8TypedFaultV10::Structural(StructuralFaultCase::ArchiveCountOverflow {
+                ordinal: 3,
+                sealed_capacity: 50_000,
+                observed: 50_001,
+            })
+        }
+        _ => R8TypedFaultV10::Structural(StructuralFaultCase::ZeroUnion {
+            ordinal: 2,
+            observed: 0,
+            allowed_min: 1,
+            sealed_max: 32,
+        }),
+    };
+    R8FirstFaultContractV10 {
+        primary,
+        later_overwrite_probe,
+    }
+}
+
+fn validate_first_fault_contract_v10(contract: R8FirstFaultContractV10) {
+    validate_typed_fault_v10(contract.primary);
+    validate_typed_fault_v10(contract.later_overwrite_probe);
+    assert_ne!(contract.primary, contract.later_overwrite_probe);
+    match contract.primary {
+        R8TypedFaultV10::Structural(StructuralFaultCase::ZeroUnion { .. }) => assert!(matches!(
+            contract.later_overwrite_probe,
+            R8TypedFaultV10::Structural(StructuralFaultCase::ArchiveCountOverflow {
+                observed: 50_001,
+                ..
+            })
+        )),
+        _ => assert!(matches!(
+            contract.later_overwrite_probe,
+            R8TypedFaultV10::Structural(StructuralFaultCase::ZeroUnion { .. })
+        )),
+    }
+}
+
+fn validate_metric_fault_contract_v10(contract: &MetricFaultContractV10) {
+    let mut seen = [[false; 11]; 2];
+    for (expected_ordinal, case) in contract.cases.into_iter().enumerate() {
+        validate_metric_case_v10(case);
+        assert_eq!(case.case_ordinal as usize, expected_ordinal);
+        let cell = &mut seen[case.value_class.ordinal()][case.metric_slot as usize];
+        assert!(!*cell, "duplicate R8 metric fault identity");
+        *cell = true;
+        validate_first_fault_contract_v10(first_fault_contract_v10(R8TypedFaultV10::Metric(case)));
+    }
+    assert!(seen.into_iter().flatten().all(|was_seen| was_seen));
+    validate_atomic_non_publication_v10(contract.atomic);
+}
+
+fn validate_structural_fault_contract_v10(contract: &StructuralFaultContractV10) {
+    let mut seen = [false; 6];
+    for (expected_ordinal, case) in contract.cases.into_iter().enumerate() {
+        validate_structural_case_v10(case);
+        assert_eq!(case.ordinal(), expected_ordinal);
+        let cell = &mut seen[case.ordinal()];
+        assert!(!*cell, "duplicate R8 structural fault identity");
+        *cell = true;
+        validate_first_fault_contract_v10(first_fault_contract_v10(R8TypedFaultV10::Structural(
+            case,
+        )));
+    }
+    assert!(seen.into_iter().all(|was_seen| was_seen));
+    validate_atomic_non_publication_v10(contract.atomic);
+}
+
+fn validate_cleanup_contract_v10(contract: &CleanupContractV10) {
+    let mut seen = [false; 4];
+    for state in contract.states {
+        match state {
+            CleanupStateContractV10::EventProvedSemanticFault {
+                fault,
+                cleanup_order,
+                native_ack_before_disarm_drop,
+                cleanup_calls,
+                second_cleanup_rejected,
+                reuse_rejected,
+            } => {
+                assert!(!seen[0]);
+                seen[0] = true;
+                validate_typed_fault_v10(fault);
+                assert_eq!(cleanup_order, R8_CLEANUP_ORDER);
+                assert!(native_ack_before_disarm_drop);
+                assert_eq!(cleanup_calls, 1);
+                assert!(second_cleanup_rejected);
+                assert!(reuse_rejected);
+            }
+            CleanupStateContractV10::NotReady {
+                polls,
+                same_pending_owner,
+                same_run_token,
+                same_boxed_receipt_identity,
+                same_allocation_identities,
+                cleanup_delta,
+                poisoned,
+                tombstoned,
+            } => {
+                assert!(!seen[1]);
+                seen[1] = true;
+                assert_eq!(polls, 2);
+                assert!(same_pending_owner);
+                assert!(same_run_token);
+                assert!(same_boxed_receipt_identity);
+                assert!(same_allocation_identities);
+                assert_eq!(cleanup_delta, 0);
+                assert!(!poisoned);
+                assert!(!tombstoned);
+            }
+            CleanupStateContractV10::UnknownCudaOutcome {
+                whole_owner_poisoned,
+                whole_owner_retained,
+                detached_child_count,
+                cleanup_delta,
+                reusable,
+            } => {
+                assert!(!seen[2]);
+                seen[2] = true;
+                assert!(whole_owner_poisoned);
+                assert!(whole_owner_retained);
+                assert_eq!(detached_child_count, 0);
+                assert_eq!(cleanup_delta, 0);
+                assert!(!reusable);
+            }
+            CleanupStateContractV10::UnprovedEvent {
+                plausible_terminal_bytes_ignored,
+                exact_event_proof,
+                whole_owner_poisoned,
+                whole_owner_retained,
+                cleanup_delta,
+                reusable,
+            } => {
+                assert!(!seen[3]);
+                seen[3] = true;
+                assert!(plausible_terminal_bytes_ignored);
+                assert!(!exact_event_proof);
+                assert!(whole_owner_poisoned);
+                assert!(whole_owner_retained);
+                assert_eq!(cleanup_delta, 0);
+                assert!(!reusable);
+            }
+        }
+    }
+    assert!(seen.into_iter().all(|was_seen| was_seen));
+}
+
+fn validate_fresh_run_contract_v10(contract: &FreshRunContractV10) {
+    let mut executed = [0_u8; 28];
+    for identity in contract.executed_identities {
+        let index = match identity {
+            R8FaultIdentityV10::Metric(ordinal) => {
+                assert!(ordinal < 22);
+                ordinal as usize
+            }
+            R8FaultIdentityV10::Structural(ordinal) => {
+                assert!(ordinal < 6);
+                22 + ordinal as usize
+            }
+        };
+        executed[index] = executed[index]
+            .checked_add(1)
+            .expect("R8 executed identity counter overflow");
+        assert_eq!(executed[index], 1, "duplicate R8 recovery identity");
+    }
+    assert!(executed.into_iter().all(|count| count == 1));
+    assert_eq!(contract.expected_fault_run_count, 28);
+    assert_eq!(contract.expected_fresh_admission_count, 28);
+    assert_eq!(contract.expected_successful_fresh_publication_count, 28);
+    assert!(contract.identity.run_token_distinct);
+    assert!(contract.identity.boxed_receipt_identity_distinct);
+    assert!(contract.identity.every_allocation_identity_distinct);
+}
+
+fn execute_r8_contract_v10(request: R8ContractRequestV10) -> Result<(), R8ContractErrorV10> {
+    match request {
+        R8ContractRequestV10::MetricFaults(contract) => {
+            validate_metric_fault_contract_v10(&contract)
+        }
+        R8ContractRequestV10::StructuralFaults(contract) => {
+            validate_structural_fault_contract_v10(&contract)
+        }
+        R8ContractRequestV10::Cleanup(contract) => validate_cleanup_contract_v10(&contract),
+        R8ContractRequestV10::FreshRuns(contract) => validate_fresh_run_contract_v10(&contract),
+    }
+    Err(R8ContractErrorV10::R8ImplementationPending)
+}
+
+fn require_r8_contract_result_v10(result: Result<(), R8ContractErrorV10>) {
+    match result {
+        Ok(()) => {}
+        Err(R8ContractErrorV10::R8ImplementationPending) => panic!("R8ImplementationPending"),
+    }
+}
+
+#[test]
+fn r8_all_eleven_metric_slots_reject_nan_and_infinity_atomically() {
+    require_r8_required_card_v10();
+    let contract = metric_fault_contract_v10();
+    validate_metric_fault_contract_v10(&contract);
+    require_r8_contract_result_v10(execute_r8_contract_v10(R8ContractRequestV10::MetricFaults(
+        contract,
+    )));
+}
+
+#[test]
+fn r8_structural_fault_matrix_is_atomic() {
+    require_r8_required_card_v10();
+    let contract = structural_fault_contract_v10();
+    validate_structural_fault_contract_v10(&contract);
+    require_r8_contract_result_v10(execute_r8_contract_v10(
+        R8ContractRequestV10::StructuralFaults(contract),
+    ));
+}
+
+#[test]
+fn r8_fault_cleanup_is_checked_once_and_owner_never_reused() {
+    require_r8_required_card_v10();
+    let contract = cleanup_contract_v10();
+    validate_cleanup_contract_v10(&contract);
+    require_r8_contract_result_v10(execute_r8_contract_v10(R8ContractRequestV10::Cleanup(
+        contract,
+    )));
+}
+
+#[test]
+fn r8_every_recoverable_fault_allows_a_fresh_unrelated_run() {
+    require_r8_required_card_v10();
+    let contract = fresh_run_contract_v10();
+    validate_fresh_run_contract_v10(&contract);
+    require_r8_contract_result_v10(execute_r8_contract_v10(R8ContractRequestV10::FreshRuns(
+        contract,
+    )));
+}
