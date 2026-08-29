@@ -3,16 +3,16 @@
 Status: design and executable RED plan only; production implementation is not
 authorized by this document.
 
-Version: 5
+Version: 6
 
 Authoritative base: `7824e191c04b4eb78e547728ad7cdb78f915a2af`
 
 Branch: `codex/resident-search-novelty-slice2`
 
-Version 5 supersedes the version-4 design at commit
-`2f5bb09bf0d4a430577bb4bad02364b0a61f68a6`. The version-2, version-3 and
-version-4 manifests remain immutable historical receipts; the version-5
-manifest alone binds this corrected document.
+Version 6 supersedes the version-5 design at commit
+`a17a2091e094f9064695de1f6a9e3247d995dfc6`. The version-2 through version-5
+manifests remain immutable historical receipts; the version-6 manifest alone
+binds this corrected document and its R6 implementation plan.
 
 ## Outcome and boundary
 
@@ -49,9 +49,14 @@ headless `DiscoveryResult` remain later gates.
 - Lehman's dissertation Appendix A records `K=15` for the referenced novelty
   experiments; Slice 2 exposes and seals that value rather than hiding it as a
   kernel constant: <https://www.joellehman.com/lehman-dissertation.pdf>.
-- CUDA stream-ordered allocation and asynchronous-execution contracts govern
-  same-stream lifetime, terminal-event proof and the prohibition on host access
-  to an in-flight D2H destination:
+- The CUDA Runtime API memory-management contract governs the exact
+  `cudaHostAlloc(..., cudaHostAllocPortable)` terminal allocation:
+  <https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html>.
+- The CUDA Runtime API stream-ordered allocator contract governs the two exact
+  `cudaMallocAsync` device allocations:
+  <https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY__POOLS.html>.
+  Same-stream lifetime, terminal-event proof and the prohibition on host access
+  to an in-flight D2H destination additionally follow:
   <https://docs.nvidia.com/cuda/cuda-program-guide/04-special-topics/stream-ordered-memory-allocation.html>
   and
   <https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html>.
@@ -59,7 +64,7 @@ headless `DiscoveryResult` remain later gates.
   order; therefore the fixed-K and rank tie keys are explicit versioned inputs:
   <https://nvidia.github.io/cccl/unstable/cccl/determinism.html>.
 
-## Review corrections incorporated through version 5
+## Review corrections incorporated through version 6
 
 | Finding | Versioned decision |
 | --- | --- |
@@ -68,7 +73,7 @@ headless `DiscoveryResult` remain later gates.
 | Rational comparison could overflow | The comparator widens to `u64` only after a checked host preflight proves the maximum cross product; device inputs are range-validated against that receipt. |
 | Existing composite cannot insert post-rank/pre-rotation | A three-state typed transaction separates score/rank, archive staging, and evolution/publication. |
 | Readiness was listed as a RED | Unchanged readiness is a continuously GREEN invariant, not a missing behavior. |
-| Opacity was a source-string assertion | Public opacity and move-only ownership use the executable compiler-UI contract sealed in R7; missing archive allocation is a behavioral pre-allocation RED. |
+| Opacity was a source-string assertion | Public opacity and move-only ownership use the executable compiler-UI contract sealed in R7; a missing logical archive subreceipt inside the combined arena is a behavioral pre-allocation RED. |
 | Hash collision behavior was unspecified | Hashes are accelerators only; equality falls back to the exact full gene and unequal colliding genes both survive. |
 | `23_707_648` bytes was ambiguous | It replaces three V1 scoring regions and is a net `23_699_200`-byte increase before the unchanged fitness/decision/CUB regions. |
 | Calibration could benchmark an easy case | The exact production fixed-K kernel is benchmarked with `P=200`, a prefilled `A=50_000` archive, `W=4`, and `K=15`. |
@@ -86,6 +91,10 @@ headless `DiscoveryResult` remain later gates.
 | The plan/deadline-marker ownership file was absent from may-touch scope | Version 5 names `gpu_resident_current_config_plan_v1.rs` and fixes the declaration-only deadline marker's exact source location without implementing a deadline receipt. |
 | The nested UI fixture package could join the parent workspace or select the wrong target | Version 5 requires an empty `[workspace]`, `autobins=false`, ten explicit `[[bin]]` mappings and one exact `--bin` selection per compiler invocation. |
 | The disabled-interposer child could be a weaker/different run | Version 5 re-spawns the exact current executable/test/fixture/hashes/argv with only the test-only interposer mode changed, and requires the exact typed handshake error and sealed non-zero exit. |
+| The R6 physical allocation ledger was implied rather than enumerated | Version 6 freezes exactly three physical calls in order: one portable 104-byte terminal host receipt, one generation arena and one combined scoring/archive arena. There is no separate archive allocation; event creation remains R9 evidence and is outside the allocator ledger. |
+| Allocator reserve and full-workspace authority were conflated | Version 6 separates allocator/context headroom, full-workspace authority, retained pre-Search workspace and remaining Search allocation bytes, then requires checked partition and availability equations before native create. |
+| An R6 receipt could self-report a plausible ledger | Version 6 requires a separate recorder facade on the actual Rust admission path, exact cardinality before element comparison and mutation controls for missing, extra, reordered and field-drifted actual calls. |
+| R6 could fail to compile or fan out into unrelated production changes | Version 6 permits only a test-only stub/child registration in `resident_search_v2.rs` plus `resident_search_v2_tests.rs`, and freezes exactly five warning-clean runtime `ImplementationPending` failures. |
 
 ## Current source constraints
 
@@ -174,11 +183,13 @@ The independent interception epoch is sealed only after the complete trimmed
 carrier and its ready-event identity exist and after the test validator's
 bounded expected-value H2D upload, but before the first combined Search
 admission call. Consequently all admission allocations are inside the epoch.
-The layout receipt declares their exact allocator symbol, order, aligned byte
-count and category; the intercept ledger must equal that declaration. The epoch
-does not close at event record. It remains live through successful nonblocking
-query of the one terminal event and host projection of the one compact terminal
-receipt.
+The layout receipt declares the exact three-entry physical allocation ledger
+frozen below. The independent recorder must observe the same cardinality,
+allocator symbol, order, category, requested/aligned byte count, alignment,
+flags, stream and resolved pool; equality of a shared prefix is insufficient.
+The epoch does not close at event record. It remains live through successful
+nonblocking query of the one terminal event and host projection of the one
+compact terminal receipt.
 
 ### Completion and cleanup
 
@@ -493,10 +504,93 @@ increase is therefore exactly:
 ```
 
 Existing fitness-score, decision-key and CUB-scratch regions remain and are
-added once by the native V2 layout query. Generation, evaluator, trim and
-terminal allocations are separate fields of the full combined admission. The
-query returns every aligned component and the final total; Rust recomputes and
-compares each field before the first full Search allocation.
+added once by the native V2 layout query. The query returns every aligned
+component and the final total; Rust recomputes and compares each field before
+the first full Search allocation.
+
+### Exact combined-admission physical allocation ledger
+
+R6 freezes exactly three physical allocation calls, in this order:
+
+| Ordinal | Exact symbol | Category | Requested bytes | Aligned bytes | Alignment | Flags | Stream | Resolved pool |
+| ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- |
+| 0 | `cudaHostAlloc` | `TerminalHostReceipt` | `104` | `104` | `8` | `cudaHostAllocPortable` (`0x01`) | none | none |
+| 1 | `cudaMallocAsync` | `GenerationArena` | `generation_receipt.total_device_bytes` | the same exact receipt total | `256` | `0` | exact admitted Search stream | exact admitted active pool |
+| 2 | `cudaMallocAsync` | `ScoringArchiveArena` | `scoring_archive_receipt.total_device_bytes` | the same exact receipt total | `256` | `0` | exact admitted Search stream | exact admitted active pool |
+
+`ScoringArchiveArena` is one physical allocation. Its checked receipt includes
+the unchanged fitness-score, decision-key and CUB-scratch components exactly
+once and all twelve aligned Slice 2 rows in the table above exactly once. There
+is no fourth physical allocation and specifically no standalone archive arena.
+The generation receipt total and scoring/archive receipt total are exact
+runtime-query facts, not estimates or independently rounded copies.
+
+The legacy phrase "missing/zero archive arena" retained in the R6 test and error
+names means a missing or zero logical archive subreceipt inside this one
+`ScoringArchiveArena`; it never authorizes an `ArchiveOnlyArena` allocation.
+
+Event creation is not an allocation-ledger entry. The terminal event and its
+record/query behavior remain exclusively within the R9 CUDA interception and
+completion proof. R6 neither creates an event category nor treats an event API
+call as an allocator call.
+
+### Exact reserve and workspace authority
+
+The combined admission carries four distinct checked byte authorities; none is
+an alias for another:
+
+- `allocator_context_headroom_bytes`: bytes intentionally left free in the
+  same CUDA context for allocator/runtime operation;
+- `full_workspace_authority_bytes`: the sealed full-run workspace authority;
+- `retained_pre_search_workspace_bytes`: bytes already retained by data,
+  evaluator, population and trim owners when the Search allocation epoch opens;
+- `remaining_search_allocation_bytes_after_trim`: the exact device budget left
+  for the two Search device arenas after trim.
+
+Before native create or any allocator call, checked arithmetic must prove:
+
+```text
+retained_pre_search_workspace_bytes
+  + remaining_search_allocation_bytes_after_trim
+  == full_workspace_authority_bytes
+
+requested_device_sum
+  = generation_receipt.total_device_bytes
+  + scoring_archive_receipt.total_device_bytes
+
+requested_device_sum <= remaining_search_allocation_bytes_after_trim
+requested_device_sum
+  <= same_context_free_bytes - allocator_context_headroom_bytes
+```
+
+Every addition and subtraction above is checked; wrapping and saturating
+arithmetic are forbidden. The four byte fields and their authority identities
+must bind the same device UUID, primary context, stream, active pool, run,
+full-workspace receipt and post-trim receipt. Exact fit on both inequalities is
+GREEN. A budget that is one byte short on either independent inequality returns
+the corresponding typed refusal before native create. The 104-byte host receipt
+is governed by the host allocation ledger and is not added to
+`requested_device_sum`.
+
+### R6 independent admission recorder
+
+The R6 test facade sits on the actual Rust combined-admission path. The valid
+path invokes the native-create facade once, and that facade records the arguments
+of each actual allocator invocation as it occurs. The recorder does not accept
+the declared ledger, cannot copy a receipt into observed state and cannot be
+backfilled after the fact. Its record contains exact length/order plus symbol,
+category, requested bytes, aligned bytes, alignment, flags, stream and pool.
+Its state is private to the test implementation and has no append/setter API;
+the admission seam can affect it only by invoking the facade's native-create,
+host-allocation and async-device-allocation methods with the actual arguments.
+
+Every negative calls the real Rust admission API once, but validation completes
+before native create: native-create count, physical allocator count, generation
+arena count, scoring/archive arena count and forbidden archive-only arena count
+all remain zero, and the observed ledger is empty. The valid case requires one
+native-create call and the exact three entries above. After that admission it
+queues three generations and proves the complete ledger and every allocation
+counter remain byte-for-byte unchanged.
 
 ## Calibration and deadline claims
 
@@ -753,12 +847,125 @@ D2H and record one event after the last combined commit.
 
 Path: `crates/neoethos-gpu-cuda/src/resident_search_v2_tests.rs`
 
-A combined admission with a missing/zero archive arena, mismatched aligned
-field, insufficient reserve or foreign calibration returns a typed admission
-error while generation/scoring/archive allocation counters all remain zero.
-The exact valid receipt performs the layout receipt's declared allocator-symbol,
-order, aligned-byte and category ledger once inside the pre-admission
-interception epoch; no later generation allocates.
+The only companion edit is a `#[cfg(test)]` stub and child-module registration
+in `crates/neoethos-gpu-cuda/src/resident_search_v2.rs`. R6 RED may not touch
+`lib.rs`, any Cargo/build/native file, or any R1-R5 source/test. It is a pure
+host/test-fixture contract and makes no CUDA hardware claim.
+
+The test-only error authority is
+`ResidentSearchSlice2AdmissionErrorV2`, with these exact discriminants and
+payload shapes:
+
+```text
+ImplementationPending
+MissingArchiveArena
+ZeroArchiveArenaBytes
+AlignedLayoutFieldMismatch {
+    field: ResidentSearchSlice2AlignedFieldV2,
+    expected_aligned_bytes: u64,
+    observed_aligned_bytes: u64,
+}
+ReserveAuthorityMismatch {
+    axis: ResidentSearchSlice2ReserveAuthorityAxisV2,
+}
+ReserveArithmeticOverflow {
+    operation: ResidentSearchSlice2ReserveArithmeticV2,
+}
+InsufficientAllocationBudget {
+    axis: ResidentSearchSlice2AllocationBudgetAxisV2,
+    required_bytes: u64,
+    available_bytes: u64,
+}
+ForeignCalibration {
+    axis: ResidentSearchSlice2CalibrationAxisV2,
+}
+```
+
+`ResidentSearchSlice2AlignedFieldV2` has exactly the twelve table-row variants
+`ArchiveGeneScalars`, `ArchiveTermIndices`, `ArchiveTermWeights`,
+`ArchiveMetricRows`, `ArchiveSignatures`, `ArchiveHashes`,
+`CurrentPopulationSignatures`, `NoveltyScores`, `ExactTopKKeys`,
+`AdmissionFlags`, `AdmissionOffsets` and `ArchiveControlAndSeal`.
+
+`ResidentSearchSlice2ReserveAuthorityAxisV2` has the exact axes
+`AllocatorContextHeadroomIdentity`, `FullWorkspaceAuthorityIdentity`,
+`RetainedPreSearchWorkspaceIdentity`,
+`RemainingSearchAllocationAfterTrimIdentity` and
+`RetainedPlusRemainingEqualsFullWorkspace`. The arithmetic operation enum has
+`WorkspacePartitionAdd`, `RequestedDeviceSumAdd` and
+`SameContextFreeMinusHeadroom`. The insufficient-budget axes are
+`RemainingSearchAllocationAfterTrim` and
+`SameContextFreeAfterAllocatorHeadroom`.
+
+`ResidentSearchSlice2CalibrationAxisV2` has the independent axes `DeviceUuid`,
+`PrimaryContext`, `SearchStream`, `ActivePool`, `CudaBuildIdentity`,
+`KernelSemanticsIdentity`, `Binary64MathIdentity`, `PlanIdentity` and
+`RunIdentity`. Each foreign case starts from the otherwise-valid calibration
+receipt and changes exactly one axis.
+
+Exactly these five named tests are the R6 authority:
+
+1. `slice2_combined_admission_rejects_missing_or_zero_archive_arena_before_allocation`
+   covers both absent archive authority and present-but-zero archive bytes. It
+   requires `MissingArchiveArena` and `ZeroArchiveArenaBytes`, respectively.
+2. `slice2_combined_admission_rejects_each_aligned_layout_field_mismatch_before_allocation`
+   mutates each of the twelve aligned fields independently while recomputing the
+   declared subtotal so that subtotal-only validation would pass. Every case
+   requires `AlignedLayoutFieldMismatch` with the exact field and byte payload.
+3. `slice2_combined_admission_rejects_insufficient_reserve_before_allocation`
+   covers every reserve-authority identity and partition relation, all three
+   checked-arithmetic failures, exact fit on both independent budgets and a
+   one-byte-short failure on each budget. Exact fit reaches the otherwise-valid
+   `ImplementationPending` RED seam; each short case returns the exact
+   `InsufficientAllocationBudget` axis and byte payload.
+4. `slice2_combined_admission_rejects_foreign_calibration_before_allocation`
+   changes each calibration axis above independently and requires
+   `ForeignCalibration` with that exact axis.
+5. `slice2_valid_combined_admission_executes_declared_ledger_once_and_later_generations_allocate_nothing`
+   opens the recorder before actual admission, requires one native-create call,
+   compares exact ledger length `3` before full vector equality with the frozen
+   ledger, queues generations one, two and three, and requires the ledger and
+   all allocation counters to remain byte-for-byte equal to the post-admission
+   snapshot.
+
+Every input-rejection case invokes the real Rust admission API exactly once but
+must stop before native create. The native-create count, physical allocator
+count, generation-arena count, scoring/archive-arena count and forbidden
+archive-only-arena count are all zero, and the observed ledger is empty.
+
+The R6 mutation gate must kill every one of these edits:
+
+- delete missing-archive validation or zero-archive validation;
+- validate only the subtotal: each of the twelve fields is independently
+  changed while the subtotal remains self-consistent;
+- replace checked reserve math with wrapping or saturating math;
+- delete any allocator-headroom, full-workspace, retained-workspace, remaining-
+  Search or partition relation;
+- accept exact fit incorrectly or accept a one-byte-short budget;
+- delete any calibration binding, with UUID-only foreign receipt mandatory and
+  context, stream, pool, build, kernel-semantics, binary64-math, plan and run
+  axes independently controlled;
+- copy the declared ledger into observed state instead of recording actual
+  allocator calls;
+- skip or reorder one call; independently change its ordinal, symbol, category,
+  requested bytes, aligned bytes, alignment, flags, stream or resolved pool;
+- prepend or append an extra observed entry, proving a `zip` comparison without
+  exact cardinality cannot pass;
+- allocate again while queueing generation two or generation three.
+
+The RED commit freezes this complete register and the input mutations inside
+the five test bodies, but it cannot truthfully claim to kill implementation
+mutants while the only implementation is the unconditional
+`ImplementationPending` stub. Actual apply/revert mutation kills are mandatory
+against the first passing GREEN implementation that removes that stub, after
+the canonical R1-R9 pure-RED checkpoint. The deferred GREEN receipt does not
+block R7-R9 RED scaffolding after R6 review; it blocks advancing production
+implementation beyond combined-admission GREEN and blocks the authorized RTX
+sequence.
+
+The first R6 commit compiles warning-clean and runs exactly these five tests.
+All five fail at runtime with the typed `ImplementationPending` discriminant;
+there is no compile failure, sixth test, unrelated failure or device execution.
 
 ### R7: executable move-only opacity
 
@@ -906,7 +1113,8 @@ One self-authenticating sequence runs:
    independent `P`, `A`, `W` and `M` shape drift, source-kind/ordinal identity
    drift, binary64 operation/math-mode drift and each tolerance-field drift,
    with the exact typed binding/field refusal, zero combined-admission calls and
-   zero generation/scoring/archive allocation deltas on every rejection;
+   zero generation-arena/scoring-archive-arena/archive-only-arena allocation
+   deltas on every rejection;
 3. at least three resident generations compared to the independent CPU oracle
    by the preloaded test-only device validator for neighbor identities, novelty
    values under the receipt-bound `(2^-50, 2^-48, 4 ULP)` policy, rank, archive
