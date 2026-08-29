@@ -1,0 +1,71 @@
+[package]
+name = "neoethos-resident-search-slice2-ui"
+version = "0.0.0"
+edition = "2024"
+publish = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[workspace]
+members = ["."]
+resolver = "3"
+
+[features]
+default = []
+resident-search-slice2-compile-contract = [
+    "neoethos-search/resident-search-slice2-compile-contract",
+]
+
+[dependencies]
+neoethos-search = { path = "../../..", default-features = false }
+neoethos-gpu-cuda = { path = "../../../../neoethos-gpu-cuda", default-features = false }
+
+[patch.crates-io]
+vector-ta = { path = "../../../../../vendor/vector-ta-0.2.9-patched" }
+
+[[bin]]
+name = "pass_typed_surface"
+path = "pass/typed_surface.rs"
+
+[[bin]]
+name = "fail_clone_owner_e0599"
+path = "fail/clone_owner_e0599.rs"
+
+[[bin]]
+name = "fail_copy_owner_e0277"
+path = "fail/copy_owner_e0277.rs"
+
+[[bin]]
+name = "fail_read_chain_inner_e0616"
+path = "fail/read_chain_inner_e0616.rs"
+
+[[bin]]
+name = "fail_read_ranked_inner_e0616"
+path = "fail/read_ranked_inner_e0616.rs"
+
+[[bin]]
+name = "fail_read_staged_inner_e0616"
+path = "fail/read_staged_inner_e0616.rs"
+
+[[bin]]
+name = "fail_read_pending_inner_e0616"
+path = "fail/read_pending_inner_e0616.rs"
+
+[[bin]]
+name = "fail_call_staged_constructor_e0624"
+path = "fail/call_staged_constructor_e0624.rs"
+
+[[bin]]
+name = "fail_construct_ranked_state_e0451"
+path = "fail/construct_ranked_state_e0451.rs"
+
+[[bin]]
+name = "fail_novelty_receipt_as_full_deadline_e0308"
+path = "fail/novelty_receipt_as_full_deadline_e0308.rs"
+
+[[bin]]
+name = "fail_feature_gate_off_e0432"
+path = "fail/feature_gate_off_e0432.rs"

@@ -1,4 +1,7 @@
 #include "resident_scoring_novelty_v1_abi.cuh"
+#include "resident_archive_knn_v2_abi.cuh"
+#include "resident_scoring_novelty_v2_internal.cuh"
+#include "resident_search_generation_v2_abi.cuh"
 
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
@@ -190,6 +193,8 @@ std::int32_t query_cub_reduce_scratch_bytes_v1(
   const int count = static_cast<int>(plan.logical_population_count);
   auto* input = static_cast<const double*>(nullptr);
   auto* output = static_cast<double*>(nullptr);
+  auto* rank_keys = static_cast<std::uint64_t*>(nullptr);
+  auto* rank_values = static_cast<std::uint64_t*>(nullptr);
   std::size_t candidate = 0;
   std::size_t maximum = 0;
   cudaError_t status =
@@ -200,6 +205,30 @@ std::int32_t query_cub_reduce_scratch_bytes_v1(
   maximum = candidate;
   candidate = 0;
   status = cub::DeviceReduce::Max(nullptr, candidate, input, output, count, stream);
+  if (status != cudaSuccess) {
+    return NEO_SCORING_STATUS_CUB_ERROR_V1;
+  }
+  maximum = candidate > maximum ? candidate : maximum;
+  candidate = 0;
+  status = cub::DeviceRadixSort::SortPairs(
+      nullptr, candidate, rank_keys, rank_keys, rank_values, rank_values,
+      count, 0, 64, stream);
+  if (status != cudaSuccess) {
+    return NEO_SCORING_STATUS_CUB_ERROR_V1;
+  }
+  maximum = candidate > maximum ? candidate : maximum;
+  candidate = 0;
+  status = cub::DeviceRadixSort::SortPairs(
+      nullptr, candidate, rank_keys, rank_keys, rank_values, rank_values,
+      count, 0, 64, stream);
+  if (status != cudaSuccess) {
+    return NEO_SCORING_STATUS_CUB_ERROR_V1;
+  }
+  maximum = candidate > maximum ? candidate : maximum;
+  candidate = 0;
+  status = cub::DeviceRadixSort::SortPairsDescending(
+      nullptr, candidate, rank_keys, rank_keys, rank_values, rank_values,
+      count, 0, 64, stream);
   if (status != cudaSuccess) {
     return NEO_SCORING_STATUS_CUB_ERROR_V1;
   }
@@ -583,6 +612,82 @@ __global__ void seal_scoring_novelty_content_kernel_v1(
   }
 }
 
+__global__ void seal_finite_objective_content_kernel_v2(
+    const NeoResidentScoringNoveltyMetricRowV1* metric_rows,
+    const double* fitness_scores, const std::uint32_t* device_fault_word,
+    NeoResidentScoringNoveltyDeviceSealV1* seal,
+    NeoResidentScoringNoveltyPlanV1 plan) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  seal->abi_version = NEO_RESIDENT_SCORING_NOVELTY_ABI_V1;
+  seal->valid = *device_fault_word == 0 ? 1u : 0u;
+  seal->device_fault_word = *device_fault_word;
+  seal->reserved = 0;
+  std::uint64_t lanes[4] = {FNV_OFFSET_V1,
+                            FNV_OFFSET_V1 ^ 0x9e3779b97f4a7c15ull,
+                            FNV_OFFSET_V1 ^ 0xa0761d6478bd642full,
+                            FNV_OFFSET_V1 ^ 0xe7037ed1a0b428dbull};
+  for (std::uint64_t candidate = 0;
+       candidate < plan.logical_population_count; ++candidate) {
+    const auto& row = metric_rows[candidate];
+    for (std::uint32_t lane = 0; lane < 4; ++lane) {
+      lanes[lane] =
+          hash_mix_v1(lanes[lane], row.candidate_id ^ candidate ^ lane);
+      lanes[lane] = hash_mix_v1(lanes[lane], row.scenario_id ^ lane);
+      lanes[lane] = hash_mix_v1(
+          lanes[lane], f64_bits_v1(fitness_scores[candidate]) ^ lane);
+    }
+    for (std::uint32_t metric = 0; metric < 11; ++metric) {
+      for (std::uint32_t lane = 0; lane < 4; ++lane) {
+        lanes[lane] = hash_mix_v1(
+            lanes[lane], f64_bits_v1(row.values[metric]) ^ lane);
+      }
+    }
+  }
+  for (std::uint32_t identity_index = 0; identity_index < 32;
+       ++identity_index) {
+    const std::uint64_t bound =
+        static_cast<std::uint64_t>(
+            plan.metric_semantics_sha256[identity_index]) |
+        (static_cast<std::uint64_t>(
+             plan.scoring_semantics_sha256[identity_index])
+         << 8) |
+        (static_cast<std::uint64_t>(
+             plan.novelty_semantics_sha256[identity_index])
+         << 16) |
+        (static_cast<std::uint64_t>(plan.rank_semantics_sha256[identity_index])
+         << 24) |
+        (static_cast<std::uint64_t>(
+             plan.cuda_build_manifest_sha256[identity_index])
+         << 32) |
+        (static_cast<std::uint64_t>(
+             plan.cuda_math_flags_sha256[identity_index])
+         << 40);
+    const std::uint64_t execution_and_schema =
+        static_cast<std::uint64_t>(
+            plan.cuda_device_identity_sha256[identity_index]) |
+        (static_cast<std::uint64_t>(
+             plan.primary_context_identity_sha256[identity_index])
+         << 8) |
+        (static_cast<std::uint64_t>(
+             plan.run_stream_identity_sha256[identity_index])
+         << 16) |
+        (static_cast<std::uint64_t>(
+             plan.scenario_order_semantics_sha256[identity_index])
+         << 24) |
+        (static_cast<std::uint64_t>(plan.gene_schema_sha256[identity_index])
+         << 32);
+    for (std::uint32_t lane = 0; lane < 4; ++lane) {
+      lanes[lane] = hash_mix_v1(lanes[lane], bound ^ lane);
+      lanes[lane] = hash_mix_v1(lanes[lane], execution_and_schema ^ lane);
+    }
+  }
+  for (std::uint32_t lane = 0; lane < 4; ++lane) {
+    seal->content_lanes[lane] = seal->valid != 0u ? lanes[lane] : 0ull;
+  }
+}
+
 std::uint32_t grid_for_v1(std::uint64_t count) {
   constexpr std::uint64_t threads = 256;
   return static_cast<std::uint32_t>((count + threads - 1) / threads);
@@ -590,6 +695,151 @@ std::uint32_t grid_for_v1(std::uint64_t count) {
 
 std::int32_t launch_status_v1() {
   return cuda_status_v1(cudaPeekAtLastError());
+}
+
+bool same_slice2_region_v2(
+    const resident_archive_knn_v2::NeoResidentArchiveKnnArenaRegionV2& left,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnArenaRegionV2& right) {
+  return left.offset_bytes == right.offset_bytes &&
+         left.size_bytes == right.size_bytes;
+}
+
+bool valid_slice2_region_v2(
+    const resident_archive_knn_v2::NeoResidentArchiveKnnArenaRegionV2& region,
+    std::uint64_t expected_offset, std::uint64_t expected_size,
+    std::uint64_t* next_offset) {
+  std::uint64_t end = 0;
+  return next_offset != nullptr && region.offset_bytes == expected_offset &&
+         region.offset_bytes % DEVICE_ALIGNMENT_V1 == 0 &&
+         region.size_bytes == expected_size && region.size_bytes != 0 &&
+         region.size_bytes % DEVICE_ALIGNMENT_V1 == 0 &&
+         checked_add_v1(region.offset_bytes, region.size_bytes, &end) &&
+         ((*next_offset = end), true);
+}
+
+bool all_slice2_device_uuid_bytes_present_v2(const std::uint8_t uuid[16]) {
+  std::uint8_t aggregate = 0;
+  for (std::size_t index = 0; index < 16; ++index) {
+    aggregate |= uuid[index];
+  }
+  return aggregate != 0;
+}
+
+bool validate_slice2_combined_binding_v2(
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding) {
+  using namespace resident_archive_knn_v2;
+  if (binding == nullptr ||
+      binding->abi_version != NEO_RESIDENT_ARCHIVE_KNN_ABI_V2 ||
+      binding->reserved != 0u ||
+      binding->population_count != NEO_RESIDENT_ARCHIVE_KNN_POPULATION_COUNT_V2 ||
+      binding->archive_capacity != NEO_RESIDENT_ARCHIVE_KNN_CAPACITY_V2 ||
+      binding->signature_word_count !=
+          NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 ||
+      binding->novelty_neighbor_count != NEO_RESIDENT_ARCHIVE_KNN_K_V2 ||
+      binding->max_terms_per_gene != NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 ||
+      binding->reserved_extents != 0u || binding->total_device_bytes == 0ull ||
+      binding->total_device_bytes >
+          static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+      !all_slice2_device_uuid_bytes_present_v2(binding->device_uuid) ||
+      binding->primary_context_identity == 0ull ||
+      binding->search_stream_identity == 0ull ||
+      binding->active_pool_identity == 0ull ||
+      binding->cuda_build_identity == 0ull ||
+      binding->kernel_semantics_identity == 0ull ||
+      binding->binary64_math_identity == 0ull ||
+      binding->plan_identity == 0ull || binding->run_identity == 0ull ||
+      binding->full_workspace_receipt_identity == 0ull ||
+      binding->post_trim_receipt_identity == 0ull) {
+    return false;
+  }
+
+  std::uint64_t cursor = 0;
+  if (!valid_slice2_region_v2(binding->fitness_scores, cursor, 1'792,
+                              &cursor) ||
+      !valid_slice2_region_v2(binding->decision_keys, cursor, 1'792,
+                              &cursor) ||
+      binding->cub_scratch.offset_bytes != cursor ||
+      binding->cub_scratch.size_bytes == 0ull ||
+      binding->cub_scratch.offset_bytes % DEVICE_ALIGNMENT_V1 != 0 ||
+      binding->cub_scratch.size_bytes % DEVICE_ALIGNMENT_V1 != 0 ||
+      !checked_add_v1(binding->cub_scratch.offset_bytes,
+                      binding->cub_scratch.size_bytes, &cursor) ||
+      !valid_slice2_region_v2(binding->archive_gene_scalars, cursor,
+                              3'600'128, &cursor) ||
+      !valid_slice2_region_v2(binding->archive_term_indices, cursor,
+                              6'400'000, &cursor) ||
+      !valid_slice2_region_v2(binding->archive_term_weights, cursor,
+                              6'400'000, &cursor) ||
+      !valid_slice2_region_v2(binding->archive_metric_rows, cursor,
+                              5'200'128, &cursor) ||
+      !valid_slice2_region_v2(binding->archive_signatures, cursor, 1'600'000,
+                              &cursor) ||
+      !valid_slice2_region_v2(binding->archive_hashes, cursor, 400'128,
+                              &cursor) ||
+      !valid_slice2_region_v2(binding->current_population_signatures, cursor,
+                              6'400, &cursor) ||
+      !valid_slice2_region_v2(binding->novelty_scores, cursor, 1'792,
+                              &cursor) ||
+      !valid_slice2_region_v2(binding->exact_top_k_keys, cursor, 96'000,
+                              &cursor) ||
+      !valid_slice2_region_v2(binding->admission_flags, cursor, 1'024,
+                              &cursor) ||
+      !valid_slice2_region_v2(binding->admission_offsets, cursor, 1'792,
+                              &cursor) ||
+      !valid_slice2_region_v2(binding->archive_control_and_seal, cursor, 256,
+                              &cursor)) {
+    return false;
+  }
+  return cursor == binding->total_device_bytes;
+}
+
+bool same_slice2_binding_v2(
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2& left,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2& right) {
+  const bool same_regions =
+      same_slice2_region_v2(left.fitness_scores, right.fitness_scores) &&
+      same_slice2_region_v2(left.decision_keys, right.decision_keys) &&
+      same_slice2_region_v2(left.cub_scratch, right.cub_scratch) &&
+      same_slice2_region_v2(left.archive_gene_scalars,
+                            right.archive_gene_scalars) &&
+      same_slice2_region_v2(left.archive_term_indices,
+                            right.archive_term_indices) &&
+      same_slice2_region_v2(left.archive_term_weights,
+                            right.archive_term_weights) &&
+      same_slice2_region_v2(left.archive_metric_rows,
+                            right.archive_metric_rows) &&
+      same_slice2_region_v2(left.archive_signatures,
+                            right.archive_signatures) &&
+      same_slice2_region_v2(left.archive_hashes, right.archive_hashes) &&
+      same_slice2_region_v2(left.current_population_signatures,
+                            right.current_population_signatures) &&
+      same_slice2_region_v2(left.novelty_scores, right.novelty_scores) &&
+      same_slice2_region_v2(left.exact_top_k_keys, right.exact_top_k_keys) &&
+      same_slice2_region_v2(left.admission_flags, right.admission_flags) &&
+      same_slice2_region_v2(left.admission_offsets, right.admission_offsets) &&
+      same_slice2_region_v2(left.archive_control_and_seal,
+                            right.archive_control_and_seal);
+  return same_regions && left.abi_version == right.abi_version &&
+         left.reserved == right.reserved &&
+         left.total_device_bytes == right.total_device_bytes &&
+         left.population_count == right.population_count &&
+         left.archive_capacity == right.archive_capacity &&
+         left.signature_word_count == right.signature_word_count &&
+         left.novelty_neighbor_count == right.novelty_neighbor_count &&
+         left.max_terms_per_gene == right.max_terms_per_gene &&
+         left.reserved_extents == right.reserved_extents &&
+         std::memcmp(left.device_uuid, right.device_uuid, 16) == 0 &&
+         left.primary_context_identity == right.primary_context_identity &&
+         left.search_stream_identity == right.search_stream_identity &&
+         left.active_pool_identity == right.active_pool_identity &&
+         left.cuda_build_identity == right.cuda_build_identity &&
+         left.kernel_semantics_identity == right.kernel_semantics_identity &&
+         left.binary64_math_identity == right.binary64_math_identity &&
+         left.plan_identity == right.plan_identity &&
+         left.run_identity == right.run_identity &&
+         left.full_workspace_receipt_identity ==
+             right.full_workspace_receipt_identity &&
+         left.post_trim_receipt_identity == right.post_trim_receipt_identity;
 }
 
 }  // namespace
@@ -616,13 +866,57 @@ struct NeoResidentScoringNoveltyRunV1 {
   double* max_fitness_device;
   double* max_novelty_device;
   NeoResidentScoringNoveltyDeviceSealV1* device_seal;
+  std::uint64_t* slice2_current_population_signatures_device;
+  resident_archive_knn_v2::NeoResidentArchiveKnnBindV2
+      retained_slice2_binding_v2;
   std::uint64_t feature_word_count;
   std::uint64_t same_stream_enqueue_count;
   std::uint64_t next_event_id;
+  std::uint32_t selected_cuda_ordinal_v2;
   bool sealed;
+  bool bound_v2;
+  bool slice2_combined_arena_v2;
+  bool poisoned_v2;
+  bool allocation_free_issued_v2;
+  bool free_outcome_unknown_deliberate_leak_v2;
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+  std::uint32_t fixture_metric_mode_v2;
+  std::uint32_t fixture_metric_fault_enabled_v2;
+  std::uint32_t fixture_metric_fault_slot_v2;
+  std::uint64_t fixture_metric_fault_bits_v2;
+#endif
 };
 
 namespace {
+
+void* retire_scoring_allocation_identity_v2(
+    NeoResidentScoringNoveltyRunV1* run) {
+  if (run == nullptr || run->allocation_free_issued_v2) {
+    return nullptr;
+  }
+  void* allocation_to_retire = run->allocation_base;
+  run->allocation_base = nullptr;
+  run->set_words_device = nullptr;
+  run->fitness_scores_device = nullptr;
+  run->novelty_scores_device = nullptr;
+  run->decision_keys_device = nullptr;
+  run->cub_scratch_device = nullptr;
+  run->device_fault_word = nullptr;
+  run->min_fitness_device = nullptr;
+  run->max_fitness_device = nullptr;
+  run->max_novelty_device = nullptr;
+  run->device_seal = nullptr;
+  run->slice2_current_population_signatures_device = nullptr;
+  run->retained_slice2_binding_v2 = {};
+  run->slice2_combined_arena_v2 = false;
+  run->allocation_free_issued_v2 = true;
+  // CUDA's stream-ordered allocator contract says cudaFreeAsync may surface a
+  // prior asynchronous error. The identity is therefore retired before
+  // invocation and is never queried, accessed, or freed again, regardless of
+  // the returned status:
+  // https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY__POOLS.html
+  return allocation_to_retire;
+}
 
 bool partition_allocation_v1(NeoResidentScoringNoveltyRunV1* run) {
   if (run == nullptr || run->allocation_base == nullptr) {
@@ -655,6 +949,73 @@ bool partition_allocation_v1(NeoResidentScoringNoveltyRunV1* run) {
          run->fitness_scores_device != nullptr && run->novelty_scores_device != nullptr &&
          run->decision_keys_device != nullptr && run->cub_scratch_device != nullptr &&
          run->device_fault_word != nullptr && run->device_seal != nullptr;
+}
+
+bool partition_slice2_combined_arena_v2(
+    NeoResidentScoringNoveltyRunV1* run,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2& binding) {
+  using namespace resident_scoring_novelty_v2_internal;
+  if (run == nullptr || run->allocation_base == nullptr ||
+      run->allocation.total_device_bytes != binding.total_device_bytes ||
+      binding.archive_control_and_seal.size_bytes <
+          NEO_RESIDENT_SCORING_SLICE2_CONTROL_BYTES_V2) {
+    return false;
+  }
+  auto* base = static_cast<std::uint8_t*>(run->allocation_base);
+  run->set_words_device = nullptr;
+  run->fitness_scores_device = reinterpret_cast<double*>(
+      base + binding.fitness_scores.offset_bytes);
+  run->decision_keys_device = reinterpret_cast<std::uint64_t*>(
+      base + binding.decision_keys.offset_bytes);
+  run->cub_scratch_device = base + binding.cub_scratch.offset_bytes;
+  run->slice2_current_population_signatures_device =
+      reinterpret_cast<std::uint64_t*>(
+          base + binding.current_population_signatures.offset_bytes);
+  run->novelty_scores_device =
+      reinterpret_cast<double*>(base + binding.novelty_scores.offset_bytes);
+  auto* control = base + binding.archive_control_and_seal.offset_bytes;
+  run->device_fault_word = reinterpret_cast<std::uint32_t*>(control);
+  run->min_fitness_device = nullptr;
+  run->max_fitness_device = nullptr;
+  run->max_novelty_device = nullptr;
+  run->device_seal =
+      reinterpret_cast<NeoResidentScoringNoveltyDeviceSealV1*>(control + 8);
+  return run->fitness_scores_device != nullptr &&
+         run->decision_keys_device != nullptr &&
+         run->cub_scratch_device != nullptr &&
+         run->slice2_current_population_signatures_device != nullptr &&
+         run->novelty_scores_device != nullptr &&
+         run->device_fault_word != nullptr && run->device_seal != nullptr;
+}
+
+bool validate_slice2_population_source_v2(
+    const NeoResidentScoringNoveltyRunV1* run,
+    const resident_search_generation_v2::NeoResidentScoringPopulationSourceV2*
+        population) {
+  using namespace resident_search_generation_v2;
+  return run != nullptr && population != nullptr &&
+         run->slice2_combined_arena_v2 && !run->poisoned_v2 &&
+         !run->allocation_free_issued_v2 && run->allocation_base != nullptr &&
+         run->admitted_run_stream != nullptr &&
+         run->fitness_scores_device != nullptr &&
+         run->decision_keys_device != nullptr &&
+         run->device_fault_word != nullptr && run->device_seal != nullptr &&
+         population->abi_version == NEO_RESIDENT_SEARCH_GENERATION_ABI_V2 &&
+         population->reserved == 0u && population->receipt_token != nullptr &&
+         population->population_lifetime_owner != nullptr &&
+         population->selected_cuda_ordinal == run->selected_cuda_ordinal_v2 &&
+         population->admitted_run_stream == run->admitted_run_stream &&
+         population->metrics_ready_event != nullptr &&
+         population->scoring_ready_event == run->scoring_novelty_ready_event &&
+         population->metrics_ready_event != population->scoring_ready_event &&
+         population->metric_rows_device != nullptr &&
+         population->expected_scenario_ids_device != nullptr &&
+         population->logical_population_count ==
+             run->plan.logical_population_count &&
+         population->feature_count == run->plan.feature_count &&
+         population->max_terms_per_gene == run->plan.max_terms_per_gene &&
+         population->full_discovery_reserve_bytes ==
+             run->allocation.full_discovery_reserve_bytes;
 }
 
 std::int32_t record_ready_event_v1(NeoResidentScoringNoveltyRunV1* run,
@@ -834,11 +1195,290 @@ extern "C" std::int32_t create_resident_scoring_novelty_run_v1(
   return NEO_SCORING_STATUS_OK_V1;
 }
 
+extern "C" std::int32_t query_resident_scoring_admission_v2(
+    const NeoResidentScoringAdmissionV2* admission,
+    const NeoResidentScoringNoveltyPlanV1* plan,
+    NeoResidentScoringNoveltyAllocationReceiptV1* receipt) {
+  if (!validate_scoring_admission_v2(admission, plan) || receipt == nullptr) {
+    return NEO_SCORING_STATUS_INVALID_ARGUMENT_V1;
+  }
+  int current_device = -1;
+  if (cudaGetDevice(&current_device) != cudaSuccess || current_device < 0 ||
+      static_cast<std::uint32_t>(current_device) !=
+          admission->selected_cuda_ordinal) {
+    return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
+  }
+  std::size_t same_context_free_bytes = 0;
+  std::size_t same_context_total_bytes = 0;
+  if (cudaMemGetInfo(&same_context_free_bytes, &same_context_total_bytes) !=
+      cudaSuccess) {
+    return NEO_SCORING_STATUS_CUDA_ERROR_V1;
+  }
+  (void)same_context_total_bytes;
+  return calculate_resident_scoring_allocation_v2(
+      plan, admission->admitted_run_stream, same_context_free_bytes,
+      admission->full_discovery_reserve_bytes, receipt);
+}
+
+extern "C" std::int32_t calculate_resident_scoring_allocation_v2(
+    const NeoResidentScoringNoveltyPlanV1* plan,
+    cudaStream_t admitted_run_stream,
+    std::uint64_t same_context_free_bytes,
+    std::uint64_t full_discovery_reserve_bytes,
+    NeoResidentScoringNoveltyAllocationReceiptV1* receipt) {
+  if (plan == nullptr || receipt == nullptr || admitted_run_stream == nullptr) {
+    return NEO_SCORING_STATUS_INVALID_ARGUMENT_V1;
+  }
+  if (plan->abi_version != NEO_RESIDENT_SCORING_NOVELTY_ABI_V1) {
+    return NEO_SCORING_STATUS_ABI_MISMATCH_V1;
+  }
+  if (!validate_plan_v1(plan)) {
+    return NEO_SCORING_STATUS_INVALID_ARGUMENT_V1;
+  }
+  PhysicalLayoutV1 layout{};
+  if (!checked_physical_layout_v1(*plan, admitted_run_stream, &layout)) {
+    return NEO_SCORING_STATUS_ARITHMETIC_OVERFLOW_V1;
+  }
+  if (full_discovery_reserve_bytes > same_context_free_bytes ||
+      layout.total_device_bytes >
+          same_context_free_bytes - full_discovery_reserve_bytes) {
+    return NEO_SCORING_STATUS_OUT_OF_MEMORY_V1;
+  }
+  std::memset(receipt, 0, sizeof(*receipt));
+  receipt->abi_version = NEO_RESIDENT_SCORING_NOVELTY_ABI_V1;
+  receipt->scoring_store_allocation_count = 1;
+  receipt->set_bitmap_bytes = layout.set_bitmap_bytes;
+  receipt->fitness_score_bytes = layout.fitness_score_bytes;
+  receipt->novelty_score_bytes = layout.novelty_score_bytes;
+  receipt->decision_key_bytes = layout.decision_key_bytes;
+  receipt->cub_scratch_bytes = layout.cub_scratch_bytes;
+  receipt->device_control_bytes = layout.device_control_bytes;
+  receipt->total_device_bytes = layout.total_device_bytes;
+  receipt->same_context_free_bytes = same_context_free_bytes;
+  receipt->full_discovery_reserve_bytes = full_discovery_reserve_bytes;
+  receipt->logical_population_count = plan->logical_population_count;
+  receipt->feature_word_count = layout.feature_word_count;
+  copy_identity_v1(receipt->allocation_plan_sha256,
+                   plan->plan_identity_sha256);
+  return NEO_SCORING_STATUS_OK_V1;
+}
+
+extern "C" std::int32_t create_unbound_resident_scoring_run_v2(
+    const NeoResidentScoringAdmissionV2* admission,
+    const NeoResidentScoringNoveltyPlanV1* plan,
+    const NeoResidentScoringNoveltyAllocationReceiptV1* receipt,
+    NeoResidentScoringNoveltyRunV1** run) {
+  if (!validate_scoring_admission_v2(admission, plan) || receipt == nullptr ||
+      run == nullptr || *run != nullptr ||
+      receipt->abi_version != NEO_RESIDENT_SCORING_NOVELTY_ABI_V1 ||
+      receipt->scoring_store_allocation_count != 1 ||
+      receipt->logical_population_count != plan->logical_population_count ||
+      receipt->full_discovery_reserve_bytes !=
+          admission->full_discovery_reserve_bytes ||
+      !identity_equal_v1(receipt->allocation_plan_sha256,
+                         plan->plan_identity_sha256)) {
+    return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
+  }
+  auto* created = new (std::nothrow) NeoResidentScoringNoveltyRunV1{};
+  if (created == nullptr) {
+    return NEO_SCORING_STATUS_OUT_OF_MEMORY_V1;
+  }
+  created->plan = *plan;
+  created->allocation = *receipt;
+  created->admitted_run_stream = admission->admitted_run_stream;
+  created->scoring_novelty_ready_event =
+      admission->scoring_novelty_ready_event;
+  created->feature_word_count = receipt->feature_word_count;
+  created->same_stream_enqueue_count = 0;
+  created->next_event_id = 0;
+  created->sealed = false;
+  created->bound_v2 = false;
+  created->poisoned_v2 = false;
+  created->allocation_free_issued_v2 = false;
+  created->free_outcome_unknown_deliberate_leak_v2 = false;
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+  created->fixture_metric_mode_v2 = 0;
+  created->fixture_metric_fault_enabled_v2 = 0;
+  created->fixture_metric_fault_slot_v2 = 0;
+  created->fixture_metric_fault_bits_v2 = 0;
+#endif
+  void* attempted_allocation = nullptr;
+  cudaError_t status = cudaMallocAsync(
+      &attempted_allocation,
+      static_cast<std::size_t>(receipt->total_device_bytes),
+      created->admitted_run_stream);
+  if (status != cudaSuccess) {
+    // Runtime allocation APIs may surface an earlier asynchronous fault. An
+    // attempted output identity is deliberately discarded without query/free.
+    attempted_allocation = nullptr;
+    delete created;
+    return NEO_SCORING_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2;
+  }
+  created->allocation_base = attempted_allocation;
+  if (!partition_allocation_v1(created)) {
+    void* allocation_to_retire =
+        retire_scoring_allocation_identity_v2(created);
+    const cudaError_t release_status =
+        cudaFreeAsync(allocation_to_retire, created->admitted_run_stream);
+    if (release_status != cudaSuccess) {
+      created->poisoned_v2 = true;
+      created->free_outcome_unknown_deliberate_leak_v2 = true;
+      delete created;
+      return NEO_SCORING_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2;
+    }
+    delete created;
+    return NEO_SCORING_STATUS_ARITHMETIC_OVERFLOW_V1;
+  }
+  *run = created;
+  return NEO_SCORING_STATUS_OK_V1;
+}
+
+extern "C" std::int32_t bind_and_seal_resident_scoring_v2(
+    NeoResidentScoringNoveltyRunV1* run,
+    const NeoResidentScoringNoveltyPopulationImportV1* population,
+    NeoResidentScoredDecisionRowsV1* output,
+    NeoResidentScoringNoveltyReadyEventV1* ready) {
+  if (run == nullptr || population == nullptr || output == nullptr ||
+      ready == nullptr || run->sealed || run->bound_v2 ||
+      run->slice2_combined_arena_v2 ||
+      run->plan.novelty_weight_bits != 0ull ||
+      population->abi_version != NEO_RESIDENT_SCORING_NOVELTY_ABI_V1 ||
+      population->admitted_run_stream != run->admitted_run_stream ||
+      population->scoring_novelty_ready_event !=
+          run->scoring_novelty_ready_event ||
+      population->metrics_ready_event == nullptr ||
+      population->metrics_ready_event ==
+          population->scoring_novelty_ready_event ||
+      population->population_lifetime_owner == nullptr ||
+      population->metric_rows_device == nullptr ||
+      population->gene_scalars_device == nullptr ||
+      population->gene_indices_device == nullptr ||
+      population->expected_scenario_ids_device == nullptr ||
+      population->logical_population_count !=
+          run->plan.logical_population_count ||
+      population->feature_count != run->plan.feature_count ||
+      population->max_terms_per_gene != run->plan.max_terms_per_gene ||
+      !identity_equal_v1(population->cuda_device_identity_sha256,
+                         run->plan.cuda_device_identity_sha256) ||
+      !identity_equal_v1(population->primary_context_identity_sha256,
+                         run->plan.primary_context_identity_sha256) ||
+      !identity_equal_v1(population->run_stream_identity_sha256,
+                         run->plan.run_stream_identity_sha256) ||
+      !identity_equal_v1(population->metric_semantics_sha256,
+                         run->plan.metric_semantics_sha256) ||
+      !identity_equal_v1(population->gene_schema_sha256,
+                         run->plan.gene_schema_sha256) ||
+      !identity_equal_v1(population->scenario_order_semantics_sha256,
+                         run->plan.scenario_order_semantics_sha256) ||
+      !identity_equal_v1(population->cuda_build_manifest_sha256,
+                         run->plan.cuda_build_manifest_sha256) ||
+      !identity_equal_v1(population->cuda_math_flags_sha256,
+                         run->plan.cuda_math_flags_sha256)) {
+    return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
+  }
+  run->metrics_ready_event = population->metrics_ready_event;
+  run->population_lifetime_owner = population->population_lifetime_owner;
+  run->metric_rows_device = population->metric_rows_device;
+  run->gene_scalars_device = population->gene_scalars_device;
+  run->gene_indices_device = population->gene_indices_device;
+  run->expected_scenario_ids_device =
+      population->expected_scenario_ids_device;
+  run->bound_v2 = true;
+  if (cudaStreamWaitEvent(run->admitted_run_stream, run->metrics_ready_event,
+                          0) != cudaSuccess ||
+      cudaMemsetAsync(run->allocation_base, 0,
+                      static_cast<std::size_t>(
+                          run->allocation.total_device_bytes),
+                      run->admitted_run_stream) != cudaSuccess) {
+    return NEO_SCORING_STATUS_CUDA_ERROR_V1;
+  }
+  run->same_stream_enqueue_count += 2;
+  constexpr std::uint32_t threads = 256;
+  const std::uint32_t grid = grid_for_v1(run->plan.logical_population_count);
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+  if (run->fixture_metric_mode_v2 != 0u ||
+      run->fixture_metric_fault_enabled_v2 != 0u) {
+    fixture_rewrite_resident_metric_rows_kernel_v2<<<
+        grid, threads, 0, run->admitted_run_stream>>>(
+        const_cast<NeoResidentScoringNoveltyMetricRowV1*>(
+            run->metric_rows_device),
+        run->plan.logical_population_count, run->fixture_metric_mode_v2,
+        run->fixture_metric_fault_enabled_v2,
+        run->fixture_metric_fault_slot_v2,
+        run->fixture_metric_fault_bits_v2);
+    ++run->same_stream_enqueue_count;
+    const std::int32_t fixture_status = launch_status_v1();
+    if (fixture_status != NEO_SCORING_STATUS_OK_V1) {
+      return fixture_status;
+    }
+  }
+#endif
+  score_canonical_metrics_kernel_v1<<<grid, threads, 0,
+                                      run->admitted_run_stream>>>(
+      run->metric_rows_device, run->fitness_scores_device,
+      run->device_fault_word, run->plan);
+  ++run->same_stream_enqueue_count;
+  std::int32_t status = launch_status_v1();
+  if (status != NEO_SCORING_STATUS_OK_V1) {
+    return status;
+  }
+  encode_finite_objective_keys_kernel_v2<<<grid, threads, 0,
+                                            run->admitted_run_stream>>>(
+      run->fitness_scores_device, run->decision_keys_device,
+      run->device_fault_word, run->plan.logical_population_count);
+  ++run->same_stream_enqueue_count;
+  status = launch_status_v1();
+  if (status != NEO_SCORING_STATUS_OK_V1) {
+    return status;
+  }
+  seal_scoring_novelty_content_kernel_v1<<<1, 1, 0,
+                                            run->admitted_run_stream>>>(
+      run->metric_rows_device, run->decision_keys_device,
+      run->device_fault_word, run->device_seal, run->plan);
+  ++run->same_stream_enqueue_count;
+  status = launch_status_v1();
+  if (status != NEO_SCORING_STATUS_OK_V1) {
+    return status;
+  }
+  run->sealed = true;
+  status = record_ready_event_v1(run, ready);
+  if (status != NEO_SCORING_STATUS_OK_V1) {
+    return status;
+  }
+  std::memset(output, 0, sizeof(*output));
+  output->abi_version = NEO_RESIDENT_SCORING_NOVELTY_ABI_V1;
+  output->metric_rows_device = run->metric_rows_device;
+  output->resident_decision_keys_device = run->decision_keys_device;
+  output->expected_scenario_ids_device =
+      run->expected_scenario_ids_device;
+  output->device_seal = run->device_seal;
+  output->scoring_novelty_ready_event = run->scoring_novelty_ready_event;
+  output->logical_population_count = run->plan.logical_population_count;
+  output->event_id = ready->event_id;
+  output->same_stream_enqueue_count = ready->same_stream_enqueue_count;
+  copy_identity_v1(output->metric_semantics_sha256,
+                   run->plan.metric_semantics_sha256);
+  copy_identity_v1(output->scoring_semantics_sha256,
+                   run->plan.scoring_semantics_sha256);
+  copy_identity_v1(output->novelty_semantics_sha256,
+                   run->plan.novelty_semantics_sha256);
+  copy_identity_v1(output->scenario_order_semantics_sha256,
+                   run->plan.scenario_order_semantics_sha256);
+  copy_identity_v1(output->rank_semantics_sha256,
+                   run->plan.rank_semantics_sha256);
+  copy_identity_v1(output->cuda_build_manifest_sha256,
+                   run->plan.cuda_build_manifest_sha256);
+  copy_identity_v1(output->cuda_math_flags_sha256,
+                   run->plan.cuda_math_flags_sha256);
+  return NEO_SCORING_STATUS_OK_V1;
+}
+
 extern "C" std::int32_t enqueue_and_seal_resident_scoring_novelty_v1(
     NeoResidentScoringNoveltyRunV1* run,
     NeoResidentScoredDecisionRowsV1* output,
     NeoResidentScoringNoveltyReadyEventV1* ready) {
-  if (run == nullptr || output == nullptr || ready == nullptr || run->sealed) {
+  if (run == nullptr || output == nullptr || ready == nullptr || run->sealed ||
+      run->slice2_combined_arena_v2) {
     return NEO_SCORING_STATUS_STATE_ERROR_V1;
   }
   cudaError_t cuda_status = cudaMemsetAsync(
@@ -971,4 +1611,274 @@ extern "C" std::int32_t enqueue_resident_scoring_novelty_release_v1(
   return NEO_SCORING_STATUS_OK_V1;
 }
 
+extern "C" std::int32_t enqueue_resident_scoring_release_v2(
+    NeoResidentScoringNoveltyRunV1* run) {
+  return enqueue_resident_scoring_novelty_release_v1(run);
+}
+
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+extern "C" std::int32_t fixture_set_resident_scoring_metric_mode_v2(
+    NeoResidentScoringNoveltyRunV1* run, std::uint32_t mode) {
+  if (run == nullptr || run->sealed || run->bound_v2 ||
+      run->slice2_combined_arena_v2 || mode > 3u) {
+    return NEO_SCORING_STATUS_STATE_ERROR_V1;
+  }
+  run->fixture_metric_mode_v2 = mode;
+  return NEO_SCORING_STATUS_OK_V1;
+}
+
+extern "C" std::int32_t fixture_set_resident_scoring_metric_fault_v2(
+    NeoResidentScoringNoveltyRunV1* run, std::uint32_t metric_slot,
+    std::uint64_t nonfinite_bits) {
+  double value = 0.0;
+  std::memcpy(&value, &nonfinite_bits, sizeof(value));
+  if (run == nullptr || run->sealed || run->bound_v2 ||
+      run->slice2_combined_arena_v2 || metric_slot >= 11u || isfinite(value)) {
+    return NEO_SCORING_STATUS_STATE_ERROR_V1;
+  }
+  run->fixture_metric_fault_enabled_v2 = 1u;
+  run->fixture_metric_fault_slot_v2 = metric_slot;
+  run->fixture_metric_fault_bits_v2 = nonfinite_bits;
+  return NEO_SCORING_STATUS_OK_V1;
+}
+
+extern "C" std::int32_t fixture_copy_resident_scoring_snapshot_v2(
+    NeoResidentScoringNoveltyRunV1* run,
+    NeoResidentScoringNoveltyMetricRowV1* metric_rows_host,
+    double* fitness_scores_host, std::uint64_t* decision_keys_host,
+    std::uint64_t capacity, NeoResidentScoringFixtureSnapshotV2* snapshot) {
+  if (run == nullptr || metric_rows_host == nullptr ||
+      fitness_scores_host == nullptr || decision_keys_host == nullptr ||
+      snapshot == nullptr || !run->bound_v2 || !run->sealed ||
+      run->slice2_combined_arena_v2 ||
+      capacity != run->plan.logical_population_count) {
+    return NEO_SCORING_STATUS_STATE_ERROR_V1;
+  }
+  const std::size_t count = static_cast<std::size_t>(capacity);
+  const std::size_t metric_bytes =
+      count * sizeof(NeoResidentScoringNoveltyMetricRowV1);
+  const std::size_t score_bytes = count * sizeof(double);
+  const std::size_t key_bytes = count * sizeof(std::uint64_t);
+  NeoResidentScoringNoveltyDeviceSealV1 seal{};
+  if (cudaStreamSynchronize(run->admitted_run_stream) != cudaSuccess ||
+      cudaMemcpy(metric_rows_host, run->metric_rows_device, metric_bytes,
+                 cudaMemcpyDeviceToHost) != cudaSuccess ||
+      cudaMemcpy(fitness_scores_host, run->fitness_scores_device, score_bytes,
+                 cudaMemcpyDeviceToHost) != cudaSuccess ||
+      cudaMemcpy(decision_keys_host, run->decision_keys_device, key_bytes,
+                 cudaMemcpyDeviceToHost) != cudaSuccess ||
+      cudaMemcpy(&seal, run->device_seal, sizeof(seal),
+                 cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return NEO_SCORING_STATUS_CUDA_ERROR_V1;
+  }
+  *snapshot = {};
+  snapshot->abi_version = 2u;
+  snapshot->scoring_objective = run->plan.scoring_objective;
+  snapshot->device_fault_word = seal.device_fault_word;
+  snapshot->logical_population_count = capacity;
+  snapshot->terminal_synchronization_count = 1;
+  snapshot->terminal_readback_count = 4;
+  snapshot->terminal_readback_bytes =
+      metric_bytes + score_bytes + key_bytes + sizeof(seal);
+  return NEO_SCORING_STATUS_OK_V1;
+}
+#endif
+
 }  // namespace neoethos::resident_scoring_novelty_v1
+
+namespace neoethos::resident_scoring_novelty_v2_internal {
+
+std::int32_t create_slice2_combined_scoring_archive_run_v2(
+    const resident_scoring_novelty_v1::NeoResidentScoringAdmissionV2*
+        admission,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* plan,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
+    resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1** run) {
+  using namespace resident_scoring_novelty_v1;
+  if (!validate_scoring_admission_v2(admission, plan) ||
+      !validate_slice2_combined_binding_v2(binding) || run == nullptr ||
+      *run != nullptr ||
+      binding->population_count != plan->logical_population_count ||
+      binding->max_terms_per_gene != plan->max_terms_per_gene) {
+    return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
+  }
+  int current_device = -1;
+  if (cudaGetDevice(&current_device) != cudaSuccess || current_device < 0 ||
+      static_cast<std::uint32_t>(current_device) !=
+          admission->selected_cuda_ordinal) {
+    return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
+  }
+
+  auto* created = new (std::nothrow) NeoResidentScoringNoveltyRunV1{};
+  if (created == nullptr) {
+    return NEO_SCORING_STATUS_OUT_OF_MEMORY_V1;
+  }
+  created->plan = *plan;
+  created->allocation = {};
+  created->allocation.abi_version = NEO_RESIDENT_SCORING_NOVELTY_ABI_V1;
+  created->allocation.scoring_store_allocation_count = 1;
+  created->allocation.fitness_score_bytes = binding->fitness_scores.size_bytes;
+  created->allocation.novelty_score_bytes = binding->novelty_scores.size_bytes;
+  created->allocation.decision_key_bytes = binding->decision_keys.size_bytes;
+  created->allocation.cub_scratch_bytes = binding->cub_scratch.size_bytes;
+  created->allocation.device_control_bytes =
+      binding->archive_control_and_seal.size_bytes;
+  created->allocation.total_device_bytes = binding->total_device_bytes;
+  created->allocation.full_discovery_reserve_bytes =
+      admission->full_discovery_reserve_bytes;
+  created->allocation.logical_population_count = plan->logical_population_count;
+  copy_identity_v1(created->allocation.allocation_plan_sha256,
+                   plan->plan_identity_sha256);
+  created->admitted_run_stream = admission->admitted_run_stream;
+  created->scoring_novelty_ready_event =
+      admission->scoring_novelty_ready_event;
+  created->feature_word_count = 0;
+  created->same_stream_enqueue_count = 0;
+  created->next_event_id = 0;
+  created->selected_cuda_ordinal_v2 = admission->selected_cuda_ordinal;
+  created->sealed = false;
+  created->bound_v2 = false;
+  created->poisoned_v2 = false;
+  created->allocation_free_issued_v2 = false;
+  created->free_outcome_unknown_deliberate_leak_v2 = false;
+  created->retained_slice2_binding_v2 = *binding;
+
+  void* attempted_allocation = nullptr;
+  const cudaError_t status = cudaMallocAsync(
+      &attempted_allocation,
+      static_cast<std::size_t>(binding->total_device_bytes),
+      created->admitted_run_stream);
+  if (status != cudaSuccess) {
+    attempted_allocation = nullptr;
+    delete created;
+    return NEO_SCORING_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2;
+  }
+  created->allocation_base = attempted_allocation;
+  if (!partition_slice2_combined_arena_v2(created, *binding)) {
+    void* allocation_to_retire = retire_scoring_allocation_identity_v2(created);
+    const cudaError_t release_status =
+        cudaFreeAsync(allocation_to_retire, created->admitted_run_stream);
+    if (release_status != cudaSuccess) {
+      created->poisoned_v2 = true;
+      created->free_outcome_unknown_deliberate_leak_v2 = true;
+      delete created;
+      return NEO_SCORING_STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2;
+    }
+    delete created;
+    return NEO_SCORING_STATUS_ARITHMETIC_OVERFLOW_V1;
+  }
+  created->slice2_combined_arena_v2 = true;
+  *run = created;
+  return NEO_SCORING_STATUS_OK_V1;
+}
+
+std::int32_t borrow_resident_scoring_archive_arena_v2(
+    resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1* run,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
+    ResidentScoringArenaAccessV2* access) {
+  using namespace resident_scoring_novelty_v1;
+  if (access != nullptr) {
+    *access = {};
+  }
+  if (run == nullptr || binding == nullptr || access == nullptr ||
+      !run->slice2_combined_arena_v2 || run->poisoned_v2 ||
+      run->allocation_free_issued_v2 || run->allocation_base == nullptr ||
+      run->admitted_run_stream == nullptr ||
+      !validate_slice2_combined_binding_v2(binding) ||
+      !same_slice2_binding_v2(run->retained_slice2_binding_v2, *binding) ||
+      run->allocation.total_device_bytes != binding->total_device_bytes) {
+    return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
+  }
+  access->admitted_run_stream = run->admitted_run_stream;
+  access->allocation_base = run->allocation_base;
+  access->allocation_bytes = run->allocation.total_device_bytes;
+  access->same_stream_enqueue_count = run->same_stream_enqueue_count;
+  return NEO_SCORING_STATUS_OK_V1;
+}
+
+std::int32_t enqueue_resident_scoring_finite_objective_v2(
+    resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1* run,
+    const resident_search_generation_v2::NeoResidentScoringPopulationSourceV2*
+        population,
+    ResidentScoringFiniteObjectiveRowsV2* rows) {
+  using namespace resident_scoring_novelty_v1;
+  if (rows != nullptr) {
+    *rows = {};
+  }
+  if (rows == nullptr || !validate_slice2_population_source_v2(run, population)) {
+    return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
+  }
+
+  run->metrics_ready_event = population->metrics_ready_event;
+  run->population_lifetime_owner = population->population_lifetime_owner;
+  run->metric_rows_device = population->metric_rows_device;
+  run->expected_scenario_ids_device = population->expected_scenario_ids_device;
+  if (cudaMemsetAsync(run->device_fault_word, 0,
+                      sizeof(*run->device_fault_word),
+                      run->admitted_run_stream) != cudaSuccess) {
+    return NEO_SCORING_STATUS_CUDA_ERROR_V1;
+  }
+  ++run->same_stream_enqueue_count;
+  if (cudaMemsetAsync(run->device_seal, 0, sizeof(*run->device_seal),
+                      run->admitted_run_stream) != cudaSuccess) {
+    return NEO_SCORING_STATUS_CUDA_ERROR_V1;
+  }
+  ++run->same_stream_enqueue_count;
+
+  constexpr std::uint32_t threads = 256;
+  const std::uint32_t grid = grid_for_v1(run->plan.logical_population_count);
+  score_canonical_metrics_kernel_v1<<<grid, threads, 0,
+                                      run->admitted_run_stream>>>(
+      run->metric_rows_device, run->fitness_scores_device,
+      run->device_fault_word, run->plan);
+  ++run->same_stream_enqueue_count;
+  std::int32_t status = launch_status_v1();
+  if (status != NEO_SCORING_STATUS_OK_V1) {
+    return status;
+  }
+  encode_finite_objective_keys_kernel_v2<<<grid, threads, 0,
+                                            run->admitted_run_stream>>>(
+      run->fitness_scores_device, run->decision_keys_device,
+      run->device_fault_word, run->plan.logical_population_count);
+  ++run->same_stream_enqueue_count;
+  status = launch_status_v1();
+  if (status != NEO_SCORING_STATUS_OK_V1) {
+    return status;
+  }
+  seal_finite_objective_content_kernel_v2<<<1, 1, 0,
+                                             run->admitted_run_stream>>>(
+      run->metric_rows_device, run->fitness_scores_device,
+      run->device_fault_word, run->device_seal, run->plan);
+  ++run->same_stream_enqueue_count;
+  status = launch_status_v1();
+  if (status != NEO_SCORING_STATUS_OK_V1) {
+    return status;
+  }
+
+  rows->scoring_owner = run;
+  rows->admitted_run_stream = run->admitted_run_stream;
+  rows->metric_rows_device = run->metric_rows_device;
+  rows->expected_scenario_ids_device = run->expected_scenario_ids_device;
+  rows->fitness_scores_device = run->fitness_scores_device;
+  rows->decision_keys_device = run->decision_keys_device;
+  rows->device_seal = run->device_seal;
+  rows->logical_population_count = run->plan.logical_population_count;
+  rows->same_stream_enqueue_count = run->same_stream_enqueue_count;
+  copy_identity_v1(rows->metric_semantics_sha256,
+                   run->plan.metric_semantics_sha256);
+  copy_identity_v1(rows->scoring_semantics_sha256,
+                   run->plan.scoring_semantics_sha256);
+  copy_identity_v1(rows->novelty_semantics_sha256,
+                   run->plan.novelty_semantics_sha256);
+  copy_identity_v1(rows->scenario_order_semantics_sha256,
+                   run->plan.scenario_order_semantics_sha256);
+  copy_identity_v1(rows->rank_semantics_sha256,
+                   run->plan.rank_semantics_sha256);
+  copy_identity_v1(rows->cuda_build_manifest_sha256,
+                   run->plan.cuda_build_manifest_sha256);
+  copy_identity_v1(rows->cuda_math_flags_sha256,
+                   run->plan.cuda_math_flags_sha256);
+  return NEO_SCORING_STATUS_OK_V1;
+}
+
+}  // namespace neoethos::resident_scoring_novelty_v2_internal

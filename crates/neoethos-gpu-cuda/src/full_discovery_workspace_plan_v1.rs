@@ -2,8 +2,8 @@
 
 #[cfg(feature = "cuda")]
 use crate::resident_feature_store_v3::{
-    FullDiscoveryRunDeviceAdmissionRequestV3, GpuOnlyRunDeviceAdmissionV3,
-    seal_gpu_only_run_device_admission_v3,
+    GpuOnlyRunDeviceAdmissionRequestV3, GpuOnlyRunDeviceAdmissionV3,
+    SealedFullDiscoveryTrimAdmissionV1, seal_gpu_only_run_device_admission_v3,
 };
 use crate::run_device_admission_v1::{
     DiscoveryRunDeviceAdmissionErrorV1, SealedDiscoveryRunDeviceAdmissionV1,
@@ -23,6 +23,7 @@ const MAX_FINAL_COMPACT_READBACK_BYTES_V1: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FullDiscoveryWorkspaceStageV1 {
     ResidentFeatureStore,
+    ResidentTrimPrefilter,
     PopulationParentAndViews,
     ResidentGeneticEvolution,
     WalkForwardValidation,
@@ -38,6 +39,7 @@ impl FullDiscoveryWorkspaceStageV1 {
     const fn wire_name(self) -> &'static str {
         match self {
             Self::ResidentFeatureStore => "resident-feature-store",
+            Self::ResidentTrimPrefilter => "resident-trim-prefilter",
             Self::PopulationParentAndViews => "population-parent-and-views",
             Self::ResidentGeneticEvolution => "resident-genetic-evolution",
             Self::WalkForwardValidation => "walk-forward-validation",
@@ -48,6 +50,33 @@ impl FullDiscoveryWorkspaceStageV1 {
             Self::FinalCompactReadback => "final-compact-readback",
             Self::WorkspaceSemantics => "workspace-semantics",
         }
+    }
+}
+
+/// Allocation-free receipt from the resident trim native scratch query plus
+/// its exact memory calibration. Fields are private so callers cannot replace
+/// the query with guessed bytes. No production constructor exists until that
+/// provider is wired before phase-one allocation; therefore production
+/// full-workspace sealing fails closed rather than aliasing another stage.
+#[derive(Debug)]
+pub struct OpaqueResidentTrimPrefilterPreflightV1 {
+    peak_device_bytes: u64,
+    retained_view_device_bytes: u64,
+    cub_select_scratch_bytes: u64,
+    cub_radix_sort_scratch_bytes: u64,
+    population_overlap_device_bytes: u64,
+    native_query_identity_sha256: [u8; 32],
+    calibration_identity_sha256: [u8; 32],
+    preflight_identity_sha256: [u8; 32],
+}
+
+impl OpaqueResidentTrimPrefilterPreflightV1 {
+    pub const fn peak_device_bytes(&self) -> u64 {
+        self.peak_device_bytes
+    }
+
+    pub const fn preflight_identity_sha256(&self) -> [u8; 32] {
+        self.preflight_identity_sha256
     }
 }
 
@@ -116,6 +145,7 @@ pub struct OpaqueFullDiscoveryWorkspaceSemanticsPreflightV1 {
 #[derive(Debug)]
 pub struct FullDiscoveryWorkspacePreflightBundleV1 {
     resident_feature_store: OpaqueFullDiscoveryStagePreflightV1,
+    resident_trim_prefilter: OpaqueResidentTrimPrefilterPreflightV1,
     population_parent_and_views: OpaqueFullDiscoveryStagePreflightV1,
     resident_genetic_evolution: OpaqueFullDiscoveryStagePreflightV1,
     walk_forward_validation: OpaqueFullDiscoveryPhasePreflightV1,
@@ -194,6 +224,8 @@ struct PhaseArenaReuseProofV1 {
 #[derive(Debug)]
 pub struct SealedFullDiscoveryGpuWorkspacePlanV1 {
     always_resident_bytes: u64,
+    trim_prefilter_reserved_bytes: u64,
+    trim_prefilter_preflight_identity_sha256: [u8; 32],
     reusable_phase_arena_bytes: u64,
     bounded_final_readback_bytes: u64,
     required_workspace_bytes: u64,
@@ -209,6 +241,14 @@ pub struct SealedFullDiscoveryGpuWorkspacePlanV1 {
 impl SealedFullDiscoveryGpuWorkspacePlanV1 {
     pub const fn always_resident_bytes(&self) -> u64 {
         self.always_resident_bytes
+    }
+
+    pub const fn trim_prefilter_reserved_bytes(&self) -> u64 {
+        self.trim_prefilter_reserved_bytes
+    }
+
+    pub const fn trim_prefilter_preflight_identity_sha256(&self) -> [u8; 32] {
+        self.trim_prefilter_preflight_identity_sha256
     }
 
     pub const fn reusable_phase_arena_bytes(&self) -> u64 {
@@ -263,6 +303,10 @@ pub fn seal_full_discovery_gpu_workspace_plan_v1(
         &preflight.population_parent_and_views,
         FullDiscoveryWorkspaceStageV1::PopulationParentAndViews,
     )?;
+    require_resident_trim_prefilter_preflight_v1(
+        &preflight.resident_trim_prefilter,
+        &preflight.population_parent_and_views,
+    )?;
     require_stage_v1(
         &preflight.resident_genetic_evolution,
         FullDiscoveryWorkspaceStageV1::ResidentGeneticEvolution,
@@ -274,6 +318,7 @@ pub fn seal_full_discovery_gpu_workspace_plan_v1(
     require_workspace_semantics_v1(&preflight.workspace_semantics)?;
 
     let always_resident_bytes = checked_sum_always_resident_bytes_v1(&preflight)?;
+    let trim_prefilter_reserved_bytes = preflight.resident_trim_prefilter.peak_device_bytes;
     let (phase_lifetime_plan, phase_arena_reuse_proof) = seal_mutually_exclusive_phase_arena_v1(
         preflight.walk_forward_validation,
         preflight.cpcv_and_pbo,
@@ -308,6 +353,13 @@ pub fn seal_full_discovery_gpu_workspace_plan_v1(
         })?;
     let component_identity_sha256 = [
         preflight.resident_feature_store.stage_identity_sha256,
+        preflight.resident_trim_prefilter.preflight_identity_sha256,
+        preflight
+            .resident_trim_prefilter
+            .native_query_identity_sha256,
+        preflight
+            .resident_trim_prefilter
+            .calibration_identity_sha256,
         preflight.population_parent_and_views.stage_identity_sha256,
         preflight.resident_genetic_evolution.stage_identity_sha256,
         preflight.portfolio_constraints.stage_identity_sha256,
@@ -319,6 +371,7 @@ pub fn seal_full_discovery_gpu_workspace_plan_v1(
     let workspace_plan_identity_sha256 =
         hash_workspace_plan_v1(&FullDiscoveryWorkspacePlanHashInputV1 {
             always_resident_bytes,
+            trim_prefilter_reserved_bytes,
             reusable_phase_arena_bytes,
             bounded_final_readback_bytes,
             required_workspace_bytes,
@@ -329,6 +382,10 @@ pub fn seal_full_discovery_gpu_workspace_plan_v1(
         });
     Ok(SealedFullDiscoveryGpuWorkspacePlanV1 {
         always_resident_bytes,
+        trim_prefilter_reserved_bytes,
+        trim_prefilter_preflight_identity_sha256: preflight
+            .resident_trim_prefilter
+            .preflight_identity_sha256,
         reusable_phase_arena_bytes,
         bounded_final_readback_bytes,
         required_workspace_bytes,
@@ -350,6 +407,7 @@ fn checked_sum_always_resident_bytes_v1(
     let semantics = &preflight.workspace_semantics;
     [
         preflight.resident_feature_store.device_bytes,
+        preflight.resident_trim_prefilter.peak_device_bytes,
         preflight.population_parent_and_views.device_bytes,
         preflight.resident_genetic_evolution.device_bytes,
         preflight.portfolio_constraints.device_bytes,
@@ -498,6 +556,62 @@ fn require_stage_v1(
     Ok(())
 }
 
+fn require_resident_trim_prefilter_preflight_v1(
+    preflight: &OpaqueResidentTrimPrefilterPreflightV1,
+    population: &OpaqueFullDiscoveryStagePreflightV1,
+) -> Result<(), FullDiscoveryWorkspacePlanErrorV1> {
+    let known_extent = preflight
+        .retained_view_device_bytes
+        .checked_add(preflight.cub_select_scratch_bytes)
+        .and_then(|bytes| bytes.checked_add(preflight.cub_radix_sort_scratch_bytes));
+    let expected_identity = hash_resident_trim_prefilter_preflight_v1(
+        preflight.peak_device_bytes,
+        preflight.retained_view_device_bytes,
+        preflight.cub_select_scratch_bytes,
+        preflight.cub_radix_sort_scratch_bytes,
+        preflight.population_overlap_device_bytes,
+        preflight.native_query_identity_sha256,
+        preflight.calibration_identity_sha256,
+    );
+    if preflight.peak_device_bytes == 0
+        || preflight.retained_view_device_bytes == 0
+        || preflight.cub_select_scratch_bytes == 0
+        || preflight.cub_radix_sort_scratch_bytes == 0
+        || known_extent.is_none_or(|bytes| bytes > preflight.peak_device_bytes)
+        || preflight.population_overlap_device_bytes != population.device_bytes
+        || is_zero_sha256_v1(preflight.native_query_identity_sha256)
+        || is_zero_sha256_v1(preflight.calibration_identity_sha256)
+        || preflight.preflight_identity_sha256 != expected_identity
+    {
+        return Err(FullDiscoveryWorkspacePlanErrorV1::new(
+            FullDiscoveryWorkspacePlanErrorCodeV1::MissingStageRequirement,
+            "resident trim/prefilter requires a distinct native-query and calibration preflight before allocation",
+        ));
+    }
+    Ok(())
+}
+
+fn hash_resident_trim_prefilter_preflight_v1(
+    peak_device_bytes: u64,
+    retained_view_device_bytes: u64,
+    cub_select_scratch_bytes: u64,
+    cub_radix_sort_scratch_bytes: u64,
+    population_overlap_device_bytes: u64,
+    native_query_identity_sha256: [u8; 32],
+    calibration_identity_sha256: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.resident-trim-prefilter-workspace-preflight.v1");
+    hasher.update(peak_device_bytes.to_le_bytes());
+    hasher.update(retained_view_device_bytes.to_le_bytes());
+    hasher.update(cub_select_scratch_bytes.to_le_bytes());
+    hasher.update(cub_radix_sort_scratch_bytes.to_le_bytes());
+    hasher.update(population_overlap_device_bytes.to_le_bytes());
+    hasher.update(native_query_identity_sha256);
+    hasher.update(calibration_identity_sha256);
+    hasher.finalize().into()
+}
+
 fn require_workspace_semantics_v1(
     semantics: &OpaqueFullDiscoveryWorkspaceSemanticsPreflightV1,
 ) -> Result<(), FullDiscoveryWorkspacePlanErrorV1> {
@@ -531,6 +645,7 @@ fn hash_phase_event_chain_v1(phases: &[FullDiscoveryWorkspacePhaseV1]) -> [u8; 3
 
 struct FullDiscoveryWorkspacePlanHashInputV1<'a> {
     always_resident_bytes: u64,
+    trim_prefilter_reserved_bytes: u64,
     reusable_phase_arena_bytes: u64,
     bounded_final_readback_bytes: u64,
     required_workspace_bytes: u64,
@@ -544,6 +659,7 @@ fn hash_workspace_plan_v1(input: &FullDiscoveryWorkspacePlanHashInputV1<'_>) -> 
     let mut hasher = Sha256::new();
     hasher.update(FULL_DISCOVERY_WORKSPACE_PLAN_SCHEMA_V1.as_bytes());
     hasher.update(input.always_resident_bytes.to_le_bytes());
+    hasher.update(input.trim_prefilter_reserved_bytes.to_le_bytes());
     hasher.update(input.reusable_phase_arena_bytes.to_le_bytes());
     hasher.update(input.bounded_final_readback_bytes.to_le_bytes());
     hasher.update(input.required_workspace_bytes.to_le_bytes());
@@ -707,6 +823,8 @@ impl AdmittedNativeCudaFullDiscoveryRunV1 {
         } = cuda_build_identity;
         let SealedFullDiscoveryGpuWorkspacePlanV1 {
             allocator_context_reserve_bytes,
+            trim_prefilter_reserved_bytes,
+            required_workspace_bytes,
             vector_ta_build_sha256,
             exact_math_authority,
             ..
@@ -729,6 +847,13 @@ impl AdmittedNativeCudaFullDiscoveryRunV1 {
             exact_math_authority,
             phase_one_free_bytes_snapshot: free_memory_bytes_snapshot,
             allocator_context_reserve_bytes,
+            data_population_limits: None,
+            full_discovery_trim_admission: Some(SealedFullDiscoveryTrimAdmissionV1::new(
+                workspace_plan_identity_sha256,
+                required_workspace_bytes,
+                trim_prefilter_reserved_bytes,
+                required_workspace_bytes,
+            )),
         })
         .map_err(|error| {
             FullDiscoveryWorkspacePlanErrorV1::new(
@@ -748,6 +873,41 @@ impl AdmittedNativeCudaFullDiscoveryRunV1 {
 
     pub const fn selected_device_ordinal(&self) -> u32 {
         self.selected_device_ordinal
+    }
+}
+
+#[cfg(any(all(test, feature = "cuda"), feature = "cuda-device-fixtures"))]
+fn resident_trim_prefilter_test_fixture_v1(
+    identity: impl Fn(&str) -> [u8; 32],
+    population_overlap_device_bytes: u64,
+) -> OpaqueResidentTrimPrefilterPreflightV1 {
+    // This synthetic extent is reachable only under an explicit test fixture
+    // cfg. Production has no byte-based constructor and therefore cannot seal
+    // until the real native scratch-query/calibration provider is connected.
+    let retained_view_device_bytes = 1;
+    let cub_select_scratch_bytes = 1;
+    let cub_radix_sort_scratch_bytes = 1;
+    let peak_device_bytes = 3;
+    let native_query_identity_sha256 = identity("fixture-native-trim-query-v1");
+    let calibration_identity_sha256 = identity("fixture-native-trim-calibration-v1");
+    let preflight_identity_sha256 = hash_resident_trim_prefilter_preflight_v1(
+        peak_device_bytes,
+        retained_view_device_bytes,
+        cub_select_scratch_bytes,
+        cub_radix_sort_scratch_bytes,
+        population_overlap_device_bytes,
+        native_query_identity_sha256,
+        calibration_identity_sha256,
+    );
+    OpaqueResidentTrimPrefilterPreflightV1 {
+        peak_device_bytes,
+        retained_view_device_bytes,
+        cub_select_scratch_bytes,
+        cub_radix_sort_scratch_bytes,
+        population_overlap_device_bytes,
+        native_query_identity_sha256,
+        calibration_identity_sha256,
+        preflight_identity_sha256,
     }
 }
 
@@ -798,6 +958,7 @@ pub fn seal_test_full_discovery_run_v1(
                 FullDiscoveryWorkspaceStageV1::ResidentFeatureStore,
                 always_resident_fixture_bytes,
             ),
+            resident_trim_prefilter: resident_trim_prefilter_test_fixture_v1(&identity, 1),
             population_parent_and_views: stage(
                 FullDiscoveryWorkspaceStageV1::PopulationParentAndViews,
                 1,

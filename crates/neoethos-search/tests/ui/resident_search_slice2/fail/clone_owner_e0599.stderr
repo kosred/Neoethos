@@ -1,0 +1,6 @@
+error[E0599]: no method named `clone` found for struct `ResidentSearchGenerationChainV3` in the current scope
+ --> fail/clone_owner_e0599.rs:8:13
+  |
+8 |     chain().clone();
+  |             ^^^^^ method not found in `ResidentSearchGenerationChainV3`
+

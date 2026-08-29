@@ -385,7 +385,7 @@ fn erf(x: f64) -> f64 {
     sign * y
 }
 
-/// Standard normal CDF. Absolute error ≤ 1.5e-7 (inherited from [`erf`]).
+/// Standard normal CDF. Absolute error ≤ 1.5e-7 (inherited from `erf`).
 pub fn normal_cdf(z: f64) -> f64 {
     if !z.is_finite() {
         return if z > 0.0 { 1.0 } else { 0.0 };

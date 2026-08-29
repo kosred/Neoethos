@@ -26,6 +26,22 @@ pub mod resident_regime_v3;
 #[cfg(feature = "cuda")]
 pub mod resident_robust_normalization_v2;
 #[cfg(feature = "cuda")]
+mod resident_scoring_v2;
+#[cfg(any(
+    feature = "cuda",
+    feature = "resident-search-slice2-compile-contract",
+    all(test, feature = "resident-search-slice2-host-contract")
+))]
+#[cfg_attr(
+    not(all(test, feature = "resident-search-slice2-host-contract")),
+    allow(dead_code)
+)]
+mod resident_search_slice2_admission_v2;
+#[cfg(any(feature = "cuda", feature = "resident-search-slice2-compile-contract"))]
+pub mod resident_search_slice2_v3;
+#[cfg(feature = "cuda")]
+pub mod resident_search_v2;
+#[cfg(feature = "cuda")]
 pub mod resident_session_v2;
 #[cfg(feature = "cuda-device-fixtures")]
 pub mod resident_session_v2_device_fixture;
@@ -33,6 +49,12 @@ pub mod resident_session_v2_device_fixture;
 pub mod resident_smc_v3;
 #[cfg(feature = "cuda")]
 pub mod resident_trim_prefilter_v1;
+
+#[cfg(all(test, feature = "cuda"))]
+mod resident_archive_knn_v2_tests;
+
+#[cfg(all(test, feature = "cuda-device-fixtures"))]
+mod resident_search_generation_v2_device_tests;
 
 pub mod full_discovery_workspace_plan_v1;
 pub mod physical_gpu_inventory_v1;

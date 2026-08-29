@@ -152,6 +152,10 @@ pub struct GeneticSearchRuntimeOverrides {
     /// Novelty bonus weight applied during candidate ranking. `0.0`
     /// disables novelty scoring (default).
     pub novelty_weight: f64,
+    /// Exact `k` for mean k-nearest-neighbor novelty over the current
+    /// population plus the permanent archive. It is explicit because changing
+    /// `k` changes selection and therefore the run identity.
+    pub novelty_neighbors: usize,
     /// Number of stagnant generations the search tolerates before
     /// triggering the SOFT diversity kick / gate-relaxation. Always at
     /// least `1`. (The HARD early-stop is the separate, larger
@@ -190,6 +194,7 @@ impl Default for GeneticSearchRuntimeOverrides {
         Self {
             seed: None,
             novelty_weight: 0.0,
+            novelty_neighbors: 15,
             stagnation_patience: 2,
             convergence_patience: 250,
             min_improvement: 1e-12,
@@ -228,6 +233,7 @@ impl GeneticSearchRuntimeOverrides {
         Self {
             seed: c.seed,
             novelty_weight: c.novelty_weight,
+            novelty_neighbors: c.novelty_neighbors,
             stagnation_patience: c.stagnation_patience,
             convergence_patience: c.convergence_patience,
             min_improvement: c.min_improvement,
@@ -319,6 +325,19 @@ impl GeneticSearchRuntimeOverrides {
         raw.max(population).min(200_000)
     }
 
+    /// Checked form used by pre-allocation resident admission. It refuses an
+    /// unrepresentable population x generation product rather than silently
+    /// changing the Search identity.
+    pub fn checked_effective_archive_cap(
+        &self,
+        population: usize,
+        generations: usize,
+    ) -> Option<usize> {
+        let derived = population.checked_mul(generations.max(1))?.min(50_000);
+        let raw = self.archive_cap_override.unwrap_or(derived);
+        Some(raw.max(population).min(200_000))
+    }
+
     /// Resolve the effective stagnation patience, guaranteeing a minimum
     /// of `1` so callers do not need to clamp themselves.
     pub fn effective_stagnation_patience(&self) -> usize {
@@ -402,7 +421,7 @@ pub struct CostProfileRuntimeOverrides {
     /// `infer_market_cost_profile` — `commission_per_trade` above is a caller's
     /// value and is already a round trip by the name of the field, so it is
     /// never doubled. See
-    /// [`crate::genetic::strategy_gene::round_trip_commission_per_lot`] for
+    /// `crate::genetic::strategy_gene::round_trip_commission_per_lot` for
     /// why one subtraction per closed trade means this conversion has to happen
     /// somewhere, and why it happens at exactly two places.
     pub commission_is_per_side: bool,
@@ -830,6 +849,7 @@ mod tests {
         let defaults = GeneticSearchRuntimeOverrides::default();
         assert_eq!(defaults.seed, None);
         assert!((defaults.novelty_weight - 0.0).abs() < 1e-9);
+        assert_eq!(defaults.novelty_neighbors, 15);
         assert_eq!(defaults.stagnation_patience, 2);
         assert_eq!(defaults.convergence_patience, 250);
         assert!((defaults.min_improvement - 1e-12).abs() < 1e-18);

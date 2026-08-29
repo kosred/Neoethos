@@ -4,6 +4,9 @@
 //! can only be minted by the future resident-store/session bridge. No pointer,
 //! event, selected count or selected-column list is exposed outside gpu-cuda.
 
+use crate::resident_feature_store_v3::{
+    ResidentFeatureStoreCudaErrorV3, ResidentFeatureStoreImportV3, ResidentPopulationSessionV3,
+};
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::ffi::c_void;
@@ -42,6 +45,13 @@ pub enum ResidentTrimPrefilterDeviceErrorV1 {
         operation: &'static str,
         status: i32,
     },
+    Population(ResidentFeatureStoreCudaErrorV3),
+}
+
+impl From<ResidentFeatureStoreCudaErrorV3> for ResidentTrimPrefilterDeviceErrorV1 {
+    fn from(error: ResidentFeatureStoreCudaErrorV3) -> Self {
+        Self::Population(error)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -521,28 +531,28 @@ fn require_hash_v1(
 /// Opaque parent import. Its constructor stays gpu-cuda-private so Search can
 /// only receive it by consuming the already-admitted resident session.
 pub struct ResidentTrimPrefilterParentImportV1 {
-    owner: Option<Box<dyn Any + Send>>,
-    selected_cuda_ordinal: u32,
-    parent_row_count: u64,
-    parent_column_count: u64,
-    packed_validity_bytes: u64,
-    admitted_run_stream: NonNull<c_void>,
-    parent_ready_event: NonNull<c_void>,
-    indicators_bar_major: NonNull<f64>,
-    indicators_validity_u4: NonNull<u8>,
-    close: NonNull<f64>,
-    high: NonNull<f64>,
-    low: NonNull<f64>,
-    canonical_search_input_receipt_sha256: [u8; 32],
-    canonical_content_merkle_sha256: [u8; 32],
-    normalization_fit_sha256: [u8; 32],
-    feature_plan_sha256: [u8; 32],
-    source_provenance_sha256: [u8; 32],
-    cuda_device_identity_sha256: [u8; 32],
-    primary_context_identity_sha256: [u8; 32],
-    run_stream_identity_sha256: [u8; 32],
-    cuda_build_manifest_sha256: [u8; 32],
-    cuda_math_flags_sha256: [u8; 32],
+    pub(crate) owner: Option<Box<ResidentFeatureStoreImportV3>>,
+    pub(crate) selected_cuda_ordinal: u32,
+    pub(crate) parent_row_count: u64,
+    pub(crate) parent_column_count: u64,
+    pub(crate) packed_validity_bytes: u64,
+    pub(crate) admitted_run_stream: NonNull<c_void>,
+    pub(crate) parent_ready_event: NonNull<c_void>,
+    pub(crate) indicators_bar_major: NonNull<f64>,
+    pub(crate) indicators_validity_u4: NonNull<u8>,
+    pub(crate) close: NonNull<f64>,
+    pub(crate) high: NonNull<f64>,
+    pub(crate) low: NonNull<f64>,
+    pub(crate) canonical_search_input_receipt_sha256: [u8; 32],
+    pub(crate) canonical_content_merkle_sha256: [u8; 32],
+    pub(crate) normalization_fit_sha256: [u8; 32],
+    pub(crate) feature_plan_sha256: [u8; 32],
+    pub(crate) source_provenance_sha256: [u8; 32],
+    pub(crate) cuda_device_identity_sha256: [u8; 32],
+    pub(crate) primary_context_identity_sha256: [u8; 32],
+    pub(crate) run_stream_identity_sha256: [u8; 32],
+    pub(crate) cuda_build_manifest_sha256: [u8; 32],
+    pub(crate) cuda_math_flags_sha256: [u8; 32],
 }
 
 impl ResidentTrimPrefilterParentImportV1 {
@@ -577,20 +587,20 @@ impl ResidentTrimPrefilterParentImportV1 {
 
 /// Device-resident classification authority sealed during Data materialization.
 pub struct SealedResidentColumnClassificationV1 {
-    owner: Option<Box<dyn Any + Send>>,
-    selected_cuda_ordinal: u32,
-    parent_column_count: u64,
-    retained_device_bytes: u64,
-    timeframe_group_count: u64,
-    schema_ready_event: NonNull<c_void>,
-    column_class_flags_device: NonNull<u8>,
-    timeframe_group_ids_device: NonNull<u32>,
-    template_force_keep_flags_device: NonNull<u8>,
-    ordered_feature_schema_sha256: [u8; 32],
-    column_classification_content_sha256: [u8; 32],
-    primary_context_identity_sha256: [u8; 32],
-    run_stream_identity_sha256: [u8; 32],
-    cuda_build_manifest_sha256: [u8; 32],
+    pub(crate) owner: Option<Box<dyn Any + Send>>,
+    pub(crate) selected_cuda_ordinal: u32,
+    pub(crate) parent_column_count: u64,
+    pub(crate) retained_device_bytes: u64,
+    pub(crate) timeframe_group_count: u64,
+    pub(crate) schema_ready_event: NonNull<c_void>,
+    pub(crate) column_class_flags_device: NonNull<u8>,
+    pub(crate) timeframe_group_ids_device: NonNull<u32>,
+    pub(crate) template_force_keep_flags_device: NonNull<u8>,
+    pub(crate) ordered_feature_schema_sha256: [u8; 32],
+    pub(crate) column_classification_content_sha256: [u8; 32],
+    pub(crate) primary_context_identity_sha256: [u8; 32],
+    pub(crate) run_stream_identity_sha256: [u8; 32],
+    pub(crate) cuda_build_manifest_sha256: [u8; 32],
 }
 
 impl SealedResidentColumnClassificationV1 {
@@ -645,14 +655,14 @@ impl SealedResidentColumnClassificationV1 {
 
 /// Opaque slice of the already-sealed full-discovery workspace authority.
 pub struct ResidentTrimPrefilterFullDiscoveryAdmissionV1 {
-    owner: Option<Box<dyn Any + Send>>,
-    selected_cuda_ordinal: u32,
-    trim_prefilter_ready_event: NonNull<c_void>,
-    trim_prefilter_reserved_bytes: u64,
-    full_discovery_reserve_bytes: u64,
-    primary_context_identity_sha256: [u8; 32],
-    run_stream_identity_sha256: [u8; 32],
-    cuda_build_manifest_sha256: [u8; 32],
+    pub(crate) owner: Option<Box<dyn Any + Send>>,
+    pub(crate) selected_cuda_ordinal: u32,
+    pub(crate) trim_prefilter_ready_event: NonNull<c_void>,
+    pub(crate) trim_prefilter_reserved_bytes: u64,
+    pub(crate) full_discovery_reserve_bytes: u64,
+    pub(crate) primary_context_identity_sha256: [u8; 32],
+    pub(crate) run_stream_identity_sha256: [u8; 32],
+    pub(crate) cuda_build_manifest_sha256: [u8; 32],
 }
 
 impl ResidentTrimPrefilterFullDiscoveryAdmissionV1 {
@@ -678,6 +688,151 @@ impl ResidentTrimPrefilterFullDiscoveryAdmissionV1 {
 
     pub const fn cuda_build_manifest_sha256(&self) -> [u8; 32] {
         self.cuda_build_manifest_sha256
+    }
+}
+
+/// Process-local identity receipt for the three one-shot trim inputs. It binds
+/// only immutable hashes and the selected ordinal; raw CUDA representations
+/// remain private to this crate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentTrimPrefilterImportIdentityV1 {
+    pub(crate) admission_identity_sha256: [u8; 32],
+    pub(crate) workspace_plan_identity_sha256: [u8; 32],
+    pub(crate) canonical_search_input_receipt_sha256: [u8; 32],
+    pub(crate) canonical_content_merkle_sha256: [u8; 32],
+    pub(crate) normalization_fit_sha256: [u8; 32],
+    pub(crate) feature_plan_sha256: [u8; 32],
+    pub(crate) source_provenance_sha256: [u8; 32],
+    pub(crate) ordered_feature_schema_sha256: [u8; 32],
+    pub(crate) column_classification_content_sha256: [u8; 32],
+    pub(crate) selected_cuda_ordinal: u32,
+    pub(crate) parent_row_count: u64,
+    pub(crate) parent_column_count: u64,
+    pub(crate) cuda_device_identity_sha256: [u8; 32],
+    pub(crate) primary_context_identity_sha256: [u8; 32],
+    pub(crate) run_stream_identity_sha256: [u8; 32],
+    pub(crate) cuda_build_manifest_sha256: [u8; 32],
+    pub(crate) cuda_math_flags_sha256: [u8; 32],
+    pub(crate) phase_one_free_bytes_snapshot: u64,
+    pub(crate) allocator_context_reserve_bytes: u64,
+    pub(crate) required_workspace_bytes: u64,
+    pub(crate) trim_prefilter_reserved_bytes: u64,
+    pub(crate) full_discovery_reserve_bytes: u64,
+}
+
+impl ResidentTrimPrefilterImportIdentityV1 {
+    pub const fn admission_identity_sha256(&self) -> [u8; 32] {
+        self.admission_identity_sha256
+    }
+
+    pub const fn workspace_plan_identity_sha256(&self) -> [u8; 32] {
+        self.workspace_plan_identity_sha256
+    }
+
+    pub const fn canonical_search_input_receipt_sha256(&self) -> [u8; 32] {
+        self.canonical_search_input_receipt_sha256
+    }
+
+    pub const fn canonical_content_merkle_sha256(&self) -> [u8; 32] {
+        self.canonical_content_merkle_sha256
+    }
+
+    pub const fn normalization_fit_sha256(&self) -> [u8; 32] {
+        self.normalization_fit_sha256
+    }
+
+    pub const fn feature_plan_sha256(&self) -> [u8; 32] {
+        self.feature_plan_sha256
+    }
+
+    pub const fn source_provenance_sha256(&self) -> [u8; 32] {
+        self.source_provenance_sha256
+    }
+
+    pub const fn ordered_feature_schema_sha256(&self) -> [u8; 32] {
+        self.ordered_feature_schema_sha256
+    }
+
+    pub const fn column_classification_content_sha256(&self) -> [u8; 32] {
+        self.column_classification_content_sha256
+    }
+
+    pub const fn selected_cuda_ordinal(&self) -> u32 {
+        self.selected_cuda_ordinal
+    }
+
+    pub const fn parent_row_count(&self) -> u64 {
+        self.parent_row_count
+    }
+
+    pub const fn parent_column_count(&self) -> u64 {
+        self.parent_column_count
+    }
+
+    pub const fn cuda_device_identity_sha256(&self) -> [u8; 32] {
+        self.cuda_device_identity_sha256
+    }
+
+    pub const fn primary_context_identity_sha256(&self) -> [u8; 32] {
+        self.primary_context_identity_sha256
+    }
+
+    pub const fn run_stream_identity_sha256(&self) -> [u8; 32] {
+        self.run_stream_identity_sha256
+    }
+
+    pub const fn cuda_build_manifest_sha256(&self) -> [u8; 32] {
+        self.cuda_build_manifest_sha256
+    }
+
+    pub const fn cuda_math_flags_sha256(&self) -> [u8; 32] {
+        self.cuda_math_flags_sha256
+    }
+
+    pub const fn phase_one_free_bytes_snapshot(&self) -> u64 {
+        self.phase_one_free_bytes_snapshot
+    }
+
+    pub const fn allocator_context_reserve_bytes(&self) -> u64 {
+        self.allocator_context_reserve_bytes
+    }
+
+    pub const fn required_workspace_bytes(&self) -> u64 {
+        self.required_workspace_bytes
+    }
+
+    pub const fn trim_prefilter_reserved_bytes(&self) -> u64 {
+        self.trim_prefilter_reserved_bytes
+    }
+
+    pub const fn full_discovery_reserve_bytes(&self) -> u64 {
+        self.full_discovery_reserve_bytes
+    }
+}
+
+/// Move-only result of consuming a sealed V3 feature-store import. The three
+/// native inputs cannot be reconstructed independently or cloned.
+#[must_use = "resident trim inputs must be consumed by the same admitted run"]
+pub struct ResidentTrimPrefilterInputsV1 {
+    pub(crate) parent_import: ResidentTrimPrefilterParentImportV1,
+    pub(crate) sealed_schema: SealedResidentColumnClassificationV1,
+    pub(crate) full_admission: ResidentTrimPrefilterFullDiscoveryAdmissionV1,
+    pub(crate) identity: ResidentTrimPrefilterImportIdentityV1,
+}
+
+impl ResidentTrimPrefilterInputsV1 {
+    pub const fn identity(&self) -> &ResidentTrimPrefilterImportIdentityV1 {
+        &self.identity
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ResidentTrimPrefilterParentImportV1,
+        SealedResidentColumnClassificationV1,
+        ResidentTrimPrefilterFullDiscoveryAdmissionV1,
+    ) {
+        (self.parent_import, self.sealed_schema, self.full_admission)
     }
 }
 
@@ -817,7 +972,7 @@ pub fn begin_resident_trim_prefilter_device_run_v1(
             .owner
             .as_deref_mut()
             .map_or(std::ptr::null_mut(), |owner| {
-                owner as *mut dyn Any as *mut c_void
+                owner as *mut ResidentFeatureStoreImportV3 as *mut c_void
             }),
         schema_lifetime_owner: sealed_schema
             .owner
@@ -1002,6 +1157,81 @@ pub struct SealedResidentTrimPrefilterDeviceViewsV1 {
     armed: bool,
 }
 
+/// Move-only ownership carrier joining the native population session to the
+/// exact compact-column map that selected it. It deliberately exposes neither
+/// owner as an executable population API: the next resident Search slice must
+/// consume both together and bind the device map before numerical evaluation.
+#[must_use = "the trimmed population carrier must be consumed by resident Search"]
+pub struct ResidentTrimmedPopulationSessionV1 {
+    population_session: Option<ResidentPopulationSessionV3>,
+    trim_native: NonNull<NativeResidentTrimPrefilterRunV1>,
+    parent_import: Option<ResidentTrimPrefilterParentImportV1>,
+    sealed_schema: Option<SealedResidentColumnClassificationV1>,
+    full_admission: Option<ResidentTrimPrefilterFullDiscoveryAdmissionV1>,
+    views: RawResidentTrimPrefilterViewsV1,
+    ready: RawResidentTrimPrefilterReadyEventV1,
+    armed: bool,
+}
+
+impl ResidentTrimmedPopulationSessionV1 {
+    /// Move the complete trim/population authority and a separately minted
+    /// calibration receipt into the fail-closed Slice 2 Search chain. No raw
+    /// CUDA handle or detached child owner is exposed.
+    pub fn begin_resident_search_slice2_v3(
+        self,
+        calibration: crate::resident_search_slice2_v3::ResidentArchiveKnnCalibrationReceiptV2,
+    ) -> crate::resident_search_slice2_v3::ResidentSearchGenerationChainV3 {
+        crate::resident_search_slice2_v3::start_resident_search_slice2_v3(self, calibration)
+    }
+
+    pub const fn selected_compact_to_parent_columns_device(&self) -> bool {
+        !self
+            .views
+            .selected_compact_to_parent_columns_device
+            .is_null()
+    }
+
+    pub const fn selected_column_count_device(&self) -> bool {
+        !self.views.selected_column_count_device.is_null()
+    }
+
+    pub const fn same_selected_column_map_for_holdout(&self) -> bool {
+        self.views.same_selected_column_map_for_holdout == 1
+    }
+
+    pub const fn same_stream_enqueue_count(&self) -> u64 {
+        self.ready.same_stream_enqueue_count
+    }
+
+    pub const fn has_zero_trim_host_boundary(&self) -> bool {
+        self.ready.intermediate_host_wait_count == 0
+            && self.ready.intermediate_readback_count == 0
+            && self.ready.host_to_device_transfer_count == 0
+            && self.ready.device_to_host_transfer_count == 0
+            && self.ready.explicit_synchronization_count == 0
+    }
+
+    pub fn population_rows(&self) -> usize {
+        self.population_session
+            .as_ref()
+            .map_or(0, |session| session.rows())
+    }
+
+    pub fn parent_columns(&self) -> usize {
+        self.population_session
+            .as_ref()
+            .map_or(0, |session| session.columns())
+    }
+
+    pub const fn plan_identity_sha256(&self) -> [u8; 32] {
+        self.views.plan_identity_sha256
+    }
+
+    pub const fn canonical_content_merkle_sha256(&self) -> [u8; 32] {
+        self.views.canonical_content_merkle_sha256
+    }
+}
+
 impl SealedResidentTrimPrefilterDeviceViewsV1 {
     pub const fn selected_compact_to_parent_columns_device(&self) -> bool {
         !self
@@ -1038,6 +1268,67 @@ impl SealedResidentTrimPrefilterDeviceViewsV1 {
             self.promotion_eligibility,
             ResidentTrimPrefilterPromotionEligibilityV1::NotPromotionEligible
         )
+    }
+
+    /// Consume the sealed map and its three retained lifetimes into the one
+    /// population owner created from the original V3 import. The compact map,
+    /// selected-count scalar and trim-ready event remain private and retained;
+    /// no selected result is read back. Population creation reuses the V3
+    /// store's existing one-time Data-transient retirement boundary; it does
+    /// not add a Search-generation host boundary.
+    pub fn consume_into_population_session_v3(
+        mut self,
+    ) -> Result<ResidentTrimmedPopulationSessionV1, ResidentTrimPrefilterDeviceErrorV1> {
+        if !self.armed
+            || self
+                .parent_import
+                .as_ref()
+                .is_none_or(|parent| parent.owner.is_none())
+            || self.sealed_schema.is_none()
+            || self.full_admission.is_none()
+            || self
+                .views
+                .selected_compact_to_parent_columns_device
+                .is_null()
+            || self.views.selected_column_count_device.is_null()
+            || self.views.trim_prefilter_ready_event.is_null()
+        {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation);
+        }
+
+        // These are the only ownership moves out of the sealed trim handoff.
+        // Every fallible path below either returns the joined carrier or leaks
+        // the still-in-flight owners fail-closed.
+        let mut parent_import = self.parent_import.take().expect("sealed parent import");
+        let sealed_schema = self.sealed_schema.take().expect("sealed schema owner");
+        let full_admission = self.full_admission.take().expect("sealed admission owner");
+        let resident_import = *parent_import
+            .owner
+            .take()
+            .expect("sealed parent retains the typed V3 import");
+        let population_session = match resident_import.consume_into_population_session_v3() {
+            Ok(session) => session,
+            Err(error) => {
+                mem::forget(parent_import);
+                mem::forget(sealed_schema);
+                mem::forget(full_admission);
+                return Err(error.into());
+            }
+        };
+
+        let output = ResidentTrimmedPopulationSessionV1 {
+            population_session: Some(population_session),
+            trim_native: self.native,
+            parent_import: Some(parent_import),
+            sealed_schema: Some(sealed_schema),
+            full_admission: Some(full_admission),
+            views: self.views,
+            ready: self.ready,
+            armed: true,
+        };
+        self.armed = false;
+        mem::forget(self);
+        Ok(output)
     }
 
     /// Queue release of this stage's owned buffers on the admitted stream.
@@ -1263,6 +1554,29 @@ impl Drop for SealedResidentTrimPrefilterDeviceViewsV1 {
             // A future same-stream consumer will disarm this handoff and call
             // `enqueue_resident_trim_prefilter_release_v1` only after its own
             // completion event has been recorded.
+        }
+    }
+}
+
+impl Drop for ResidentTrimmedPopulationSessionV1 {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(owner) = self.population_session.take() {
+                mem::forget(owner);
+            }
+            if let Some(owner) = self.parent_import.take() {
+                mem::forget(owner);
+            }
+            if let Some(owner) = self.sealed_schema.take() {
+                mem::forget(owner);
+            }
+            if let Some(owner) = self.full_admission.take() {
+                mem::forget(owner);
+            }
+            // `trim_native` owns the selected map and ready event dependency.
+            // Until the next same-stream Search consumer exists, an abandoned
+            // carrier deliberately leaks rather than freeing in-flight state.
+            let _ = self.trim_native;
         }
     }
 }

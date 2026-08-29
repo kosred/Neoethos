@@ -6,18 +6,37 @@
 //! admitted full-workspace carrier into Data's sealed resident store.
 
 use crate::data_selection::{
-    CanonicalSearchArtifactScopeV2, CanonicalSearchInput, CanonicalSearchInputReceiptV2,
-    CanonicalSearchWindowRoleV1,
+    CanonicalGpuResidentSearchArtifactScopeV3, CanonicalGpuResidentSearchInputReceiptV3,
+    CanonicalSearchInput, CanonicalSearchInputReceiptV2, CanonicalSearchWindowRoleV1,
+};
+use crate::gpu_resident_current_config_plan_v1::{
+    CurrentConfigResidentSearchAdmissionFactsV1, SealedCurrentConfigResidentSearchPlanV1,
+    seal_current_config_resident_search_plan_v1,
+};
+use crate::gpu_resident_trim_prefilter_view_v1::{
+    begin_gpu_resident_trim_prefilter_view_v1, execute_gpu_resident_trim_prefilter_view_v1,
+    resolve_current_config_resident_trim_prefilter_plan_v1,
+    seal_gpu_resident_trim_prefilter_view_v1,
+};
+use crate::prefilter_schema_v1::seal_prefilter_column_classification_v1;
+use crate::resident_population_auto_sizing_receipt_v2::{
+    RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2, ResidentPopulationAutoSizingReceiptV2,
+    evaluation_config_from_canonical_trendbar_contract_v2,
+    seal_resident_population_auto_for_canonical_trendbar_research_v2,
+    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_v2,
 };
 use crate::strict_discovery_device_route_v1::SealedStrictDiscoveryDeviceAdmissionV1;
 use crate::strict_resident_feature_store_v3::{
     StrictResidentPopulationExecutionRunV3, bind_strict_resident_feature_store_v3_run_input,
     record_resident_feature_store_consumer_completion_v3,
+    validate_strict_resident_feature_store_v3,
 };
 use crate::{DiscoveryConfig, DiscoveryProgress, DiscoveryResult, PropFirmRiskRules};
 use anyhow::{Context, Result, bail, ensure};
 use neoethos_data::SealedGpuResidentFeatureStoreV3;
 use neoethos_gpu_cuda::full_discovery_workspace_plan_v1::AdmittedNativeCudaFullDiscoveryRunV1;
+use neoethos_gpu_cuda::resident_feature_store_v3::ResidentTrimPrefilterSchemaUploadV1;
+use neoethos_gpu_cuda::resident_trim_prefilter_v1::ResidentTrimmedPopulationSessionV1;
 use neoethos_gpu_cuda::run_device_admission_v1::SealedCpuNoPhysicalGpuRunDeviceAdmissionV1;
 use neoethos_gpu_cuda::{
     AdmittedFullDiscoveryGpuRunV1, SealedDiscoveryRunDeviceAdmissionV1,
@@ -258,32 +277,52 @@ where
             run_cpu_prepared_discovery_v3(cpu, config, prop_firm_rules, progress_fn)
         }
         PreparedCanonicalDiscoveryRunInputV3::NativeCuda(native) => {
-            let scope = CanonicalSearchArtifactScopeV2::for_entire_receipt(
+            let PreparedNativeCudaCanonicalDiscoveryRunInputV3 {
+                receipt,
+                feature_names,
+                sealed_store,
+            } = native;
+            let scope = CanonicalGpuResidentSearchArtifactScopeV3::for_entire_receipt(
                 CanonicalSearchWindowRoleV1::DiscoveryInput,
-                native.receipt,
+                receipt,
             )
             .context("bind native resident parent to the canonical Search receipt")?;
-            let run = bind_strict_resident_feature_store_v3_run_input(native.sealed_store, &scope)?;
-            let view = seal_gpu_native_trim_prefilter_view_identity_v3(&run);
-            let outcome = view.and_then(|view| {
-                run_native_cuda_prepared_discovery_v3(
-                    &run,
-                    view,
-                    config,
-                    prop_firm_rules,
-                    &mut progress_fn,
-                )
-            });
-            let expected_completion_shape = (run.row_count(), run.column_count());
-            let consumer_completion_lease =
-                record_resident_feature_store_consumer_completion_v3(run)
-                    .context("complete native resident Search consumer before release")?;
-            ensure!(
-                consumer_completion_lease.rows() == expected_completion_shape.0
-                    && consumer_completion_lease.columns() == expected_completion_shape.1,
-                "resident Search completion lease shape drifted from its consumed native run"
-            );
-            outcome
+            validate_strict_resident_feature_store_v3(&sealed_store, &scope)
+                .context("validate the resident parent before current-config preflight")?;
+            let parent_rows = usize::try_from(sealed_store.contract().layout().row_count())
+                .context("resident parent row count does not fit this process")?;
+            let parent_columns =
+                usize::try_from(sealed_store.contract().layout().column_count())
+                    .context("resident parent column count does not fit this process")?;
+
+            // This admission is deliberately resolved before the compact
+            // schema upload or any trim allocation. Slice 1 has no authority
+            // to invent archive-kNN throughput or memory-pool identity facts.
+            let admission =
+                require_current_config_resident_search_admission_facts_v1(&scope, &sealed_store)?;
+            let runtime = crate::genetic::current_genetic_search_runtime_overrides();
+            let current_config_plan = seal_current_config_resident_search_plan_v1(
+                config,
+                &runtime,
+                parent_rows,
+                parent_columns,
+                admission,
+            )
+            .context("seal current-config resident Search plan before trim allocation")?;
+            let trimmed_population = consume_native_store_into_trimmed_population_v1(
+                sealed_store,
+                &scope,
+                feature_names,
+                config,
+                &current_config_plan,
+            )?;
+            run_native_cuda_prepared_discovery_v3(
+                trimmed_population,
+                current_config_plan,
+                config,
+                prop_firm_rules,
+                &mut progress_fn,
+            )
         }
     }
 }
@@ -406,33 +445,121 @@ where
     Ok((result, prepared.input))
 }
 
-struct GpuNativeTrimPrefilterViewIdentityV3 {
-    parent_scope_identity_sha256: String,
-    parent_rows: usize,
-    parent_columns: usize,
+fn require_current_config_resident_search_admission_facts_v1(
+    scope: &CanonicalGpuResidentSearchArtifactScopeV3,
+    sealed_store: &SealedGpuResidentFeatureStoreV3,
+) -> Result<CurrentConfigResidentSearchAdmissionFactsV1> {
+    scope
+        .validate()
+        .context("validate current-config Search scope before admission")?;
+    ensure!(
+        sealed_store.admission_identity_sha256() != [0; 32]
+            && sealed_store
+                .device_identity()
+                .primary_context_process_token()
+                != [0; 32],
+        "resident store lacks its sealed CUDA admission identity"
+    );
+    bail!(
+        "current-config resident Search requires an actual run memory-pool identity, a measured exact archive-kNN popcount calibration receipt, and the native-query/calibrated resident trim workspace preflight before any allocation; Slice 1 refuses to fabricate admission facts"
+    )
 }
 
-fn seal_gpu_native_trim_prefilter_view_identity_v3(
-    run: &StrictResidentPopulationExecutionRunV3,
-) -> Result<GpuNativeTrimPrefilterViewIdentityV3> {
-    let parent_scope_identity_sha256 = run
-        .scope()
-        .identity_sha256()
-        .context("seal resident parent scope identity")?;
+fn decode_lower_hex_sha256_v1(value: &str, field: &'static str) -> Result<[u8; 32]> {
     ensure!(
-        run.row_count() > 0 && run.column_count() > 0,
-        "resident parent view is empty"
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{field} is not a canonical lowercase SHA-256"
     );
-    Ok(GpuNativeTrimPrefilterViewIdentityV3 {
-        parent_scope_identity_sha256,
-        parent_rows: run.row_count(),
-        parent_columns: run.column_count(),
-    })
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte: u8| -> u8 {
+            match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => unreachable!("canonical lowercase SHA-256 was validated"),
+            }
+        };
+        decoded[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    Ok(decoded)
+}
+
+fn consume_native_store_into_trimmed_population_v1(
+    sealed_store: SealedGpuResidentFeatureStoreV3,
+    scope: &CanonicalGpuResidentSearchArtifactScopeV3,
+    feature_names: Vec<String>,
+    config: &DiscoveryConfig,
+    current_config_plan: &SealedCurrentConfigResidentSearchPlanV1,
+) -> Result<ResidentTrimmedPopulationSessionV1> {
+    validate_strict_resident_feature_store_v3(&sealed_store, scope)
+        .context("revalidate resident parent before moving it into trim")?;
+    let resident_feature_names = sealed_store
+        .ordered_feature_names()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    ensure!(
+        feature_names == resident_feature_names,
+        "prepared feature order drifted from the sealed resident store"
+    );
+    let classification = seal_prefilter_column_classification_v1(&feature_names)
+        .context("seal the shared CPU/resident prefilter schema classification")?;
+    let canonical_receipt_identity = decode_lower_hex_sha256_v1(
+        &scope
+            .receipt()
+            .identity_sha256()
+            .context("seal canonical resident input receipt identity")?,
+        "canonical resident input receipt identity",
+    )?;
+    let schema_upload = ResidentTrimPrefilterSchemaUploadV1::new(
+        canonical_receipt_identity,
+        sealed_store
+            .contract()
+            .canonical_feature_content_merkle_sha256(),
+        sealed_store.normalization_fit_sha256(),
+        sealed_store.final_feature_plan_v3_sha256(),
+        sealed_store.source_provenance_sha256(),
+        classification.ordered_feature_schema_sha256(),
+        classification.column_classification_content_sha256(),
+        classification.column_class_flags().to_vec(),
+        classification.timeframe_group_ids().to_vec(),
+        classification.template_force_keep_flags().to_vec(),
+        classification.timeframe_group_count(),
+    )
+    .context("seal the compact resident trim schema upload")?;
+    let resident_import = sealed_store
+        .into_resident_feature_store_import_v3()
+        .context("move the sealed resident store into its admitted-stream import")?;
+    let trim_inputs = resident_import
+        .consume_into_resident_trim_prefilter_v1(schema_upload)
+        .context("move the resident feature store into the trim owner")?;
+    let import_identity = *trim_inputs.identity();
+    let resolved_plan = resolve_current_config_resident_trim_prefilter_plan_v1(
+        config,
+        current_config_plan,
+        &import_identity,
+        &classification,
+        None,
+    )
+    .context("bind the trim plan to the exact current-config Search admission")?;
+    let (parent, schema, admission) = trim_inputs.into_parts();
+    let trim_run =
+        begin_gpu_resident_trim_prefilter_view_v1(parent, schema, admission, resolved_plan)
+            .context("begin the admitted resident trim/prefilter run")?;
+    let trim_run = execute_gpu_resident_trim_prefilter_view_v1(trim_run)
+        .context("enqueue the resident trim/prefilter stages")?;
+    let sealed_views = seal_gpu_resident_trim_prefilter_view_v1(trim_run)
+        .context("seal the resident trim/prefilter device views")?;
+    sealed_views
+        .consume_into_population_session_v3()
+        .context("move sealed trim views into the resident population owner")
 }
 
 fn run_native_cuda_prepared_discovery_v3<F>(
-    run: &StrictResidentPopulationExecutionRunV3,
-    view: GpuNativeTrimPrefilterViewIdentityV3,
+    trimmed_population: ResidentTrimmedPopulationSessionV1,
+    current_config_plan: SealedCurrentConfigResidentSearchPlanV1,
     _config: &DiscoveryConfig,
     _prop_firm_rules: PropFirmRiskRules,
     progress_fn: &mut F,
@@ -441,16 +568,20 @@ where
     F: FnMut(DiscoveryProgress),
 {
     ensure!(
-        view.parent_scope_identity_sha256 == run.scope().identity_sha256()?
-            && view.parent_rows == run.row_count()
-            && view.parent_columns == run.column_count(),
-        "native resident parent view identity drifted before GPU execution"
+        current_config_plan.plan_identity_sha256() != [0; 32]
+            && trimmed_population.population_rows() == current_config_plan.parent_row_range().end
+            && trimmed_population.parent_columns() == current_config_plan.parent_column_count()
+            && trimmed_population.selected_compact_to_parent_columns_device()
+            && trimmed_population.selected_column_count_device()
+            && trimmed_population.same_selected_column_map_for_holdout()
+            && trimmed_population.has_zero_trim_host_boundary(),
+        "native resident trim/population carrier drifted before Search execution"
     );
     progress_fn(DiscoveryProgress::StageAdvanced {
         stage: "gpu_native_trim_prefilter",
-        detail: "sealed resident input reached the GPU-native trim/prefilter boundary".to_owned(),
+        detail: "sealed resident input was move-consumed through the real GPU-native trim/prefilter owner into the population carrier".to_owned(),
     });
     bail!(
-        "GPU-native trim/prefilter and resident full-Discovery stage pipeline are not integrated; refusing host materialization or CPU fallback"
+        "resident multi-generation archive-kNN Search has no consumer for the sealed trim/population carrier yet; refusing host materialization, CPU fallback, or an armed-carrier readiness claim"
     )
 }

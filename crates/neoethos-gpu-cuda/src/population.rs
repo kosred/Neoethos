@@ -967,6 +967,48 @@ struct RawResidentPopulationMetricsHandleV1 {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct RawResidentScoringPopulationSourceV2 {
+    abi_version: u32,
+    selected_cuda_ordinal: u32,
+    admitted_run_stream: *mut c_void,
+    metrics_ready_event: *mut c_void,
+    scoring_ready_event: *mut c_void,
+    receipt_token: *const c_void,
+    population_lifetime_owner: *mut c_void,
+    metric_rows_device: *const NeoPopulationMetricRow,
+    expected_scenario_ids_device: *const u64,
+    logical_population_count: u64,
+    feature_count: u64,
+    max_terms_per_gene: u32,
+    reserved: u32,
+    full_discovery_reserve_bytes: u64,
+}
+
+impl Default for RawResidentScoringPopulationSourceV2 {
+    fn default() -> Self {
+        Self {
+            abi_version: 0,
+            selected_cuda_ordinal: 0,
+            admitted_run_stream: std::ptr::null_mut(),
+            metrics_ready_event: std::ptr::null_mut(),
+            scoring_ready_event: std::ptr::null_mut(),
+            receipt_token: std::ptr::null(),
+            population_lifetime_owner: std::ptr::null_mut(),
+            metric_rows_device: std::ptr::null(),
+            expected_scenario_ids_device: std::ptr::null(),
+            logical_population_count: 0,
+            feature_count: 0,
+            max_terms_per_gene: 0,
+            reserved: 0,
+            full_discovery_reserve_bytes: 0,
+        }
+    }
+}
+
+const _: [(); 96] = [(); std::mem::size_of::<RawResidentScoringPopulationSourceV2>()];
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct RawTerminalCompactPopulationResultV1 {
     abi_version: u32,
@@ -2206,6 +2248,221 @@ impl PopulationSession {
             settings_identity_sha256,
             native_build_identity_sha256,
             terminal_scenario_identity,
+            expected_scenario_identities,
+            counters,
+            consumed: false,
+        })
+    }
+
+    #[cfg(feature = "cuda-device-fixtures")]
+    pub(crate) fn enqueue_resident_gene_metrics_fixture_v2(
+        &mut self,
+        genes: &crate::resident_search_v2::RawResidentGenerationGeneViewV2,
+        settings: &NeoPopulationSettings,
+    ) -> Result<ResidentPopulationMetricsV1<'_>, CudaPopulationError> {
+        self.require_strict_idle_v1("enqueue_resident_gene_metrics_fixture_v2")?;
+        if !self.scenarios_uploaded || self.gene_batch_identity_sha256.is_none() {
+            return Err(CudaPopulationError::native(
+                "enqueue_resident_gene_metrics_fixture_v2",
+                STATUS_MISSING_UPLOAD,
+            ));
+        }
+        if settings.month_capacity == 0 || settings.month_capacity > i32::MAX as u32 {
+            return Err(invalid(
+                "month_capacity must be non-zero and fit the native signed extent",
+            ));
+        }
+        let plan = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(
+            self.scenario_count,
+            settings.month_capacity,
+        )?;
+        let settings_identity_sha256 = hash_population_settings_identity_v1(settings);
+        let mut receipt = Box::new(RawResidentPopulationMetricsHandleV1::default());
+        let mut counters = NeoPopulationCounters::default();
+        // SAFETY: the feature-gated real-card fixture owns the Search gene view;
+        // native retains only this boxed metrics receipt until terminal consume.
+        let status = unsafe {
+            neoethos_gpu_cuda_population_enqueue_resident_gene_metrics_v2(
+                self.handle,
+                genes,
+                settings,
+                receipt.as_mut(),
+                &mut counters,
+            )
+        };
+        if status != STATUS_OK {
+            if !strict_enqueue_failure_is_known_prelaunch_v1(status) {
+                self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            }
+            return Err(CudaPopulationError::native(
+                "enqueue_resident_gene_metrics_fixture_v2",
+                status,
+            ));
+        }
+        self.strict_resident_state = StrictResidentSessionStateV1::InFlight;
+        self.emitted_events = 0;
+        self.pending_event = Some(receipt.event_id);
+        self.metrics_ready = false;
+        if let Err(error) = validate_exact_resident_receipt_v1(receipt.as_ref(), plan) {
+            self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            // SAFETY: native accepted this exact boxed receipt; rejection of
+            // its fixed-width plan poisons that same native owner.
+            let _ = unsafe {
+                neoethos_gpu_cuda_population_abandon_resident_metrics_v1(
+                    self.handle,
+                    receipt.as_ref(),
+                )
+            };
+            return Err(error);
+        }
+        let resident_session_identity_sha256 = self.resident_session_identity_sha256;
+        let view_identity_sha256 = self.view_identity_sha256;
+        let gene_batch_identity_sha256 = self.gene_batch_identity_sha256;
+        let scenario_batch_identity_sha256 = self.scenario_batch_identity_sha256;
+        let native_build_identity_sha256 = self.native_build_identity_sha256;
+        let terminal_scenario_identity = self.terminal_scenario_identity;
+        let expected_scenario_identities = Arc::clone(&self.expected_scenario_identities);
+        Ok(ResidentPopulationMetricsV1 {
+            session: self,
+            receipt,
+            plan,
+            resident_session_identity_sha256,
+            view_identity_sha256,
+            gene_batch_identity_sha256,
+            scenario_batch_identity_sha256,
+            settings_identity_sha256,
+            native_build_identity_sha256,
+            terminal_scenario_identity,
+            expected_scenario_identities,
+            counters,
+            consumed: false,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)] // Consumed by the move-only resident Search pending owner.
+    pub(crate) fn enqueue_resident_gene_metrics_owned_v2(
+        mut self,
+        genes: &crate::resident_search_v2::RawResidentGenerationGeneViewV2,
+        settings: &NeoPopulationSettings,
+        logical_population_count: u64,
+        retained_evaluation_capacity: u64,
+        expected_feature_count: u64,
+        expected_max_terms: u32,
+        expected_full_discovery_reserve_bytes: u64,
+    ) -> Result<ResidentSearchPopulationCompletionLeaseV2, CudaPopulationError> {
+        self.require_strict_idle_v1("enqueue_resident_gene_metrics_owned_v2")?;
+        if !self.scenarios_uploaded
+            || self.gene_batch_identity_sha256.is_none()
+            || logical_population_count == 0
+            || retained_evaluation_capacity != logical_population_count
+            || self.scenario_count as u64 != logical_population_count
+            || self.population as u64 != logical_population_count
+            || expected_full_discovery_reserve_bytes == 0
+        {
+            return Err(invalid(
+                "owned resident scoring requires one immutable full-population chunk",
+            ));
+        }
+        if settings.month_capacity == 0 || settings.month_capacity > i32::MAX as u32 {
+            return Err(invalid(
+                "month_capacity must be non-zero and fit the native signed extent",
+            ));
+        }
+        let plan = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(
+            self.scenario_count,
+            settings.month_capacity,
+        )?;
+        let mut receipt = Box::new(RawResidentPopulationMetricsHandleV1::default());
+        let mut counters = NeoPopulationCounters::default();
+        // SAFETY: `self` is moved into the returned lease, so the native session
+        // and stable boxed receipt outlive every queued evaluator/scoring read.
+        let status = unsafe {
+            neoethos_gpu_cuda_population_enqueue_resident_gene_metrics_v2(
+                self.handle,
+                genes,
+                settings,
+                receipt.as_mut(),
+                &mut counters,
+            )
+        };
+        if status != STATUS_OK {
+            if !strict_enqueue_failure_is_known_prelaunch_v1(status) {
+                self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            }
+            return Err(CudaPopulationError::native(
+                "enqueue_resident_gene_metrics_owned_v2",
+                status,
+            ));
+        }
+        self.strict_resident_state = StrictResidentSessionStateV1::InFlight;
+        self.emitted_events = 0;
+        self.pending_event = Some(receipt.event_id);
+        self.metrics_ready = false;
+        if let Err(error) = validate_exact_resident_receipt_v1(receipt.as_ref(), plan) {
+            self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            // SAFETY: native accepted this exact receipt and must be abandoned
+            // before the failed owner leaves scope.
+            let _ = unsafe {
+                neoethos_gpu_cuda_population_abandon_resident_metrics_v1(
+                    self.handle,
+                    receipt.as_ref(),
+                )
+            };
+            return Err(error);
+        }
+        let mut raw = RawResidentScoringPopulationSourceV2::default();
+        // SAFETY: the source is minted from the same stable receipt retained by
+        // the owning completion lease below.
+        let status = unsafe {
+            neoethos_gpu_cuda_population_export_resident_scoring_source_v2(
+                self.handle,
+                receipt.as_ref(),
+                logical_population_count,
+                expected_feature_count,
+                expected_max_terms,
+                &mut raw,
+            )
+        };
+        if status != STATUS_OK
+            || raw.abi_version != 2
+            || raw.reserved != 0
+            || raw.admitted_run_stream.is_null()
+            || raw.metrics_ready_event.is_null()
+            || raw.scoring_ready_event.is_null()
+            || raw.receipt_token.is_null()
+            || raw.population_lifetime_owner.is_null()
+            || raw.population_lifetime_owner != self.handle
+            || std::ptr::eq(
+                raw.population_lifetime_owner.cast_const(),
+                raw.receipt_token,
+            )
+            || raw.metric_rows_device.is_null()
+            || raw.expected_scenario_ids_device.is_null()
+            || raw.logical_population_count != logical_population_count
+            || raw.feature_count != expected_feature_count
+            || raw.max_terms_per_gene != expected_max_terms
+            || raw.full_discovery_reserve_bytes != expected_full_discovery_reserve_bytes
+        {
+            self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            let _ = unsafe {
+                neoethos_gpu_cuda_population_abandon_resident_metrics_v1(
+                    self.handle,
+                    receipt.as_ref(),
+                )
+            };
+            return Err(if status == STATUS_OK {
+                invalid("native owned resident scoring source identity mismatch")
+            } else {
+                CudaPopulationError::native("export_resident_scoring_source_v2", status)
+            });
+        }
+        Ok(ResidentSearchPopulationCompletionLeaseV2 {
+            session: Some(self),
+            receipt,
+            raw,
+            #[cfg(feature = "cuda-device-fixtures")]
+            counters,
             consumed: false,
         })
     }
@@ -2601,6 +2858,24 @@ mod tests {
             offset_of!(RawResidentPopulationMetricsHandleV1, total_device_bytes),
             64
         );
+        layout!(RawResidentScoringPopulationSourceV2, 96, 8);
+        assert_eq!(
+            offset_of!(
+                RawResidentScoringPopulationSourceV2,
+                population_lifetime_owner
+            ),
+            40
+        );
+        assert_eq!(
+            offset_of!(
+                RawResidentScoringPopulationSourceV2,
+                full_discovery_reserve_bytes
+            ),
+            88
+        );
+        let default_scoring_source = RawResidentScoringPopulationSourceV2::default();
+        assert!(default_scoring_source.receipt_token.is_null());
+        assert!(default_scoring_source.population_lifetime_owner.is_null());
         layout!(RawTerminalCompactPopulationResultV1, 160, 8);
         assert_eq!(
             offset_of!(RawTerminalCompactPopulationResultV1, metric_row),
@@ -2641,6 +2916,12 @@ mod tests {
         ) -> *mut c_void = neoethos_gpu_cuda_population_bind_resident_feature_store_v3;
         let _: unsafe extern "C" fn(*mut c_void, *const RawEvaluationViewV1) -> i32 =
             neoethos_gpu_cuda_population_bind_view_v1;
+        #[cfg(feature = "cuda")]
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *const RawEvaluationViewV1,
+            *const ResidentAdaptiveBaseRequestV1,
+        ) -> i32 = neoethos_gpu_cuda_population_bind_resident_adaptive_view_v1;
         let _: unsafe extern "C" fn(*mut c_void, *mut PopulationResidencyCountersV1) -> i32 =
             neoethos_gpu_cuda_population_read_residency_counters_v1;
         let _: unsafe extern "C" fn(*mut c_void, *mut CudaPopulationDeviceIdentityV1) -> i32 =
@@ -2698,7 +2979,7 @@ mod tests {
             "static_assert(offsetof(NeoGeneDescriptor, reserved) == 64);",
             "static_assert(sizeof(NeoPopulationDatasetView) == 232);",
             "static_assert(sizeof(NeoPopulationParentDatasetV1) == 216);",
-            "static_assert(sizeof(NeoPopulationResidentFeatureStoreV3) == 216);",
+            "static_assert(sizeof(NeoPopulationResidentFeatureStoreV3) == 256);",
             "static_assert(sizeof(NeoPopulationEvaluationViewV1) == 72);",
             "static_assert(sizeof(NeoPopulationResidencyCountersV1) == 144);",
             "static_assert(sizeof(NeoPopulationDeviceIdentityV1) == 312);",

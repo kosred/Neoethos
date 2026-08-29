@@ -1,0 +1,7 @@
+# Resident Search Slice 2 design authority manifest v7
+# Authoritative base: 7824e191c04b4eb78e547728ad7cdb78f915a2af
+# Supersedes version-6 design commit: 4f0880148677df0d8f58c11373b42d0bd87e5b13
+# The v2, v3, v4, v5 and v6 manifests remain immutable receipts for superseded designs.
+# Digest inputs are the UTF-8 texts with CRLF normalized to LF.
+ca2813a9beb919bd717147657021e169f5e696b3ed7f95c676b529b98db87a1b  docs/superpowers/specs/2026-08-28-resident-search-slice2-archive-knn-design.md
+1c4bab38b0ac50d123ce8851507c96ad04cc457d4c98fa63d09f041c40f62fa6  docs/superpowers/plans/2026-08-29-resident-search-slice2-r6-combined-preallocation.md

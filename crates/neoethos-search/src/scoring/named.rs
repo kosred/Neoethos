@@ -50,7 +50,7 @@ pub struct ScoringVersion(pub u32);
 /// 2026-06-06: bumped to `3` — `ga_fitness` is now CONSISTENT-monthly-return
 /// oriented. v2 rewarded total net (compounding → lumpy genes that failed the
 /// prop-firm window-consistency gate); v3's dominant reward is the fraction of
-/// months hitting the operator's ≥4%/month bar (metrics[7], the same consistency
+/// months hitting the operator's ≥4%/month bar (`metrics[7]`, the same consistency
 /// the gate checks). (v1 = Sharpe-only; v2 = total-net.) Runs before this are NOT
 /// directly comparable (different fitness landscape); old artifacts still deserialize.
 ///

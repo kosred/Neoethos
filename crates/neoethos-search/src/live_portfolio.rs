@@ -370,7 +370,7 @@ impl LivePortfolioArtifact {
 
     /// The cost-band verdict recorded for `strategy_id` in THIS artifact.
     ///
-    /// A gene with no row is [`CostBandVerdict::Unmeasured`], never
+    /// A gene with no row is [`crate::discovery::CostBandVerdict::Unmeasured`], never
     /// `SurvivesBand`. Strict v3 validation rejects such a missing row on load;
     /// the fallback is only defensive for an in-memory value mutated after
     /// validation.

@@ -1671,14 +1671,14 @@ pub struct WalkforwardPopulationInput<'a> {
 /// prop_compliant, …) which need the per-trade list. So per split this helper:
 ///  - takes the **metrics half** (slots 0/3/4/8/10) from `metrics_fn`'s GPU rows
 ///    (one per gene), and
-///  - computes [`walkforward_risk_diagnostics`] **on the CPU** per gene on the
+///  - computes `walkforward_risk_diagnostics` **on the CPU** per gene on the
 ///    sliced precomputed `signals` — EXACTLY as the single-gene path does.
 ///
 /// The resulting per-gene `WalkforwardSplitResult` is field-for-field identical
 /// to the single-gene path's (the metric slots are read the SAME way; the risk
 /// fields come from the SAME CPU function on the SAME sliced signals), and each
 /// gene's `WalkforwardSummary` is built through the SHARED
-/// [`summarize_walkforward_splits`] reducer — so the avg/any/all aggregation is
+/// `summarize_walkforward_splits` reducer — so the avg/any/all aggregation is
 /// byte-identical to `embargoed_walkforward_backtest`.
 ///
 /// ## Fixed-1-lot

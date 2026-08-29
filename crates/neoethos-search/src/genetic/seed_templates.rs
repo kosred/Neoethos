@@ -438,7 +438,7 @@ fn build_variant(
 ///   fewer than `count` rather than producing nonsense).
 /// Collect the feature indices the professional seed templates would
 /// reference against `feature_names`, resolved by the SAME role logic the
-/// templates use ([`resolve_role`] = primary keyword, then family fallback,
+/// templates use (`resolve_role` = primary keyword, then family fallback,
 /// matched case-insensitively together with the TF prefix), deduplicated.
 ///
 /// The feature prefilter calls this to FORCE-KEEP exactly the multi-TF

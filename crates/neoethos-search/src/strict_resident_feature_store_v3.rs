@@ -48,7 +48,7 @@ fn hex_lower(bytes: [u8; 32]) -> String {
     output
 }
 
-fn validate_strict_resident_feature_store_v3(
+pub(crate) fn validate_strict_resident_feature_store_v3(
     sealed_store: &SealedGpuResidentFeatureStoreV3,
     scope: &CanonicalSearchArtifactScopeV2,
 ) -> Result<()> {

@@ -1883,19 +1883,52 @@ fn discovery_profile_exports_runtime_override_resolution() {
 fn timeframe_group_classifies_multitimeframe_prefixes() {
     // Higher-TF columns are emitted as "{TF}_{indicator}" by
     // prepare_multitimeframe_features_with_options.
-    assert_eq!(timeframe_group("H1_rsi_14"), Some("H1"));
-    assert_eq!(timeframe_group("H4_ema_20"), Some("H4"));
-    assert_eq!(timeframe_group("M15_macd_signal"), Some("M15"));
-    assert_eq!(timeframe_group("D1_atr"), Some("D1"));
-    assert_eq!(timeframe_group("MN1_close"), Some("MN1"));
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("H1_rsi_14"),
+        Some("H1")
+    );
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("H4_ema_20"),
+        Some("H4")
+    );
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("M15_macd_signal"),
+        Some("M15")
+    );
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("D1_atr"),
+        Some("D1")
+    );
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("MN1_close"),
+        Some("MN1")
+    );
     // Base-TF + regime columns are unprefixed → no group.
-    assert_eq!(timeframe_group("rsi_14"), None);
-    assert_eq!(timeframe_group("macd_signal"), None);
-    assert_eq!(timeframe_group("ema_20"), None);
-    assert_eq!(timeframe_group("regime_wilder_adx_14_v3"), None);
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("rsi_14"),
+        None
+    );
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("macd_signal"),
+        None
+    );
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("ema_20"),
+        None
+    );
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("regime_trend_strength"),
+        None
+    );
     // Uppercase base heads that are NOT timeframe labels must not match.
-    assert_eq!(timeframe_group("MA_20"), None); // letters then non-digit
-    assert_eq!(timeframe_group("MACD_x"), None); // 4 chars, too long
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("MA_20"),
+        None
+    ); // letters then non-digit
+    assert_eq!(
+        crate::prefilter_schema_v1::timeframe_group_v1("MACD_x"),
+        None
+    ); // 4 chars, too long
 }
 
 #[test]
@@ -1968,7 +2001,10 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
     let (legacy, _) =
         prefilter_features(&frame, &ohlcv, &spec(3, 0)).expect("legacy prefilter succeeds");
     assert!(
-        !legacy.names.iter().any(|n| timeframe_group(n).is_some()),
+        !legacy
+            .names
+            .iter()
+            .any(|n| crate::prefilter_schema_v1::timeframe_group_v1(n).is_some()),
         "legacy prefilter should keep only base features, got {:?}",
         legacy.names
     );

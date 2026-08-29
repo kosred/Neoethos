@@ -46,7 +46,7 @@ neoethos-dataset-contracts.workspace = true
 neoethos-broker-truth = { path = "../neoethos-broker-truth" }
 neoethos-core = { path = "../neoethos-core" }
 neoethos-gpu-contracts = { path = "../neoethos-gpu-contracts" }
-neoethos-gpu-cuda = { path = "../neoethos-gpu-cuda", optional = true }
+neoethos-gpu-cuda = { path = "../neoethos-gpu-cuda", optional = true, default-features = false }
 duckdb = { version = "1.1.1", optional = true, features = ["bundled"] }
 # REMOVED 2026-08-02: `tch = { version = "0.22.0", optional = true }`.
 # No feature in this crate ever listed `dep:tch`, and no file under src/
@@ -102,6 +102,10 @@ gpu-cuda = [
 # to the GPU under this feature alone.
 gpu-b-adapter = ["dep:neoethos-gpu-cuda"]
 gpu-b-native = ["gpu-b-adapter", "neoethos-gpu-cuda/cuda"]
+resident-search-slice2-compile-contract = [
+    "dep:neoethos-gpu-cuda",
+    "neoethos-gpu-cuda/resident-search-slice2-compile-contract",
+]
 gpu-vulkan = ["gpu", "cubecl/wgpu", "neoethos-core/gpu-wgpu"]
 gpu-rocm = ["gpu", "cubecl/hip", "neoethos-core/gpu-rocm"]
 strategy-db = ["dep:duckdb"]
@@ -109,3 +113,9 @@ strategy-db = ["dep:duckdb"]
 [dev-dependencies]
 # The probe example needs a subscriber to surface the engine's own diagnostics.
 tracing-subscriber = { workspace = true }
+tempfile = "3.27"
+
+[[test]]
+name = "resident_search_slice2_compile_contract"
+path = "tests/resident_search_slice2_compile_contract.rs"
+required-features = ["resident-search-slice2-compile-contract"]

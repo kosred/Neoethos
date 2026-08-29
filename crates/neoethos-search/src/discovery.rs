@@ -73,7 +73,7 @@ fn permutation_monte_carlo_p_value_v1(beats: usize, permutations: usize) -> Resu
 /// kept, how much data the stage-1 funnel sees, what counts as in-sample for
 /// the prefilter), so they belong in typed config rather than ambient env
 /// state. These are configured via `models.discovery_runtime` (typed config)
-/// and resolved by [`DiscoveryRuntimeOverrides::from_settings`], which is the
+/// and resolved by `DiscoveryRuntimeOverrides::from_settings`, which is the
 /// ONLY constructor that reads operator input.
 ///
 /// 2026-08-10: the legacy `from_env()` reader was deleted. It carried six
@@ -520,7 +520,7 @@ pub struct DiscoveryConfig {
     /// The evaluators subtract this exactly once per closed trade, so a
     /// per-side broker quote must already have been doubled before it lands
     /// here — `from_settings` does that through
-    /// [`crate::genetic::strategy_gene::round_trip_commission_per_lot`], gated
+    /// `crate::genetic::strategy_gene::round_trip_commission_per_lot`, gated
     /// on `risk.commission_per_lot_is_per_side`.
     pub evaluation_commission_per_trade: f64,
     /// Session-aware spread curve in pips, `[asian, overlap, late_ny]`,
@@ -549,7 +549,7 @@ pub struct DiscoveryConfig {
     /// Friday-late / Monday-open entries (`eval.rs:1537`, `:1654`).
     ///
     /// WIRED 2026-08-10 (audit #75/#217). This was the literal `true` in
-    /// [`discovery_backtest_settings`], sitting between two fields that read
+    /// `discovery_backtest_settings`, sitting between two fields that read
     /// `config.`. Live read `risk.kill_zones_enabled`
     /// (`live_trading.rs:732-735`) and the search read nothing, so the knob was
     /// ONE-SIDED: setting it to `false` could only make live hold through
@@ -1625,7 +1625,7 @@ pub struct DiscoveryResult {
     /// with no band configured. A reader that treats an absent entry as
     /// `SurvivesBand` re-creates the defect; the verdict for a gene with no
     /// entry is [`CostBandVerdict::Unmeasured`], which is what
-    /// [`cost_band_for_strategy`] returns.
+    /// [`DiscoveryResult::cost_band_for_strategy`] returns.
     pub cost_band_by_strategy: Vec<(String, CostBandVerdict)>,
     pub portfolio: Vec<Gene>,
     pub candidates: Vec<Gene>,
@@ -6442,7 +6442,7 @@ where
             // The `len()` guard is not decorative: `timeframe_group("H4")`
             // returns `Some("H4")` for a column with no suffix at all, and an
             // unguarded `&name[tf.len() + 1..]` would panic mid-run on it.
-            let bare = match timeframe_group(name) {
+            let bare = match crate::prefilter_schema_v1::timeframe_group_v1(name) {
                 Some(tf) if name.len() > tf.len() => &name[tf.len() + 1..],
                 _ => name.as_str(),
             };
@@ -6520,80 +6520,13 @@ where
         //    objective actually scores, not the 1-bar forward return, and
         //  * the ranking is refit INSIDE each CPCV fold's purged train set
         //    instead of once on a leading prefix.
-        let evaluation = config.evaluation_config(ohlcv.close.last().copied());
-        let pip = if evaluation.pip_value.is_finite() && evaluation.pip_value > 0.0 {
-            evaluation.pip_value
-        } else {
-            // The cost-model guard upstream has already bailed on a non-finite
-            // spread, so this is only reachable for an exotic with no pip size.
-            // Charging zero cost into the label would make it claim trades pay
-            // for free, so refuse the cost term instead and say so.
-            tracing::warn!(
-                target: "neoethos_search::discovery",
-                pip_value = evaluation.pip_value,
-                "prefilter label: no usable pip size — the first-passage barriers carry NO \
-                 cost, so the label is optimistic about which trades would have paid"
-            );
-            0.0
-        };
-        // Round-trip cost in PRICE units: the full spread (slippage already
-        // folded in by `from_settings`) plus the round-trip commission
-        // converted from account currency into pips via the per-lot pip value.
-        let commission_pips = if evaluation.pip_value_per_lot.is_finite()
-            && evaluation.pip_value_per_lot > 0.0
-            && evaluation.commission_per_trade.is_finite()
-        {
-            evaluation.commission_per_trade / evaluation.pip_value_per_lot
-        } else {
-            0.0
-        };
-        let round_trip_cost_px = (evaluation.spread_pips.max(0.0) + commission_pips.max(0.0)) * pip;
-        // The gene stop band this run installed, converted from pips back into
-        // ATR multiples so the labeller (which sizes barriers off its own
-        // rolling ATR in price units) speaks the same language. Falls back to
-        // the pre-2026-08-09 literals, loudly, when no ATR scale is in force —
-        // the absolute pip band cannot be turned into an ATR multiple.
-        let (label_sl_atr_mult, label_rr) = {
-            let bounds = crate::genetic::current_gene_stop_bounds();
-            let mid_rr = 0.5 * (bounds.rr_min + bounds.rr_max);
-            match bounds.atr_pips {
-                Some(atr_pips) if atr_pips.is_finite() && atr_pips > 0.0 => {
-                    let mid_sl_pips = 0.5 * (bounds.sl_min_pips + bounds.sl_max_pips);
-                    let mult = mid_sl_pips / atr_pips;
-                    if mult.is_finite() && mult > 0.0 && mid_rr.is_finite() && mid_rr > 0.0 {
-                        (mult, mid_rr)
-                    } else {
-                        (1.0, 2.0)
-                    }
-                }
-                _ => {
-                    tracing::warn!(
-                        target: "neoethos_search::prefilter",
-                        sl_min_pips = bounds.sl_min_pips,
-                        sl_max_pips = bounds.sl_max_pips,
-                        rr_min = bounds.rr_min,
-                        rr_max = bounds.rr_max,
-                        "no ATR scale installed for this dataset, so the prefilter label falls \
-                         back to the literal (1.0 ATR, rr 2.0) geometry. That is the bottom \
-                         corner of the searchable band and the ranking it produces is not \
-                         representative of what the GA will explore."
-                    );
-                    (1.0, 2.0)
-                }
-            }
-        };
+        let financial_geometry =
+            resolve_prefilter_financial_geometry_v1(config, ohlcv.close.last().copied());
         let spec = PrefilterSpec {
             top_k: prefilter_top_k,
             insample_frac: prefilter_insample_frac,
             min_per_tf: prefilter_min_per_tf,
-            max_hold_bars: if evaluation.max_hold_bars > 0 {
-                evaluation.max_hold_bars
-            } else {
-                // A gene with no vertical barrier still cannot be graded over
-                // an unbounded horizon by a labeller, so the label uses the
-                // configured triple-barrier horizon. Stated, not silent.
-                35
-            },
+            max_hold_bars: financial_geometry.max_hold_bars,
             atr_period: 14,
             // THE LABEL'S GEOMETRY, read from the band the GA will actually
             // search rather than pinned to a literal. Corrected 2026-08-09: the
@@ -6609,9 +6542,9 @@ where
             // single representative than a corner; a full band sweep, keeping
             // the worst point the way the fold rule keeps the worst fold, is the
             // follow-up and it costs k× the correlation pass.
-            sl_atr_mult: label_sl_atr_mult,
-            rr: label_rr,
-            round_trip_cost_px,
+            sl_atr_mult: financial_geometry.stop_atr_multiplier,
+            rr: financial_geometry.reward_risk_ratio,
+            round_trip_cost_px: financial_geometry.round_trip_cost_price,
             cpcv: config.enable_cpcv.then_some((
                 config.cpcv_n_splits,
                 config.cpcv_n_test_groups,
@@ -6770,7 +6703,7 @@ where
         let mut by_tf: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
         for name in &effective_feature_names {
-            let key = timeframe_group(name)
+            let key = crate::prefilter_schema_v1::timeframe_group_v1(name)
                 .map(|g| g.to_string())
                 .unwrap_or_else(|| "base".to_string());
             *by_tf.entry(key).or_insert(0) += 1;
@@ -7103,6 +7036,88 @@ pub(crate) struct PrefilterSpec {
     /// embargo_pct, purge_pct, max_rows)`. `None` = fit once on the prefix,
     /// which is the contaminating behaviour this replaces.
     pub cpcv: Option<(usize, usize, f64, f64, usize)>,
+}
+
+/// One numerical authority for the CPU and resident-CUDA prefilter label
+/// geometry. The GPU path consumes these resolved scalars; it never rebuilds
+/// cost conversion or stop-band midpoints from a second formula.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResolvedPrefilterFinancialGeometryV1 {
+    pub(crate) max_hold_bars: usize,
+    pub(crate) stop_atr_multiplier: f64,
+    pub(crate) reward_risk_ratio: f64,
+    pub(crate) round_trip_cost_price: f64,
+}
+
+pub(crate) fn resolve_prefilter_financial_geometry_v1(
+    config: &DiscoveryConfig,
+    price_hint: Option<f64>,
+) -> ResolvedPrefilterFinancialGeometryV1 {
+    let evaluation = config.evaluation_config(price_hint);
+    let pip = if evaluation.pip_value.is_finite() && evaluation.pip_value > 0.0 {
+        evaluation.pip_value
+    } else {
+        // The cost-model guard upstream has already rejected a non-finite
+        // spread. Preserve the historical zero-cost fallback for an exotic
+        // with no usable pip size, but state it at the shared authority.
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            pip_value = evaluation.pip_value,
+            "prefilter label: no usable pip size — the first-passage barriers carry NO \
+             cost, so the label is optimistic about which trades would have paid"
+        );
+        0.0
+    };
+    let commission_pips = if evaluation.pip_value_per_lot.is_finite()
+        && evaluation.pip_value_per_lot > 0.0
+        && evaluation.commission_per_trade.is_finite()
+    {
+        evaluation.commission_per_trade / evaluation.pip_value_per_lot
+    } else {
+        0.0
+    };
+    let round_trip_cost_price = (evaluation.spread_pips.max(0.0) + commission_pips.max(0.0)) * pip;
+    let bounds = crate::genetic::current_gene_stop_bounds();
+    let midpoint_rr = 0.5 * (bounds.rr_min + bounds.rr_max);
+    let (stop_atr_multiplier, reward_risk_ratio) = match bounds.atr_pips {
+        Some(atr_pips) if atr_pips.is_finite() && atr_pips > 0.0 => {
+            let midpoint_stop_pips = 0.5 * (bounds.sl_min_pips + bounds.sl_max_pips);
+            let multiplier = midpoint_stop_pips / atr_pips;
+            if multiplier.is_finite()
+                && multiplier > 0.0
+                && midpoint_rr.is_finite()
+                && midpoint_rr > 0.0
+            {
+                (multiplier, midpoint_rr)
+            } else {
+                (1.0, 2.0)
+            }
+        }
+        _ => {
+            tracing::warn!(
+                target: "neoethos_search::prefilter",
+                sl_min_pips = bounds.sl_min_pips,
+                sl_max_pips = bounds.sl_max_pips,
+                rr_min = bounds.rr_min,
+                rr_max = bounds.rr_max,
+                "no ATR scale installed for this dataset, so the prefilter label falls \
+                 back to the literal (1.0 ATR, rr 2.0) geometry. That is the bottom \
+                 corner of the searchable band and the ranking it produces is not \
+                 representative of what the GA will explore."
+            );
+            (1.0, 2.0)
+        }
+    };
+    ResolvedPrefilterFinancialGeometryV1 {
+        max_hold_bars: if evaluation.max_hold_bars > 0 {
+            evaluation.max_hold_bars
+        } else {
+            35
+        },
+        stop_atr_multiplier,
+        reward_risk_ratio,
+        round_trip_cost_price,
+    }
 }
 
 /// Counted outcomes of one prefilter pass. Nothing on this path is discarded
@@ -7440,6 +7455,30 @@ fn prefilter_features(
         };
         return Ok((features.clone(), census));
     }
+    let sealed_schema =
+        crate::prefilter_schema_v1::seal_prefilter_column_classification_v1(&features.names)
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot seal an empty or overflowing prefilter schema")
+            })?;
+    if sealed_schema.ordered_feature_schema_sha256() == [0; 32]
+        || sealed_schema.column_classification_content_sha256() == [0; 32]
+        || sealed_schema
+            .timeframe_group_ids()
+            .iter()
+            .copied()
+            .max()
+            .is_some_and(|group| u64::from(group) > sealed_schema.timeframe_group_count())
+        || sealed_schema
+            .column_class_flags()
+            .iter()
+            .zip(sealed_schema.template_force_keep_flags())
+            .any(|(class, force_keep)| {
+                (*class & crate::prefilter_schema_v1::COLUMN_CLASS_TEMPLATE_V1 != 0)
+                    != (*force_keep != 0)
+            })
+    {
+        anyhow::bail!("prefilter schema classification is internally inconsistent");
+    }
 
     // THE TARGET (2026-08-09). Was the 1-bar forward return; is now the
     // triple-barrier label the objective scores. See `first_passage_labels`.
@@ -7544,8 +7583,10 @@ fn prefilter_features(
     let scored: Vec<ColumnScore> = (0..n_cols)
         .into_par_iter()
         .map(|col_idx| {
-            let name = &features.names[col_idx];
-            if is_prefilter_state_column(name) {
+            if sealed_schema.column_class_flags()[col_idx]
+                & crate::prefilter_schema_v1::COLUMN_CLASS_STATE_V1
+                != 0
+            {
                 // Force-keep. `regime_` was always here; `smc_`, `session_` and
                 // `fp_` joined it 2026-08-10 — see PREFILTER_STATE_FAMILIES for
                 // the argument and for why repairing the correlation function
@@ -7673,14 +7714,14 @@ fn prefilter_features(
     // force-kept STATE column (regime_ + smc_ + session_ + fp_ on the base
     // timeframe). The per-family split is in the log line below so a reader can
     // see which families the number is made of.
-    census.regime_forced = features
-        .names
+    census.regime_forced = sealed_schema
+        .column_class_flags()
         .iter()
-        .filter(|n| is_prefilter_state_column(n))
+        .filter(|flags| **flags & crate::prefilter_schema_v1::COLUMN_CLASS_STATE_V1 != 0)
         .count();
     {
         let mut per_family: Vec<(&str, usize)> = Vec::new();
-        for family in PREFILTER_STATE_FAMILIES {
+        for family in crate::prefilter_schema_v1::PREFILTER_STATE_FAMILIES_V1 {
             per_family.push((
                 family,
                 features
@@ -7728,17 +7769,19 @@ fn prefilter_features(
     {
         let mut kept: std::collections::HashSet<usize> = keep_indices.iter().copied().collect();
         if spec.min_per_tf > 0 {
-            let mut per_group: std::collections::HashMap<&str, usize> =
+            let mut per_group: std::collections::HashMap<u32, usize> =
                 std::collections::HashMap::new();
             for &idx in &keep_indices {
-                if let Some(group) = timeframe_group(&features.names[idx]) {
+                let group = sealed_schema.timeframe_group_ids()[idx];
+                if group != 0 {
                     *per_group.entry(group).or_insert(0) += 1;
                 }
             }
             for &(idx, _) in &correlations {
-                let Some(group) = timeframe_group(&features.names[idx]) else {
+                let group = sealed_schema.timeframe_group_ids()[idx];
+                if group == 0 {
                     continue;
-                };
+                }
                 let count = per_group.entry(group).or_insert(0);
                 if *count >= spec.min_per_tf {
                     continue;
@@ -7760,8 +7803,15 @@ fn prefilter_features(
         // dropped. Two unrelated decisions on one flag, with nothing saying so.
         // BEHAVIOUR CHANGE: at `min_per_tf = 0` the template columns are now
         // kept; at any positive value nothing changes.
-        for idx in crate::genetic::seed_templates::template_feature_indices(&features.names) {
-            kept.insert(idx);
+        for (idx, force_keep) in sealed_schema
+            .template_force_keep_flags()
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            if force_keep != 0 {
+                kept.insert(idx);
+            }
         }
         keep_indices = kept.into_iter().collect();
     }
@@ -7893,49 +7943,7 @@ pub fn resolve_prefilter_top_k(
 ///
 /// BASE TIMEFRAME ONLY, by construction: higher-TF columns carry a `H1_`/`H4_`
 /// prefix (see `timeframe_group`), so `starts_with` matches the base block and
-/// not its ten resamplings. Regime-v3 uses truthful identities with both
-/// `regime_` and `neoethos_custom_` heads, so its exact frozen name set is
-/// checked separately rather than widening the custom prefix.
-const PREFILTER_STATE_FAMILIES: [&str; 3] = ["smc_", "session_", "fp_"];
-
-/// Whether this column is force-kept by the prefilter regardless of its
-/// correlation rank.
-fn is_prefilter_state_column(name: &str) -> bool {
-    neoethos_data::REGIME_FEATURE_NAMES_V3.contains(&name)
-        || PREFILTER_STATE_FAMILIES
-            .iter()
-            .any(|family| name.starts_with(family))
-}
-
-/// Identify the higher-timeframe prefix group of a multi-TF feature name.
-///
-/// Multi-resolution features are emitted as `"{TF}_{indicator}"` (e.g.
-/// `"H1_rsi_14"`, `"M15_ema_20"`) by
-/// `prepare_multitimeframe_features_with_options`. Base-TF features are
-/// unprefixed and `regime_*` columns are handled separately, so this returns
-/// `None` for all base columns. A timeframe label is one or two leading uppercase letters
-/// (`M`, `H`, `D`, `W`, or `MN`) followed by digits, terminated by `_` — which
-/// distinguishes it from lowercase/longer base indicator heads (`rsi`, `macd`,
-/// `ema`, `bb`) without needing the live higher-TF list.
-fn timeframe_group(name: &str) -> Option<&str> {
-    let head = name.split('_').next()?;
-    // Canonical TF labels are 2-3 chars: M1/H1/D1/W1 (2) or M15/MN1 (3).
-    if head.len() < 2 || head.len() > 3 {
-        return None;
-    }
-    let digits = if let Some(rest) = head.strip_prefix("MN") {
-        rest
-    } else if head.starts_with(['M', 'H', 'D', 'W']) {
-        &head[1..]
-    } else {
-        return None;
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(head)
-}
-
+/// not its ten resamplings. Same as `regime_` has always behaved.
 fn validate_regime_robustness(
     trades: &[crate::quality::Trade],
     features: &FeatureFrame,
@@ -11943,7 +11951,7 @@ pub fn save_prop_firm_validation_artifacts(
 ///   bridge will treat that as missing evidence if it requires the
 ///   gate).
 /// - `prop_firm_passed` aggregates the per-strategy
-///   [`PropFirmRiskValidationArtifactFile::summary.all_rules_passed`]
+///   [`PropFirmRiskValidationArtifactFile`] values' `summary().all_rules_passed`
 ///   flags: `Some(true)` when every persisted prop-firm artifact passes,
 ///   `Some(false)` when at least one fails, and `None` when no
 ///   prop-firm artifact was produced (the live bridge will treat that
@@ -12874,15 +12882,24 @@ mod streaming_and_predicate_tests {
     /// by the per-TF quota instead).
     #[test]
     fn only_base_timeframe_state_columns_are_force_kept() {
-        assert!(is_prefilter_state_column(
-            "neoethos_custom_gk_vol_ratio_state_10_50_v3"
+        assert!(crate::prefilter_schema_v1::is_prefilter_state_column_v1(
+            "regime_vol_state"
         ));
-        assert!(!is_prefilter_state_column("regime_vol_state"));
-        assert!(is_prefilter_state_column("smc_ob"));
-        assert!(is_prefilter_state_column("session_london_open"));
-        assert!(is_prefilter_state_column("fp_delta"));
-        assert!(!is_prefilter_state_column("rsi_14"));
-        assert!(!is_prefilter_state_column("H1_smc_ob"));
+        assert!(crate::prefilter_schema_v1::is_prefilter_state_column_v1(
+            "smc_ob"
+        ));
+        assert!(crate::prefilter_schema_v1::is_prefilter_state_column_v1(
+            "session_london_open"
+        ));
+        assert!(crate::prefilter_schema_v1::is_prefilter_state_column_v1(
+            "fp_delta"
+        ));
+        assert!(!crate::prefilter_schema_v1::is_prefilter_state_column_v1(
+            "rsi_14"
+        ));
+        assert!(!crate::prefilter_schema_v1::is_prefilter_state_column_v1(
+            "H1_smc_ob"
+        ));
     }
 }
 

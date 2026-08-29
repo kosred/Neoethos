@@ -33,6 +33,11 @@ use crate::resident_robust_normalization_v2::{
 use crate::resident_session_v2::{
     ResidentSessionLaunchAuthorityV2, ResidentSessionRuntimeReceiptV2, launch_resident_session_v2,
 };
+use crate::resident_trim_prefilter_v1::{
+    RESIDENT_TRIM_PREFILTER_CUDA_MATH_FLAGS_V1, ResidentTrimPrefilterFullDiscoveryAdmissionV1,
+    ResidentTrimPrefilterImportIdentityV1, ResidentTrimPrefilterInputsV1,
+    ResidentTrimPrefilterParentImportV1, SealedResidentColumnClassificationV1,
+};
 use crate::{NeoPopulationSettings, ScenarioDescriptor};
 use cust::context::{Context, CurrentContext};
 use cust::memory::{
@@ -53,8 +58,10 @@ use neoethos_gpu_contracts::resident_feature_store_v3::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -194,6 +201,247 @@ pub enum ResidentFeatureStoreCudaErrorV3 {
     Population(#[from] CudaPopulationError),
 }
 
+/// Opaque full-workspace slice reserved for the resident trim/prefilter. Its
+/// constructor is crate-private; public consumers can inspect only bounded
+/// byte and identity facts, never CUDA handles.
+#[derive(Debug)]
+pub struct SealedFullDiscoveryTrimAdmissionV1 {
+    workspace_plan_identity_sha256: [u8; SHA256_BYTES],
+    required_workspace_bytes: u64,
+    trim_prefilter_reserved_bytes: u64,
+    full_discovery_reserve_bytes: u64,
+}
+
+impl SealedFullDiscoveryTrimAdmissionV1 {
+    pub(crate) const fn new(
+        workspace_plan_identity_sha256: [u8; SHA256_BYTES],
+        required_workspace_bytes: u64,
+        trim_prefilter_reserved_bytes: u64,
+        full_discovery_reserve_bytes: u64,
+    ) -> Self {
+        Self {
+            workspace_plan_identity_sha256,
+            required_workspace_bytes,
+            trim_prefilter_reserved_bytes,
+            full_discovery_reserve_bytes,
+        }
+    }
+
+    pub const fn workspace_plan_identity_sha256(&self) -> [u8; SHA256_BYTES] {
+        self.workspace_plan_identity_sha256
+    }
+
+    pub const fn required_workspace_bytes(&self) -> u64 {
+        self.required_workspace_bytes
+    }
+
+    pub const fn trim_prefilter_reserved_bytes(&self) -> u64 {
+        self.trim_prefilter_reserved_bytes
+    }
+
+    pub const fn full_discovery_reserve_bytes(&self) -> u64 {
+        self.full_discovery_reserve_bytes
+    }
+}
+
+/// Host-metadata-only classification sealed by Search's single CPU/schema
+/// authority. gpu-cuda validates its exact shape and uploads it once on the
+/// admitted stream; it never recomputes classification from a second rule set.
+#[derive(Debug)]
+pub struct ResidentTrimPrefilterSchemaUploadV1 {
+    canonical_search_input_receipt_sha256: [u8; SHA256_BYTES],
+    canonical_content_merkle_sha256: [u8; SHA256_BYTES],
+    normalization_fit_sha256: [u8; SHA256_BYTES],
+    feature_plan_sha256: [u8; SHA256_BYTES],
+    source_provenance_sha256: [u8; SHA256_BYTES],
+    ordered_feature_schema_sha256: [u8; SHA256_BYTES],
+    column_classification_content_sha256: [u8; SHA256_BYTES],
+    column_class_flags: Vec<u8>,
+    timeframe_group_ids: Vec<u32>,
+    template_force_keep_flags: Vec<u8>,
+    timeframe_group_count: u64,
+}
+
+impl ResidentTrimPrefilterSchemaUploadV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        canonical_search_input_receipt_sha256: [u8; SHA256_BYTES],
+        canonical_content_merkle_sha256: [u8; SHA256_BYTES],
+        normalization_fit_sha256: [u8; SHA256_BYTES],
+        feature_plan_sha256: [u8; SHA256_BYTES],
+        source_provenance_sha256: [u8; SHA256_BYTES],
+        ordered_feature_schema_sha256: [u8; SHA256_BYTES],
+        column_classification_content_sha256: [u8; SHA256_BYTES],
+        column_class_flags: Vec<u8>,
+        timeframe_group_ids: Vec<u32>,
+        template_force_keep_flags: Vec<u8>,
+        timeframe_group_count: u64,
+    ) -> Result<Self, ResidentFeatureStoreCudaErrorV3> {
+        let column_count = column_class_flags.len();
+        let hashes = [
+            canonical_search_input_receipt_sha256,
+            canonical_content_merkle_sha256,
+            normalization_fit_sha256,
+            feature_plan_sha256,
+            source_provenance_sha256,
+            ordered_feature_schema_sha256,
+            column_classification_content_sha256,
+        ];
+        let group_ids = timeframe_group_ids
+            .iter()
+            .copied()
+            .filter(|group| *group != 0)
+            .collect::<BTreeSet<_>>();
+        let exact_group_ids = u64::try_from(group_ids.len())
+            .ok()
+            .is_some_and(|count| count == timeframe_group_count)
+            && group_ids
+                .iter()
+                .copied()
+                .eq(1..=u32::try_from(timeframe_group_count).unwrap_or(0));
+        let exact_classes = column_class_flags
+            .iter()
+            .zip(&template_force_keep_flags)
+            .all(|(class, force_keep)| {
+                *class & !0b11 == 0
+                    && *force_keep <= 1
+                    && (*force_keep == 1) == (*class & 0b10 != 0)
+            });
+        if column_count == 0
+            || timeframe_group_ids.len() != column_count
+            || template_force_keep_flags.len() != column_count
+            || timeframe_group_count == 0
+            || timeframe_group_ids
+                .iter()
+                .any(|group| u64::from(*group) > timeframe_group_count)
+            || !exact_group_ids
+            || !exact_classes
+            || hashes.iter().any(|hash| *hash == [0; SHA256_BYTES])
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident trim schema upload is not an exact sealed classification".into(),
+            ));
+        }
+        Ok(Self {
+            canonical_search_input_receipt_sha256,
+            canonical_content_merkle_sha256,
+            normalization_fit_sha256,
+            feature_plan_sha256,
+            source_provenance_sha256,
+            ordered_feature_schema_sha256,
+            column_classification_content_sha256,
+            column_class_flags,
+            timeframe_group_ids,
+            template_force_keep_flags,
+            timeframe_group_count,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PendingResidentTrimSchemaUploadV1 {
+    host_column_class_flags: Option<LockedBuffer<u8>>,
+    host_timeframe_group_ids: Option<LockedBuffer<u32>>,
+    host_template_force_keep_flags: Option<LockedBuffer<u8>>,
+    column_class_flags: Option<StreamOrderedDeviceBufferV3<u8>>,
+    timeframe_group_ids: Option<StreamOrderedDeviceBufferV3<u32>>,
+    template_force_keep_flags: Option<StreamOrderedDeviceBufferV3<u8>>,
+    ready_event: Option<OwnedCudaEventV3>,
+}
+
+impl PendingResidentTrimSchemaUploadV1 {
+    fn new(ready_event: OwnedCudaEventV3) -> Self {
+        Self {
+            host_column_class_flags: None,
+            host_timeframe_group_ids: None,
+            host_template_force_keep_flags: None,
+            column_class_flags: None,
+            timeframe_group_ids: None,
+            template_force_keep_flags: None,
+            ready_event: Some(ready_event),
+        }
+    }
+
+    fn into_lifetime(mut self) -> ResidentTrimSchemaLifetimeV1 {
+        ResidentTrimSchemaLifetimeV1 {
+            _host_column_class_flags: self
+                .host_column_class_flags
+                .take()
+                .expect("sealed trim schema retains class upload"),
+            _host_timeframe_group_ids: self
+                .host_timeframe_group_ids
+                .take()
+                .expect("sealed trim schema retains timeframe upload"),
+            _host_template_force_keep_flags: self
+                .host_template_force_keep_flags
+                .take()
+                .expect("sealed trim schema retains template upload"),
+            column_class_flags: self
+                .column_class_flags
+                .take()
+                .expect("sealed trim schema retains class device buffer"),
+            timeframe_group_ids: self
+                .timeframe_group_ids
+                .take()
+                .expect("sealed trim schema retains timeframe device buffer"),
+            template_force_keep_flags: self
+                .template_force_keep_flags
+                .take()
+                .expect("sealed trim schema retains template device buffer"),
+            ready_event: self
+                .ready_event
+                .take()
+                .expect("sealed trim schema retains ready event"),
+        }
+    }
+}
+
+impl Drop for PendingResidentTrimSchemaUploadV1 {
+    fn drop(&mut self) {
+        // Any failed async allocation/copy/record may have retained every host
+        // and device address. Without a terminal event there is no safe host
+        // wait or retry boundary, so retire all identities by deliberate leak.
+        if let Some(owner) = self.host_column_class_flags.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.host_timeframe_group_ids.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.host_template_force_keep_flags.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.column_class_flags.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.timeframe_group_ids.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.template_force_keep_flags.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.ready_event.take() {
+            std::mem::forget(owner);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResidentTrimSchemaLifetimeV1 {
+    _host_column_class_flags: LockedBuffer<u8>,
+    _host_timeframe_group_ids: LockedBuffer<u32>,
+    _host_template_force_keep_flags: LockedBuffer<u8>,
+    column_class_flags: StreamOrderedDeviceBufferV3<u8>,
+    timeframe_group_ids: StreamOrderedDeviceBufferV3<u32>,
+    template_force_keep_flags: StreamOrderedDeviceBufferV3<u8>,
+    ready_event: OwnedCudaEventV3,
+}
+
+#[derive(Debug)]
+struct ResidentTrimAdmissionLifetimeV1 {
+    _owner: Arc<ResidentFeatureStoreOwnerV3>,
+    ready_event: OwnedCudaEventV3,
+}
+
 /// One process-local, gpu-cuda-owned device admission carried from the single
 /// pre-materialization probe through Data materialization and consumed by the
 /// strict Search session. It has no public constructor and cannot be rebuilt
@@ -210,6 +458,8 @@ pub struct GpuOnlyRunDeviceAdmissionV3 {
     phase_one_free_bytes_snapshot: u64,
     allocator_context_reserve_bytes: u64,
     reserve_policy_id: &'static str,
+    data_population_limits: Option<SealedDataPopulationExecutionLimitsV1>,
+    full_discovery_trim_admission: Option<SealedFullDiscoveryTrimAdmissionV1>,
 }
 
 #[derive(Debug)]
@@ -231,11 +481,27 @@ pub(crate) struct FullDiscoveryRunDeviceAdmissionRequestV3 {
     pub(crate) exact_math_authority: String,
     pub(crate) phase_one_free_bytes_snapshot: u64,
     pub(crate) allocator_context_reserve_bytes: u64,
+    pub(crate) data_population_limits: Option<SealedDataPopulationExecutionLimitsV1>,
+    pub(crate) full_discovery_trim_admission: Option<SealedFullDiscoveryTrimAdmissionV1>,
 }
 
 impl GpuOnlyRunDeviceAdmissionV3 {
     pub const fn admission_identity_sha256(&self) -> [u8; SHA256_BYTES] {
         self.admission_identity_sha256
+    }
+
+    pub const fn workspace_plan_identity_sha256(&self) -> [u8; SHA256_BYTES] {
+        self.workspace_plan_identity_sha256
+    }
+
+    pub const fn data_population_limits(&self) -> Option<&SealedDataPopulationExecutionLimitsV1> {
+        self.data_population_limits.as_ref()
+    }
+
+    pub const fn full_discovery_trim_admission(
+        &self,
+    ) -> Option<&SealedFullDiscoveryTrimAdmissionV1> {
+        self.full_discovery_trim_admission.as_ref()
     }
 
     pub fn device_identity(&self) -> &CudaPrimaryContextBuildIdentityV3 {
@@ -285,8 +551,44 @@ pub(crate) fn seal_gpu_only_run_device_admission_v3(
         || request.exact_math_authority.trim().is_empty()
     {
         return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
-            "full Discovery run-device authority is incomplete".into(),
+            "GPU-only run-device authority is incomplete".into(),
         ));
+    }
+    if request.data_population_limits.is_some() == request.full_discovery_trim_admission.is_some() {
+        return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "GPU-only admission must carry exactly one Data+population or full-Discovery workspace authority"
+                .into(),
+        ));
+    }
+    if request
+        .data_population_limits
+        .as_ref()
+        .is_some_and(|limits| {
+            limits.workspace_plan_identity_sha256() != request.workspace_plan_identity_sha256
+        })
+    {
+        return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "Data+population execution limits do not match the workspace plan".into(),
+        ));
+    }
+    if let Some(trim) = request.full_discovery_trim_admission.as_ref() {
+        let reserve_fits = request
+            .phase_one_free_bytes_snapshot
+            .checked_sub(request.allocator_context_reserve_bytes)
+            .is_some_and(|available| available >= trim.full_discovery_reserve_bytes);
+        if trim.workspace_plan_identity_sha256 != request.workspace_plan_identity_sha256
+            || trim.required_workspace_bytes == 0
+            || trim.trim_prefilter_reserved_bytes == 0
+            || trim.full_discovery_reserve_bytes == 0
+            || trim.trim_prefilter_reserved_bytes > trim.required_workspace_bytes
+            || trim.full_discovery_reserve_bytes != trim.required_workspace_bytes
+            || !reserve_fits
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "full-Discovery trim admission does not match the sealed workspace or admitted reserve"
+                    .into(),
+            ));
+        }
     }
     let admission_identity_sha256 = hash_gpu_only_run_device_admission_v3(&request);
     let primary_context_process_token = process_handle_token_v3(
@@ -320,6 +622,8 @@ pub(crate) fn seal_gpu_only_run_device_admission_v3(
         phase_one_free_bytes_snapshot: request.phase_one_free_bytes_snapshot,
         allocator_context_reserve_bytes: request.allocator_context_reserve_bytes,
         reserve_policy_id: RESIDENT_ALLOCATOR_CONTEXT_RESERVE_POLICY_V3,
+        data_population_limits: request.data_population_limits,
+        full_discovery_trim_admission: request.full_discovery_trim_admission,
     })
 }
 
@@ -346,6 +650,27 @@ fn hash_gpu_only_run_device_admission_v3(
     hasher.update(request.phase_one_free_bytes_snapshot.to_le_bytes());
     hasher.update(request.allocator_context_reserve_bytes.to_le_bytes());
     hasher.update(RESIDENT_ALLOCATOR_CONTEXT_RESERVE_POLICY_V3.as_bytes());
+    if let Some(limits) = request.data_population_limits.as_ref() {
+        hasher.update(b"data-population-stage-v1");
+        hasher.update(limits.population_sizing_authority_sha256());
+        hasher.update(limits.data_extent_identity_sha256());
+        hasher.update(limits.parent_row_count().to_le_bytes());
+        hasher.update(limits.feature_count().to_le_bytes());
+        hasher.update(limits.max_ordered_index_count().to_le_bytes());
+        hasher.update(limits.max_adaptive_row_count().to_le_bytes());
+        hasher.update(limits.max_candidate_count().to_le_bytes());
+        hasher.update(limits.max_gene_term_count().to_le_bytes());
+        hasher.update(limits.max_concurrent_scenario_count().to_le_bytes());
+        hasher.update(limits.month_capacity().to_le_bytes());
+        hasher.update(limits.bounded_host_metric_readback_bytes().to_le_bytes());
+    }
+    if let Some(trim) = request.full_discovery_trim_admission.as_ref() {
+        hasher.update(b"full-discovery-trim-stage-v1");
+        hasher.update(trim.workspace_plan_identity_sha256);
+        hasher.update(trim.required_workspace_bytes.to_le_bytes());
+        hasher.update(trim.trim_prefilter_reserved_bytes.to_le_bytes());
+        hasher.update(trim.full_discovery_reserve_bytes.to_le_bytes());
+    }
     hasher.finalize().into()
 }
 
@@ -360,6 +685,29 @@ fn process_handle_token_v3(
     hasher.update(admission_identity_sha256);
     hasher.update((handle as u64).to_le_bytes());
     hasher.update(sequence.to_le_bytes());
+    hasher.finalize().into()
+}
+
+fn trim_identity_sha256_v1(domain: &[u8], parts: &[&[u8]]) -> [u8; SHA256_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+fn ordered_feature_schema_sha256_v1(
+    bindings: &[ResidentFeatureColumnBindingV3],
+) -> [u8; SHA256_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.ordered-prefilter-feature-schema.v1");
+    hasher.update((bindings.len() as u64).to_le_bytes());
+    for binding in bindings {
+        hasher.update((binding.feature_name.len() as u64).to_le_bytes());
+        hasher.update(binding.feature_name.as_bytes());
+    }
     hasher.finalize().into()
 }
 
@@ -2739,6 +3087,383 @@ impl ResidentFeatureStoreImportV3 {
                     "resident import has no admitted identity".into(),
                 )
             })
+    }
+
+    /// Move the complete admitted V3 lifetime into the resident trim stage.
+    /// The only host data copied is the compact schema classification; feature
+    /// values, validity, parent prices and selected-column results stay on the
+    /// admitted device and stream.
+    pub fn consume_into_resident_trim_prefilter_v1(
+        mut self,
+        schema: ResidentTrimPrefilterSchemaUploadV1,
+    ) -> Result<ResidentTrimPrefilterInputsV1, ResidentFeatureStoreCudaErrorV3> {
+        let owner = self.owner.as_ref().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput("resident import was consumed".into())
+        })?;
+        let consumer_context = self.consumer_context.as_ref().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput("consumer context was consumed".into())
+        })?;
+        let consumer_stream = self.consumer_stream.as_ref().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput("consumer stream was consumed".into())
+        })?;
+        let admitted = owner.run_device.as_ref().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident store lost its admitted run-device authority".into(),
+            )
+        })?;
+        let full_trim = admitted.full_discovery_trim_admission().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident store has no sealed full-Discovery trim admission".into(),
+            )
+        })?;
+        if owner.device_ordinal != admitted.device_identity.ordinal()
+            || owner.device_ordinal != owner.parent_source().device_ordinal()
+            || !Arc::ptr_eq(
+                consumer_context,
+                admitted.primary_context_for_resident_producer_v3(),
+            )
+            || !Arc::ptr_eq(consumer_context, &owner.context)
+            || !Arc::ptr_eq(
+                consumer_stream,
+                admitted.run_stream_for_resident_producer_v3(),
+            )
+            || !Arc::ptr_eq(consumer_stream, &owner.producer_stream)
+            || consumer_context.as_raw() != owner.context.as_raw()
+            || consumer_stream.as_inner() != owner.producer_stream.as_inner()
+            || owner.parent_source().producer_context().as_raw() != consumer_context.as_raw()
+            || owner.parent_source().producer_stream().as_inner() != consumer_stream.as_inner()
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::PrimaryContextMismatch);
+        }
+        CurrentContext::set_current(consumer_context.as_ref())?;
+        let expected_ordinal = i32::try_from(owner.device_ordinal).map_err(|_| {
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("resident trim device ordinal ABI")
+        })?;
+        if CurrentContext::get_device()?.as_raw() != expected_ordinal
+            || stream_context(consumer_stream)? != consumer_context.as_raw()
+            || consumer_stream.as_inner().is_null()
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::PrimaryContextMismatch);
+        }
+
+        let parent_row_count = u64::try_from(owner.rows).map_err(|_| {
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("resident trim parent rows")
+        })?;
+        let parent_column_count = u64::try_from(owner.columns).map_err(|_| {
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("resident trim parent columns")
+        })?;
+        let cells = owner.rows.checked_mul(owner.columns).ok_or(
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("resident trim parent cells"),
+        )?;
+        let logical_validity_bytes = cells / 2 + cells % 2;
+        let values = owner.search_bar_major_values.as_ref().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "sealed resident bar-major values were released".into(),
+            )
+        })?;
+        let validity = owner.search_bar_major_validity_u4.as_ref().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "sealed resident packed validity was released".into(),
+            )
+        })?;
+        let parent = owner.parent_source();
+        if parent_row_count == 0
+            || parent_column_count == 0
+            || values.len() != cells
+            || validity.len() != owner.packed_validity_allocated_bytes
+            || validity.len() < logical_validity_bytes
+            || schema.column_class_flags.len() != owner.columns
+            || schema.timeframe_group_ids.len() != owner.columns
+            || schema.template_force_keep_flags.len() != owner.columns
+            || ordered_feature_schema_sha256_v1(&owner.column_bindings)
+                != schema.ordered_feature_schema_sha256
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident trim parent or schema extent drifted".into(),
+            ));
+        }
+        let compact_hashes = owner.compact_hashes_if_ready()?;
+        let normalization_fit_sha256 = owner
+            .robust_normalization_runtime_receipt_v2
+            .as_ref()
+            .map(ResidentRobustNormalizationRuntimeReceiptV2::fit_metadata_sha256)
+            .ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident store has no sealed normalization-fit identity".into(),
+                )
+            })?;
+        if compact_hashes.canonical_content_merkle != schema.canonical_content_merkle_sha256
+            || normalization_fit_sha256 != schema.normalization_fit_sha256
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident trim identities do not match the sealed V3 store".into(),
+            ));
+        }
+
+        let packed_validity_bytes = u64::try_from(validity.len()).map_err(|_| {
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                "resident trim packed-validity bytes",
+            )
+        })?;
+        let retained_schema_bytes = schema
+            .column_class_flags
+            .len()
+            .checked_add(
+                schema
+                    .timeframe_group_ids
+                    .len()
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                        "resident trim timeframe metadata bytes",
+                    ))?,
+            )
+            .and_then(|bytes| bytes.checked_add(schema.template_force_keep_flags.len()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                "resident trim schema metadata bytes",
+            ))?;
+        if retained_schema_bytes > full_trim.trim_prefilter_reserved_bytes() {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident trim schema metadata exceeds its sealed workspace slice".into(),
+            ));
+        }
+
+        let admitted_run_stream = NonNull::new(consumer_stream.as_inner().cast::<c_void>())
+            .ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident trim admitted stream is null".into(),
+                )
+            })?;
+        let parent_ready_event = NonNull::new(owner.ready_event.raw().cast::<c_void>())
+            .ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident trim parent-ready event is null".into(),
+                )
+            })?;
+        let indicators_bar_major =
+            NonNull::new(values.as_device_ptr().as_ptr()).ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident trim feature pointer is null".into(),
+                )
+            })?;
+        let indicators_validity_u4 =
+            NonNull::new(validity.as_device_ptr().as_ptr()).ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident trim validity pointer is null".into(),
+                )
+            })?;
+        let close = NonNull::new(parent.close().as_device_ptr().as_ptr()).ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident trim close pointer is null".into(),
+            )
+        })?;
+        let high = NonNull::new(parent.high().as_device_ptr().as_ptr()).ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident trim high pointer is null".into(),
+            )
+        })?;
+        let low = NonNull::new(parent.low().as_device_ptr().as_ptr()).ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident trim low pointer is null".into(),
+            )
+        })?;
+
+        let admission_identity_sha256 = admitted.admission_identity_sha256();
+        let workspace_plan_identity_sha256 = admitted.workspace_plan_identity_sha256();
+        let selected_cuda_ordinal = owner.device_ordinal;
+        let phase_one_free_bytes_snapshot = admitted.phase_one_free_bytes_snapshot();
+        let allocator_context_reserve_bytes = admitted.allocator_context_reserve_bytes();
+        let required_workspace_bytes = full_trim.required_workspace_bytes();
+        let trim_prefilter_reserved_bytes = full_trim.trim_prefilter_reserved_bytes();
+        let full_discovery_reserve_bytes = full_trim.full_discovery_reserve_bytes();
+        let ordinal_bytes = selected_cuda_ordinal.to_le_bytes();
+        let compute_major_bytes = admitted.compute_capability_major.to_le_bytes();
+        let compute_minor_bytes = admitted.compute_capability_minor.to_le_bytes();
+        let cuda_device_identity_sha256 = trim_identity_sha256_v1(
+            b"neoethos.resident-trim-device-identity.v1",
+            &[
+                &admission_identity_sha256,
+                &admitted.device_uuid,
+                &ordinal_bytes,
+                &compute_major_bytes,
+                &compute_minor_bytes,
+            ],
+        );
+        let primary_context_identity_sha256 =
+            admitted.device_identity().primary_context_process_token();
+        let run_stream_identity_sha256 = admitted.run_stream_process_token_v3();
+        let vector_ta_build_sha256 = admitted.device_identity().vector_ta_build_sha256();
+        let cuda_build_manifest_sha256 = trim_identity_sha256_v1(
+            b"neoethos.resident-trim-build-manifest.v1",
+            &[
+                &admission_identity_sha256,
+                &workspace_plan_identity_sha256,
+                &vector_ta_build_sha256,
+                admitted.device_identity().native_sass_target().as_bytes(),
+                admitted.device_identity().nvcc_version().as_bytes(),
+            ],
+        );
+        let mut math_hasher = Sha256::new();
+        math_hasher.update(b"neoethos.resident-trim-cuda-math-flags.v1");
+        for flag in RESIDENT_TRIM_PREFILTER_CUDA_MATH_FLAGS_V1 {
+            math_hasher.update((flag.len() as u64).to_le_bytes());
+            math_hasher.update(flag.as_bytes());
+        }
+        let cuda_math_flags_sha256 = math_hasher.finalize().into();
+
+        // Both events are created before the first schema H2D. Once a copy is
+        // attempted, every failure path below deliberately retires its pointer
+        // identities through PendingResidentTrimSchemaUploadV1::drop.
+        let trim_prefilter_ready_event = OwnedCudaEventV3::new()?;
+        let schema_ready_event = OwnedCudaEventV3::new()?;
+        let mut upload = PendingResidentTrimSchemaUploadV1::new(schema_ready_event);
+        let (host_column_class_flags, column_class_flags) = compact_device_buffer_from_slice_async(
+            &schema.column_class_flags,
+            consumer_context,
+            consumer_stream,
+        )?;
+        upload.host_column_class_flags = Some(host_column_class_flags);
+        upload.column_class_flags = Some(column_class_flags);
+        let (host_timeframe_group_ids, timeframe_group_ids) =
+            compact_device_buffer_from_slice_async(
+                &schema.timeframe_group_ids,
+                consumer_context,
+                consumer_stream,
+            )?;
+        upload.host_timeframe_group_ids = Some(host_timeframe_group_ids);
+        upload.timeframe_group_ids = Some(timeframe_group_ids);
+        let (host_template_force_keep_flags, template_force_keep_flags) =
+            compact_device_buffer_from_slice_async(
+                &schema.template_force_keep_flags,
+                consumer_context,
+                consumer_stream,
+            )?;
+        upload.host_template_force_keep_flags = Some(host_template_force_keep_flags);
+        upload.template_force_keep_flags = Some(template_force_keep_flags);
+        upload
+            .ready_event
+            .as_ref()
+            .expect("armed trim schema upload retains its ready event")
+            .record(consumer_stream)?;
+        let schema_lifetime = upload.into_lifetime();
+        let schema_ready_event = NonNull::new(schema_lifetime.ready_event.raw().cast::<c_void>())
+            .expect("owned CUDA event is non-null");
+        let column_class_flags_device =
+            NonNull::new(schema_lifetime.column_class_flags.as_device_ptr().as_ptr())
+                .expect("non-empty trim class allocation is non-null");
+        let timeframe_group_ids_device =
+            NonNull::new(schema_lifetime.timeframe_group_ids.as_device_ptr().as_ptr())
+                .expect("non-empty trim timeframe allocation is non-null");
+        let template_force_keep_flags_device = NonNull::new(
+            schema_lifetime
+                .template_force_keep_flags
+                .as_device_ptr()
+                .as_ptr(),
+        )
+        .expect("non-empty trim template allocation is non-null");
+        let trim_prefilter_ready_event_raw =
+            NonNull::new(trim_prefilter_ready_event.raw().cast::<c_void>())
+                .expect("owned CUDA event is non-null");
+        let admission_lifetime = ResidentTrimAdmissionLifetimeV1 {
+            _owner: Arc::clone(owner),
+            ready_event: trim_prefilter_ready_event,
+        };
+        debug_assert_eq!(
+            admission_lifetime.ready_event.raw().cast::<c_void>(),
+            trim_prefilter_ready_event_raw.as_ptr()
+        );
+
+        // No fallible operation follows these three takes. The complete V3
+        // lifetime is moved into the parent token atomically; Drop can no
+        // longer observe a half-consumed import.
+        let retained_owner = self.owner.take().expect("validated V3 owner");
+        let retained_context = self.consumer_context.take().expect("validated context");
+        let retained_stream = self.consumer_stream.take().expect("validated stream");
+        let retained_import = ResidentFeatureStoreImportV3 {
+            owner: Some(retained_owner),
+            consumer_context: Some(retained_context),
+            consumer_stream: Some(retained_stream),
+        };
+        let parent_import = ResidentTrimPrefilterParentImportV1 {
+            owner: Some(Box::new(retained_import)),
+            selected_cuda_ordinal,
+            parent_row_count,
+            parent_column_count,
+            packed_validity_bytes,
+            admitted_run_stream,
+            parent_ready_event,
+            indicators_bar_major,
+            indicators_validity_u4,
+            close,
+            high,
+            low,
+            canonical_search_input_receipt_sha256: schema.canonical_search_input_receipt_sha256,
+            canonical_content_merkle_sha256: schema.canonical_content_merkle_sha256,
+            normalization_fit_sha256: schema.normalization_fit_sha256,
+            feature_plan_sha256: schema.feature_plan_sha256,
+            source_provenance_sha256: schema.source_provenance_sha256,
+            cuda_device_identity_sha256,
+            primary_context_identity_sha256,
+            run_stream_identity_sha256,
+            cuda_build_manifest_sha256,
+            cuda_math_flags_sha256,
+        };
+        let sealed_schema = SealedResidentColumnClassificationV1 {
+            owner: Some(Box::new(schema_lifetime)),
+            selected_cuda_ordinal,
+            parent_column_count,
+            retained_device_bytes: retained_schema_bytes,
+            timeframe_group_count: schema.timeframe_group_count,
+            schema_ready_event,
+            column_class_flags_device,
+            timeframe_group_ids_device,
+            template_force_keep_flags_device,
+            ordered_feature_schema_sha256: schema.ordered_feature_schema_sha256,
+            column_classification_content_sha256: schema.column_classification_content_sha256,
+            primary_context_identity_sha256,
+            run_stream_identity_sha256,
+            cuda_build_manifest_sha256,
+        };
+        let full_admission = ResidentTrimPrefilterFullDiscoveryAdmissionV1 {
+            owner: Some(Box::new(admission_lifetime)),
+            selected_cuda_ordinal,
+            trim_prefilter_ready_event: trim_prefilter_ready_event_raw,
+            trim_prefilter_reserved_bytes,
+            full_discovery_reserve_bytes,
+            primary_context_identity_sha256,
+            run_stream_identity_sha256,
+            cuda_build_manifest_sha256,
+        };
+        let identity = ResidentTrimPrefilterImportIdentityV1 {
+            admission_identity_sha256,
+            workspace_plan_identity_sha256,
+            canonical_search_input_receipt_sha256: schema.canonical_search_input_receipt_sha256,
+            canonical_content_merkle_sha256: schema.canonical_content_merkle_sha256,
+            normalization_fit_sha256: schema.normalization_fit_sha256,
+            feature_plan_sha256: schema.feature_plan_sha256,
+            source_provenance_sha256: schema.source_provenance_sha256,
+            ordered_feature_schema_sha256: schema.ordered_feature_schema_sha256,
+            column_classification_content_sha256: schema.column_classification_content_sha256,
+            selected_cuda_ordinal,
+            parent_row_count,
+            parent_column_count,
+            cuda_device_identity_sha256,
+            primary_context_identity_sha256,
+            run_stream_identity_sha256,
+            cuda_build_manifest_sha256,
+            cuda_math_flags_sha256,
+            phase_one_free_bytes_snapshot,
+            allocator_context_reserve_bytes,
+            required_workspace_bytes,
+            trim_prefilter_reserved_bytes,
+            full_discovery_reserve_bytes,
+        };
+        Ok(ResidentTrimPrefilterInputsV1 {
+            parent_import,
+            sealed_schema,
+            full_admission,
+            identity,
+        })
     }
 
     pub fn consume_into_population_session_v3(

@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `ResidentSearchGenerationChainV3: Copy` is not satisfied
+  --> fail/copy_owner_e0277.rs:10:18
+   |
+10 |     require_copy(chain());
+   |     ------------ ^^^^^^^ the trait `Copy` is not implemented for `ResidentSearchGenerationChainV3`
+   |     |
+   |     required by a bound introduced by this call
+   |
+note: required by a bound in `require_copy`
+  --> fail/copy_owner_e0277.rs:7:20
+   |
+ 7 | fn require_copy<T: Copy>(_: T) {}
+   |                    ^^^^ required by this bound in `require_copy`
+

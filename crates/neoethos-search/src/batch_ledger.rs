@@ -39,7 +39,7 @@
 //!
 //! # The four invariants (doc §"Implement it with these invariants")
 //!
-//! 1. **Append-only within a run.** [`CanonicalFeatureIndex::intern`] never
+//! 1. **Append-only within a run.** `CanonicalFeatureIndex::intern` never
 //!    renumbers and never removes: an index, once issued, keeps its meaning for
 //!    the life of the run. That is the property whose absence IS the defect.
 //! 2. **Remap at BATCH EXIT.** Enforced by where this is called from — the loop
