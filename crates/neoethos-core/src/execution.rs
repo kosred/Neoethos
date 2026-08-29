@@ -7,7 +7,7 @@
 //! cannot be reached without another lease transfer.
 
 use crate::execution_budget::{
-    CpuLeaseTransfer, CpuPermitBroker, WorkerLimit, enter_lease_bound_worker_scope,
+    CpuLease, CpuLeaseTransfer, CpuPermitBroker, WorkerLimit, enter_lease_bound_worker_scope,
 };
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::collections::BTreeMap;
@@ -109,6 +109,32 @@ impl BudgetedCpuExecutor {
         Work: FnOnce() -> R + Send,
     {
         self.execute_scoped(transfer, move |_| work())
+    }
+
+    /// Execute work on the matching private pool while lending the accepted
+    /// lease to the work item. This is the lease-bearing form required by
+    /// APIs that must verify or split the exact reservation they execute
+    /// under; the lease remains owned by the executor until all work returns.
+    pub fn execute_with_lease<R, Work>(
+        &self,
+        transfer: CpuLeaseTransfer,
+        work: Work,
+    ) -> Result<R, BudgetedCpuExecutorError>
+    where
+        R: Send,
+        Work: FnOnce(&CpuLease) -> R + Send,
+    {
+        if !self.inner.authority.owns_transfer(&transfer) {
+            return Err(BudgetedCpuExecutorError::MismatchedLeaseAuthority);
+        }
+        let lease = transfer.accept();
+        let width = lease.width().get();
+        let checkout = self.checkout(width)?;
+        let result = checkout.pool().scope(|_| lease.scope(|| work(&lease)));
+
+        drop(lease);
+        drop(checkout);
+        Ok(result)
     }
 
     /// Execute fork-join work on the matching private pool and wait for every
