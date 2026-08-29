@@ -1794,7 +1794,7 @@ impl ResidentSearchRunV2 {
             .session
             .take()
             .ok_or(ResidentSearchV2Error::StateViolation)?;
-        let mut source = session.enqueue_resident_gene_metrics_owned_v2(
+        let mut source = match session.enqueue_resident_gene_metrics_owned_v2(
             &view,
             settings,
             expected_population,
@@ -1802,7 +1802,15 @@ impl ResidentSearchRunV2 {
             expected_feature_count,
             expected_max_terms,
             expected_full_discovery_reserve_bytes,
-        )?;
+        ) {
+            Ok(source) => source,
+            Err(rejected) => {
+                let (error, session) = rejected.into_parts_v2();
+                self.session = Some(session);
+                self.state = ResidentSearchStateV2::Poisoned;
+                return Err(error.into());
+            }
+        };
         #[cfg(feature = "cuda-device-fixtures")]
         let population_counters = source.counters_fixture_v2();
         // Take, but retain, the exact Box whose receipt address native sealed.
@@ -2003,11 +2011,18 @@ impl ResidentSearchAdvancePendingV2 {
             run.state = ResidentSearchStateV2::Poisoned;
             run.terminal_receipt = Some(receipt);
             let cleanup = (|| -> Result<(), ResidentSearchV2Error> {
-                let session = self
+                let completion = self
                     .completion
                     .take()
-                    .ok_or(ResidentSearchV2Error::StateViolation)?
-                    .finish_device_consume_v2()?;
+                    .ok_or(ResidentSearchV2Error::StateViolation)?;
+                let session = match completion.finish_device_consume_v2() {
+                    Ok(session) => session,
+                    Err(rejected) => {
+                        let (error, completion) = rejected.into_parts_v2();
+                        self.completion = Some(completion);
+                        return Err(error.into());
+                    }
+                };
                 run.session = Some(session);
                 run.release_terminal_proven_fault_resources_v2()?;
                 run.session
@@ -2069,11 +2084,19 @@ impl ResidentSearchAdvancePendingV2 {
             self.consumed = true;
             return Err(ResidentSearchV2Error::GeneViewIdentityMismatch);
         }
-        let session = self
+        let completion = self
             .completion
             .take()
-            .ok_or(ResidentSearchV2Error::StateViolation)?
-            .finish_device_consume_v2()?;
+            .ok_or(ResidentSearchV2Error::StateViolation)?;
+        let session = match completion.finish_device_consume_v2() {
+            Ok(session) => session,
+            Err(rejected) => {
+                let (error, completion) = rejected.into_parts_v2();
+                self.completion = Some(completion);
+                run.state = ResidentSearchStateV2::Poisoned;
+                return Err(error.into());
+            }
+        };
         run.session = Some(session);
         run.ready_receipt_address = std::ptr::from_ref(committed.as_ref()) as usize;
         run.ready = Some(committed);

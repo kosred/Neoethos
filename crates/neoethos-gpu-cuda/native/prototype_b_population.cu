@@ -4006,6 +4006,10 @@ neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
         NeoResidentSearchCombinedAdmissionV2* admission) {
   using namespace neoethos::resident_scoring_novelty_v1;
   using namespace neoethos::resident_search_generation_v2;
+  auto* session = static_cast<NeoCudaPopulationSession*>(opaque_session);
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
   if (binding == nullptr || admission == nullptr) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }

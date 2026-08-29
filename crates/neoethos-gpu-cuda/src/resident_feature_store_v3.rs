@@ -3400,33 +3400,36 @@ impl ResidentFeatureStoreImportV3 {
                     "resident trim parent-ready event is null".into(),
                 )
             })?;
-        let indicators_bar_major =
-            NonNull::new(values.as_device_ptr().as_ptr()).ok_or_else(|| {
+        let indicators_bar_major = NonNull::new(values.as_device_ptr().as_ptr().cast_mut())
+            .ok_or_else(|| {
                 ResidentFeatureStoreCudaErrorV3::InvalidInput(
                     "resident trim feature pointer is null".into(),
                 )
             })?;
-        let indicators_validity_u4 =
-            NonNull::new(validity.as_device_ptr().as_ptr()).ok_or_else(|| {
+        let indicators_validity_u4 = NonNull::new(validity.as_device_ptr().as_ptr().cast_mut())
+            .ok_or_else(|| {
                 ResidentFeatureStoreCudaErrorV3::InvalidInput(
                     "resident trim validity pointer is null".into(),
                 )
             })?;
-        let close = NonNull::new(parent.close().as_device_ptr().as_ptr()).ok_or_else(|| {
-            ResidentFeatureStoreCudaErrorV3::InvalidInput(
-                "resident trim close pointer is null".into(),
-            )
-        })?;
-        let high = NonNull::new(parent.high().as_device_ptr().as_ptr()).ok_or_else(|| {
-            ResidentFeatureStoreCudaErrorV3::InvalidInput(
-                "resident trim high pointer is null".into(),
-            )
-        })?;
-        let low = NonNull::new(parent.low().as_device_ptr().as_ptr()).ok_or_else(|| {
-            ResidentFeatureStoreCudaErrorV3::InvalidInput(
-                "resident trim low pointer is null".into(),
-            )
-        })?;
+        let close =
+            NonNull::new(parent.close().as_device_ptr().as_ptr().cast_mut()).ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident trim close pointer is null".into(),
+                )
+            })?;
+        let high =
+            NonNull::new(parent.high().as_device_ptr().as_ptr().cast_mut()).ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident trim high pointer is null".into(),
+                )
+            })?;
+        let low =
+            NonNull::new(parent.low().as_device_ptr().as_ptr().cast_mut()).ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident trim low pointer is null".into(),
+                )
+            })?;
 
         let admission_identity_sha256 = admitted.admission_identity_sha256();
         let workspace_plan_identity_sha256 = admitted.workspace_plan_identity_sha256();
@@ -3508,17 +3511,28 @@ impl ResidentFeatureStoreImportV3 {
         let schema_lifetime = upload.into_lifetime();
         let schema_ready_event = NonNull::new(schema_lifetime.ready_event.raw().cast::<c_void>())
             .expect("owned CUDA event is non-null");
-        let column_class_flags_device =
-            NonNull::new(schema_lifetime.column_class_flags.as_device_ptr().as_ptr())
-                .expect("non-empty trim class allocation is non-null");
-        let timeframe_group_ids_device =
-            NonNull::new(schema_lifetime.timeframe_group_ids.as_device_ptr().as_ptr())
-                .expect("non-empty trim timeframe allocation is non-null");
+        let column_class_flags_device = NonNull::new(
+            schema_lifetime
+                .column_class_flags
+                .as_device_ptr()
+                .as_ptr()
+                .cast_mut(),
+        )
+        .expect("non-empty trim class allocation is non-null");
+        let timeframe_group_ids_device = NonNull::new(
+            schema_lifetime
+                .timeframe_group_ids
+                .as_device_ptr()
+                .as_ptr()
+                .cast_mut(),
+        )
+        .expect("non-empty trim timeframe allocation is non-null");
         let template_force_keep_flags_device = NonNull::new(
             schema_lifetime
                 .template_force_keep_flags
                 .as_device_ptr()
-                .as_ptr(),
+                .as_ptr()
+                .cast_mut(),
         )
         .expect("non-empty trim template allocation is non-null");
         let trim_prefilter_ready_event_raw =

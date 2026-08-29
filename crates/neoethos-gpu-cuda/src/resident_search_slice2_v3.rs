@@ -329,7 +329,10 @@ impl Drop for ResidentSearchTerminalReceiptV3 {
 #[cfg(feature = "cuda")]
 impl Drop for ResidentSearchTransitionErrorV3 {
     fn drop(&mut self) {
-        let _ = &self.inner;
+        if let ResidentSearchRejectedTransitionV3::Native(error) = &self.inner {
+            let _ = error;
+        }
+        let _ = &self.retained_terminal_authority;
     }
 }
 

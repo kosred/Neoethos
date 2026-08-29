@@ -3007,7 +3007,8 @@ bool borrow_resident_generation_terminal_lifecycle_v2(
   if (run->source_ready_receipt_token_v2 == nullptr) {
     const auto* source = run->ready_receipt_token_v2;
     if (source == nullptr ||
-        source->abi_version != NEO_RESIDENT_GENERATION_ABI_V1 ||
+        source->abi_version !=
+            resident_generation_v1::NEO_RESIDENT_GENERATION_ABI_V1 ||
         source->reserved != 0u || source->event_id != run->next_event_id ||
         source->generation_index != run->current_generation_index ||
         source->same_stream_enqueue_count != run->same_stream_enqueue_count ||
@@ -3022,7 +3023,8 @@ bool borrow_resident_generation_terminal_lifecycle_v2(
   }
   const auto* source = run->source_ready_receipt_token_v2;
   if (source == nullptr ||
-      source->abi_version != NEO_RESIDENT_GENERATION_ABI_V1 ||
+      source->abi_version !=
+          resident_generation_v1::NEO_RESIDENT_GENERATION_ABI_V1 ||
       source->reserved != 0u || source->event_id != run->source_event_id_v2 ||
       source->same_stream_enqueue_count !=
           run->source_same_stream_enqueue_count_v2 ||
