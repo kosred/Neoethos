@@ -83,7 +83,7 @@ arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
 arrow-ipc = { version = "58.3.0", default-features = false, features = ["lz4", "zstd"] }
 parquet = { version = "58.3.0", default-features = false, features = ["arrow", "snap", "brotli", "flate2-zlib-rs", "lz4", "zstd"] }
-thrift = { version = "0.17.0", default-features = false }
+thrift = { version = "0.23.0", default-features = false }
 flatbuffers = "25.12.19"
 vortex-flatbuffers = { version = "0.67.0", default-features = false, features = ["file"] }
 anyhow      = "1.0.100"
