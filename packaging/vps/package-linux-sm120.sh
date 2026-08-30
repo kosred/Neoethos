@@ -31,6 +31,49 @@ json_escape() {
   printf '%s' "${value}"
 }
 
+validated_semver() {
+  local source_kind="$1"
+  local source_path="$2"
+  python3 - "${source_kind}" "${source_path}" <<'PY'
+import pathlib
+import re
+import sys
+import tomllib
+
+numeric = rb"(?:0|[1-9][0-9]*)"
+prerelease_identifier = rb"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+prerelease = prerelease_identifier + rb"(?:\." + prerelease_identifier + rb")*"
+build = rb"[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*"
+semver = numeric + rb"\." + numeric + rb"\." + numeric + rb"(?:-" + prerelease + rb")?(?:\+" + build + rb")?"
+
+source_kind, source_path = sys.argv[1:]
+if source_kind == "app-output":
+    raw = pathlib.Path(source_path).read_bytes()
+    matched = re.fullmatch(rb"neoethos-app (" + semver + rb")\n", raw)
+    value = matched.group(1) if matched else None
+elif source_kind == "cargo-toml":
+    with open(source_path, "rb") as source:
+        package_version = tomllib.load(source).get("package", {}).get("version")
+    value = package_version.encode("ascii") if isinstance(package_version, str) else None
+    if value is not None and re.fullmatch(semver, value) is None:
+        value = None
+else:
+    value = None
+
+if value is None:
+    raise SystemExit(1)
+sys.stdout.buffer.write(value)
+PY
+}
+
+parse_exact_app_semver() {
+  validated_semver app-output "$1"
+}
+
+cargo_package_semver() {
+  validated_semver cargo-toml "$1"
+}
+
 usage() {
   cat >&2 <<'USAGE'
 Usage: packaging/vps/package-linux-sm120.sh VERSION [SOURCE_RELEASE] [OUTPUT_DIR]
@@ -286,8 +329,18 @@ env -u LD_LIBRARY_PATH "${BUNDLE_DIR}/neoethos-app" --version \
   >"${BUNDLE_DIR}/evidence/neoethos-app.version.txt"
 env -u LD_LIBRARY_PATH "${BUNDLE_DIR}/neoethos-cli" --version \
   >"${BUNDLE_DIR}/evidence/neoethos-cli.version.txt"
-APP_VERSION="$(tr -d '\r\n' <"${BUNDLE_DIR}/evidence/neoethos-app.version.txt")"
-CLI_VERSION="$(tr -d '\r\n' <"${BUNDLE_DIR}/evidence/neoethos-cli.version.txt")"
+APP_VERSION="$(parse_exact_app_semver "${BUNDLE_DIR}/evidence/neoethos-app.version.txt")" \
+  || fail "neoethos-app --version did not emit one exact semver line"
+APP_CARGO_VERSION="$(cargo_package_semver "${REPO_ROOT}/crates/neoethos-app/Cargo.toml")" \
+  || fail "neoethos-app Cargo package version is not exact semver"
+[[ "${APP_VERSION}" == "${APP_CARGO_VERSION}" ]] \
+  || fail "neoethos-app binary/Cargo version mismatch: ${APP_VERSION} != ${APP_CARGO_VERSION}"
+CLI_VERSION="$(cargo_package_semver "${REPO_ROOT}/crates/neoethos-cli/Cargo.toml")" \
+  || fail "neoethos-cli Cargo package version is not exact semver"
+[[ "${CLI_VERSION}" == "${APP_VERSION}" ]] \
+  || fail "neoethos app/CLI package version mismatch: ${APP_VERSION} != ${CLI_VERSION}"
+grep -aFq -- "${CLI_VERSION}" "${BUNDLE_DIR}/neoethos-cli" \
+  || fail "neoethos-cli does not embed its Cargo package version: ${CLI_VERSION}"
 
 FILE_ROWS="${STAGING_ROOT}/payload-files.tsv"
 (

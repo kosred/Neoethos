@@ -192,3 +192,39 @@ fn bundle_and_archive_have_manifested_sorted_sha256_evidence() {
         .expect("atomic release-asset directory publication");
     assert!(archive < archive_check && archive_check < publish);
 }
+
+#[test]
+fn manifest_versions_are_exact_semver_not_raw_process_output() {
+    let script = packaging_script();
+
+    require_all(
+        &script,
+        &[
+            "parse_exact_app_semver",
+            "cargo_package_semver",
+            "APP_VERSION=\"$(parse_exact_app_semver \"${BUNDLE_DIR}/evidence/neoethos-app.version.txt\")\"",
+            "CLI_VERSION=\"$(cargo_package_semver \"${REPO_ROOT}/crates/neoethos-cli/Cargo.toml\")\"",
+            "grep -aFq -- \"${CLI_VERSION}\" \"${BUNDLE_DIR}/neoethos-cli\"",
+            "fail \"neoethos-cli does not embed its Cargo package version: ${CLI_VERSION}\"",
+        ],
+    );
+    assert!(
+        !script.contains("APP_VERSION=\"$(tr -d"),
+        "raw app output must be parsed and validated before entering JSON"
+    );
+    assert!(
+        !script.contains("CLI_VERSION=\"$(tr -d"),
+        "raw CLI logging/help output must remain evidence, not enter JSON"
+    );
+
+    let cli_execution = script
+        .find("env -u LD_LIBRARY_PATH \"${BUNDLE_DIR}/neoethos-cli\" --version")
+        .expect("raw CLI version-command evidence");
+    let cli_manifest_version = script
+        .find("CLI_VERSION=\"$(cargo_package_semver")
+        .expect("validated CLI package semver");
+    assert!(
+        cli_execution < cli_manifest_version,
+        "the bundled CLI must still execute before its sanitized manifest version is recorded"
+    );
+}
