@@ -1,6 +1,7 @@
 use neoethos_data::core::features::{FeatureCellValidity, FeatureColumnF64};
 use neoethos_data::core::quant_features::{
-    compute_quant_feature_columns_f64, compute_quant_feature_columns_v3_f64,
+    compute_quant_feature_columns, compute_quant_feature_columns_f64,
+    compute_quant_feature_columns_v4_f64,
 };
 use neoethos_data::{CanonicalTimeframe, Ohlcv};
 
@@ -147,6 +148,17 @@ fn flat_close_transition_fixture() -> Ohlcv {
     bars
 }
 
+fn zero_range_recovery_fixture() -> Ohlcv {
+    let mut bars = fixture_with_rows(140);
+    for row in [0_usize, 60] {
+        let price = bars.close[row];
+        bars.open[row] = price;
+        bars.high[row] = price;
+        bars.low[row] = price;
+    }
+    bars
+}
+
 fn validate_grid(bars: &Ohlcv, timeframe_millis: i64) -> OracleResult<(usize, usize, usize)> {
     if timeframe_millis <= 0
         || UTC_DAY_MILLIS % timeframe_millis != 0
@@ -208,6 +220,58 @@ fn fixed_validity(rows: usize, warmup: usize) -> Vec<FeatureCellValidity> {
             }
         })
         .collect()
+}
+
+fn install_cumulative_delta_rolling_validity(
+    bars: &Ohlcv,
+    columns: &mut [FeatureColumnF64],
+) -> OracleResult<()> {
+    const WINDOW: usize = 50;
+
+    let volume = bars
+        .volume
+        .as_deref()
+        .ok_or_else(|| "Quant-v4 cumulative delta requires volume".to_owned())?;
+    let values = compute_quant_feature_columns(bars)
+        .into_iter()
+        .find_map(|(name, values)| (name == "quant_cum_delta_zscore").then_some(values))
+        .ok_or_else(|| "raw Quant values omitted cumulative delta".to_owned())?;
+    let rows = bars.len();
+    let mut delta_valid = vec![true; rows];
+    let mut cumulative = vec![0.0; rows];
+    let mut running = 0.0;
+    for row in 0..rows {
+        let range = bars.high[row] - bars.low[row];
+        if range <= EPS {
+            delta_valid[row] = false;
+        } else {
+            let buy_fraction = (bars.close[row] - bars.low[row]) / range;
+            running += volume[row] * (2.0 * buy_fraction - 1.0);
+        }
+        cumulative[row] = running;
+    }
+
+    let mut validity = fixed_validity(rows, WINDOW);
+    for row in WINDOW..rows {
+        if delta_valid[(row + 1 - WINDOW)..=row]
+            .iter()
+            .any(|valid| !valid)
+        {
+            validity[row] = FeatureCellValidity::ZeroDenominator;
+            continue;
+        }
+        let slice = &cumulative[(row - WINDOW)..row];
+        let mean = slice.iter().sum::<f64>() / WINDOW as f64;
+        let variance = slice
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / (WINDOW as f64 - 1.0);
+        if variance.sqrt() <= EPS {
+            validity[row] = FeatureCellValidity::ZeroDenominator;
+        }
+    }
+    replace_column(columns, "quant_cum_delta_zscore", values, validity)
 }
 
 fn cloned_validity(
@@ -620,6 +684,7 @@ fn typed_quant_v3_oracle(
 ) -> OracleResult<Vec<FeatureColumnF64>> {
     let (_, bars_per_day, _) = validate_grid(bars, timeframe_millis)?;
     let mut columns = compute_quant_feature_columns_f64(bars).map_err(|error| error.to_string())?;
+    install_cumulative_delta_rolling_validity(bars, &mut columns)?;
     install_exact_log_migrations(bars, bars_per_day, &mut columns)?;
     install_temporal_migrations(bars, &mut columns)?;
     let names: Vec<&str> = columns.iter().map(|column| column.name.as_str()).collect();
@@ -629,16 +694,16 @@ fn typed_quant_v3_oracle(
     Ok(columns)
 }
 
-fn assert_bitwise_preserved_v2_routes(v2: &[FeatureColumnF64], v3: &[FeatureColumnF64]) {
+fn assert_bitwise_preserved_v2_routes(v2: &[FeatureColumnF64], v4: &[FeatureColumnF64]) {
     let mut compared = 0;
     for (index, route) in RESIDENT_QUANT_ROUTE_CENSUS_V3.iter().enumerate() {
         if route.lineage != ResidentQuantRouteLineageV3::V2BitwisePreserved {
             continue;
         }
         compared += 1;
-        assert_eq!(v2[index].name, v3[index].name);
+        assert_eq!(v2[index].name, v4[index].name);
         assert_eq!(
-            v2[index].validity, v3[index].validity,
+            v2[index].validity, v4[index].validity,
             "{} validity",
             route.name
         );
@@ -648,7 +713,7 @@ fn assert_bitwise_preserved_v2_routes(v2: &[FeatureColumnF64], v3: &[FeatureColu
                 .iter()
                 .map(|value| value.to_bits())
                 .collect::<Vec<_>>(),
-            v3[index]
+            v4[index]
                 .values
                 .iter()
                 .map(|value| value.to_bits())
@@ -657,10 +722,10 @@ fn assert_bitwise_preserved_v2_routes(v2: &[FeatureColumnF64], v3: &[FeatureColu
             route.name
         );
     }
-    assert_eq!(compared, 31);
+    assert_eq!(compared, 30);
 }
 
-fn assert_migrated_v3_routes(columns: &[FeatureColumnF64]) {
+fn assert_migrated_v4_routes(columns: &[FeatureColumnF64]) {
     let mut compared = 0;
     for (index, route) in RESIDENT_QUANT_ROUTE_CENSUS_V3.iter().enumerate() {
         if route.lineage == ResidentQuantRouteLineageV3::V2BitwisePreserved {
@@ -672,7 +737,7 @@ fn assert_migrated_v3_routes(columns: &[FeatureColumnF64]) {
                 .validity
                 .iter()
                 .all(|validity| *validity != FeatureCellValidity::MissingInput),
-            "{} retained v2 MissingInput under v3",
+            "{} retained v2 MissingInput under v4",
             route.name
         );
         for (value, validity) in columns[index].values.iter().zip(&columns[index].validity) {
@@ -688,7 +753,7 @@ fn assert_migrated_v3_routes(columns: &[FeatureColumnF64]) {
             }
         }
     }
-    assert_eq!(compared, 32);
+    assert_eq!(compared, 33);
 }
 
 fn column<'a>(columns: &'a [FeatureColumnF64], name: &str) -> &'a FeatureColumnF64 {
@@ -699,7 +764,7 @@ fn column<'a>(columns: &'a [FeatureColumnF64], name: &str) -> &'a FeatureColumnF
 }
 
 #[test]
-fn production_quant_v3_cpu_authority_matches_the_frozen_oracle() {
+fn production_quant_v4_cpu_authority_matches_the_frozen_oracle() {
     for (fixture_name, timeframe, bars) in [
         (
             "ordinary_m1",
@@ -726,14 +791,19 @@ fn production_quant_v3_cpu_authority_matches_the_frozen_oracle() {
             CanonicalTimeframe::M30,
             flat_close_transition_fixture(),
         ),
+        (
+            "zero_range_recovery",
+            CanonicalTimeframe::M30,
+            zero_range_recovery_fixture(),
+        ),
     ] {
         let timeframe_millis = timeframe
             .fixed_duration_ms()
             .expect("admitted parity fixtures use fixed intraday timeframes");
         let expected =
-            typed_quant_v3_oracle(&bars, timeframe_millis).expect("frozen typed Quant-v3 oracle");
-        let actual = compute_quant_feature_columns_v3_f64(&bars, timeframe)
-            .expect("production typed Quant-v3 CPU authority");
+            typed_quant_v3_oracle(&bars, timeframe_millis).expect("frozen typed Quant-v4 oracle");
+        let actual = compute_quant_feature_columns_v4_f64(&bars, timeframe)
+            .expect("production typed Quant-v4 CPU authority");
         assert_eq!(actual.len(), expected.len(), "{fixture_name} width");
         for (actual, expected) in actual.iter().zip(&expected) {
             assert_eq!(actual.name, expected.name, "{fixture_name} name");
@@ -761,7 +831,7 @@ fn production_quant_v3_cpu_authority_matches_the_frozen_oracle() {
 }
 
 #[test]
-fn production_quant_v3_rejects_nonresident_timeframes() {
+fn production_quant_v4_rejects_nonresident_timeframes() {
     let bars = ordinary_m30_fixture();
     for timeframe in [
         CanonicalTimeframe::H1,
@@ -771,23 +841,23 @@ fn production_quant_v3_rejects_nonresident_timeframes() {
         CanonicalTimeframe::W1,
         CanonicalTimeframe::MN1,
     ] {
-        let error = compute_quant_feature_columns_v3_f64(&bars, timeframe)
-            .expect_err("nonresident Quant-v3 timeframe must fail closed");
+        let error = compute_quant_feature_columns_v4_f64(&bars, timeframe)
+            .expect_err("nonresident Quant-v4 timeframe must fail closed");
         assert!(
-            error.to_string().contains("Quant-v3")
-                || error.to_string().contains("resident Quant-v3"),
+            error.to_string().contains("Quant-v4")
+                || error.to_string().contains("resident Quant-v4"),
             "{timeframe}: {error}"
         );
     }
 }
 
 #[test]
-fn ordinary_m30_fixture_preserves_31_routes_and_defines_all_32_migrations() {
+fn ordinary_m30_fixture_preserves_30_routes_and_defines_all_33_migrations() {
     let bars = ordinary_m30_fixture();
     let v2 = compute_quant_feature_columns_f64(&bars).expect("valid current Quant-v2 oracle");
-    let v3 = typed_quant_v3_oracle(&bars, M30_MILLIS).expect("valid typed Quant-v3 oracle");
-    assert_bitwise_preserved_v2_routes(&v2, &v3);
-    assert_migrated_v3_routes(&v3);
+    let v4 = typed_quant_v3_oracle(&bars, M30_MILLIS).expect("valid typed Quant-v4 oracle");
+    assert_bitwise_preserved_v2_routes(&v2, &v4);
+    assert_migrated_v4_routes(&v4);
 }
 
 #[test]
@@ -875,6 +945,41 @@ fn cum_delta_zscore_preserves_floor_aware_values_and_unfloored_validity() {
         FeatureCellValidity::Valid
     );
     assert!(ordinary_cumulative_delta.values[50].is_finite());
+}
+
+#[test]
+fn cum_delta_zscore_recovers_after_zero_range_delta_leaves_rolling_dependency() {
+    let bars = zero_range_recovery_fixture();
+    let legacy_columns =
+        compute_quant_feature_columns_f64(&bars).expect("legacy prefix-validity fixture");
+    let legacy_cumulative_delta = column(&legacy_columns, "quant_cum_delta_zscore");
+    assert_eq!(
+        legacy_cumulative_delta.validity[50],
+        FeatureCellValidity::ZeroDenominator,
+        "semantic-v2 retains its prefix dependency"
+    );
+    assert_eq!(
+        legacy_cumulative_delta.validity[110],
+        FeatureCellValidity::ZeroDenominator,
+        "semantic-v2 compatibility must not change silently"
+    );
+
+    let columns = compute_quant_feature_columns_v4_f64(&bars, CanonicalTimeframe::M30)
+        .expect("semantic-v4 zero-range recovery fixture");
+    let delta = column(&columns, "quant_delta_volume");
+    let cumulative_delta = column(&columns, "quant_cum_delta_zscore");
+
+    assert_eq!(delta.validity[0], FeatureCellValidity::ZeroDenominator);
+    assert_eq!(delta.validity[60], FeatureCellValidity::ZeroDenominator);
+    assert_eq!(cumulative_delta.validity[50], FeatureCellValidity::Valid);
+    assert!(cumulative_delta.values[50].is_finite());
+    assert!(
+        cumulative_delta.validity[60..110]
+            .iter()
+            .all(|validity| *validity == FeatureCellValidity::ZeroDenominator)
+    );
+    assert_eq!(cumulative_delta.validity[110], FeatureCellValidity::Valid);
+    assert!(cumulative_delta.values[110].is_finite());
 }
 
 #[test]
@@ -1078,6 +1183,7 @@ fn rtx_device_fixture_matches_all_quant_v3_value_bits_and_validity_codes() {
         ("exact_grid_gap", exact_grid_gap_fixture()),
         ("positive_subfloor", positive_subfloor_fixture()),
         ("flat_close_transition", flat_close_transition_fixture()),
+        ("zero_range_recovery", zero_range_recovery_fixture()),
     ] {
         let expected = typed_quant_v3_oracle(&bars, M30_MILLIS).expect("typed CPU oracle");
         let actual = run_resident_quant_v3_device_fixture(

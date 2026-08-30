@@ -1136,7 +1136,7 @@ fn compute_production_feature_columns(
             }
             #[cfg(feature = "gpu-cuda")]
             MultiTimeframeFeatureMathAuthorityV3::ResidentGpuExactParityCpuReferenceV3 => {
-                compute_quant_feature_columns_v3_f64(
+                compute_quant_feature_columns_v4_f64(
                     source.ohlcv(),
                     source.artifact().frame_timeframe(),
                 )
@@ -1159,7 +1159,7 @@ fn production_feature_manifest_row(
         == MultiTimeframeFeatureMathAuthorityV3::ResidentGpuExactParityCpuReferenceV3
         && producer == ProductionFeatureProducerId::Quantitative
     {
-        return Ok(quantitative_feature_producer_manifest_v3()?);
+        return Ok(quantitative_feature_producer_manifest_v4()?);
     }
 
     production_feature_producer_manifest_v1()?

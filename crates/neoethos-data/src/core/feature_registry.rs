@@ -119,29 +119,30 @@ pub fn production_feature_producer_manifest_v1()
     }
 }
 
-static QUANTITATIVE_FEATURE_PRODUCER_MANIFEST_V3: OnceLock<
+static QUANTITATIVE_FEATURE_PRODUCER_MANIFEST_V4: OnceLock<
     std::result::Result<ProductionFeatureProducerManifestRowV1, FeatureContractError>,
 > = OnceLock::new();
 
-/// Distinct semantic authority for the typed Quant-v3 CPU reference used by
+/// Distinct semantic authority for the corrected typed Quant-v4 CPU reference
+/// used by
 /// the resident GPU exact-parity route. The ordinary production manifest stays
 /// on Quant-v2; selecting this row is an explicit whole-feature math decision.
-pub fn quantitative_feature_producer_manifest_v3()
+pub fn quantitative_feature_producer_manifest_v4()
 -> std::result::Result<&'static ProductionFeatureProducerManifestRowV1, FeatureContractError> {
-    match QUANTITATIVE_FEATURE_PRODUCER_MANIFEST_V3
-        .get_or_init(build_quantitative_feature_producer_manifest_v3)
+    match QUANTITATIVE_FEATURE_PRODUCER_MANIFEST_V4
+        .get_or_init(build_quantitative_feature_producer_manifest_v4)
     {
         Ok(row) => Ok(row),
         Err(error) => Err(error.clone()),
     }
 }
 
-fn build_quantitative_feature_producer_manifest_v3()
+fn build_quantitative_feature_producer_manifest_v4()
 -> std::result::Result<ProductionFeatureProducerManifestRowV1, FeatureContractError> {
     producer_row(
         ProductionFeatureProducerId::Quantitative,
         FeatureSource::Quantitative,
-        3,
+        4,
         vec![
             embedded_source!(
                 "crates/neoethos-data/src/core/quant_features.rs",

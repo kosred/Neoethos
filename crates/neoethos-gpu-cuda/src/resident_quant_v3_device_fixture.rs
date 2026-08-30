@@ -456,7 +456,7 @@ pub fn run_resident_quant_v3_device_perf_fixture(
     )?;
     let native_launch = NeoResidentQuantLaunchV3 {
         abi_version: 3,
-        semantic_version: RESIDENT_QUANT_SEMANTIC_VERSION_V3,
+        semantic_version: RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4,
         feature_column_count: RESIDENT_QUANT_COLUMN_NAMES_V3.len() as u32,
         reserved: 0,
         row_count,

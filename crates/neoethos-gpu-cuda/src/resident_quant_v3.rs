@@ -1,4 +1,4 @@
-//! Resident CUDA implementation of the complete Quant semantic-v3 family.
+//! Resident CUDA implementation of the complete Quant semantic-v4 family.
 //!
 //! A source-sealed, move-only launch authority binds one typed intraday grid,
 //! the explicit 252-session annualization rule, retained parent buffers and a
@@ -23,10 +23,11 @@ use std::sync::Arc;
 const SHA256_BYTES: usize = 32;
 const UTC_DAY_MILLIS_V3: u64 = 86_400_000;
 const ASIAN_SESSION_MILLIS_V3: u64 = 28_800_000;
-pub const RESIDENT_QUANT_SEMANTIC_VERSION_V3: u32 = 3;
-pub const RESIDENT_QUANT_IMPLEMENTATION_ID_V3: &str = "neoethos.cuda.resident-quant.semantic-v3";
-pub const RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3: &str = "neoethos.quant.cpu-cuda.semantic-v3;sun-fdlibm-openlibm-e_log;commit=82e90aef0657289192efe77be89791c07dea0775;source-sha256=8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD;cpu-cuda-bit-tolerance=zero;real-log-accuracy=bounded-faithful-max-1ulp-reviewed-wide-domain;f64-fixed-order;canonical-ms-fixed-intraday;utc-day-open=00:00;asian-session=00:00-08:00;trading-sessions-per-year=252;annualization=sqrt(252*bars-per-utc-day);orb=asian-session-reset;validity=logical-u8-v3;fmad=false;ftz=false;prec-div=true;prec-sqrt=true";
+pub const RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4: u32 = 4;
+pub const RESIDENT_QUANT_IMPLEMENTATION_ID_V4: &str = "neoethos.cuda.resident-quant.semantic-v4";
+pub const RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4: &str = "neoethos.quant.cpu-cuda.semantic-v4;sun-fdlibm-openlibm-e_log;commit=82e90aef0657289192efe77be89791c07dea0775;source-sha256=8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD;cpu-cuda-bit-tolerance=zero;real-log-accuracy=bounded-faithful-max-1ulp-reviewed-wide-domain;f64-fixed-order;canonical-ms-fixed-intraday;utc-day-open=00:00;asian-session=00:00-08:00;trading-sessions-per-year=252;annualization=sqrt(252*bars-per-utc-day);orb=asian-session-reset;cumulative-delta-validity=rolling-50-increments;validity=logical-u8-v3;fmad=false;ftz=false;prec-div=true;prec-sqrt=true";
 pub const RESIDENT_QUANT_V2_TO_V3_MIGRATION_POLICY: &str = "neoethos.quant.migration.v2-to-v3;bitwise-preserved-v2-routes=31;migrated-existing-exact-log-routes=10;migrated-annualized-exact-log-routes=8;migrated-temporal-routes=14;changed-routes=32;trading_sessions_per_year=252;v2-artifacts=fail-closed;unversioned-artifacts=fail-closed;never-label-as-bitwise-v2-parity";
+pub const RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY: &str = "neoethos.quant.migration.v3-to-v4;changed-routes=1;route=quant_cum_delta_zscore;raw-value-formula=unchanged;materialized-value-bits=change-on-validity-recovery;validity=rolling-50-increments;v3-artifacts=fail-closed;unversioned-artifacts=fail-closed";
 pub const RESIDENT_QUANT_RETAINED_BYTES_PER_ROW_V3: usize = 567;
 pub const RESIDENT_QUANT_POINTER_TABLE_DEVICE_BYTES_V3: usize = 2_016;
 pub const RESIDENT_QUANT_ISOLATED_POINTER_SCHEMA_BYTES_V3: usize = 3_575;
@@ -166,7 +167,7 @@ impl SealedResidentQuantMigrationClosureV3 {
 
 pub fn seal_resident_quant_migration_closure_v3() -> SealedResidentQuantMigrationClosureV3 {
     let mut implementation = Sha256::new();
-    implementation.update(b"neoethos.gpu-cuda.resident-quant.f64.semantic-v3\0");
+    implementation.update(b"neoethos.gpu-cuda.resident-quant.f64.semantic-v4\0");
     implementation.update(include_bytes!("resident_quant_v3.rs"));
     implementation.update(include_bytes!("resident_quant_v3_census.rs"));
     implementation.update(include_bytes!("../native/resident_quant_v3_abi.cuh"));
@@ -190,8 +191,9 @@ pub fn seal_resident_quant_migration_closure_v3() -> SealedResidentQuantMigratio
     implementation.update(include_bytes!(
         "../tests/fixtures/resident_quant_v3_device_parity.release.txt"
     ));
-    implementation.update(RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3.as_bytes());
+    implementation.update(RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4.as_bytes());
     implementation.update(RESIDENT_QUANT_V2_TO_V3_MIGRATION_POLICY.as_bytes());
+    implementation.update(RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY.as_bytes());
     SealedResidentQuantMigrationClosureV3 {
         implementation_sha256: implementation.finalize().into(),
     }
@@ -222,7 +224,7 @@ pub fn resident_quant_capability_v3()
     }
     for required in [
         "verified=true",
-        "semantic_version=3",
+        "semantic_version=4",
         "feature_column_count=63",
         "cpu_cuda_value_bit_mismatches=0",
         "cpu_cuda_validity_mismatches=0",
@@ -252,9 +254,9 @@ pub fn resident_quant_capability_v3()
     let closure = seal_resident_quant_migration_closure_v3();
     ResidentProducerCapabilityV3::new(
         ResidentFeatureProducerV3::Quant,
-        RESIDENT_QUANT_IMPLEMENTATION_ID_V3,
+        RESIDENT_QUANT_IMPLEMENTATION_ID_V4,
         closure.implementation_sha256(),
-        RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3,
+        RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4,
     )
     .map_err(Into::into)
 }
@@ -584,7 +586,7 @@ pub(crate) fn launch_resident_quant_v3(
     )?;
     let native_launch = NeoResidentQuantLaunchV3 {
         abi_version: 3,
-        semantic_version: RESIDENT_QUANT_SEMANTIC_VERSION_V3,
+        semantic_version: RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4,
         feature_column_count: RESIDENT_QUANT_COLUMN_NAMES_V3.len() as u32,
         reserved: 0,
         row_count: rows as u64,
@@ -615,7 +617,7 @@ pub(crate) fn launch_resident_quant_v3(
     let ready_event =
         ResidentProducerReadyEventV3::record(context.as_ref(), stream.as_ref(), device_ordinal)?;
     let receipt = ResidentQuantRuntimeReceiptV3 {
-        semantic_version: RESIDENT_QUANT_SEMANTIC_VERSION_V3,
+        semantic_version: RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4,
         row_count: rows,
         feature_column_count: RESIDENT_QUANT_COLUMN_NAMES_V3.len(),
         timeframe_millis: authority.timeframe_millis,
@@ -771,7 +773,7 @@ mod tests {
         assert_eq!(capability.producer(), ResidentFeatureProducerV3::Quant);
         assert_eq!(
             capability.implementation_id(),
-            RESIDENT_QUANT_IMPLEMENTATION_ID_V3
+            RESIDENT_QUANT_IMPLEMENTATION_ID_V4
         );
         assert_eq!(
             capability.implementation_sha256(),
@@ -779,7 +781,7 @@ mod tests {
         );
         assert_eq!(
             capability.exact_math_authority(),
-            RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3
+            RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4
         );
     }
 }

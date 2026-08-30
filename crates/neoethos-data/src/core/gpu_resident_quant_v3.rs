@@ -1,8 +1,7 @@
-//! Data-owned resident Quant semantic-v3 producer preflight.
+//! Data-owned resident Quant semantic-v4 producer preflight.
 //!
-//! Quant-v3 is an explicit migration: thirty-one routes preserve v2 bits,
-//! eighteen routes use one sealed Sun/OpenLibm CPU/CUDA log graph, and fourteen
-//! previously-missing temporal routes consume the typed UTC/Asian grid. This
+//! Quant-v4 extends the v3 exact-log/temporal migration and corrects the
+//! cumulative-delta validity dependency while preserving its value bits. This
 //! owner admits the ordered 63-column family only after canonical OHLCV,
 //! millisecond timestamps, a fixed M30-or-finer timeframe and the explicit
 //! 252-trading-session annualization authority are present.
@@ -17,9 +16,11 @@ use neoethos_gpu_cuda::resident_feature_store_v3::{
     ResidentFeatureStoreCudaErrorV3,
 };
 use neoethos_gpu_cuda::resident_quant_v3::{
-    RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3 as NATIVE_QUANT_EXACT_MATH_AUTHORITY_V3,
-    RESIDENT_QUANT_IMPLEMENTATION_ID_V3 as NATIVE_QUANT_IMPLEMENTATION_ID_V3,
+    RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4 as NATIVE_QUANT_EXACT_MATH_AUTHORITY_V4,
+    RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4 as NATIVE_QUANT_FEATURE_SEMANTIC_VERSION_V4,
+    RESIDENT_QUANT_IMPLEMENTATION_ID_V4 as NATIVE_QUANT_IMPLEMENTATION_ID_V4,
     RESIDENT_QUANT_V2_TO_V3_MIGRATION_POLICY as NATIVE_QUANT_MIGRATION_POLICY_V3,
+    RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY as NATIVE_QUANT_MIGRATION_POLICY_V4,
     ResidentQuantLaunchAuthorityV3, ResidentQuantRuntimeReceiptV3, resident_quant_capability_v3,
     seal_resident_quant_migration_closure_v3,
 };
@@ -36,13 +37,15 @@ use super::gpu_resident_temporal_grid_v1::{
 };
 use super::timestamps::validate_canonical_millisecond_timestamps;
 
-pub(crate) const RESIDENT_QUANT_SEMANTIC_VERSION_V3: u32 = 3;
-pub(crate) const RESIDENT_QUANT_IMPLEMENTATION_ID_V3: &str = NATIVE_QUANT_IMPLEMENTATION_ID_V3;
-pub(crate) const RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3: &str =
-    NATIVE_QUANT_EXACT_MATH_AUTHORITY_V3;
+pub(crate) const RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4: u32 =
+    NATIVE_QUANT_FEATURE_SEMANTIC_VERSION_V4;
+pub(crate) const RESIDENT_QUANT_IMPLEMENTATION_ID_V4: &str = NATIVE_QUANT_IMPLEMENTATION_ID_V4;
+pub(crate) const RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4: &str =
+    NATIVE_QUANT_EXACT_MATH_AUTHORITY_V4;
 pub(crate) const RESIDENT_QUANT_V2_TO_V3_MIGRATION_POLICY: &str = NATIVE_QUANT_MIGRATION_POLICY_V3;
-const RESIDENT_QUANT_ROUTE_DOMAIN_V3: &str = "neoethos.data.resident-quant-route.semantic-v3";
-const RESIDENT_QUANT_INDICATOR_ID_V3: &str = "neoethos_quant_semantic_v3";
+pub(crate) const RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY: &str = NATIVE_QUANT_MIGRATION_POLICY_V4;
+const RESIDENT_QUANT_ROUTE_DOMAIN_V4: &str = "neoethos.data.resident-quant-route.semantic-v4";
+const RESIDENT_QUANT_INDICATOR_ID_V4: &str = "neoethos_quant_semantic_v4";
 
 pub(crate) const RESIDENT_QUANT_COLUMN_NAMES_V3: [&str; 63] = [
     "quant_close",
@@ -318,7 +321,7 @@ impl ResidentQuantHigherTimeframeBatchMemoryV3 {
 impl ResidentQuantRuntimeAdmissionV3 {
     fn validate_native_receipt(&self, receipt: &ResidentQuantRuntimeReceiptV3) -> Result<()> {
         ensure!(
-            receipt.semantic_version() == RESIDENT_QUANT_SEMANTIC_VERSION_V3,
+            receipt.semantic_version() == RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4,
             "resident Quant-v3 native semantic version drifted"
         );
         ensure!(
@@ -559,11 +562,11 @@ fn preflight_resident_quant_v3(
         "resident Quant-v3 native capability has the wrong producer"
     );
     ensure!(
-        native_capability.implementation_id() == RESIDENT_QUANT_IMPLEMENTATION_ID_V3,
+        native_capability.implementation_id() == RESIDENT_QUANT_IMPLEMENTATION_ID_V4,
         "resident Quant-v3 native capability has the wrong implementation id"
     );
     ensure!(
-        native_capability.exact_math_authority() == RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3,
+        native_capability.exact_math_authority() == RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4,
         "resident Quant-v3 native capability has the wrong exact-math authority"
     );
     let implementation_sha256 = native_capability.implementation_sha256();
@@ -572,9 +575,9 @@ fn preflight_resident_quant_v3(
         format!("resident Quant-v3 rejects calendar base timeframe {timeframe}")
     })?;
     let grid = admit_fixed_intraday_grid_v1(timeframe_millis, timestamps)?;
-    let semantic_source_sha256 = quant_semantic_source_sha256_v3();
+    let semantic_source_sha256 = quant_semantic_source_sha256_v4();
     let input_identity_sha256 =
-        quant_input_identity_v3(ohlcv, timeframe, &grid, volume, semantic_source_sha256);
+        quant_input_identity_v4(ohlcv, timeframe, &grid, volume, semantic_source_sha256);
     ensure!(
         input_identity_sha256 != [0; 32],
         "resident Quant-v3 input identity is zero"
@@ -596,7 +599,7 @@ fn preflight_resident_quant_v3(
         .collect::<Result<Vec<_>>>()?;
     let draft = ResidentProducerDraftV4::from_owner_preflight(
         ResidentFeatureProducerV3::Quant,
-        RESIDENT_QUANT_SEMANTIC_VERSION_V3,
+        RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4,
         routes,
         vec![ResidentProducerBatchDraftV4::from_owner_preflight(
             0, 63, 0, 0,
@@ -737,6 +740,12 @@ fn quant_route_v3(
             ),
         )?,
         parameter(
+            "quant_v4_migration_policy",
+            ResidentCanonicalParameterValueV4::Text(
+                RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY.to_owned(),
+            ),
+        )?,
+        parameter(
             "warmup_bars",
             ResidentCanonicalParameterValueV4::U64(warmup_bars),
         )?,
@@ -797,12 +806,12 @@ fn quant_route_v3(
     ];
     ResidentRouteDraftV4::from_typed_parts(
         name,
-        Some(RESIDENT_QUANT_INDICATOR_ID_V3),
+        Some(RESIDENT_QUANT_INDICATOR_ID_V4),
         Some(name),
         ResidentFeatureStageV3::Derived,
         None,
         parameters,
-        RESIDENT_QUANT_ROUTE_DOMAIN_V3,
+        RESIDENT_QUANT_ROUTE_DOMAIN_V4,
     )
     .map_err(Into::into)
 }
@@ -867,7 +876,7 @@ fn parameter(
     ResidentCanonicalParameterV4::from_typed_value(name, value).map_err(Into::into)
 }
 
-fn quant_input_identity_v3(
+fn quant_input_identity_v4(
     ohlcv: &Ohlcv,
     timeframe: CanonicalTimeframe,
     grid: &AdmittedFixedIntradayGridV1,
@@ -875,8 +884,8 @@ fn quant_input_identity_v3(
     semantic_source_sha256: [u8; 32],
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"neoethos.data.resident-quant-input.semantic-v3\0");
-    hash.update(RESIDENT_QUANT_SEMANTIC_VERSION_V3.to_le_bytes());
+    hash.update(b"neoethos.data.resident-quant-input.semantic-v4\0");
+    hash.update(RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4.to_le_bytes());
     hash.update(semantic_source_sha256);
     hash.update([timeframe.identity_tag()]);
     hash.update(grid.timeframe_millis().to_le_bytes());
@@ -900,14 +909,15 @@ fn quant_input_identity_v3(
     hash.finalize().into()
 }
 
-fn quant_semantic_source_sha256_v3() -> [u8; 32] {
+fn quant_semantic_source_sha256_v4() -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"neoethos.data.resident-quant-semantic-source.v3\0");
+    hash.update(b"neoethos.data.resident-quant-semantic-source.v4\0");
     hash.update(include_bytes!("quant_features.rs"));
     hash.update(include_bytes!("quant_exact_math_v3.rs"));
     hash.update(include_bytes!("timestamps.rs"));
     hash.update(include_bytes!("gpu_resident_temporal_grid_v1.rs"));
-    hash.update(RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3.as_bytes());
+    hash.update(RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4.as_bytes());
     hash.update(RESIDENT_QUANT_V2_TO_V3_MIGRATION_POLICY.as_bytes());
+    hash.update(RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY.as_bytes());
     hash.finalize().into()
 }

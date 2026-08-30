@@ -757,15 +757,23 @@ __device__ void compute_bitwise_preserved_v3(
   double cumulative_ring[50] = {0.0};
   // The preserved CPU f64 contract has two intentionally distinct schedules:
   // values keep the legacy 1e-10 range floor, while validity replays delta for
-  // every range above the logical epsilon. Keep both to preserve v2 exactly.
+  // every range above the logical epsilon. Keep both to preserve v2 value
+  // bits while semantic-v4 applies the corrected rolling validity dependency.
   double validity_cumulative_delta = 0.0;
   double validity_cumulative_ring[50] = {0.0};
-  bool invalid_delta_prefix = false;
+  bool invalid_delta_ring[50] = {false};
+  std::size_t invalid_delta_window_count = 0U;
   for (std::size_t row = 0; row < rows; ++row) {
     const double range = sub_rn_v3(launch.high[row], launch.low[row]);
     double delta = 0.0;
     double validity_delta = 0.0;
-    if (range <= kValidityEpsilonV3) invalid_delta_prefix = true;
+    const bool invalid_delta = range <= kValidityEpsilonV3;
+    const std::size_t delta_ring_slot = row % 50U;
+    if (row >= 50U && invalid_delta_ring[delta_ring_slot]) {
+      --invalid_delta_window_count;
+    }
+    invalid_delta_ring[delta_ring_slot] = invalid_delta;
+    if (invalid_delta) ++invalid_delta_window_count;
     if (range > kValidityEpsilonV3) {
       const double validity_buy_fraction =
           div_rn_v3(sub_rn_v3(launch.close[row], launch.low[row]), range);
@@ -789,7 +797,7 @@ __device__ void compute_bitwise_preserved_v3(
     }
 
     if (row >= 50U) {
-      if (invalid_delta_prefix) {
+      if (invalid_delta_window_count != 0U) {
         set_invalid_v3(launch, 62, row, kZeroDenominatorV3);
       } else {
         double validity_sum = 0.0;
@@ -1036,7 +1044,8 @@ extern "C" int neoethos_resident_quant_f64_v3(
     const NeoResidentQuantLaunchV3* launch, CUstream_st* stream_handle) {
   if (launch == nullptr || stream_handle == nullptr ||
       launch->abi_version != NEOETHOS_RESIDENT_QUANT_ABI_VERSION_V3 ||
-      launch->semantic_version != NEOETHOS_RESIDENT_QUANT_SEMANTIC_VERSION_V3 ||
+      launch->semantic_version !=
+          NEOETHOS_RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4 ||
       launch->feature_column_count !=
           NEOETHOS_RESIDENT_QUANT_FEATURE_COLUMNS_V3 ||
       launch->reserved != 0U || launch->row_count == 0U ||

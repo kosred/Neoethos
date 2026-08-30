@@ -19,23 +19,24 @@ fn read(relative: &str) -> String {
 }
 
 #[test]
-fn exact_cpu_reference_owns_typed_quant_v3_without_rebinding_ordinary_quant_v2() {
+fn exact_cpu_reference_owns_typed_quant_v4_without_rebinding_ordinary_quant_v2() {
     let registry = read("src/core/feature_registry.rs");
     let library = read("src/lib.rs");
+    let quant = read("src/core/quant_features.rs");
 
     assert!(
-        registry.contains("pub fn quantitative_feature_producer_manifest_v3"),
-        "the exact CPU reference needs a distinct Quant-v3 manifest"
+        registry.contains("pub fn quantitative_feature_producer_manifest_v4"),
+        "the corrected exact CPU reference needs a distinct Quant-v4 manifest"
     );
-    let v3_manifest = registry
-        .split("fn build_quantitative_feature_producer_manifest_v3")
+    let v4_manifest = registry
+        .split("fn build_quantitative_feature_producer_manifest_v4")
         .nth(1)
         .expect("Quant-v3 manifest builder");
     assert!(
-        v3_manifest.contains("ProductionFeatureProducerId::Quantitative")
-            && v3_manifest.contains("FeatureSource::Quantitative")
-            && v3_manifest.contains("\n        3,"),
-        "the distinct quantitative manifest must be semantic-v3"
+        v4_manifest.contains("ProductionFeatureProducerId::Quantitative")
+            && v4_manifest.contains("FeatureSource::Quantitative")
+            && v4_manifest.contains("\n        4,"),
+        "the distinct quantitative manifest must be semantic-v4"
     );
     for path in [
         "crates/neoethos-data/src/core/quant_features.rs",
@@ -47,7 +48,7 @@ fn exact_cpu_reference_owns_typed_quant_v3_without_rebinding_ordinary_quant_v2()
         "crates/neoethos-data/src/lib.rs",
     ] {
         assert!(
-            v3_manifest.contains(path),
+            v4_manifest.contains(path),
             "Quant-v3 manifest omitted `{path}`"
         );
     }
@@ -67,8 +68,14 @@ fn exact_cpu_reference_owns_typed_quant_v3_without_rebinding_ordinary_quant_v2()
         "one typed authority must govern both Classic planning and whole-feature math"
     );
     assert!(
-        library.contains("compute_quant_feature_columns_v3_f64(\n                    source.ohlcv(),\n                    source.artifact().frame_timeframe(),"),
-        "exact Quant-v3 must consume the typed timeframe from each canonical frame"
+        library.contains("compute_quant_feature_columns_v4_f64(\n                    source.ohlcv(),\n                    source.artifact().frame_timeframe(),"),
+        "exact Quant-v4 must consume the typed timeframe from each canonical frame"
+    );
+    assert!(
+        quant.contains("CumulativeDeltaValidityDependency::Prefix")
+            && quant.contains("CumulativeDeltaValidityDependency::RollingWindow")
+            && quant.contains("pub fn compute_quant_feature_columns_v4_f64"),
+        "semantic-v2 must retain prefix validity while semantic-v4 owns rolling validity"
     );
     assert!(
         library.contains("MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy"),

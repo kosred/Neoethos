@@ -874,6 +874,22 @@ fn quant_mark_all(
 /// timeframe are marked missing until that typed contract reaches the
 /// producer; guessing those semantics would make a fast but false feature.
 pub fn compute_quant_feature_columns_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureColumnF64>> {
+    compute_quant_feature_columns_f64_with_cumulative_delta_dependency(
+        ohlcv,
+        CumulativeDeltaValidityDependency::Prefix,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CumulativeDeltaValidityDependency {
+    Prefix,
+    RollingWindow,
+}
+
+fn compute_quant_feature_columns_f64_with_cumulative_delta_dependency(
+    ohlcv: &Ohlcv,
+    cumulative_delta_dependency: CumulativeDeltaValidityDependency,
+) -> Result<Vec<FeatureColumnF64>> {
     const EPS: f64 = 1e-12;
 
     let n = ohlcv.len();
@@ -1251,7 +1267,15 @@ pub fn compute_quant_feature_columns_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureCol
 
         quant_mark_after_warmup(&mut validity_by_name, "quant_cum_delta_zscore", 50)?;
         for row in 50..n {
-            if delta_validity[..=row]
+            let dependency_start = match cumulative_delta_dependency {
+                CumulativeDeltaValidityDependency::Prefix => 0,
+                // A delta at or before the oldest cumulative observation is a
+                // common additive offset in every value used by this z-score
+                // and cancels. Only the 50 increments through the current row
+                // affect relative levels in corrected semantic-v4.
+                CumulativeDeltaValidityDependency::RollingWindow => row + 1 - 50,
+            };
+            if delta_validity[dependency_start..=row]
                 .iter()
                 .any(|validity| !validity.is_valid())
             {
@@ -1767,7 +1791,7 @@ fn quant_v3_install_temporal_migrations(
     Ok(())
 }
 
-/// Typed CPU authority for the exact resident Quant semantic-v3 graph.
+/// Typed CPU authority for the corrected exact resident Quant semantic-v4 graph.
 ///
 /// Unlike the compatibility `compute_quant_feature_columns_f64` entrypoint,
 /// this requires an explicit fixed intraday timeframe, validates every source
@@ -1775,28 +1799,31 @@ fn quant_v3_install_temporal_migrations(
 /// `sqrt(252 * bars_per_UTC_day)`, and materializes the UTC-day/Asian-session
 /// routes. Its operation order is shared with the frozen CPU/CUDA parity
 /// oracle; invalid cells retain explicit validity and canonical NaN payloads.
-pub fn compute_quant_feature_columns_v3_f64(
+pub fn compute_quant_feature_columns_v4_f64(
     ohlcv: &Ohlcv,
     timeframe: CanonicalTimeframe,
 ) -> Result<Vec<FeatureColumnF64>> {
     let timeframe_millis = timeframe.fixed_duration_ms().ok_or_else(|| {
-        anyhow::anyhow!("Quant-v3 requires a fixed intraday timeframe, got {timeframe}")
+        anyhow::anyhow!("Quant-v4 requires a fixed intraday timeframe, got {timeframe}")
     })?;
     let timestamps = ohlcv
         .timestamp
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("Quant-v3 requires canonical millisecond timestamps"))?;
+        .ok_or_else(|| anyhow::anyhow!("Quant-v4 requires canonical millisecond timestamps"))?;
     let admitted_grid = admit_fixed_intraday_grid_v1(timeframe_millis, timestamps)
-        .map_err(|error| anyhow::anyhow!("Quant-v3 temporal admission failed: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("Quant-v4 temporal admission failed: {error}"))?;
     ensure!(
         admitted_grid.timeframe_millis()
             == u64::try_from(timeframe_millis)
-                .map_err(|_| anyhow::anyhow!("Quant-v3 timeframe width overflow"))?
+                .map_err(|_| anyhow::anyhow!("Quant-v4 timeframe width overflow"))?
             && admitted_grid.bars_per_asian_session() > 0
             && admitted_grid.bars_per_trading_week() >= admitted_grid.bars_per_utc_day(),
-        "Quant-v3 temporal admission returned an internally inconsistent grid receipt"
+        "Quant-v4 temporal admission returned an internally inconsistent grid receipt"
     );
-    let mut columns = compute_quant_feature_columns_f64(ohlcv)?;
+    let mut columns = compute_quant_feature_columns_f64_with_cumulative_delta_dependency(
+        ohlcv,
+        CumulativeDeltaValidityDependency::RollingWindow,
+    )?;
     quant_v3_install_exact_log_migrations(
         ohlcv,
         admitted_grid.bars_per_utc_day(),
@@ -1811,12 +1838,12 @@ pub fn compute_quant_feature_columns_v3_f64(
                 .iter()
                 .map(|column| column.name.as_str())
                 .eq(RESIDENT_QUANT_COLUMN_NAMES_V3),
-        "Quant-v3 CPU authority schema does not match the exact resident 63-column order"
+        "Quant-v4 CPU authority schema does not match the exact resident 63-column order"
     );
     #[cfg(not(feature = "gpu-cuda"))]
     ensure!(
         columns.len() == 63,
-        "Quant-v3 CPU authority schema width is {}, expected 63",
+        "Quant-v4 CPU authority schema width is {}, expected 63",
         columns.len()
     );
     Ok(columns)

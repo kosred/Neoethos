@@ -4,12 +4,12 @@
 #include <cstdint>
 
 #define NEOETHOS_RESIDENT_QUANT_ABI_VERSION_V3 3u
-#define NEOETHOS_RESIDENT_QUANT_SEMANTIC_VERSION_V3 3u
+#define NEOETHOS_RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4 4u
 #define NEOETHOS_RESIDENT_QUANT_FEATURE_COLUMNS_V3 63u
 
 struct CUstream_st;
 
-/// Fixed-width launch descriptor for the complete resident Quant-v3 family.
+/// Fixed-width V3 ABI descriptor for the complete Quant semantic-v4 family.
 /// Every pointer names an already-resident allocation in `stream`'s primary
 /// context. Outputs are feature-major `[63][row_count]` f64/u8 matrices.
 struct NeoResidentQuantLaunchV3 {

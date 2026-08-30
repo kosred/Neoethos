@@ -1,28 +1,32 @@
-//! Frozen route/formula/validity census for resident Quant semantic-v3.
+//! Frozen route/formula/validity census for resident Quant semantic-v4.
 //!
-//! Thirty-one routes retain the current `compute_quant_feature_columns_f64`
+//! Thirty routes retain the current `compute_quant_feature_columns_f64`
 //! value bits and logical validity. Ten formerly unchanged routes and all
 //! eight annualized-volatility routes migrate to the same Sun/OpenLibm exact
 //! log graph used by CUDA. Fourteen temporal/session routes are also explicit
-//! semantic-v3 migrations. Quant-v3 as a whole is never bitwise-v2 parity.
+//! semantic-v3 migrations. Semantic-v4 preserves their values and corrects
+//! the cumulative-delta validity dependency from a prefix to 50 increments.
 
 #![allow(dead_code)]
 
-pub const RESIDENT_QUANT_SEMANTIC_VERSION_V3: u32 = 3;
+pub const RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4: u32 = 4;
 pub const RESIDENT_QUANT_FEATURE_COLUMN_COUNT_V3: usize = 63;
-pub const RESIDENT_QUANT_V2_BITWISE_PRESERVED_ROUTE_COUNT_V3: usize = 31;
+pub const RESIDENT_QUANT_V2_BITWISE_PRESERVED_ROUTE_COUNT_V4: usize = 30;
 pub const RESIDENT_QUANT_V3_EXACT_LOG_MIGRATION_ROUTE_COUNT_V3: usize = 10;
 pub const RESIDENT_QUANT_V3_ANNUALIZED_EXACT_LOG_MIGRATION_ROUTE_COUNT_V3: usize = 8;
 pub const RESIDENT_QUANT_V3_TEMPORAL_MIGRATION_ROUTE_COUNT_V3: usize = 14;
 pub const RESIDENT_QUANT_V3_EXACT_LOG_AFFECTED_ROUTE_COUNT_V3: usize = 18;
 pub const RESIDENT_QUANT_V3_MIGRATED_ROUTE_COUNT_V3: usize = 32;
+pub const RESIDENT_QUANT_V4_ROLLING_VALIDITY_MIGRATION_ROUTE_COUNT_V4: usize = 1;
+pub const RESIDENT_QUANT_V4_CHANGED_ROUTE_COUNT_V4: usize = 33;
 pub const RESIDENT_QUANT_TRADING_SESSIONS_PER_YEAR_V3: u64 = 252;
 pub const RESIDENT_QUANT_CANONICAL_NAN_BITS_V3: u64 = 0x7ff8_0000_0000_0000;
 
-pub const RESIDENT_QUANT_IMPLEMENTATION_ID_V3: &str = "neoethos.cuda.resident-quant.semantic-v3";
-pub const RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3: &str = "neoethos.quant.cpu-cuda.semantic-v3;sun-fdlibm-openlibm-e_log;commit=82e90aef0657289192efe77be89791c07dea0775;source-sha256=8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD;cpu-cuda-bit-tolerance=zero;real-log-accuracy=bounded-faithful-max-1ulp-reviewed-wide-domain;f64-fixed-order;canonical-ms-fixed-intraday;utc-day-open=00:00;asian-session=00:00-08:00;trading-sessions-per-year=252;annualization=sqrt(252*bars-per-utc-day);orb=asian-session-reset;validity=logical-u8-v3;fmad=false;ftz=false;prec-div=true;prec-sqrt=true";
+pub const RESIDENT_QUANT_IMPLEMENTATION_ID_V4: &str = "neoethos.cuda.resident-quant.semantic-v4";
+pub const RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4: &str = "neoethos.quant.cpu-cuda.semantic-v4;sun-fdlibm-openlibm-e_log;commit=82e90aef0657289192efe77be89791c07dea0775;source-sha256=8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD;cpu-cuda-bit-tolerance=zero;real-log-accuracy=bounded-faithful-max-1ulp-reviewed-wide-domain;f64-fixed-order;canonical-ms-fixed-intraday;utc-day-open=00:00;asian-session=00:00-08:00;trading-sessions-per-year=252;annualization=sqrt(252*bars-per-utc-day);orb=asian-session-reset;cumulative-delta-validity=rolling-50-increments;validity=logical-u8-v3;fmad=false;ftz=false;prec-div=true;prec-sqrt=true";
 pub const RESIDENT_QUANT_V2_TO_V3_MIGRATION_POLICY: &str = "neoethos.quant.migration.v2-to-v3;bitwise-preserved-v2-routes=31;migrated-existing-exact-log-routes=10;migrated-annualized-exact-log-routes=8;migrated-temporal-routes=14;changed-routes=32;trading_sessions_per_year=252;v2-artifacts=fail-closed;unversioned-artifacts=fail-closed;never-label-as-bitwise-v2-parity";
-pub const RESIDENT_QUANT_OPERATION_SCHEDULE_V3: &str = "neoethos.quant.semantic-v3.single-thread-fixed-order-linear-scan;one-native-launch;fixed-maximum-lookback=500-bars;utc-day-week-asian-state=O(1)-per-row;no-feature-d2h";
+pub const RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY: &str = "neoethos.quant.migration.v3-to-v4;changed-routes=1;route=quant_cum_delta_zscore;raw-value-formula=unchanged;materialized-value-bits=change-on-validity-recovery;validity=rolling-50-increments;v3-artifacts=fail-closed;unversioned-artifacts=fail-closed";
+pub const RESIDENT_QUANT_OPERATION_SCHEDULE_V4: &str = "neoethos.quant.semantic-v4.single-thread-fixed-order-linear-scan;one-native-launch;fixed-maximum-lookback=500-bars;utc-day-week-asian-state=O(1)-per-row;no-feature-d2h";
 
 pub const RESIDENT_QUANT_COLUMN_NAMES_V3: [&str; 63] = [
     "quant_close",
@@ -133,6 +137,7 @@ pub enum ResidentQuantRouteLineageV3 {
     V3ExactLogMigration,
     V3AnnualizedExactLogMigration,
     V3TemporalSessionMigration,
+    V4RollingValidityMigration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +148,7 @@ pub enum ResidentQuantValidityRuleV3 {
     PreviousUtcDayBoundaryOrZeroDenominator,
     PreviousFiveTradingDaysOrZeroDenominator,
     AsianOpeningRangeObservedBars,
-    CumulativeDeltaPrefixOrZeroDenominator,
+    CumulativeDeltaRollingWindowOrZeroDenominator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,10 +178,10 @@ const fn route(
 
 use ResidentQuantRouteLineageV3::{
     V2BitwisePreserved, V3AnnualizedExactLogMigration, V3ExactLogMigration,
-    V3TemporalSessionMigration,
+    V3TemporalSessionMigration, V4RollingValidityMigration,
 };
 use ResidentQuantValidityRuleV3::{
-    AlwaysValid, AsianOpeningRangeObservedBars, CumulativeDeltaPrefixOrZeroDenominator,
+    AlwaysValid, AsianOpeningRangeObservedBars, CumulativeDeltaRollingWindowOrZeroDenominator,
     FixedWarmup, FixedWarmupOrZeroDenominator, PreviousFiveTradingDaysOrZeroDenominator,
     PreviousUtcDayBoundaryOrZeroDenominator,
 };
@@ -614,8 +619,8 @@ pub const RESIDENT_QUANT_ROUTE_CENSUS_V3: [ResidentQuantRouteCensusV3; 63] = [
         "quant_cum_delta_zscore",
         "cumulative_delta_zscore:window=50",
         50,
-        V2BitwisePreserved,
-        CumulativeDeltaPrefixOrZeroDenominator,
+        V4RollingValidityMigration,
+        CumulativeDeltaRollingWindowOrZeroDenominator,
     ),
 ];
 
@@ -641,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn lineage_is_exactly_31_plus_10_plus_8_plus_14() {
+    fn lineage_is_exactly_30_plus_10_plus_8_plus_14_plus_1() {
         let count = |lineage| {
             RESIDENT_QUANT_ROUTE_CENSUS_V3
                 .iter()
@@ -650,7 +655,7 @@ mod tests {
         };
         assert_eq!(
             count(V2BitwisePreserved),
-            RESIDENT_QUANT_V2_BITWISE_PRESERVED_ROUTE_COUNT_V3
+            RESIDENT_QUANT_V2_BITWISE_PRESERVED_ROUTE_COUNT_V4
         );
         assert_eq!(
             count(V3ExactLogMigration),
@@ -665,8 +670,13 @@ mod tests {
             RESIDENT_QUANT_V3_TEMPORAL_MIGRATION_ROUTE_COUNT_V3
         );
         assert_eq!(
-            RESIDENT_QUANT_V2_BITWISE_PRESERVED_ROUTE_COUNT_V3
-                + RESIDENT_QUANT_V3_MIGRATED_ROUTE_COUNT_V3,
+            count(V4RollingValidityMigration),
+            RESIDENT_QUANT_V4_ROLLING_VALIDITY_MIGRATION_ROUTE_COUNT_V4
+        );
+        assert_eq!(
+            RESIDENT_QUANT_V2_BITWISE_PRESERVED_ROUTE_COUNT_V4
+                + RESIDENT_QUANT_V3_MIGRATED_ROUTE_COUNT_V3
+                + RESIDENT_QUANT_V4_ROLLING_VALIDITY_MIGRATION_ROUTE_COUNT_V4,
             RESIDENT_QUANT_FEATURE_COLUMN_COUNT_V3
         );
         let changed = RESIDENT_QUANT_ROUTE_CENSUS_V3
@@ -674,6 +684,11 @@ mod tests {
             .filter(|route| route.lineage != V2BitwisePreserved)
             .map(|route| route.name)
             .collect::<Vec<_>>();
-        assert_eq!(changed, RESIDENT_QUANT_V3_CHANGED_COLUMN_NAMES_V3);
+        assert_eq!(changed.len(), RESIDENT_QUANT_V4_CHANGED_ROUTE_COUNT_V4);
+        assert_eq!(
+            &changed[..RESIDENT_QUANT_V3_CHANGED_COLUMN_NAMES_V3.len()],
+            RESIDENT_QUANT_V3_CHANGED_COLUMN_NAMES_V3
+        );
+        assert_eq!(changed.last().copied(), Some("quant_cum_delta_zscore"));
     }
 }

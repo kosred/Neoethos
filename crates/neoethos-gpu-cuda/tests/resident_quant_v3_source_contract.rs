@@ -88,19 +88,25 @@ const QUANT_COLUMN_NAMES_V3: [&str; 63] = [
 ];
 
 #[test]
-fn census_freezes_31_preserved_and_32_versioned_migrations_in_schema_order() {
+fn census_freezes_30_preserved_and_33_versioned_migrations_in_schema_order() {
     let source = read("crates/neoethos-gpu-cuda/src/resident_quant_v3_census.rs");
     let compact_source = compact(&source);
     for name in QUANT_COLUMN_NAMES_V3 {
         assert!(source.contains(name), "Quant-v3 census omitted {name}");
     }
     for required in [
+        "RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4: u32 = 4",
+        "RESIDENT_QUANT_IMPLEMENTATION_ID_V4",
+        "RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4",
+        "RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY",
         "RESIDENT_QUANT_COLUMN_NAMES_V3: [&str; 63]",
-        "RESIDENT_QUANT_V2_BITWISE_PRESERVED_ROUTE_COUNT_V3: usize = 31",
+        "RESIDENT_QUANT_V2_BITWISE_PRESERVED_ROUTE_COUNT_V4: usize = 30",
         "RESIDENT_QUANT_V3_EXACT_LOG_MIGRATION_ROUTE_COUNT_V3: usize = 10",
         "RESIDENT_QUANT_V3_ANNUALIZED_EXACT_LOG_MIGRATION_ROUTE_COUNT_V3: usize = 8",
         "RESIDENT_QUANT_V3_TEMPORAL_MIGRATION_ROUTE_COUNT_V3: usize = 14",
         "RESIDENT_QUANT_V3_MIGRATED_ROUTE_COUNT_V3: usize = 32",
+        "RESIDENT_QUANT_V4_ROLLING_VALIDITY_MIGRATION_ROUTE_COUNT_V4: usize = 1",
+        "RESIDENT_QUANT_V4_CHANGED_ROUTE_COUNT_V4: usize = 33",
         "RESIDENT_QUANT_V3_CHANGED_COLUMN_NAMES_V3: [&str; 32]",
         "trading_sessions_per_year=252",
         "unversioned-artifacts=fail-closed",
@@ -109,6 +115,7 @@ fn census_freezes_31_preserved_and_32_versioned_migrations_in_schema_order() {
         "V3ExactLogMigration",
         "V3AnnualizedExactLogMigration",
         "V3TemporalSessionMigration",
+        "V4RollingValidityMigration",
     ] {
         assert!(source.contains(required), "census omitted `{required}`");
     }
@@ -120,6 +127,7 @@ fn native_abi_is_fixed_width_typed_and_has_one_63_column_entrypoint() {
     let source = read("crates/neoethos-gpu-cuda/native/resident_quant_v3_abi.cuh");
     for required in [
         "NEOETHOS_RESIDENT_QUANT_ABI_VERSION_V3",
+        "NEOETHOS_RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4 4u",
         "NeoResidentQuantLaunchV3",
         "semantic_version",
         "feature_column_count",
@@ -190,6 +198,11 @@ fn rust_owner_binds_real_abi_before_minting_capability_and_retains_same_stream_b
     let source = read("crates/neoethos-gpu-cuda/src/resident_quant_v3.rs");
     let compact_source = compact(&source);
     for required in [
+        "RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4: u32 = 4",
+        "RESIDENT_QUANT_IMPLEMENTATION_ID_V4",
+        "RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4",
+        "RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY",
+        "semantic_version=4",
         "SealedResidentQuantMigrationClosureV3",
         "seal_resident_quant_migration_closure_v3",
         "ResidentQuantLaunchAuthorityV3",
@@ -227,6 +240,10 @@ fn rust_owner_binds_real_abi_before_minting_capability_and_retains_same_stream_b
             "Rust native owner omitted `{required}`"
         );
     }
+    assert!(
+        !source.contains("semantic_version=3"),
+        "semantic-v4 capability must reject the stale semantic-v3 receipt"
+    );
     for required in [
         "include_bytes!(\"../../neoethos-data/src/core/quant_features.rs\")",
         "include_bytes!(\"../../neoethos-data/src/core/gpu_resident_quant_v3.rs\")",
@@ -254,7 +271,7 @@ fn data_connection_consumes_native_closure_and_never_accepts_caller_capability_b
         "resident_quant_capability_v3",
         "ResidentQuantLaunchAuthorityV3::seal",
         "append_resident_quant_v3",
-        "into_launched_parts",
+        "into_recipe_parts",
     ] {
         assert!(
             source.contains(required),
@@ -279,7 +296,7 @@ fn oracle_and_device_fixtures_cover_values_validity_gaps_nonfinite_and_boundarie
         "five_day_week_boundary_fixture",
         "asian_session_orb_boundary_fixture",
         "assert_bitwise_preserved_v2_routes",
-        "assert_migrated_v3_routes",
+        "assert_migrated_v4_routes",
         "rtx_device_fixture_profiles_the_single_lane_bounded_schedule",
         "NEOETHOS_QUANT_PERF_ROWS",
         "canonical quiet NaN",
@@ -455,6 +472,8 @@ fn cumulative_delta_preserves_the_split_value_and_validity_schedules() {
 
     for required in [
         "cum_delta_zscore_preserves_floor_aware_values_and_unfloored_validity",
+        "cum_delta_zscore_recovers_after_zero_range_delta_leaves_rolling_dependency",
+        "zero_range_recovery_fixture",
         "legacy.values[row].to_bits() == 0.0_f64.to_bits()",
         "legacy.validity[row] == FeatureCellValidity::Valid",
         "let mut mismatch_census = Vec::new();",
@@ -472,7 +491,7 @@ fn cumulative_delta_preserves_the_split_value_and_validity_schedules() {
         .split("fn rtx_device_fixture_matches_all_quant_v3_value_bits_and_validity_codes()")
         .nth(1)
         .expect("real-device Quant-v3 parity test")
-        .split("fn rtx_device_fixture_profiles_the_single_lane_bounded_schedule()")
+        .split("fn integrated_m30_parent_fixture")
         .next()
         .expect("end of real-device Quant-v3 parity test");
     assert_eq!(
@@ -488,6 +507,10 @@ fn cumulative_delta_preserves_the_split_value_and_validity_schedules() {
     for required in [
         "doublevalidity_cumulative_delta=0.0;",
         "doublevalidity_cumulative_ring[50]={0.0};",
+        "boolinvalid_delta_ring[50]={false};",
+        "std::size_tinvalid_delta_window_count=0U;",
+        "if(row>=50U&&invalid_delta_ring[delta_ring_slot])",
+        "if(invalid_delta_window_count!=0U)",
         "validity_cumulative_delta=add_rn_v3(validity_cumulative_delta,validity_delta);",
         "validity_cumulative_ring[index%50U]",
         "value_standard_deviation>kValueFloorV3",
@@ -498,11 +521,15 @@ fn cumulative_delta_preserves_the_split_value_and_validity_schedules() {
             "Quant-v3 CUDA cumulative-delta compatibility schedule omitted `{required}`"
         );
     }
+    assert!(
+        !compact_native.contains("invalid_delta_prefix"),
+        "one zero-range delta must not poison every future cumulative-delta z-score"
+    );
 
     let route = census
         .split("\"quant_cum_delta_zscore\"")
         .nth(1)
         .expect("cumulative-delta census route");
-    assert!(route.contains("V2BitwisePreserved"));
-    assert!(route.contains("CumulativeDeltaPrefixOrZeroDenominator"));
+    assert!(route.contains("V4RollingValidityMigration"));
+    assert!(route.contains("CumulativeDeltaRollingWindowOrZeroDenominator"));
 }

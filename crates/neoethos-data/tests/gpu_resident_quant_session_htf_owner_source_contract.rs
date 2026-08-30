@@ -22,11 +22,11 @@ fn compact(source: &str) -> String {
 }
 
 #[test]
-fn quant_v3_owner_freezes_all_63_routes_and_typed_temporal_inputs() {
+fn quant_v4_owner_freezes_all_63_routes_and_typed_temporal_inputs() {
     let source = read("crates/neoethos-data/src/core/gpu_resident_quant_v3.rs");
     let compact_source = compact(&source);
     for required in [
-        "RESIDENT_QUANT_SEMANTIC_VERSION_V3: u32 = 3",
+        "RESIDENT_QUANT_FEATURE_SEMANTIC_VERSION_V4: u32",
         "RESIDENT_QUANT_COLUMN_NAMES_V3: [&str; 63]",
         "TRADING_SESSIONS_PER_YEAR_V3",
         "annualization_periods_per_year",
@@ -35,12 +35,13 @@ fn quant_v3_owner_freezes_all_63_routes_and_typed_temporal_inputs() {
         "bars_per_trading_week",
         "ResidentFeatureProducerV3::Quant",
         "ResidentFeatureStageV3::Derived",
-        "neoethos.data.resident-quant-route.semantic-v3",
+        "neoethos.data.resident-quant-route.semantic-v4",
         "ResidentProducerDraftV4::from_owner_preflight",
         "feature_value_d2h_bytes: 0",
         "validate_native_receipt",
-        "native_capability.implementation_id() == RESIDENT_QUANT_IMPLEMENTATION_ID_V3",
-        "native_capability.exact_math_authority() == RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V3",
+        "native_capability.implementation_id() == RESIDENT_QUANT_IMPLEMENTATION_ID_V4",
+        "native_capability.exact_math_authority() == RESIDENT_QUANT_EXACT_MATH_AUTHORITY_V4",
+        "RESIDENT_QUANT_V3_TO_V4_MIGRATION_POLICY",
     ] {
         assert!(
             source.contains(required),
