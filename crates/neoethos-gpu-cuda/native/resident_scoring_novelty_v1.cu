@@ -818,14 +818,42 @@ bool all_slice2_device_uuid_bytes_present_v2(const std::uint8_t uuid[16]) {
   return aggregate != 0;
 }
 
+bool checked_slice2_region_bytes_v2(std::uint64_t item_count,
+                                    std::uint64_t elements_per_item,
+                                    std::size_t element_bytes,
+                                    std::uint64_t* aligned_bytes) {
+  if (aligned_bytes == nullptr || item_count == 0 || elements_per_item == 0 ||
+      item_count > static_cast<std::uint64_t>(
+                       std::numeric_limits<std::size_t>::max()) ||
+      elements_per_item > static_cast<std::uint64_t>(
+                                  std::numeric_limits<std::size_t>::max())) {
+    return false;
+  }
+  std::size_t element_count = 0;
+  std::size_t raw_bytes = 0;
+  std::size_t aligned = 0;
+  if (!checked_mul_v1(static_cast<std::size_t>(item_count),
+                      static_cast<std::size_t>(elements_per_item),
+                      &element_count) ||
+      !checked_mul_v1(element_count, element_bytes, &raw_bytes) ||
+      !align_device_bytes_v1(raw_bytes, &aligned)) {
+    return false;
+  }
+  *aligned_bytes = static_cast<std::uint64_t>(aligned);
+  return true;
+}
+
 bool validate_slice2_combined_binding_v2(
     const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding) {
   using namespace resident_archive_knn_v2;
   if (binding == nullptr ||
       binding->abi_version != NEO_RESIDENT_ARCHIVE_KNN_ABI_V2 ||
       binding->reserved != 0u ||
-      binding->population_count != NEO_RESIDENT_ARCHIVE_KNN_POPULATION_COUNT_V2 ||
-      binding->archive_capacity != NEO_RESIDENT_ARCHIVE_KNN_CAPACITY_V2 ||
+      binding->population_count == 0 ||
+      binding->population_count >
+          NEO_RESIDENT_ARCHIVE_KNN_MAX_POPULATION_COUNT_V2 ||
+      binding->archive_capacity == 0 ||
+      binding->archive_capacity > NEO_RESIDENT_ARCHIVE_KNN_MAX_CAPACITY_V2 ||
       binding->signature_word_count !=
           NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 ||
       binding->novelty_neighbor_count != NEO_RESIDENT_ARCHIVE_KNN_K_V2 ||
@@ -846,10 +874,65 @@ bool validate_slice2_combined_binding_v2(
     return false;
   }
 
+  std::uint64_t population_scalar_bytes = 0;
+  std::uint64_t archive_gene_scalar_bytes = 0;
+  std::uint64_t archive_term_index_bytes = 0;
+  std::uint64_t archive_term_weight_bytes = 0;
+  std::uint64_t archive_metric_row_bytes = 0;
+  std::uint64_t archive_signature_bytes = 0;
+  std::uint64_t archive_hash_bytes = 0;
+  std::uint64_t population_signature_bytes = 0;
+  std::uint64_t exact_top_k_bytes = 0;
+  std::uint64_t admission_flag_bytes = 0;
+  std::uint64_t admission_offset_bytes = 0;
+  if (!checked_slice2_region_bytes_v2(binding->population_count, 1,
+                                      sizeof(double),
+                                      &population_scalar_bytes) ||
+      !checked_slice2_region_bytes_v2(
+          binding->archive_capacity, 1,
+          sizeof(NeoResidentScoringNoveltyGeneScalarV1),
+          &archive_gene_scalar_bytes) ||
+      !checked_slice2_region_bytes_v2(binding->archive_capacity,
+                                      binding->max_terms_per_gene,
+                                      sizeof(std::uint64_t),
+                                      &archive_term_index_bytes) ||
+      !checked_slice2_region_bytes_v2(binding->archive_capacity,
+                                      binding->max_terms_per_gene,
+                                      sizeof(double),
+                                      &archive_term_weight_bytes) ||
+      !checked_slice2_region_bytes_v2(
+          binding->archive_capacity, 1,
+          sizeof(NeoResidentScoringNoveltyMetricRowV1),
+          &archive_metric_row_bytes) ||
+      !checked_slice2_region_bytes_v2(binding->archive_capacity,
+                                      binding->signature_word_count,
+                                      sizeof(std::uint64_t),
+                                      &archive_signature_bytes) ||
+      !checked_slice2_region_bytes_v2(binding->archive_capacity, 1,
+                                      sizeof(std::uint64_t),
+                                      &archive_hash_bytes) ||
+      !checked_slice2_region_bytes_v2(binding->population_count,
+                                      binding->signature_word_count,
+                                      sizeof(std::uint64_t),
+                                      &population_signature_bytes) ||
+      !checked_slice2_region_bytes_v2(binding->population_count,
+                                      binding->novelty_neighbor_count, 32,
+                                      &exact_top_k_bytes) ||
+      !checked_slice2_region_bytes_v2(binding->population_count, 1,
+                                      sizeof(std::uint32_t),
+                                      &admission_flag_bytes) ||
+      !checked_slice2_region_bytes_v2(binding->population_count, 1,
+                                      sizeof(std::uint64_t),
+                                      &admission_offset_bytes)) {
+    return false;
+  }
+
   std::uint64_t cursor = 0;
-  if (!valid_slice2_region_v2(binding->fitness_scores, cursor, 1'792,
+  if (!valid_slice2_region_v2(binding->fitness_scores, cursor,
+                              population_scalar_bytes,
                               &cursor) ||
-      !valid_slice2_region_v2(binding->decision_keys, cursor, 1'792,
+      !valid_slice2_region_v2(binding->decision_keys, cursor,
+                              population_scalar_bytes,
                               &cursor) ||
       binding->cub_scratch.offset_bytes != cursor ||
       binding->cub_scratch.size_bytes == 0ull ||
@@ -858,26 +941,30 @@ bool validate_slice2_combined_binding_v2(
       !checked_add_v1(binding->cub_scratch.offset_bytes,
                       binding->cub_scratch.size_bytes, &cursor) ||
       !valid_slice2_region_v2(binding->archive_gene_scalars, cursor,
-                              3'600'128, &cursor) ||
+                              archive_gene_scalar_bytes, &cursor) ||
       !valid_slice2_region_v2(binding->archive_term_indices, cursor,
-                              6'400'000, &cursor) ||
+                              archive_term_index_bytes, &cursor) ||
       !valid_slice2_region_v2(binding->archive_term_weights, cursor,
-                              6'400'000, &cursor) ||
+                              archive_term_weight_bytes, &cursor) ||
       !valid_slice2_region_v2(binding->archive_metric_rows, cursor,
-                              5'200'128, &cursor) ||
-      !valid_slice2_region_v2(binding->archive_signatures, cursor, 1'600'000,
-                              &cursor) ||
-      !valid_slice2_region_v2(binding->archive_hashes, cursor, 400'128,
-                              &cursor) ||
+                              archive_metric_row_bytes, &cursor) ||
+      !valid_slice2_region_v2(binding->archive_signatures, cursor,
+                              archive_signature_bytes, &cursor) ||
+      !valid_slice2_region_v2(binding->archive_hashes, cursor,
+                              archive_hash_bytes, &cursor) ||
       !valid_slice2_region_v2(binding->current_population_signatures, cursor,
-                              6'400, &cursor) ||
-      !valid_slice2_region_v2(binding->novelty_scores, cursor, 1'792,
+                              population_signature_bytes, &cursor) ||
+      !valid_slice2_region_v2(binding->novelty_scores, cursor,
+                              population_scalar_bytes,
                               &cursor) ||
-      !valid_slice2_region_v2(binding->exact_top_k_keys, cursor, 96'000,
+      !valid_slice2_region_v2(binding->exact_top_k_keys, cursor,
+                              exact_top_k_bytes,
                               &cursor) ||
-      !valid_slice2_region_v2(binding->admission_flags, cursor, 1'024,
+      !valid_slice2_region_v2(binding->admission_flags, cursor,
+                              admission_flag_bytes,
                               &cursor) ||
-      !valid_slice2_region_v2(binding->admission_offsets, cursor, 1'792,
+      !valid_slice2_region_v2(binding->admission_offsets, cursor,
+                              admission_offset_bytes,
                               &cursor) ||
       !valid_slice2_region_v2(binding->archive_control_and_seal, cursor, 256,
                               &cursor)) {

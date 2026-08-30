@@ -12,9 +12,20 @@ use crate::resident_search_v2::RawResidentGenerationGeneViewV2;
 use std::ffi::c_void;
 
 const SCORING_ARCHIVE_ALIGNMENT_BYTES_V2: u64 = 256;
-const FITNESS_SCORE_BYTES_V2: u64 = 1_792;
-const DECISION_KEY_BYTES_V2: u64 = 1_792;
-const REPLACEMENT_SUBTOTAL_BYTES_V2: u64 = 23_707_648;
+const GENE_SCALAR_BYTES_V2: u64 = 72;
+const TERM_INDEX_BYTES_V2: u64 = 8;
+const TERM_WEIGHT_BYTES_V2: u64 = 8;
+const METRIC_ROW_BYTES_V2: u64 = 104;
+const SIGNATURE_WORD_BYTES_V2: u64 = 8;
+const HASH_BYTES_V2: u64 = 8;
+const SCORE_BYTES_V2: u64 = 8;
+const EXACT_NEIGHBOR_KEY_BYTES_V2: u64 = 32;
+const ADMISSION_FLAG_BYTES_V2: u64 = 4;
+const ADMISSION_OFFSET_BYTES_V2: u64 = 8;
+const SIGNATURE_WORD_COUNT_V2: u64 = 4;
+const NOVELTY_NEIGHBOR_COUNT_V2: u64 = 15;
+const MAX_TERMS_PER_GENE_V2: u64 = 16;
+const ARCHIVE_CONTROL_AND_SEAL_BYTES_V2: u64 = 256;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,9 +431,154 @@ fn append_region_v2(
     Ok(RegionV2::new(offset_bytes, size_bytes))
 }
 
+fn checked_aligned_product_v2(
+    region: ScoringArchiveArenaRegionV2,
+    factors: &[u64],
+) -> Result<u64, ScoringArchiveArenaLayoutErrorV2> {
+    let logical_bytes = factors
+        .iter()
+        .copied()
+        .try_fold(1_u64, |value, factor| value.checked_mul(factor));
+    logical_bytes
+        .and_then(|bytes| bytes.checked_add(SCORING_ARCHIVE_ALIGNMENT_BYTES_V2 - 1))
+        .map(|bytes| bytes & !(SCORING_ARCHIVE_ALIGNMENT_BYTES_V2 - 1))
+        .ok_or(ScoringArchiveArenaLayoutErrorV2::ArithmeticOverflow { region })
+}
+
+pub(super) fn checked_expected_slice2_layout_v2(
+    population_count: u64,
+    archive_capacity: u64,
+) -> Result<super::ResidentSearchSlice2AlignedLayoutV2, ScoringArchiveArenaLayoutErrorV2> {
+    let archive_gene_scalars = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::ArchiveGeneScalars,
+        &[archive_capacity, GENE_SCALAR_BYTES_V2],
+    )?;
+    let archive_term_indices = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::ArchiveTermIndices,
+        &[archive_capacity, MAX_TERMS_PER_GENE_V2, TERM_INDEX_BYTES_V2],
+    )?;
+    let archive_term_weights = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::ArchiveTermWeights,
+        &[
+            archive_capacity,
+            MAX_TERMS_PER_GENE_V2,
+            TERM_WEIGHT_BYTES_V2,
+        ],
+    )?;
+    let archive_metric_rows = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::ArchiveMetricRows,
+        &[archive_capacity, METRIC_ROW_BYTES_V2],
+    )?;
+    let archive_signatures = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::ArchiveSignatures,
+        &[
+            archive_capacity,
+            SIGNATURE_WORD_COUNT_V2,
+            SIGNATURE_WORD_BYTES_V2,
+        ],
+    )?;
+    let archive_hashes = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::ArchiveHashes,
+        &[archive_capacity, HASH_BYTES_V2],
+    )?;
+    let current_population_signatures = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::CurrentPopulationSignatures,
+        &[
+            population_count,
+            SIGNATURE_WORD_COUNT_V2,
+            SIGNATURE_WORD_BYTES_V2,
+        ],
+    )?;
+    let novelty_scores = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::NoveltyScores,
+        &[population_count, SCORE_BYTES_V2],
+    )?;
+    let exact_top_k_keys = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::ExactTopKKeys,
+        &[
+            population_count,
+            NOVELTY_NEIGHBOR_COUNT_V2,
+            EXACT_NEIGHBOR_KEY_BYTES_V2,
+        ],
+    )?;
+    let admission_flags = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::AdmissionFlags,
+        &[population_count, ADMISSION_FLAG_BYTES_V2],
+    )?;
+    let admission_offsets = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::AdmissionOffsets,
+        &[population_count, ADMISSION_OFFSET_BYTES_V2],
+    )?;
+    let archive_control_and_seal = ARCHIVE_CONTROL_AND_SEAL_BYTES_V2;
+    let regions = [
+        (
+            ScoringArchiveArenaRegionV2::ArchiveGeneScalars,
+            archive_gene_scalars,
+        ),
+        (
+            ScoringArchiveArenaRegionV2::ArchiveTermIndices,
+            archive_term_indices,
+        ),
+        (
+            ScoringArchiveArenaRegionV2::ArchiveTermWeights,
+            archive_term_weights,
+        ),
+        (
+            ScoringArchiveArenaRegionV2::ArchiveMetricRows,
+            archive_metric_rows,
+        ),
+        (
+            ScoringArchiveArenaRegionV2::ArchiveSignatures,
+            archive_signatures,
+        ),
+        (ScoringArchiveArenaRegionV2::ArchiveHashes, archive_hashes),
+        (
+            ScoringArchiveArenaRegionV2::CurrentPopulationSignatures,
+            current_population_signatures,
+        ),
+        (ScoringArchiveArenaRegionV2::NoveltyScores, novelty_scores),
+        (ScoringArchiveArenaRegionV2::ExactTopKKeys, exact_top_k_keys),
+        (ScoringArchiveArenaRegionV2::AdmissionFlags, admission_flags),
+        (
+            ScoringArchiveArenaRegionV2::AdmissionOffsets,
+            admission_offsets,
+        ),
+        (
+            ScoringArchiveArenaRegionV2::ArchiveControlAndSeal,
+            archive_control_and_seal,
+        ),
+    ];
+    let replacement_subtotal_bytes =
+        regions
+            .iter()
+            .try_fold(0_u64, |subtotal, (region, size_bytes)| {
+                subtotal
+                    .checked_add(*size_bytes)
+                    .ok_or(ScoringArchiveArenaLayoutErrorV2::ArithmeticOverflow { region: *region })
+            })?;
+
+    Ok(super::ResidentSearchSlice2AlignedLayoutV2 {
+        archive_gene_scalars,
+        archive_term_indices,
+        archive_term_weights,
+        archive_metric_rows,
+        archive_signatures,
+        archive_hashes,
+        current_population_signatures,
+        novelty_scores,
+        exact_top_k_keys,
+        admission_flags,
+        admission_offsets,
+        archive_control_and_seal,
+        replacement_subtotal_bytes,
+    })
+}
+
 pub(super) fn validate_scoring_archive_arena_layout_v2(
     allocation: ResidentSearchSlice2AsyncAllocationArgsV2,
     receipt: ResidentSearchSlice2ScoringArchiveReceiptV2,
+    population_count: u64,
+    archive_capacity: u64,
 ) -> Result<ResidentScoringArchiveArenaLayoutV2, ScoringArchiveArenaLayoutErrorV2> {
     if allocation.ordinal != 2 {
         return Err(
@@ -454,77 +610,86 @@ pub(super) fn validate_scoring_archive_arena_layout_v2(
         );
     }
 
+    let expected_fitness_score_bytes = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::FitnessScores,
+        &[population_count, SCORE_BYTES_V2],
+    )?;
+    let expected_decision_key_bytes = checked_aligned_product_v2(
+        ScoringArchiveArenaRegionV2::DecisionKeys,
+        &[population_count, SCORE_BYTES_V2],
+    )?;
     require_region_size_v2(
         ScoringArchiveArenaRegionV2::FitnessScores,
         receipt.fitness_score_bytes,
-        FITNESS_SCORE_BYTES_V2,
+        expected_fitness_score_bytes,
     )?;
     require_region_size_v2(
         ScoringArchiveArenaRegionV2::DecisionKeys,
         receipt.decision_key_bytes,
-        DECISION_KEY_BYTES_V2,
+        expected_decision_key_bytes,
     )?;
 
+    let expected_layout = checked_expected_slice2_layout_v2(population_count, archive_capacity)?;
     let expected_regions = [
         (
             ScoringArchiveArenaRegionV2::ArchiveGeneScalars,
             receipt.layout.archive_gene_scalars,
-            3_600_128,
+            expected_layout.archive_gene_scalars,
         ),
         (
             ScoringArchiveArenaRegionV2::ArchiveTermIndices,
             receipt.layout.archive_term_indices,
-            6_400_000,
+            expected_layout.archive_term_indices,
         ),
         (
             ScoringArchiveArenaRegionV2::ArchiveTermWeights,
             receipt.layout.archive_term_weights,
-            6_400_000,
+            expected_layout.archive_term_weights,
         ),
         (
             ScoringArchiveArenaRegionV2::ArchiveMetricRows,
             receipt.layout.archive_metric_rows,
-            5_200_128,
+            expected_layout.archive_metric_rows,
         ),
         (
             ScoringArchiveArenaRegionV2::ArchiveSignatures,
             receipt.layout.archive_signatures,
-            1_600_000,
+            expected_layout.archive_signatures,
         ),
         (
             ScoringArchiveArenaRegionV2::ArchiveHashes,
             receipt.layout.archive_hashes,
-            400_128,
+            expected_layout.archive_hashes,
         ),
         (
             ScoringArchiveArenaRegionV2::CurrentPopulationSignatures,
             receipt.layout.current_population_signatures,
-            6_400,
+            expected_layout.current_population_signatures,
         ),
         (
             ScoringArchiveArenaRegionV2::NoveltyScores,
             receipt.layout.novelty_scores,
-            1_792,
+            expected_layout.novelty_scores,
         ),
         (
             ScoringArchiveArenaRegionV2::ExactTopKKeys,
             receipt.layout.exact_top_k_keys,
-            96_000,
+            expected_layout.exact_top_k_keys,
         ),
         (
             ScoringArchiveArenaRegionV2::AdmissionFlags,
             receipt.layout.admission_flags,
-            1_024,
+            expected_layout.admission_flags,
         ),
         (
             ScoringArchiveArenaRegionV2::AdmissionOffsets,
             receipt.layout.admission_offsets,
-            1_792,
+            expected_layout.admission_offsets,
         ),
         (
             ScoringArchiveArenaRegionV2::ArchiveControlAndSeal,
             receipt.layout.archive_control_and_seal,
-            256,
+            expected_layout.archive_control_and_seal,
         ),
     ];
     for (region, observed, expected) in expected_regions {
@@ -539,10 +704,10 @@ pub(super) fn validate_scoring_archive_arena_layout_v2(
                     .checked_add(*observed)
                     .ok_or(ScoringArchiveArenaLayoutErrorV2::ArithmeticOverflow { region: *region })
             })?;
-    if replacement_subtotal_bytes != REPLACEMENT_SUBTOTAL_BYTES_V2 {
+    if replacement_subtotal_bytes != expected_layout.replacement_subtotal_bytes {
         return Err(
             ScoringArchiveArenaLayoutErrorV2::ReplacementSubtotalMismatch {
-                expected: REPLACEMENT_SUBTOTAL_BYTES_V2,
+                expected: expected_layout.replacement_subtotal_bytes,
                 observed: replacement_subtotal_bytes,
             },
         );
@@ -1007,8 +1172,8 @@ mod tests {
     fn host_fixture_layout_has_every_exact_offset_and_end() {
         let receipt = valid_receipt(HOST_FIXTURE_CUB_BYTES);
         let allocation = valid_allocation(receipt.total_device_bytes);
-        let authority =
-            validate_scoring_archive_arena_layout_v2(allocation, receipt).expect("valid layout");
+        let authority = validate_scoring_archive_arena_layout_v2(allocation, receipt, 200, 50_000)
+            .expect("valid layout");
 
         assert_eq!(authority.fitness_scores, RegionV2::new(0, 1_792));
         assert_eq!(authority.decision_keys, RegionV2::new(1_792, 1_792));
@@ -1059,11 +1224,45 @@ mod tests {
     }
 
     #[test]
+    fn runtime_population_and_archive_extents_drive_the_checked_layout() {
+        let receipt = ResidentSearchSlice2ScoringArchiveReceiptV2 {
+            fitness_score_bytes: 3_328,
+            decision_key_bytes: 3_328,
+            cub_scratch_bytes: HOST_FIXTURE_CUB_BYTES,
+            layout: ResidentSearchSlice2AlignedLayoutV2 {
+                archive_gene_scalars: 72_192,
+                archive_term_indices: 128_000,
+                archive_term_weights: 128_000,
+                archive_metric_rows: 104_192,
+                archive_signatures: 32_000,
+                archive_hashes: 8_192,
+                current_population_signatures: 12_800,
+                novelty_scores: 3_328,
+                exact_top_k_keys: 192_000,
+                admission_flags: 1_792,
+                admission_offsets: 3_328,
+                archive_control_and_seal: 256,
+                replacement_subtotal_bytes: 686_080,
+            },
+            total_device_bytes: 758_272,
+        };
+        let allocation = valid_allocation(receipt.total_device_bytes);
+
+        let authority = validate_scoring_archive_arena_layout_v2(allocation, receipt, 400, 1_000)
+            .expect("runtime shape must be admitted");
+
+        assert_eq!(authority.fitness_scores.size_bytes, 3_328);
+        assert_eq!(authority.archive_gene_scalars.size_bytes, 72_192);
+        assert_eq!(authority.replacement_subtotal_bytes, 686_080);
+        assert_eq!(authority.total_device_bytes, 758_272);
+    }
+
+    #[test]
     fn runtime_cub_size_moves_following_offsets_with_checked_nonoverlap() {
         let receipt = valid_receipt(131_072);
         let allocation = valid_allocation(receipt.total_device_bytes);
-        let authority =
-            validate_scoring_archive_arena_layout_v2(allocation, receipt).expect("valid layout");
+        let authority = validate_scoring_archive_arena_layout_v2(allocation, receipt, 200, 50_000)
+            .expect("valid layout");
         let regions = authority.regions_v2();
 
         assert_eq!(authority.archive_gene_scalars.offset_bytes, 134_656);
@@ -1086,7 +1285,7 @@ mod tests {
         field_drift.total_device_bytes -= SCORING_ARCHIVE_ALIGNMENT_BYTES_V2;
         let field_allocation = valid_allocation(field_drift.total_device_bytes);
         assert_eq!(
-            validate_scoring_archive_arena_layout_v2(field_allocation, field_drift),
+            validate_scoring_archive_arena_layout_v2(field_allocation, field_drift, 200, 50_000),
             Err(ScoringArchiveArenaLayoutErrorV2::RegionSizeMismatch {
                 region: ScoringArchiveArenaRegionV2::ArchiveHashes,
                 expected: 400_128,
@@ -1098,7 +1297,7 @@ mod tests {
         total_drift.total_device_bytes += SCORING_ARCHIVE_ALIGNMENT_BYTES_V2;
         let total_allocation = valid_allocation(total_drift.total_device_bytes);
         assert_eq!(
-            validate_scoring_archive_arena_layout_v2(total_allocation, total_drift),
+            validate_scoring_archive_arena_layout_v2(total_allocation, total_drift, 200, 50_000),
             Err(ScoringArchiveArenaLayoutErrorV2::ReceiptTotalMismatch {
                 expected: HOST_FIXTURE_TOTAL_BYTES,
                 observed: HOST_FIXTURE_TOTAL_BYTES + SCORING_ARCHIVE_ALIGNMENT_BYTES_V2,
@@ -1110,7 +1309,7 @@ mod tests {
         overflow.total_device_bytes = 0;
         let overflow_allocation = valid_allocation(0);
         assert_eq!(
-            validate_scoring_archive_arena_layout_v2(overflow_allocation, overflow),
+            validate_scoring_archive_arena_layout_v2(overflow_allocation, overflow, 200, 50_000),
             Err(ScoringArchiveArenaLayoutErrorV2::ArithmeticOverflow {
                 region: ScoringArchiveArenaRegionV2::CubScratch,
             })
@@ -1124,35 +1323,40 @@ mod tests {
         let mut ordinal = valid_allocation(receipt.total_device_bytes);
         ordinal.ordinal = 1;
         assert_eq!(
-            validate_scoring_archive_arena_layout_v2(ordinal, receipt),
+            validate_scoring_archive_arena_layout_v2(ordinal, receipt, 200, 50_000),
             Err(ScoringArchiveArenaLayoutErrorV2::AllocationOrdinalMismatch { observed: 1 })
         );
 
         let mut category = valid_allocation(receipt.total_device_bytes);
         category.category = ResidentSearchSlice2AllocationCategoryV2::GenerationArena;
         assert_eq!(
-            validate_scoring_archive_arena_layout_v2(category, receipt),
+            validate_scoring_archive_arena_layout_v2(category, receipt, 200, 50_000),
             Err(ScoringArchiveArenaLayoutErrorV2::AllocationCategoryMismatch)
         );
 
         let mut alignment = valid_allocation(receipt.total_device_bytes);
         alignment.alignment_bytes = 128;
         assert_eq!(
-            validate_scoring_archive_arena_layout_v2(alignment, receipt),
+            validate_scoring_archive_arena_layout_v2(alignment, receipt, 200, 50_000),
             Err(ScoringArchiveArenaLayoutErrorV2::AllocationAlignmentMismatch { observed: 128 })
         );
 
         let mut flags = valid_allocation(receipt.total_device_bytes);
         flags.flags = 1;
         assert_eq!(
-            validate_scoring_archive_arena_layout_v2(flags, receipt),
+            validate_scoring_archive_arena_layout_v2(flags, receipt, 200, 50_000),
             Err(ScoringArchiveArenaLayoutErrorV2::AllocationFlagsMismatch { observed: 1 })
         );
 
         let unaligned_receipt = valid_receipt(HOST_FIXTURE_CUB_BYTES + 1);
         let unaligned_allocation = valid_allocation(unaligned_receipt.total_device_bytes);
         assert_eq!(
-            validate_scoring_archive_arena_layout_v2(unaligned_allocation, unaligned_receipt),
+            validate_scoring_archive_arena_layout_v2(
+                unaligned_allocation,
+                unaligned_receipt,
+                200,
+                50_000,
+            ),
             Err(
                 ScoringArchiveArenaLayoutErrorV2::CubScratchAlignmentMismatch {
                     observed: HOST_FIXTURE_CUB_BYTES + 1,

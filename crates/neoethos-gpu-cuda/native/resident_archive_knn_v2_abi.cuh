@@ -12,8 +12,9 @@ namespace neoethos::resident_archive_knn_v2 {
 
 constexpr std::uint32_t NEO_RESIDENT_ARCHIVE_KNN_ABI_V2 = 2;
 constexpr std::uint32_t NEO_RESIDENT_ARCHIVE_KNN_ARENA_REGION_COUNT_V2 = 15;
-constexpr std::uint64_t NEO_RESIDENT_ARCHIVE_KNN_POPULATION_COUNT_V2 = 200;
-constexpr std::uint64_t NEO_RESIDENT_ARCHIVE_KNN_CAPACITY_V2 = 50'000;
+constexpr std::uint64_t NEO_RESIDENT_ARCHIVE_KNN_MAX_POPULATION_COUNT_V2 =
+    2'147'483'647;
+constexpr std::uint64_t NEO_RESIDENT_ARCHIVE_KNN_MAX_CAPACITY_V2 = 65'535;
 constexpr std::uint32_t NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 = 4;
 constexpr std::uint32_t NEO_RESIDENT_ARCHIVE_KNN_K_V2 = 15;
 constexpr std::uint32_t NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 = 16;

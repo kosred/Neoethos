@@ -3,18 +3,18 @@ pub(crate) mod resident_archive_knn_v2_native;
 
 use self::resident_archive_knn_v2_native::{
     RawResidentArchiveKnnBindV2, ResidentScoringArchiveArenaLayoutV2,
-    ScoringArchiveArenaLayoutErrorV2, validate_scoring_archive_arena_layout_v2,
+    ScoringArchiveArenaLayoutErrorV2, checked_expected_slice2_layout_v2,
+    validate_scoring_archive_arena_layout_v2,
 };
 
-const SLICE2_POPULATION_COUNT_V2: u64 = 200;
-const SLICE2_ARCHIVE_CAPACITY_V2: u64 = 50_000;
 const SLICE2_SIGNATURE_WORD_COUNT_V2: u32 = 4;
 const SLICE2_NOVELTY_NEIGHBOR_COUNT_V2: u32 = 15;
 const SLICE2_MAX_TERMS_PER_GENE_V2: u32 = 16;
+const SLICE2_MAX_POPULATION_COUNT_V2: u64 = i32::MAX as u64;
+const SLICE2_MAX_ARCHIVE_CAPACITY_V2: u64 = u16::MAX as u64;
 const SLICE2_TERMINAL_HOST_RECEIPT_BYTES_V2: u64 = 104;
 const SLICE2_TERMINAL_HOST_ALIGNMENT_BYTES_V2: u64 = 8;
 const SLICE2_TERMINAL_HOST_FLAGS_V2: u32 = 0x01;
-const SLICE2_ARCHIVE_REPLACEMENT_SUBTOTAL_BYTES_V2: u64 = 23_707_648;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResidentSearchSlice2AlignedFieldV2 {
@@ -378,8 +378,12 @@ pub(crate) struct ResidentSearchSlice2NativeBindAuthorityV2 {
 }
 
 impl ResidentSearchSlice2NativeBindAuthorityV2 {
-    pub(crate) const fn raw_v2(&self) -> &RawResidentArchiveKnnBindV2 {
-        &self.raw
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn with_raw_v2<R>(
+        &self,
+        use_raw: impl FnOnce(&RawResidentArchiveKnnBindV2) -> R,
+    ) -> R {
+        use_raw(&self.raw)
     }
 }
 
@@ -417,7 +421,7 @@ impl ResidentSearchSlice2ValidatedRuntimeAuthorityV2 {
 #[cfg(all(test, feature = "resident-search-slice2-host-contract"))]
 impl ResidentSearchSlice2NativeBindAuthorityV2 {
     fn test_raw_v2(&self) -> &RawResidentArchiveKnnBindV2 {
-        self.raw_v2()
+        &self.raw
     }
 
     fn test_observed_reserve_v2(&self) -> &ResidentSearchSlice2ObservedReserveSetV2 {
@@ -551,14 +555,6 @@ pub(crate) fn validate_and_seal_slice2_combined_v2(
     if request.archive_arena_bytes == 0 {
         return Err(ResidentSearchSlice2AdmissionErrorV2::ZeroArchiveArenaBytes);
     }
-    if request.archive_arena_bytes != SLICE2_ARCHIVE_REPLACEMENT_SUBTOTAL_BYTES_V2 {
-        return Err(
-            ResidentSearchSlice2AdmissionErrorV2::ArchiveArenaBytesMismatch {
-                expected_bytes: SLICE2_ARCHIVE_REPLACEMENT_SUBTOTAL_BYTES_V2,
-                observed_bytes: request.archive_arena_bytes,
-            },
-        );
-    }
     if request.terminal_host_receipt_bytes != SLICE2_TERMINAL_HOST_RECEIPT_BYTES_V2 {
         return Err(
             ResidentSearchSlice2AdmissionErrorV2::TerminalHostReceiptBytesMismatch {
@@ -584,17 +580,49 @@ pub(crate) fn validate_and_seal_slice2_combined_v2(
         );
     }
 
-    for (axis, expected, observed) in [
+    for (axis, observed, maximum) in [
         (
             ResidentSearchSlice2ShapeAxisV2::PopulationCount,
-            SLICE2_POPULATION_COUNT_V2,
             request.population_count,
+            SLICE2_MAX_POPULATION_COUNT_V2,
         ),
         (
             ResidentSearchSlice2ShapeAxisV2::ArchiveCapacity,
-            SLICE2_ARCHIVE_CAPACITY_V2,
             request.archive_capacity,
+            SLICE2_MAX_ARCHIVE_CAPACITY_V2,
         ),
+    ] {
+        if observed == 0 {
+            return Err(ResidentSearchSlice2AdmissionErrorV2::ShapeMismatch {
+                axis,
+                expected: 1,
+                observed,
+            });
+        }
+        if observed > maximum {
+            return Err(ResidentSearchSlice2AdmissionErrorV2::ShapeMismatch {
+                axis,
+                expected: maximum,
+                observed,
+            });
+        }
+    }
+    if request.population_count <= u64::from(SLICE2_NOVELTY_NEIGHBOR_COUNT_V2) {
+        return Err(ResidentSearchSlice2AdmissionErrorV2::ShapeMismatch {
+            axis: ResidentSearchSlice2ShapeAxisV2::PopulationCount,
+            expected: u64::from(SLICE2_NOVELTY_NEIGHBOR_COUNT_V2) + 1,
+            observed: request.population_count,
+        });
+    }
+    if request.archive_capacity < request.population_count {
+        return Err(ResidentSearchSlice2AdmissionErrorV2::ShapeMismatch {
+            axis: ResidentSearchSlice2ShapeAxisV2::ArchiveCapacity,
+            expected: request.population_count,
+            observed: request.archive_capacity,
+        });
+    }
+
+    for (axis, expected, observed) in [
         (
             ResidentSearchSlice2ShapeAxisV2::SignatureWordCount,
             u64::from(SLICE2_SIGNATURE_WORD_COUNT_V2),
@@ -620,71 +648,137 @@ pub(crate) fn validate_and_seal_slice2_combined_v2(
         }
     }
 
+    let dynamic_layout =
+        checked_expected_slice2_layout_v2(request.population_count, request.archive_capacity)
+            .map_err(ResidentSearchSlice2AdmissionErrorV2::ScoringArchiveLayout)?;
+    if request.archive_arena_bytes != dynamic_layout.replacement_subtotal_bytes {
+        return Err(
+            ResidentSearchSlice2AdmissionErrorV2::ArchiveArenaBytesMismatch {
+                expected_bytes: dynamic_layout.replacement_subtotal_bytes,
+                observed_bytes: request.archive_arena_bytes,
+            },
+        );
+    }
+
     let expected_layout = &request.expected_slice2_layout;
     let observed_layout = &request.scoring_archive_receipt.layout;
+    let expected_replacement_subtotal = checked_receipt_sum_v2(
+        &[
+            expected_layout.archive_gene_scalars,
+            expected_layout.archive_term_indices,
+            expected_layout.archive_term_weights,
+            expected_layout.archive_metric_rows,
+            expected_layout.archive_signatures,
+            expected_layout.archive_hashes,
+            expected_layout.current_population_signatures,
+            expected_layout.novelty_scores,
+            expected_layout.exact_top_k_keys,
+            expected_layout.admission_flags,
+            expected_layout.admission_offsets,
+            expected_layout.archive_control_and_seal,
+        ],
+        ResidentSearchSlice2ReceiptArithmeticV2::ReplacementSubtotalAdd,
+    )?;
+    if expected_layout.replacement_subtotal_bytes != expected_replacement_subtotal {
+        return Err(ResidentSearchSlice2AdmissionErrorV2::ReceiptTotalMismatch {
+            axis: ResidentSearchSlice2ReceiptTotalAxisV2::ReplacementSubtotal,
+            expected_total_bytes: expected_replacement_subtotal,
+            observed_total_bytes: expected_layout.replacement_subtotal_bytes,
+        });
+    }
+    if expected_layout.replacement_subtotal_bytes != dynamic_layout.replacement_subtotal_bytes {
+        return Err(ResidentSearchSlice2AdmissionErrorV2::ReceiptTotalMismatch {
+            axis: ResidentSearchSlice2ReceiptTotalAxisV2::ReplacementSubtotal,
+            expected_total_bytes: dynamic_layout.replacement_subtotal_bytes,
+            observed_total_bytes: expected_layout.replacement_subtotal_bytes,
+        });
+    }
     let aligned_fields = [
         (
             ResidentSearchSlice2AlignedFieldV2::ArchiveGeneScalars,
+            dynamic_layout.archive_gene_scalars,
             expected_layout.archive_gene_scalars,
             observed_layout.archive_gene_scalars,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::ArchiveTermIndices,
+            dynamic_layout.archive_term_indices,
             expected_layout.archive_term_indices,
             observed_layout.archive_term_indices,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::ArchiveTermWeights,
+            dynamic_layout.archive_term_weights,
             expected_layout.archive_term_weights,
             observed_layout.archive_term_weights,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::ArchiveMetricRows,
+            dynamic_layout.archive_metric_rows,
             expected_layout.archive_metric_rows,
             observed_layout.archive_metric_rows,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::ArchiveSignatures,
+            dynamic_layout.archive_signatures,
             expected_layout.archive_signatures,
             observed_layout.archive_signatures,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::ArchiveHashes,
+            dynamic_layout.archive_hashes,
             expected_layout.archive_hashes,
             observed_layout.archive_hashes,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::CurrentPopulationSignatures,
+            dynamic_layout.current_population_signatures,
             expected_layout.current_population_signatures,
             observed_layout.current_population_signatures,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::NoveltyScores,
+            dynamic_layout.novelty_scores,
             expected_layout.novelty_scores,
             observed_layout.novelty_scores,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::ExactTopKKeys,
+            dynamic_layout.exact_top_k_keys,
             expected_layout.exact_top_k_keys,
             observed_layout.exact_top_k_keys,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::AdmissionFlags,
+            dynamic_layout.admission_flags,
             expected_layout.admission_flags,
             observed_layout.admission_flags,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::AdmissionOffsets,
+            dynamic_layout.admission_offsets,
             expected_layout.admission_offsets,
             observed_layout.admission_offsets,
         ),
         (
             ResidentSearchSlice2AlignedFieldV2::ArchiveControlAndSeal,
+            dynamic_layout.archive_control_and_seal,
             expected_layout.archive_control_and_seal,
             observed_layout.archive_control_and_seal,
         ),
     ];
-    for (field, expected_aligned_bytes, observed_aligned_bytes) in aligned_fields {
+    for (field, dynamic_aligned_bytes, expected_aligned_bytes, observed_aligned_bytes) in
+        aligned_fields
+    {
+        if expected_aligned_bytes != dynamic_aligned_bytes {
+            return Err(
+                ResidentSearchSlice2AdmissionErrorV2::AlignedLayoutFieldMismatch {
+                    field,
+                    expected_aligned_bytes: dynamic_aligned_bytes,
+                    observed_aligned_bytes: expected_aligned_bytes,
+                },
+            );
+        }
         if observed_aligned_bytes != expected_aligned_bytes {
             return Err(
                 ResidentSearchSlice2AdmissionErrorV2::AlignedLayoutFieldMismatch {
@@ -961,9 +1055,13 @@ pub(crate) fn validate_and_seal_slice2_combined_v2(
         stream_identity: calibration.search_stream_identity,
         pool_identity: calibration.active_pool_identity,
     };
-    let scoring_archive_layout =
-        validate_scoring_archive_arena_layout_v2(scoring_archive_arena, *scoring)
-            .map_err(ResidentSearchSlice2AdmissionErrorV2::ScoringArchiveLayout)?;
+    let scoring_archive_layout = validate_scoring_archive_arena_layout_v2(
+        scoring_archive_arena,
+        *scoring,
+        request.population_count,
+        request.archive_capacity,
+    )
+    .map_err(ResidentSearchSlice2AdmissionErrorV2::ScoringArchiveLayout)?;
 
     Ok(ResidentSearchSlice2ValidatedAdmissionV2 {
         terminal_host_receipt,

@@ -1346,22 +1346,12 @@ fn slice2_combined_admission_rejects_missing_or_zero_archive_arena_before_alloca
     }
 
     for axis in [
-        ResidentSearchSlice2ShapeAxisV2::PopulationCount,
-        ResidentSearchSlice2ShapeAxisV2::ArchiveCapacity,
         ResidentSearchSlice2ShapeAxisV2::SignatureWordCount,
         ResidentSearchSlice2ShapeAxisV2::NoveltyNeighborCount,
         ResidentSearchSlice2ShapeAxisV2::MaxTermsPerGene,
     ] {
         let mut request = valid_request();
         let (expected, observed) = match axis {
-            ResidentSearchSlice2ShapeAxisV2::PopulationCount => {
-                request.population_count += 1;
-                (POPULATION_COUNT, request.population_count)
-            }
-            ResidentSearchSlice2ShapeAxisV2::ArchiveCapacity => {
-                request.archive_capacity += 1;
-                (ARCHIVE_CAPACITY, request.archive_capacity)
-            }
             ResidentSearchSlice2ShapeAxisV2::SignatureWordCount => {
                 request.signature_word_count += 1;
                 (
@@ -1383,6 +1373,8 @@ fn slice2_combined_admission_rejects_missing_or_zero_archive_arena_before_alloca
                     u64::from(request.max_terms_per_gene),
                 )
             }
+            ResidentSearchSlice2ShapeAxisV2::PopulationCount
+            | ResidentSearchSlice2ShapeAxisV2::ArchiveCapacity => unreachable!(),
         };
         let mut recorder = ResidentSearchSlice2AllocationRecorderV2::default();
         let actual = admit_with_pristine_seal(request, &mut recorder);

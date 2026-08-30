@@ -761,7 +761,7 @@ impl Default for DiscoveryConfig {
             // and not two.
             kill_zones_enabled: true,
             population: 1000,
-            population_auto: false,
+            population_auto: true,
             generations: 10,
             max_indicators: 5,
             candidate_count: 5000,

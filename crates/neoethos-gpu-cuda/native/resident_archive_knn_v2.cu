@@ -120,6 +120,33 @@ bool checked_add_v2(std::uint64_t left, std::uint64_t right,
   return true;
 }
 
+bool checked_mul_v2(std::uint64_t left, std::uint64_t right,
+                    std::uint64_t* result) {
+  if (result == nullptr ||
+      (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left)) {
+    return false;
+  }
+  *result = left * right;
+  return true;
+}
+
+bool checked_aligned_region_size_v2(std::uint64_t item_count,
+                                    std::uint64_t elements_per_item,
+                                    std::uint64_t element_size,
+                                    std::uint64_t* result) {
+  std::uint64_t element_count = 0;
+  std::uint64_t raw_bytes = 0;
+  if (item_count == 0 || elements_per_item == 0 || element_size == 0 ||
+      !checked_mul_v2(item_count, elements_per_item, &element_count) ||
+      !checked_mul_v2(element_count, element_size, &raw_bytes)) {
+    return false;
+  }
+  const std::uint64_t remainder = raw_bytes % kAlignmentV2;
+  const std::uint64_t padding =
+      remainder == 0 ? 0 : kAlignmentV2 - remainder;
+  return checked_add_v2(raw_bytes, padding, result);
+}
+
 bool nonzero_uuid_v2(const std::uint8_t uuid[16]) {
   std::uint8_t aggregate = 0;
   for (std::size_t index = 0; index < 16; ++index) {
@@ -146,8 +173,11 @@ bool validate_region_v2(const NeoResidentArchiveKnnArenaRegionV2& region,
 bool validate_binding_layout_v2(const NeoResidentArchiveKnnBindV2& binding) {
   if (binding.abi_version != NEO_RESIDENT_ARCHIVE_KNN_ABI_V2 ||
       binding.reserved != 0 || binding.reserved_extents != 0 ||
-      binding.population_count != NEO_RESIDENT_ARCHIVE_KNN_POPULATION_COUNT_V2 ||
-      binding.archive_capacity != NEO_RESIDENT_ARCHIVE_KNN_CAPACITY_V2 ||
+      binding.population_count == 0 ||
+      binding.population_count >
+          NEO_RESIDENT_ARCHIVE_KNN_MAX_POPULATION_COUNT_V2 ||
+      binding.archive_capacity == 0 ||
+      binding.archive_capacity > NEO_RESIDENT_ARCHIVE_KNN_MAX_CAPACITY_V2 ||
       binding.signature_word_count !=
           NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 ||
       binding.novelty_neighbor_count != NEO_RESIDENT_ARCHIVE_KNN_K_V2 ||
@@ -164,26 +194,85 @@ bool validate_binding_layout_v2(const NeoResidentArchiveKnnBindV2& binding) {
     return false;
   }
 
+  std::uint64_t population_scalar_bytes = 0;
+  std::uint64_t archive_gene_scalar_bytes = 0;
+  std::uint64_t archive_term_index_bytes = 0;
+  std::uint64_t archive_term_weight_bytes = 0;
+  std::uint64_t archive_metric_row_bytes = 0;
+  std::uint64_t archive_signature_bytes = 0;
+  std::uint64_t archive_hash_bytes = 0;
+  std::uint64_t population_signature_bytes = 0;
+  std::uint64_t exact_top_k_bytes = 0;
+  std::uint64_t admission_flag_bytes = 0;
+  std::uint64_t admission_offset_bytes = 0;
+  if (!checked_aligned_region_size_v2(binding.population_count, 1,
+                                      sizeof(double),
+                                      &population_scalar_bytes) ||
+      !checked_aligned_region_size_v2(binding.archive_capacity, 1,
+                                      sizeof(GeneScalarV2),
+                                      &archive_gene_scalar_bytes) ||
+      !checked_aligned_region_size_v2(
+          binding.archive_capacity, binding.max_terms_per_gene,
+          sizeof(std::uint64_t), &archive_term_index_bytes) ||
+      !checked_aligned_region_size_v2(
+          binding.archive_capacity, binding.max_terms_per_gene,
+          sizeof(double), &archive_term_weight_bytes) ||
+      !checked_aligned_region_size_v2(binding.archive_capacity, 1,
+                                      sizeof(MetricRowV2),
+                                      &archive_metric_row_bytes) ||
+      !checked_aligned_region_size_v2(
+          binding.archive_capacity, binding.signature_word_count,
+          sizeof(std::uint64_t), &archive_signature_bytes) ||
+      !checked_aligned_region_size_v2(binding.archive_capacity, 1,
+                                      sizeof(std::uint64_t),
+                                      &archive_hash_bytes) ||
+      !checked_aligned_region_size_v2(
+          binding.population_count, binding.signature_word_count,
+          sizeof(std::uint64_t), &population_signature_bytes) ||
+      !checked_aligned_region_size_v2(
+          binding.population_count, binding.novelty_neighbor_count,
+          sizeof(ExactNeighborKeyV2), &exact_top_k_bytes) ||
+      !checked_aligned_region_size_v2(binding.population_count, 1,
+                                      sizeof(std::uint32_t),
+                                      &admission_flag_bytes) ||
+      !checked_aligned_region_size_v2(binding.population_count, 1,
+                                      sizeof(std::uint64_t),
+                                      &admission_offset_bytes)) {
+    return false;
+  }
+
   std::uint64_t cursor = 0;
-  if (!validate_region_v2(binding.fitness_scores, 1792, &cursor) ||
-      !validate_region_v2(binding.decision_keys, 1792, &cursor) ||
+  if (!validate_region_v2(binding.fitness_scores, population_scalar_bytes,
+                          &cursor) ||
+      !validate_region_v2(binding.decision_keys, population_scalar_bytes,
+                          &cursor) ||
       binding.cub_scratch.offset_bytes != cursor ||
       binding.cub_scratch.size_bytes == 0 ||
       binding.cub_scratch.size_bytes % kAlignmentV2 != 0 ||
       !checked_add_v2(binding.cub_scratch.offset_bytes,
                       binding.cub_scratch.size_bytes, &cursor) ||
-      !validate_region_v2(binding.archive_gene_scalars, 3600128, &cursor) ||
-      !validate_region_v2(binding.archive_term_indices, 6400000, &cursor) ||
-      !validate_region_v2(binding.archive_term_weights, 6400000, &cursor) ||
-      !validate_region_v2(binding.archive_metric_rows, 5200128, &cursor) ||
-      !validate_region_v2(binding.archive_signatures, 1600000, &cursor) ||
-      !validate_region_v2(binding.archive_hashes, 400128, &cursor) ||
-      !validate_region_v2(binding.current_population_signatures, 6400,
+      !validate_region_v2(binding.archive_gene_scalars,
+                          archive_gene_scalar_bytes, &cursor) ||
+      !validate_region_v2(binding.archive_term_indices,
+                          archive_term_index_bytes, &cursor) ||
+      !validate_region_v2(binding.archive_term_weights,
+                          archive_term_weight_bytes, &cursor) ||
+      !validate_region_v2(binding.archive_metric_rows,
+                          archive_metric_row_bytes, &cursor) ||
+      !validate_region_v2(binding.archive_signatures, archive_signature_bytes,
                           &cursor) ||
-      !validate_region_v2(binding.novelty_scores, 1792, &cursor) ||
-      !validate_region_v2(binding.exact_top_k_keys, 96000, &cursor) ||
-      !validate_region_v2(binding.admission_flags, 1024, &cursor) ||
-      !validate_region_v2(binding.admission_offsets, 1792, &cursor) ||
+      !validate_region_v2(binding.archive_hashes, archive_hash_bytes,
+                          &cursor) ||
+      !validate_region_v2(binding.current_population_signatures,
+                          population_signature_bytes, &cursor) ||
+      !validate_region_v2(binding.novelty_scores, population_scalar_bytes,
+                          &cursor) ||
+      !validate_region_v2(binding.exact_top_k_keys, exact_top_k_bytes,
+                          &cursor) ||
+      !validate_region_v2(binding.admission_flags, admission_flag_bytes,
+                          &cursor) ||
+      !validate_region_v2(binding.admission_offsets, admission_offset_bytes,
+                          &cursor) ||
       !validate_region_v2(binding.archive_control_and_seal, 256, &cursor)) {
     return false;
   }
@@ -739,7 +828,8 @@ __global__ void stage_ranked_archive_tail_v2(
     const MetricRowV2* current_metrics,
     const std::uint64_t* current_signatures,
     const std::uint64_t* ranked_ordinals, std::uint32_t* admission_flags,
-    std::uint64_t* admission_offsets, GeneScalarV2* archive_scalars,
+    std::uint64_t* admission_offsets, double* fitness_scores_scratch,
+    GeneScalarV2* archive_scalars,
     std::uint64_t* archive_term_indices, double* archive_term_weights,
     MetricRowV2* archive_metrics, std::uint64_t* archive_signatures,
     std::uint64_t* archive_hashes, ArchiveControlV2* control,
@@ -764,9 +854,14 @@ __global__ void stage_ranked_archive_tail_v2(
     return;
   }
 
+  if (fitness_scores_scratch == nullptr) {
+    latch_device_fault_v2(control, kGeneShapeFaultV2);
+    return;
+  }
+  auto* staged_destinations =
+      reinterpret_cast<std::uint64_t*>(fitness_scores_scratch);
   std::uint64_t staged = 0;
   std::uint64_t collisions = 0;
-  std::uint64_t staged_destinations[NEO_RESIDENT_ARCHIVE_KNN_POPULATION_COUNT_V2];
   for (std::uint64_t candidate = 0;
        candidate < expected.logical_population_count; ++candidate) {
     staged_destinations[candidate] = ~std::uint64_t{0};
@@ -1449,6 +1544,7 @@ extern "C" std::int32_t enqueue_resident_archive_stage_from_rank_v2(
       owner->finite_rows.metric_rows_device,
       owner->current_population_signatures, owner->admission_offsets,
       owner->admission_flags, owner->admission_offsets,
+      owner->fitness_scores,
       owner->archive_gene_scalars, owner->archive_term_indices,
       owner->archive_term_weights, owner->archive_metric_rows,
       owner->archive_signatures, owner->archive_hashes, owner->control,

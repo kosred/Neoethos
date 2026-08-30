@@ -899,15 +899,15 @@ impl ResidentSearchSlice2NativeOwnerV3 {
         // SAFETY: the additive composite creator retained the exact bind before
         // either arena allocation. All pointers below belong to that same
         // admitted run and the stable gene view remains owned by `run`.
-        let status = unsafe {
+        let status = bind_authority.with_raw_v2(|binding| unsafe {
             bind_preallocated_resident_archive_knn_v2(
                 scoring.as_ptr().cast::<NativeResidentScoringNoveltyRunV1>(),
                 generation.as_ptr(),
                 &run.view,
-                bind_authority.raw_v2(),
+                binding,
                 &mut archive,
             )
-        };
+        });
         let Some(archive) = NonNull::new(archive) else {
             run.state = ResidentSearchStateV2::Poisoned;
             if let Some(scoring) = run.scoring.as_mut() {
@@ -1134,12 +1134,14 @@ impl ResidentSearchSlice2NativeOwnerV3 {
             .pending
             .as_deref()
             .expect("terminal owner retains pending receipt");
-        let binding = self
+        let terminal_valid = self
             .bind_authority
             .as_ref()
             .expect("Slice2 owner retains bind authority")
-            .raw_v2();
-        if !terminal.validates_committed_v2(pending, binding, committed.as_ref()) {
+            .with_raw_v2(|binding| {
+                terminal.validates_committed_v2(pending, binding, committed.as_ref())
+            });
+        if !terminal_valid {
             return Err(self.reject_v3("validate_resident_archive_terminal_v2", -6));
         }
         let run = self.run.as_mut().expect("Slice2 owner retains Search run");
@@ -2228,14 +2230,16 @@ impl PopulationSession {
         smc_gate_disabled: bool,
         bind_authority: ResidentSearchSlice2NativeBindAuthorityV2,
     ) -> Result<ResidentSearchSlice2NativeOwnerV3, ResidentSearchSlice2NativeErrorV3> {
-        let run = self.begin_resident_search_sealed_impl_v3(
-            plan,
-            smc_weights,
-            smc_gate_disabled,
-            ResidentScoringObjectiveV2::PropFirmV4,
-            0.0,
-            Some(bind_authority.raw_v2()),
-        )?;
+        let run = bind_authority.with_raw_v2(|binding| {
+            self.begin_resident_search_sealed_impl_v3(
+                plan,
+                smc_weights,
+                smc_gate_disabled,
+                ResidentScoringObjectiveV2::PropFirmV4,
+                0.0,
+                Some(binding),
+            )
+        })?;
         ResidentSearchSlice2NativeOwnerV3::bind_v3(run, bind_authority)
     }
 

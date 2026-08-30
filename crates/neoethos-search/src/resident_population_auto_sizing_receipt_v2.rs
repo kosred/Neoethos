@@ -22,7 +22,35 @@ use neoethos_gpu_cuda::{
 pub const RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V2: u16 = 2;
 const RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_HASH_DOMAIN_V2: &[u8] =
     b"neoethos.search.resident-population-auto-sizing-receipt.v2\0";
-const RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2: usize = 16_384;
+pub(crate) const RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2: usize = 16_384;
+
+fn checked_effective_hard_growth_cap_v2(
+    external_hard_population_cap: usize,
+) -> Result<usize, ResidentPopulationAutoSizingErrorV2> {
+    if external_hard_population_cap == 0 {
+        return Err(ResidentPopulationAutoSizingErrorV2::new(
+            ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
+            "external resident population hard cap must be non-zero",
+        ));
+    }
+    Ok(external_hard_population_cap.min(RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2))
+}
+
+fn checked_configured_population_against_external_hard_cap_v2(
+    configured_population: usize,
+    external_hard_population_cap: usize,
+) -> Result<(), ResidentPopulationAutoSizingErrorV2> {
+    checked_effective_hard_growth_cap_v2(external_hard_population_cap)?;
+    if configured_population > external_hard_population_cap {
+        return Err(ResidentPopulationAutoSizingErrorV2::new(
+            ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
+            format!(
+                "configured resident population {configured_population} exceeds external hard cap {external_hard_population_cap}"
+            ),
+        ));
+    }
+    Ok(())
+}
 const RESIDENT_SELECTION_STAGE1_ROLE_V2: &str = "selection_stage1";
 type InternalWorkspaceBytesV2 = (
     PopulationGeneStorePlanV1,
@@ -1411,6 +1439,27 @@ pub fn seal_resident_population_auto_sizing_receipt_v2(
     ),
     ResidentPopulationAutoSizingErrorV2,
 > {
+    seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
+        prepared,
+        native_facts,
+        request,
+        RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
+    )
+}
+
+fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
+    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
+    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
+    request: ResidentPopulationAutoSizingRequestV2,
+    external_hard_population_cap: usize,
+) -> Result<
+    (
+        ResidentPopulationAutoSizingReceiptV2,
+        SealedDataPopulationGpuWorkspacePlanV1,
+    ),
+    ResidentPopulationAutoSizingErrorV2,
+> {
+    let hard_growth_cap = checked_effective_hard_growth_cap_v2(external_hard_population_cap)?;
     let extent = prepared.workspace_extent();
     let parent_rows = usize::try_from(extent.row_count()).map_err(|_| {
         ResidentPopulationAutoSizingErrorV2::new(
@@ -1516,7 +1565,7 @@ pub fn seal_resident_population_auto_sizing_receipt_v2(
         request.population_auto,
         request.configured_population,
         effective_time_cap,
-        RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
+        hard_growth_cap,
         |candidate_count, scenario_count| {
             workspace_fit_for_extents_v2(
                 prepared,
@@ -1622,10 +1671,7 @@ pub fn seal_resident_population_auto_sizing_receipt_v2(
                 "effective time cap does not fit u64",
             )
         })?,
-        hard_growth_cap: checked_u64(
-            RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
-            "hard growth cap",
-        )?,
+        hard_growth_cap: checked_u64(hard_growth_cap, "hard growth cap")?,
         memory_one_launch_population_cap: checked_u64(
             resolution.memory_one_launch_population_cap,
             "memory one-launch cap",
@@ -1659,6 +1705,60 @@ pub fn seal_resident_population_auto_for_canonical_trendbar_research_v2(
     ),
     ResidentPopulationAutoSizingErrorV2,
 > {
+    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
+        prepared,
+        native_facts,
+        config,
+        financial_contract,
+        RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
+        false,
+    )
+}
+
+pub(crate) fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_v2(
+    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
+    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
+    config: &crate::DiscoveryConfig,
+    financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    external_hard_population_cap: usize,
+) -> Result<
+    (
+        ResidentPopulationAutoSizingReceiptV2,
+        SealedDataPopulationGpuWorkspacePlanV1,
+    ),
+    ResidentPopulationAutoSizingErrorV2,
+> {
+    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
+        prepared,
+        native_facts,
+        config,
+        financial_contract,
+        external_hard_population_cap,
+        true,
+    )
+}
+
+fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
+    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
+    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
+    config: &crate::DiscoveryConfig,
+    financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    external_hard_population_cap: usize,
+    enforce_configured_population_cap: bool,
+) -> Result<
+    (
+        ResidentPopulationAutoSizingReceiptV2,
+        SealedDataPopulationGpuWorkspacePlanV1,
+    ),
+    ResidentPopulationAutoSizingErrorV2,
+> {
+    checked_effective_hard_growth_cap_v2(external_hard_population_cap)?;
+    if enforce_configured_population_cap {
+        checked_configured_population_against_external_hard_cap_v2(
+            config.population,
+            external_hard_population_cap,
+        )?;
+    }
     let resident_parent_rows =
         usize::try_from(prepared.workspace_extent().row_count()).map_err(|_| {
             ResidentPopulationAutoSizingErrorV2::new(
@@ -1671,7 +1771,12 @@ pub fn seal_resident_population_auto_for_canonical_trendbar_research_v2(
         resident_parent_rows,
         financial_contract,
     )?;
-    seal_resident_population_auto_sizing_receipt_v2(prepared, native_facts, request)
+    seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
+        prepared,
+        native_facts,
+        request,
+        external_hard_population_cap,
+    )
 }
 
 #[cfg(test)]

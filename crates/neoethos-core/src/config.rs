@@ -868,10 +868,8 @@ pub struct ModelsConfig {
     /// the card's fits ceiling (never above 16 384, never below
     /// `prop_search_population`) and logs the resolved value. When no card
     /// ceiling is readable, the configured population is kept and a warning
-    /// says so. Default `false`: exactly today's behaviour, because whether
-    /// a bigger search finds better strategies (rather than more of the
-    /// same) is an experiment, not an assumption — see
-    /// `scripts/population-experiment.sh`.
+    /// says so. Default `true`: the card-sized result is sealed into the run
+    /// receipt, so every search records the exact population it evaluated.
     pub prop_search_population_auto: bool,
     pub prop_search_generations: usize,
     pub prop_search_max_hours: f64,
@@ -2467,7 +2465,7 @@ impl Default for ModelsConfig {
             evo_sigma: 0.25,
             prop_search_enabled: false,
             prop_search_population: 100,
-            prop_search_population_auto: false,
+            prop_search_population_auto: true,
             prop_search_generations: 50,
             prop_search_max_hours: 0.5, // 2026-06-05: sane default (was 8.0=absurd 8h/combo); config-overridable (VPS budget run uses 0.25)
             prop_search_max_rows: 0,
