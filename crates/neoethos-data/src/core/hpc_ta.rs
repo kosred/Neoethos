@@ -4,7 +4,7 @@ use crate::core::feature_budget::{VocabularyBudget, admit_indicators};
 use crate::core::features::{FeatureCellValidity, FeatureColumnF64};
 use crate::core::indicator_ledger::{
     DropReason, IndicatorLedger, expected_non_producing, has_finite_variation, output_ids_for,
-    planned_output_count, series_fingerprint,
+    planned_output_count, production_floor_affordance, series_fingerprint,
 };
 use crate::core::timestamps::validate_canonical_millisecond_timestamps;
 use rayon::prelude::*;
@@ -414,6 +414,28 @@ impl ClassicTaRunPlan {
 }
 
 impl ClassicTaAdmissionPlan {
+    /// Base columns admitted by RAM alone, before the versioned GPU
+    /// capability subset removes unsupported families. The budget log must
+    /// report this value; using the final resident width falsely attributes a
+    /// capability exclusion to memory pressure.
+    pub(crate) fn budget_admitted_base_columns(&self) -> anyhow::Result<usize> {
+        let budget_deferred_columns = self
+            .budget_deferred_indicator_ids
+            .iter()
+            .try_fold(0usize, |total, indicator_id| {
+                total.checked_add(planned_output_count(indicator_id))
+            })
+            .ok_or_else(|| anyhow::anyhow!("budget-deferred Classic column count overflowed"))?;
+        self.planned_base_columns
+            .checked_sub(budget_deferred_columns)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "budget-deferred Classic columns {budget_deferred_columns} exceed planned base columns {}",
+                    self.planned_base_columns
+                )
+            })
+    }
+
     pub(crate) fn execution_report(
         &self,
         historical_sweep_produced_columns: usize,
@@ -1184,7 +1206,7 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
     let base_budget = &admission.base_budget;
     let admitted = &admission.admitted_indicator_ids;
     let planned_columns = admission.planned_base_columns;
-    let base_admitted_plan = admission.admitted_base_columns;
+    let budget_admitted_base_columns = admission.budget_admitted_base_columns()?;
 
     // 3. Dispatch to every admitted indicator — PARALLEL across indicators.
     //    Each indicator is an independent pure function of the shared
@@ -1251,7 +1273,11 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
     // labels those defects as RAM deferrals. The indicator ledger below owns
     // production failures, while this line reports only the actual budget
     // decision.
-    base_budget.log("base-vocabulary", planned_columns, base_admitted_plan);
+    base_budget.log(
+        "base-vocabulary",
+        planned_columns,
+        budget_admitted_base_columns,
+    );
 
     // 3. Multi-period variants for the most critical indicators. Appended
     //    after the base columns to preserve the original ordering exactly.
@@ -1315,7 +1341,8 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
     //
     //     So the extension may never plan more columns than the vocabulary it
     //     extends. That is a ratio to a measured quantity rather than a
-    //     constant — it scales with the machine through `base_admitted_plan` —
+    //     constant — it scales with the machine through the frozen base
+    //     admission plan —
     //     and it is deliberately a stopgap: the real answer is not to
     //     materialise the extension at all but to stream it, which is
     //     `docs/streaming-parameter-search.md`.
@@ -1474,13 +1501,15 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
     //    truncation is already a WARN, and this floor is only about the second.
     //    See `IndicatorLedger::enforce_floor`.
     if n >= VOCABULARY_FLOOR_MIN_ROWS {
+        let (floor_afforded_ids, floor_afforded_columns) =
+            production_floor_affordance(&admission.admitted_indicator_ids);
         ledger.enforce_floor(
             "classic-ta",
             n,
             MIN_PRODUCING_INDICATOR_IDS,
             MIN_BASE_VOCABULARY_COLUMNS,
-            admitted.len(),
-            base_admitted_plan,
+            floor_afforded_ids,
+            floor_afforded_columns,
         )?;
     } else {
         tracing::info!(
@@ -3130,6 +3159,13 @@ mod streaming_advance_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vocabulary_floor_excludes_ids_with_no_production_output() {
+        assert_eq!(planned_output_count("mwdx"), 0);
+        assert!(expected_non_producing("ma").is_some());
+        assert_eq!(production_floor_affordance(&["rsi", "mwdx", "ma"]), (1, 1));
+    }
 
     fn semantic_pattern_columns(
         open: &[f64],

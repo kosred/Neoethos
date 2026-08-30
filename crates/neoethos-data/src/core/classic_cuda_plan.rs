@@ -15,7 +15,7 @@ use super::hpc_ta::{
 };
 use super::indicator_ledger::{
     DropReason, expected_non_producing, has_finite_variation, output_ids_for, planned_output_count,
-    series_fingerprint,
+    production_floor_affordance, series_fingerprint,
 };
 use anyhow::{Result, bail, ensure};
 use std::collections::HashSet;
@@ -17656,13 +17656,15 @@ pub(crate) fn execute_gpu_only_classic_plan(
 
     ledger.log_summary("classic-ta-gpu-only", plan.rows);
     if plan.rows >= VOCABULARY_FLOOR_MIN_ROWS {
+        let (floor_afforded_ids, floor_afforded_columns) =
+            production_floor_affordance(&admission.admitted_indicator_ids);
         ledger.enforce_floor(
             "classic-ta-gpu-only",
             plan.rows,
             MIN_PRODUCING_INDICATOR_IDS,
             MIN_BASE_VOCABULARY_COLUMNS,
-            admission.admitted_indicator_ids.len(),
-            admission.admitted_base_columns,
+            floor_afforded_ids,
+            floor_afforded_columns,
         )?;
     }
     let historical_sweep_produced_columns = plan

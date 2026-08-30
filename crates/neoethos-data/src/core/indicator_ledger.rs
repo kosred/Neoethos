@@ -343,6 +343,25 @@ pub fn planned_output_count(id: &str) -> usize {
     output_ids_for(id).len()
 }
 
+/// Exact base-vocabulary promise used to clamp the regression floor.
+///
+/// Admission deliberately retains zero-output static exclusions and named
+/// expected-failure probes so their receipts cannot silently disappear. They
+/// are not, however, features that execution can produce. Counting either as
+/// an affordable producer makes the floor demand output that the same static
+/// schema forbids. Return both distinct producing families and their planned
+/// columns from the same filter so CPU and CUDA cannot drift.
+pub(crate) fn production_floor_affordance(ids: &[&str]) -> (usize, usize) {
+    ids.iter()
+        .filter_map(|id| {
+            let columns = planned_output_count(id);
+            (columns > 0 && expected_non_producing(id).is_none()).then_some(columns)
+        })
+        .fold((0usize, 0usize), |(ids, columns), planned_columns| {
+            (ids + 1, columns + planned_columns)
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Drop reasons.
 // ---------------------------------------------------------------------------
@@ -736,7 +755,7 @@ impl IndicatorLedger {
     ) -> anyhow::Result<()> {
         let effective_ids = min_ids.min(afforded_ids);
         let effective_columns = min_columns.min(afforded_columns);
-        let budget_bound = effective_ids < min_ids || effective_columns < min_columns;
+        let admission_bound = effective_ids < min_ids || effective_columns < min_columns;
         if self.producing_ids() >= effective_ids && self.produced_columns() >= effective_columns {
             return Ok(());
         }
@@ -766,13 +785,14 @@ impl IndicatorLedger {
                 "no drops were recorded at all besides the budget's own, which is itself a defect"
                     .into()
             });
-        let sizing = if budget_bound {
+        let sizing = if admission_bound {
             format!(
-                " NOTE: the hardware vocabulary budget only admitted {afforded_ids} ids / \
-                 {afforded_columns} columns on this machine, so the floor was clamped from \
-                 {min_ids}/{min_columns} down to {effective_ids}/{effective_columns}. The pass \
-                 failed even THAT, so this is a dispatch regression and not a sizing problem — \
-                 see the feature_budget WARN line for the sizing."
+                " NOTE: the frozen admission contains {afforded_ids} floor-eligible ids / \
+                 {afforded_columns} columns after budget, static-output, and capability \
+                 exclusions, so the floor was clamped from {min_ids}/{min_columns} down to \
+                 {effective_ids}/{effective_columns}. The pass failed even THAT, so execution \
+                 produced less than its own admitted schema; consult the feature-budget and \
+                 indicator-ledger lines for the responsible exclusion class."
             )
         } else {
             String::new()
