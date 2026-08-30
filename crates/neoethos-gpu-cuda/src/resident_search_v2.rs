@@ -5,7 +5,7 @@
 //! `cuda-device-fixtures` constructor exists only to exercise ownership and the
 //! resident gene-view ABI on a real card; it cannot produce a promotable run.
 
-#[cfg(feature = "cuda-device-fixtures")]
+#[cfg(all(test, feature = "cuda-device-fixtures"))]
 use crate::population::ResidentPopulationMetricsV1;
 #[cfg(feature = "cuda-device-fixtures")]
 use crate::population::terminal_search_session_destroy_count_fixture_v2;
