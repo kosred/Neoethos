@@ -24,6 +24,204 @@ fn before(haystack: &str, left: &str, right: &str) {
     assert!(left_index < right_index, "`{left}` must precede `{right}`");
 }
 
+fn braced_item<'a>(source: &'a str, start: &str) -> &'a str {
+    let start_index = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing braced source boundary `{start}`"));
+    let open_offset = source[start_index..]
+        .find('{')
+        .unwrap_or_else(|| panic!("missing opening brace after `{start}`"));
+    let open_index = start_index + open_offset;
+    let mut depth = 0_u64;
+    for (offset, byte) in source.as_bytes()[open_index..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start_index..=open_index + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("missing closing brace after `{start}`")
+}
+
+fn function_signature<'a>(source: &'a str, start: &str) -> &'a str {
+    let start_index = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing function signature `{start}`"));
+    let end_offset = source[start_index..]
+        .find('{')
+        .unwrap_or_else(|| panic!("missing function body after `{start}`"));
+    &source[start_index..start_index + end_offset]
+}
+
+fn let_binding_for_call<'a>(source: &'a str, call_marker: &str) -> &'a str {
+    let call_index = source
+        .find(call_marker)
+        .unwrap_or_else(|| panic!("missing call `{call_marker}`"));
+    let let_index = source[..call_index]
+        .rfind("let ")
+        .unwrap_or_else(|| panic!("missing owning let binding for `{call_marker}`"));
+    let binding = source[let_index + 4..call_index].trim_start();
+    let binding = binding.strip_prefix("mut ").unwrap_or(binding);
+    let end = binding
+        .find(|character: char| character.is_whitespace() || character == ':' || character == '=')
+        .unwrap_or(binding.len());
+    &binding[..end]
+}
+
+fn parenthesized_call<'a>(source: &'a str, call_marker: &str) -> &'a str {
+    let start = source
+        .find(call_marker)
+        .unwrap_or_else(|| panic!("missing call `{call_marker}`"));
+    let open = start
+        + source[start..]
+            .find('(')
+            .unwrap_or_else(|| panic!("missing call opening parenthesis for `{call_marker}`"));
+    let mut depth = 0_u64;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("missing call closing parenthesis for `{call_marker}`")
+}
+
+fn require_by_value_type(signature: &str, type_name: &str, context: &str) {
+    let open = signature
+        .find('(')
+        .unwrap_or_else(|| panic!("{context} has no parameter list"));
+    let mut parenthesis_depth = 0_u64;
+    let close = signature.as_bytes()[open..]
+        .iter()
+        .enumerate()
+        .find_map(|(offset, byte)| match byte {
+            b'(' => {
+                parenthesis_depth += 1;
+                None
+            }
+            b')' => {
+                parenthesis_depth -= 1;
+                (parenthesis_depth == 0).then_some(open + offset)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{context} has an unclosed parameter list"));
+    let mut delimiter_depth = 0_i64;
+    let mut start = open + 1;
+    let mut exact_matches = 0_u64;
+    for end in (open + 1..=close).filter(|&index| {
+        if index == close {
+            return true;
+        }
+        match signature.as_bytes()[index] {
+            b'(' | b'[' | b'{' | b'<' => delimiter_depth += 1,
+            b')' | b']' | b'}' | b'>' => delimiter_depth -= 1,
+            b',' if delimiter_depth == 0 => return true,
+            _ => {}
+        }
+        false
+    }) {
+        let parameter = signature[start..end].trim();
+        start = end + 1;
+        let Some((pattern, parameter_type)) = parameter.split_once(':') else {
+            continue;
+        };
+        let exact_type: String = parameter_type
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        if exact_type == type_name {
+            assert!(
+                !pattern.split_whitespace().any(|token| token == "ref") && !pattern.contains('&'),
+                "{context} must move `{type_name}` through a plain binding"
+            );
+            exact_matches += 1;
+        }
+    }
+    assert_eq!(
+        exact_matches, 1,
+        "{context} must have exactly one parameter whose type is exactly `{type_name}`; references, wrappers and aliases are rejected"
+    );
+}
+
+fn exact_parameter_binding<'a>(signature: &'a str, type_name: &str) -> &'a str {
+    for (type_index, _) in signature.match_indices(type_name) {
+        let before_type = &signature[..type_index];
+        let Some(colon) = before_type.rfind(':') else {
+            continue;
+        };
+        if !before_type[colon + 1..].trim().is_empty() {
+            continue;
+        }
+        let after_type = &signature[type_index + type_name.len()..];
+        if !after_type
+            .find(|character| character == ',' || character == ')')
+            .is_some_and(|end| after_type[..end].trim().is_empty())
+        {
+            continue;
+        }
+        let pattern_start = before_type[..colon]
+            .rfind(|character| character == ',' || character == '(')
+            .map_or(0, |index| index + 1);
+        let pattern = before_type[pattern_start..colon].trim();
+        let pattern = pattern.strip_prefix("mut ").unwrap_or(pattern);
+        assert!(
+            !pattern.is_empty()
+                && pattern
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+            "typed parameter must use a plain binding"
+        );
+        return pattern;
+    }
+    panic!("missing exact parameter type `{type_name}`")
+}
+
+fn require_move_only_type(source: &str, type_marker: &str) {
+    let declaration = format!("struct {type_marker}");
+    let type_index = source
+        .find(&declaration)
+        .unwrap_or_else(|| panic!("missing move-only type `{type_marker}`"));
+    let prefix_start = source[..type_index]
+        .rfind("\n\n")
+        .map_or(0, |index| index + 2);
+    let attribute_prefix = &source[prefix_start..type_index];
+    let compact_attributes: String = attribute_prefix
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    for trait_name in ["Clone", "Copy"] {
+        let mut derives = compact_attributes.as_str();
+        while let Some((_, after_derive)) = derives.split_once("derive(") {
+            let (derive_list, rest) = after_derive
+                .split_once(')')
+                .unwrap_or_else(|| panic!("unclosed derive attribute for `{type_marker}`"));
+            assert!(
+                !derive_list
+                    .split(',')
+                    .any(|derived| derived.rsplit("::").next() == Some(trait_name)),
+                "{type_marker} must not derive {trait_name}"
+            );
+            derives = rest;
+        }
+        assert!(
+            !source.contains(&format!("impl {trait_name} for {type_marker}")),
+            "{type_marker} must not implement {trait_name}"
+        );
+    }
+}
+
 #[test]
 fn strict_phase_one_is_opaque_and_refuses_incomplete_producers_before_device_work() {
     let source = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
@@ -732,4 +930,193 @@ fn htf_runtime_receipt_survives_append_and_is_revalidated_at_import() {
             "missing sealed HTF evidence token `{token}`"
         );
     }
+}
+
+#[test]
+fn two_pass_continuation_seals_selection_before_any_final_store_allocation() {
+    let source = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
+
+    for token in [
+        "pub struct PreparedGpuOnlyFeatureTwoPassContinuationV2",
+        "pub struct ScoredGpuOnlyFeatureTwoPassContinuationV2",
+        "pub struct SealedResidentSelectedMapReceiptV2",
+        "pub fn begin_prepared_gpu_only_feature_two_pass_v2(",
+        "pub fn stream_score_batches_v2(",
+        "pub fn seal_selected_map_v2(",
+        "pub fn materialize_compact_selected_store_v2(",
+        "selected_column_count",
+        "selected_map_sha256",
+    ] {
+        assert!(
+            source.contains(token),
+            "missing two-pass compact-materialization contract `{token}`"
+        );
+    }
+
+    let begin_signature = function_signature(
+        &source,
+        "pub fn begin_prepared_gpu_only_feature_two_pass_v2(",
+    );
+    require_by_value_type(
+        begin_signature,
+        "PreparedGpuOnlyFeatureMaterializationV3",
+        "two-pass begin",
+    );
+    assert!(
+        begin_signature.contains("PreparedGpuOnlyFeatureTwoPassContinuationV2"),
+        "two-pass begin must return the prepared score-pass continuation"
+    );
+
+    let score_signature = function_signature(&source, "pub fn stream_score_batches_v2(");
+    require_by_value_type(
+        score_signature,
+        "PreparedGpuOnlyFeatureTwoPassContinuationV2",
+        "score pass",
+    );
+    assert!(
+        score_signature.contains("ScoredGpuOnlyFeatureTwoPassContinuationV2"),
+        "score pass must return the scored continuation"
+    );
+
+    let seal_signature = function_signature(&source, "pub fn seal_selected_map_v2(");
+    require_by_value_type(
+        seal_signature,
+        "ScoredGpuOnlyFeatureTwoPassContinuationV2",
+        "selected-map seal",
+    );
+    assert!(
+        seal_signature.contains("SealedResidentSelectedMapReceiptV2"),
+        "selected-map seal must return the typed sealed receipt"
+    );
+
+    let compact_signature =
+        function_signature(&source, "pub fn materialize_compact_selected_store_v2(");
+    require_by_value_type(
+        compact_signature,
+        "SealedResidentSelectedMapReceiptV2",
+        "compact materialization",
+    );
+    assert!(
+        compact_signature.contains("SealedGpuResidentFeatureStoreV3"),
+        "compact materialization must return the sealed resident store"
+    );
+
+    for pre_seal_stage in [
+        "pub fn begin_prepared_gpu_only_feature_two_pass_v2(",
+        "pub fn stream_score_batches_v2(",
+        "pub fn seal_selected_map_v2(",
+    ] {
+        let stage = braced_item(&source, pre_seal_stage);
+        for forbidden in [
+            "ResidentFeatureStoreAssemblerV3",
+            "SealedGpuResidentFeatureStoreV3",
+            "seal_gpu_resident_feature_store_v3(",
+            "materialize_compact_selected_store_v2(",
+        ] {
+            assert!(
+                !stage.contains(forbidden),
+                "pre-seal bounded screening stage `{pre_seal_stage}` reached final-store authority `{forbidden}`"
+            );
+        }
+    }
+    for continuation in [
+        "PreparedGpuOnlyFeatureTwoPassContinuationV2",
+        "ScoredGpuOnlyFeatureTwoPassContinuationV2",
+        "SealedResidentSelectedMapReceiptV2",
+    ] {
+        require_move_only_type(&source, continuation);
+    }
+}
+
+#[test]
+fn compact_public_path_consumes_only_the_sealed_selected_extent() {
+    let source = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
+    let compact_signature =
+        function_signature(&source, "pub fn materialize_compact_selected_store_v2(");
+    require_by_value_type(
+        compact_signature,
+        "SealedResidentSelectedMapReceiptV2",
+        "compact resident materialization",
+    );
+    for forbidden_type in [
+        "PreparedGpuOnlyFeatureTwoPassContinuationV2",
+        "ScoredGpuOnlyFeatureTwoPassContinuationV2",
+    ] {
+        assert!(
+            !compact_signature.contains(forbidden_type),
+            "compact final-store entry accepts pre-seal authority `{forbidden_type}`"
+        );
+    }
+
+    let compact_body = braced_item(&source, "pub fn materialize_compact_selected_store_v2(");
+    for token in ["selected_column_count", "selected_map_sha256"] {
+        assert!(
+            compact_body.contains(token),
+            "compact final allocation omits sealed receipt fact `{token}`"
+        );
+    }
+
+    let extent_signature = function_signature(
+        &source,
+        "pub fn compact_selected_store_allocation_extent_v2(",
+    );
+    assert!(extent_signature.contains("CompactSelectedStoreAllocationExtentV2"));
+    let extent_binding =
+        let_binding_for_call(compact_body, "compact_selected_store_allocation_extent_v2(");
+    let allocator_call = parenthesized_call(
+        compact_body,
+        "ResidentFeatureStoreAssemblerV3::new_compact_v2(",
+    );
+    assert!(
+        allocator_call.contains(extent_binding)
+            && !allocator_call.contains(&format!("&{extent_binding}"))
+            && !allocator_call.contains(&format!("{extent_binding}.clone()")),
+        "compact materialization must move the sizing helper's typed extent into the allocator"
+    );
+
+    let allocator_source = read("crates/neoethos-gpu-cuda/src/resident_feature_store_v3.rs");
+    assert!(allocator_source.contains("pub struct CompactSelectedStoreAllocationExtentV2"));
+    require_move_only_type(&allocator_source, "CompactSelectedStoreAllocationExtentV2");
+    let allocator = braced_item(&allocator_source, "pub fn new_compact_v2(");
+    require_by_value_type(
+        allocator,
+        "CompactSelectedStoreAllocationExtentV2",
+        "compact resident allocator",
+    );
+    let typed_extent = exact_parameter_binding(allocator, "CompactSelectedStoreAllocationExtentV2");
+    for getter in ["rows()", "selected_columns()", "cells()"] {
+        assert!(
+            allocator.contains(&format!("{typed_extent}.{getter}")),
+            "compact allocator must derive buffer extents from typed extent getter `{getter}`"
+        );
+    }
+    let allocation_start = [
+        "StreamOrderedDeviceBufferV3::<f64>",
+        "StreamOrderedDeviceBufferV3::<u8>",
+        "DeviceBuffer::<f64>",
+        "DeviceBuffer::<u8>",
+    ]
+    .into_iter()
+    .filter_map(|marker| allocator.find(marker))
+    .min()
+    .expect("compact allocator must allocate resident value/validity buffers");
+    let allocation_body = &allocator[allocation_start..];
+    assert!(
+        !allocation_body.contains("parent_columns")
+            && !allocation_body.contains("parent_column_count")
+            && allocation_body.contains(&format!("{typed_extent}.cells()")),
+        "parent extent may validate selection before allocation but cannot size compact buffers"
+    );
+}
+
+#[cfg(feature = "gpu-cuda")]
+#[test]
+fn compact_allocator_sizes_from_selected_extent_when_parent_is_much_larger() {
+    let extent = neoethos_data::core::gpu_resident_feature_store_v3::
+        compact_selected_store_allocation_extent_v2(4_096, 1_000_000, 7)
+        .expect("valid compact selected extent");
+
+    assert_eq!(extent.row_count(), 4_096);
+    assert_eq!(extent.column_count(), 7);
+    assert_eq!(extent.cell_count(), 4_096 * 7);
 }

@@ -9,6 +9,52 @@ use neoethos_search::{
     install_and_seal_canonical_native_runtime_authority_v1,
 };
 
+fn let_binding_for_call<'a>(source: &'a str, call_marker: &str) -> &'a str {
+    let call_index = source
+        .find(call_marker)
+        .unwrap_or_else(|| panic!("missing call `{call_marker}`"));
+    let let_index = source[..call_index]
+        .rfind("let ")
+        .unwrap_or_else(|| panic!("missing owning let binding for `{call_marker}`"));
+    let mut binding = source[let_index + 4..call_index].trim_start();
+    if let Some(rest) = binding.strip_prefix("mut ") {
+        binding = rest;
+    }
+    let end = binding
+        .find(|character: char| character.is_whitespace() || character == ':' || character == '=')
+        .unwrap_or(binding.len());
+    let binding = &binding[..end];
+    assert!(
+        !binding.is_empty(),
+        "empty owning let binding for `{call_marker}`"
+    );
+    binding
+}
+
+fn parenthesized_call<'a>(source: &'a str, call_marker: &str) -> &'a str {
+    let start = source
+        .find(call_marker)
+        .unwrap_or_else(|| panic!("missing call `{call_marker}`"));
+    let open_offset = source[start..]
+        .find('(')
+        .unwrap_or_else(|| panic!("missing call opening parenthesis for `{call_marker}`"));
+    let open = start + open_offset;
+    let mut depth = 0_u64;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("missing call closing parenthesis for `{call_marker}`")
+}
+
 #[test]
 fn canonical_native_executor_public_api_exists() {
     let _ = std::mem::size_of::<CanonicalNativeCancellationTokenV1>();
@@ -119,7 +165,10 @@ fn source_contract_is_one_staged_native_pipeline_without_population_clone_or_reo
         "prepare_gpu_only_feature_materialization_v3",
         "preflight_canonical_native_generation_zero_result_v1",
         "prepare_prepared_canonical_trendbar_research_run_input_capped_v5",
-        "materialize_prepared_gpu_only_feature_store_for_data_population_v3",
+        "begin_prepared_gpu_only_feature_two_pass_v2",
+        "stream_score_batches_v2",
+        "seal_selected_map_v2",
+        "materialize_compact_selected_store_v2",
         "CanonicalGpuResidentSearchInputReceiptV3::from_resident_store",
         "run_prepared_canonical_trendbar_research_generation_zero_gated_typed_v5",
         "seal_canonical_native_generation_zero_research_result_v1",
@@ -135,8 +184,12 @@ fn source_contract_is_one_staged_native_pipeline_without_population_clone_or_reo
         "pin_exact_canonical_series_v1",
         "preflight_gpu_only_feature_workspace_v3",
         "prepare_gpu_only_feature_materialization_v3",
+        "begin_prepared_gpu_only_feature_two_pass_v2",
+        "stream_score_batches_v2",
+        "seal_selected_map_v2",
         "preflight_canonical_native_generation_zero_result_v1",
         "prepare_prepared_canonical_trendbar_research_run_input_capped_v5",
+        "materialize_compact_selected_store_v2",
         "run_prepared_canonical_trendbar_research_generation_zero_gated_typed_v5",
         "seal_canonical_native_generation_zero_research_result_v1",
         "publish_canonical_native_generation_zero_research_result_v1",
@@ -146,6 +199,50 @@ fn source_contract_is_one_staged_native_pipeline_without_population_clone_or_reo
         let position = pipeline.find(marker).unwrap();
         assert!(position >= previous, "stage `{marker}` is out of order");
         previous = position;
+    }
+
+    let seal_position = pipeline.find("seal_selected_map_v2(").unwrap();
+    let selected_map_binding = let_binding_for_call(pipeline, "seal_selected_map_v2(");
+    let selected_count_call = format!("{selected_map_binding}.selected_column_count()");
+    let selected_count_position = pipeline.find(&selected_count_call).unwrap_or_else(|| {
+        panic!("sealed receipt `{selected_map_binding}` never supplies its count")
+    });
+    let result_preflight_position = pipeline
+        .find("preflight_canonical_native_generation_zero_result_v1(")
+        .unwrap();
+    assert!(
+        seal_position < selected_count_position
+            && selected_count_position < result_preflight_position,
+        "selected-map seal and compact selected count must precede result preflight"
+    );
+
+    let result_preflight = parenthesized_call(
+        pipeline,
+        "preflight_canonical_native_generation_zero_result_v1(",
+    );
+    if !result_preflight.contains(&selected_count_call) {
+        let compact_count_binding = let_binding_for_call(pipeline, &selected_count_call);
+        assert!(
+            result_preflight.contains(compact_count_binding),
+            "result preflight must consume the compact selected count"
+        );
+    }
+
+    let compact_materialization =
+        parenthesized_call(pipeline, "materialize_compact_selected_store_v2(");
+    assert!(
+        compact_materialization.contains(selected_map_binding),
+        "compact materialization must consume the exact sealed selected-map receipt"
+    );
+    for forbidden in [
+        format!("&{selected_map_binding}"),
+        format!("{selected_map_binding}.clone()"),
+        format!("Arc::clone(&{selected_map_binding})"),
+    ] {
+        assert!(
+            !compact_materialization.contains(&forbidden),
+            "Search must move the sealed selected-map receipt by value, not `{forbidden}`"
+        );
     }
 
     for forbidden in [
@@ -165,6 +262,10 @@ fn source_contract_is_one_staged_native_pipeline_without_population_clone_or_reo
             "forbidden executor path `{forbidden}`"
         );
     }
+    assert!(
+        !pipeline.contains("materialize_prepared_gpu_only_feature_store_for_data_population_v3"),
+        "production native pipeline must not reopen the unfiltered resident-store materializer"
+    );
 
     assert!(pipeline.matches("probe_cancellation_v1(").count() >= 6);
     assert!(pipeline.contains("ExecutorCancellationMarkerV1"));
