@@ -219,6 +219,7 @@ impl Default for FeatureBuildOptions {
 pub enum FeatureData {
     InMemory(Vec<FeatureColumnF64>),
     Vortex(Arc<crate::core::vortex_feature_store::VortexFeatureStore>),
+    VortexSet(Arc<crate::core::vortex_feature_store::VortexFeatureStoreSet>),
     VortexWindow(crate::core::vortex_feature_store::VortexFeatureWindow),
     /// Lazy row/column view over an existing frame. This keeps one physical
     /// backing (RAM columns or Vortex) while preserving the exact f64 values,
@@ -334,9 +335,9 @@ impl FeatureFrame {
         )
     }
 
-    pub(crate) fn from_canonical_vortex(
+    pub(crate) fn from_canonical_vortex_set(
         timestamps: Vec<i64>,
-        store: Arc<crate::core::vortex_feature_store::VortexFeatureStore>,
+        stores: Arc<crate::core::vortex_feature_store::VortexFeatureStoreSet>,
         plan: FeaturePlanV1,
         provenance: DatasetFeatureArtifactProvenanceV1,
         source_generation_leases: Vec<
@@ -347,11 +348,11 @@ impl FeatureFrame {
             !source_generation_leases.is_empty(),
             "canonical Vortex feature frame requires pinned source generations"
         );
-        let names = store.names().to_vec();
+        let names = stores.names().to_vec();
         Self::build(
             timestamps,
             names,
-            FeatureData::Vortex(store),
+            FeatureData::VortexSet(stores),
             plan,
             provenance,
             source_generation_leases,
@@ -468,6 +469,30 @@ impl FeatureFrame {
                 anyhow::ensure!(
                     store.names() == self.names,
                     "Vortex feature schema mismatch"
+                );
+                let FeatureFrameRowIds::Contiguous { origin } = &self.row_ids else {
+                    anyhow::bail!("Vortex feature backing requires contiguous row identities");
+                };
+                anyhow::ensure!(
+                    store.matches_row_identity(&self.timestamps, *origin)?,
+                    "Vortex feature timestamp/row identity mismatch"
+                );
+            }
+            FeatureData::VortexSet(stores) => {
+                anyhow::ensure!(
+                    stores.n_samples() == rows,
+                    "Vortex feature-set row count mismatch"
+                );
+                anyhow::ensure!(
+                    stores.names() == self.names,
+                    "Vortex feature-set schema mismatch"
+                );
+                let FeatureFrameRowIds::Contiguous { origin } = &self.row_ids else {
+                    anyhow::bail!("Vortex feature-set backing requires contiguous row identities");
+                };
+                anyhow::ensure!(
+                    stores.matches_row_identity(&self.timestamps, *origin)?,
+                    "Vortex feature-set timestamp/row identity mismatch"
                 );
             }
             FeatureData::VortexWindow(window) => {
@@ -623,6 +648,7 @@ impl FeatureFrame {
                 ))
             }
             FeatureData::Vortex(store) => store.project(column_indices, row_range),
+            FeatureData::VortexSet(stores) => stores.project(column_indices, row_range),
             FeatureData::VortexWindow(window) => window.window(row_range)?.project(column_indices),
             FeatureData::View(view) => {
                 let physical_columns = column_indices

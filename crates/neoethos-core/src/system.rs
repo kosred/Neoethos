@@ -8,7 +8,7 @@ use neoethos_execution_budget::{
 use serde::{Deserialize, Serialize};
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 use std::process::Command;
-use sysinfo::System;
+use sysinfo::{ProcessesToUpdate, System, get_current_pid};
 
 // NO `use std::env` (2026-08-09). After `AutoTuner` was deleted this file reads
 // and writes zero environment variables — the whole hardware decision now comes
@@ -1026,13 +1026,48 @@ fn tighter_of(host: u64, limit: u64) -> u64 {
     }
 }
 
+fn clamp_memory_figures_to_reported_cgroup(
+    host_total: u64,
+    host_available: u64,
+    limit_total: u64,
+    limit_available: u64,
+) -> (u64, u64) {
+    (
+        tighter_of(host_total, limit_total),
+        host_available.min(limit_available),
+    )
+}
+
+fn preferred_cgroup_memory_limits(
+    process: Option<(u64, u64)>,
+    root: Option<(u64, u64)>,
+) -> Option<(u64, u64)> {
+    process.or(root)
+}
+
+fn current_process_cgroup_memory_limits(sys: &System) -> Option<(u64, u64)> {
+    let process = get_current_pid()
+        .ok()
+        .and_then(|pid| sys.process(pid))
+        .and_then(|process| process.cgroup_limits())
+        .map(|limits| (limits.total_memory, limits.free_memory));
+    let root = sys
+        .cgroup_limits()
+        .map(|limits| (limits.total_memory, limits.free_memory));
+    preferred_cgroup_memory_limits(process, root)
+}
+
 fn clamp_to_cgroup(sys: &System, host_total: u64, host_available: u64) -> (u64, u64) {
-    let Some(limits) = sys.cgroup_limits() else {
+    let Some((limit_total, limit_available)) = current_process_cgroup_memory_limits(sys) else {
         return (host_total, host_available);
     };
 
-    let total = tighter_of(host_total, limits.total_memory);
-    let available = tighter_of(host_available, limits.free_memory);
+    let (total, available) = clamp_memory_figures_to_reported_cgroup(
+        host_total,
+        host_available,
+        limit_total,
+        limit_available,
+    );
 
     if total < host_total || available < host_available {
         static ANNOUNCED: std::sync::Once = std::sync::Once::new();
@@ -1061,6 +1096,9 @@ fn clamp_to_cgroup(sys: &System, host_total: u64, host_available: u64) -> (u64, 
 pub fn available_memory_bytes() -> u64 {
     let mut sys = System::new();
     sys.refresh_memory();
+    if let Ok(pid) = get_current_pid() {
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    }
     clamp_to_cgroup(&sys, sys.total_memory(), sys.available_memory()).1
 }
 
@@ -1071,6 +1109,9 @@ pub fn available_memory_bytes() -> u64 {
 pub fn total_memory_bytes() -> u64 {
     let mut sys = System::new();
     sys.refresh_memory();
+    if let Ok(pid) = get_current_pid() {
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    }
     clamp_to_cgroup(&sys, sys.total_memory(), sys.available_memory()).0
 }
 
@@ -2332,5 +2373,29 @@ mod tests {
 
         // And it never invents memory the host does not have.
         assert!(tighter_of(HOST, CONTAINER) <= HOST);
+    }
+
+    #[test]
+    fn reported_zero_cgroup_headroom_clamps_available_but_not_total_memory() {
+        const HOST_TOTAL: u64 = 64 * 1024 * 1024 * 1024;
+        const HOST_AVAILABLE: u64 = 32 * 1024 * 1024 * 1024;
+
+        assert_eq!(
+            clamp_memory_figures_to_reported_cgroup(HOST_TOTAL, HOST_AVAILABLE, 0, 0),
+            (HOST_TOTAL, 0)
+        );
+    }
+
+    #[test]
+    fn current_process_cgroup_wins_and_root_is_only_a_fallback() {
+        let process = (128_u64, 32_u64);
+        let root = (256_u64, 200_u64);
+
+        assert_eq!(
+            preferred_cgroup_memory_limits(Some(process), Some(root)),
+            Some(process)
+        );
+        assert_eq!(preferred_cgroup_memory_limits(None, Some(root)), Some(root));
+        assert_eq!(preferred_cgroup_memory_limits(None, None), None);
     }
 }

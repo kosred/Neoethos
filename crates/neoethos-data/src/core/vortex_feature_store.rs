@@ -30,6 +30,7 @@ const TIMESTAMP_FIELD: &str = "timestamp_ms";
 const ROW_ID_FIELD: &str = "__neoethos_row_id";
 const VALIDITY_PREFIX: &str = "__neoethos_validity__";
 const SCHEMA_DOMAIN: &[u8] = b"neoethos.vortex-feature-store.schema.v1\0";
+const IDENTITY_DOMAIN: &[u8] = b"neoethos.vortex-feature-store.identity.v1\0";
 const DEFAULT_CHUNK_ROWS: usize = 8_192;
 const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -72,7 +73,148 @@ pub struct VortexFeatureStore {
     n_samples: usize,
     file_sha256: String,
     schema_sha256: [u8; 32],
+    identity_sha256: [u8; 32],
     cache: Mutex<DecodedChunkCache>,
+}
+
+/// One logical feature schema backed by independently persisted Vortex shards.
+///
+/// Each shard owns a contiguous range of the global feature order. Projection
+/// partitions arbitrary caller order across those ranges, reads only the
+/// requested fields from each shard, and restores the exact caller order in
+/// the returned batch. Keeping shards independent lets a multi-timeframe
+/// builder persist and release one full aligned block before computing the
+/// next one.
+#[derive(Debug)]
+pub struct VortexFeatureStoreSet {
+    stores: Vec<Arc<VortexFeatureStore>>,
+    offsets: Vec<usize>,
+    names: Vec<String>,
+    n_samples: usize,
+}
+
+impl VortexFeatureStoreSet {
+    pub fn new(stores: Vec<Arc<VortexFeatureStore>>) -> Result<Self> {
+        ensure!(!stores.is_empty(), "Vortex feature store set needs shards");
+        let n_samples = stores[0].n_samples();
+        let identity_sha256 = stores[0].identity_sha256;
+        let mut offsets = Vec::with_capacity(stores.len() + 1);
+        let mut names = Vec::new();
+        offsets.push(0);
+        for store in &stores {
+            ensure!(
+                store.n_samples() == n_samples,
+                "Vortex feature shard row count mismatch: {} != {n_samples}",
+                store.n_samples()
+            );
+            ensure!(
+                store.identity_sha256 == identity_sha256,
+                "Vortex feature shard identity mismatch"
+            );
+            names.extend(store.names().iter().cloned());
+            offsets.push(names.len());
+        }
+        validate_names(&names)?;
+        Ok(Self {
+            stores,
+            offsets,
+            names,
+            n_samples,
+        })
+    }
+
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    pub const fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.stores.len()
+    }
+
+    pub(crate) fn matches_row_identity(
+        &self,
+        timestamps: &[i64],
+        row_origin: usize,
+    ) -> Result<bool> {
+        self.stores[0].matches_row_identity(timestamps, row_origin)
+    }
+
+    pub fn project(
+        &self,
+        column_indices: &[usize],
+        row_range: Range<usize>,
+    ) -> Result<Arc<VortexFeatureBatch>> {
+        ensure!(
+            !column_indices.is_empty(),
+            "Vortex feature projection must select at least one column"
+        );
+        validate_range(&row_range, self.n_samples)?;
+        let mut unique = HashSet::with_capacity(column_indices.len());
+        let mut per_shard = vec![Vec::<(usize, usize)>::new(); self.stores.len()];
+        for (output_index, &global_index) in column_indices.iter().enumerate() {
+            ensure!(
+                global_index < self.names.len(),
+                "feature column {global_index} is outside 0..{}",
+                self.names.len()
+            );
+            ensure!(
+                unique.insert(global_index),
+                "duplicate feature column {global_index}"
+            );
+            let shard_index = self
+                .offsets
+                .partition_point(|&offset| offset <= global_index)
+                .saturating_sub(1)
+                .min(self.stores.len() - 1);
+            per_shard[shard_index].push((output_index, global_index - self.offsets[shard_index]));
+        }
+
+        let mut timestamps = None;
+        let mut row_ids = None;
+        let mut columns = vec![None; column_indices.len()];
+        for (store, requested) in self.stores.iter().zip(per_shard) {
+            if requested.is_empty() {
+                continue;
+            }
+            let local_indices = requested
+                .iter()
+                .map(|(_, local_index)| *local_index)
+                .collect::<Vec<_>>();
+            let batch = store.project(&local_indices, row_range.clone())?;
+            if let Some(expected) = timestamps.as_ref() {
+                ensure!(
+                    expected == &batch.timestamps,
+                    "Vortex feature shards returned different timestamps"
+                );
+            } else {
+                timestamps = Some(batch.timestamps.clone());
+            }
+            if let Some(expected) = row_ids.as_ref() {
+                ensure!(
+                    expected == &batch.row_ids,
+                    "Vortex feature shards returned different row IDs"
+                );
+            } else {
+                row_ids = Some(batch.row_ids.clone());
+            }
+            for ((output_index, _), column) in requested.iter().zip(&batch.columns) {
+                columns[*output_index] = Some(column.clone());
+            }
+        }
+
+        Ok(Arc::new(VortexFeatureBatch {
+            timestamps: timestamps.context("Vortex feature store set produced no timestamps")?,
+            row_ids: row_ids.context("Vortex feature store set produced no row IDs")?,
+            columns: columns
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .context("Vortex feature store set left a projected column unresolved")?,
+        }))
+    }
 }
 
 impl VortexFeatureStore {
@@ -131,6 +273,7 @@ impl VortexFeatureStore {
         ensure!(n_samples > 0, "Vortex feature store must not be empty");
         let file_sha256 = sha256_file(&path)?;
         let schema_sha256 = schema_hash(&expected_names);
+        let identity_sha256 = identity_hash_from_file(&path, n_samples)?;
         Ok(Arc::new(Self {
             lease,
             path,
@@ -138,6 +281,7 @@ impl VortexFeatureStore {
             n_samples,
             file_sha256,
             schema_sha256,
+            identity_sha256,
             cache: Mutex::new(DecodedChunkCache::new(decoded_cache_bytes)),
         }))
     }
@@ -156,6 +300,14 @@ impl VortexFeatureStore {
 
     pub const fn n_samples(&self) -> usize {
         self.n_samples
+    }
+
+    pub(crate) fn matches_row_identity(
+        &self,
+        timestamps: &[i64],
+        row_origin: usize,
+    ) -> Result<bool> {
+        Ok(self.identity_sha256 == identity_hash_from_timestamps(timestamps, row_origin)?)
     }
 
     pub fn cache_stats(&self) -> DecodedCacheStats {
@@ -615,6 +767,82 @@ fn schema_hash(names: &[String]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn identity_hash_from_file(path: &Path, n_samples: usize) -> Result<[u8; 32]> {
+    let mut hasher = new_identity_hasher(n_samples)?;
+    let mut previous_timestamp = None;
+    for start in (0..n_samples).step_by(DEFAULT_CHUNK_ROWS) {
+        let end = (start + DEFAULT_CHUNK_ROWS).min(n_samples);
+        let start_u64 = u64::try_from(start).context("identity range start does not fit u64")?;
+        let end_u64 = u64::try_from(end).context("identity range end does not fit u64")?;
+        let array = read_vortex_projection_range(
+            path,
+            &[TIMESTAMP_FIELD, ROW_ID_FIELD],
+            start_u64..end_u64,
+        )?;
+        let structure = array.to_struct();
+        let timestamps = extract_non_null::<i64>(
+            structure.unmasked_field_by_name(TIMESTAMP_FIELD)?,
+            TIMESTAMP_FIELD,
+        )?;
+        let row_ids = extract_non_null::<u64>(
+            structure.unmasked_field_by_name(ROW_ID_FIELD)?,
+            ROW_ID_FIELD,
+        )?;
+        ensure!(
+            timestamps.len() == end - start && row_ids.len() == end - start,
+            "Vortex identity projection length mismatch"
+        );
+        validate_canonical_millisecond_timestamps(&timestamps)?;
+        if let (Some(previous), Some(&first)) = (previous_timestamp, timestamps.first()) {
+            ensure!(
+                first > previous,
+                "Vortex timestamps must remain strictly increasing across identity chunks"
+            );
+        }
+        for (local_row, (&timestamp, &row_id)) in timestamps.iter().zip(&row_ids).enumerate() {
+            let expected = u64::try_from(start + local_row)
+                .context("expected Vortex identity row id does not fit u64")?;
+            ensure!(
+                row_id == expected,
+                "Vortex row identity mismatch at row {}: expected {expected}, got {row_id}",
+                start + local_row
+            );
+            update_identity_hash(&mut hasher, timestamp, row_id);
+        }
+        previous_timestamp = timestamps.last().copied();
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn identity_hash_from_timestamps(timestamps: &[i64], row_origin: usize) -> Result<[u8; 32]> {
+    validate_canonical_millisecond_timestamps(timestamps)?;
+    let mut hasher = new_identity_hasher(timestamps.len())?;
+    for (offset, &timestamp) in timestamps.iter().enumerate() {
+        let row = row_origin
+            .checked_add(offset)
+            .context("Vortex identity row id overflow")?;
+        let row_id = u64::try_from(row).context("Vortex identity row id does not fit u64")?;
+        update_identity_hash(&mut hasher, timestamp, row_id);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn new_identity_hasher(n_samples: usize) -> Result<Sha256> {
+    let mut hasher = Sha256::new();
+    hasher.update(IDENTITY_DOMAIN);
+    hasher.update(
+        u64::try_from(n_samples)
+            .context("Vortex identity row count does not fit u64")?
+            .to_be_bytes(),
+    );
+    Ok(hasher)
+}
+
+fn update_identity_hash(hasher: &mut Sha256, timestamp: i64, row_id: u64) {
+    hasher.update(timestamp.to_be_bytes());
+    hasher.update(row_id.to_be_bytes());
+}
+
 fn extract_non_null<T: vortex_array::dtype::NativePType>(
     array: &ArrayRef,
     label: &str,
@@ -687,5 +915,21 @@ mod tests {
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.resident_bytes, weight);
         assert_eq!(cache.order.len(), 1);
+    }
+
+    #[test]
+    fn source_identity_hash_binds_timestamp_bits_and_row_origin() {
+        let timestamps = [1_704_067_200_000_i64, 1_704_067_260_000_i64];
+        let shifted = [1_704_067_201_000_i64, 1_704_067_261_000_i64];
+
+        let identity = identity_hash_from_timestamps(&timestamps, 0).expect("valid identity");
+        assert_ne!(
+            identity,
+            identity_hash_from_timestamps(&shifted, 0).expect("valid shifted identity")
+        );
+        assert_ne!(
+            identity,
+            identity_hash_from_timestamps(&timestamps, 1).expect("valid offset identity")
+        );
     }
 }

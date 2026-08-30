@@ -1109,11 +1109,13 @@ type ProductionFeatureColumns = Vec<FeatureColumnF64>;
 /// same typed ids, so a family cannot remain reachable while being invisible
 /// to provenance/validity review (the previous Footprint defect).
 fn compute_production_feature_columns(
+    feature_math_authority: MultiTimeframeFeatureMathAuthorityV3,
     producer: ProductionFeatureProducerId,
-    ohlcv: &Ohlcv,
+    source: &CanonicalOhlcvFrame,
     budget_rows: usize,
     classic_run_plan: Option<&crate::core::hpc_ta::ClassicTaRunPlan>,
 ) -> Result<ProductionFeatureColumns> {
+    let ohlcv = source.ohlcv();
     match producer {
         ProductionFeatureProducerId::SmartMoneyConcept => compute_smc_feature_columns_f64(ohlcv),
         ProductionFeatureProducerId::ClassicVectorTa => match classic_run_plan {
@@ -1128,11 +1130,42 @@ fn compute_production_feature_columns(
                 budget_rows,
             ),
         },
-        ProductionFeatureProducerId::Quantitative => compute_quant_feature_columns_f64(ohlcv),
+        ProductionFeatureProducerId::Quantitative => match feature_math_authority {
+            MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy => {
+                compute_quant_feature_columns_f64(ohlcv)
+            }
+            #[cfg(feature = "gpu-cuda")]
+            MultiTimeframeFeatureMathAuthorityV3::ResidentGpuExactParityCpuReferenceV3 => {
+                compute_quant_feature_columns_v3_f64(
+                    source.ohlcv(),
+                    source.artifact().frame_timeframe(),
+                )
+            }
+        },
         ProductionFeatureProducerId::Session => compute_session_feature_columns_f64(ohlcv),
         ProductionFeatureProducerId::Regime => compute_regime_feature_columns_f64(ohlcv),
         ProductionFeatureProducerId::Footprint => compute_footprint_feature_columns_f64(ohlcv),
     }
+}
+
+fn production_feature_manifest_row(
+    feature_math_authority: MultiTimeframeFeatureMathAuthorityV3,
+    producer: ProductionFeatureProducerId,
+) -> Result<&'static ProductionFeatureProducerManifestRowV1> {
+    #[cfg(not(feature = "gpu-cuda"))]
+    let _ = feature_math_authority;
+    #[cfg(feature = "gpu-cuda")]
+    if feature_math_authority
+        == MultiTimeframeFeatureMathAuthorityV3::ResidentGpuExactParityCpuReferenceV3
+        && producer == ProductionFeatureProducerId::Quantitative
+    {
+        return Ok(quantitative_feature_producer_manifest_v3()?);
+    }
+
+    production_feature_producer_manifest_v1()?
+        .iter()
+        .find(|row| row.producer() == producer)
+        .ok_or_else(|| anyhow::anyhow!("production producer {producer:?} has no manifest"))
 }
 
 fn production_feature_node_id(producer: ProductionFeatureProducerId) -> &'static str {
@@ -1163,6 +1196,7 @@ fn direct_frame_source_node(
 fn build_production_feature_contract(
     source: &CanonicalOhlcvFrame,
     groups: &[(ProductionFeatureProducerId, ProductionFeatureColumns)],
+    feature_math_authority: MultiTimeframeFeatureMathAuthorityV3,
 ) -> Result<(
     neoethos_feature_contracts::FeaturePlanV1,
     neoethos_feature_contracts::DatasetFeatureArtifactProvenanceV1,
@@ -1199,16 +1233,12 @@ fn build_production_feature_contract(
         source_semantic_hash,
     )?;
 
-    let producer_manifest = production_feature_producer_manifest_v1()?;
     let mut nodes = Vec::with_capacity(groups.len() + 1);
     nodes.push(source_node);
     let (producer_input_node_id, _) = direct_frame_source_node(source, &source_node_id, "single")?;
     let mut final_outputs = Vec::new();
     for (producer, columns) in groups {
-        let manifest = producer_manifest
-            .iter()
-            .find(|row| row.producer() == *producer)
-            .ok_or_else(|| anyhow::anyhow!("production producer {producer:?} has no manifest"))?;
+        let manifest = production_feature_manifest_row(feature_math_authority, *producer)?;
         let outputs = columns
             .iter()
             .map(|column| FeatureOutputV1::f64(column.name.clone(), manifest.semantic_version()))
@@ -1267,6 +1297,7 @@ pub fn compute_hpc_feature_frame_sized(
         profile,
         budget_rows,
         &classic_run_plan,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
     )
 }
 
@@ -1275,6 +1306,7 @@ fn compute_hpc_feature_frame_sized_with_classic_plan(
     _profile: FeatureProfile,
     budget_rows: usize,
     classic_run_plan: &crate::core::hpc_ta::ClassicTaRunPlan,
+    feature_math_authority: MultiTimeframeFeatureMathAuthorityV3,
 ) -> Result<FeatureFrame> {
     let ohlcv = source.ohlcv();
 
@@ -1299,13 +1331,22 @@ fn compute_hpc_feature_frame_sized_with_classic_plan(
         footprint_id,
     ] = PRODUCTION_FEATURE_PRODUCER_ORDER;
     let (smc, (classic, (quant, (session, (regime, footprint))))) = rayon::join(
-        || compute_production_feature_columns(smc_id, ohlcv, budget_rows, Some(classic_run_plan)),
+        || {
+            compute_production_feature_columns(
+                feature_math_authority,
+                smc_id,
+                source,
+                budget_rows,
+                Some(classic_run_plan),
+            )
+        },
         || {
             rayon::join(
                 || {
                     compute_production_feature_columns(
+                        feature_math_authority,
                         classic_id,
-                        ohlcv,
+                        source,
                         budget_rows,
                         Some(classic_run_plan),
                     )
@@ -1314,8 +1355,9 @@ fn compute_hpc_feature_frame_sized_with_classic_plan(
                     rayon::join(
                         || {
                             compute_production_feature_columns(
+                                feature_math_authority,
                                 quant_id,
-                                ohlcv,
+                                source,
                                 budget_rows,
                                 Some(classic_run_plan),
                             )
@@ -1324,8 +1366,9 @@ fn compute_hpc_feature_frame_sized_with_classic_plan(
                             rayon::join(
                                 || {
                                     compute_production_feature_columns(
+                                        feature_math_authority,
                                         session_id,
-                                        ohlcv,
+                                        source,
                                         budget_rows,
                                         Some(classic_run_plan),
                                     )
@@ -1334,8 +1377,9 @@ fn compute_hpc_feature_frame_sized_with_classic_plan(
                                     rayon::join(
                                         || {
                                             compute_production_feature_columns(
+                                                feature_math_authority,
                                                 regime_id,
-                                                ohlcv,
+                                                source,
                                                 budget_rows,
                                                 Some(classic_run_plan),
                                             )
@@ -1347,8 +1391,9 @@ fn compute_hpc_feature_frame_sized_with_classic_plan(
                                         // (projection matches by name).
                                         || {
                                             compute_production_feature_columns(
+                                                feature_math_authority,
                                                 footprint_id,
-                                                ohlcv,
+                                                source,
                                                 budget_rows,
                                                 Some(classic_run_plan),
                                             )
@@ -1384,7 +1429,8 @@ fn compute_hpc_feature_frame_sized_with_classic_plan(
         (regime_id, regime),
         (footprint_id, footprint),
     ];
-    let (plan, provenance) = build_production_feature_contract(source, &groups)?;
+    let (plan, provenance) =
+        build_production_feature_contract(source, &groups, feature_math_authority)?;
     let columns = groups
         .into_iter()
         .flat_map(|(_, columns)| columns)
@@ -1506,6 +1552,80 @@ struct MultiTimeframeFeatureBlock {
     max_age_ms: Option<i64>,
 }
 
+#[derive(Debug)]
+struct MultiTimeframeFeatureContractBlock {
+    timeframe: String,
+    source: CanonicalOhlcvFrame,
+    original_names: Vec<String>,
+    projected_names: Vec<String>,
+    higher_timeframe: bool,
+    availability_rule: String,
+    availability_lag_ms: Option<i64>,
+    max_age_ms: Option<i64>,
+}
+
+struct PreparedMultiTimeframeFeatureBlock {
+    contract: Option<MultiTimeframeFeatureContractBlock>,
+    columns: Vec<FeatureColumnF64>,
+    normalization_fits: Vec<crate::core::normalization::RobustNormalizationFitF64>,
+    dropped: Vec<String>,
+}
+
+fn prepare_multitimeframe_feature_block(
+    mut block: MultiTimeframeFeatureBlock,
+    normalize: bool,
+    normalization_training_rows: Option<std::ops::Range<usize>>,
+    drop_columns_without_normalization_training_support: bool,
+) -> Result<PreparedMultiTimeframeFeatureBlock> {
+    let mut dropped = Vec::new();
+    let mut normalization_fits = Vec::new();
+    if normalize {
+        let training_rows = normalization_training_rows
+            .context("normalization is enabled without an explicit training row range")?;
+        if drop_columns_without_normalization_training_support {
+            dropped = retain_columns_with_normalization_training_support(
+                &mut block.columns,
+                training_rows.clone(),
+            )?;
+        }
+        for column in &mut block.columns {
+            normalization_fits.push(crate::core::normalization::normalize_feature_column_f64(
+                column,
+                training_rows.clone(),
+            )?);
+        }
+    }
+
+    if block.columns.is_empty() {
+        return Ok(PreparedMultiTimeframeFeatureBlock {
+            contract: None,
+            columns: Vec::new(),
+            normalization_fits,
+            dropped,
+        });
+    }
+    let projected_names = block
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    Ok(PreparedMultiTimeframeFeatureBlock {
+        contract: Some(MultiTimeframeFeatureContractBlock {
+            timeframe: block.timeframe,
+            source: block.source,
+            original_names: block.original_names,
+            projected_names,
+            higher_timeframe: block.higher_timeframe,
+            availability_rule: block.availability_rule,
+            availability_lag_ms: block.availability_lag_ms,
+            max_age_ms: block.max_age_ms,
+        }),
+        columns: block.columns,
+        normalization_fits,
+        dropped,
+    })
+}
+
 fn retain_columns_with_normalization_training_support(
     columns: &mut Vec<FeatureColumnF64>,
     training_rows: std::ops::Range<usize>,
@@ -1536,7 +1656,10 @@ fn retain_columns_with_normalization_training_support(
 fn take_in_memory_columns(frame: FeatureFrame) -> Result<Vec<FeatureColumnF64>> {
     match frame.data {
         FeatureData::InMemory(columns) => Ok(columns),
-        FeatureData::Vortex(_) | FeatureData::VortexWindow(_) | FeatureData::View(_) => {
+        FeatureData::Vortex(_)
+        | FeatureData::VortexSet(_)
+        | FeatureData::VortexWindow(_)
+        | FeatureData::View(_) => {
             anyhow::bail!("scalar feature computation unexpectedly returned a Vortex-backed frame")
         }
     }
@@ -1553,6 +1676,7 @@ fn compute_aligned_higher_block(
     profile: FeatureProfile,
     budget_rows: usize,
     classic_run_plan: &crate::core::hpc_ta::ClassicTaRunPlan,
+    feature_math_authority: MultiTimeframeFeatureMathAuthorityV3,
 ) -> Result<Option<MultiTimeframeFeatureBlock>> {
     if h_tf == base_tf {
         return Ok(None);
@@ -1566,6 +1690,7 @@ fn compute_aligned_higher_block(
         profile,
         budget_rows,
         classic_run_plan,
+        feature_math_authority,
     )?;
     let h_ns = h_ohlcv
         .timestamp
@@ -1667,18 +1792,18 @@ fn semantic_source_hash(parts: &[&[u8]]) -> [u8; 32] {
 }
 
 fn normalization_fit_hash(
-    columns: &[FeatureColumnF64],
+    names: &[String],
     fits: &[crate::core::normalization::RobustNormalizationFitF64],
 ) -> Result<[u8; 32]> {
     anyhow::ensure!(
-        columns.len() == fits.len(),
+        names.len() == fits.len(),
         "normalization fit count mismatch"
     );
     let mut hash = Sha256::new();
     hash.update(b"neoethos.robust-normalization-fit.f64.v1\0");
-    for (column, fit) in columns.iter().zip(fits) {
-        hash.update((column.name.len() as u64).to_be_bytes());
-        hash.update(column.name.as_bytes());
+    for (name, fit) in names.iter().zip(fits) {
+        hash.update((name.len() as u64).to_be_bytes());
+        hash.update(name.as_bytes());
         hash.update((fit.training_rows.start as u64).to_be_bytes());
         hash.update((fit.training_rows.end as u64).to_be_bytes());
         hash.update(fit.median.to_bits().to_be_bytes());
@@ -1690,7 +1815,8 @@ fn normalization_fit_hash(
 }
 
 fn build_multitimeframe_feature_contract(
-    blocks: &[MultiTimeframeFeatureBlock],
+    blocks: &[MultiTimeframeFeatureContractBlock],
+    feature_math_authority: MultiTimeframeFeatureMathAuthorityV3,
     normalization_fits: Option<&[crate::core::normalization::RobustNormalizationFitF64]>,
 ) -> Result<(
     neoethos_feature_contracts::FeaturePlanV1,
@@ -1706,7 +1832,6 @@ fn build_multitimeframe_feature_contract(
         !blocks.is_empty(),
         "multi-timeframe plan has no source blocks"
     );
-    let producer_manifest = production_feature_producer_manifest_v1()?;
     let physical_schema_hash = semantic_source_hash(&[b"neoethos.ohlcv.f64-ms.v1"]);
     let projection_source_hash = semantic_source_hash(&[include_bytes!("lib.rs")]);
     let alignment_source_hash =
@@ -1723,7 +1848,7 @@ fn build_multitimeframe_feature_contract(
 
     for (block_index, block) in blocks.iter().enumerate() {
         anyhow::ensure!(
-            !block.original_names.is_empty() && !block.columns.is_empty(),
+            !block.original_names.is_empty() && !block.projected_names.is_empty(),
             "{} feature block is empty",
             block.timeframe
         );
@@ -1771,10 +1896,7 @@ fn build_multitimeframe_feature_contract(
                 "{} feature block emitted no columns for production producer {producer:?}",
                 block.timeframe
             );
-            let manifest = producer_manifest
-                .iter()
-                .find(|row| row.producer() == producer)
-                .ok_or_else(|| anyhow::anyhow!("producer {producer:?} has no semantic manifest"))?;
+            let manifest = production_feature_manifest_row(feature_math_authority, producer)?;
             let node_id = format!("{}:{frame_token}", production_feature_node_id(producer));
             let outputs = selected
                 .iter()
@@ -1801,13 +1923,13 @@ fn build_multitimeframe_feature_contract(
 
         let projection_node_id = format!("projection:{block_index}:{frame_token}");
         let projected_outputs = block
-            .columns
+            .projected_names
             .iter()
-            .map(|column| {
+            .map(|name| {
                 let output_name = if normalized {
-                    format!("pre-normalize:{block_index}:{}", column.name)
+                    format!("pre-normalize:{block_index}:{name}")
                 } else {
-                    column.name.clone()
+                    name.clone()
                 };
                 FeatureOutputV1::f64(
                     output_name,
@@ -1856,15 +1978,15 @@ fn build_multitimeframe_feature_contract(
             None,
         )?);
         projection_node_ids.push(projection_node_id);
-        final_outputs.extend(block.columns.iter().map(|column| column.name.clone()));
+        final_outputs.extend(block.projected_names.iter().cloned());
     }
 
     if let Some(fits) = normalization_fits {
-        let all_columns = blocks
+        let all_names = blocks
             .iter()
-            .flat_map(|block| block.columns.iter().cloned())
+            .flat_map(|block| block.projected_names.iter().cloned())
             .collect::<Vec<_>>();
-        let fitted_state_hash = normalization_fit_hash(&all_columns, fits)?;
+        let fitted_state_hash = normalization_fit_hash(&all_names, fits)?;
         let outputs = final_outputs
             .iter()
             .map(|name| FeatureOutputV1::f64(name.clone(), 2))
@@ -1887,33 +2009,14 @@ fn build_multitimeframe_feature_contract(
     Ok((plan, provenance, source_leases))
 }
 
-/// Decide whether the multi-TF feature cube is assembled in RAM (fast, no disk
-/// write/cleanup) or streamed to a disk-mmap store (the NEVER-OOM fallback).
+/// Decide whether the multi-TF feature cube stays in RAM or is persisted as
+/// independent Vortex shards. The decision is made after the base block is
+/// known and before any higher-timeframe block is allocated. On the disk path
+/// each block is written and released before the next one is computed.
 ///
-/// 2026-08-10: `NEOETHOS_FEATURE_CUBE_MODE = ram | disk | auto` used to force
-/// the choice, and the `ram` arm returned BEFORE the free-RAM check two lines
-/// below — a failure wearing the costume of a choice, and the never-OOM
-/// invariant inverted. The variable is gone; the knob survives as
-/// `models.data_runtime.feature_cube_mode`, recorded in the discovery run
-/// profile at `/execution/feature_cube_mode`, with the ordering corrected: the
-/// probe now binds `ram` instead of being skipped by it. The derivation is
-/// logged, so "why did this run go to disk?" has an answer in the log instead
-/// of in someone's shell history.
-///
-/// The `auto` requirement is derived from the assembly's ACTUAL peak, which is
-/// why it changed on 2026-07-20. The old assembly built every per-TF block and
-/// then `concatenate`d them, so both the blocks and the result were live at
-/// once — a ~2× peak, demanded as 2.5× for margin. That was an artifact of the
-/// implementation, not a property of the data: a 10.5 GB cube "needed" 28 GB
-/// and went to disk on a 32 GB machine with 22 GB free, paying a 10 GB write
-/// plus mmap page-fault traffic for the whole GA.
-///
-/// [`try_assemble_cube_in_ram`] now allocates the cube ONCE and fills each
-/// timeframe's columns in place, freeing each block immediately — so the peak
-/// is the cube plus ONE timeframe block (~1.1× on a 10-TF build). We require
-/// 1.5× plus the same 2 GB floor for the OS and the GA's working buffers. A
-/// failed free-RAM probe (0) still takes the safe disk path, and any surprise
-/// during assembly falls back to disk rather than growing memory.
+/// `models.data_runtime.feature_cube_mode=disk` can lower memory use. `auto`
+/// and the historical `ram` policy remain bounded by the live-memory probe;
+/// no configuration can bypass the never-OOM guard.
 /// Test-only seam replacing the deleted `NEOETHOS_FEATURE_CUBE_MODE`.
 /// `0` = derive (production), `1` = force RAM, `2` = force disk.
 ///
@@ -1924,6 +2027,23 @@ fn build_multitimeframe_feature_contract(
 /// deletion as something a test can reach and a shell cannot.
 #[cfg(test)]
 pub(crate) static TEST_CUBE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test-only seam for exercising normalization through both physical sinks.
+/// `0` = configured production value, `1` = enabled, `2` = disabled.
+#[cfg(test)]
+static TEST_NORMALIZATION_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn feature_normalization_enabled() -> bool {
+    #[cfg(test)]
+    {
+        match TEST_NORMALIZATION_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+    }
+    current_data_runtime_overrides().normalize_features
+}
 
 /// Peak RAM the in-memory assembly needs for a cube of `cube_bytes`: the cube
 /// plus ONE timeframe block (~1.1x, demanded as 1.5x for margin) plus a 2 GB
@@ -1968,7 +2088,7 @@ fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
             cube_gb = %cube_gb,
             configured = "disk",
             in_ram = false,
-            "feature-cube assembly forced to the disk-mmap store by \
+            "feature-cube assembly forced to Vortex scratch shards by \
              models.data_runtime.feature_cube_mode"
         );
         return false;
@@ -1980,7 +2100,7 @@ fn should_build_cube_in_ram(cube_bytes: u64) -> bool {
             target: "neoethos_data::feature_cube",
             cube_gb = %cube_gb,
             configured = %configured.as_str(),
-            "available-memory probe returned 0 — taking the disk-mmap path. This is the \
+            "available-memory probe returned 0 — taking the Vortex scratch path. This is the \
              safe answer, not a measured one."
         );
         return false;
@@ -2041,6 +2161,101 @@ pub fn report_retired_env_vars() {
     });
 }
 
+static FEATURE_RUN_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+enum MultiTimeframeFeatureSink {
+    InMemory {
+        columns: Vec<FeatureColumnF64>,
+    },
+    Vortex {
+        scratch_root: PathBuf,
+        run_id_prefix: String,
+        shards: Vec<std::sync::Arc<crate::core::vortex_feature_store::VortexFeatureStore>>,
+    },
+}
+
+impl MultiTimeframeFeatureSink {
+    fn new(in_ram: bool, symbol: &str, base_tf: &str, timeframe_count: usize) -> Result<Self> {
+        if in_ram {
+            return Ok(Self::InMemory {
+                columns: Vec::new(),
+            });
+        }
+
+        let scratch_root = vortex_feature_run_root();
+        let removed = crate::core::feature_run_lease::sweep_orphan_feature_runs(&scratch_root)?;
+        if !removed.is_empty() {
+            tracing::info!(
+                target: "neoethos_data::vortex_feature_store",
+                removed_runs = removed.len(),
+                "removed crashed Vortex feature scratch runs after acquiring their OS leases"
+            );
+        }
+        let sanitize = |value: &str| {
+            value
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .take(24)
+                .collect::<String>()
+        };
+        let run_id_prefix = format!(
+            "{}-{}-{}-{}",
+            sanitize(symbol),
+            sanitize(base_tf),
+            std::process::id(),
+            FEATURE_RUN_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        Ok(Self::Vortex {
+            scratch_root,
+            run_id_prefix,
+            shards: Vec::with_capacity(timeframe_count),
+        })
+    }
+
+    fn push(
+        &mut self,
+        timeframe: &str,
+        timestamps: &[i64],
+        columns: Vec<FeatureColumnF64>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !columns.is_empty(),
+            "cannot append an empty {timeframe} feature block"
+        );
+        match self {
+            Self::InMemory { columns: all } => {
+                all.extend(columns);
+            }
+            Self::Vortex {
+                scratch_root,
+                run_id_prefix,
+                shards,
+            } => {
+                let shard_index = shards.len();
+                let timeframe = timeframe
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .take(16)
+                    .collect::<String>();
+                let run_id = format!("{run_id_prefix}-{shard_index}-{timeframe}");
+                let feature_run = std::sync::Arc::new(
+                    crate::core::feature_run_lease::FeatureRunLease::create(scratch_root, &run_id)?,
+                );
+                let store = crate::core::vortex_feature_store::VortexFeatureStore::create(
+                    feature_run,
+                    timestamps,
+                    &columns,
+                    crate::core::vortex_feature_store::VortexFeatureStoreOptions::default(),
+                )?;
+                shards.push(store);
+                // `columns` is released here, before the caller computes the
+                // next higher-timeframe block.
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Build the multi-timeframe feature cube.
 ///
 /// This used to take a fourth argument, `_cache: Option<&FeatureCache>`. The
@@ -2049,8 +2264,8 @@ pub fn report_retired_env_vars() {
 /// the type are gone; see the note at the top of `core/loader.rs` for why the
 /// cache could not have been wired as designed, and what a correct one would
 /// have to key on.
-#[derive(Clone, Copy)]
-enum MultiTimeframeClassicPlanAuthorityV3 {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MultiTimeframeFeatureMathAuthorityV3 {
     CurrentProcessPolicy,
     #[cfg(feature = "gpu-cuda")]
     ResidentGpuExactParityCpuReferenceV3,
@@ -2064,8 +2279,8 @@ pub fn prepare_multitimeframe_features_with_options(
     prepare_multitimeframe_features_with_optional_cutoff(ds, base_tf, opts, None)
 }
 
-/// Build the canonical multi-timeframe CPU V2 feature cube with the exact
-/// ordered Classic subset admitted by the resident GPU V3 Standard profile.
+/// Build the canonical multi-timeframe CPU exact-parity feature cube with the
+/// resident GPU V3 Quant math and ordered Classic subset.
 ///
 /// This is an explicit contract-authoring boundary, not an adaptive fallback:
 /// it retains every non-Classic production family and all source/provenance
@@ -2087,12 +2302,12 @@ pub fn prepare_multitimeframe_features_gpu_exact_parity_cpu_reference_v3(
         "the resident GPU V3 exact-parity CPU reference supports only Standard, HPC, or \
          Adaptive; Full must retain the complete fail-closed Classic graph"
     );
-    prepare_multitimeframe_features_with_classic_plan_authority_v3(
+    prepare_multitimeframe_features_with_feature_math_authority_v3(
         ds,
         base_tf,
         opts,
         None,
-        MultiTimeframeClassicPlanAuthorityV3::ResidentGpuExactParityCpuReferenceV3,
+        MultiTimeframeFeatureMathAuthorityV3::ResidentGpuExactParityCpuReferenceV3,
     )
 }
 
@@ -2118,21 +2333,21 @@ fn prepare_multitimeframe_features_with_optional_cutoff(
     opts: &FeatureBuildOptions,
     end_exclusive_ms: Option<i64>,
 ) -> Result<FeatureFrame> {
-    prepare_multitimeframe_features_with_classic_plan_authority_v3(
+    prepare_multitimeframe_features_with_feature_math_authority_v3(
         ds,
         base_tf,
         opts,
         end_exclusive_ms,
-        MultiTimeframeClassicPlanAuthorityV3::CurrentProcessPolicy,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
     )
 }
 
-fn prepare_multitimeframe_features_with_classic_plan_authority_v3(
+fn prepare_multitimeframe_features_with_feature_math_authority_v3(
     ds: &SymbolDataset,
     base_tf: &str,
     opts: &FeatureBuildOptions,
     end_exclusive_ms: Option<i64>,
-    classic_plan_authority: MultiTimeframeClassicPlanAuthorityV3,
+    feature_math_authority: MultiTimeframeFeatureMathAuthorityV3,
 ) -> Result<FeatureFrame> {
     let base_timeframe = base_tf
         .parse::<CanonicalTimeframe>()
@@ -2184,15 +2399,15 @@ fn prepare_multitimeframe_features_with_classic_plan_authority_v3(
     // producer starts, so a missing CUDA route cannot leave partial CPU/SMC
     // feature allocations behind. Every frame below borrows this exact plan;
     // falling available RAM during the build cannot narrow later timeframes.
-    let classic_run_plan = match classic_plan_authority {
-        MultiTimeframeClassicPlanAuthorityV3::CurrentProcessPolicy => {
+    let classic_run_plan = match feature_math_authority {
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy => {
             crate::core::hpc_ta::prepare_classic_ta_run_plan(
                 budget_rows,
                 crate::core::hpc_ta::resolved_indicator_compute_policy(),
             )?
         }
         #[cfg(feature = "gpu-cuda")]
-        MultiTimeframeClassicPlanAuthorityV3::ResidentGpuExactParityCpuReferenceV3 => {
+        MultiTimeframeFeatureMathAuthorityV3::ResidentGpuExactParityCpuReferenceV3 => {
             crate::core::hpc_ta::prepare_classic_ta_gpu_exact_parity_cpu_reference_run_plan_v3(
                 budget_rows,
             )?
@@ -2209,11 +2424,22 @@ fn prepare_multitimeframe_features_with_classic_plan_authority_v3(
         .context("base has no timestamps")?
         .clone();
     let n_samples = base_ns.len();
-    let normalize = current_data_runtime_overrides().normalize_features;
+    let normalize = feature_normalization_enabled();
     if normalize {
         anyhow::ensure!(
             opts.normalization_training_rows.is_some(),
             "normalization is enabled but no explicit in-sample training row range was supplied"
+        );
+    }
+    let normalization_training_rows = opts
+        .normalization_training_rows
+        .clone()
+        .filter(|_| normalize);
+    if let Some(training_rows) = &normalization_training_rows {
+        anyhow::ensure!(
+            training_rows.start < training_rows.end && training_rows.end <= n_samples,
+            "normalization training rows {:?} are outside 0..{n_samples}",
+            training_rows
         );
     }
 
@@ -2222,6 +2448,7 @@ fn prepare_multitimeframe_features_with_classic_plan_authority_v3(
         opts.profile,
         budget_rows,
         &classic_run_plan,
+        feature_math_authority,
     )?;
     let original_names = base_frame.names.clone();
     let mut base_columns = take_in_memory_columns(base_frame)?;
@@ -2230,7 +2457,36 @@ fn prepare_multitimeframe_features_with_classic_plan_authority_v3(
             column.name = format!("{}_{}", base_tf, column.name);
         }
     }
-    let mut blocks = vec![MultiTimeframeFeatureBlock {
+    let estimated_features = base_columns.len().saturating_mul(1 + active_higher.len());
+    let cube_bytes = (n_samples as u64)
+        .saturating_mul(estimated_features as u64)
+        .saturating_mul(
+            (std::mem::size_of::<f64>() + std::mem::size_of::<FeatureCellValidity>()) as u64,
+        );
+    // The sink decision is deliberately made while only the base block is
+    // live. The disk path below persists and releases it before any higher-TF
+    // alignment can allocate another full base-grid block.
+    let in_ram = should_build_cube_in_ram(cube_bytes);
+    tracing::info!(
+        target: "neoethos_data::prepare_multitimeframe_features",
+        symbol = %ds.symbol,
+        base_tf = base_tf,
+        rows = n_samples,
+        features = estimated_features,
+        timeframes = 1 + active_higher.len(),
+        est_cube_gb = format!("{:.2}", cube_bytes as f64 / 1e9),
+        available_ram_gb = format!("{:.1}", neoethos_core::available_memory_bytes() as f64 / 1e9),
+        sink = if in_ram { "RAM (f64 + validity)" } else { "Vortex scratch shards" },
+        "feature cube build plan"
+    );
+    let mut sink =
+        MultiTimeframeFeatureSink::new(in_ram, &ds.symbol, base_tf, 1 + active_higher.len())?;
+    let mut contract_blocks = Vec::with_capacity(1 + active_higher.len());
+    let mut normalization_fits = Vec::new();
+    let mut dropped = Vec::new();
+    let mut retained_columns = 0usize;
+
+    let base_block = MultiTimeframeFeatureBlock {
         timeframe: base_tf.to_owned(),
         source: base_source,
         original_names,
@@ -2239,7 +2495,20 @@ fn prepare_multitimeframe_features_with_classic_plan_authority_v3(
         availability_rule: "base_bar_open_v1".to_owned(),
         availability_lag_ms: Some(0),
         max_age_ms: None,
-    }];
+    };
+    let prepared = prepare_multitimeframe_feature_block(
+        base_block,
+        normalize,
+        normalization_training_rows.clone(),
+        opts.drop_columns_without_normalization_training_support,
+    )?;
+    dropped.extend(prepared.dropped);
+    normalization_fits.extend(prepared.normalization_fits);
+    if let Some(contract) = prepared.contract {
+        retained_columns = retained_columns.saturating_add(prepared.columns.len());
+        sink.push(&contract.timeframe, &base_ns, prepared.columns)?;
+        contract_blocks.push(contract);
+    }
 
     for higher_tf in &active_higher {
         let source = direct_sources
@@ -2253,133 +2522,63 @@ fn prepare_multitimeframe_features_with_classic_plan_authority_v3(
             opts.profile,
             budget_rows,
             &classic_run_plan,
+            feature_math_authority,
         )?
         .with_context(|| format!("required direct timeframe {higher_tf} disappeared"))?;
-        blocks.push(block);
+        let prepared = prepare_multitimeframe_feature_block(
+            block,
+            normalize,
+            normalization_training_rows.clone(),
+            opts.drop_columns_without_normalization_training_support,
+        )?;
+        dropped.extend(prepared.dropped);
+        normalization_fits.extend(prepared.normalization_fits);
+        if let Some(contract) = prepared.contract {
+            retained_columns = retained_columns.saturating_add(prepared.columns.len());
+            sink.push(&contract.timeframe, &base_ns, prepared.columns)?;
+            contract_blocks.push(contract);
+        }
     }
 
-    let mut normalization_fits = Vec::new();
-    if let Some(training_rows) = opts
-        .normalization_training_rows
-        .clone()
-        .filter(|_| normalize)
-    {
+    if let Some(training_rows) = &normalization_training_rows {
         anyhow::ensure!(
-            training_rows.start < training_rows.end && training_rows.end <= n_samples,
-            "normalization training rows {:?} are outside 0..{n_samples}",
+            !contract_blocks.is_empty(),
+            "normalization training range {:?} supports no feature columns",
             training_rows
         );
-        if opts.drop_columns_without_normalization_training_support {
-            let mut dropped = Vec::new();
-            for block in &mut blocks {
-                dropped.extend(retain_columns_with_normalization_training_support(
-                    &mut block.columns,
-                    training_rows.clone(),
-                )?);
-            }
-            blocks.retain(|block| !block.columns.is_empty());
-            anyhow::ensure!(
-                !blocks.is_empty(),
-                "normalization training range {:?} supports no feature columns",
-                training_rows
+        if !dropped.is_empty() {
+            tracing::info!(
+                target: "neoethos_data::prepare_multitimeframe_features",
+                dropped_columns = dropped.len(),
+                retained_columns,
+                training_start = training_rows.start,
+                training_end = training_rows.end,
+                "projected columns without normalization support in the exact training range"
             );
-            if !dropped.is_empty() {
-                let retained = blocks
-                    .iter()
-                    .map(|block| block.columns.len())
-                    .sum::<usize>();
-                tracing::info!(
-                    target: "neoethos_data::prepare_multitimeframe_features",
-                    dropped_columns = dropped.len(),
-                    retained_columns = retained,
-                    training_start = training_rows.start,
-                    training_end = training_rows.end,
-                    "projected columns without normalization support in the exact training range"
-                );
-            }
-        }
-        for block in &mut blocks {
-            for column in &mut block.columns {
-                normalization_fits.push(crate::core::normalization::normalize_feature_column_f64(
-                    column,
-                    training_rows.clone(),
-                )?);
-            }
         }
     }
-
     let (plan, provenance, source_leases) = build_multitimeframe_feature_contract(
-        &blocks,
+        &contract_blocks,
+        feature_math_authority,
         normalize.then_some(normalization_fits.as_slice()),
     )?;
-    let columns = blocks
-        .into_iter()
-        .flat_map(|block| block.columns)
-        .collect::<Vec<_>>();
-    let est_features = columns.len();
-    let cube_bytes = (n_samples as u64)
-        .saturating_mul(est_features as u64)
-        .saturating_mul(
-            (std::mem::size_of::<f64>() + std::mem::size_of::<FeatureCellValidity>()) as u64,
-        );
-    let in_ram = should_build_cube_in_ram(cube_bytes);
-    tracing::info!(
-        target: "neoethos_data::prepare_multitimeframe_features",
-        symbol = %ds.symbol,
-        base_tf = base_tf,
-        rows = n_samples,
-        features = est_features,
-        timeframes = 1 + active_higher.len(),
-        est_cube_gb = format!("{:.2}", cube_bytes as f64 / 1e9),
-        available_ram_gb = format!("{:.1}", neoethos_core::available_memory_bytes() as f64 / 1e9),
-        sink = if in_ram { "RAM (f64 + validity)" } else { "Vortex scratch" },
-        "feature cube build plan"
-    );
-    if in_ram {
-        return FeatureFrame::from_canonical_columns(
-            base_ns.clone(),
-            columns,
-            plan,
-            provenance,
-            source_leases,
-        );
+    match sink {
+        MultiTimeframeFeatureSink::InMemory { columns } => {
+            FeatureFrame::from_canonical_columns(base_ns, columns, plan, provenance, source_leases)
+        }
+        MultiTimeframeFeatureSink::Vortex { shards, .. } => {
+            let stores = std::sync::Arc::new(
+                crate::core::vortex_feature_store::VortexFeatureStoreSet::new(shards)?,
+            );
+            FeatureFrame::from_canonical_vortex_set(
+                base_ns,
+                stores,
+                plan,
+                provenance,
+                source_leases,
+            )
+        }
     }
-
-    static RUN_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let scratch_root = vortex_feature_run_root();
-    let removed = crate::core::feature_run_lease::sweep_orphan_feature_runs(&scratch_root)?;
-    if !removed.is_empty() {
-        tracing::info!(
-            target: "neoethos_data::vortex_feature_store",
-            removed_runs = removed.len(),
-            "removed crashed Vortex feature scratch runs after acquiring their OS leases"
-        );
-    }
-    let sanitize = |value: &str| {
-        value
-            .chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .take(24)
-            .collect::<String>()
-    };
-    let run_id = format!(
-        "{}-{}-{}-{}",
-        sanitize(&ds.symbol),
-        sanitize(base_tf),
-        std::process::id(),
-        RUN_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    let feature_run = std::sync::Arc::new(crate::core::feature_run_lease::FeatureRunLease::create(
-        &scratch_root,
-        &run_id,
-    )?);
-    let store = crate::core::vortex_feature_store::VortexFeatureStore::create(
-        feature_run,
-        &base_ns,
-        &columns,
-        crate::core::vortex_feature_store::VortexFeatureStoreOptions::default(),
-    )?;
-    FeatureFrame::from_canonical_vortex(base_ns, store, plan, provenance, source_leases)
 }
 
 #[cfg(test)]
@@ -2473,16 +2672,19 @@ mod cube_assembly_tests {
     /// force-RAM value to an unrelated budget test.
     static TEST_CUBE_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn with_test_cube_mode<T>(mode: u8, f: impl FnOnce() -> T) -> T {
+    fn with_test_cube_mode<T>(mode: u8, normalization_mode: u8, f: impl FnOnce() -> T) -> T {
         let _lock = TEST_CUBE_MODE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         super::TEST_CUBE_MODE.store(mode, std::sync::atomic::Ordering::SeqCst);
+        super::TEST_NORMALIZATION_MODE
+            .store(normalization_mode, std::sync::atomic::Ordering::SeqCst);
 
         struct ResetCubeMode;
         impl Drop for ResetCubeMode {
             fn drop(&mut self) {
                 super::TEST_CUBE_MODE.store(0, std::sync::atomic::Ordering::SeqCst);
+                super::TEST_NORMALIZATION_MODE.store(0, std::sync::atomic::Ordering::SeqCst);
             }
         }
 
@@ -2596,19 +2798,21 @@ mod cube_assembly_tests {
     /// happened to have — the worst kind of non-determinism.
     #[test]
     fn ram_and_disk_cubes_are_identical() {
-        let (_root, ds) = tiny_dataset(6000);
+        let (_root, ds) = tiny_dataset(512);
         let opts = FeatureBuildOptions {
             higher_tfs: vec!["M5".to_string()],
+            normalization_training_rows: Some(0..400),
+            drop_columns_without_normalization_training_support: true,
             ..Default::default()
         };
 
         // 2026-08-10: was `NEOETHOS_FEATURE_CUBE_MODE`, now the `#[cfg(test)]`
         // seam — the forcing this test needs, without a lever production can
         // be handed by a shell.
-        let ram = with_test_cube_mode(1, || {
+        let ram = with_test_cube_mode(1, 1, || {
             prepare_multitimeframe_features_with_options(&ds, "M1", &opts).expect("in-RAM cube")
         });
-        let disk = with_test_cube_mode(2, || {
+        let disk = with_test_cube_mode(2, 1, || {
             prepare_multitimeframe_features_with_options(&ds, "M1", &opts).expect("disk cube")
         });
 
@@ -2616,10 +2820,20 @@ mod cube_assembly_tests {
             matches!(ram.data, crate::core::features::FeatureData::InMemory(_)),
             "ram mode must not touch disk"
         );
+        assert!(
+            matches!(
+                &disk.data,
+                crate::core::features::FeatureData::VortexSet(stores)
+                    if stores.shard_count() == 2
+            ),
+            "disk mode must persist one independently releasable Vortex shard per timeframe"
+        );
         assert_eq!(ram.names, disk.names, "column ORDER + names must match");
         assert_eq!(ram.timestamps, disk.timestamps);
         assert_eq!(ram.n_samples(), disk.n_samples());
         assert_eq!(ram.names.len(), disk.names.len());
+        assert_eq!(ram.plan_identity(), disk.plan_identity());
+        assert_eq!(ram.provenance_identity(), disk.provenance_identity());
         assert!(ram.n_samples() > 0 && !ram.names.is_empty());
 
         for r in 0..ram.n_samples() {
@@ -2652,7 +2866,7 @@ mod cube_assembly_tests {
     /// derivation is real rather than a constant.
     #[test]
     fn in_ram_budget_tracks_available_memory() {
-        with_test_cube_mode(0, || {
+        with_test_cube_mode(0, 0, || {
             // The decision must scale with the cube AND the machine — not a fixed
             // fraction. A byte-sized cube always fits; an absurd one never does.
             assert!(should_build_cube_in_ram(1));

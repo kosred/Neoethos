@@ -119,6 +119,60 @@ pub fn production_feature_producer_manifest_v1()
     }
 }
 
+static QUANTITATIVE_FEATURE_PRODUCER_MANIFEST_V3: OnceLock<
+    std::result::Result<ProductionFeatureProducerManifestRowV1, FeatureContractError>,
+> = OnceLock::new();
+
+/// Distinct semantic authority for the typed Quant-v3 CPU reference used by
+/// the resident GPU exact-parity route. The ordinary production manifest stays
+/// on Quant-v2; selecting this row is an explicit whole-feature math decision.
+pub fn quantitative_feature_producer_manifest_v3()
+-> std::result::Result<&'static ProductionFeatureProducerManifestRowV1, FeatureContractError> {
+    match QUANTITATIVE_FEATURE_PRODUCER_MANIFEST_V3
+        .get_or_init(build_quantitative_feature_producer_manifest_v3)
+    {
+        Ok(row) => Ok(row),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn build_quantitative_feature_producer_manifest_v3()
+-> std::result::Result<ProductionFeatureProducerManifestRowV1, FeatureContractError> {
+    producer_row(
+        ProductionFeatureProducerId::Quantitative,
+        FeatureSource::Quantitative,
+        3,
+        vec![
+            embedded_source!(
+                "crates/neoethos-data/src/core/quant_features.rs",
+                "/src/core/quant_features.rs"
+            ),
+            embedded_source!(
+                "crates/neoethos-data/src/core/quant_exact_math_v3.rs",
+                "/src/core/quant_exact_math_v3.rs"
+            ),
+            embedded_source!(
+                "crates/neoethos-data/src/core/gpu_resident_temporal_grid_v1.rs",
+                "/src/core/gpu_resident_temporal_grid_v1.rs"
+            ),
+            embedded_source!(
+                "crates/neoethos-data/src/core/gpu_resident_quant_v3.rs",
+                "/src/core/gpu_resident_quant_v3.rs"
+            ),
+            embedded_source!(
+                "crates/neoethos-data/src/core/timestamps.rs",
+                "/src/core/timestamps.rs"
+            ),
+            embedded_source!(
+                "crates/neoethos-dataset-contracts/src/temporal.rs",
+                "/../neoethos-dataset-contracts/src/temporal.rs"
+            ),
+            embedded_source!("crates/neoethos-data/src/lib.rs", "/src/lib.rs"),
+        ],
+        Vec::new(),
+    )
+}
+
 fn build_production_manifest_v1()
 -> std::result::Result<Vec<ProductionFeatureProducerManifestRowV1>, FeatureContractError> {
     const CHRONO_CHECKSUM: [u8; 32] = [

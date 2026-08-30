@@ -458,8 +458,9 @@ impl CanonicalSearchInput {
         )
     }
 
-    /// Build the CPU V2 contract input from the exact Classic vocabulary that
-    /// the resident GPU V3 Standard profile admits. The returned receipt still
+    /// Build the CPU-authored exact-parity contract input from the feature
+    /// vocabulary and Quant-v3 semantics admitted by the resident GPU V3
+    /// Standard profile. The returned V2 envelope receipt still
     /// records the real CPU/Auto process authority and selected CPU math lane;
     /// the Data boundary refuses this call if the process was installed as
     /// GpuOnly, so CPU values cannot be mislabeled as CUDA output.

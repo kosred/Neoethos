@@ -4,11 +4,32 @@
 /// market microstructure analysis, and alpha generation.
 use super::super::Ohlcv;
 use super::features::{FeatureCellValidity, FeatureColumnF64};
+#[cfg(feature = "gpu-cuda")]
+use super::gpu_resident_quant_v3::RESIDENT_QUANT_COLUMN_NAMES_V3;
+#[cfg(feature = "gpu-cuda")]
+use super::gpu_resident_temporal_grid_v1::{
+    ASIAN_SESSION_MILLIS_V2, UTC_DAY_MILLIS_V2, admit_fixed_intraday_grid_v1,
+};
+use super::quant_exact_math_v3::quant_log_positive_f64_v3;
 use super::timestamps::{
     infer_timestamp_unit, timestamp_to_millis, validate_canonical_millisecond_timestamps,
 };
 use anyhow::{Result, ensure};
+use neoethos_dataset_contracts::CanonicalTimeframe;
 use std::collections::HashMap;
+
+// Quant-v3's resident owner is feature-gated because its production consumer
+// launches CUDA. The CPU oracle itself remains buildable without CUDA, but it
+// must execute the exact same temporal admission source rather than copy its
+// rules. This path-backed module is compiled only when the resident owner is
+// absent; a given build therefore has one temporal-grid implementation.
+#[cfg(not(feature = "gpu-cuda"))]
+#[path = "gpu_resident_temporal_grid_v1.rs"]
+mod quant_v3_temporal_grid_cpu_authority;
+#[cfg(not(feature = "gpu-cuda"))]
+use quant_v3_temporal_grid_cpu_authority::{
+    ASIAN_SESSION_MILLIS_V2, UTC_DAY_MILLIS_V2, admit_fixed_intraday_grid_v1,
+};
 
 /// Bars per trading day, derived from the actual timestamp spacing (audit
 /// D04). The "previous day / previous week" levels used a hardcoded 24 / 120
@@ -1284,6 +1305,521 @@ pub fn compute_quant_feature_columns_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureCol
             FeatureColumnF64::new(name, values, validity)
         })
         .collect()
+}
+
+const QUANT_V3_EPS: f64 = 1e-12;
+
+#[derive(Debug, Clone, Copy)]
+struct QuantV3CompletedUtcDay {
+    high: f64,
+    low: f64,
+    close: f64,
+}
+
+fn quant_v3_replace_column(
+    columns: &mut [FeatureColumnF64],
+    name: &str,
+    values: Vec<f64>,
+    validity: Vec<FeatureCellValidity>,
+) -> Result<()> {
+    let replacement = FeatureColumnF64::new(name, values, validity)?;
+    let slot = columns
+        .iter_mut()
+        .find(|column| column.name == name)
+        .ok_or_else(|| anyhow::anyhow!("Quant-v3 source omitted `{name}`"))?;
+    *slot = replacement;
+    Ok(())
+}
+
+fn quant_v3_fixed_validity(rows: usize, warmup: usize) -> Vec<FeatureCellValidity> {
+    (0..rows)
+        .map(|row| {
+            if row < warmup {
+                FeatureCellValidity::Warmup
+            } else {
+                FeatureCellValidity::Valid
+            }
+        })
+        .collect()
+}
+
+fn quant_v3_cloned_validity(
+    columns: &[FeatureColumnF64],
+    name: &str,
+) -> Result<Vec<FeatureCellValidity>> {
+    columns
+        .iter()
+        .find(|column| column.name == name)
+        .map(|column| column.validity.clone())
+        .ok_or_else(|| anyhow::anyhow!("Quant-v3 source omitted `{name}`"))
+}
+
+fn quant_v3_exact_log(value: f64) -> Result<f64> {
+    quant_log_positive_f64_v3(value)
+        .ok_or_else(|| anyhow::anyhow!("Quant-v3 exact log rejected {value}"))
+}
+
+fn quant_v3_install_exact_log_migrations(
+    bars: &Ohlcv,
+    bars_per_day: u64,
+    annualization_periods_per_year: u64,
+    columns: &mut [FeatureColumnF64],
+) -> Result<()> {
+    ensure!(
+        bars_per_day > 0,
+        "Quant-v3 admitted grid reported zero bars per UTC day"
+    );
+    let rows = bars.len();
+    let mut log_returns = vec![0.0; rows];
+    for row in 1..rows {
+        if bars.close[row - 1].abs() > 1e-10 && bars.close[row].abs() > 1e-10 {
+            log_returns[row] = quant_v3_exact_log(bars.close[row] / bars.close[row - 1])?;
+        }
+    }
+    quant_v3_replace_column(
+        columns,
+        "quant_log_return",
+        log_returns.clone(),
+        quant_v3_cloned_validity(columns, "quant_log_return")?,
+    )?;
+
+    let mut log_volatility = vec![0.0; rows];
+    for row in 0..rows {
+        let range = bars.high[row] - bars.low[row];
+        if range > 1e-10 {
+            log_volatility[row] = quant_v3_exact_log(range)?;
+        }
+    }
+    quant_v3_replace_column(
+        columns,
+        "quant_log_volatility",
+        log_volatility,
+        quant_v3_cloned_validity(columns, "quant_log_volatility")?,
+    )?;
+
+    ensure!(
+        annualization_periods_per_year >= bars_per_day,
+        "Quant-v3 admitted annualization periods are smaller than one UTC trading day"
+    );
+    let annualization_scale = (annualization_periods_per_year as f64).sqrt();
+
+    for window in [5_usize, 10, 20, 50] {
+        let mut values = vec![0.0; rows];
+        for row in window..rows {
+            let mut sum_squared = 0.0;
+            for value in &log_returns[(row - window + 1)..=row] {
+                sum_squared += value * value;
+            }
+            values[row] = (sum_squared / window as f64).sqrt() * annualization_scale;
+        }
+        quant_v3_replace_column(
+            columns,
+            &format!("quant_realized_vol_{window}"),
+            values,
+            quant_v3_fixed_validity(rows, window),
+        )?;
+    }
+
+    for window in [10_usize, 20] {
+        let mut values = vec![0.0; rows];
+        for row in window..rows {
+            let mut sum = 0.0;
+            for index in (row - window + 1)..=row {
+                if bars.open[index].abs() > 1e-10 {
+                    let up = quant_v3_exact_log(bars.high[index] / bars.open[index])?;
+                    let down = quant_v3_exact_log(bars.low[index] / bars.open[index])?;
+                    let close = quant_v3_exact_log(bars.close[index] / bars.open[index])?;
+                    sum += 0.5 * (up - down).powi(2)
+                        - (quant_v3_exact_log(2.0)? - 1.0) * close.powi(2);
+                }
+            }
+            values[row] = (sum / window as f64).abs().sqrt() * annualization_scale;
+        }
+        quant_v3_replace_column(
+            columns,
+            &format!("quant_gk_vol_{window}"),
+            values,
+            quant_v3_fixed_validity(rows, window),
+        )?;
+    }
+
+    for window in [10_usize, 20] {
+        let mut values = vec![0.0; rows];
+        for row in window..rows {
+            let mut sum = 0.0;
+            for index in (row - window + 1)..=row {
+                if bars.low[index] > 1e-10 {
+                    let high_low = quant_v3_exact_log(bars.high[index] / bars.low[index])?;
+                    sum += high_low * high_low;
+                }
+            }
+            let factor = 1.0 / (4.0 * window as f64 * quant_v3_exact_log(2.0)?);
+            values[row] = (factor * sum).sqrt() * annualization_scale;
+        }
+        quant_v3_replace_column(
+            columns,
+            &format!("quant_parkinson_vol_{window}"),
+            values,
+            quant_v3_fixed_validity(rows, window),
+        )?;
+    }
+
+    let mut vol_ratio = vec![0.0; rows];
+    let mut vol_ratio_validity = quant_v3_fixed_validity(rows, 20);
+    for row in 20..rows {
+        let mut short_squared = 0.0;
+        let mut long_squared = 0.0;
+        for value in &log_returns[(row - 4)..=row] {
+            short_squared += value * value;
+        }
+        for value in &log_returns[(row - 19)..=row] {
+            long_squared += value * value;
+        }
+        let short = (short_squared / 5.0).sqrt();
+        let long = (long_squared / 20.0).sqrt();
+        if long_squared <= QUANT_V3_EPS {
+            vol_ratio_validity[row] = FeatureCellValidity::ZeroDenominator;
+        }
+        vol_ratio[row] = if long > 1e-10 { short / long } else { 1.0 };
+    }
+    quant_v3_replace_column(columns, "quant_vol_ratio", vol_ratio, vol_ratio_validity)?;
+
+    let mut hurst = vec![0.5; rows];
+    let mut hurst_validity = quant_v3_fixed_validity(rows, 100);
+    for row in 100..rows {
+        let slice = &log_returns[(row - 99)..=row];
+        let mean = slice.iter().sum::<f64>() / 100.0;
+        let mut cumulative = Vec::with_capacity(100);
+        let mut running = 0.0;
+        for value in slice {
+            running += value - mean;
+            cumulative.push(running);
+        }
+        let spread = cumulative.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            - cumulative.iter().copied().fold(f64::INFINITY, f64::min);
+        let variance = slice
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / 99.0;
+        let deviation = variance.sqrt();
+        if deviation <= QUANT_V3_EPS || spread <= QUANT_V3_EPS {
+            hurst_validity[row] = FeatureCellValidity::ZeroDenominator;
+            continue;
+        }
+        hurst[row] =
+            (quant_v3_exact_log(spread / deviation)? / quant_v3_exact_log(100.0)?).clamp(0.0, 1.0);
+    }
+    quant_v3_replace_column(columns, "quant_hurst_100", hurst, hurst_validity)?;
+
+    for lag in [1_usize, 5, 10] {
+        let mut autocorrelation = vec![0.0; rows];
+        let mut autocorrelation_validity = quant_v3_fixed_validity(rows, 50 + lag);
+        for row in (50 + lag)..rows {
+            let slice = &log_returns[(row - 49)..=row];
+            let mean = slice.iter().sum::<f64>() / 50.0;
+            let mut numerator = 0.0;
+            let mut denominator = 0.0;
+            for offset in lag..50 {
+                let current = slice[offset] - mean;
+                let lagged = slice[offset - lag] - mean;
+                numerator += current * lagged;
+                denominator += current * current;
+            }
+            if denominator <= QUANT_V3_EPS {
+                autocorrelation_validity[row] = FeatureCellValidity::ZeroDenominator;
+            }
+            autocorrelation[row] = if denominator.abs() > QUANT_V3_EPS {
+                numerator / denominator
+            } else {
+                0.0
+            }
+            .clamp(-1.0, 1.0);
+        }
+        quant_v3_replace_column(
+            columns,
+            &format!("quant_autocorr_{lag}"),
+            autocorrelation,
+            autocorrelation_validity,
+        )?;
+    }
+
+    let mut skewness = vec![0.0; rows];
+    let mut kurtosis = vec![0.0; rows];
+    let mut skewness_validity = quant_v3_fixed_validity(rows, 30);
+    let mut kurtosis_validity = quant_v3_fixed_validity(rows, 30);
+    for row in 30..rows {
+        let slice = &log_returns[(row - 29)..=row];
+        let mean = slice.iter().sum::<f64>() / 30.0;
+        let mut second = 0.0;
+        let mut third = 0.0;
+        let mut fourth = 0.0;
+        for value in slice {
+            let deviation = value - mean;
+            second += deviation * deviation;
+            third += deviation * deviation * deviation;
+            fourth += deviation * deviation * deviation * deviation;
+        }
+        second /= 30.0;
+        third /= 30.0;
+        fourth /= 30.0;
+        let standard_deviation = second.sqrt();
+        if standard_deviation <= QUANT_V3_EPS {
+            skewness_validity[row] = FeatureCellValidity::ZeroDenominator;
+            kurtosis_validity[row] = FeatureCellValidity::ZeroDenominator;
+            continue;
+        }
+        skewness[row] = (third / standard_deviation.powi(3)).clamp(-10.0, 10.0);
+        kurtosis[row] = (fourth / standard_deviation.powi(4) - 3.0).clamp(-10.0, 50.0);
+    }
+    quant_v3_replace_column(columns, "quant_skewness_30", skewness, skewness_validity)?;
+    quant_v3_replace_column(columns, "quant_kurtosis_30", kurtosis, kurtosis_validity)?;
+
+    let mut fractal_dimension = vec![1.5; rows];
+    for row in 30..rows {
+        let slice = &bars.close[(row - 30)..=row];
+        let maximum = slice.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let minimum = slice.iter().copied().fold(f64::INFINITY, f64::min);
+        if maximum - minimum > 1e-10 {
+            let mut sign_changes = 0_usize;
+            for offset in 2..slice.len() {
+                let current = slice[offset] - slice[offset - 1];
+                let previous = slice[offset - 1] - slice[offset - 2];
+                if current * previous < 0.0 {
+                    sign_changes += 1;
+                }
+            }
+            let points = slice.len() as f64;
+            let sign_changes = sign_changes as f64;
+            let numerator = quant_v3_exact_log(points)?;
+            let denominator =
+                numerator + quant_v3_exact_log(points / (points + 0.4 * sign_changes))?;
+            fractal_dimension[row] = (numerator / denominator).clamp(1.0, 2.0);
+        }
+    }
+    quant_v3_replace_column(
+        columns,
+        "quant_fractal_dim",
+        fractal_dimension,
+        quant_v3_cloned_validity(columns, "quant_fractal_dim")?,
+    )?;
+    Ok(())
+}
+
+fn quant_v3_install_temporal_migrations(
+    bars: &Ohlcv,
+    columns: &mut [FeatureColumnF64],
+) -> Result<()> {
+    const NAMES: [&str; 14] = [
+        "quant_prev_day_h_dist",
+        "quant_prev_day_l_dist",
+        "quant_prev_week_h_dist",
+        "quant_prev_week_l_dist",
+        "quant_orb_4",
+        "quant_orb_8",
+        "quant_orb_12",
+        "quant_pivot_dist",
+        "quant_r1_dist",
+        "quant_r2_dist",
+        "quant_s1_dist",
+        "quant_s2_dist",
+        "quant_cam_r3_dist",
+        "quant_cam_s3_dist",
+    ];
+    let rows = bars.len();
+    let timestamps = bars
+        .timestamp
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Quant-v3 requires canonical millisecond timestamps"))?;
+    let mut values: [Vec<f64>; 14] = std::array::from_fn(|_| vec![0.0; rows]);
+    let mut validity: [Vec<FeatureCellValidity>; 14] =
+        std::array::from_fn(|_| vec![FeatureCellValidity::Warmup; rows]);
+
+    let mut completed_days: [Option<QuantV3CompletedUtcDay>; 5] = [None; 5];
+    let mut completed_day_count = 0_usize;
+    let mut current_day_key = timestamps[0].div_euclid(UTC_DAY_MILLIS_V2);
+    let mut current_day = QuantV3CompletedUtcDay {
+        high: f64::NEG_INFINITY,
+        low: f64::INFINITY,
+        close: bars.close[0],
+    };
+    let mut orb_count = 0_usize;
+    let mut orb_high = [f64::NEG_INFINITY; 3];
+    let mut orb_low = [f64::INFINITY; 3];
+    let orb_thresholds = [4_usize, 8, 12];
+
+    for row in 0..rows {
+        let day_key = timestamps[row].div_euclid(UTC_DAY_MILLIS_V2);
+        if day_key != current_day_key {
+            if completed_day_count < completed_days.len() {
+                completed_days[completed_day_count] = Some(current_day);
+                completed_day_count += 1;
+            } else {
+                completed_days.rotate_left(1);
+                completed_days[completed_days.len() - 1] = Some(current_day);
+            }
+            current_day_key = day_key;
+            current_day = QuantV3CompletedUtcDay {
+                high: f64::NEG_INFINITY,
+                low: f64::INFINITY,
+                close: bars.close[row],
+            };
+            orb_count = 0;
+            orb_high.fill(f64::NEG_INFINITY);
+            orb_low.fill(f64::INFINITY);
+        }
+
+        if completed_day_count > 0 {
+            let previous = completed_days[(completed_day_count - 1).min(4)]
+                .expect("completed-day ring is dense");
+            let previous_range = previous.high - previous.low;
+            for index in [0_usize, 1] {
+                validity[index][row] = if previous_range <= QUANT_V3_EPS {
+                    FeatureCellValidity::ZeroDenominator
+                } else {
+                    FeatureCellValidity::Valid
+                };
+            }
+            let denominator = previous_range.max(1e-10);
+            values[0][row] = (bars.close[row] - previous.high) / denominator;
+            values[1][row] = (bars.close[row] - previous.low) / denominator;
+
+            let pivot = (previous.high + previous.low + previous.close) / 3.0;
+            let r1 = 2.0 * pivot - previous.low;
+            let r2 = pivot + previous_range;
+            let s1 = 2.0 * pivot - previous.high;
+            let s2 = pivot - previous_range;
+            let cam_r3 = previous.close + previous_range * 1.1 / 4.0;
+            let cam_s3 = previous.close - previous_range * 1.1 / 4.0;
+            let current_range = bars.high[row] - bars.low[row];
+            let current_denominator = current_range.max(1e-10);
+            for index in 7..14 {
+                validity[index][row] = if current_range <= QUANT_V3_EPS {
+                    FeatureCellValidity::ZeroDenominator
+                } else {
+                    FeatureCellValidity::Valid
+                };
+            }
+            for (slot, level) in [pivot, r1, r2, s1, s2, cam_r3, cam_s3]
+                .into_iter()
+                .enumerate()
+            {
+                values[7 + slot][row] = (bars.close[row] - level) / current_denominator;
+            }
+        }
+
+        if completed_day_count == completed_days.len() {
+            let mut week_high = f64::NEG_INFINITY;
+            let mut week_low = f64::INFINITY;
+            for day in completed_days.into_iter().flatten() {
+                week_high = week_high.max(day.high);
+                week_low = week_low.min(day.low);
+            }
+            let week_range = week_high - week_low;
+            for index in [2_usize, 3] {
+                validity[index][row] = if week_range <= QUANT_V3_EPS {
+                    FeatureCellValidity::ZeroDenominator
+                } else {
+                    FeatureCellValidity::Valid
+                };
+            }
+            let denominator = week_range.max(1e-10);
+            values[2][row] = (bars.close[row] - week_high) / denominator;
+            values[3][row] = (bars.close[row] - week_low) / denominator;
+        }
+
+        for (slot, threshold) in orb_thresholds.into_iter().enumerate() {
+            if orb_count >= threshold {
+                validity[4 + slot][row] = FeatureCellValidity::Valid;
+                values[4 + slot][row] = if bars.close[row] > orb_high[slot] {
+                    1.0
+                } else if bars.close[row] < orb_low[slot] {
+                    -1.0
+                } else {
+                    0.0
+                };
+            }
+        }
+        let millis_in_day = timestamps[row].rem_euclid(UTC_DAY_MILLIS_V2);
+        if millis_in_day < ASIAN_SESSION_MILLIS_V2 {
+            for (slot, threshold) in orb_thresholds.into_iter().enumerate() {
+                if orb_count < threshold {
+                    orb_high[slot] = orb_high[slot].max(bars.high[row]);
+                    orb_low[slot] = orb_low[slot].min(bars.low[row]);
+                }
+            }
+            orb_count += 1;
+        }
+
+        current_day.high = current_day.high.max(bars.high[row]);
+        current_day.low = current_day.low.min(bars.low[row]);
+        current_day.close = bars.close[row];
+    }
+
+    for index in 0..NAMES.len() {
+        quant_v3_replace_column(
+            columns,
+            NAMES[index],
+            std::mem::take(&mut values[index]),
+            std::mem::take(&mut validity[index]),
+        )?;
+    }
+    Ok(())
+}
+
+/// Typed CPU authority for the exact resident Quant semantic-v3 graph.
+///
+/// Unlike the compatibility `compute_quant_feature_columns_f64` entrypoint,
+/// this requires an explicit fixed intraday timeframe, validates every source
+/// timestamp against that grid, annualizes per-bar volatility with
+/// `sqrt(252 * bars_per_UTC_day)`, and materializes the UTC-day/Asian-session
+/// routes. Its operation order is shared with the frozen CPU/CUDA parity
+/// oracle; invalid cells retain explicit validity and canonical NaN payloads.
+pub fn compute_quant_feature_columns_v3_f64(
+    ohlcv: &Ohlcv,
+    timeframe: CanonicalTimeframe,
+) -> Result<Vec<FeatureColumnF64>> {
+    let timeframe_millis = timeframe.fixed_duration_ms().ok_or_else(|| {
+        anyhow::anyhow!("Quant-v3 requires a fixed intraday timeframe, got {timeframe}")
+    })?;
+    let timestamps = ohlcv
+        .timestamp
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Quant-v3 requires canonical millisecond timestamps"))?;
+    let admitted_grid = admit_fixed_intraday_grid_v1(timeframe_millis, timestamps)
+        .map_err(|error| anyhow::anyhow!("Quant-v3 temporal admission failed: {error}"))?;
+    ensure!(
+        admitted_grid.timeframe_millis()
+            == u64::try_from(timeframe_millis)
+                .map_err(|_| anyhow::anyhow!("Quant-v3 timeframe width overflow"))?
+            && admitted_grid.bars_per_asian_session() > 0
+            && admitted_grid.bars_per_trading_week() >= admitted_grid.bars_per_utc_day(),
+        "Quant-v3 temporal admission returned an internally inconsistent grid receipt"
+    );
+    let mut columns = compute_quant_feature_columns_f64(ohlcv)?;
+    quant_v3_install_exact_log_migrations(
+        ohlcv,
+        admitted_grid.bars_per_utc_day(),
+        admitted_grid.annualization_periods_per_year(),
+        &mut columns,
+    )?;
+    quant_v3_install_temporal_migrations(ohlcv, &mut columns)?;
+    #[cfg(feature = "gpu-cuda")]
+    ensure!(
+        columns.len() == RESIDENT_QUANT_COLUMN_NAMES_V3.len()
+            && columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .eq(RESIDENT_QUANT_COLUMN_NAMES_V3),
+        "Quant-v3 CPU authority schema does not match the exact resident 63-column order"
+    );
+    #[cfg(not(feature = "gpu-cuda"))]
+    ensure!(
+        columns.len() == 63,
+        "Quant-v3 CPU authority schema width is {}, expected 63",
+        columns.len()
+    );
+    Ok(columns)
 }
 
 #[cfg(test)]

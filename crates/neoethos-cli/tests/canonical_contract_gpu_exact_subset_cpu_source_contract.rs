@@ -58,7 +58,7 @@ fn contract_builder_uses_the_resident_v3_classic_subset_as_a_cpu_reference() {
     );
     let shared_data_builder = function_body(
         &data,
-        "fn prepare_multitimeframe_features_with_classic_plan_authority_v3(",
+        "fn prepare_multitimeframe_features_with_feature_math_authority_v3(",
     );
     assert!(
         shared_data_builder

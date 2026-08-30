@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use neoethos_data::core::feature_run_lease::FeatureRunLease;
 use neoethos_data::core::features::{FeatureCellValidity, FeatureColumnF64};
-use neoethos_data::core::vortex_feature_store::{VortexFeatureStore, VortexFeatureStoreOptions};
+use neoethos_data::core::vortex_feature_store::{
+    VortexFeatureStore, VortexFeatureStoreOptions, VortexFeatureStoreSet,
+};
 
 fn unique_root(label: &str) -> Result<PathBuf> {
     let nonce = SystemTime::now()
@@ -183,5 +185,148 @@ fn vortex_store_preserves_values_that_an_f32_narrowing_would_destroy() -> Result
     }
     drop(store);
     std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+#[test]
+fn vortex_store_set_preserves_arbitrary_global_projection_order_and_cell_contract() -> Result<()> {
+    let root = unique_root("set-contract")?;
+    let first_lease = Arc::new(FeatureRunLease::create(&root, "set-first")?);
+    let second_lease = Arc::new(FeatureRunLease::create(&root, "set-second")?);
+    let first_columns = fixture_columns()?;
+    let second_columns = vec![
+        FeatureColumnF64::new(
+            "second_exact",
+            vec![9.0, f64::NAN, 7.0, 6.0, f64::NAN, 4.0],
+            vec![
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::AlignmentMissing,
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::ComputeFailure,
+                FeatureCellValidity::Valid,
+            ],
+        )?,
+        FeatureColumnF64::new(
+            "second_precise",
+            vec![
+                std::f64::consts::E,
+                1.000_000_000_000_000_2,
+                f64::NAN,
+                -std::f64::consts::PI,
+                0.0,
+                42.000_000_000_000_01,
+            ],
+            vec![
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::Gap,
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::Valid,
+                FeatureCellValidity::Valid,
+            ],
+        )?,
+    ];
+    let options = VortexFeatureStoreOptions {
+        chunk_rows: 2,
+        decoded_cache_bytes: 64 * 1024,
+    };
+    let first = VortexFeatureStore::create(
+        Arc::clone(&first_lease),
+        &timestamps(),
+        &first_columns,
+        options,
+    )?;
+    let second = VortexFeatureStore::create(
+        Arc::clone(&second_lease),
+        &timestamps(),
+        &second_columns,
+        options,
+    )?;
+    let stores = VortexFeatureStoreSet::new(vec![Arc::clone(&first), Arc::clone(&second)])?;
+
+    assert_eq!(stores.shard_count(), 2);
+    assert_eq!(
+        stores.names(),
+        ["exact", "high_precision", "second_exact", "second_precise"]
+    );
+    assert_eq!(stores.n_samples(), timestamps().len());
+
+    let projection = stores.project(&[2, 0, 3, 1], 1..5)?;
+    assert_eq!(projection.timestamps, timestamps()[1..5]);
+    assert_eq!(projection.row_ids, [1, 2, 3, 4]);
+    assert_eq!(
+        projection
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        ["second_exact", "exact", "second_precise", "high_precision"]
+    );
+    for (actual, expected) in projection.columns.iter().zip([
+        &second_columns[0],
+        &first_columns[0],
+        &second_columns[1],
+        &first_columns[1],
+    ]) {
+        assert_eq!(actual.validity, expected.validity[1..5]);
+        for (actual, expected) in actual.values.iter().zip(&expected.values[1..5]) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
+
+    let first_run = first_lease.run_dir().to_path_buf();
+    let second_run = second_lease.run_dir().to_path_buf();
+    drop(stores);
+    drop(first);
+    drop(second);
+    drop(first_lease);
+    drop(second_lease);
+    assert!(!first_run.exists());
+    assert!(!second_run.exists());
+    Ok(())
+}
+
+#[test]
+fn vortex_store_set_rejects_same_length_shards_with_different_timestamp_identity() -> Result<()> {
+    let root = unique_root("set-identity-mismatch")?;
+    let first_lease = Arc::new(FeatureRunLease::create(&root, "identity-first")?);
+    let second_lease = Arc::new(FeatureRunLease::create(&root, "identity-second")?);
+    let validity = vec![FeatureCellValidity::Valid; timestamps().len()];
+    let first_columns = vec![FeatureColumnF64::new(
+        "first_identity_feature",
+        vec![1.0; timestamps().len()],
+        validity.clone(),
+    )?];
+    let second_columns = vec![FeatureColumnF64::new(
+        "second_identity_feature",
+        vec![2.0; timestamps().len()],
+        validity,
+    )?];
+    let first = VortexFeatureStore::create(
+        first_lease,
+        &timestamps(),
+        &first_columns,
+        VortexFeatureStoreOptions::default(),
+    )?;
+    let shifted_timestamps = timestamps()
+        .into_iter()
+        .map(|timestamp| timestamp + 1_000)
+        .collect::<Vec<_>>();
+    let second = VortexFeatureStore::create(
+        second_lease,
+        &shifted_timestamps,
+        &second_columns,
+        VortexFeatureStoreOptions::default(),
+    )?;
+
+    let error = VortexFeatureStoreSet::new(vec![first, second])
+        .expect_err("different timestamp identities must fail when the set is constructed");
+    assert!(
+        error
+            .to_string()
+            .contains("Vortex feature shard identity mismatch"),
+        "unexpected error: {error:#}"
+    );
     Ok(())
 }

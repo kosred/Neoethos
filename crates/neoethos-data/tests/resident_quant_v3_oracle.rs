@@ -1,6 +1,8 @@
-use neoethos_data::Ohlcv;
 use neoethos_data::core::features::{FeatureCellValidity, FeatureColumnF64};
-use neoethos_data::core::quant_features::compute_quant_feature_columns_f64;
+use neoethos_data::core::quant_features::{
+    compute_quant_feature_columns_f64, compute_quant_feature_columns_v3_f64,
+};
+use neoethos_data::{CanonicalTimeframe, Ohlcv};
 
 #[path = "../src/core/quant_exact_math_v3.rs"]
 mod quant_exact_math_v3;
@@ -16,6 +18,7 @@ use resident_quant_v3_census::{
 const UTC_DAY_MILLIS: i64 = 86_400_000;
 const ASIAN_SESSION_MILLIS: i64 = 8 * 60 * 60 * 1_000;
 const M30_MILLIS: i64 = 30 * 60 * 1_000;
+#[cfg(feature = "gpu-cuda-device-fixtures")]
 const M15_MILLIS: i64 = 15 * 60 * 1_000;
 const EPS: f64 = 1e-12;
 
@@ -693,6 +696,89 @@ fn column<'a>(columns: &'a [FeatureColumnF64], name: &str) -> &'a FeatureColumnF
         .iter()
         .find(|column| column.name == name)
         .unwrap_or_else(|| panic!("missing Quant-v3 oracle column {name}"))
+}
+
+#[test]
+fn production_quant_v3_cpu_authority_matches_the_frozen_oracle() {
+    for (fixture_name, timeframe, bars) in [
+        (
+            "ordinary_m1",
+            CanonicalTimeframe::M1,
+            fixture_with_rows_at_timeframe(1_600, 60_000),
+        ),
+        (
+            "ordinary_m30",
+            CanonicalTimeframe::M30,
+            ordinary_m30_fixture(),
+        ),
+        (
+            "exact_grid_gap",
+            CanonicalTimeframe::M30,
+            exact_grid_gap_fixture(),
+        ),
+        (
+            "positive_subfloor",
+            CanonicalTimeframe::M30,
+            positive_subfloor_fixture(),
+        ),
+        (
+            "flat_close_transition",
+            CanonicalTimeframe::M30,
+            flat_close_transition_fixture(),
+        ),
+    ] {
+        let timeframe_millis = timeframe
+            .fixed_duration_ms()
+            .expect("admitted parity fixtures use fixed intraday timeframes");
+        let expected =
+            typed_quant_v3_oracle(&bars, timeframe_millis).expect("frozen typed Quant-v3 oracle");
+        let actual = compute_quant_feature_columns_v3_f64(&bars, timeframe)
+            .expect("production typed Quant-v3 CPU authority");
+        assert_eq!(actual.len(), expected.len(), "{fixture_name} width");
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.name, expected.name, "{fixture_name} name");
+            assert_eq!(
+                actual.validity, expected.validity,
+                "{fixture_name}:{} validity",
+                actual.name
+            );
+            assert_eq!(
+                actual
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{fixture_name}:{} value bits",
+                actual.name
+            );
+        }
+    }
+}
+
+#[test]
+fn production_quant_v3_rejects_nonresident_timeframes() {
+    let bars = ordinary_m30_fixture();
+    for timeframe in [
+        CanonicalTimeframe::H1,
+        CanonicalTimeframe::H4,
+        CanonicalTimeframe::H12,
+        CanonicalTimeframe::D1,
+        CanonicalTimeframe::W1,
+        CanonicalTimeframe::MN1,
+    ] {
+        let error = compute_quant_feature_columns_v3_f64(&bars, timeframe)
+            .expect_err("nonresident Quant-v3 timeframe must fail closed");
+        assert!(
+            error.to_string().contains("Quant-v3")
+                || error.to_string().contains("resident Quant-v3"),
+            "{timeframe}: {error}"
+        );
+    }
 }
 
 #[test]
