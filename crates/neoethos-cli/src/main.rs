@@ -226,6 +226,7 @@ fn main() -> Result<()> {
         "features" => cmd_features(&args[2..]),
         "prepare" => cmd_prepare(&args[2..]),
         "canonical-cost-build" => canonical_full_run::build_cost_assumptions(tail, settings),
+        "canonical-contract-build" => canonical_full_run::build_contract(tail, settings),
         "canonical-train" => canonical_full_run::train_receipt_bound(tail, settings),
         "canonical-full-run" => canonical_full_run::run(&args[2..], &startup_settings),
         "native-research" => native_research::run(tail),
@@ -4658,6 +4659,9 @@ fn print_help() {
     println!("  train --symbol EURUSD --base M1 --higher H1,H4 --horizon 1 --root data");
     println!(
         "  canonical-cost-build --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --basis-timeframe D1 --broker-symbol-contract <json> --settings-source <yaml> --out <json>"
+    );
+    println!(
+        "  canonical-contract-build --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --base-timeframe M1 --cost-assumptions <json> --broker-symbol-contract <json> --settings-source <yaml> --contract-out <json> --receipt-out <json>"
     );
     println!(
         "  canonical-full-run --authority-root <dir> --data-root <dir> --plan-sha256 <sha> \\\n         --matrix-sha256 <sha> --symbol EURUSD --base-timeframe M1 \\\n         --cost-assumptions <json> --broker-symbol-contract <json> \\\n         --settings-source <yaml> --models-dir <dir> --out <json> \\\n         --receipt-out <json>"

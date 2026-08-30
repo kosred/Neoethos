@@ -12,14 +12,11 @@ use neoethos_broker_history::{
     CanonicalTrendbarMatrixV1, CanonicalTrendbarPlanReceiptV1,
 };
 use neoethos_data::{
-    CanonicalDatasetSeriesReceiptV1, CanonicalTimeframe, SelectedDatasetGenerationV1,
-    load_exact_canonical_timeframe,
+    CanonicalDatasetSeriesReceiptV1, CanonicalTimeframe, FeatureBuildOptions,
+    SelectedDatasetGenerationV1, load_exact_canonical_timeframe,
 };
 #[cfg(feature = "gpu-nvidia-full")]
-use neoethos_data::{
-    FeatureBuildOptions, pin_exact_canonical_series_v1,
-    prepare_multitimeframe_features_with_options,
-};
+use neoethos_data::{pin_exact_canonical_series_v1, prepare_multitimeframe_features_with_options};
 #[cfg(feature = "gpu-nvidia-full")]
 use neoethos_search::historical_research::{
     HistoricalResearchArtifactClassV1, HistoricalResearchPromotionEligibilityV1,
@@ -37,6 +34,8 @@ const CANONICAL_TRAIN_SCHEMA_V1: &str = "neoethos.canonical-trendbar-training.v1
 #[cfg(feature = "gpu-nvidia-full")]
 const CANONICAL_TRAIN_RECEIPT_SCHEMA_V1: &str = "neoethos.canonical-trendbar-training-receipt.v1";
 const MAX_COST_ASSUMPTION_BYTES: u64 = 64 * 1024;
+const MAX_CONTRACT_ARTIFACT_BYTES: u64 =
+    neoethos_search::MAX_CANONICAL_RESEARCH_CONTRACT_BYTES_V1 as u64;
 #[cfg(feature = "gpu-nvidia-full")]
 const MAX_FULL_RUN_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const FULL_RUN_REQUIRED_FLAGS: [&str; 12] = [
@@ -79,6 +78,19 @@ const COST_BUILD_REQUIRED_FLAGS: [&str; 9] = [
     "--broker-symbol-contract",
     "--settings-source",
     "--out",
+];
+const CONTRACT_BUILD_REQUIRED_FLAGS: [&str; 11] = [
+    "--authority-root",
+    "--data-root",
+    "--plan-sha256",
+    "--matrix-sha256",
+    "--symbol",
+    "--base-timeframe",
+    "--cost-assumptions",
+    "--broker-symbol-contract",
+    "--settings-source",
+    "--contract-out",
+    "--receipt-out",
 ];
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -249,6 +261,165 @@ struct CanonicalCostBuildOutcomeV1<'a> {
     version: u16,
     cost_assumption_sha256: &'a str,
     path: &'a Path,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalContractBuildOutcomeV1<'a> {
+    schema: &'static str,
+    version: u16,
+    base_row_count: usize,
+    oos_from_ms: i64,
+    contract_sha256: &'a str,
+    receipt_sha256: &'a str,
+    contract_path: &'a Path,
+    receipt_path: &'a Path,
+}
+
+pub fn build_contract(args: &[String], settings: &neoethos_core::Settings) -> Result<()> {
+    validate_contract_build_args(args)?;
+    let authority_root = required_path(args, "--authority-root")?;
+    let data_root = required_path(args, "--data-root")?;
+    let plan_sha256 = required(args, "--plan-sha256")?;
+    let matrix_sha256 = required(args, "--matrix-sha256")?;
+    let symbol = required(args, "--symbol")?;
+    let base_timeframe = required(args, "--base-timeframe")?
+        .parse::<CanonicalTimeframe>()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let cost_assumption_path = required_path(args, "--cost-assumptions")?;
+    let broker_symbol_contract_path = required_path(args, "--broker-symbol-contract")?;
+    let settings_source_path = required_path(args, "--settings-source")?;
+    let contract_out = required_path(args, "--contract-out")?;
+    let receipt_out = required_path(args, "--receipt-out")?;
+    ensure_distinct_output_targets(
+        &contract_out,
+        &receipt_out,
+        &[
+            &cost_assumption_path,
+            &broker_symbol_contract_path,
+            &settings_source_path,
+        ],
+    )?;
+
+    let plan_receipt = CanonicalTrendbarPlanReceiptV1::from_sha256(plan_sha256)?;
+    let matrix_receipt = CanonicalTrendbarMatrixReceiptV1::from_sha256(matrix_sha256)?;
+    let store = CanonicalTrendbarAcquisitionStoreV1::new(authority_root);
+    let plan = store.open_plan(&plan_receipt)?;
+    let matrix = store.open_matrix(&data_root, &plan_receipt, &matrix_receipt)?;
+    let series = ensure_unique_series(&matrix, &symbol)?;
+    series.validate()?;
+    let selected_base = ensure_unique_selected_timeframe(series, base_timeframe)?;
+    let exact_base = load_exact_canonical_timeframe(&data_root, selected_base)
+        .context("open exact canonical base timeframe for discovery split")?;
+    let normalization_training_rows =
+        neoethos_search::canonical_discovery_normalization_training_rows(exact_base.ohlcv().len())?;
+
+    let cost_assumption_bytes = read_bounded_regular_file(&cost_assumption_path)?;
+    let costs: ScreeningCostEnvelopeWireV2 = serde_json::from_slice(&cost_assumption_bytes)
+        .context("decode canonical screening-cost envelope V2")?;
+    let settings_source_bytes = read_bounded_regular_file(&settings_source_path)?;
+    validate_settings_source(
+        settings,
+        &settings_source_path,
+        &settings_source_bytes,
+        &costs,
+    )?;
+    let broker_symbol_contract_bytes = read_bounded_regular_file(&broker_symbol_contract_path)?;
+    let broker_cost_facts =
+        validate_broker_symbol_contract(&broker_symbol_contract_bytes, &costs, &symbol, &plan)?;
+    let pip_value_per_lot = validate_costs(
+        &costs,
+        &symbol,
+        settings,
+        &plan,
+        &matrix,
+        &data_root,
+        broker_cost_facts,
+    )?;
+
+    let mut feature_options = canonical_feature_options(settings, base_timeframe)?;
+    feature_options.normalization_training_rows = Some(normalization_training_rows);
+    let search_input =
+        neoethos_search::data_selection::CanonicalSearchInput::from_exact_series_receipt(
+            &data_root,
+            series,
+            base_timeframe,
+            &feature_options,
+        )
+        .context("build exact canonical search input for standalone research contract")?;
+    let base_ohlcv = search_input.base_frame().ohlcv();
+    let base_row_count = base_ohlcv.len();
+    ensure!(
+        base_row_count == exact_base.ohlcv().len(),
+        "exact canonical base timeframe row count changed during contract construction"
+    );
+    let normalization_training_rows =
+        neoethos_search::canonical_discovery_normalization_training_rows(base_row_count)?;
+    ensure!(
+        feature_options.normalization_training_rows.as_ref() == Some(&normalization_training_rows),
+        "canonical feature normalization split changed during contract construction"
+    );
+    let oos_from_ms = base_ohlcv
+        .timestamp
+        .as_ref()
+        .and_then(|timestamps| timestamps.get(normalization_training_rows.end))
+        .copied()
+        .context("exact canonical base timeframe has no timestamp at the discovery OOS split")?;
+    let receipt = search_input.receipt()?;
+    validate_input_receipt_against_series(&receipt, series, base_timeframe)?;
+    let assumption_source_sha256 = format!("{:x}", Sha256::digest(&cost_assumption_bytes));
+    let contract = neoethos_search::CanonicalTrendbarResearchExecutionContractV3::new(
+        receipt.clone(),
+        neoethos_search::CanonicalTrendbarResearchCostAssumptionsV2 {
+            symbol: &costs.symbol,
+            account_currency: &costs.account_currency,
+            assumption_source_id: &costs.assumption_source_id,
+            assumption_source_sha256: &assumption_source_sha256,
+            pip_size: costs.pip_size,
+            pip_value_per_lot,
+            full_spread_pips_assumption: costs.full_spread_pips_assumption,
+            slippage_pips_per_fill_assumption: costs.slippage_pips_per_fill_assumption,
+            commission_account_per_lot_per_fill_assumption: costs
+                .commission_account_per_lot_per_fill_assumption,
+            swap_long_pips_per_day: costs.swap_long_pips_per_day,
+            swap_short_pips_per_day: costs.swap_short_pips_per_day,
+            pnl_conversion_fee_rate: costs.pnl_conversion_fee_rate,
+        },
+    )?;
+    contract.validate_against_receipt(&receipt)?;
+
+    neoethos_core::storage::json::write_json_atomic(&receipt_out, &receipt)
+        .context("publish standalone canonical search-input receipt")?;
+    neoethos_core::storage::json::write_json_atomic(&contract_out, &contract)
+        .context("publish standalone canonical research contract")?;
+    let contract_bytes = read_regular_file_with_limit(&contract_out, MAX_CONTRACT_ARTIFACT_BYTES)?;
+    let receipt_bytes = read_regular_file_with_limit(&receipt_out, MAX_CONTRACT_ARTIFACT_BYTES)?;
+    let reopened_contract: neoethos_search::CanonicalTrendbarResearchExecutionContractV3 =
+        serde_json::from_slice(&contract_bytes).context("reopen standalone research contract")?;
+    let reopened_receipt =
+        neoethos_search::CanonicalSearchInputReceiptV2::from_json_bytes(&receipt_bytes)
+            .context("reopen standalone canonical search-input receipt")?;
+    ensure!(
+        reopened_contract == contract && reopened_receipt == receipt,
+        "standalone canonical contract or receipt did not reopen exactly"
+    );
+    reopened_contract.validate_against_receipt(&reopened_receipt)?;
+    let contract_sha256 = format!("{:x}", Sha256::digest(&contract_bytes));
+    let receipt_sha256 = format!("{:x}", Sha256::digest(&receipt_bytes));
+    println!(
+        "{}",
+        serde_json::to_string(&CanonicalContractBuildOutcomeV1 {
+            schema: "neoethos.canonical-contract-build-outcome.v1",
+            version: 1,
+            base_row_count,
+            oos_from_ms,
+            contract_sha256: &contract_sha256,
+            receipt_sha256: &receipt_sha256,
+            contract_path: &contract_out,
+            receipt_path: &receipt_out,
+        })?
+    );
+    Ok(())
 }
 
 pub fn build_cost_assumptions(args: &[String], settings: &neoethos_core::Settings) -> Result<()> {
@@ -483,6 +654,23 @@ pub fn train_receipt_bound(args: &[String], settings: &neoethos_core::Settings) 
     let matrix = store.open_matrix(&data_root, &plan_receipt, &matrix_receipt)?;
     let series = ensure_unique_series(&matrix, &symbol)?;
     series.validate()?;
+
+    let selected_base = ensure_unique_selected_timeframe(series, base_timeframe)?;
+    let exact_base = load_exact_canonical_timeframe(&data_root, selected_base)
+        .context("open exact canonical base timeframe for training OOS boundary")?;
+    let exact_training_rows =
+        neoethos_search::canonical_discovery_normalization_training_rows(exact_base.ohlcv().len())?;
+    let exact_training_oos_from_ms = exact_base
+        .ohlcv()
+        .timestamp
+        .as_ref()
+        .and_then(|timestamps| timestamps.get(exact_training_rows.end))
+        .copied()
+        .context("exact canonical base timeframe has no timestamp at the training OOS split")?;
+    ensure!(
+        training_oos_from_ms == exact_training_oos_from_ms,
+        "--oos-from-ms does not equal the deterministic OOS boundary of the exact canonical base generation"
+    );
 
     let input_receipt_bytes = read_bounded_regular_file(&input_receipt_path)?;
     let input_receipt =
@@ -796,7 +984,10 @@ pub fn run(args: &[String], settings: &neoethos_core::Settings) -> Result<()> {
 
     let assumption_source_sha256 = format!("{:x}", Sha256::digest(&cost_assumption_bytes));
     let contract = neoethos_search::CanonicalTrendbarResearchExecutionContractV3::new(
-        prepared_input.receipt().clone(),
+        prepared_input
+            .cpu_receipt_v2()
+            .context("canonical full run requires a CPU receipt until the native Discovery workspace is sealed")?
+            .clone(),
         neoethos_search::CanonicalTrendbarResearchCostAssumptionsV2 {
             symbol: &costs.symbol,
             account_currency: &costs.account_currency,
@@ -1088,7 +1279,6 @@ fn ensure_unique_selected_timeframe(
     Ok(matches[0])
 }
 
-#[cfg(feature = "gpu-nvidia-full")]
 fn validate_input_receipt_against_series(
     receipt: &neoethos_search::CanonicalSearchInputReceiptV2,
     series: &CanonicalDatasetSeriesReceiptV1,
@@ -1249,7 +1439,6 @@ fn exact_source_component(role: &str, exact_bytes: &[u8]) -> CostSourceComponent
     }
 }
 
-#[cfg(feature = "gpu-nvidia-full")]
 fn canonical_feature_options(
     settings: &neoethos_core::Settings,
     base_timeframe: CanonicalTimeframe,
@@ -2124,7 +2313,6 @@ fn read_regular_file_with_limit(path: &Path, max_bytes: u64) -> Result<Vec<u8>> 
     fs::read(path).with_context(|| format!("read exact input {}", path.display()))
 }
 
-#[cfg(feature = "gpu-nvidia-full")]
 fn ensure_distinct_output_targets(
     artifact_out: &Path,
     receipt_out: &Path,
@@ -2201,6 +2389,36 @@ fn validate_cost_build_args(args: &[String]) -> Result<()> {
     ensure!(
         seen.len() == COST_BUILD_REQUIRED_FLAGS.len(),
         "canonical-cost-build omitted a required argument"
+    );
+    Ok(())
+}
+
+fn validate_contract_build_args(args: &[String]) -> Result<()> {
+    ensure!(
+        args.len() == CONTRACT_BUILD_REQUIRED_FLAGS.len() * 2,
+        "canonical-contract-build requires exactly {} flag/value pairs",
+        CONTRACT_BUILD_REQUIRED_FLAGS.len()
+    );
+    let mut seen = BTreeSet::new();
+    for pair in args.chunks_exact(2) {
+        let flag = pair[0].as_str();
+        let value = pair[1].as_str();
+        ensure!(
+            CONTRACT_BUILD_REQUIRED_FLAGS.contains(&flag),
+            "canonical-contract-build received unknown argument {flag}"
+        );
+        ensure!(
+            seen.insert(flag),
+            "canonical-contract-build argument {flag} was supplied more than once"
+        );
+        ensure!(
+            !value.trim().is_empty() && !value.starts_with("--"),
+            "canonical-contract-build argument {flag} has no value"
+        );
+    }
+    ensure!(
+        seen.len() == CONTRACT_BUILD_REQUIRED_FLAGS.len(),
+        "canonical-contract-build omitted a required argument"
     );
     Ok(())
 }
