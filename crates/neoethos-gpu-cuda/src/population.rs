@@ -3562,6 +3562,7 @@ impl PopulationSession {
         })
     }
 
+    #[cfg(test)]
     #[cfg(feature = "cuda-device-fixtures")]
     pub(crate) fn enqueue_resident_gene_metrics_fixture_v2(
         &mut self,
