@@ -1337,6 +1337,12 @@ fn map_native_plan_error_v2(
             ResidentPopulationAutoSizingErrorCodeV2::InvalidInput
         }
         neoethos_gpu_cuda::CudaPopulationError::RuntimeUnavailable
+        | neoethos_gpu_cuda::CudaPopulationError::AsyncFreeOutcomeUnknownDeliberateLeak {
+            ..
+        }
+        | neoethos_gpu_cuda::CudaPopulationError::AsyncAllocationOutcomeUnknownDeliberateLeak {
+            ..
+        }
         | neoethos_gpu_cuda::CudaPopulationError::Native { .. } => {
             ResidentPopulationAutoSizingErrorCodeV2::WorkspacePlan
         }
@@ -1782,6 +1788,25 @@ fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_async_cuda_outcomes_fail_closed_as_workspace_plan_errors() {
+        for error in [
+            neoethos_gpu_cuda::CudaPopulationError::AsyncFreeOutcomeUnknownDeliberateLeak {
+                operation: "fixture-free",
+            },
+            neoethos_gpu_cuda::CudaPopulationError::AsyncAllocationOutcomeUnknownDeliberateLeak {
+                operation: "fixture-alloc",
+            },
+        ] {
+            let mapped = map_native_plan_error_v2("population sizing", error);
+            assert_eq!(
+                mapped.code(),
+                ResidentPopulationAutoSizingErrorCodeV2::WorkspacePlan
+            );
+            assert!(mapped.to_string().contains("unknown stream-ordered"));
+        }
+    }
 
     fn refresh_fixture_workspace_bytes_v2(receipt: &mut ResidentPopulationAutoSizingReceiptV2) {
         let (gene, metrics, required, including) = receipt
