@@ -50,7 +50,7 @@ fn canonical_contract_build_seals_exact_cpu_feature_receipt_without_starting_res
         "store.open_plan(&plan_receipt)?",
         "store.open_matrix(&data_root, &plan_receipt, &matrix_receipt)?",
         "canonical_feature_options(settings, base_timeframe)?",
-        "CanonicalSearchInput::from_exact_series_receipt(",
+        "CanonicalSearchInput::from_exact_series_receipt_gpu_exact_parity_cpu_reference_v3(",
         "search_input.receipt()?",
         "CanonicalTrendbarResearchExecutionContractV3::new(",
         "contract.validate_against_receipt(&receipt)?",

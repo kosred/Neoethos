@@ -2049,12 +2049,51 @@ pub fn report_retired_env_vars() {
 /// the type are gone; see the note at the top of `core/loader.rs` for why the
 /// cache could not have been wired as designed, and what a correct one would
 /// have to key on.
+#[derive(Clone, Copy)]
+enum MultiTimeframeClassicPlanAuthorityV3 {
+    CurrentProcessPolicy,
+    #[cfg(feature = "gpu-cuda")]
+    ResidentGpuExactParityCpuReferenceV3,
+}
+
 pub fn prepare_multitimeframe_features_with_options(
     ds: &SymbolDataset,
     base_tf: &str,
     opts: &FeatureBuildOptions,
 ) -> Result<FeatureFrame> {
     prepare_multitimeframe_features_with_optional_cutoff(ds, base_tf, opts, None)
+}
+
+/// Build the canonical multi-timeframe CPU V2 feature cube with the exact
+/// ordered Classic subset admitted by the resident GPU V3 Standard profile.
+///
+/// This is an explicit contract-authoring boundary, not an adaptive fallback:
+/// it retains every non-Classic production family and all source/provenance
+/// checks while replacing only the ordinary complete Classic graph with the
+/// versioned exact-parity subset. The process feature authority must already
+/// resolve to CPU/Auto; the underlying planner refuses a GpuOnly process so
+/// CPU bits can never be sealed as CUDA output.
+#[cfg(feature = "gpu-cuda")]
+pub fn prepare_multitimeframe_features_gpu_exact_parity_cpu_reference_v3(
+    ds: &SymbolDataset,
+    base_tf: &str,
+    opts: &FeatureBuildOptions,
+) -> Result<FeatureFrame> {
+    anyhow::ensure!(
+        matches!(
+            opts.profile,
+            FeatureProfile::Standard | FeatureProfile::HPC | FeatureProfile::Adaptive
+        ),
+        "the resident GPU V3 exact-parity CPU reference supports only Standard, HPC, or \
+         Adaptive; Full must retain the complete fail-closed Classic graph"
+    );
+    prepare_multitimeframe_features_with_classic_plan_authority_v3(
+        ds,
+        base_tf,
+        opts,
+        None,
+        MultiTimeframeClassicPlanAuthorityV3::ResidentGpuExactParityCpuReferenceV3,
+    )
 }
 
 /// Build the multi-timeframe feature cube from the independently downloaded
@@ -2078,6 +2117,22 @@ fn prepare_multitimeframe_features_with_optional_cutoff(
     base_tf: &str,
     opts: &FeatureBuildOptions,
     end_exclusive_ms: Option<i64>,
+) -> Result<FeatureFrame> {
+    prepare_multitimeframe_features_with_classic_plan_authority_v3(
+        ds,
+        base_tf,
+        opts,
+        end_exclusive_ms,
+        MultiTimeframeClassicPlanAuthorityV3::CurrentProcessPolicy,
+    )
+}
+
+fn prepare_multitimeframe_features_with_classic_plan_authority_v3(
+    ds: &SymbolDataset,
+    base_tf: &str,
+    opts: &FeatureBuildOptions,
+    end_exclusive_ms: Option<i64>,
+    classic_plan_authority: MultiTimeframeClassicPlanAuthorityV3,
 ) -> Result<FeatureFrame> {
     let base_timeframe = base_tf
         .parse::<CanonicalTimeframe>()
@@ -2129,10 +2184,20 @@ fn prepare_multitimeframe_features_with_optional_cutoff(
     // producer starts, so a missing CUDA route cannot leave partial CPU/SMC
     // feature allocations behind. Every frame below borrows this exact plan;
     // falling available RAM during the build cannot narrow later timeframes.
-    let classic_run_plan = crate::core::hpc_ta::prepare_classic_ta_run_plan(
-        budget_rows,
-        crate::core::hpc_ta::resolved_indicator_compute_policy(),
-    )?;
+    let classic_run_plan = match classic_plan_authority {
+        MultiTimeframeClassicPlanAuthorityV3::CurrentProcessPolicy => {
+            crate::core::hpc_ta::prepare_classic_ta_run_plan(
+                budget_rows,
+                crate::core::hpc_ta::resolved_indicator_compute_policy(),
+            )?
+        }
+        #[cfg(feature = "gpu-cuda")]
+        MultiTimeframeClassicPlanAuthorityV3::ResidentGpuExactParityCpuReferenceV3 => {
+            crate::core::hpc_ta::prepare_classic_ta_gpu_exact_parity_cpu_reference_run_plan_v3(
+                budget_rows,
+            )?
+        }
+    };
 
     let base_source = direct_sources
         .remove(base_tf)

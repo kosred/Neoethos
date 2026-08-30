@@ -339,14 +339,28 @@ pub fn build_contract(args: &[String], settings: &neoethos_core::Settings) -> Re
 
     let mut feature_options = canonical_feature_options(settings, base_timeframe)?;
     feature_options.normalization_training_rows = Some(normalization_training_rows);
-    let search_input =
-        neoethos_search::data_selection::CanonicalSearchInput::from_exact_series_receipt(
-            &data_root,
-            series,
-            base_timeframe,
-            &feature_options,
-        )
-        .context("build exact canonical search input for standalone research contract")?;
+    let search_input = {
+        #[cfg(feature = "gpu-nvidia")]
+        {
+            neoethos_search::data_selection::CanonicalSearchInput::from_exact_series_receipt_gpu_exact_parity_cpu_reference_v3(
+                &data_root,
+                series,
+                base_timeframe,
+                &feature_options,
+            )
+            .context(
+                "build exact resident-GPU-V3-subset CPU reference input for standalone research contract",
+            )?
+        }
+        #[cfg(not(feature = "gpu-nvidia"))]
+        {
+            anyhow::bail!(
+                "canonical-contract-build requires the gpu-nvidia feature so it can seal the \
+                 exact resident GPU V3 Classic subset; the ordinary full Classic CPU graph is \
+                 not a substitute"
+            )
+        }
+    };
     let base_ohlcv = search_input.base_frame().ohlcv();
     let base_row_count = base_ohlcv.len();
     ensure!(

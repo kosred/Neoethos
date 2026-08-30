@@ -1041,6 +1041,27 @@ pub(crate) fn prepare_classic_ta_gpu_exact_parity_run_plan_v3(
     })
 }
 
+/// CPU execution authority for the exact Classic subset admitted by the
+/// resident CUDA V3 plan. This is used when a canonical CPU V2 receipt must
+/// bind the same ordered feature vocabulary that a later resident GPU V3 run
+/// will materialize. Admission is still resolved by the GPU-only planner;
+/// only execution of those already-proved nodes is switched to the CPU parity
+/// lane, and no CUDA launch authority escapes this boundary.
+#[cfg(feature = "gpu-cuda")]
+pub(crate) fn prepare_classic_ta_gpu_exact_parity_cpu_reference_run_plan_v3(
+    budget_rows: usize,
+) -> anyhow::Result<ClassicTaRunPlan> {
+    anyhow::ensure!(
+        resolved_indicator_compute_policy() != IndicatorComputePolicy::GpuOnly,
+        "the resident V3 Classic CPU reference requires a CPU/Auto process authority; \
+         refusing to label CPU feature bits with a GpuOnly receipt"
+    );
+    let mut run_plan = prepare_classic_ta_gpu_exact_parity_run_plan_v3(budget_rows)?;
+    run_plan.policy = IndicatorComputePolicy::CpuOnly;
+    run_plan.resident_cuda_launches = None;
+    Ok(run_plan)
+}
+
 /// Required-card fixture oracle for the exact versioned Classic subset.
 /// Admission is resolved through the same GpuOnly plan as production, then
 /// only the execution policy is switched to CPU so the fixture compares the
@@ -1050,10 +1071,9 @@ pub fn compute_classic_ta_gpu_exact_parity_feature_columns_for_device_fixture_v3
     ohlcv: &Ohlcv,
     budget_rows: usize,
 ) -> anyhow::Result<Vec<FeatureColumnF64>> {
-    let mut run_plan =
-        prepare_classic_ta_gpu_exact_parity_run_plan_v3(budget_rows.max(ohlcv.len()))?;
-    run_plan.policy = IndicatorComputePolicy::CpuOnly;
-    run_plan.resident_cuda_launches = None;
+    let run_plan = prepare_classic_ta_gpu_exact_parity_cpu_reference_run_plan_v3(
+        budget_rows.max(ohlcv.len()),
+    )?;
     compute_classic_ta_feature_columns_f64_with_run_plan(ohlcv, &run_plan)
 }
 

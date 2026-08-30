@@ -449,6 +449,47 @@ impl CanonicalSearchInput {
         base_timeframe: CanonicalTimeframe,
         options: &FeatureBuildOptions,
     ) -> Result<CanonicalSearchInput, CanonicalDataSelectionError> {
+        Self::from_exact_series_receipt_with_builder_v3(
+            root,
+            series,
+            base_timeframe,
+            options,
+            prepare_multitimeframe_features_with_options,
+        )
+    }
+
+    /// Build the CPU V2 contract input from the exact Classic vocabulary that
+    /// the resident GPU V3 Standard profile admits. The returned receipt still
+    /// records the real CPU/Auto process authority and selected CPU math lane;
+    /// the Data boundary refuses this call if the process was installed as
+    /// GpuOnly, so CPU values cannot be mislabeled as CUDA output.
+    #[cfg(feature = "gpu-cuda")]
+    pub fn from_exact_series_receipt_gpu_exact_parity_cpu_reference_v3(
+        root: impl AsRef<Path>,
+        series: &CanonicalDatasetSeriesReceiptV1,
+        base_timeframe: CanonicalTimeframe,
+        options: &FeatureBuildOptions,
+    ) -> Result<CanonicalSearchInput, CanonicalDataSelectionError> {
+        Self::from_exact_series_receipt_with_builder_v3(
+            root,
+            series,
+            base_timeframe,
+            options,
+            neoethos_data::prepare_multitimeframe_features_gpu_exact_parity_cpu_reference_v3,
+        )
+    }
+
+    fn from_exact_series_receipt_with_builder_v3(
+        root: impl AsRef<Path>,
+        series: &CanonicalDatasetSeriesReceiptV1,
+        base_timeframe: CanonicalTimeframe,
+        options: &FeatureBuildOptions,
+        build_features: fn(
+            &SymbolDataset,
+            &str,
+            &FeatureBuildOptions,
+        ) -> anyhow::Result<FeatureFrame>,
+    ) -> Result<CanonicalSearchInput, CanonicalDataSelectionError> {
         series
             .validate()
             .map_err(|error| CanonicalDataSelectionError::DatasetOpenFailed {
@@ -512,10 +553,11 @@ impl CanonicalSearchInput {
         let feature_execution = CanonicalFeatureExecutionReceiptV1::from_runtime_authority(
             resolved_canonical_feature_execution_authority_v1(),
         );
-        let features = prepare_multitimeframe_features_with_options(&dataset, base_name, options)
-            .map_err(|error| CanonicalDataSelectionError::FeatureBuildFailed {
-            anchor_id: anchor.to_path_component(),
-            detail: error.to_string(),
+        let features = build_features(&dataset, base_name, options).map_err(|error| {
+            CanonicalDataSelectionError::FeatureBuildFailed {
+                anchor_id: anchor.to_path_component(),
+                detail: error.to_string(),
+            }
         })?;
         let execution_after_build = CanonicalFeatureExecutionReceiptV1::from_runtime_authority(
             resolved_canonical_feature_execution_authority_v1(),
