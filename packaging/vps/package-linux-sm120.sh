@@ -270,14 +270,16 @@ for executable_name in neoethos-app neoethos-cli; do
   if grep -Fq 'not found' "${BUNDLE_DIR}/evidence/${executable_name}.ldd.txt"; then
     fail "${executable_name} has an unresolved dynamic dependency"
   fi
-  for tree_runtime in libxgboost.so libcatboostmodel.so; do
-    resolved_path="$(awk -v library="${tree_runtime}" \
-      '$1 == library && $2 == "=>" { print $3; exit }' \
-      "${BUNDLE_DIR}/evidence/${executable_name}.ldd.txt")"
-    [[ -n "${resolved_path}" ]] || fail "${executable_name} did not resolve ${tree_runtime}"
-    [[ "$(realpath "${resolved_path}")" == "$(realpath "${BUNDLE_DIR}/${tree_runtime}")" ]] \
-      || fail "${executable_name} resolved ${tree_runtime} outside the bundle: ${resolved_path}"
-  done
+done
+
+CLI_LDD_EVIDENCE="${BUNDLE_DIR}/evidence/neoethos-cli.ldd.txt"
+for tree_runtime in libxgboost.so libcatboostmodel.so; do
+  resolved_path="$(awk -v library="${tree_runtime}" \
+    '$1 == library && $2 == "=>" { print $3; exit }' \
+    "${CLI_LDD_EVIDENCE}")"
+  [[ -n "${resolved_path}" ]] || fail "neoethos-cli did not resolve ${tree_runtime}"
+  [[ "$(realpath "${resolved_path}")" == "$(realpath "${BUNDLE_DIR}/${tree_runtime}")" ]] \
+    || fail "neoethos-cli resolved ${tree_runtime} outside the bundle: ${resolved_path}"
 done
 
 env -u LD_LIBRARY_PATH "${BUNDLE_DIR}/neoethos-app" --version \

@@ -101,6 +101,39 @@ fn native_and_cuda_runtimes_are_adjacent_and_driver_library_is_forbidden() {
 }
 
 #[test]
+fn ldd_requires_training_libraries_only_for_cli() {
+    let script = packaging_script();
+
+    require_all(
+        &script,
+        &[
+            "for executable_name in neoethos-app neoethos-cli; do",
+            "fail \"${executable_name} has an unresolved dynamic dependency\"",
+            "CLI_LDD_EVIDENCE=\"${BUNDLE_DIR}/evidence/neoethos-cli.ldd.txt\"",
+            "for tree_runtime in libxgboost.so libcatboostmodel.so; do",
+            "\"${CLI_LDD_EVIDENCE}\"",
+            "fail \"neoethos-cli did not resolve ${tree_runtime}\"",
+            "fail \"neoethos-cli resolved ${tree_runtime} outside the bundle: ${resolved_path}\"",
+        ],
+    );
+
+    let both_binaries = script
+        .find("for executable_name in neoethos-app neoethos-cli; do")
+        .expect("shared app/CLI loader validation");
+    let cli_training_libraries = script
+        .find("CLI_LDD_EVIDENCE=\"${BUNDLE_DIR}/evidence/neoethos-cli.ldd.txt\"")
+        .expect("CLI-only training-library validation");
+    let version_checks = script
+        .find("env -u LD_LIBRARY_PATH \"${BUNDLE_DIR}/neoethos-app\" --version")
+        .expect("post-loader version checks");
+    assert!(both_binaries < cli_training_libraries && cli_training_libraries < version_checks);
+    assert!(
+        !script.contains("fail \"${executable_name} did not resolve ${tree_runtime}\""),
+        "training-only libraries must not be required from neoethos-app"
+    );
+}
+
+#[test]
 fn wrappers_pin_config_metadata_and_gpu_requirement_to_bundle_paths() {
     let script = packaging_script();
 
