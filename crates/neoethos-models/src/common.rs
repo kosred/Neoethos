@@ -16,6 +16,46 @@
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 
+/// ROCm aliases are intentionally separate from CUDA normalization: explicit
+/// NVIDIA requests must remain visible and fail in a ROCm-only neural build.
+pub fn normalize_rocm_device_policy(policy: &str) -> String {
+    let value = policy.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "default" => "auto".into(),
+        "hip" | "gpu" => "rocm".into(),
+        _ => value
+            .strip_prefix("hip:")
+            .or_else(|| value.strip_prefix("gpu:"))
+            .map(|ordinal| format!("rocm:{ordinal}"))
+            .unwrap_or(value),
+    }
+}
+
+/// Checked against CubeCL 0.10 AmdDevice's u16 DeviceId representation. This
+/// only parses intent; it does not assert a device exists or permit fallback.
+pub fn parse_rocm_device_ordinal(policy: &str) -> Result<usize> {
+    let normalized = normalize_rocm_device_policy(policy);
+    let ordinal = match normalized.as_str() {
+        "auto" | "rocm" => 0,
+        value if value.starts_with("rocm:") => {
+            let digits = &value[5..];
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                bail!("invalid explicit ROCm device policy `{policy}`");
+            }
+            digits
+                .parse::<usize>()
+                .context("ROCm device ordinal overflow")?
+        }
+        _ => bail!(
+            "native ROCm cannot honor device policy `{policy}`; select the matching CPU or CUDA build explicitly"
+        ),
+    };
+    if ordinal > u16::MAX as usize {
+        bail!("ROCm device ordinal exceeds CubeCL's exact u16 device identity");
+    }
+    Ok(ordinal)
+}
+
 /// Operator intent for an NVIDIA CUDA execution path.
 ///
 /// This type is deliberately CUDA-specific. Vendor-neutral labels such as
@@ -42,8 +82,8 @@ pub fn parse_cuda_device_policy(policy: &str) -> Result<CudaDevicePolicy> {
         "" | "auto" => Ok(CudaDevicePolicy::Auto),
         "cpu" => Ok(CudaDevicePolicy::Cpu),
         "gpu" | "cuda" | "nvidia" => Ok(CudaDevicePolicy::Gpu { ordinal: 0 }),
-        "rocm" | "metal" | "vulkan" | "wgpu" => {
-            bail!("ROCm device policies cannot select a CUDA backend: `{policy}`")
+        "rocm" | "hip" | "metal" | "vulkan" | "wgpu" | "dx12" => {
+            bail!("non-CUDA device policy cannot select a CUDA backend: `{policy}`")
         }
         _ => {
             for prefix in ["gpu:", "cuda:", "nvidia:"] {
@@ -57,11 +97,11 @@ pub fn parse_cuda_device_policy(policy: &str) -> Result<CudaDevicePolicy> {
                     return Ok(CudaDevicePolicy::Gpu { ordinal });
                 }
             }
-            if ["rocm:", "metal:", "vulkan:", "wgpu:"]
+            if ["rocm:", "hip:", "metal:", "vulkan:", "wgpu:", "dx12:"]
                 .iter()
                 .any(|prefix| normalized.starts_with(prefix))
             {
-                bail!("ROCm device policies cannot select a CUDA backend: `{policy}`");
+                bail!("non-CUDA device policy cannot select a CUDA backend: `{policy}`");
             }
             bail!(
                 "unsupported CUDA device policy `{policy}`; expected auto, cpu, gpu[:N], cuda[:N], or nvidia[:N]"
@@ -185,43 +225,24 @@ pub fn cuda_kernel_units(max_units: u32) -> u32 {
     max_units.max(1)
 }
 
-/// Collapse vendor-specific device labels into the canonical
-/// `auto|cpu|gpu|gpu:N` set used by the runtime capability layer.
+/// Normalize CUDA labels into the canonical `auto|cpu|gpu|gpu:N` set used by
+/// the runtime capability layer.
 ///
-/// `extra_prefixes` lets callers extend the recognised vendor set
-/// (e.g. burn passes `["wgpu"]` because the burn backend accepts the
-/// `wgpu:N` form that statistical / runtime callers do not).
-///
-/// Unknown tokens are returned unchanged (lowercased) so callers can
-/// layer their own validation on top.
-pub fn normalize_vendor_device_policy(policy: &str, extra_prefixes: &[&str]) -> String {
+/// Retired or future vendor tokens are returned unchanged so the CUDA parser
+/// or family-specific caller can reject them; they are never aliased to CUDA.
+pub fn normalize_vendor_device_policy(policy: &str, _extra_prefixes: &[&str]) -> String {
     let normalized = policy.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         return "auto".to_string();
     }
-    if matches!(
-        normalized.as_str(),
-        "cuda" | "rocm" | "metal" | "vulkan" | "nvidia"
-    ) || extra_prefixes.contains(&normalized.as_str())
-    {
+    if matches!(normalized.as_str(), "cuda" | "nvidia") {
         return "gpu".to_string();
     }
 
-    let mut suffix = normalized
+    let suffix = normalized
         .strip_prefix("cuda:")
-        .or_else(|| normalized.strip_prefix("rocm:"))
-        .or_else(|| normalized.strip_prefix("metal:"))
-        .or_else(|| normalized.strip_prefix("vulkan:"))
+        .or_else(|| normalized.strip_prefix("nvidia:"))
         .or_else(|| normalized.strip_prefix("gpu:"));
-    if suffix.is_none() {
-        for prefix in extra_prefixes {
-            let with_colon = format!("{prefix}:");
-            if let Some(rest) = normalized.strip_prefix(&with_colon) {
-                suffix = Some(rest);
-                break;
-            }
-        }
-    }
     if let Some(index) = suffix {
         return format!("gpu:{index}");
     }
@@ -231,6 +252,34 @@ pub fn normalize_vendor_device_policy(policy: &str, extra_prefixes: &[&str]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rocm_policy_preserves_vendor_and_exact_representable_ordinal() {
+        for (input, ordinal) in [("auto", 0), ("HIP", 0), ("gpu:3", 3), ("rocm:65535", 65535)] {
+            assert_eq!(parse_rocm_device_ordinal(input).unwrap(), ordinal);
+        }
+        assert_eq!(normalize_rocm_device_policy(" CUDA:2 "), "cuda:2");
+        for invalid in [
+            "cpu",
+            "cuda",
+            "cuda:0",
+            "nvidia",
+            "vulkan:0",
+            "rocm:",
+            "rocm:-1",
+            "rocm:+1",
+            "rocm:1.0",
+            "rocm:65536",
+            "rocm:18446744073709551616",
+        ] {
+            assert!(
+                parse_rocm_device_ordinal(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        // Existing NVIDIA consumers must continue rejecting the AMD vocabulary.
+        assert!(parse_cuda_device_policy("rocm:0").is_err());
+    }
     use ndarray::array;
 
     #[test]
@@ -320,23 +369,24 @@ mod tests {
     }
 
     #[test]
-    fn normalize_vendor_device_policy_collapses_aliases() {
+    fn normalize_vendor_device_policy_collapses_only_cuda_aliases() {
         assert_eq!(normalize_vendor_device_policy("cuda:1", &[]), "gpu:1");
-        assert_eq!(normalize_vendor_device_policy("rocm:2", &[]), "gpu:2");
-        assert_eq!(normalize_vendor_device_policy("metal", &[]), "gpu");
-        assert_eq!(normalize_vendor_device_policy("vulkan:0", &[]), "gpu:0");
+        assert_eq!(normalize_vendor_device_policy("nvidia", &[]), "gpu");
         assert_eq!(normalize_vendor_device_policy("", &[]), "auto");
     }
 
     #[test]
-    fn normalize_vendor_device_policy_respects_extras() {
-        assert_eq!(normalize_vendor_device_policy("wgpu:2", &["wgpu"]), "gpu:2");
-        assert_eq!(normalize_vendor_device_policy("wgpu", &["wgpu"]), "gpu");
+    fn normalize_vendor_device_policy_does_not_alias_retired_backends() {
+        for retired in ["rocm:2", "hip", "metal", "vulkan:0", "wgpu", "dx12"] {
+            assert_eq!(normalize_vendor_device_policy(retired, &["wgpu"]), retired);
+        }
     }
 
     #[test]
     fn strict_cuda_policy_rejects_non_cuda_vendors_and_malformed_ordinals() {
-        for invalid in ["rocm", "rocm:1", "vulkan:0", "gpu:", "gpu:-1", "gpu:nope"] {
+        for invalid in [
+            "rocm", "rocm:1", "hip:0", "vulkan:0", "wgpu:0", "gpu:", "gpu:-1", "gpu:nope",
+        ] {
             assert!(
                 parse_cuda_device_policy(invalid).is_err(),
                 "accepted {invalid}"

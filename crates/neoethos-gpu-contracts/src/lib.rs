@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod normalization_v3;
 pub mod resident_feature_store_v3;
 pub mod resident_search_scoring_v2;
 

@@ -35,24 +35,183 @@ fn compact_whitespace(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn braced_definition<'a>(source: &'a str, signature: &str) -> Result<&'a str, String> {
+    let start = source
+        .find(signature)
+        .ok_or_else(|| format!("missing function {signature:?}"))?;
+    if !source[..start]
+        .rsplit('\n')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        return Err(format!("unexpected qualifier before {signature:?}"));
+    }
+    let open = start + source[start..].find('{').ok_or("missing function body")?;
+    let mut depth = 0_usize;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(&source[start..=open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(format!("unterminated function {signature:?}"))
+}
+
+fn validate_host_u32_maxima(source: &str) -> Result<(), String> {
+    let maximum = "std::numeric_limits<std::uint32_t>::max()";
+    let mut outside_host_validators = source.to_owned();
+    for (signature, required) in [
+        (
+            "bool validate_import_v1(",
+            "import->selected_cuda_ordinal != std::numeric_limits<std::uint32_t>::max()",
+        ),
+        (
+            "bool validate_adaptive_policy_v3(",
+            "policy->seen_retry_attempts > std::numeric_limits<std::uint32_t>::max() / 256u",
+        ),
+    ] {
+        let body = braced_definition(source, signature)?;
+        let start = source.find(signature).ok_or("missing host validator")?;
+        let preceding_declaration = source[..start].rsplit(['}', ';']).next().unwrap_or("");
+        if preceding_declaration.contains("__device__")
+            || preceding_declaration.contains("__global__")
+        {
+            return Err(format!(
+                "host validator became device-reachable: {signature:?}"
+            ));
+        }
+        if body.matches(maximum).count() != 1 || !compact_whitespace(body).contains(required) {
+            return Err(format!(
+                "host maximum lost its exact bound in {signature:?}"
+            ));
+        }
+        outside_host_validators = outside_host_validators.replacen(body, "", 1);
+    }
+    if outside_host_validators.contains(maximum) {
+        return Err("u32 standard-library maximum escaped its two host validators".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_legacy_integer_and_adaptive_softmax_scopes(source: &str) -> Result<(), String> {
+    let update = braced_definition(source, "__global__ void update_adaptive_policy_v3(")?;
+    let pick = braced_definition(source, "__device__ std::uint64_t adaptive_pick_rank_v3(")?;
+    let softmax = braced_definition(update, "if (policy.parent_policy == 3)")?;
+    let launch = braced_definition(source, "std::int32_t launch_device_parent_selection_v1(")?;
+    let adaptive_launch = braced_definition(launch, "if (run->adaptive_enabled_v3)")?;
+    if softmax.matches("exp(").count() != 1
+        || !adaptive_launch.contains("update_adaptive_policy_v3<<<")
+        || !adaptive_launch.contains("select_adaptive_parents_v3<<<")
+        || !adaptive_launch.contains("select_adaptive_survivors_v3<<<")
+        || !compact_whitespace(adaptive_launch).ends_with("return launch_status_v1(); }")
+        || !launch
+            .split_once(adaptive_launch)
+            .ok_or("missing adaptive branch")?
+            .1
+            .contains("select_rank_weighted_parents_kernel_v1<<<")
+    {
+        return Err(
+            "adaptive softmax must stay in its configured branch, separate from legacy selection"
+                .to_owned(),
+        );
+    }
+    let compact_update = compact_whitespace(update);
+    let compact_pick = compact_whitespace(pick);
+    for (body, required) in [
+        (compact_update.as_str(), "if (policy.parent_policy == 3) {"),
+        (
+            compact_update.as_str(),
+            "(adaptive_score_from_key_v3(decision_keys[ranked[rank]]) - top) / fmax(policy.selection_temperature, 1e-6)",
+        ),
+        (
+            compact_update.as_str(),
+            "isfinite(top) && isfinite(centered) ? fmax(exp(centered), 1e-12) : 1.0",
+        ),
+        (compact_update.as_str(), "parent_cdf[rank] = cumulative;"),
+        (
+            compact_pick.as_str(),
+            "if (selection == 2) return adaptive_available_rank_v3(available, count, rng.below(active));",
+        ),
+        (compact_pick.as_str(), "if (selection == 4) {"),
+        (
+            compact_pick.as_str(),
+            "if (selection == 1) { const auto total = active * (active + 1) / 2; return adaptive_available_rank_v3(available, count, rank_from_weighted_draw_v1(rng.below(total), active)); }",
+        ),
+        (
+            compact_pick.as_str(),
+            "(adaptive_score_from_key_v3(keys[ranked[i]]) - maximum) / fmax(temperature, 1e-6)",
+        ),
+        (
+            compact_pick.as_str(),
+            "isfinite(maximum) && isfinite(centered) ? fmax(exp(centered), 1e-12) : 1.0",
+        ),
+    ] {
+        if !body.contains(required) {
+            return Err(format!("adaptive selection lost {required:?}"));
+        }
+    }
+    if update.matches("exp(").count() != 1
+        || pick.matches("exp(").count() != 2
+        || compact_pick
+            .matches(
+                "(adaptive_score_from_key_v3(keys[ranked[i]]) - maximum) / fmax(temperature, 1e-6)",
+            )
+            .count()
+            != 2
+        || compact_pick
+            .matches("isfinite(maximum) && isfinite(centered) ? fmax(exp(centered), 1e-12) : 1.0")
+            .count()
+            != 2
+    {
+        return Err(
+            "adaptive exponentials must remain the three guarded f64 softmax weights".to_owned(),
+        );
+    }
+    let outside_adaptive = source.replacen(update, "", 1).replacen(pick, "", 1);
+    if outside_adaptive.contains("exp(") || source.contains("expf(") {
+        return Err("legacy integer decisions must not use exponentials or f32 softmax".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_slice2_wait_topology(
     generation_cuda: &str,
     scoring_cuda: &str,
     archive_cuda: &str,
 ) -> Result<(), String> {
-    let generation_create = section(
+    let legacy_create = braced_definition(
         generation_cuda,
         "extern \"C\" std::int32_t create_resident_generation_run_from_import_v1(",
-        "\n}",
-    );
+    )?;
+    let legacy_body = legacy_create.split_once('{').ok_or("missing V1 body")?.1;
+    if compact_whitespace(legacy_body)
+        != "return create_resident_generation_run_from_import_v3(import, plan, nullptr, receipt, run); }"
+    {
+        return Err(
+            "V1 must delegate once to V3 with the original inputs and null adaptive policy"
+                .to_owned(),
+        );
+    }
+    let generation_create = braced_definition(
+        generation_cuda,
+        "extern \"C\" std::int32_t create_resident_generation_run_from_import_v3(",
+    )?;
     let finite_scoring = section(
         scoring_cuda,
         "std::int32_t enqueue_resident_scoring_finite_objective_v2(",
         "\n}",
     );
-    let wait = "cudaStreamWaitEvent(created->admitted_run_stream,\n                               created->resident_parent_ready_event, 0)";
+    let wait = "cudaStreamWaitEvent(created->admitted_run_stream, created->resident_parent_ready_event, 0)";
     if generation_create.matches("cudaStreamWaitEvent").count() != 1
-        || !generation_create.contains(wait)
+        || !compact_whitespace(generation_create).contains(wait)
     {
         return Err("generation create must retain the one exact parent-ready wait".to_owned());
     }
@@ -176,61 +335,9 @@ fn validate_slice2_publish_bounds_are_fail_closed(source: &str) -> Result<(), St
 }
 
 #[test]
-fn rust_owner_is_move_only_run_bound_and_fail_closed_while_work_is_in_flight() {
-    let source = read_required("src/resident_generation_v1.rs");
-    let owner = section(&source, "pub struct ResidentGenerationDeviceRunV1 {", "\n}");
-    require_all(
-        owner,
-        &[
-            "native: NonNull<NativeResidentGenerationRunV1>",
-            "population_session_import: Option<ResidentGenerationPopulationSessionImportV1>",
-            "state: ResidentGenerationRunStateV1",
-            "selected_cuda_ordinal: u32",
-            "primary_context_identity_sha256: [u8; 32]",
-            "run_stream_identity_sha256: [u8; 32]",
-            "cuda_build_manifest_sha256: [u8; 32]",
-            "generation_semantics_sha256: [u8; 32]",
-        ],
-    );
-    assert!(
-        !owner.contains("pub "),
-        "native owner fields must stay private"
-    );
-    require_all(
-        &source,
-        &[
-            "#[must_use = \"resident generation work must be consumed on the admitted run stream\"]",
-            "enum ResidentGenerationRunStateV1",
-            "StrictIdle",
-            "InFlight",
-            "Sealed",
-            "Poisoned",
-            "bind_population_session_import_v1(",
-            "pub(crate) generation_ready_event: *mut c_void",
-            "raw.generation_ready_event.is_null()",
-            "raw.generation_ready_event == raw.resident_parent_ready_event",
-            "impl Drop for ResidentGenerationDeviceRunV1",
-            "leak_live_native_generation_run_v1(",
-        ],
-    );
-    for forbidden in [
-        "impl Clone for ResidentGenerationDeviceRunV1",
-        "impl Default for ResidentGenerationDeviceRunV1",
-        "Deserialize",
-        "pub fn raw_",
-        "pub fn from_raw",
-        "pub fn from_hash",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "owner escape via {forbidden:?}"
-        );
-    }
-}
-
-#[test]
 fn private_abi_uses_one_fixed_stride_normalized_gene_schema_and_checked_extents() {
     let header = read_required("native/resident_generation_v1_abi.cuh");
+    let population_header = read_required("native/neoethos_gpu_cuda.h");
     require_all(
         &header,
         &[
@@ -254,11 +361,17 @@ fn private_abi_uses_one_fixed_stride_normalized_gene_schema_and_checked_extents(
             "std::uint32_t minimum_terms_per_gene;",
             "std::uint64_t generation_count;",
             "std::uint8_t generation_semantics_sha256[32];",
-            "struct NeoResidentGenerationMetricRowV1",
+            "using NeoResidentGenerationMetricRowV1 = ::NeoPopulationMetricRow;",
+            "static_assert(sizeof(NeoResidentGenerationMetricRowV1) == 104",
+        ],
+    );
+    require_all(
+        &population_header,
+        &[
+            "struct NeoPopulationMetricRow",
             "std::uint64_t candidate_id;",
             "std::uint64_t scenario_id;",
             "double values[11];",
-            "static_assert(sizeof(NeoResidentGenerationMetricRowV1) == 104",
         ],
     );
     let cuda = read_required("native/resident_generation_v1.cu");
@@ -317,11 +430,8 @@ fn device_reachable_maxima_are_exact_typed_expressions_without_relaxed_constexpr
         0,
         "device-reachable u64 maxima must not call the host standard-library constexpr"
     );
-    assert_eq!(
-        cuda.matches("std::numeric_limits<std::uint32_t>::max()")
-            .count(),
-        1,
-        "only the host-side import sentinel may retain numeric_limits<u32>::max()"
+    validate_host_u32_maxima(&cuda).expect(
+        "only the exact host import sentinel and adaptive retry bound may use the u32 maximum",
     );
     assert!(
         cuda.matches("const std::uint64_t u64_max_v1 = ~std::uint64_t{0};")
@@ -337,6 +447,41 @@ fn device_reachable_maxima_are_exact_typed_expressions_without_relaxed_constexpr
         assert!(
             !source.contains("expt-relaxed-constexpr"),
             "the native build must not weaken CUDA constexpr authority"
+        );
+    }
+}
+
+#[test]
+fn host_maximum_scope_rejects_device_qualifiers_missing_bounds_and_relocation() {
+    let cuda = read_required("native/resident_generation_v1.cu");
+    validate_host_u32_maxima(&cuda).expect("current two exact host guards");
+    for (before, after) in [
+        (
+            "bool validate_import_v1(",
+            "__device__ bool validate_import_v1(",
+        ),
+        (
+            "bool validate_adaptive_policy_v3(",
+            "__host__ __device__ bool validate_adaptive_policy_v3(",
+        ),
+        (
+            "bool validate_import_v1(",
+            "__device__\nbool validate_import_v1(",
+        ),
+        (
+            "policy->seen_retry_attempts > std::numeric_limits<std::uint32_t>::max() / 256u",
+            "policy->seen_retry_attempts > std::numeric_limits<std::uint32_t>::max()",
+        ),
+        (
+            "return logical_population_count - rank;",
+            "return std::numeric_limits<std::uint32_t>::max();",
+        ),
+    ] {
+        let mutant = cuda.replacen(before, after, 1);
+        assert_ne!(mutant, cuda, "negative control must change {before:?}");
+        assert!(
+            validate_host_u32_maxima(&mutant).is_err(),
+            "accepted {after:?}"
         );
     }
 }
@@ -383,35 +528,14 @@ fn strict_v1_admits_only_rank_weighted_and_refuses_every_other_policy() {
 
 #[test]
 fn allocation_plan_charges_every_store_and_queries_one_reusable_cub_arena() {
-    let rust = read_required("src/resident_generation_v1.rs");
     let cuda = read_required("native/resident_generation_v1.cu");
-    require_all(
-        &rust,
-        &[
-            "pub struct ActualResidentGenerationAllocationPlanV1",
-            "logical_gene_scalar_bytes",
-            "logical_gene_index_bytes",
-            "logical_gene_weight_bytes",
-            "offspring_bytes",
-            "metric_row_bytes",
-            "rank_key_bytes",
-            "selection_bytes",
-            "dedup_hash_bytes",
-            "cub_scratch_bytes",
-            "retained_evaluation_workspace_bytes",
-            "checked_add",
-            "checked_mul",
-            "same_context_free_bytes",
-            "full_discovery_reserve_bytes",
-        ],
-    );
     require_all(
         &cuda,
         &[
             "query_cub_generation_scratch_bytes_v1(",
-            "cub::DeviceRadixSort::SortPairs",
-            "cub::DeviceSelect::Flagged",
-            "cub::DeviceRunLengthEncode::Encode",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs",
+            "neoethos_parallel_primitives_v1::DeviceSelect::Flagged",
+            "neoethos_parallel_primitives_v1::DeviceRunLengthEncode::Encode",
             "cudaMallocAsync",
             "cudaFreeAsync",
             "generation_store_allocation_count = 1",
@@ -429,6 +553,60 @@ fn allocation_plan_charges_every_store_and_queries_one_reusable_cub_arena() {
         assert!(
             !cuda.contains(forbidden),
             "generation allocation retains legacy or synchronizing storage via {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn adaptive_threshold_validation_allows_ties_but_rejects_descents_before_native_allocation() {
+    let rust = read_required("src/resident_generation_v1.rs");
+    let cuda = read_required("native/resident_generation_v1.cu");
+    let legacy_seal = section(&rust, "pub fn seal_resident_generation_plan_v1(", "\n}");
+    assert!(compact_whitespace(legacy_seal).contains(
+        "seal_generation_geometry(input, discovery_generation_semantics_sha256_v1(), true)"
+    ));
+    let adaptive_seal = section(
+        &rust,
+        "pub fn seal_adaptive_resident_generation_plan_v3(",
+        "\n}",
+    );
+    assert!(compact_whitespace(adaptive_seal).contains(
+        "seal_generation_geometry( input, discovery_adaptive_generation_semantics_sha256_v3(), false, )?"
+    ));
+    let validation = section(&cuda, "bool validate_adaptive_policy_v3(", "\n}");
+    require_all(
+        validation,
+        &[
+            "!std::isfinite(threshold)",
+            "threshold <= 0.0",
+            "i != 0 && threshold < previous_threshold",
+            "previous_threshold = threshold;",
+        ],
+    );
+    assert!(
+        !validation.contains("threshold <= previous_threshold"),
+        "native adaptive percentile validation must accept equal adjacent values"
+    );
+    for (entry, first_allocation_operation) in [
+        (
+            "extern \"C\" std::int32_t calculate_resident_generation_allocation_v3(",
+            "checked_physical_layout_v1(",
+        ),
+        (
+            "extern \"C\" std::int32_t create_resident_generation_run_from_import_v3(",
+            "new (std::nothrow) NeoResidentGenerationRunV1{}",
+        ),
+    ] {
+        let body = section(&cuda, entry, "\n}");
+        let guard = body
+            .find("validate_adaptive_policy_v3(")
+            .expect("adaptive guard");
+        let allocate = body
+            .find(first_allocation_operation)
+            .expect("allocation operation");
+        assert!(
+            guard < allocate,
+            "{entry} must reject invalid geometry before allocation"
         );
     }
 }
@@ -491,8 +669,8 @@ fn rank_parent_survivor_and_dedup_decisions_are_integer_and_device_resident() {
         &[
             "stable_gene_identity_tie_key_v1(",
             "resident_decision_keys_device",
-            "cub::DeviceRadixSort::SortPairsDescending",
-            "cub::DeviceRadixSort::SortPairs",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs",
             "identity_equal_v1(import->cuda_build_manifest_sha256,",
             "plan->cuda_build_manifest_sha256)",
             "rank_weight_v1(",
@@ -501,16 +679,16 @@ fn rank_parent_survivor_and_dedup_decisions_are_integer_and_device_resident() {
             "philox_uniform_below_without_modulo_bias_v1(",
             "select_rank_weighted_parents_kernel_v1",
             "select_rank_weighted_survivors_kernel_v1",
-            "cub::DeviceRunLengthEncode::Encode",
+            "neoethos_parallel_primitives_v1::DeviceRunLengthEncode::Encode",
             "full_fixed_stride_gene_equal_v1(",
             "gene_hash_collision_fault_device",
-            "cub::DeviceSelect::Flagged",
+            "neoethos_parallel_primitives_v1::DeviceSelect::Flagged",
         ],
     );
+    validate_legacy_integer_and_adaptive_softmax_scopes(&cuda)
+        .expect("legacy integer selection and adaptive guarded f64 softmax must remain distinct");
     for forbidden in [
         "partial_cmp",
-        "exp(",
-        "expf(",
         "curand",
         "host_rank",
         "std::sort",
@@ -528,15 +706,51 @@ fn rank_parent_survivor_and_dedup_decisions_are_integer_and_device_resident() {
 }
 
 #[test]
+fn selection_scope_rejects_legacy_exponentials_and_adaptive_policy_drift() {
+    let cuda = read_required("native/resident_generation_v1.cu");
+    validate_legacy_integer_and_adaptive_softmax_scopes(&cuda).expect("current selection scopes");
+    for (before, after) in [
+        (
+            "return logical_population_count - rank;",
+            "return static_cast<std::uint64_t>(exp(logical_population_count - rank));",
+        ),
+        (
+            "return logical_population_count - rank;",
+            "return static_cast<std::uint64_t>(expf(logical_population_count - rank));",
+        ),
+        (
+            "if (run->adaptive_enabled_v3) {\n    update_adaptive_policy_v3",
+            "if (true) {\n    update_adaptive_policy_v3",
+        ),
+        ("if (policy.parent_policy == 3) {", "if (true) {"),
+        ("fmax(policy.selection_temperature, 1e-6)", "1.0"),
+        ("fmax(temperature, 1e-6)", "1.0"),
+        ("isfinite(top) && isfinite(centered)", "true"),
+        ("isfinite(maximum) && isfinite(centered)", "true"),
+        ("fmax(exp(centered), 1e-12)", "exp(centered)"),
+        (
+            "rank_from_weighted_draw_v1(rng.below(total), active)",
+            "rng.below(active)",
+        ),
+    ] {
+        let mutant = cuda.replacen(before, after, 1);
+        assert_ne!(mutant, cuda, "negative control must change {before:?}");
+        assert!(
+            validate_legacy_integer_and_adaptive_softmax_scopes(&mutant).is_err(),
+            "accepted {after:?}"
+        );
+    }
+}
+
+#[test]
 fn metric_rows_bind_identity_but_scoring_and_novelty_supply_the_sealed_u64_decision_keys() {
-    let rust = read_required("src/resident_generation_v1.rs");
     let header = read_required("native/resident_generation_v1_abi.cuh");
     let cuda = read_required("native/resident_generation_v1.cu");
 
     require_all(
         &header,
         &[
-            "struct NeoResidentGenerationMetricRowV1",
+            "using NeoResidentGenerationMetricRowV1 = ::NeoPopulationMetricRow;",
             "const NeoResidentGenerationMetricRowV1* metric_rows_device;",
             "const std::uint64_t* resident_decision_keys_device;",
             "const std::uint64_t* expected_scenario_ids_device;",
@@ -545,18 +759,6 @@ fn metric_rows_bind_identity_but_scoring_and_novelty_supply_the_sealed_u64_decis
             "std::uint8_t scoring_semantics_sha256[32];",
             "std::uint8_t novelty_semantics_sha256[32];",
             "std::uint8_t scenario_order_semantics_sha256[32];",
-        ],
-    );
-    require_all(
-        &rust,
-        &[
-            "struct RawResidentGenerationMetricRowV1",
-            "const _: [(); 104] = [(); std::mem::size_of::<RawResidentGenerationMetricRowV1>()];",
-            "resident_decision_keys_device: *const u64",
-            "expected_scenario_ids_device: *const u64",
-            "scoring_semantics_sha256: [u8; 32]",
-            "novelty_semantics_sha256: [u8; 32]",
-            "scenario_order_semantics_sha256: [u8; 32]",
         ],
     );
     require_all(
@@ -628,18 +830,7 @@ fn initial_population_crossover_mutation_and_offspring_never_leave_the_device() 
 
 #[test]
 fn exact_chunks_cover_the_logical_population_without_padding_or_reallocation() {
-    let rust = read_required("src/resident_generation_v1.rs");
     let cuda = read_required("native/resident_generation_v1.cu");
-    require_all(
-        &rust,
-        &[
-            "checked_generation_chunk_count_v1(",
-            "checked_generation_chunk_range_v1(",
-            "retained_evaluation_capacity >= 1",
-            "active_scenarios <= retained_evaluation_capacity",
-            "covered_logical_population == logical_population_count",
-        ],
-    );
     require_all(
         &cuda,
         &[
@@ -694,7 +885,6 @@ fn every_operation_uses_the_imported_stream_and_only_event_dependencies_cross_st
         "cudaEventCreate",
         "cudaEventDestroy",
         "cudaDeviceSynchronize",
-        "cudaStreamSynchronize",
         "cudaEventSynchronize",
     ] {
         assert!(
@@ -753,60 +943,6 @@ fn every_operation_uses_the_imported_stream_and_only_event_dependencies_cross_st
         assert!(
             !generation_loop.contains(forbidden),
             "generation loop crossed a host transfer/sync boundary via {forbidden:?}"
-        );
-    }
-}
-
-#[test]
-fn sealed_handoff_is_content_addressed_resident_and_not_promotion_authority() {
-    let rust = read_required("src/resident_generation_v1.rs");
-    let receipt = section(
-        &rust,
-        "pub struct SealedResidentGenerationDeviceOutcomeV1 {",
-        "\n}",
-    );
-    require_all(
-        receipt,
-        &[
-            "ready: ResidentGenerationReadyEventV1",
-            "resident_gene_content: ResidentGenerationContentIdentityV1",
-            "resident_metric_content: ResidentGenerationContentIdentityV1",
-            "resident_generation_receipt: ResidentGenerationReceiptIdentityV1",
-            "artifact_class: GenerationArtifactClassV1",
-            "promotion_eligibility: GenerationPromotionEligibilityV1",
-        ],
-    );
-    assert!(
-        !receipt.contains("pub "),
-        "sealed handoff fields must be private"
-    );
-    require_all(
-        &rust,
-        &[
-            "pub struct ResidentGenerationReadyEventV1",
-            "run: Option<ResidentGenerationDeviceRunV1>",
-            "consume_into_post_ga_v1(",
-            "GenerationArtifactClassV1::ResearchOnly",
-            "GenerationPromotionEligibilityV1::NotPromotionEligible",
-            "seal_content_identities_on_device_v1(",
-            "generation_semantics_sha256",
-            "selected_cuda_ordinal",
-            "cuda_build_manifest_sha256",
-            "ResidentGenerationContentIdentityV1",
-            "ResidentGenerationReceiptIdentityV1",
-            "final_compact_readback_count == 0",
-        ],
-    );
-    for forbidden in [
-        "impl Clone for SealedResidentGenerationDeviceOutcomeV1",
-        "impl Default for SealedResidentGenerationDeviceOutcomeV1",
-        "pub fn from_hash",
-        "pub genes: Vec",
-        "pub metrics: Vec",
-    ] {
-        assert!(
-            !rust.contains(forbidden),
-            "sealed handoff escape via {forbidden:?}"
         );
     }
 }
@@ -1018,6 +1154,36 @@ fn slice2_has_one_pre_search_parent_wait_and_no_phase_local_waits() {
         validate_slice2_wait_topology(&generation_cuda, &duplicate_scoring_wait, &archive_cuda)
             .is_err(),
         "the contract must kill a per-generation scoring wait"
+    );
+
+    for (before, after) in [
+        (
+            "return create_resident_generation_run_from_import_v3(import, plan, nullptr, receipt, run);",
+            "return create_resident_generation_run_from_import_v3(import, plan, nullptr, nullptr, run);",
+        ),
+        (
+            "status = cudaStreamWaitEvent(created->admitted_run_stream,\n                               created->resident_parent_ready_event, 0);",
+            "status = cudaStreamWaitEvent(created->admitted_run_stream, created->ready_event, 0);",
+        ),
+        (
+            "created->same_stream_enqueue_count = 1;",
+            "cudaStreamWaitEvent(created->admitted_run_stream, created->resident_parent_ready_event, 0);\n  created->same_stream_enqueue_count = 1;",
+        ),
+    ] {
+        let mutant = generation_cuda.replacen(before, after, 1);
+        assert_ne!(
+            mutant, generation_cuda,
+            "negative control must change {before:?}"
+        );
+        assert!(
+            validate_slice2_wait_topology(&mutant, &scoring_cuda, &archive_cuda).is_err(),
+            "accepted {after:?}"
+        );
+    }
+    let extra_archive_wait = format!("{archive_cuda}\ncudaStreamWaitEvent(stream, event, 0);\n");
+    assert!(
+        validate_slice2_wait_topology(&generation_cuda, &scoring_cuda, &extra_archive_wait)
+            .is_err()
     );
 }
 

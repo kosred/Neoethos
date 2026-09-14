@@ -3,7 +3,7 @@
 //! The binary is a separate crate target, so it cannot consume the
 //! crate-private lease/job types directly. This module keeps those authorities
 //! private while returning one move-only handle that the headless process must
-//! retain until shutdown.
+//! retain until the actual worker completes or shutdown has cancelled and joined it.
 
 use std::fmt;
 
@@ -124,6 +124,10 @@ impl HeadlessExecutionHandleV1 {
         self.inner.cancel();
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+
     pub async fn await_terminal(self) -> HeadlessExecutionTerminalV1 {
         map_terminal_v1(self.inner.await_terminal().await)
     }
@@ -211,12 +215,34 @@ fn map_terminal_v1(terminal: TypedLegacyExecutionTerminalV1) -> HeadlessExecutio
         },
         TypedLegacyExecutionTerminalV1::WorkerPanicked {
             lease_token,
+            job_kind,
             detail,
         } => HeadlessExecutionTerminalV1 {
             state: HeadlessExecutionTerminalStateV1::WorkerPanicked,
             lease_token,
-            completed_kind: None,
+            completed_kind: Some(format!("{job_kind:?}")),
             summary: detail,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headless_panic_report_preserves_the_actual_chained_training_phase() {
+        let terminal = map_terminal_v1(TypedLegacyExecutionTerminalV1::WorkerPanicked {
+            lease_token: 17,
+            job_kind: crate::app_services::jobs::JobKind::Training,
+            detail: "combined candidate validation panicked".to_owned(),
+        });
+        assert_eq!(
+            terminal.state(),
+            HeadlessExecutionTerminalStateV1::WorkerPanicked
+        );
+        assert_eq!(terminal.lease_token(), 17);
+        assert_eq!(terminal.completed_kind(), Some("Training"));
+        assert_eq!(terminal.summary(), "combined candidate validation panicked");
     }
 }

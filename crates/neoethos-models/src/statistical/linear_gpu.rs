@@ -6,7 +6,10 @@ use ndarray::{Array1, Array2};
 
 use neoethos_core::BackendKind;
 
-use crate::cubecl_lifecycle::{cubecl_cuda_client, cubecl_residency_scope};
+use crate::cubecl_lifecycle::{
+    cubecl_cuda_client, cubecl_residency_scope,
+    cuda_allocator_page_size_for_buffer as allocator_page_size_for_buffer,
+};
 
 const CLASS_COUNT: usize = 3;
 const GRADIENT_ROWS_PER_PARTIAL: usize = 4096;
@@ -576,68 +579,6 @@ fn planned_prediction_device_bytes(
     }
 
     Ok(planned)
-}
-
-fn align_up_checked(value: usize, alignment: usize) -> Result<usize> {
-    if alignment == 0 {
-        bail!("statistical CUDA allocator reported zero memory alignment");
-    }
-    let remainder = value % alignment;
-    if remainder == 0 {
-        return Ok(value);
-    }
-    value
-        .checked_add(alignment - remainder)
-        .context("statistical CUDA allocator page alignment overflow")
-}
-
-fn allocator_page_size_for_buffer(
-    bytes: usize,
-    max_page_size: usize,
-    alignment: usize,
-) -> Result<usize> {
-    if bytes == 0 {
-        return Ok(0);
-    }
-    if bytes > max_page_size {
-        bail!(
-            "statistical CUDA max single buffer bytes {bytes} exceed selected device allocator page limit {max_page_size}"
-        );
-    }
-
-    const MB: usize = 1024 * 1024;
-    let mut current = max_page_size;
-    let mut base = 1u32;
-    let mut intermediate = Vec::new();
-    while current >= 32 * MB {
-        current /= 4;
-        current = align_up_checked(current, alignment)?;
-        let divisor = 1usize
-            .checked_shl(base)
-            .context("statistical CUDA allocator pool divisor overflow")?;
-        intermediate.push((current, current / divisor));
-        base = base
-            .checked_add(1)
-            .context("statistical CUDA allocator pool count overflow")?;
-    }
-
-    for (page_size, max_slice_size) in intermediate.into_iter().rev() {
-        let close_to_page = page_size
-            .checked_sub(bytes)
-            .and_then(|difference| difference.checked_mul(5))
-            .is_some_and(|scaled| scaled < page_size);
-        if max_slice_size >= bytes || close_to_page {
-            return Ok(page_size);
-        }
-    }
-
-    let final_page_size = max_page_size / alignment * alignment;
-    if bytes > final_page_size {
-        bail!(
-            "statistical CUDA max single buffer bytes {bytes} exceed aligned allocator page limit {final_page_size}"
-        );
-    }
-    Ok(final_page_size)
 }
 
 fn allocator_reservation_upper_bound(

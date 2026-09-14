@@ -27,8 +27,10 @@ use crate::burn_models::{
     predict_proba_on_device as burn_predict_proba_on_device, resolve_infer_device,
     resolve_train_device,
     train_model_with_report_with_external_val as burn_train_model_with_report_with_external_val,
-    validate_burn_device_selection,
+    train_model_with_transport_v1, validate_burn_device_selection,
 };
+#[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+use crate::burn_models::{BurnResidentDatasetPlanV1, resident_tensor_bytes_v1};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{
     CapabilityState, ModelFamily, normalize_training_precision_policy,
@@ -38,6 +40,156 @@ use crate::runtime::prediction::RuntimePrediction;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const CONFIG_FILE_NAME: &str = "config.json";
 const MODEL_RECORD_BASENAME: &str = "model";
+
+/// Exact parameter shape of BurnMLPConfig::init (including linear biases and
+/// both LayerNorm parameters). All admission arithmetic precedes tensor allocation.
+#[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+fn mlp_parameter_count(input: usize, hidden: usize, layers: usize) -> Result<usize> {
+    if input == 0 || hidden == 0 || layers == 0 {
+        bail!("MLP capacity requires positive input, hidden and layer dimensions");
+    }
+    input
+        .checked_mul(hidden)
+        .and_then(|n| {
+            hidden
+                .checked_mul(hidden)?
+                .checked_mul(layers - 1)?
+                .checked_add(n)
+        })
+        .and_then(|n| layers.checked_mul(3)?.checked_mul(hidden)?.checked_add(n))
+        .and_then(|n| hidden.checked_mul(3)?.checked_add(3)?.checked_add(n))
+        .context("MLP parameter count overflow")
+}
+
+/// Conservative padded live-set estimate, not an allocator/RSS reservation.
+/// Eight FP32 parameter copies cover weights, gradients, AdamW moments, best
+/// weights and update/cast temporaries. Training reserves sixteen activation
+/// copies; validation reserves eight and uses its ENTIRE row span, as the
+/// current trainer does. Allocator/kernel workspace headroom is reserved again
+/// when translating live free memory into an operation budget.
+#[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+fn mlp_training_bytes(
+    input: usize,
+    hidden: usize,
+    layers: usize,
+    batch_rows: usize,
+    validation_rows: usize,
+    alignment: usize,
+) -> Result<usize> {
+    mlp_parameter_count(input, hidden, layers)?; // shared shape/overflow guard
+    let tensor = |height, width| resident_tensor_bytes_v1(height, width, usize::MAX, alignment);
+    // Exact initialized topology: first linear, remaining linears, three
+    // hidden vectors per layer (bias + LayerNorm gamma/beta), output + bias.
+    let parameters = tensor(input, hidden)?
+        .checked_add(if layers > 1 {
+            tensor(hidden, hidden)?
+                .checked_mul(layers - 1)
+                .context("MLP hidden parameter bytes overflow")?
+        } else {
+            0
+        })
+        .and_then(|n| {
+            tensor(1, hidden)
+                .ok()?
+                .checked_mul(3)?
+                .checked_mul(layers)?
+                .checked_add(n)
+        })
+        .and_then(|n| n.checked_add(tensor(hidden, 3).ok()?))
+        .and_then(|n| n.checked_add(tensor(1, 3).ok()?))
+        .context("MLP padded parameter bytes overflow")?;
+    let activations = |rows| -> Result<usize> {
+        tensor(rows, input)?
+            .checked_add(
+                tensor(rows, hidden)?
+                    .checked_mul(layers)
+                    .context("MLP hidden activation bytes overflow")?,
+            )
+            .and_then(|n| n.checked_add(tensor(rows, 3).ok()?))
+            .context("MLP padded activation bytes overflow")
+    };
+    let training = activations(batch_rows)?
+        .checked_mul(16)
+        .context("MLP training activation bytes overflow")?;
+    let validation = activations(validation_rows)?
+        .checked_mul(8)
+        .context("MLP validation activation bytes overflow")?;
+    parameters
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(training.max(validation)))
+        .context("MLP training live-set bytes overflow")
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+fn mlp_admitted_width(
+    input: usize,
+    requested: usize,
+    layers: usize,
+    batch_rows: usize,
+    validation_rows: usize,
+    budget: usize,
+    max_tensor_bytes: usize,
+    alignment: usize,
+    automatic: bool,
+) -> Result<usize> {
+    let max_tensor_bytes = max_tensor_bytes.min((u32::MAX as usize).saturating_mul(4));
+    let fits = |width: usize| -> bool {
+        let weight_axis = input.max(if layers > 1 { width } else { 0 }).max(3);
+        // Both orientations bound linear weights and their transpose/copy;
+        // pitched extents, not only logical cell counts, must fit one page.
+        resident_tensor_bytes_v1(weight_axis, width, max_tensor_bytes, alignment).is_ok()
+            && resident_tensor_bytes_v1(width, weight_axis, max_tensor_bytes, alignment).is_ok()
+            && resident_tensor_bytes_v1(
+                batch_rows.max(validation_rows),
+                input.max(width).max(3),
+                max_tensor_bytes,
+                alignment,
+            )
+            .is_ok()
+            && mlp_training_bytes(input, width, layers, batch_rows, validation_rows, alignment)
+                .is_ok_and(|n| n <= budget)
+    };
+    if !fits(requested) {
+        bail!(
+            "MLP configured minimum architecture does not fit current memory admission (hidden_dim={requested}, budget_bytes={budget}, validation_rows={validation_rows})"
+        );
+    }
+    if !automatic {
+        return Ok(requested);
+    }
+    // The padded estimate and per-tensor dimensions are monotone in width.
+    // No catalogue width ceiling: both available memory and actual rows/features
+    // determine the upper bound. Explicit depth and batch size are unchanged.
+    let mut low = requested;
+    let mut high = budget / 32;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(low)
+}
+
+#[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+fn mlp_fractional_width(requested: usize, admitted: usize, fraction: f64) -> Result<usize> {
+    if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 || admitted < requested {
+        bail!("MLP capacity_fraction must be finite in (0, 1] within the admitted width range");
+    }
+    let span = admitted - requested;
+    Ok(requested + ((span as f64 * fraction).floor() as usize).min(span))
+}
+
+#[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend"))]
+fn mlp_host_bytes(rows: usize, input: usize, bytes_per_cell: usize) -> Result<usize> {
+    rows.checked_mul(input)
+        .and_then(|n| n.checked_mul(bytes_per_cell))
+        .and_then(|n| rows.checked_mul(32)?.checked_add(n))
+        .context("MLP host staging byte count overflow")
+}
 
 /// Checked, backend-local narrowing for Burn, whose public tensor input is
 /// intrinsically f32. Shared model input remains `FeatureFrame` f64+validity;
@@ -215,6 +367,10 @@ pub struct BurnDeepExpert {
     burn_training_report: Option<BurnTrainingReport>,
     persisted_runtime_selection: Option<BurnDeviceSelection>,
     host_runtime_selection: Option<BurnDeviceSelection>,
+    // Declared after the model, shared by clones, and retained until its last
+    // tensor handle is dropped on the exact originating Fusion/CubeCL stream.
+    #[cfg(feature = "burn-rocm-backend")]
+    rocm_residency: Option<std::sync::Arc<crate::burn_rocm_backend::RocmModelResidency>>,
 }
 
 impl BurnDeepExpert {
@@ -237,7 +393,35 @@ impl BurnDeepExpert {
             burn_training_report: None,
             persisted_runtime_selection: None,
             host_runtime_selection: None,
+            #[cfg(feature = "burn-rocm-backend")]
+            rocm_residency: None,
         }
+    }
+
+    #[cfg(feature = "burn-rocm-backend")]
+    fn ensure_rocm_residency(
+        &mut self,
+    ) -> Result<std::sync::Arc<crate::burn_rocm_backend::RocmModelResidency>> {
+        let policy = self.configured_requested_device_policy();
+        let ordinal = crate::common::parse_rocm_device_ordinal(&policy)?;
+        if let Some(owner) = self.rocm_residency.as_ref() {
+            if owner.ordinal() != ordinal {
+                bail!("ROCm model device changed while its tensor handles are still retained");
+            }
+            return Ok(std::sync::Arc::clone(owner));
+        }
+        let owner =
+            std::sync::Arc::new(crate::burn_rocm_backend::RocmModelResidency::new(&policy)?);
+        self.rocm_residency = Some(std::sync::Arc::clone(&owner));
+        Ok(owner)
+    }
+
+    fn on_runtime_stream<T>(&self, operation: impl FnOnce() -> T) -> T {
+        #[cfg(feature = "burn-rocm-backend")]
+        if let Some(owner) = self.rocm_residency.as_ref() {
+            return owner.executes(operation);
+        }
+        operation()
     }
 
     pub fn model_name(&self) -> &'static str {
@@ -253,6 +437,173 @@ impl BurnDeepExpert {
             n_classes: 3,
             seed: self.u64_param("seed", self.seed),
         }
+    }
+
+    fn automatic_mlp_capacity(&self) -> Result<bool> {
+        match self.params.get("capacity_mode").map(|v| v.trim()) {
+            None | Some("fixed") => Ok(false),
+            Some("auto") if self.kind == DeepModelKind::Mlp => Ok(true),
+            Some("auto") => bail!("automatic capacity is currently supported only for MLP"),
+            Some(other) => {
+                bail!("invalid deep-model capacity_mode `{other}`; expected fixed or auto")
+            }
+        }
+    }
+
+    fn mlp_capacity_fraction(&self) -> Result<f64> {
+        let fraction = self
+            .params
+            .get("capacity_fraction")
+            .map(|value| {
+                value
+                    .parse::<f64>()
+                    .context("invalid MLP capacity_fraction")
+            })
+            .transpose()?
+            .unwrap_or(1.0);
+        if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
+            bail!("MLP capacity_fraction must be finite in (0, 1]");
+        }
+        Ok(fraction)
+    }
+
+    #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend"))]
+    fn admitted_mlp_config(
+        &self,
+        input: usize,
+        rows: usize,
+        external_validation_rows: Option<usize>,
+        selection: &BurnDeviceSelection,
+    ) -> Result<(BurnMLPConfig, usize, usize, BurnResidentDatasetPlanV1)> {
+        #[cfg(feature = "burn-cuda-backend")]
+        let (free, total, max_page_size, alignment) = {
+            let ordinal = selection
+                .effective_policy
+                .strip_prefix("gpu:")
+                .and_then(|v| v.parse::<usize>().ok())
+                .context("MLP memory admission requires the exact selected CUDA ordinal")?;
+            // Inspect the same runtime/device as Burn, without registering an
+            // allocation owner before the trainer's own lifetime has begun.
+            let client = <cubecl::cuda::CudaRuntime as cubecl::prelude::Runtime>::client(
+                &cubecl::cuda::CudaDevice::new(ordinal),
+            );
+            let context = cudarc::driver::CudaContext::new(ordinal)
+                .context("retain MLP CUDA memory-query context")?;
+            let (free, total) = context
+                .mem_get_info()
+                .context("query live MLP CUDA memory")?;
+            if total == 0 {
+                bail!("MLP CUDA memory query returned zero capacity");
+            }
+            (
+                free,
+                total,
+                usize::try_from(client.properties().memory.max_page_size)
+                    .context("MLP CUDA maximum tensor size exceeds usize")?,
+                usize::try_from(client.properties().memory.alignment)
+                    .context("MLP CUDA allocation alignment exceeds usize")?,
+            )
+        };
+        #[cfg(feature = "burn-rocm-backend")]
+        let (free, total, max_page_size, alignment) = {
+            let ordinal = crate::common::parse_rocm_device_ordinal(&selection.effective_policy)?;
+            let (free, total, max_page_size) =
+                crate::burn_rocm_backend::mlp_memory_snapshot(ordinal)?;
+            let client = <cubecl::hip::HipRuntime as cubecl::prelude::Runtime>::client(
+                &cubecl::hip::AmdDevice::new(ordinal),
+            );
+            let alignment = usize::try_from(client.properties().memory.alignment)
+                .context("MLP ROCm allocation alignment exceeds usize")?;
+            (free, total, max_page_size, alignment)
+        };
+        let reserve = (total / 10).max(256 * 1024 * 1024).min(total);
+        // Leave half of the remaining free memory for allocator pages, fusion
+        // and matmul workspaces not described by the logical live-set estimate.
+        let mut budget = free.min(total).saturating_sub(reserve) / 2;
+        if let Some(value) = self.params.get("memory_budget_gb") {
+            let gb = value
+                .parse::<f64>()
+                .context("MLP memory_budget_gb must be numeric")?;
+            if !gb.is_finite() || gb <= 0.0 || gb * 1_073_741_824.0 > usize::MAX as f64 {
+                bail!("MLP memory_budget_gb must be finite, positive and representable");
+            }
+            budget = budget.min((gb * 1_073_741_824.0) as usize);
+        }
+        let train = self.train_config();
+        let dataset_plan = BurnResidentDatasetPlanV1::checked(
+            rows,
+            input,
+            external_validation_rows,
+            train.batch_size,
+            max_page_size,
+            alignment,
+        )?;
+        let validation_rows = dataset_plan.validation_rows();
+        let model_budget = budget.checked_sub(dataset_plan.peak_bytes()).context(
+            "MLP resident dataset plus gather/upload workspace exceeds the admitted memory budget",
+        )?;
+        let all_rows = rows
+            .checked_add(external_validation_rows.unwrap_or(0))
+            .context("MLP dataset row count overflow")?;
+        // Split arrays plus a largest full-split TensorData flattening copy can
+        // coexist during the one-time upload. This is distinct from VRAM.
+        let remaining_host = mlp_host_bytes(all_rows, input, 8)?
+            .checked_add(mlp_host_bytes(dataset_plan.batch_rows(), input, 12)?)
+            .context("MLP remaining host allocation estimate overflow")?;
+        if remaining_host as u64 > neoethos_core::available_memory_bytes() / 2 {
+            bail!("MLP training copies exceed current available host RAM");
+        }
+        let mut config = self.mlp_config(input);
+        let automatic = self.automatic_mlp_capacity()?;
+        let requested = if automatic {
+            self.params
+                .get("capacity_requested_hidden_dim")
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .context("invalid MLP requested capacity width")
+                })
+                .transpose()?
+                .unwrap_or(config.hidden_dim)
+        } else {
+            config.hidden_dim
+        };
+        let admitted_width = mlp_admitted_width(
+            input,
+            requested,
+            config.n_layers,
+            dataset_plan.batch_rows(),
+            validation_rows,
+            model_budget,
+            max_page_size,
+            alignment,
+            automatic,
+        )?;
+        let fraction = if automatic {
+            self.mlp_capacity_fraction()?
+        } else {
+            1.0
+        };
+        let width = mlp_fractional_width(requested, admitted_width, fraction)?;
+        config.hidden_dim = width;
+        let estimate = mlp_training_bytes(
+            input,
+            width,
+            config.n_layers,
+            dataset_plan.batch_rows(),
+            validation_rows,
+            alignment,
+        )?
+        .checked_add(dataset_plan.peak_bytes())
+        .context("MLP total admitted training bytes overflow")?;
+        tracing::info!(target: "neoethos_models::burn", requested_hidden_dim=requested,
+            resolved_hidden_dim=width, layers=config.n_layers, batch_size=train.batch_size,
+            validation_rows, free_vram_bytes=free, budget_bytes=budget,
+            train_rows=dataset_plan.train_rows(), resident_dataset_peak_bytes=dataset_plan.peak_bytes(),
+            model_budget_bytes=model_budget, transport="inner-backend-resident",
+            estimated_training_bytes=estimate, automatic, capacity_fraction=fraction,
+            admitted_hidden_dim=admitted_width, "MLP live-memory capacity admission");
+        Ok((config, requested, estimate, dataset_plan))
     }
 
     fn metadata(&self) -> Result<RuntimeArtifactMetadata> {
@@ -374,27 +725,23 @@ impl BurnDeepExpert {
     }
 
     fn is_supported_device_policy(normalized: &str) -> bool {
-        normalized == "auto"
-            || normalized == "cpu"
-            || normalized.starts_with("cuda:")
-            || normalized.starts_with("gpu:")
+        #[cfg(feature = "burn-rocm-backend")]
+        {
+            return matches!(normalized, "auto" | "cpu")
+                || crate::common::parse_rocm_device_ordinal(normalized).is_ok();
+        }
+        #[cfg(not(feature = "burn-rocm-backend"))]
+        {
+            matches!(normalized, "auto" | "cpu" | "gpu")
+                || normalized
+                    .strip_prefix("gpu:")
+                    .is_some_and(|ordinal| ordinal.parse::<usize>().is_ok())
+        }
     }
 
     fn is_supported_execution_backend(backend: &str) -> bool {
-        matches!(
-            backend.trim(),
-            "ndarray_cpu"
-                | "wgpu_cpu"
-                | "wgpu_default"
-                | "wgpu_discrete_gpu"
-                | "wgpu_integrated_gpu"
-                | "wgpu_virtual_gpu"
-                // Native Burn CUDA backend (`burn-cuda-backend` build): neural
-                // models train on the selected card and report "cuda".
-                | "cuda"
-                | "cuda_default"
-                | "cuda_discrete_gpu"
-        )
+        matches!(backend.trim(), "ndarray_cpu" | "cuda")
+            || (cfg!(feature = "burn-rocm-backend") && backend.trim() == "rocm")
     }
 
     fn runtime_selection_from_report(report: &BurnTrainingReport) -> BurnDeviceSelection {
@@ -417,19 +764,15 @@ impl BurnDeepExpert {
                 self.model_name()
             )
         })?;
-        let expected_summary_val_rows = report
-            .dataset_rows
-            .checked_sub(report.train_rows)
-            .with_context(|| {
-                format!(
-                    "{} Burn training report train rows exceed dataset rows",
-                    self.model_name()
-                )
-            })?;
         if report.dataset_rows != summary.dataset_rows
             || report.train_rows != summary.train_rows
-            || expected_summary_val_rows != summary.val_rows
-            || report.val_rows > expected_summary_val_rows
+            || report.embargo_rows != summary.embargo_rows
+            || report.val_rows != summary.val_rows
+            || report
+                .train_rows
+                .checked_add(report.embargo_rows)
+                .and_then(|rows| rows.checked_add(report.val_rows))
+                != Some(report.dataset_rows)
         {
             bail!(
                 "{} Burn training report rows do not match persisted training summary",
@@ -491,6 +834,8 @@ impl BurnDeepExpert {
     }
 
     fn validate_model_params(&self) -> Result<()> {
+        self.automatic_mlp_capacity()?;
+        self.mlp_capacity_fraction()?;
         for key in [
             "hidden_dim",
             "n_layers",
@@ -505,6 +850,7 @@ impl BurnDeepExpert {
             "batch_size",
             "max_epochs",
             "patience",
+            "capacity_requested_hidden_dim",
         ] {
             if let Some(value) = self.params.get(key) {
                 let parsed = value.trim().parse::<usize>().map_err(|_| {
@@ -597,15 +943,7 @@ impl BurnDeepExpert {
         if metadata_path.exists() {
             let sidecar: RuntimeArtifactMetadata = Self::read_json(&metadata_path)?;
             if let Some(embedded) = config.runtime_metadata.as_ref()
-                && (sidecar.model_name != embedded.model_name
-                    || sidecar.family != embedded.family
-                    || sidecar.state != embedded.state
-                    || sidecar.feature_columns != embedded.feature_columns
-                    || sidecar.label_mapping != embedded.label_mapping
-                    || sidecar.training_summary.dataset_rows
-                        != embedded.training_summary.dataset_rows
-                    || sidecar.training_summary.train_rows != embedded.training_summary.train_rows
-                    || sidecar.training_summary.val_rows != embedded.training_summary.val_rows)
+                && &sidecar != embedded
             {
                 bail!(
                     "deep artifact {} metadata sidecar mismatch with embedded runtime metadata",
@@ -901,7 +1239,8 @@ impl BurnDeepExpert {
         TrainingSummaryMetadata::new(
             report.dataset_rows,
             report.train_rows,
-            report.dataset_rows.saturating_sub(report.train_rows),
+            report.embargo_rows,
+            report.val_rows,
         )
     }
 
@@ -911,7 +1250,7 @@ impl BurnDeepExpert {
     /// internal time_series_split holdout.
     #[allow(clippy::too_many_arguments)]
     fn train_runtime_model_with_val(
-        &self,
+        &mut self,
         input_dim: usize,
         features: &Array2<f32>,
         labels: &[i32],
@@ -929,19 +1268,55 @@ impl BurnDeepExpert {
         let (device, device_selection) = resolve_train_device(&requested_device)?;
         match self.kind {
             DeepModelKind::Mlp => {
-                let model = self.mlp_config(input_dim).init::<TrainBackend>(&device);
-                let (trained, report) =
-                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
-                        model,
-                        features,
-                        labels,
-                        &train_config,
-                        &device,
+                #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend"))]
+                let (mlp_config, requested_width, estimated_bytes, dataset_plan) = self
+                    .admitted_mlp_config(
+                        input_dim,
+                        features.nrows(),
+                        external_val_x.map(|values| values.nrows()),
                         &device_selection,
-                        requested_training_precision.as_deref(),
-                        external_val_x,
-                        external_val_y,
                     )?;
+                #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
+                let mlp_config = {
+                    if self.automatic_mlp_capacity()? {
+                        bail!(
+                            "automatic MLP capacity requires a native CUDA or ROCm training backend"
+                        );
+                    }
+                    self.mlp_config(input_dim)
+                };
+                #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend"))]
+                let dataset_plan = Some(dataset_plan);
+                #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
+                let dataset_plan = None;
+                let model = mlp_config.init::<TrainBackend>(&device);
+                let (trained, report) = train_model_with_transport_v1::<TrainBackend, _>(
+                    model,
+                    features,
+                    labels,
+                    &train_config,
+                    &device,
+                    &device_selection,
+                    requested_training_precision.as_deref(),
+                    external_val_x,
+                    external_val_y,
+                    dataset_plan,
+                )?;
+                #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend"))]
+                {
+                    // Persist the actual initialized architecture, not a plan
+                    // that would be re-resolved against another machine on load.
+                    self.params
+                        .insert("hidden_dim".into(), mlp_config.hidden_dim.to_string());
+                    self.params.insert(
+                        "capacity_requested_hidden_dim".into(),
+                        requested_width.to_string(),
+                    );
+                    self.params.insert(
+                        "capacity_estimated_training_bytes".into(),
+                        estimated_bytes.to_string(),
+                    );
+                }
                 Ok((
                     RuntimeDeepModel::Mlp(trained.valid()),
                     Self::training_summary_from_report(&report),
@@ -1227,11 +1602,15 @@ impl BurnDeepExpert {
     }
 
     fn validate_training_summary(summary: &TrainingSummaryMetadata) -> Result<()> {
-        if summary.dataset_rows != summary.train_rows + summary.val_rows {
+        let partition_rows = summary
+            .train_rows
+            .checked_add(summary.embargo_rows)
+            .and_then(|rows| rows.checked_add(summary.val_rows));
+        if Some(summary.dataset_rows) != partition_rows {
             bail!(
-                "deep-model training summary is inconsistent: dataset_rows={} but train_rows + val_rows = {}",
+                "deep-model training summary is inconsistent: dataset_rows={} but train_rows + embargo_rows + val_rows = {:?}",
                 summary.dataset_rows,
-                summary.train_rows + summary.val_rows
+                partition_rows
             );
         }
 
@@ -1430,6 +1809,36 @@ impl BurnDeepExpert {
         val_x: Option<&FeatureFrame>,
         val_y: Option<&[i32]>,
     ) -> Result<()> {
+        #[cfg(feature = "burn-rocm-backend")]
+        {
+            self.validate_model_params()?;
+            let owner = self.ensure_rocm_residency()?;
+            return owner.executes(|| self.fit_internal_on_stream(x, y, val_x, val_y));
+        }
+        #[cfg(not(feature = "burn-rocm-backend"))]
+        self.fit_internal_on_stream(x, y, val_x, val_y)
+    }
+
+    fn fit_internal_on_stream(
+        &mut self,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
+    ) -> Result<()> {
+        self.validate_model_params()?;
+        #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend"))]
+        if self.kind == DeepModelKind::Mlp {
+            let rows = x
+                .n_samples()
+                .checked_add(val_x.map_or(0, FeatureFrame::n_samples))
+                .context("MLP host dataset row count overflow")?;
+            if mlp_host_bytes(rows, x.n_features(), 12)? as u64
+                > neoethos_core::available_memory_bytes() / 2
+            {
+                bail!("MLP input materialization exceeds current available host RAM");
+            }
+        }
         let features = deep_backend_f32_matrix(x)
             .with_context(|| format!("build {} feature matrix", self.model_name()))?;
         validate_model_labels(y, features.nrows())
@@ -1527,64 +1936,67 @@ impl ExpertModel for BurnDeepExpert {
 
     fn predict_proba(&self, x: &FeatureFrame, lease: &CpuLease) -> Result<Array2<f64>> {
         lease.scope(|| {
+            self.on_runtime_stream(|| {
+                self.ensure_runtime_state_ready()?;
+                let model = self.model.as_ref().with_context(|| {
+                    format!("{} model is not trained or loaded", self.model_name())
+                })?;
+
+                let actual_columns = feature_columns_from_frame(x);
+                if !self.feature_columns.is_empty() && self.feature_columns != actual_columns {
+                    bail!(
+                        "feature column mismatch for persisted deep model; expected {:?}, got {:?}",
+                        self.feature_columns,
+                        actual_columns
+                    );
+                }
+
+                let features = deep_backend_f32_matrix(x)
+                    .with_context(|| format!("build {} inference matrix", self.model_name()))?;
+                let (device, _) = self.resolve_runtime_infer_device()?;
+                let probabilities =
+                    model.predict_probabilities(&features, self.batch_size(), &device)?;
+                if probabilities.ncols() != 3 {
+                    bail!(
+                        "{} should output 3 probability columns, got {}",
+                        self.model_name(),
+                        probabilities.ncols()
+                    );
+                }
+                Ok(probabilities.mapv(f64::from))
+            })
+        })
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        self.on_runtime_stream(|| {
             self.ensure_runtime_state_ready()?;
             let model = self
                 .model
                 .as_ref()
                 .with_context(|| format!("{} model is not trained or loaded", self.model_name()))?;
-
-            let actual_columns = feature_columns_from_frame(x);
-            if !self.feature_columns.is_empty() && self.feature_columns != actual_columns {
-                bail!(
-                    "feature column mismatch for persisted deep model; expected {:?}, got {:?}",
-                    self.feature_columns,
-                    actual_columns
-                );
+            let metadata = self.metadata()?;
+            let config = self.artifact_config()?;
+            let staged_path = Self::staged_artifact_dir(path);
+            Self::cleanup_artifact_dir(&staged_path)?;
+            std::fs::create_dir_all(&staged_path).with_context(|| {
+                format!(
+                    "create staged deep-model directory {}",
+                    staged_path.display()
+                )
+            })?;
+            if let Err(error) = (|| -> Result<()> {
+                model.save_to(&Self::model_record_path(&staged_path))?;
+                Self::write_json(&Self::metadata_path(&staged_path), &metadata)?;
+                Self::write_json(&Self::config_path(&staged_path), &config)?;
+                Ok(())
+            })() {
+                let _ = Self::cleanup_artifact_dir(&staged_path);
+                return Err(error);
             }
-
-            let features = deep_backend_f32_matrix(x)
-                .with_context(|| format!("build {} inference matrix", self.model_name()))?;
-            let (device, _) = self.resolve_runtime_infer_device()?;
-            let probabilities =
-                model.predict_probabilities(&features, self.batch_size(), &device)?;
-            if probabilities.ncols() != 3 {
-                bail!(
-                    "{} should output 3 probability columns, got {}",
-                    self.model_name(),
-                    probabilities.ncols()
-                );
-            }
-            Ok(probabilities.mapv(f64::from))
-        })
-    }
-
-    fn save(&self, path: &Path) -> Result<()> {
-        self.ensure_runtime_state_ready()?;
-        let model = self
-            .model
-            .as_ref()
-            .with_context(|| format!("{} model is not trained or loaded", self.model_name()))?;
-        let metadata = self.metadata()?;
-        let config = self.artifact_config()?;
-        let staged_path = Self::staged_artifact_dir(path);
-        Self::cleanup_artifact_dir(&staged_path)?;
-        std::fs::create_dir_all(&staged_path).with_context(|| {
-            format!(
-                "create staged deep-model directory {}",
-                staged_path.display()
-            )
-        })?;
-        if let Err(error) = (|| -> Result<()> {
-            model.save_to(&Self::model_record_path(&staged_path))?;
-            Self::write_json(&Self::metadata_path(&staged_path), &metadata)?;
-            Self::write_json(&Self::config_path(&staged_path), &config)?;
+            Self::replace_artifact_directory(&staged_path, path)?;
             Ok(())
-        })() {
-            let _ = Self::cleanup_artifact_dir(&staged_path);
-            return Err(error);
-        }
-        Self::replace_artifact_directory(&staged_path, path)?;
-        Ok(())
+        })
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
@@ -1615,85 +2027,109 @@ impl ExpertModel for BurnDeepExpert {
         next_state.burn_training_report = config.burn_training_report;
         next_state.persisted_runtime_selection = persisted_runtime_selection;
         next_state.validate_model_params()?;
-        let next_model = next_state.init_runtime_model(next_feature_columns.len())?;
+        #[cfg(feature = "burn-rocm-backend")]
+        let owner = next_state.ensure_rocm_residency()?;
+        let complete_load = || -> Result<()> {
+            let next_model = next_state.init_runtime_model(next_feature_columns.len())?;
 
-        let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
-        let base_path = Self::model_record_path(path);
-        let (device, host_runtime_selection) = next_state.resolve_runtime_infer_device()?;
-        if let Some(persisted_runtime_selection) = next_state.persisted_runtime_selection.as_ref()
-            && (persisted_runtime_selection.requested_policy
-                != host_runtime_selection.requested_policy
-                || persisted_runtime_selection.effective_policy
-                    != host_runtime_selection.effective_policy
-                || persisted_runtime_selection.execution_backend
-                    != host_runtime_selection.execution_backend)
-        {
-            bail!(
-                "{} runtime identity drift between persisted {:?} and host {:?}",
-                self.model_name(),
-                persisted_runtime_selection,
-                host_runtime_selection
-            );
-        }
-        let loaded = match next_model {
-            RuntimeDeepModel::Mlp(model) => RuntimeDeepModel::Mlp(
-                model
-                    .load_file(base_path.clone(), &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
-            RuntimeDeepModel::NBeats(model) => RuntimeDeepModel::NBeats(
-                model
-                    .load_file(base_path.clone(), &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
-            RuntimeDeepModel::NBeatsxNf(model) => RuntimeDeepModel::NBeatsxNf(
-                model
-                    .load_file(base_path.clone(), &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
-            RuntimeDeepModel::TiDE(model) => RuntimeDeepModel::TiDE(
-                model
-                    .load_file(base_path.clone(), &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
-            RuntimeDeepModel::TiDENf(model) => RuntimeDeepModel::TiDENf(
-                model
-                    .load_file(base_path.clone(), &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
-            RuntimeDeepModel::TabNet(model) => RuntimeDeepModel::TabNet(
-                model
-                    .load_file(base_path.clone(), &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
-            RuntimeDeepModel::Kan(model) => RuntimeDeepModel::Kan(
-                model
-                    .load_file(base_path.clone(), &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
-            RuntimeDeepModel::Transformer(model) => RuntimeDeepModel::Transformer(
-                model
-                    .load_file(base_path, &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
-            RuntimeDeepModel::PatchTst(model) => RuntimeDeepModel::PatchTst(
-                model
-                    .load_file(base_path.clone(), &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
-            RuntimeDeepModel::TimesNet(model) => RuntimeDeepModel::TimesNet(
-                model
-                    .load_file(base_path, &recorder, &device)
-                    .with_context(|| format!("load {} Burn record", self.model_name()))?,
-            ),
+            let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
+            let base_path = Self::model_record_path(path);
+            let (device, host_runtime_selection) = next_state.resolve_runtime_infer_device()?;
+            if let Some(persisted_runtime_selection) =
+                next_state.persisted_runtime_selection.as_ref()
+                && (persisted_runtime_selection.requested_policy
+                    != host_runtime_selection.requested_policy
+                    || persisted_runtime_selection.effective_policy
+                        != host_runtime_selection.effective_policy
+                    || persisted_runtime_selection.execution_backend
+                        != host_runtime_selection.execution_backend)
+            {
+                bail!(
+                    "{} runtime identity drift between persisted {:?} and host {:?}",
+                    self.model_name(),
+                    persisted_runtime_selection,
+                    host_runtime_selection
+                );
+            }
+            let loaded = match next_model {
+                RuntimeDeepModel::Mlp(model) => RuntimeDeepModel::Mlp(
+                    model
+                        .load_file(base_path.clone(), &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+                RuntimeDeepModel::NBeats(model) => RuntimeDeepModel::NBeats(
+                    model
+                        .load_file(base_path.clone(), &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+                RuntimeDeepModel::NBeatsxNf(model) => RuntimeDeepModel::NBeatsxNf(
+                    model
+                        .load_file(base_path.clone(), &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+                RuntimeDeepModel::TiDE(model) => RuntimeDeepModel::TiDE(
+                    model
+                        .load_file(base_path.clone(), &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+                RuntimeDeepModel::TiDENf(model) => RuntimeDeepModel::TiDENf(
+                    model
+                        .load_file(base_path.clone(), &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+                RuntimeDeepModel::TabNet(model) => RuntimeDeepModel::TabNet(
+                    model
+                        .load_file(base_path.clone(), &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+                RuntimeDeepModel::Kan(model) => RuntimeDeepModel::Kan(
+                    model
+                        .load_file(base_path.clone(), &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+                RuntimeDeepModel::Transformer(model) => RuntimeDeepModel::Transformer(
+                    model
+                        .load_file(base_path, &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+                RuntimeDeepModel::PatchTst(model) => RuntimeDeepModel::PatchTst(
+                    model
+                        .load_file(base_path.clone(), &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+                RuntimeDeepModel::TimesNet(model) => RuntimeDeepModel::TimesNet(
+                    model
+                        .load_file(base_path, &recorder, &device)
+                        .with_context(|| format!("load {} Burn record", self.model_name()))?,
+                ),
+            };
+            next_state.params = next_params;
+            next_state.host_runtime_selection = Some(host_runtime_selection);
+            next_state.feature_columns = next_feature_columns;
+            next_state.training_summary = next_training_summary;
+            next_state.model = Some(loaded);
+            *self = next_state;
+            Ok(())
         };
-        next_state.params = next_params;
-        next_state.host_runtime_selection = Some(host_runtime_selection);
-        next_state.feature_columns = next_feature_columns;
-        next_state.training_summary = next_training_summary;
-        next_state.model = Some(loaded);
-        *self = next_state;
-        Ok(())
+        #[cfg(feature = "burn-rocm-backend")]
+        {
+            owner.executes(complete_load)
+        }
+        #[cfg(not(feature = "burn-rocm-backend"))]
+        {
+            complete_load()
+        }
+    }
+}
+
+#[cfg(feature = "burn-rocm-backend")]
+impl Drop for BurnDeepExpert {
+    fn drop(&mut self) {
+        // Fusion records DropOps on the owning stream even if the caller
+        // moved this expert to another host thread before destruction.
+        if let Some(owner) = self.rocm_residency.as_ref() {
+            owner.drop_handles(|| drop(self.model.take()));
+        }
     }
 }
 
@@ -1770,6 +2206,265 @@ mod tests {
     use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
     use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
 
+    /// Genuine HIP training/inference/record reload, never a host-only pass.
+    /// Execute explicitly on the later AMD acceptance host, not in host subsets.
+    #[cfg(feature = "burn-rocm-backend")]
+    #[test]
+    fn burn_rocm_real_mlp_three_epoch_reload_and_cross_thread_cleanup() -> Result<()> {
+        use burn_fusion::{inspect::FusionInspector, stream::StreamId};
+        assert_eq!(
+            std::env::var("NEOETHOS_REQUIRE_GPU").as_deref(),
+            Ok("1"),
+            "this test requires explicit real-device acceptance, not a skipped GPU test"
+        );
+        let inspector = FusionInspector::install(StreamId::current());
+        let device = burn_rocm::RocmDevice::new(0);
+        <InferBackend as burn::tensor::backend::Backend>::sync(&device)
+            .map_err(|error| anyhow::anyhow!("ROCm baseline sync failed: {error:?}"))?;
+        inspector.set_baseline();
+        let frame = typed_frame(vec![
+            ("rsi", (0..224).map(|i| (i % 17) as f64 / 17.0).collect()),
+            (
+                "atr",
+                (0..224).map(|i| 1.0 + (i % 11) as f64 / 11.0).collect(),
+            ),
+        ])?;
+        let train = frame.select_rows(&(0..160).collect::<Vec<_>>())?;
+        let validation = frame.select_rows(&(160..224).collect::<Vec<_>>())?;
+        let labels = (0..224).map(|i| [-1, 0, 1][i % 3]).collect::<Vec<_>>();
+        let mut expert = BurnDeepExpert::new(
+            DeepModelKind::Mlp,
+            17,
+            Some(HashMap::from([
+                ("device".into(), "rocm:0".into()),
+                ("max_epochs".into(), "3".into()),
+                ("patience".into(), "3".into()),
+                ("batch_size".into(), "16".into()),
+                ("hidden_dim".into(), "16".into()),
+                ("n_layers".into(), "2".into()),
+                ("dropout".into(), "0".into()),
+                ("training_precision".into(), "fp32".into()),
+            ])),
+        );
+        let lease = one_worker_lease();
+        expert.fit_with_validation(
+            &train,
+            &labels[..160],
+            Some(&validation),
+            Some(&labels[160..]),
+            &lease,
+        )?;
+        let report = expert
+            .burn_training_report
+            .as_ref()
+            .context("missing real ROCm training report")?;
+        assert_eq!(report.epochs_ran, 3);
+        assert_eq!(report.execution_backend, "rocm");
+        assert_eq!(report.effective_device_policy, "rocm:0");
+        assert_eq!(report.training_precision, "fp32");
+        let before = expert.predict_proba(&validation, &lease)?;
+        assert_eq!(before.dim(), (64, 3));
+        for row in before.rows() {
+            assert!(
+                row.iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            );
+            assert!((row.sum() - 1.0).abs() < 1e-5);
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("neoethos-rocm-mlp-{}-{nonce}", std::process::id()));
+        assert!(!path.exists());
+        expert.save(&path)?;
+        let mut loaded = BurnDeepExpert::new(DeepModelKind::Mlp, 17, None);
+        loaded.load(&path)?;
+        let retained = std::sync::Arc::downgrade(loaded.rocm_residency.as_ref().unwrap());
+        let after = std::thread::spawn(move || -> Result<Array2<f64>> {
+            let values = loaded.predict_proba(&validation, &one_worker_lease())?;
+            drop(loaded);
+            Ok(values)
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("ROCm cross-thread model operation panicked"))??;
+        assert!(retained.upgrade().is_none());
+        assert_eq!(before.mapv(f64::to_bits), after.mapv(f64::to_bits));
+        drop(expert);
+        <InferBackend as burn::tensor::backend::Backend>::sync(&device)
+            .map_err(|error| anyhow::anyhow!("ROCm terminal sync failed: {error:?}"))?;
+        assert!(inspector.new_handles_since_baseline().is_empty());
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mlp_capacity_parameter_estimate_matches_the_actual_module() -> Result<()> {
+        let config = BurnMLPConfig::new(5).with_hidden_dim(7).with_n_layers(3);
+        let model = config.init::<burn_ndarray::NdArray<f32>>(&Default::default());
+        assert_eq!(mlp_parameter_count(5, 7, 3)?, model.num_params());
+        assert_eq!(mlp_parameter_count(5, 7, 3)?, 220);
+        Ok(())
+    }
+
+    #[test]
+    fn mlp_capacity_charges_each_padded_tensor_in_tiny_models() -> Result<()> {
+        // I=H=L=B=V=1: six parameter tensors, each256B; eight copies.
+        // Three activation tensors, each256B; max(16 train,8 validation) copies.
+        // The old logical formula was640B, less than parameters alone (1536B).
+        assert_eq!(mlp_parameter_count(1, 1, 1)?, 10);
+        assert_eq!(mlp_training_bytes(1, 1, 1, 1, 1, 256)?, 24_576);
+        assert_eq!(mlp_training_bytes(1, 1, 1, 1, 1, 512)?, 49_152);
+        assert!(mlp_admitted_width(1, 1, 1, 1, 1, 640, 1 << 20, 256, false).is_err());
+        assert_eq!(
+            mlp_admitted_width(1, 1, 1, 1, 1, 24_576, 1 << 20, 256, false)?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mlp_capacity_padded_estimate_is_monotone_across_alignment_boundaries() -> Result<()> {
+        for alignment in [32, 256, 512] {
+            let mut previous = 0;
+            for width in 1..=130 {
+                let current = mlp_training_bytes(7, width, 3, 17, 65, alignment)?;
+                assert!(current >= previous, "width {width}, alignment {alignment}");
+                previous = current;
+            }
+        }
+        // Logical matrix17x3=204B, but its aligned physical extent is512B.
+        assert!(mlp_admitted_width(1, 1, 1, 1, 17, 1 << 20, 300, 256, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mlp_capacity_reserves_the_dataset_before_resolving_requested_width() -> Result<()> {
+        let plan = BurnResidentDatasetPlanV1::checked(200, 3, Some(50), 17, 1 << 24, 256)?;
+        let model_only =
+            mlp_training_bytes(3, 37, 3, plan.batch_rows(), plan.validation_rows(), 256)?;
+        let combined = model_only.checked_add(plan.peak_bytes()).unwrap();
+        assert_eq!(plan.peak_bytes(), 8960);
+        assert!(
+            mlp_admitted_width(
+                3,
+                37,
+                3,
+                17,
+                50,
+                model_only - plan.peak_bytes(),
+                1 << 24,
+                256,
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(
+            mlp_admitted_width(
+                3,
+                37,
+                3,
+                17,
+                50,
+                combined - plan.peak_bytes(),
+                1 << 24,
+                256,
+                false
+            )?,
+            37
+        );
+        // More cache memory must not be silently funded by shrinking the
+        // configured architecture, even when automatic growth is requested.
+        assert!(mlp_admitted_width(3, 37, 3, 17, 50, model_only - 1, 1 << 24, 256, true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mlp_capacity_grows_with_memory_and_accounts_for_full_validation() -> Result<()> {
+        const MIB: usize = 1024 * 1024;
+        let small = mlp_admitted_width(128, 64, 3, 64, 1000, 256 * MIB, 1024 * MIB, 256, true)?;
+        let large = mlp_admitted_width(128, 64, 3, 64, 1000, 1024 * MIB, 1024 * MIB, 256, true)?;
+        assert!(large > small && small > 64);
+        let longer_validation =
+            mlp_admitted_width(128, 64, 3, 64, 10_000, 1024 * MIB, 1024 * MIB, 256, true)?;
+        assert!(longer_validation < large);
+        assert!(mlp_training_bytes(128, large, 3, 64, 1000, 256)? <= 1024 * MIB);
+        assert!(mlp_training_bytes(128, large + 1, 3, 64, 1000, 256)? > 1024 * MIB);
+        let low_fraction = mlp_fractional_width(64, large, 0.25)?;
+        let high_fraction = mlp_fractional_width(64, large, 0.75)?;
+        assert!(64 <= low_fraction && low_fraction < high_fraction && high_fraction <= large);
+        assert!(mlp_fractional_width(64, large, 0.75)? > mlp_fractional_width(64, small, 0.75)?);
+        Ok(())
+    }
+
+    #[test]
+    fn mlp_capacity_preserves_fixed_dimensions_and_rejects_impossible_shapes() -> Result<()> {
+        const MIB: usize = 1024 * 1024;
+        for budget in [256 * MIB, 1024 * MIB] {
+            assert_eq!(
+                mlp_admitted_width(128, 37, 3, 64, 1000, budget, MIB, 256, false)?,
+                37
+            );
+        }
+        assert!(mlp_admitted_width(128, 64, 3, 64, 1000, 1, MIB, 256, true).is_err());
+        assert!(mlp_admitted_width(128, 64, 3, 64, 1000, usize::MAX, 1, 256, true).is_err());
+        assert!(
+            mlp_admitted_width(
+                usize::MAX,
+                64,
+                3,
+                64,
+                1000,
+                usize::MAX,
+                usize::MAX,
+                256,
+                true
+            )
+            .is_err()
+        );
+        assert!(mlp_parameter_count(128, 0, 3).is_err());
+        assert!(mlp_parameter_count(128, 64, 0).is_err());
+        assert_eq!(
+            mlp_admitted_width(2, 10_000, 1, 1, 1, 16 * MIB, MIB, 256, false)?,
+            10_000
+        );
+        for bad in ["0", "-1", "1.1", "NaN", "inf", "invalid"] {
+            let expert = BurnDeepExpert::new(
+                DeepModelKind::Mlp,
+                1,
+                Some(HashMap::from([("capacity_fraction".into(), bad.into())])),
+            );
+            assert!(expert.mlp_capacity_fraction().is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mlp_capacity_saved_dimensions_reload_without_resizing() -> Result<()> {
+        let config = DeepArtifactConfig {
+            kind: DeepModelKind::Mlp,
+            params: HashMap::from([
+                ("capacity_mode".into(), "auto".into()),
+                ("capacity_requested_hidden_dim".into(), "64".into()),
+                ("hidden_dim".into(), "777".into()),
+                ("n_layers".into(), "3".into()),
+                ("capacity_fraction".into(), "0.375".into()),
+            ]),
+            burn_training_report: None,
+            runtime_metadata: None,
+        };
+        let decoded: DeepArtifactConfig = serde_json::from_slice(&serde_json::to_vec(&config)?)?;
+        let expert = BurnDeepExpert::new(decoded.kind, 1, Some(decoded.params));
+        assert!(expert.automatic_mlp_capacity()?);
+        assert_eq!(expert.mlp_config(128).hidden_dim, 777);
+        assert_eq!(expert.mlp_config(128).n_layers, 3);
+        assert_eq!(expert.mlp_capacity_fraction()?, 0.375);
+        let legacy = BurnDeepExpert::new(DeepModelKind::Mlp, 1, None);
+        assert!(!legacy.automatic_mlp_capacity()?);
+        assert_eq!(legacy.mlp_config(128).hidden_dim, 256);
+        Ok(())
+    }
+
     fn one_worker_lease() -> CpuLease {
         let width = WorkerLimit::new(1).expect("one worker is valid");
         CpuPermitBroker::new(width)
@@ -1832,7 +2527,7 @@ mod tests {
     fn metadata_uses_training_summary_and_feature_columns() -> Result<()> {
         let mut expert = BurnDeepExpert::new(DeepModelKind::Mlp, 7, None);
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
-        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
+        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 0, 20));
 
         let metadata = expert.metadata()?;
         assert_eq!(metadata.model_name, "mlp");
@@ -1851,7 +2546,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::raw_for_validation(10, 7, 2),
+            TrainingSummaryMetadata::raw_for_validation(10, 7, 0, 2),
         );
 
         let err = BurnDeepExpert::validate_loaded_metadata(&metadata, "mlp")
@@ -1899,24 +2594,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_runtime_params_accepts_integrated_wgpu_provenance() {
+    fn validate_runtime_params_rejects_retired_wgpu_provenance() {
         let params = HashMap::from([
-            (
-                "requested_device_policy".to_string(),
-                "gpu:integrated:0".to_string(),
-            ),
-            (
-                "effective_device_policy".to_string(),
-                "gpu:integrated:0".to_string(),
-            ),
+            ("requested_device_policy".to_string(), "gpu:0".to_string()),
+            ("effective_device_policy".to_string(), "gpu:0".to_string()),
             (
                 "execution_backend".to_string(),
                 "wgpu_integrated_gpu".to_string(),
             ),
         ]);
 
-        BurnDeepExpert::validate_runtime_params(&params)
-            .expect("integrated WGPU runtime provenance should round-trip");
+        let error = BurnDeepExpert::validate_runtime_params(&params)
+            .expect_err("retired WGPU runtime provenance must fail closed");
+        assert!(error.to_string().contains("unsupported backend"));
     }
 
     #[test]
@@ -1924,10 +2614,7 @@ mod tests {
         let params = HashMap::from([
             ("requested_device_policy".to_string(), "cpu".to_string()),
             ("effective_device_policy".to_string(), "cpu".to_string()),
-            (
-                "execution_backend".to_string(),
-                "wgpu_discrete_gpu".to_string(),
-            ),
+            ("execution_backend".to_string(), "cuda".to_string()),
         ]);
 
         let err = BurnDeepExpert::validate_runtime_params(&params)
@@ -1951,7 +2638,7 @@ mod tests {
             ])),
         );
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
-        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
+        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 0, 20));
 
         let err = expert
             .ensure_runtime_state_ready()
@@ -1963,7 +2650,7 @@ mod tests {
     fn ensure_runtime_state_ready_requires_runtime_device_metadata() {
         let mut expert = BurnDeepExpert::new(DeepModelKind::Mlp, 7, None);
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
-        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
+        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 0, 20));
 
         let err = expert
             .ensure_runtime_state_ready()
@@ -1983,7 +2670,7 @@ mod tests {
             ])),
         );
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
-        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
+        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 0, 20));
 
         let err = expert
             .ensure_runtime_state_ready()
@@ -1996,7 +2683,7 @@ mod tests {
         let mut expert = BurnDeepExpert::new(DeepModelKind::Mlp, 7, None);
         expert
             .params
-            .insert("execution_backend".to_string(), "wgpu".to_string());
+            .insert("execution_backend".to_string(), "cuda".to_string());
         expert
             .params
             .insert("requested_device_policy".to_string(), "cuda:0".to_string());
@@ -2005,7 +2692,7 @@ mod tests {
             .insert("effective_device_policy".to_string(), "cpu".to_string());
 
         let (backend, degraded_reason) = expert.runtime_details();
-        assert_eq!(backend.as_deref(), Some("wgpu"));
+        assert_eq!(backend.as_deref(), Some("cuda"));
         assert!(
             degraded_reason
                 .as_deref()
@@ -2060,13 +2747,13 @@ mod tests {
             execution_backend: "ndarray_cpu".to_string(),
         });
         expert.host_runtime_selection = Some(BurnDeviceSelection {
-            requested_policy: "cpu".to_string(),
-            effective_policy: "default".to_string(),
-            execution_backend: "wgpu_default".to_string(),
+            requested_policy: "gpu:0".to_string(),
+            effective_policy: "gpu:0".to_string(),
+            execution_backend: "cuda".to_string(),
         });
 
         let (backend, degraded_reason) = expert.runtime_details();
-        assert_eq!(backend.as_deref(), Some("wgpu_default"));
+        assert_eq!(backend.as_deref(), Some("cuda"));
         let degraded_reason = degraded_reason.expect("runtime re-resolution should be degraded");
         assert!(degraded_reason.contains("deep_runtime_device_re_resolved"));
         assert!(degraded_reason.contains("deep_runtime_backend_re_resolved"));
@@ -2089,16 +2776,16 @@ mod tests {
             .execution_backend;
         expert.model = Some(model);
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
-        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
+        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 0, 20));
         expert.persisted_runtime_selection = Some(BurnDeviceSelection {
             requested_policy: "cpu".to_string(),
             effective_policy: "cpu".to_string(),
             execution_backend: live_backend.clone(),
         });
         expert.host_runtime_selection = Some(BurnDeviceSelection {
-            requested_policy: "cpu".to_string(),
-            effective_policy: "default".to_string(),
-            execution_backend: "wgpu_default".to_string(),
+            requested_policy: "gpu:0".to_string(),
+            effective_policy: "gpu:0".to_string(),
+            execution_backend: "cuda".to_string(),
         });
 
         let (backend, degraded_reason) = expert.runtime_details();
@@ -2158,11 +2845,11 @@ mod tests {
     fn artifact_config_persists_burn_training_report() -> Result<()> {
         let mut expert = BurnDeepExpert::new(DeepModelKind::Mlp, 7, None);
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
-        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
+        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 5, 15));
         expert.burn_training_report = Some(BurnTrainingReport {
             dataset_rows: 100,
             train_rows: 80,
-            val_rows: 20,
+            val_rows: 15,
             embargo_rows: 5,
             class_weights: vec![1.0, 1.0, 1.0],
             best_loss: 0.2,
@@ -2200,7 +2887,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string(), "atr".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(100, 80, 20),
+            TrainingSummaryMetadata::new(100, 80, 0, 20),
         );
         let config = DeepArtifactConfig {
             kind: DeepModelKind::Mlp,
@@ -2246,7 +2933,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string(), "atr".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(100, 80, 20),
+            TrainingSummaryMetadata::new(100, 80, 0, 20),
         );
         let embedded = RuntimeArtifactMetadata::new(
             "mlp",
@@ -2254,7 +2941,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string(), "atr".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(100, 81, 19),
+            TrainingSummaryMetadata::new(100, 81, 0, 19),
         );
         let config = DeepArtifactConfig {
             kind: DeepModelKind::Mlp,
@@ -2279,11 +2966,11 @@ mod tests {
     fn artifact_config_rejects_burn_training_report_row_drift() {
         let mut expert = BurnDeepExpert::new(DeepModelKind::Mlp, 7, None);
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
-        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
+        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 5, 15));
         expert.burn_training_report = Some(BurnTrainingReport {
             dataset_rows: 101,
             train_rows: 81,
-            val_rows: 20,
+            val_rows: 15,
             embargo_rows: 5,
             class_weights: vec![1.0, 1.0, 1.0],
             best_loss: 0.2,
@@ -2311,11 +2998,11 @@ mod tests {
     fn artifact_config_rejects_burn_training_report_runtime_incoherence() {
         let mut expert = BurnDeepExpert::new(DeepModelKind::Mlp, 7, None);
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
-        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
+        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 5, 15));
         expert.burn_training_report = Some(BurnTrainingReport {
             dataset_rows: 100,
             train_rows: 80,
-            val_rows: 20,
+            val_rows: 15,
             embargo_rows: 5,
             class_weights: vec![1.0, 1.0, 1.0],
             best_loss: 0.2,
@@ -2328,7 +3015,7 @@ mod tests {
             seed: 7,
             requested_device_policy: "cpu".to_string(),
             effective_device_policy: "cpu".to_string(),
-            execution_backend: "wgpu_discrete_gpu".to_string(),
+            execution_backend: "cuda".to_string(),
             training_precision: "fp32".to_string(),
             training_precision_reason: None,
         });
@@ -2346,7 +3033,7 @@ mod tests {
     fn artifact_config_requires_burn_training_report() {
         let mut expert = BurnDeepExpert::new(DeepModelKind::Mlp, 7, None);
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
-        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 20));
+        expert.training_summary = Some(TrainingSummaryMetadata::new(100, 80, 0, 20));
 
         let err = expert
             .artifact_config()

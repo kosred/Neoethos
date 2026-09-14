@@ -1,11 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Chunk 3 is the first production caller of the sealed result publisher"
-    )
-)]
-
 use std::fmt;
 use std::io;
 
@@ -84,10 +76,12 @@ impl CanonicalNativeGenerationZeroPublicationErrorV1 {
         &self.kind
     }
 
+    #[cfg(test)]
     pub(crate) const fn final_state(&self) -> CanonicalNativeGenerationZeroPublicationFinalStateV1 {
         self.final_state
     }
 
+    #[cfg(test)]
     pub(crate) const fn temporary_state(
         &self,
     ) -> CanonicalNativeGenerationZeroPublicationTemporaryStateV1 {
@@ -113,13 +107,16 @@ pub(crate) struct CanonicalNativeGenerationZeroPublicationReceiptV1 {
     byte_count: u64,
     file_sha256: String,
     reused_identical: bool,
+    #[cfg(test)]
     final_state: CanonicalNativeGenerationZeroPublicationFinalStateV1,
+    #[cfg(test)]
     temporary_state: CanonicalNativeGenerationZeroPublicationTemporaryStateV1,
     evidence_identity_sha256: String,
     financial_input_receipt_identity_sha256: String,
     native_input_receipt_identity_sha256: String,
     population_sizing_receipt_identity_sha256: String,
     resolved_population: usize,
+    #[cfg(test)]
     term_cap: usize,
     selected_device_ordinal: u32,
     engine: String,
@@ -148,10 +145,12 @@ impl CanonicalNativeGenerationZeroPublicationReceiptV1 {
         self.reused_identical
     }
 
+    #[cfg(test)]
     pub(crate) const fn final_state(&self) -> CanonicalNativeGenerationZeroPublicationFinalStateV1 {
         self.final_state
     }
 
+    #[cfg(test)]
     pub(crate) const fn temporary_state(
         &self,
     ) -> CanonicalNativeGenerationZeroPublicationTemporaryStateV1 {
@@ -178,6 +177,7 @@ impl CanonicalNativeGenerationZeroPublicationReceiptV1 {
         self.resolved_population
     }
 
+    #[cfg(test)]
     pub(crate) const fn term_cap(&self) -> usize {
         self.term_cap
     }
@@ -318,15 +318,18 @@ pub(crate) fn publish_canonical_native_generation_zero_research_result_v1(
         ));
     }
 
-    let (reused_identical, final_state) = match low_level_receipt.disposition() {
-        CanonicalArtifactPublishDispositionV1::Installed => (
-            false,
-            CanonicalNativeGenerationZeroPublicationFinalStateV1::InstalledDurable,
-        ),
-        CanonicalArtifactPublishDispositionV1::ExistingIdentical => (
-            true,
-            CanonicalNativeGenerationZeroPublicationFinalStateV1::ExistingIdentical,
-        ),
+    let reused_identical = matches!(
+        low_level_receipt.disposition(),
+        CanonicalArtifactPublishDispositionV1::ExistingIdentical
+    );
+    #[cfg(test)]
+    let final_state = match low_level_receipt.disposition() {
+        CanonicalArtifactPublishDispositionV1::Installed => {
+            CanonicalNativeGenerationZeroPublicationFinalStateV1::InstalledDurable
+        }
+        CanonicalArtifactPublishDispositionV1::ExistingIdentical => {
+            CanonicalNativeGenerationZeroPublicationFinalStateV1::ExistingIdentical
+        }
     };
     let milestone = view.milestone();
     let counters = milestone.residency_counters();
@@ -335,7 +338,9 @@ pub(crate) fn publish_canonical_native_generation_zero_research_result_v1(
         byte_count: actual_seal.byte_count(),
         file_sha256: actual_seal.sha256().to_owned(),
         reused_identical,
+        #[cfg(test)]
         final_state,
+        #[cfg(test)]
         temporary_state: CanonicalNativeGenerationZeroPublicationTemporaryStateV1::RemovedDurable,
         evidence_identity_sha256: evidence_identity.to_owned(),
         financial_input_receipt_identity_sha256: view
@@ -348,6 +353,7 @@ pub(crate) fn publish_canonical_native_generation_zero_research_result_v1(
             .population_sizing_receipt_identity_sha256()
             .to_owned(),
         resolved_population: milestone.resolved_population(),
+        #[cfg(test)]
         term_cap: milestone.term_cap(),
         selected_device_ordinal: milestone.selected_device_ordinal(),
         engine: milestone.engine().to_owned(),

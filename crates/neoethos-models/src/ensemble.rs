@@ -228,13 +228,22 @@ fn validate_meta_metadata(
     if metadata.feature_columns.is_empty() {
         bail!("meta artifact metadata must contain at least one feature column");
     }
-    if metadata.training_summary.dataset_rows == 0 {
-        bail!("meta artifact training summary must persist a non-zero dataset row count");
+    if metadata.training_summary.dataset_rows == 0 || metadata.training_summary.train_rows == 0 {
+        bail!("meta artifact training summary must persist non-zero dataset and train rows");
     }
-    if metadata.training_summary.dataset_rows
-        != metadata.training_summary.train_rows + metadata.training_summary.val_rows
-    {
-        bail!("meta artifact training summary is inconsistent");
+    let accounted_rows = metadata
+        .training_summary
+        .train_rows
+        .checked_add(metadata.training_summary.embargo_rows)
+        .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows));
+    if accounted_rows != Some(metadata.training_summary.dataset_rows) {
+        bail!(
+            "meta artifact training summary is inconsistent: dataset_rows={} train_rows={} embargo_rows={} val_rows={}",
+            metadata.training_summary.dataset_rows,
+            metadata.training_summary.train_rows,
+            metadata.training_summary.embargo_rows,
+            metadata.training_summary.val_rows
+        );
     }
     Ok(())
 }

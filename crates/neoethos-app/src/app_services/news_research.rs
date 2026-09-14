@@ -21,7 +21,8 @@
 //! blip — the UI always has *something* to render.
 //!
 //! Feed URLs are **operator config** (`NewsConfig.rss_feeds`, editable in
-//! Settings → News); this module hardcodes none of them. The only
+//! Settings → Advanced → Raw config.yaml, `news.rss_feeds`); this module
+//! hardcodes none of them. The only
 //! constant here is the internal fetch-coalescing cache window, which is
 //! an implementation detail (it bounds how often we hit Codex), not a
 //! trading parameter.
@@ -93,40 +94,70 @@ pub struct NewsFeed {
     pub notice: String,
 }
 
-/// Process-wide cache of the last successfully-built feed + when it was
-/// built. `OnceLock<Mutex<...>>` so the first caller initialises it and
-/// every later caller shares one coalescing window.
-static CACHE: OnceLock<Mutex<Option<(NewsFeed, Instant)>>> = OnceLock::new();
+/// One bounded process-wide entry, keyed by the exact configured feed list.
+/// The async mutex also coalesces concurrent cold requests; the individual
+/// RSS fetches inside one build still run concurrently.
+struct CachedNewsFeed {
+    configured_feeds: Vec<String>,
+    feed: NewsFeed,
+    built_at: Instant,
+}
 
-fn cache() -> &'static Mutex<Option<(NewsFeed, Instant)>> {
+static CACHE: OnceLock<Mutex<Option<CachedNewsFeed>>> = OnceLock::new();
+
+fn cache() -> &'static Mutex<Option<CachedNewsFeed>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-/// Build the feed, reusing a cached result if it's still inside
-/// [`CACHE_TTL`]. This is the default path for UI polls.
-pub async fn build_feed_cached(feeds: Vec<String>) -> NewsFeed {
-    {
-        let guard = cache().lock().await;
-        if let Some((feed, built_at)) = guard.as_ref() {
-            if built_at.elapsed() < CACHE_TTL {
-                return feed.clone();
+async fn build_feed_with_cache<F, Fut>(
+    cache: &Mutex<Option<CachedNewsFeed>>,
+    feeds: Vec<String>,
+    force: bool,
+    build: F,
+) -> NewsFeed
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = NewsFeed>,
+{
+    // Tokio's async mutex yields while waiting; no blocking mutex is held.
+    // Keep this guard through the build so two cold GETs cannot each issue
+    // the same automatic AI request before either publishes its result.
+    let mut guard = cache.lock().await;
+    if !force {
+        if let Some(cached) = guard.as_ref() {
+            if cached.configured_feeds == feeds && cached.built_at.elapsed() < CACHE_TTL {
+                return cached.feed.clone();
             }
         }
     }
-    let fresh = build_feed(feeds).await;
-    // Only cache a feed that actually carries headlines — caching an
-    // empty (all-feeds-down) result would pin the desk blank for the
-    // whole TTL even after the network recovers.
-    if !fresh.items.is_empty() {
-        let mut guard = cache().lock().await;
-        *guard = Some((fresh.clone(), Instant::now()));
+
+    // An interrupted refresh must not leave an older result looking current.
+    *guard = None;
+    let fresh = build(feeds.clone()).await;
+    // Cache an explicitly empty configuration, but not a failed/empty fetch.
+    // Thus changing to [] cannot expose old headlines, while failed requests
+    // can recover immediately. A force refresh replaces, not bypasses, this entry.
+    if feeds.is_empty() || !fresh.items.is_empty() {
+        *guard = Some(CachedNewsFeed {
+            configured_feeds: feeds,
+            feed: fresh.clone(),
+            built_at: Instant::now(),
+        });
     }
     fresh
 }
 
-/// Build the feed unconditionally (skips the cache). Wired to the UI's
-/// manual refresh button via `?force=true`.
+/// Reuse only a current result for the exact configured feed list.
+pub async fn build_feed_cached(feeds: Vec<String>) -> NewsFeed {
+    build_feed_with_cache(cache(), feeds, false, build_feed_uncached).await
+}
+
+/// Manual refresh builds fresh and replaces the same bounded cache entry.
 pub async fn build_feed(feeds: Vec<String>) -> NewsFeed {
+    build_feed_with_cache(cache(), feeds, true, build_feed_uncached).await
+}
+
+async fn build_feed_uncached(feeds: Vec<String>) -> NewsFeed {
     let generated_at_ms = Utc::now().timestamp_millis();
 
     if feeds.is_empty() {
@@ -135,7 +166,7 @@ pub async fn build_feed(feeds: Vec<String>) -> NewsFeed {
             ai_summary: String::new(),
             ai_available: false,
             generated_at_ms,
-            notice: "No news feeds configured — add RSS feeds in Settings → News.".to_string(),
+            notice: feed_notice(0, 0, true, false),
         };
     }
 
@@ -176,19 +207,7 @@ pub async fn build_feed(feeds: Vec<String>) -> NewsFeed {
     let ai_summary = summarise(&items).await.unwrap_or_default();
     let ai_available = !ai_summary.is_empty();
 
-    let notice = if items.is_empty() {
-        if failures > 0 {
-            "All news feeds were unreachable — check your connection or the feed URLs in Settings → News.".to_string()
-        } else {
-            "No headlines returned by the configured feeds.".to_string()
-        }
-    } else if used_fallback {
-        "Your configured feeds were unreachable — showing built-in defaults. Update them in Settings → News.".to_string()
-    } else if failures > 0 {
-        format!("{failures} of {total_feeds} feeds were unreachable; showing the rest.")
-    } else {
-        String::new()
-    };
+    let notice = feed_notice(total_feeds, failures, items.is_empty(), used_fallback);
 
     NewsFeed {
         items,
@@ -196,6 +215,36 @@ pub async fn build_feed(feeds: Vec<String>) -> NewsFeed {
         ai_available,
         generated_at_ms,
         notice,
+    }
+}
+
+fn feed_notice(
+    total_feeds: usize,
+    failures: usize,
+    items_empty: bool,
+    used_fallback: bool,
+) -> String {
+    const SETTINGS: &str = "news.rss_feeds in Settings → Advanced → Raw config.yaml";
+    if total_feeds == 0 {
+        format!("No RSS feeds configured. Edit {SETTINGS}.")
+    } else if items_empty {
+        if failures > 0 {
+            format!(
+                "News feeds could not be loaded or parsed. Check your connection and {SETTINGS}."
+            )
+        } else {
+            "No headlines returned by the configured feeds.".to_string()
+        }
+    } else if used_fallback {
+        format!(
+            "Configured feeds could not be loaded or parsed; showing built-in feeds. Edit {SETTINGS}."
+        )
+    } else if failures > 0 {
+        format!(
+            "{failures} of {total_feeds} feeds could not be loaded or parsed; showing the rest."
+        )
+    } else {
+        String::new()
     }
 }
 
@@ -415,4 +464,151 @@ fn strip_html(s: &str) -> String {
         .replace("&apos;", "'")
         .replace("&nbsp;", " ");
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn feed(marker: &str) -> NewsFeed {
+        NewsFeed {
+            items: vec![NewsItem {
+                title: marker.to_string(),
+                link: format!("https://example.invalid/{marker}"),
+                source: "synthetic".to_string(),
+                published_ms: Some(1),
+                blurb: String::new(),
+            }],
+            ai_summary: String::new(),
+            ai_available: false,
+            generated_at_ms: 1,
+            notice: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_is_bound_to_exact_configured_feeds_including_empty() {
+        let cache = Mutex::new(None);
+        let calls = Cell::new(0);
+        for feeds in [
+            vec!["a".to_string(), "b".to_string()],
+            vec!["b".to_string(), "a".to_string()],
+            Vec::new(),
+        ] {
+            let expected = feeds.clone();
+            let result = build_feed_with_cache(&cache, feeds.clone(), false, |got| {
+                calls.set(calls.get() + 1);
+                assert_eq!(got, expected);
+                async move {
+                    if got.is_empty() {
+                        build_feed_uncached(got).await
+                    } else {
+                        feed(&got.join(","))
+                    }
+                }
+            })
+            .await;
+            let cached = build_feed_with_cache(&cache, feeds, false, |_| async {
+                panic!("same-input cache hit must not fetch or call AI");
+            })
+            .await;
+            assert_eq!(cached.items.len(), result.items.len());
+            assert_eq!(cached.notice, result.notice);
+        }
+        assert_eq!(calls.get(), 3);
+        let guard = cache.lock().await;
+        let empty = guard.as_ref().unwrap();
+        assert!(empty.configured_feeds.is_empty());
+        assert!(empty.feed.items.is_empty());
+        assert!(empty.feed.ai_summary.is_empty());
+        assert!(!empty.feed.ai_available);
+    }
+
+    #[tokio::test]
+    async fn force_refresh_replaces_the_cached_result() {
+        let cache = Mutex::new(None);
+        let feeds = vec!["a".to_string()];
+        build_feed_with_cache(&cache, feeds.clone(), false, |_| async { feed("old") }).await;
+        let refreshed =
+            build_feed_with_cache(&cache, feeds.clone(), true, |_| async { feed("fresh") }).await;
+        let cached = build_feed_with_cache(&cache, feeds, false, |_| async {
+            panic!("manual refresh must replace the cache");
+        })
+        .await;
+        assert_eq!(refreshed.items[0].title, "fresh");
+        assert_eq!(cached.items[0].title, "fresh");
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_same_input_calls_share_one_builder() {
+        let cache = Mutex::new(None);
+        let calls = Cell::new(0);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let first = build_feed_with_cache(&cache, vec!["a".to_string()], false, |_| async {
+            calls.set(calls.get() + 1);
+            released.await.unwrap();
+            feed("first")
+        });
+        let second = async {
+            // The biased join polls the first builder until this release is
+            // needed. The second request then waits on the same async mutex.
+            release.send(()).unwrap();
+            build_feed_with_cache(&cache, vec!["a".to_string()], false, |_| async {
+                calls.set(calls.get() + 1);
+                feed("duplicate")
+            })
+            .await
+        };
+        let (first, second) = tokio::join!(biased; first, second);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first.items[0].title, "first");
+        assert_eq!(second.items[0].title, "first");
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_drops_old_cache_and_can_recover_without_ai_retry_for_headlines() {
+        let cache = Mutex::new(None);
+        let feeds = vec!["a".to_string()];
+        build_feed_with_cache(&cache, feeds.clone(), false, |_| async { feed("old") }).await;
+        let failed = build_feed_with_cache(&cache, feeds.clone(), true, |_| async {
+            NewsFeed {
+                items: Vec::new(),
+                ai_summary: String::new(),
+                ai_available: false,
+                generated_at_ms: 2,
+                notice: "synthetic fetch failure".to_string(),
+            }
+        })
+        .await;
+        assert_eq!(failed.notice, "synthetic fetch failure");
+        assert!(cache.lock().await.is_none());
+        let recovered = build_feed_with_cache(&cache, feeds.clone(), false, |_| async {
+            feed("recovered")
+        })
+        .await;
+        assert!(!recovered.ai_available);
+        let cached = build_feed_with_cache(&cache, feeds, false, |_| async {
+            panic!("headlines without AI are still a valid cached response");
+        })
+        .await;
+        assert_eq!(cached.items[0].title, "recovered");
+        assert!(!cached.ai_available);
+    }
+
+    #[test]
+    fn notices_distinguish_empty_config_fetch_failure_and_empty_success() {
+        let empty = feed_notice(0, 0, true, false);
+        assert!(empty.starts_with("No RSS feeds configured."));
+        assert!(empty.contains("news.rss_feeds in Settings → Advanced → Raw config.yaml"));
+        assert!(!empty.contains("unreachable"));
+        assert_eq!(
+            feed_notice(2, 0, true, false),
+            "No headlines returned by the configured feeds."
+        );
+        assert!(feed_notice(2, 2, true, false).contains("could not be loaded or parsed"));
+        assert!(feed_notice(2, 0, false, true).contains("showing built-in feeds"));
+        assert!(feed_notice(2, 1, false, false).starts_with("1 of 2 feeds"));
+        assert_eq!(feed_notice(2, 0, false, false), "");
+    }
 }

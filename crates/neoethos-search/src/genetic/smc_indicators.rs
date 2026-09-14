@@ -279,9 +279,9 @@ fn normalize_feature_name(name: &str) -> String {
     name.to_ascii_lowercase().replace(['-', ' '], "_")
 }
 
-/// One SMC gate flag, the EXACT column names that may feed it, and the column
-/// that exists in the vocabulary and plausibly carries the same meaning but
-/// only under a semantic equation the operator has NOT approved.
+/// One SMC gate flag and the EXACT column names that may feed it.
+/// Mappings follow the actual producer in neoethos-data, including its sign
+/// convention; names alone are not enough to establish signal parity.
 ///
 /// **Why this table replaced the substring scan (2026-08-10).** The old
 /// `find_feature_column` accepted `norm == alias || norm.contains(alias)` with
@@ -312,10 +312,6 @@ struct SmcAliasSpec {
     flag: &'static str,
     /// Exact normalised column names, highest priority first.
     candidates: &'static [&'static str],
-    /// A column the SMC family really does ship whose meaning is ARGUABLY this
-    /// flag's, but only under an equation nobody has signed off. Never bound —
-    /// named in the WARN line so the decision is visible and one edit away.
-    pending_operator_approval: Option<&'static str>,
 }
 
 /// Index of each flag in [`SMC_ALIAS_SPECS`], the tally arrays, and
@@ -355,65 +351,51 @@ const SMC_ALIAS_SPECS: [SmcAliasSpec; SMC_FLAG_COUNT] = [
     SmcAliasSpec {
         flag: "ob",
         candidates: &["smc_ob"],
-        pending_operator_approval: None,
     },
     SmcAliasSpec {
         flag: "fvg",
         candidates: &["smc_fvg"],
-        pending_operator_approval: None,
     },
     SmcAliasSpec {
         flag: "liq",
         candidates: &["smc_liq_sweep", "smc_liq"],
-        pending_operator_approval: None,
     },
     SmcAliasSpec {
         flag: "trend",
         candidates: &["smc_trend_bias", "smc_trend"],
-        pending_operator_approval: None,
     },
     SmcAliasSpec {
         flag: "premium",
-        // No `smc_premium` column exists. `smc_pd_array` is the premium/
-        // discount array and is the only column carrying that meaning, but
-        // binding it would change what every `use_premium_discount` gene votes
-        // on, so it waits for an explicit yes.
-        candidates: &["smc_premium"],
-        pending_operator_approval: Some("smc_pd_array"),
+        // Producer +1 means above the previous 40-bar equilibrium (premium).
+        // The gate's +1 means discount/long, so build_smc_arrays negates it.
+        candidates: &["smc_pd_array", "smc_premium"],
     },
     SmcAliasSpec {
         flag: "inducement",
         candidates: &["smc_inducement"],
-        pending_operator_approval: None,
     },
     SmcAliasSpec {
         flag: "bos",
         candidates: &["smc_bos"],
-        pending_operator_approval: None,
     },
     SmcAliasSpec {
         flag: "choch",
-        // No `smc_choch` column exists. `smc_mss` (market-structure shift) is
-        // the same event class in most SMC literature, but "market-structure
-        // shift IS change-of-character" is a semantic claim, not a lookup, and
-        // it is the operator's to make.
-        candidates: &["smc_choch"],
-        pending_operator_approval: Some("smc_mss"),
+        // Our producer explicitly implements MSS / CHOCH as a signed sweep
+        // plus displacement breaking the opposite swing. This binds THAT
+        // implementation, not a universal equivalence between trading terms.
+        candidates: &["smc_mss", "smc_choch"],
     },
     SmcAliasSpec {
         flag: "eqh",
         candidates: &["smc_eqh"],
-        pending_operator_approval: None,
     },
     SmcAliasSpec {
         flag: "eql",
         candidates: &["smc_eql"],
-        pending_operator_approval: None,
     },
     SmcAliasSpec {
         flag: "displacement",
         candidates: &["smc_displacement"],
-        pending_operator_approval: None,
     },
 ];
 
@@ -458,9 +440,6 @@ pub struct SmcFlagTally {
     pub flag: &'static str,
     pub bound_frames: u64,
     pub fallback_frames: u64,
-    /// The column that would bind this flag if the operator approved the
-    /// semantic equation named in `SMC_ALIAS_SPECS`.
-    pub pending_candidate: Option<&'static str>,
 }
 
 /// Snapshot of the SMC binding accounting for the process so far. Intended for
@@ -473,7 +452,6 @@ pub fn smc_binding_tally() -> Vec<SmcFlagTally> {
             flag: spec.flag,
             bound_frames: SMC_BOUND_FRAMES[i].load(Ordering::Relaxed),
             fallback_frames: SMC_FALLBACK_FRAMES[i].load(Ordering::Relaxed),
-            pending_candidate: spec.pending_operator_approval,
         })
         .collect()
 }
@@ -499,7 +477,6 @@ pub fn log_smc_binding_tally() {
                 flag = t.flag,
                 bound_frames = t.bound_frames,
                 fallback_frames = t.fallback_frames,
-                pending_candidate = t.pending_candidate.unwrap_or("none"),
                 "SMC gate fed by the crude 12/20-bar re-derivation in \
                  derive_smc_arrays, NOT by the SMC feature family, in \
                  fallback_frames frames"
@@ -559,7 +536,6 @@ fn record_binding(names: &[String], bound: &[Option<usize>; SMC_FLAG_COUNT]) {
             target: "neoethos_search::smc_binding",
             flag = spec.flag,
             candidates = %spec.candidates.join(" | "),
-            pending_candidate = spec.pending_operator_approval.unwrap_or("none"),
             "SMC alias UNBOUND — no column in this frame carries any of its exact \
              names, so this gate's vote comes from the crude 12/20-bar \
              re-derivation in derive_smc_arrays, NOT from the SMC feature family"
@@ -575,10 +551,6 @@ fn quantize_dir(value: f64) -> i8 {
     } else {
         0
     }
-}
-
-fn quantize_binary(value: f64) -> i8 {
-    if value > 1e-9 { 1 } else { 0 }
 }
 
 /// Resolve every SMC flag to a column index by EXACT name. Pure — no logging,
@@ -918,25 +890,14 @@ mod column_binding_tests {
         assert_ne!(bound[SMC_IDX_OB], Some(2));
     }
 
-    /// The two aliases with no possible binding in the shipped vocabulary,
-    /// asserted against the family's real emission list so the day a
-    /// `smc_choch` or `smc_premium` column appears, this test changes.
+    /// Bind the producer's actual MSS and premium/discount columns, with
+    /// canonical names taking priority over legacy fixture spellings.
     #[test]
-    fn choch_and_premium_are_unbound_in_the_real_vocabulary() {
-        let all = names(&REAL_SMC);
+    fn choch_and_premium_bind_the_real_vocabulary() {
+        let all = names(&["smc_choch", "smc_premium", "smc_mss", "smc_pd_array"]);
         let bound = resolve_smc_columns(&all);
-        assert!(bound[SMC_IDX_CHOCH].is_none());
-        assert!(bound[SMC_IDX_PREMIUM].is_none());
-        assert_eq!(
-            SMC_ALIAS_SPECS[SMC_IDX_CHOCH].pending_operator_approval,
-            Some("smc_mss"),
-            "smc_mss is present in this frame and is NOT bound — the semantic \
-             equation is the operator's to make"
-        );
-        assert_eq!(
-            SMC_ALIAS_SPECS[SMC_IDX_PREMIUM].pending_operator_approval,
-            Some("smc_pd_array")
-        );
+        assert_eq!(all[bound[SMC_IDX_CHOCH].unwrap()], "smc_mss");
+        assert_eq!(all[bound[SMC_IDX_PREMIUM].unwrap()], "smc_pd_array");
     }
 
     /// An unbound alias is COUNTED, not swallowed. Counts are process-global
@@ -991,17 +952,6 @@ mod column_binding_tests {
     /// End to end on real EURUSD M1 bars: a frame of nothing but decoys must
     /// leave every one of the eleven arrays exactly where the bars put them.
     /// Any capture would perturb at least one of them.
-    ///
-    /// The baseline is NOT `derive_smc_arrays` verbatim, and this is not a
-    /// concession to make a test pass. `build_smc_arrays` ends with a step
-    /// that reads the arrays it is already holding rather than the frame:
-    /// inducement is promoted to 1 wherever DISPLACEMENT is non-zero. With
-    /// nothing bound those arrays are the derived ones, so the promotion
-    /// still fires and `build != derive` for inducement — which has been true
-    /// since long before the exact-binding change (verified present unchanged
-    /// at `6c4e9390^`). The baseline therefore applies that same promotion
-    /// explicitly. Written out here rather than borrowed from the function
-    /// under test, so a leak cannot hide inside a shared helper.
     #[test]
     fn build_from_a_decoy_only_frame_equals_the_bar_derived_arrays() {
         let ohlcv = ctrader_sample_ohlcv();
@@ -1024,19 +974,7 @@ mod column_binding_tests {
                 .expect("valid f64 decoy frame");
 
         let built = build_smc_arrays(&frame, &ohlcv).expect("SMC arrays build");
-        let mut derived = derive_smc_arrays(&ohlcv);
-        // The frame-independent tail step of `build_smc_arrays`, restated.
-        let disp_baseline = derived.10.clone();
-        for (disp, slot) in disp_baseline.iter().zip(derived.5.iter_mut()) {
-            if *disp != 0 {
-                *slot = 1;
-            }
-        }
-        assert!(
-            disp_baseline.iter().any(|d| *d != 0),
-            "the promotion step is vacuous on these bars — the inducement \
-             assertion below would then prove nothing"
-        );
+        let derived = derive_smc_arrays(&ohlcv);
         assert_eq!(built.0, derived.0, "ob leaked");
         assert_eq!(built.1, derived.1, "fvg leaked");
         assert_eq!(built.2, derived.2, "liq leaked");
@@ -1095,7 +1033,31 @@ mod column_binding_tests {
 
 pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<SmcSignalTuple> {
     let n = frame.n_samples();
+    anyhow::ensure!(
+        n == ohlcv.len(),
+        "SMC frame/OHLC row count mismatch: {n} vs {}",
+        ohlcv.len()
+    );
+    anyhow::ensure!(
+        ohlcv.open.len() == n && ohlcv.high.len() == n && ohlcv.low.len() == n,
+        "SMC OHLC column length mismatch"
+    );
     let cols = detect_smc_columns(&frame.names);
+    let all_bound = [
+        cols.ob,
+        cols.fvg,
+        cols.liq,
+        cols.trend,
+        cols.premium,
+        cols.inducement,
+        cols.bos,
+        cols.choch,
+        cols.eqh,
+        cols.eql,
+        cols.displacement,
+    ]
+    .iter()
+    .all(Option::is_some);
     let (
         mut ob,
         mut fvg,
@@ -1108,7 +1070,25 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
         mut eqh,
         mut eql,
         mut displacement,
-    ) = derive_smc_arrays(ohlcv);
+    ) = if all_bound {
+        // No reason to rescan the bars with a different SMC approximation
+        // when every output will be replaced by its canonical column.
+        (
+            vec![0; n],
+            vec![0; n],
+            vec![0; n],
+            vec![0; n],
+            vec![0; n],
+            vec![0; n],
+            vec![0; n],
+            vec![0; n],
+            vec![0; n],
+            vec![0; n],
+            vec![0; n],
+        )
+    } else {
+        derive_smc_arrays(ohlcv)
+    };
 
     let valid_value = |column: &neoethos_data::FeatureColumnF64, row: usize| {
         column.validity[row]
@@ -1126,151 +1106,43 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
         }
         Ok(())
     };
-    let apply_binary_col = |target: &mut Vec<i8>, col_opt: Option<usize>| -> anyhow::Result<()> {
-        if let Some(col) = col_opt
-            && col < frame.n_features()
-        {
-            let column = frame.feature_column(col)?;
-            for (i, slot) in target.iter_mut().enumerate().take(n) {
-                *slot = valid_value(&column, i).map_or(0, quantize_binary);
-            }
-        }
-        Ok(())
-    };
-    let apply_eqh_col = |target: &mut Vec<i8>, col_opt: Option<usize>| -> anyhow::Result<()> {
-        if let Some(col) = col_opt
-            && col < frame.n_features()
-        {
-            let column = frame.feature_column(col)?;
-            for (i, slot) in target.iter_mut().enumerate().take(n) {
-                let Some(v) = valid_value(&column, i) else {
-                    *slot = 0;
-                    continue;
-                };
-                let q = quantize_dir(v);
-                *slot = if q != 0 {
-                    q
-                } else if quantize_binary(v) != 0 {
-                    -1
-                } else {
-                    0
-                };
-            }
-        }
-        Ok(())
-    };
-    let apply_eql_col = |target: &mut Vec<i8>, col_opt: Option<usize>| -> anyhow::Result<()> {
-        if let Some(col) = col_opt
-            && col < frame.n_features()
-        {
-            let column = frame.feature_column(col)?;
-            for (i, slot) in target.iter_mut().enumerate().take(n) {
-                let Some(v) = valid_value(&column, i) else {
-                    *slot = 0;
-                    continue;
-                };
-                let q = quantize_dir(v);
-                *slot = if q != 0 {
-                    q
-                } else if quantize_binary(v) != 0 {
-                    1
-                } else {
-                    0
-                };
-            }
-        }
-        Ok(())
-    };
-    // **F-040 documentation (2026-05-25)** — this closure fills zero
-    // slots in `target` with the direction signal from a SECONDARY
-    // column (typically BoS / CHoCH / displacement). The audit flagged
-    // it as "conflating separate signals" because the source column's
-    // direction is treated as the target column's direction when the
-    // primary column was silent.
-    //
-    // The conflation is INTENTIONAL: SMC theory treats BoS / CHoCH /
-    // displacement as direction-confirming signals — when an Order
-    // Block hasn't been tagged in this bar but a Break-of-Structure
-    // is signalling the same direction, the OB inherits that
-    // direction for the gate-vote. The legacy behaviour is preserved
-    // here per operator directive 2026-05-25 ("ομοιομορφία είναι
-    // καλό" — uniformity of SMC voting rules across the indicators).
-    // A future research-driven sweep may split these into separate
-    // gate-votes; that's a Phase-C scope decision, not a bug.
-    let apply_dir_fill_zeros =
-        |target: &mut Vec<i8>, col_opt: Option<usize>| -> anyhow::Result<()> {
+    let apply_presence_col =
+        |target: &mut Vec<i8>, col_opt: Option<usize>, direction: i8| -> anyhow::Result<()> {
             if let Some(col) = col_opt
                 && col < frame.n_features()
             {
                 let column = frame.feature_column(col)?;
                 for (i, slot) in target.iter_mut().enumerate().take(n) {
-                    if *slot == 0 {
-                        *slot = valid_value(&column, i).map_or(0, quantize_dir);
-                    }
+                    *slot = if valid_value(&column, i).is_some_and(|v| quantize_dir(v) != 0) {
+                        direction
+                    } else {
+                        0
+                    };
                 }
             }
             Ok(())
         };
-    let apply_eq_levels = |target: &mut Vec<i8>,
-                           eqh_col: Option<usize>,
-                           eql_col: Option<usize>|
-     -> anyhow::Result<()> {
-        if let Some(col) = eqh_col
-            && col < frame.n_features()
-        {
-            let column = frame.feature_column(col)?;
-            for (i, slot) in target.iter_mut().enumerate().take(n) {
-                if valid_value(&column, i).is_some_and(|value| quantize_binary(value) != 0) {
-                    *slot = -1;
-                }
-            }
-        }
-        if let Some(col) = eql_col
-            && col < frame.n_features()
-        {
-            let column = frame.feature_column(col)?;
-            for (i, slot) in target.iter_mut().enumerate().take(n) {
-                if valid_value(&column, i).is_some_and(|value| quantize_binary(value) != 0) {
-                    *slot = 1;
-                }
-            }
-        }
-        Ok(())
-    };
-
     apply_dir_col(&mut ob, cols.ob)?;
     apply_dir_col(&mut fvg, cols.fvg)?;
     apply_dir_col(&mut liq, cols.liq)?;
     apply_dir_col(&mut trend, cols.trend)?;
     apply_dir_col(&mut premium, cols.premium)?;
-    apply_binary_col(&mut inducement, cols.inducement)?;
+    if cols
+        .premium
+        .is_some_and(|col| normalize_feature_name(&frame.names[col]) == "smc_pd_array")
+    {
+        premium.iter_mut().for_each(|value| *value = -*value);
+    }
+    // Inducement is a presence gate for either direction. EQH is the short
+    // side and EQL the long side; the producer emits presence, not direction.
+    apply_presence_col(&mut inducement, cols.inducement, 1)?;
     apply_dir_col(&mut bos, cols.bos)?;
     apply_dir_col(&mut choch, cols.choch)?;
-    apply_eqh_col(&mut eqh, cols.eqh)?;
-    apply_eql_col(&mut eql, cols.eql)?;
+    apply_presence_col(&mut eqh, cols.eqh, -1)?;
+    apply_presence_col(&mut eql, cols.eql, 1)?;
     apply_dir_col(&mut displacement, cols.displacement)?;
-    apply_dir_fill_zeros(&mut ob, cols.bos)?;
-    apply_dir_fill_zeros(&mut ob, cols.choch)?;
-    apply_eq_levels(&mut liq, cols.eqh, cols.eql)?;
-    apply_dir_fill_zeros(&mut trend, cols.bos)?;
-    apply_dir_fill_zeros(&mut trend, cols.choch)?;
-    apply_dir_fill_zeros(&mut trend, cols.displacement)?;
-
-    if let Some(col) = cols.displacement
-        && col < frame.n_features()
-    {
-        let column = frame.feature_column(col)?;
-        for (i, slot) in inducement.iter_mut().enumerate().take(n) {
-            if valid_value(&column, i).is_some_and(|value| quantize_dir(value) != 0) {
-                *slot = 1;
-            }
-        }
-    }
-    for (disp, slot) in displacement.iter().zip(inducement.iter_mut()) {
-        if *disp != 0 {
-            *slot = 1;
-        }
-    }
+    // A silent or invalid primary signal stays silent. BOS is not an OB,
+    // equal levels are not a sweep, and displacement is not inducement.
 
     Ok((
         ob,

@@ -1,0 +1,72 @@
+{
+  "schema": "neoethos.trial_returns.v3",
+  "binary_file": "trial_returns.v1.bin",
+  "binary_hash": "fnv64:400185adada5f957",
+  "timestamp_ms": 1788614521715,
+  "search_input_receipt": {
+    "schema_version": 2,
+    "anchor_dataset_identity": "d1-dpimupbkd1nn6bj3c5n6urj9cdgmobb4c5q62sr5egmmip35dpq6it3p5pr32000040g00004dimqoj5chi6ap1dcdq74ob4clp2qpj9f1q7asj55lqmstj5e9kmcqb5cg0000068lal4laj8g0g2",
+    "feature_plan_identity": "c783561435f75d16f094484e364c42780cc1897ccd41b711818d102f1c7b720a",
+    "feature_provenance_identity": "66c5a3d771bb65e9248b97ba30035fea39edf7b80915bc25ce9358043545a26c",
+    "feature_content_sha256": "7e0a1d94f586b84979fb2fdbf7746e99c07ff284e5fe2b97bf9b54eec8a01313",
+    "feature_execution": {
+      "schema_version": 1,
+      "compute_policy": "auto",
+      "vector_ta_math_authority": "neoethos.vector-ta.cpu-f64-exact-bits.v1",
+      "selected_lane": "cpu_avx2_fma"
+    },
+    "source_bindings": [
+      {
+        "source_node_id": "source:embedded-ctrader-fixture",
+        "dataset_identity": "d1-dpimupbkd1nn6bj3c5n6urj9cdgmobb4c5q62sr5egmmip35dpq6it3p5pr32000040g00004dimqoj5chi6ap1dcdq74ob4clp2qpj9f1q7asj55lqmstj5e9kmcqb5cg0000068lal4laj8g0g2",
+        "manifest_schema_id": "neoethos.embedded-test-fixture.v1",
+        "manifest_sha256": "c1e3afefe00d29e7f32847173f2b56047b7d1d9783f9e737ef4d0dda1e10ebd7",
+        "generation_id": "embedded-fixture-v1",
+        "vortex_sha256": "c1e3afefe00d29e7f32847173f2b56047b7d1d9783f9e737ef4d0dda1e10ebd7",
+        "bar_timestamp_convention": "bar_open",
+        "segments": [
+          {
+            "row_start": 0,
+            "row_end": 100,
+            "timestamp_start_ms": 1736758800000,
+            "timestamp_end_ms": 1736764740000
+          }
+        ]
+      }
+    ]
+  },
+  "search_input_receipt_sha256": "9c4e032446cf2124b6ad7548868c41f90f9b1b09cc05a76ff023b8fa57f72c2c",
+  "config_hash": "fnv64:0123456789abcdef",
+  "symbol": "EURUSD",
+  "timeframe": "M1",
+  "period_count": 1,
+  "first_period_key": 24301,
+  "last_period_key": 24301,
+  "trials_offered": 2,
+  "trials_written": 2,
+  "trials_dropped": 0,
+  "retention_rule": "all",
+  "drop_reason": null,
+  "trades_outside_grid": 0,
+  "trades_outside_grid_offered": 0,
+  "bytes_written": 98,
+  "bytes_budget": 869902110,
+  "disk_available_bytes": 173980422144,
+  "disk_share_divisor": 200,
+  "budget_source": "filesystem_probe",
+  "dtype": "f64_le",
+  "returns_unit": "fraction_of_initial_balance",
+  "initial_balance": 100000.0,
+  "statistics": {
+    "schema": "neoethos.trial_statistics.v1",
+    "matrix_rows": 2,
+    "trials_offered": 2,
+    "matrix_periods": 1,
+    "matrix_truncated": false,
+    "deflated_sharpe": null,
+    "deflated_sharpe_refusal": "REFUSED: the matrix spans 1 monthly period(s); the Deflated Sharpe Ratio needs at least 24. Its correction is driven by the skew and kurtosis of the champion's own returns, and those two moments are noise at this length — the 'deflated' number could come out above or below the raw one for reasons that have nothing to do with the strategy.",
+    "pbo": null,
+    "pbo_refusal": "REFUSED: the matrix spans 1 monthly period(s); CSCV needs at least 16 so it can form 8 groups of 2 months. Below that the 'out-of-sample' half is a handful of months and the resulting fraction is a coin flip with a decimal point.",
+    "notes": []
+  }
+}

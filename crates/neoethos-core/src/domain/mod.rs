@@ -10,7 +10,6 @@
 //! sizing), which is exactly what makes them dangerous: a reader looking for
 //! "the news gate" found a plausible one that never ran.
 
-pub mod daily_entry_cap;
 pub mod demo_gate;
 pub mod errors;
 pub mod kelly;
@@ -18,6 +17,7 @@ pub mod promotion_gate;
 pub mod prop_firm;
 pub mod risk;
 pub mod risky_mode;
+pub mod trailing;
 
 pub use demo_gate::{DemoForwardDecision, DemoForwardGateConfig, evaluate_demo_forward_gate};
 pub use kelly::{risk_constrained_kelly, risk_constrained_kelly_empirical};
@@ -30,6 +30,6 @@ pub use prop_firm::{
     PropFirmRuntimeDefaults,
 };
 pub use risky_mode::{
-    DEFAULT_RISKY_TRADES_PER_DAY, KillSwitchTier, MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
+    DEFAULT_MONTHLY_LOSS_CAP_FRACTION, DEFAULT_RISKY_TRADES_PER_DAY, KillSwitchTier,
     RiskyModeConfig, RiskyModeManager, RiskyStage, build_logarithmic_stages,
 };

@@ -12,23 +12,33 @@ use crate::population::terminal_search_session_destroy_count_fixture_v2;
 use crate::population::{
     RawResidentScoringPopulationSourceV2, ResidentSearchPopulationCompletionLeaseV2,
 };
+use crate::resident_archive_output_v3::{
+    RawResidentArchiveExportReceiptV3, RawResidentArchiveGeneScalarV3,
+    RawResidentPopulationExportReceiptV3, ResidentArchiveOutputBuffersV3,
+    ResidentArchiveOutputErrorV3, ResidentArchiveTerminalOutputV3,
+    ResidentPopulationExportContextV3, ResidentPopulationOutputBuffersV3,
+    ResidentPopulationTerminalOutputV3,
+};
 use crate::resident_generation_v1::{
     NativeResidentGenerationRunV1 as NativeResidentGenerationRunV2, RawAllocationReceiptV1,
-    RawGenerationPlanV1, RawReadyEventV1, SealedResidentGenerationPlanV1,
+    RawGenerationPlanV1, RawReadyEventV1, RawResidentAdaptiveCheckpointV3,
+    RawResidentAdaptivePolicyV3, ResidentAdaptiveCheckpointV3, SealedResidentGenerationPlanV1,
     ffi_initialize_resident_generation_population_v1,
 };
 use crate::resident_scoring_v2::{
-    NativeResidentScoringRunV2, RawResidentSearchCombinedAdmissionV2,
-    RawResidentSearchRuntimeFactsV2, ResidentScoringObjectiveV2, ResidentScoringRunV2,
-    ResidentScoringV2Error, SealedResidentSearchAdmissionV2, seal_combined_search_admission_v2,
-    seal_resident_scoring_plan_v2,
+    NativeResidentScoringRunV2, ResidentScoringGoalContextV2, ResidentScoringObjectiveV2,
+    ResidentScoringRunV2, ResidentScoringV2Error, SealedResidentSearchAdmissionV2,
+    SelectedResidentSearchCombinedAdmissionV3, SelectedResidentSearchRuntimeFactsV3,
+    seal_combined_search_admission_v2, seal_resident_scoring_plan_v2,
 };
 use crate::resident_search_slice2_admission_v2::{
-    ResidentSearchSlice2NativeBindAuthorityV2,
+    ResidentSearchSlice2InputIdentityV3, ResidentSearchSlice2NativeBindAuthorityV2,
+    ResidentSearchSlice2ValidatedRuntimeAuthorityV2,
     resident_archive_knn_v2_native::{
         NativeResidentArchiveKnnOwnerV2, NativeResidentScoringNoveltyRunV1,
         RawResidentArchiveKnnBindV2, RawResidentArchiveKnnPendingV2,
         RawResidentArchiveKnnTerminalV2, bind_preallocated_resident_archive_knn_v2,
+        copy_resident_archive_terminal_candidates_v4,
         enqueue_resident_archive_evolve_and_publish_v2, enqueue_resident_archive_score_and_rank_v2,
         enqueue_resident_archive_stage_from_rank_v2, enqueue_resident_archive_terminal_seal_v2,
         neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2,
@@ -45,12 +55,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 #[allow(dead_code)] // Used by the crate-private V3 -> Search consumer seam.
-const GENERATION_ABI_V1: u32 = 1;
+const GENERATION_ABI_V1: u32 = crate::resident_generation_v1::selected_generation_abi_v1();
 const GENE_VIEW_ABI_V2: u32 = 2;
 const SMC_FLAG_COUNT_V2: u32 = 11;
 const STATUS_OK: i32 = 0;
 const STATUS_NOT_READY_V2: i32 = 1;
 const STATUS_DEVICE_FAULT_V2: i32 = -12;
+const STATUS_CUDA_ERROR_V2: i32 = -7;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -166,21 +177,8 @@ const _: [(); 104] = [(); std::mem::size_of::<RawResidentSearchTerminalReceiptV2
 const _: [(); 72] = [(); std::mem::size_of::<RawResidentSearchAdvancePendingReceiptV2>()];
 
 #[cfg(feature = "cuda-device-fixtures")]
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RawResidentGenerationGeneScalarFixtureV2 {
-    pub(crate) gene_identity: u64,
-    pub(crate) content_hash: u64,
-    pub(crate) term_count: u32,
-    pub(crate) smc_flags: u32,
-    pub(crate) long_threshold: f64,
-    pub(crate) short_threshold: f64,
-    pub(crate) target_pips: f64,
-    pub(crate) stop_pips: f64,
-    pub(crate) stop_vol_multiplier: f64,
-    pub(crate) generation: u32,
-    pub(crate) reserved: u32,
-}
+pub(crate) type RawResidentGenerationGeneScalarFixtureV2 =
+    crate::resident_archive_output_v3::RawResidentArchiveGeneScalarV3;
 
 #[cfg(feature = "cuda-device-fixtures")]
 const _: [(); 72] = [(); std::mem::size_of::<RawResidentGenerationGeneScalarFixtureV2>()];
@@ -228,6 +226,28 @@ const _: [(); 48] = [(); std::mem::size_of::<RawResidentScoringFixtureSnapshotV2
 const _: [(); 96] = [(); std::mem::size_of::<RawResidentGenerationAdvanceFixtureSnapshotV2>()];
 
 unsafe extern "C" {
+    fn configure_resident_archive_novelty_v3(
+        archive: *mut NativeResidentArchiveKnnOwnerV2,
+        expected_run_identity: u64,
+        novelty_weight: f64,
+    ) -> i32;
+    fn configure_resident_archive_policy_v3(
+        owner: *mut NativeResidentArchiveKnnOwnerV2,
+        expected_run_identity: u64,
+        policy: *const RawResidentArchivePolicyV3,
+    ) -> i32;
+    fn copy_resident_last_evaluated_population_v3(
+        generation: *mut NativeResidentGenerationRunV2,
+        archive: *mut NativeResidentArchiveKnnOwnerV2,
+        terminal: *const RawResidentArchiveKnnTerminalV2,
+        scalars: *mut RawResidentArchiveGeneScalarV3,
+        indices: *mut u64,
+        weights: *mut f64,
+        metrics: *mut crate::NeoPopulationMetricRow,
+        candidate_capacity: u64,
+        term_capacity: u64,
+        receipt: *mut RawResidentPopulationExportReceiptV3,
+    ) -> i32;
     #[allow(dead_code)] // Reached by the next crate-private V3 consumer.
     fn neoethos_gpu_cuda_population_create_resident_generation_run_v2(
         session: *mut c_void,
@@ -265,41 +285,126 @@ unsafe extern "C" {
         committed_ready: *mut RawReadyEventV1,
         terminal_copy: *mut RawResidentSearchTerminalReceiptV2,
     ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_reserve_resident_search_runtime_v2(
         session: *mut c_void,
-        facts: *mut RawResidentSearchRuntimeFactsV2,
+        facts: *mut SelectedResidentSearchRuntimeFactsV3,
     ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_query_resident_search_combined_v2(
         session: *mut c_void,
         generation_plan: *const RawGenerationPlanV1,
         scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
-        expected_runtime: *const RawResidentSearchRuntimeFactsV2,
-        admission: *mut RawResidentSearchCombinedAdmissionV2,
+        expected_runtime: *const SelectedResidentSearchRuntimeFactsV3,
+        admission: *mut SelectedResidentSearchCombinedAdmissionV3,
     ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_create_resident_search_combined_v2(
         session: *mut c_void,
         generation_plan: *const RawGenerationPlanV1,
         scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
-        admission: *const RawResidentSearchCombinedAdmissionV2,
+        admission: *const SelectedResidentSearchCombinedAdmissionV3,
         generation: *mut *mut NativeResidentGenerationRunV2,
         scoring: *mut *mut NativeResidentScoringRunV2,
     ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
         session: *mut c_void,
         generation_plan: *const RawGenerationPlanV1,
         scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
-        expected_runtime: *const RawResidentSearchRuntimeFactsV2,
+        expected_runtime: *const SelectedResidentSearchRuntimeFactsV3,
         binding: *const RawResidentArchiveKnnBindV2,
-        admission: *mut RawResidentSearchCombinedAdmissionV2,
+        admission: *mut SelectedResidentSearchCombinedAdmissionV3,
     ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
         session: *mut c_void,
         generation_plan: *const RawGenerationPlanV1,
         scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
-        admission: *const RawResidentSearchCombinedAdmissionV2,
+        admission: *const SelectedResidentSearchCombinedAdmissionV3,
         binding: *const RawResidentArchiveKnnBindV2,
         generation: *mut *mut NativeResidentGenerationRunV2,
         scoring: *mut *mut NativeResidentScoringRunV2,
+    ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
+    fn neoethos_gpu_cuda_population_query_resident_search_combined_adaptive_v3(
+        session: *mut c_void,
+        generation_plan: *const RawGenerationPlanV1,
+        policy: *const RawResidentAdaptivePolicyV3,
+        scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
+        expected_runtime: *const SelectedResidentSearchRuntimeFactsV3,
+        admission: *mut SelectedResidentSearchCombinedAdmissionV3,
+    ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
+    fn neoethos_gpu_cuda_population_create_resident_search_combined_adaptive_v3(
+        session: *mut c_void,
+        generation_plan: *const RawGenerationPlanV1,
+        policy: *const RawResidentAdaptivePolicyV3,
+        scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
+        admission: *const SelectedResidentSearchCombinedAdmissionV3,
+        generation: *mut *mut NativeResidentGenerationRunV2,
+        scoring: *mut *mut NativeResidentScoringRunV2,
+    ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
+    fn neoethos_gpu_cuda_population_query_resident_search_slice2_adaptive_v3(
+        session: *mut c_void,
+        generation_plan: *const RawGenerationPlanV1,
+        policy: *const RawResidentAdaptivePolicyV3,
+        scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
+        expected_runtime: *const SelectedResidentSearchRuntimeFactsV3,
+        binding: *const RawResidentArchiveKnnBindV2,
+        admission: *mut SelectedResidentSearchCombinedAdmissionV3,
+    ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
+    fn neoethos_gpu_cuda_population_create_resident_search_slice2_adaptive_v3(
+        session: *mut c_void,
+        generation_plan: *const RawGenerationPlanV1,
+        policy: *const RawResidentAdaptivePolicyV3,
+        scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
+        admission: *const SelectedResidentSearchCombinedAdmissionV3,
+        binding: *const RawResidentArchiveKnnBindV2,
+        generation: *mut *mut NativeResidentGenerationRunV2,
+        scoring: *mut *mut NativeResidentScoringRunV2,
+    ) -> i32;
+    #[cfg(feature = "hip-native-kernels")]
+    fn neoethos_hip_population_reserve_resident_search_runtime_v1(
+        session: *mut c_void,
+        runtime: *mut SelectedResidentSearchRuntimeFactsV3,
+    ) -> i32;
+    #[cfg(feature = "hip-native-kernels")]
+    fn neoethos_hip_population_query_resident_search_v1(
+        session: *mut c_void,
+        generation: *const RawGenerationPlanV1,
+        policy: *const RawResidentAdaptivePolicyV3,
+        scoring: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
+        runtime: *const SelectedResidentSearchRuntimeFactsV3,
+        binding: *const RawResidentArchiveKnnBindV2,
+        admission: *mut SelectedResidentSearchCombinedAdmissionV3,
+    ) -> i32;
+    #[cfg(feature = "hip-native-kernels")]
+    fn neoethos_hip_population_create_resident_search_v1(
+        session: *mut c_void,
+        generation_plan: *const RawGenerationPlanV1,
+        policy: *const RawResidentAdaptivePolicyV3,
+        scoring_plan: *const crate::resident_scoring_v2::RawResidentScoringPlanV2,
+        admission: *const SelectedResidentSearchCombinedAdmissionV3,
+        binding: *const RawResidentArchiveKnnBindV2,
+        generation: *mut *mut NativeResidentGenerationRunV2,
+        scoring: *mut *mut NativeResidentScoringRunV2,
+    ) -> i32;
+    fn configure_resident_generation_adaptive_inputs_v3(
+        generation: *mut NativeResidentGenerationRunV2,
+        expected_policy_identity_sha256: *const u8,
+        template_scalars: *const RawResidentArchiveGeneScalarV3,
+        template_indices: *const u64,
+        template_weights: *const f64,
+        initial_seen_hashes: *const u64,
+    ) -> i32;
+    fn copy_resident_adaptive_checkpoint_v3(
+        generation: *mut NativeResidentGenerationRunV2,
+        expected_run_identity: u64,
+        expected_completed_generations: u64,
+        checkpoint: *mut RawResidentAdaptiveCheckpointV3,
     ) -> i32;
     #[cfg(feature = "cuda-device-fixtures")]
     #[cfg_attr(not(test), allow(dead_code))] // Linked only by the feature-gated device oracle.
@@ -771,6 +876,7 @@ pub struct ResidentSearchRunV2 {
     expected_population: u64,
     expected_feature_count: u64,
     expected_max_terms: u32,
+    maximum_generations: u64,
     #[cfg(feature = "cuda-device-fixtures")]
     expected_survivor_count: u64,
     retained_evaluation_capacity: u64,
@@ -806,13 +912,28 @@ pub(crate) struct ResidentSearchSlice2NativeOwnerV3 {
     population_source: Option<ResidentSearchPopulationCompletionLeaseV2>,
     pending: Option<Box<RawResidentArchiveKnnPendingV2>>,
     terminal: Option<RawResidentArchiveKnnTerminalV2>,
+    archive_exported: bool,
+    population_exported: bool,
     state: ResidentSearchSlice2NativeStateV3,
 }
+
+#[repr(C)]
+struct RawResidentArchivePolicyV3 {
+    abi_version: u32,
+    mode: u32,
+    minimum_net: f64,
+    minimum_profit_factor: f64,
+    minimum_sharpe: f64,
+    novelty_weight: f64,
+}
+const _: () = assert!(std::mem::size_of::<RawResidentArchivePolicyV3>() == 40);
 
 #[derive(Debug, Error)]
 pub(crate) enum ResidentSearchSlice2NativeErrorV3 {
     #[error(transparent)]
     Search(#[from] ResidentSearchV2Error),
+    #[error(transparent)]
+    ArchiveOutput(#[from] ResidentArchiveOutputErrorV3),
     #[error("resident Search Slice2 native operation {operation} failed with status {status}")]
     Native {
         operation: &'static str,
@@ -886,6 +1007,8 @@ impl ResidentSearchSlice2NativeOwnerV3 {
     fn bind_v3(
         mut run: ResidentSearchRunV2,
         bind_authority: ResidentSearchSlice2NativeBindAuthorityV2,
+        novelty_weight: f64,
+        archive_policy: Option<crate::resident_search_slice2_v3::ResidentSearchArchivePolicyV3>,
     ) -> Result<Self, ResidentSearchSlice2NativeErrorV3> {
         let generation = run
             .generation
@@ -931,6 +1054,40 @@ impl ResidentSearchSlice2NativeOwnerV3 {
                 status,
             });
         }
+        // SAFETY: this exact run owns the newly bound archive. The immutable
+        // blend policy is configured once before any population ranking.
+        let (operation, status) = if let Some(policy) = archive_policy {
+            let raw = RawResidentArchivePolicyV3 {
+                abi_version: 3,
+                mode: policy.mode,
+                minimum_net: policy.min_net,
+                minimum_profit_factor: policy.min_pf,
+                minimum_sharpe: policy.min_sharpe,
+                novelty_weight,
+            };
+            ("configure_resident_archive_policy_v3", unsafe {
+                configure_resident_archive_policy_v3(
+                    archive.as_ptr(),
+                    run.view.expected_run_token,
+                    &raw,
+                )
+            })
+        } else {
+            ("configure_resident_archive_novelty_v3", unsafe {
+                configure_resident_archive_novelty_v3(
+                    archive.as_ptr(),
+                    run.view.expected_run_token,
+                    novelty_weight,
+                )
+            })
+        };
+        if status != STATUS_OK {
+            run.state = ResidentSearchStateV2::Poisoned;
+            if let Some(scoring) = run.scoring.as_mut() {
+                scoring.poison_v2();
+            }
+            return Err(ResidentSearchSlice2NativeErrorV3::Native { operation, status });
+        }
         run.scoring
             .as_mut()
             .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?
@@ -942,6 +1099,8 @@ impl ResidentSearchSlice2NativeOwnerV3 {
             population_source: None,
             pending: None,
             terminal: None,
+            archive_exported: false,
+            population_exported: false,
             state: ResidentSearchSlice2NativeStateV3::Bound,
         })
     }
@@ -953,7 +1112,7 @@ impl ResidentSearchSlice2NativeOwnerV3 {
         self.run
             .as_mut()
             .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?
-            .upload_resident_scenarios_v2(scenarios)?;
+            .upload_resident_base_scenarios_v3(scenarios)?;
         Ok(())
     }
 
@@ -1085,6 +1244,61 @@ impl ResidentSearchSlice2NativeOwnerV3 {
         Ok(self)
     }
 
+    pub(crate) fn copy_adaptive_checkpoint_v3(
+        &mut self,
+    ) -> Result<ResidentAdaptiveCheckpointV3, ResidentSearchSlice2NativeErrorV3> {
+        if self.state != ResidentSearchSlice2NativeStateV3::Published {
+            return Err(ResidentSearchSlice2NativeErrorV3::StateViolation);
+        }
+        let run = self
+            .run
+            .as_mut()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let completed = run.view.expected_generation_index;
+        if completed == 0 || completed > run.maximum_generations {
+            return Err(ResidentSearchSlice2NativeErrorV3::StateViolation);
+        }
+        let generation = run
+            .generation
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let mut raw = RawResidentAdaptiveCheckpointV3::default();
+        // Native synchronizes the admitted stream and copies only two bounded
+        // control records. All genomes, feature values and metric rows remain
+        // resident. On failure native retains any asynchronous copy storage.
+        let status = unsafe {
+            copy_resident_adaptive_checkpoint_v3(
+                generation.as_ptr(),
+                run.view.expected_run_token,
+                completed,
+                &mut raw,
+            )
+        };
+        if status != STATUS_OK {
+            run.state = ResidentSearchStateV2::Poisoned;
+            self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+            return Err(ResidentSearchSlice2NativeErrorV3::Native {
+                operation: "copy_resident_adaptive_checkpoint_v3",
+                status,
+            });
+        }
+        match ResidentAdaptiveCheckpointV3::seal_v3(
+            raw,
+            run.view.expected_run_token,
+            completed,
+            run.expected_population,
+        ) {
+            Ok(checkpoint) => Ok(checkpoint),
+            Err(_) => {
+                run.state = ResidentSearchStateV2::Poisoned;
+                self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+                Err(ResidentSearchV2Error::InvalidPlan(
+                    "native adaptive checkpoint differs from its owner",
+                )
+                .into())
+            }
+        }
+    }
+
     pub(crate) fn enqueue_terminal_seal_v3(
         mut self,
     ) -> Result<Self, ResidentSearchSlice2NativeRejectedV3> {
@@ -1141,7 +1355,12 @@ impl ResidentSearchSlice2NativeOwnerV3 {
             .with_raw_v2(|binding| {
                 terminal.validates_committed_v2(pending, binding, committed.as_ref())
             });
-        if !terminal_valid {
+        let run = self.run.as_ref().expect("Slice2 owner retains Search run");
+        if !terminal_valid
+            || committed.generation_index == 0
+            || committed.generation_index > run.maximum_generations
+            || committed.generation_index != run.view.expected_generation_index
+        {
             return Err(self.reject_v3("validate_resident_archive_terminal_v2", -6));
         }
         let run = self.run.as_mut().expect("Slice2 owner retains Search run");
@@ -1152,9 +1371,156 @@ impl ResidentSearchSlice2NativeOwnerV3 {
         Ok(ResidentSearchSlice2NativeTryCompleteV3::Complete(self))
     }
 
+    /// Copy only occupied archive members after the native terminal event has
+    /// completed. No per-generation host copy or feature-store download occurs.
+    pub(crate) fn copy_terminal_archive_v3(
+        &mut self,
+        allowed_scenario_ids: &[u64],
+    ) -> Result<ResidentArchiveTerminalOutputV3, ResidentSearchSlice2NativeErrorV3> {
+        if self.state != ResidentSearchSlice2NativeStateV3::TerminalComplete
+            || self.archive_exported
+        {
+            return Err(ResidentSearchSlice2NativeErrorV3::StateViolation);
+        }
+        let terminal = self
+            .terminal
+            .as_ref()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let run = self
+            .run
+            .as_ref()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let authority = self
+            .bind_authority
+            .as_ref()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let archive = self
+            .archive
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let context =
+            terminal.archive_export_context_v3(run.expected_feature_count, run.expected_max_terms);
+        let mut output = ResidentArchiveOutputBuffersV3::allocate(
+            context,
+            authority.with_raw_v2(RawResidentArchiveKnnBindV2::archive_capacity_v3),
+        )?;
+        let buffers = output.ffi_buffers_mut();
+        let mut receipt = RawResidentArchiveExportReceiptV3::default();
+        // SAFETY: all five exclusive vectors cover the exact committed count,
+        // and remain owned here throughout the synchronous, terminal-only D2H
+        // copies. Native rechecks event/receipt/context identity before copying.
+        let status = unsafe {
+            copy_resident_archive_terminal_candidates_v4(
+                archive.as_ptr(),
+                terminal,
+                buffers.scalars,
+                buffers.indices,
+                buffers.weights,
+                buffers.metrics,
+                buffers.admission_sequences,
+                buffers.candidate_capacity,
+                buffers.term_capacity,
+                &mut receipt,
+            )
+        };
+        if status != STATUS_OK {
+            if status == STATUS_CUDA_ERROR_V2 {
+                // A failed CUDA call may surface earlier asynchronous work.
+                // Retain destinations as well as the poisoned native graph;
+                // only successful synchronous D2H proves safe buffer reuse.
+                std::mem::forget(output);
+            }
+            self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+            return Err(ResidentSearchSlice2NativeErrorV3::Native {
+                operation: "copy_resident_archive_terminal_candidates_v4",
+                status,
+            });
+        }
+        let output = output.seal(receipt, allowed_scenario_ids)?;
+        self.archive_exported = true;
+        Ok(output)
+    }
+
+    /// Copy every last-evaluated candidate and its aligned metrics only after
+    /// the exact native terminal proof. The next unevaluated store stays device-only.
+    pub(crate) fn copy_terminal_population_v3(
+        &mut self,
+        allowed_scenario_ids: &[u64],
+    ) -> Result<ResidentPopulationTerminalOutputV3, ResidentSearchSlice2NativeErrorV3> {
+        if self.state != ResidentSearchSlice2NativeStateV3::TerminalComplete
+            || self.population_exported
+        {
+            return Err(ResidentSearchSlice2NativeErrorV3::StateViolation);
+        }
+        let terminal = self
+            .terminal
+            .as_ref()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let run = self
+            .run
+            .as_ref()
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let generation = run
+            .generation
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let archive = self
+            .archive
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let committed =
+            terminal.archive_export_context_v3(run.expected_feature_count, run.expected_max_terms);
+        let evaluated_generation = committed
+            .terminal_generation
+            .checked_sub(1)
+            .ok_or(ResidentSearchSlice2NativeErrorV3::StateViolation)?;
+        let context = ResidentPopulationExportContextV3 {
+            run_identity: committed.run_identity,
+            packed_commit_word: committed.packed_commit_word,
+            candidate_count: run.expected_population,
+            feature_count: run.expected_feature_count,
+            terminal_generation: committed.terminal_generation,
+            evaluated_generation,
+            max_terms: run.expected_max_terms,
+        };
+        let mut output = ResidentPopulationOutputBuffersV3::allocate(context)?;
+        let buffers = output.ffi_buffers_mut();
+        let mut receipt = RawResidentPopulationExportReceiptV3::default();
+        // SAFETY: exact admitted P/K-sized exclusive vectors remain owned until
+        // all four synchronous copies finish. Native validates both owners and
+        // the completed run/commit/event tuple before reading the evaluated store.
+        let status = unsafe {
+            copy_resident_last_evaluated_population_v3(
+                generation.as_ptr(),
+                archive.as_ptr(),
+                terminal,
+                buffers.scalars,
+                buffers.indices,
+                buffers.weights,
+                buffers.metrics,
+                buffers.candidate_capacity,
+                buffers.term_capacity,
+                &mut receipt,
+            )
+        };
+        if status != STATUS_OK {
+            if status == STATUS_CUDA_ERROR_V2 {
+                std::mem::forget(output);
+            }
+            self.state = ResidentSearchSlice2NativeStateV3::Poisoned;
+            return Err(ResidentSearchSlice2NativeErrorV3::Native {
+                operation: "copy_resident_last_evaluated_population_v3",
+                status,
+            });
+        }
+        let output = output.seal(receipt, allowed_scenario_ids)?;
+        self.population_exported = true;
+        Ok(output)
+    }
+
     pub(crate) fn release_terminal_v3(
         mut self,
     ) -> Result<PopulationSession, ResidentSearchSlice2NativeRejectedV3> {
+        // Successful publication and explicit discard after a host-only output
+        // rejection both release a proven terminal graph. An ambiguous native
+        // copy error poisons this state and must never enter this cleanup path.
         if self.state != ResidentSearchSlice2NativeStateV3::TerminalComplete {
             return Err(self.reject_state_v3());
         }
@@ -1421,7 +1787,7 @@ impl ResidentSearchRunV2 {
         &mut self,
         mode: u32,
     ) -> Result<(), ResidentSearchV2Error> {
-        if self.state != ResidentSearchStateV2::Active || mode > 3 {
+        if self.state != ResidentSearchStateV2::Active || mode > 4 {
             return Err(ResidentSearchV2Error::StateViolation);
         }
         let scoring = self
@@ -1715,7 +2081,28 @@ impl ResidentSearchRunV2 {
         })
     }
 
-    #[allow(dead_code)] // The next Search chunk consumes this private enqueue seam.
+    pub(crate) fn upload_resident_base_scenarios_v3(
+        &mut self,
+        scenarios: &[ScenarioDescriptor],
+    ) -> Result<(), ResidentSearchV2Error> {
+        if self.state != ResidentSearchStateV2::Active {
+            return Err(ResidentSearchV2Error::StateViolation);
+        }
+        self.session
+            .as_mut()
+            .ok_or(ResidentSearchV2Error::StateViolation)?
+            .upload_resident_base_scenarios_v3(
+                scenarios,
+                self.expected_population,
+                self.retained_evaluation_capacity,
+                self.view.expected_generation_index,
+                self.view.plan_identity_sha256,
+            )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)] // Legacy generic scenario uploader; Slice2 uses canonical base batches.
     pub(crate) fn upload_resident_scenarios_v2(
         &mut self,
         scenarios: &[ScenarioDescriptor],
@@ -2161,6 +2548,15 @@ impl Drop for ResidentSearchRunV2 {
     }
 }
 
+/// Immutable inputs to the native Slice2 admission query, not allocation authority.
+/// The runtime reservation and measured native queries below create the authority.
+pub(crate) struct ResidentSearchSlice2RequestV3 {
+    pub(crate) input: ResidentSearchSlice2InputIdentityV3,
+    pub(crate) archive_capacity: u64,
+    pub(crate) archive_policy:
+        Option<crate::resident_search_slice2_v3::ResidentSearchArchivePolicyV3>,
+}
+
 impl PopulationSession {
     /// Production stays unavailable until V2 addressed RNG and exact current
     /// GA semantics have CPU-oracle/device parity, the strict evaluator can
@@ -2185,6 +2581,7 @@ impl PopulationSession {
             smc_gate_disabled,
             ResidentScoringObjectiveV2::PropFirmV4,
             0.0,
+            None,
         )
     }
 
@@ -2197,6 +2594,7 @@ impl PopulationSession {
         smc_gate_disabled: bool,
         objective: ResidentScoringObjectiveV2,
         novelty_weight: f64,
+        goal_context: Option<ResidentScoringGoalContextV2>,
     ) -> Result<ResidentSearchRunV2, ResidentSearchV2Error> {
         self.begin_resident_search_sealed_v2(
             plan.sealed,
@@ -2204,6 +2602,7 @@ impl PopulationSession {
             smc_gate_disabled,
             objective,
             novelty_weight,
+            goal_context,
         )
     }
 
@@ -2220,6 +2619,7 @@ impl PopulationSession {
             smc_gate_disabled,
             ResidentScoringObjectiveV2::PropFirmV4,
             0.0,
+            None,
         )
     }
 
@@ -2229,19 +2629,28 @@ impl PopulationSession {
         plan: SealedResidentGenerationPlanV1,
         smc_weights: [f64; 11],
         smc_gate_disabled: bool,
-        bind_authority: ResidentSearchSlice2NativeBindAuthorityV2,
+        objective: ResidentScoringObjectiveV2,
+        novelty_weight: f64,
+        goal_context: Option<ResidentScoringGoalContextV2>,
+        request: ResidentSearchSlice2RequestV3,
     ) -> Result<ResidentSearchSlice2NativeOwnerV3, ResidentSearchSlice2NativeErrorV3> {
-        let run = bind_authority.with_raw_v2(|binding| {
-            self.begin_resident_search_sealed_impl_v3(
-                plan,
-                smc_weights,
-                smc_gate_disabled,
-                ResidentScoringObjectiveV2::PropFirmV4,
-                0.0,
-                Some(binding),
-            )
-        })?;
-        ResidentSearchSlice2NativeOwnerV3::bind_v3(run, bind_authority)
+        let archive_policy = request.archive_policy;
+        let (run, bind_authority) = self.begin_resident_search_sealed_impl_v3(
+            plan,
+            smc_weights,
+            smc_gate_disabled,
+            objective,
+            novelty_weight,
+            goal_context,
+            Some(request),
+        )?;
+        let bind_authority = bind_authority.ok_or(ResidentSearchV2Error::StateViolation)?;
+        ResidentSearchSlice2NativeOwnerV3::bind_v3(
+            run,
+            bind_authority,
+            novelty_weight,
+            archive_policy,
+        )
     }
 
     #[allow(dead_code)] // Shared by the private bridge and device-only fixture.
@@ -2252,6 +2661,7 @@ impl PopulationSession {
         smc_gate_disabled: bool,
         scoring_objective: ResidentScoringObjectiveV2,
         novelty_weight: f64,
+        goal_context: Option<ResidentScoringGoalContextV2>,
     ) -> Result<ResidentSearchRunV2, ResidentSearchV2Error> {
         self.begin_resident_search_sealed_impl_v3(
             plan,
@@ -2259,8 +2669,10 @@ impl PopulationSession {
             smc_gate_disabled,
             scoring_objective,
             novelty_weight,
+            goal_context,
             None,
         )
+        .map(|(run, _)| run)
     }
 
     fn begin_resident_search_sealed_impl_v3(
@@ -2270,12 +2682,37 @@ impl PopulationSession {
         smc_gate_disabled: bool,
         scoring_objective: ResidentScoringObjectiveV2,
         novelty_weight: f64,
-        slice2_binding: Option<&RawResidentArchiveKnnBindV2>,
-    ) -> Result<ResidentSearchRunV2, ResidentSearchV2Error> {
+        goal_context: Option<ResidentScoringGoalContextV2>,
+        slice2_request: Option<ResidentSearchSlice2RequestV3>,
+    ) -> Result<
+        (
+            ResidentSearchRunV2,
+            Option<ResidentSearchSlice2NativeBindAuthorityV2>,
+        ),
+        ResidentSearchV2Error,
+    > {
         // No Search work exists yet. Authorize ordinary destruction before any
         // fallible validation/admission step so a clean start failure cannot
         // strand the V3 population session's original leak-only policy.
+        #[cfg(not(feature = "hip-native-kernels"))]
         self.authorize_resident_session_destroy_v3();
+        // HIP remains tied to its borrowing Data guard even on admission failure.
+        // The guard quarantines an unsuccessful detached owner; do not free it here.
+        if let Some(policy) = slice2_request
+            .as_ref()
+            .and_then(|request| request.archive_policy)
+        {
+            policy
+                .validate_v3()
+                .map_err(ResidentSearchV2Error::InvalidPlan)?;
+        }
+        if slice2_request.is_some()
+            && (!novelty_weight.is_finite() || !(0.0..=1.0).contains(&novelty_weight))
+        {
+            return Err(ResidentSearchV2Error::InvalidPlan(
+                "Slice2 archive novelty weight must be finite and in [0, 1]",
+            ));
+        }
         if smc_weights
             .iter()
             .any(|weight| !weight.is_finite() || *weight < 0.0)
@@ -2288,6 +2725,7 @@ impl PopulationSession {
         let expected_feature_count = plan.feature_count_v1();
         let expected_population = plan.logical_population_count_v1();
         let expected_max_terms = plan.max_terms_per_gene_v1();
+        let maximum_generations = plan.generation_count_v1();
         #[cfg(feature = "cuda-device-fixtures")]
         let expected_survivor_count = plan.survivor_count_v1();
         let retained_evaluation_capacity = plan.retained_evaluation_capacity_v1();
@@ -2298,79 +2736,247 @@ impl PopulationSession {
                 |_| ResidentSearchV2Error::InvalidPlan("feature count does not fit host usize"),
             )?)
             .map_err(ResidentSearchV2Error::InvalidAdmission)?;
-        let mut runtime = RawResidentSearchRuntimeFactsV2::default();
+        let mut runtime = SelectedResidentSearchRuntimeFactsV3::default();
+        #[cfg(not(feature = "hip-native-kernels"))]
         let status = unsafe {
             neoethos_gpu_cuda_population_reserve_resident_search_runtime_v2(
                 session_handle,
                 &mut runtime,
             )
         };
+        #[cfg(feature = "hip-native-kernels")]
+        let status = unsafe {
+            neoethos_hip_population_reserve_resident_search_runtime_v1(session_handle, &mut runtime)
+        };
+        if status != STATUS_OK {
+            return Err(native_error("reserve_resident_search_runtime", status));
+        }
+        let scoring_plan = seal_resident_scoring_plan_v2(
+            &plan,
+            scoring_objective,
+            // Slice2 blends the actual requested novelty once in its archive
+            // stage. Its preliminary scorer must remain raw fitness only.
+            if slice2_request.is_some() {
+                0.0
+            } else {
+                novelty_weight
+            },
+            goal_context,
+            &runtime,
+        )
+        .map_err(scoring_error)?;
+        let mut raw_admission = SelectedResidentSearchCombinedAdmissionV3::default();
+        // Query the exact ordinary layout first: its measured CUB scratch and
+        // retained runtime identity are inputs to the checked archive layout.
+        // Both queries use this one reservation; neither allocates the arenas.
+        #[cfg(not(feature = "hip-native-kernels"))]
+        let status = unsafe {
+            if let Some(policy) = plan.raw_adaptive_policy_v3() {
+                neoethos_gpu_cuda_population_query_resident_search_combined_adaptive_v3(
+                    session_handle,
+                    plan.raw_plan_v1(),
+                    policy,
+                    scoring_plan.raw_v2(),
+                    &runtime,
+                    &mut raw_admission,
+                )
+            } else {
+                neoethos_gpu_cuda_population_query_resident_search_combined_v2(
+                    session_handle,
+                    plan.raw_plan_v1(),
+                    scoring_plan.raw_v2(),
+                    &runtime,
+                    &mut raw_admission,
+                )
+            }
+        };
+        #[cfg(feature = "hip-native-kernels")]
+        let status = unsafe {
+            neoethos_hip_population_query_resident_search_v1(
+                session_handle,
+                plan.raw_plan_v1(),
+                plan.raw_adaptive_policy_v3()
+                    .map_or(std::ptr::null(), std::ptr::from_ref),
+                scoring_plan.raw_v2(),
+                &runtime,
+                std::ptr::null(),
+                &mut raw_admission,
+            )
+        };
         if status != STATUS_OK {
             return Err(native_error(
-                "neoethos_gpu_cuda_population_reserve_resident_search_runtime_v2",
+                if cfg!(feature = "hip-native-kernels") {
+                    "neoethos_hip_population_query_resident_search_v1"
+                } else if plan.raw_adaptive_policy_v3().is_some() {
+                    "neoethos_gpu_cuda_population_query_resident_search_combined_adaptive_v3"
+                } else {
+                    "neoethos_gpu_cuda_population_query_resident_search_combined_v2"
+                },
                 status,
             ));
         }
-        let scoring_plan =
-            seal_resident_scoring_plan_v2(&plan, scoring_objective, novelty_weight, &runtime)
-                .map_err(scoring_error)?;
-        let mut raw_admission = RawResidentSearchCombinedAdmissionV2::default();
-        let status = unsafe {
-            match slice2_binding {
-                Some(binding) => neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
+        let preliminary =
+            seal_combined_search_admission_v2(raw_admission).map_err(scoring_error)?;
+        let bind_authority = slice2_request
+            .map(|request| {
+                ResidentSearchSlice2ValidatedRuntimeAuthorityV2::from_native_preliminary_v2(
+                    &plan,
+                    &preliminary,
+                    &request.input,
+                    request.archive_capacity,
+                    request.archive_policy.map_or(15, |policy| policy.neighbors),
+                )
+                .map(|authority| authority.into_native_bind_authority_v2())
+                .map_err(ResidentSearchV2Error::InvalidPlan)
+            })
+            .transpose()?;
+        let admission = if let Some(authority) = bind_authority.as_ref() {
+            let mut raw_admission = SelectedResidentSearchCombinedAdmissionV3::default();
+            #[cfg(not(feature = "hip-native-kernels"))]
+            let status = authority.with_raw_v2(|binding| unsafe {
+                if let Some(policy) = plan.raw_adaptive_policy_v3() {
+                    neoethos_gpu_cuda_population_query_resident_search_slice2_adaptive_v3(
+                        session_handle,
+                        plan.raw_plan_v1(),
+                        policy,
+                        scoring_plan.raw_v2(),
+                        &runtime,
+                        binding,
+                        &mut raw_admission,
+                    )
+                } else {
+                    neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
+                        session_handle,
+                        plan.raw_plan_v1(),
+                        scoring_plan.raw_v2(),
+                        &runtime,
+                        binding,
+                        &mut raw_admission,
+                    )
+                }
+            });
+            #[cfg(feature = "hip-native-kernels")]
+            let status = authority.with_raw_v2(|binding| unsafe {
+                neoethos_hip_population_query_resident_search_v1(
                     session_handle,
                     plan.raw_plan_v1(),
+                    plan.raw_adaptive_policy_v3()
+                        .map_or(std::ptr::null(), std::ptr::from_ref),
                     scoring_plan.raw_v2(),
                     &runtime,
                     binding,
                     &mut raw_admission,
-                ),
-                None => neoethos_gpu_cuda_population_query_resident_search_combined_v2(
-                    session_handle,
-                    plan.raw_plan_v1(),
-                    scoring_plan.raw_v2(),
-                    &runtime,
-                    &mut raw_admission,
-                ),
+                )
+            });
+            if status != STATUS_OK {
+                return Err(native_error(
+                    if cfg!(feature = "hip-native-kernels") {
+                        "neoethos_hip_population_query_resident_search_v1"
+                    } else if plan.raw_adaptive_policy_v3().is_some() {
+                        "neoethos_gpu_cuda_population_query_resident_search_slice2_adaptive_v3"
+                    } else {
+                        "neoethos_gpu_cuda_population_query_resident_search_slice2_v3"
+                    },
+                    status,
+                ));
             }
+            seal_combined_search_admission_v2(raw_admission).map_err(scoring_error)?
+        } else {
+            preliminary
         };
-        if status != STATUS_OK {
-            return Err(native_error(
-                "neoethos_gpu_cuda_population_query_resident_search_combined_v2",
-                status,
-            ));
-        }
-        let admission = seal_combined_search_admission_v2(raw_admission).map_err(scoring_error)?;
         let mut generation = std::ptr::null_mut();
         let mut scoring_native = std::ptr::null_mut();
         // SAFETY: native validates the sealed combined receipt and the exact
         // runtime facts before allocating either device arena.
-        let status = unsafe {
-            match slice2_binding {
-                Some(binding) => neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
+        #[cfg(not(feature = "hip-native-kernels"))]
+        let create_operation = match (
+            bind_authority.is_some(),
+            plan.raw_adaptive_policy_v3().is_some(),
+        ) {
+            (true, true) => {
+                "neoethos_gpu_cuda_population_create_resident_search_slice2_adaptive_v3"
+            }
+            (true, false) => "neoethos_gpu_cuda_population_create_resident_search_slice2_v3",
+            (false, true) => {
+                "neoethos_gpu_cuda_population_create_resident_search_combined_adaptive_v3"
+            }
+            (false, false) => "neoethos_gpu_cuda_population_create_resident_search_combined_v2",
+        };
+        #[cfg(feature = "hip-native-kernels")]
+        let create_operation = "neoethos_hip_population_create_resident_search_v1";
+        #[cfg(not(feature = "hip-native-kernels"))]
+        let status = match bind_authority.as_ref() {
+            Some(authority) => authority.with_raw_v2(|binding| unsafe {
+                if let Some(policy) = plan.raw_adaptive_policy_v3() {
+                    neoethos_gpu_cuda_population_create_resident_search_slice2_adaptive_v3(
+                        session_handle,
+                        plan.raw_plan_v1(),
+                        policy,
+                        scoring_plan.raw_v2(),
+                        &admission.raw,
+                        binding,
+                        &mut generation,
+                        &mut scoring_native,
+                    )
+                } else {
+                    neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
+                        session_handle,
+                        plan.raw_plan_v1(),
+                        scoring_plan.raw_v2(),
+                        &admission.raw,
+                        binding,
+                        &mut generation,
+                        &mut scoring_native,
+                    )
+                }
+            }),
+            None => unsafe {
+                if let Some(policy) = plan.raw_adaptive_policy_v3() {
+                    neoethos_gpu_cuda_population_create_resident_search_combined_adaptive_v3(
+                        session_handle,
+                        plan.raw_plan_v1(),
+                        policy,
+                        scoring_plan.raw_v2(),
+                        &admission.raw,
+                        &mut generation,
+                        &mut scoring_native,
+                    )
+                } else {
+                    neoethos_gpu_cuda_population_create_resident_search_combined_v2(
+                        session_handle,
+                        plan.raw_plan_v1(),
+                        scoring_plan.raw_v2(),
+                        &admission.raw,
+                        &mut generation,
+                        &mut scoring_native,
+                    )
+                }
+            },
+        };
+        #[cfg(feature = "hip-native-kernels")]
+        let status = {
+            let mut create = |binding| unsafe {
+                neoethos_hip_population_create_resident_search_v1(
                     session_handle,
                     plan.raw_plan_v1(),
+                    plan.raw_adaptive_policy_v3()
+                        .map_or(std::ptr::null(), std::ptr::from_ref),
                     scoring_plan.raw_v2(),
                     &admission.raw,
                     binding,
                     &mut generation,
                     &mut scoring_native,
-                ),
-                None => neoethos_gpu_cuda_population_create_resident_search_combined_v2(
-                    session_handle,
-                    plan.raw_plan_v1(),
-                    scoring_plan.raw_v2(),
-                    &admission.raw,
-                    &mut generation,
-                    &mut scoring_native,
-                ),
+                )
+            };
+            match bind_authority.as_ref() {
+                Some(authority) => {
+                    authority.with_raw_v2(|binding| create(std::ptr::from_ref(binding)))
+                }
+                None => create(std::ptr::null()),
             }
         };
         if status != STATUS_OK {
-            return Err(native_error(
-                "neoethos_gpu_cuda_population_create_resident_search_combined_v2",
-                status,
-            ));
+            return Err(native_error(create_operation, status));
         }
         // A successful combined create published both native arenas into the
         // session. Re-arm leak-only ownership before validating returned
@@ -2378,7 +2984,7 @@ impl PopulationSession {
         // complete owner graph until terminal proof.
         self.arm_resident_session_leak_only_v3();
         let generation = NonNull::new(generation).ok_or(ResidentSearchV2Error::Native {
-            operation: "neoethos_gpu_cuda_population_create_resident_search_combined_v2",
+            operation: create_operation,
             status,
         })?;
         let scoring = ResidentScoringRunV2::from_combined_v2(session_handle, scoring_native)
@@ -2394,6 +3000,7 @@ impl PopulationSession {
             expected_population,
             expected_feature_count,
             expected_max_terms,
+            maximum_generations,
             #[cfg(feature = "cuda-device-fixtures")]
             expected_survivor_count,
             retained_evaluation_capacity,
@@ -2415,6 +3022,30 @@ impl PopulationSession {
         ) {
             owner.state = ResidentSearchStateV2::Poisoned;
             return Err(error);
+        }
+
+        if let Some(controls) = plan.adaptive_controls_v3() {
+            // The plan owns these arrays until the native one-time upload has
+            // synchronized successfully. An uncertain CUDA failure must retain
+            // the host upload sources as well as the poisoned native graph.
+            let status = unsafe {
+                configure_resident_generation_adaptive_inputs_v3(
+                    generation.as_ptr(),
+                    controls.policy.policy_identity_sha256.as_ptr(),
+                    controls.template_scalars.as_ptr(),
+                    controls.template_indices.as_ptr(),
+                    controls.template_weights.as_ptr(),
+                    controls.initial_seen_hashes.as_ptr(),
+                )
+            };
+            if status != STATUS_OK {
+                owner.state = ResidentSearchStateV2::Poisoned;
+                std::mem::forget(plan);
+                return Err(native_error(
+                    "configure_resident_generation_adaptive_inputs_v3",
+                    status,
+                ));
+            }
         }
 
         let mut initialized = Box::new(RawReadyEventV1::default());
@@ -2481,7 +3112,7 @@ impl PopulationSession {
             return Err(error);
         }
         owner.refresh_current_gene_view_v2()?;
-        Ok(owner)
+        Ok((owner, bind_authority))
     }
 }
 
@@ -2602,7 +3233,10 @@ fn validate_allocation_receipt(
         || allocation.logical_population_count != plan.logical_population_count_v1()
         || allocation.retained_evaluation_capacity != plan.retained_evaluation_capacity_v1()
         || allocation.generation_chunk_count != expected_generation_chunks
-        || allocation.allocation_plan_sha256 != plan.plan_identity_sha256_v1()
+        || allocation.allocation_plan_sha256
+            != plan
+                .adaptive_policy_identity_sha256_v3()
+                .unwrap_or_else(|| plan.plan_identity_sha256_v1())
         || allocation.total_device_bytes != charged
         || allocation.total_device_bytes > available_after_reserve
     {

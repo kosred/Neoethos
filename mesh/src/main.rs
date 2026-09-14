@@ -14,8 +14,8 @@
 //!
 //! Roles are automatic and simultaneous: any node with queued jobs
 //! (/federation/status) is a coordinator; any node with the engine idle is a
-//! worker. Discovery is fully distributed; training runs on the worker
-//! (model-weight return over iroh-blobs is the documented next step).
+//! worker. Only discovery jobs are supported. Training requires an exact
+//! candidate handoff; remote model archives are not accepted by this protocol.
 //!
 //! ISOLATION: separate process, own Cargo.lock. Nothing here can touch the
 //! trading engine — it only speaks to the app over localhost HTTP.
@@ -73,7 +73,9 @@ enum GossipMsg {
     Announce(Announce),
     /// Elite genes migrating between GA islands. Opaque JSON here — the local
     /// app deserializes them into real genes at `/mesh/migrants`.
-    Migrants { genes: serde_json::Value },
+    Migrants {
+        genes: serde_json::Value,
+    },
 }
 
 /// This machine's real hardware, read once from the local app's `/hardware`
@@ -86,68 +88,62 @@ struct HwCaps {
     gpu: bool,
 }
 
-/// One unit of work (mirrors the app's FedJob; work_type: discovery|training).
+/// One unit of work (mirrors the app's FedJob; only discovery is supported).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FedJob {
     symbol: String,
     #[serde(rename = "baseTf")]
     base_tf: String,
-    #[serde(default = "disc")]
+    #[serde(rename = "workType", alias = "work_type", default = "disc")]
     work_type: String,
 }
 fn disc() -> String {
     "discovery".into()
 }
 
-/// True iff `s` is safe to use as a single path component (model-store
-/// subdirectory). Wire fields from peers MUST pass this before being joined
-/// into a local filesystem path — rejects `..`, separators, drive letters.
+/// Reject unsafe job selectors before any local HTTP request or filesystem use.
+/// The app remains responsible for canonical symbol/timeframe admission.
 fn safe_path_component(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Max bytes for one RPC message. Large enough for a tarred model directory
-/// (base64'd) returned from a training job.
+/// Max bytes for one discovery RPC message, including portfolios and trade logs.
 const MAX_RPC: usize = 512 * 1024 * 1024;
 
-/// Tar a directory tree into an in-memory buffer (best-effort).
-fn tar_dir(dir: &std::path::Path) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    {
-        let mut ar = tar::Builder::new(&mut buf);
-        ar.append_dir_all(".", dir).context("tar model dir")?;
-        ar.finish()?;
+fn validate_job(job: &FedJob) -> Result<()> {
+    anyhow::ensure!(
+        safe_path_component(&job.symbol) && safe_path_component(&job.base_tf),
+        "mesh job has unsafe symbol/baseTf components"
+    );
+    match job.work_type.as_str() {
+        "discovery" => {}
+        "training" => anyhow::bail!(
+            "legacy mesh training jobs are unsupported: an exact candidate training handoff is required"
+        ),
+        _ => anyhow::bail!("mesh job has an unknown workType"),
     }
-    Ok(buf)
-}
-
-/// Untar an in-memory buffer into `dest` (created if needed).
-fn untar_to(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(dest).ok();
-    let mut ar = tar::Archive::new(bytes);
-    ar.unpack(dest).context("untar model into store")?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "job_protocol_tests.rs"]
+mod job_protocol_tests;
 
 /// Request a worker sends to a coordinator over a QUIC bi-stream.
 #[derive(Debug, Serialize, Deserialize)]
 enum MeshReq {
-    GetJob { worker: String },
+    GetJob {
+        worker: String,
+    },
     Submit {
         symbol: String,
         base_tf: String,
         portfolio_json: String,
         trades_json: Option<String>,
-    },
-    /// A trained model returned from a worker: the model directory tarred and
-    /// base64'd (keeps the JSON RPC framing intact). The coordinator decodes +
-    /// untars it into its own model store.
-    SubmitTraining {
-        symbol: String,
-        base_tf: String,
-        model_tar_b64: String,
     },
 }
 
@@ -341,22 +337,22 @@ impl AppClient {
 
     /// Inject a peer island's elites into the local GA's next generation.
     async fn push_migrants(&self, genes: serde_json::Value) {
-        let _ = self.http.post(format!("{}/mesh/migrants", self.base)).json(&genes).send().await;
-    }
-
-    /// The local model store's ABSOLUTE path (from `/intelligence`), for
-    /// tarring/untarring trained models. Returns the path even if it doesn't
-    /// exist yet (the coordinator creates it on untar).
-    async fn models_dir(&self) -> Option<PathBuf> {
-        let r = self.http.get(format!("{}/intelligence", self.base)).send().await.ok()?;
-        let v: serde_json::Value = r.json().await.ok()?;
-        let dir = v.get("modelsDir").and_then(|x| x.as_str()).filter(|s| !s.is_empty())?;
-        Some(PathBuf::from(dir))
+        let _ = self
+            .http
+            .post(format!("{}/mesh/migrants", self.base))
+            .json(&genes)
+            .send()
+            .await;
     }
 
     /// (app_online, has_queued_work)
     async fn status(&self) -> (bool, bool) {
-        match self.http.get(format!("{}/federation/status", self.base)).send().await {
+        match self
+            .http
+            .get(format!("{}/federation/status", self.base))
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => {
                 let v: serde_json::Value = r.json().await.unwrap_or_default();
                 let queued = v.get("jobsQueued").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -407,28 +403,35 @@ impl AppClient {
         }
     }
 
-    /// Start a local engine run for a claimed job (worker side).
-    async fn start_engine(&self, work_type: &str, symbol: &str, base_tf: &str) -> bool {
-        let path = if work_type == "training" {
-            "/engines/training/start"
-        } else {
-            "/engines/discovery/start"
-        };
+    /// Start local discovery for a validated claimed job (worker side).
+    async fn start_discovery(&self, symbol: &str, base_tf: &str) -> bool {
         let body = serde_json::json!({ "symbol": symbol, "base_tf": base_tf });
-        self.http.post(format!("{}{path}", self.base)).json(&body).send().await
-            .map(|r| r.status().is_success()).unwrap_or(false)
+        self.http
+            .post(format!("{}/engines/discovery/start", self.base))
+            .json(&body)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 
-    /// Poll the engine state string for a work type ("Running"/"Idle"/…).
-    async fn engine_state(&self, work_type: &str) -> String {
-        let key = if work_type == "training" { "training" } else { "discovery" };
-        let Ok(r) = self.http.get(format!("{}/engines/status", self.base)).send().await else {
+    /// Poll the discovery engine state string ("Running"/"Idle"/…).
+    async fn discovery_state(&self) -> String {
+        let Ok(r) = self
+            .http
+            .get(format!("{}/engines/status", self.base))
+            .send()
+            .await
+        else {
             return "Unknown".into();
         };
         let Ok(v) = r.json::<serde_json::Value>().await else {
             return "Unknown".into();
         };
-        v.get(key).and_then(|x| x.as_str()).map(String::from).unwrap_or_else(|| "Unknown".into())
+        v.get("discovery")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| "Unknown".into())
     }
 
     /// Newest discovery portfolio (path + trades) for a combo, produced after
@@ -495,46 +498,24 @@ impl ProtocolHandler for MeshProto {
                     }
                     MeshResp::Job(job)
                 }
-                Ok(MeshReq::Submit { symbol, base_tf, portfolio_json, trades_json }) => {
+                Ok(MeshReq::Submit {
+                    symbol,
+                    base_tf,
+                    portfolio_json,
+                    trades_json,
+                }) => {
                     let (ok, msg) = self
                         .app
-                        .submit(&remote.to_string(), &symbol, &base_tf, &portfolio_json, trades_json.as_deref())
+                        .submit(
+                            &remote.to_string(),
+                            &symbol,
+                            &base_tf,
+                            &portfolio_json,
+                            trades_json.as_deref(),
+                        )
                         .await;
                     tracing::info!(peer = %remote, %symbol, ok, "received a result from a peer worker");
                     MeshResp::SubmitAck { ok, msg }
-                }
-                Ok(MeshReq::SubmitTraining { symbol, base_tf, model_tar_b64 }) => {
-                    use base64::Engine;
-                    // symbol/base_tf come off the wire — sanitize before they
-                    // become path components, and untar into the combo's OWN
-                    // subtree so a peer's archive can never overwrite models
-                    // for other symbols/timeframes in the local store.
-                    let msg = if !safe_path_component(&symbol) || !safe_path_component(&base_tf) {
-                        format!("rejected: unsafe symbol/baseTf path components ({symbol}/{base_tf})")
-                    } else {
-                        match base64::engine::general_purpose::STANDARD.decode(&model_tar_b64) {
-                            Ok(tar) => match self.app.models_dir().await {
-                                Some(dir) => {
-                                    let dest =
-                                        dir.join(symbol.to_uppercase()).join(base_tf.to_uppercase());
-                                    match untar_to(&tar, &dest) {
-                                        Ok(()) => {
-                                            tracing::info!(peer = %remote, %symbol, %base_tf, bytes = tar.len(), "received a trained model from a peer worker → saved to model store");
-                                            format!(
-                                                "model saved ({} bytes) to {}",
-                                                tar.len(),
-                                                dest.display()
-                                            )
-                                        }
-                                        Err(e) => format!("untar failed: {e}"),
-                                    }
-                                }
-                                None => "no local model store path available".to_string(),
-                            },
-                            Err(e) => format!("bad base64: {e}"),
-                        }
-                    };
-                    MeshResp::SubmitAck { ok: msg.starts_with("model saved"), msg }
                 }
                 Err(e) => MeshResp::Err(format!("bad request: {e}")),
             };
@@ -549,12 +530,11 @@ impl ProtocolHandler for MeshProto {
 
 // ── Worker: run one job from a coordinator peer ──────────────────────────────
 
-async fn rpc(
-    endpoint: &Endpoint,
-    coordinator: EndpointId,
-    req: &MeshReq,
-) -> Result<MeshResp> {
-    let conn = endpoint.connect(coordinator, MESH_ALPN).await.context("connect")?;
+async fn rpc(endpoint: &Endpoint, coordinator: EndpointId, req: &MeshReq) -> Result<MeshResp> {
+    let conn = endpoint
+        .connect(coordinator, MESH_ALPN)
+        .await
+        .context("connect")?;
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
     send.write_all(&serde_json::to_vec(req)?).await?;
     send.finish()?;
@@ -570,14 +550,23 @@ async fn run_one_job(
     my_id: &str,
     coordinator: EndpointId,
 ) -> Result<bool> {
-    let job = match rpc(endpoint, coordinator, &MeshReq::GetJob { worker: my_id.into() }).await? {
+    let job = match rpc(
+        endpoint,
+        coordinator,
+        &MeshReq::GetJob {
+            worker: my_id.into(),
+        },
+    )
+    .await?
+    {
         MeshResp::Job(Some(j)) => j,
         _ => return Ok(false),
     };
+    validate_job(&job)?;
     tracing::info!(%job.symbol, %job.base_tf, wt = %job.work_type, coord = %coordinator, "claimed a job");
 
     let start_ms = now_secs() as i64 * 1000;
-    if !app.start_engine(&job.work_type, &job.symbol, &job.base_tf).await {
+    if !app.start_discovery(&job.symbol, &job.base_tf).await {
         tracing::warn!("local engine refused to start the job; giving it back");
         return Ok(false);
     }
@@ -588,7 +577,7 @@ async fn run_one_job(
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         waited += 10;
-        let st = app.engine_state(&job.work_type).await;
+        let st = app.discovery_state().await;
         if st == "Running" {
             ever_ran = true;
         } else if ever_ran || waited > 120 {
@@ -599,56 +588,11 @@ async fn run_one_job(
         }
     }
 
-    if job.work_type == "training" {
-        // Training ran locally; return ONLY this job's combo subtree
-        // (models/<SYMBOL>/<TF>/) to the coordinator. Tarring the whole
-        // store would ship every unrelated model, blow past MAX_RPC, and
-        // overwrite the coordinator's other models on untar.
-        use base64::Engine;
-        let combo_dir = app.models_dir().await.map(|root| {
-            let upper = root.join(job.symbol.to_uppercase()).join(job.base_tf.to_uppercase());
-            if upper.exists() { upper } else { root.join(&job.symbol).join(&job.base_tf) }
-        });
-        match combo_dir {
-            Some(dir) if dir.exists() => match tar_dir(&dir) {
-                Ok(tar) => {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&tar);
-                    if b64.len() + 4096 > MAX_RPC {
-                        tracing::warn!(
-                            mb = tar.len() / (1024 * 1024),
-                            "trained model exceeds the {}MB RPC cap — not sending",
-                            MAX_RPC / (1024 * 1024)
-                        );
-                        return Ok(true);
-                    }
-                    tracing::info!(mb = tar.len() / (1024 * 1024), "training done — sending model to coordinator");
-                    match rpc(
-                        endpoint,
-                        coordinator,
-                        &MeshReq::SubmitTraining {
-                            symbol: job.symbol.clone(),
-                            base_tf: job.base_tf.clone(),
-                            model_tar_b64: b64,
-                        },
-                    )
-                    .await?
-                    {
-                        MeshResp::SubmitAck { ok, msg } => tracing::info!(ok, %msg, "model submitted to coordinator"),
-                        other => tracing::warn!("unexpected training-submit response: {other:?}"),
-                    }
-                }
-                Err(e) => tracing::warn!("could not tar model store: {e}"),
-            },
-            _ => tracing::warn!(
-                symbol = %job.symbol, tf = %job.base_tf,
-                "no trained model directory for this combo — nothing to return"
-            ),
-        }
-        return Ok(true);
-    }
-
     // Discovery: collect the produced portfolio and submit it to the coordinator.
-    match app.collect_portfolio(&job.symbol, &job.base_tf, start_ms).await {
+    match app
+        .collect_portfolio(&job.symbol, &job.base_tf, start_ms)
+        .await
+    {
         Some((pf, trades)) => {
             let resp = rpc(
                 endpoint,
@@ -913,7 +857,7 @@ async fn async_main(args: Args) -> Result<()> {
                         .map(|(id, _)| *id)
                 };
                 // Only take work when our own engine is idle (don't oversubscribe).
-                let disc = app.engine_state("discovery").await;
+                let disc = app.discovery_state().await;
                 if disc == "Running" {
                     continue;
                 }

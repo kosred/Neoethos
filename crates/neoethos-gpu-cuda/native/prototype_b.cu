@@ -4,6 +4,10 @@
 
 namespace {
 
+// One logical subgroup per event, including on AMD hardware with 64-lane waves.
+// Keep the launch, bar partition and shuffle width on this same 32-lane group.
+constexpr unsigned FIRST_HIT_LOGICAL_WIDTH_V1 = 32u;
+
 __device__ std::int32_t first_hit_reason(double high,
                                          double low,
                                          const NeoFirstHitEvent& event) {
@@ -31,7 +35,7 @@ __global__ void warp_first_hit_kernel(const double* highs,
                                       NeoFirstHitResult* results,
                                       std::size_t event_count) {
   const std::size_t event_index = static_cast<std::size_t>(blockIdx.x);
-  const unsigned lane = threadIdx.x & 31u;
+  const unsigned lane = threadIdx.x & (FIRST_HIT_LOGICAL_WIDTH_V1 - 1u);
   if (event_index >= event_count) return;
 
   const NeoFirstHitEvent event = events[event_index];
@@ -40,7 +44,7 @@ __global__ void warp_first_hit_kernel(const double* highs,
   const std::uint32_t first_bar = event.entry_bar + 1u;
   for (std::uint32_t bar = first_bar + lane;
        bar <= event.last_bar && static_cast<std::size_t>(bar) < rows;
-       bar += 32u) {
+       bar += FIRST_HIT_LOGICAL_WIDTH_V1) {
     const int reason = first_hit_reason(highs[bar], lows[bar], event);
     if (reason != 0 && static_cast<int>(bar) < best_bar) {
       best_bar = static_cast<int>(bar);
@@ -48,10 +52,14 @@ __global__ void warp_first_hit_kernel(const double* highs,
     }
   }
 
-  constexpr unsigned mask = 0xffffffffu;
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    const int other_bar = __shfl_down_sync(mask, best_bar, offset);
-    const int other_reason = __shfl_down_sync(mask, best_reason, offset);
+  // HIP requires a 64-bit mask even for a 32-lane logical subgroup. Only this
+  // block's low 32 lanes participate; CUDA receives the identical low 32 bits.
+  constexpr unsigned long long mask = 0xffffffffull;
+  for (int offset = FIRST_HIT_LOGICAL_WIDTH_V1 / 2; offset > 0; offset >>= 1) {
+    const int other_bar =
+        __shfl_down_sync(mask, best_bar, offset, FIRST_HIT_LOGICAL_WIDTH_V1);
+    const int other_reason =
+        __shfl_down_sync(mask, best_reason, offset, FIRST_HIT_LOGICAL_WIDTH_V1);
     if (other_bar < best_bar ||
         (other_bar == best_bar && other_bar != INT_MAX && other_reason < best_reason)) {
       best_bar = other_bar;
@@ -90,48 +98,44 @@ extern "C" std::int32_t neoethos_gpu_cuda_warp_first_hit(
   const std::size_t event_bytes = event_count * sizeof(NeoFirstHitEvent);
   const std::size_t result_bytes = event_count * sizeof(NeoFirstHitResult);
 
-  auto cleanup = [&]() {
-    if (device_results != nullptr) cudaFree(device_results);
-    if (device_events != nullptr) cudaFree(device_events);
-    if (device_lows != nullptr) cudaFree(device_lows);
-    if (device_highs != nullptr) cudaFree(device_highs);
+  auto cleanup = [&](std::int32_t operation_status) -> std::int32_t {
+    bool cleanup_failed = false;
+    // Attempt every release, preserving the original operation error. A
+    // cleanup-only failure must not certify successfully completed ownership.
+    if (device_results != nullptr && cudaFree(device_results) != cudaSuccess) cleanup_failed = true;
+    if (device_events != nullptr && cudaFree(device_events) != cudaSuccess) cleanup_failed = true;
+    if (device_lows != nullptr && cudaFree(device_lows) != cudaSuccess) cleanup_failed = true;
+    if (device_highs != nullptr && cudaFree(device_highs) != cudaSuccess) cleanup_failed = true;
+    return operation_status != 0 ? operation_status : (cleanup_failed ? -28 : 0);
   };
 
   if (cudaMalloc(reinterpret_cast<void**>(&device_highs), price_bytes) != cudaSuccess) {
-    cleanup();
-    return -21;
+    return cleanup(-21);
   }
   if (cudaMalloc(reinterpret_cast<void**>(&device_lows), price_bytes) != cudaSuccess) {
-    cleanup();
-    return -22;
+    return cleanup(-22);
   }
   if (cudaMalloc(reinterpret_cast<void**>(&device_events), event_bytes) != cudaSuccess) {
-    cleanup();
-    return -23;
+    return cleanup(-23);
   }
   if (cudaMalloc(reinterpret_cast<void**>(&device_results), result_bytes) != cudaSuccess) {
-    cleanup();
-    return -24;
+    return cleanup(-24);
   }
 
   if (cudaMemcpy(device_highs, highs, price_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
       cudaMemcpy(device_lows, lows, price_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
       cudaMemcpy(device_events, events, event_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-    cleanup();
-    return -25;
+    return cleanup(-25);
   }
 
-  warp_first_hit_kernel<<<static_cast<unsigned>(event_count), 32>>>(
+  warp_first_hit_kernel<<<static_cast<unsigned>(event_count), FIRST_HIT_LOGICAL_WIDTH_V1>>>(
       device_highs, device_lows, rows, device_events, device_results, event_count);
   if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
-    cleanup();
-    return -26;
+    return cleanup(-26);
   }
   if (cudaMemcpy(results, device_results, result_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-    cleanup();
-    return -27;
+    return cleanup(-27);
   }
 
-  cleanup();
-  return 0;
+  return cleanup(0);
 }

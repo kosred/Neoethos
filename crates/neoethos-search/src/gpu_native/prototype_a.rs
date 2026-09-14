@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fmt;
 use std::ops::Range;
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "gpu-cuda")]
 pub use crate::gpu_native::prototype_a_engine::create_prototype_a_engine;
 
 pub const PROTOTYPE_A_UPLOAD_SCHEMA_VERSION: u32 = 2;
@@ -389,11 +389,11 @@ impl PrototypeATelemetry {
 }
 
 pub fn prototype_a_status() -> EngineStatus {
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "gpu-cuda")]
     {
         EngineStatus::NotBenchmarked
     }
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(not(feature = "gpu-cuda"))]
     {
         EngineStatus::UnsupportedCapability
     }
@@ -411,11 +411,9 @@ pub fn prototype_a_capabilities() -> EngineCapabilities {
     }
 }
 
-pub fn is_known_no_adapter_error(message: &str) -> bool {
-    message.contains("No possible adapter available")
-        || message.contains("No Discrete GPU device found")
-        || message.contains("No Integrated GPU device found")
-        || message.contains("No Virtual GPU device found")
+pub fn is_known_no_cuda_device_error(message: &str) -> bool {
+    message.contains("GPU evaluator requested CUDA device")
+        && message.contains("CUDA devices are available")
 }
 
 pub fn disable_prototype_a_telemetry() {
@@ -514,24 +512,15 @@ mod tests {
     }
 
     #[test]
-    fn no_adapter_classifier_matches_only_the_known_cubecl_absence_signature() {
-        assert!(is_known_no_adapter_error(
-            "No possible adapter available, requested_backends: Backends(VULKAN)"
+    fn no_cuda_device_classifier_matches_only_the_owned_absence_signature() {
+        assert!(is_known_no_cuda_device_error(
+            "GPU evaluator requested CUDA device 1 but only 0 CUDA devices are available"
         ));
-        assert!(is_known_no_adapter_error(
-            "No Integrated GPU device found for index 99"
+        assert!(!is_known_no_cuda_device_error(
+            "CUDA allocation failed: out of memory"
         ));
-        assert!(is_known_no_adapter_error(
-            "No Discrete GPU device found for index 99"
-        ));
-        assert!(is_known_no_adapter_error(
-            "No Virtual GPU device found for index 99"
-        ));
-        assert!(!is_known_no_adapter_error(
-            "wgpu validation error; requested_backends: Backends(VULKAN)"
-        ));
-        assert!(!is_known_no_adapter_error(
-            "buffer offset is not aligned to min_storage_buffer_offset_alignment"
+        assert!(!is_known_no_cuda_device_error(
+            "GPU evaluator requested a different accelerator"
         ));
     }
 
@@ -688,7 +677,7 @@ mod tests {
         ));
     }
 
-    #[cfg(any(feature = "gpu-cuda", feature = "gpu-vulkan"))]
+    #[cfg(feature = "gpu-cuda")]
     #[test]
     fn direct_prototype_a_engine_is_resident_and_matches_cpu_fixture() {
         use crate::backend::EvaluationBackend;

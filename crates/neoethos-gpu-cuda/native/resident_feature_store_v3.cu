@@ -518,6 +518,14 @@ int validate_current_device_grid(unsigned int grid_x, unsigned int grid_y) {
     return static_cast<int>(cudaSuccess);
 }
 
+__global__ void accumulate_control_error_u32_v3(
+    const unsigned int* source_error,
+    unsigned int* aggregate_error) {
+    if (threadIdx.x == 0U && blockIdx.x == 0U) {
+        atomicOr(aggregate_error, *source_error);
+    }
+}
+
 }  // namespace
 
 extern "C" int neoethos_resident_initialize_validity_u4_v3(
@@ -542,6 +550,20 @@ extern "C" int neoethos_resident_initialize_validity_u4_v3(
                              sizeof(unsigned int),
                              reinterpret_cast<cudaStream_t>(stream));
     return static_cast<int>(status);
+}
+
+extern "C" int neoethos_resident_accumulate_control_error_u32_v3(
+    const unsigned int* source_error,
+    unsigned int* aggregate_error,
+    CUstream stream) {
+    if (stream == nullptr || source_error == nullptr ||
+        aggregate_error == nullptr) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    accumulate_control_error_u32_v3<<<
+        1U, 1U, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+        source_error, aggregate_error);
+    return launch_status();
 }
 
 extern "C" int neoethos_resident_pack_batch_to_bar_major_f64_u4_v3(

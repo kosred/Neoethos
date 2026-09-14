@@ -262,40 +262,53 @@ fn first_identifier(expression: &str) -> &str {
     &trimmed[..end]
 }
 
-fn stack_array_bytes(function_body: &str, binding: &str) -> usize {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadbackExtent {
+    Fixed(usize),
+    FitBytesPerColumn(usize),
+}
+
+fn readback_extent(function_body: &str, binding: &str) -> ReadbackExtent {
     let code = compact_code(function_body);
     let declaration = format!("letmut{binding}=");
-    let start = code
-        .find(&declaration)
-        .unwrap_or_else(|| panic!("copy_to destination `{binding}` is not a local fixed array"))
-        + declaration.len();
+    let start = code.find(&declaration).unwrap_or_else(|| {
+        panic!("copy_to destination `{binding}` is not a local bounded allocation")
+    }) + declaration.len();
     let initializer = &code[start..];
     if initializer.starts_with("[0_u32;1]") {
-        4
+        ReadbackExtent::Fixed(4)
     } else if initializer.starts_with("[0_u64;SHA256_BYTES/std::mem::size_of::<u64>()]")
         || initializer.starts_with("[0_u8;SHA256_BYTES]")
     {
-        32
+        ReadbackExtent::Fixed(32)
+    } else if initializer.starts_with("Vec::new();")
+        && code.contains(&format!(
+            "{binding}.try_reserve_exact(plan.fit_metadata_words())"
+        ))
+        && code.contains(&format!("{binding}.resize(plan.fit_metadata_words(),0);"))
+    {
+        ReadbackExtent::FitBytesPerColumn(48)
     } else {
         panic!("copy_to destination `{binding}` has an unapproved extent")
     }
 }
 
-fn copy_to_sites(function_body: &str) -> Vec<(usize, String, usize)> {
+fn copy_to_sites(function_body: &str) -> Vec<(usize, String, ReadbackExtent)> {
     let code = compact_code(function_body);
     code.match_indices(".copy_to(")
         .map(|(index, _)| {
             let argument = copy_to_argument(&code, index);
             let binding = first_identifier(argument).to_string();
-            let bytes = stack_array_bytes(function_body, &binding);
+            let bytes = readback_extent(function_body, &binding);
             (index, binding, bytes)
         })
         .collect()
 }
 
-fn assert_fit_digest_source(function_body: &str, site: &(usize, String, usize)) {
+fn assert_fit_digest_source(function_body: &str, site: &(usize, String, ReadbackExtent)) {
     assert_eq!(
-        site.2, 32,
+        site.2,
+        ReadbackExtent::Fixed(32),
         "fit digest destination must be exactly 32 bytes"
     );
     let code = compact_code(function_body);
@@ -312,6 +325,27 @@ fn assert_fit_digest_source(function_body: &str, site: &(usize, String, usize)) 
     );
     assert!(statement.starts_with(&format!("{receiver}.index(0..")));
     assert!(statement.contains(&format!("{}.len()", site.1)));
+}
+
+fn assert_fit_words_source(function_body: &str, site: &(usize, String, ReadbackExtent)) {
+    assert_eq!(site.2, ReadbackExtent::FitBytesPerColumn(48));
+    let code = compact_code(function_body);
+    let statement = code[..site.0]
+        .rsplit(';')
+        .next()
+        .expect("fit copy statement");
+    let receiver = first_identifier(statement);
+    assert_eq!(
+        statement, receiver,
+        "copy must cover only the exact fit buffer"
+    );
+    assert!(code.contains(&format!(
+        "letmut{receiver}=StreamOrderedDeviceBufferV3::<u64>::uninitialized_async(plan.fit_metadata_words(),"
+    )), "fit words must come from the exact preflight-owned 6F-word allocation");
+    assert!(
+        code.find("ready_event.synchronize()?")
+            .is_some_and(|i| i < site.0)
+    );
 }
 
 #[test]
@@ -345,7 +379,7 @@ fn robust_normalization_v2_freezes_the_cpu_math_and_bounded_resident_shape() {
 
     let runtime = source("crates/neoethos-gpu-cuda/src/resident_robust_normalization_v2.rs");
     for required in [
-        "RESIDENT_ROBUST_NORMALIZATION_SEMANTIC_VERSION_V2: u32 = 2",
+        "RESIDENT_ROBUST_NORMALIZATION_SEMANTIC_VERSION_V2: u32 = 3",
         "RESIDENT_ROBUST_NORMALIZATION_MAX_BATCH_COLUMNS_V2: usize = 64",
         "RESIDENT_ROBUST_NORMALIZATION_FIT_WORDS_V2: usize = 6",
         "RESIDENT_ROBUST_NORMALIZATION_FIT_BYTES_V2: usize = 48",
@@ -354,6 +388,8 @@ fn robust_normalization_v2_freezes_the_cpu_math_and_bounded_resident_shape() {
         "VALIDITY_ATOMIC_ALIGNMENT_BYTES_V2",
         "fit_metadata_sha256",
         "fit_digest_d2h_bytes",
+        "fit_words_d2h_bytes",
+        "with_column_modes_v3",
         "feature_value_d2h_bytes",
         "producer_ready_event_count",
         "producer_ready_event_synchronize_count",
@@ -372,7 +408,7 @@ fn robust_normalization_v2_freezes_the_cpu_math_and_bounded_resident_shape() {
     }
     assert!(runtime.contains("feature_value_d2h_bytes: 0"));
     let build = source("crates/neoethos-gpu-cuda/build.rs");
-    assert!(build.contains("const DEVICE_SOURCES: [&str; 13]"));
+    assert!(build.contains("const DEVICE_SOURCES: [&str; 16]"));
     assert!(build.contains("native/resident_robust_normalization_v2.cu"));
 
     let cuda = source("crates/neoethos-gpu-cuda/native/resident_robust_normalization_v2.cu");
@@ -470,13 +506,10 @@ fn data_component_receipt_binds_runtime_shape_lifetime_and_exact_run_identity() 
     assert!(seal_runtime.contains("owner.sealed_steady_device_bytes()"));
 
     let contracts = source("crates/neoethos-gpu-contracts/src/resident_feature_store_v3.rs");
-    let steady = contracts
-        .split_once("let steady_device_bytes = checked_sum(")
-        .expect("steady resident accounting")
-        .1
-        .split_once("let peak_device_bytes = checked_sum(")
-        .expect("peak resident accounting")
-        .0;
+    let steady = compact_code(braced_body_after(
+        &contracts,
+        "fn seal(request: ResidentWorkingSetRequestV3)",
+    ));
     assert!(
         steady.contains("request.fit_metadata_bytes"),
         "retained fit metadata must be charged to steady resident bytes"
@@ -539,7 +572,10 @@ fn robust_authority_carriers_are_structurally_move_only() {
 #[test]
 fn data_invokes_exact_robust_normalization_before_assembler_seal_and_merkle() {
     let data = source("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
-    let entrypoint = braced_body_after(&data, "pub fn materialize_gpu_only_feature_store_v3(");
+    let entrypoint = braced_body_after(
+        &data,
+        "fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(",
+    );
     let entrypoint = compact_code(entrypoint);
     let exact_apply = "seal_token.apply_resident_robust_normalization_v2(&mutassembler)?";
     assert_eq!(
@@ -629,7 +665,7 @@ fn cuda_u4_helpers_use_only_aligned_word_atomic_cas_access() {
 
     let entry = compact_code(braced_body_after(
         &cuda,
-        "int neoethos_resident_robust_normalize_bar_major_f64_u4_v2(",
+        "int neoethos_resident_robust_normalize_bar_major_f64_u4_v3(",
     ));
     assert!(entry.contains(
         "reinterpret_cast<std::uintptr_t>(bar_major_validity_u4)%alignof(unsignedint)!=0U"
@@ -642,16 +678,26 @@ fn cuda_u4_helpers_use_only_aligned_word_atomic_cas_access() {
 
 #[test]
 fn production_d2h_is_exhaustively_whitelisted_by_structure_and_extent() {
+    let plan = compact_code(&source(
+        "crates/neoethos-gpu-cuda/src/resident_robust_normalization_v2.rs",
+    ));
+    assert!(plan.contains("RESIDENT_ROBUST_NORMALIZATION_FIT_WORDS_V2:usize=6"));
+    assert!(plan.contains(
+        "letfit_metadata_words=columns.checked_mul(RESIDENT_ROBUST_NORMALIZATION_FIT_WORDS_V2)"
+    ));
+    assert!(plan.contains(
+        "letfit_metadata_bytes=fit_metadata_words.checked_mul(std::mem::size_of::<u64>())"
+    ));
     let runtime = source("crates/neoethos-gpu-cuda/src/resident_feature_store_v3.rs");
     let code = compact_code(&runtime);
     assert_eq!(
         code.matches(".copy_to(").count(),
-        4,
+        6,
         "every synchronous D2H site must be structurally classified"
     );
     assert_eq!(
         code.matches("copy_to(").count(),
-        4,
+        6,
         "UFCS/free-function copy_to calls may not bypass method-call classification"
     );
     assert!(
@@ -690,27 +736,57 @@ fn production_d2h_is_exhaustively_whitelisted_by_structure_and_extent() {
         }
     }
 
+    let screening = braced_body_after(&runtime, "pub fn finish_score_stream_v2(");
+    let screening_sites = copy_to_sites(screening);
+    assert_eq!(
+        screening_sites
+            .iter()
+            .map(|site| site.2)
+            .collect::<Vec<_>>(),
+        [ReadbackExtent::Fixed(4)],
+        "screening may read only its aggregate device control verdict"
+    );
+    let screening_code = compact_code(screening);
+    assert!(
+        screening_code[..screening_sites[0].0]
+            .rsplit(';')
+            .next()
+            .is_some_and(|statement| statement.contains("aggregate_control_error"))
+    );
+
     let apply = braced_body_after(&runtime, "pub fn apply_resident_robust_normalization_v2(");
     let apply_sites = copy_to_sites(apply);
     assert_eq!(
         apply_sites.iter().map(|site| site.2).collect::<Vec<_>>(),
-        [4, 32],
-        "enabled normalization may read only the verdict and fit digest"
+        [
+            ReadbackExtent::Fixed(4),
+            ReadbackExtent::Fixed(32),
+            ReadbackExtent::FitBytesPerColumn(48)
+        ],
+        "enabled normalization may read only the verdict, fit digest and exact 48F fits"
     );
     let renamed_apply = apply
         .replace("validity_code_error", "renamed_verdict")
         .replace("fit_digest_words", "renamed_digest")
-        .replace("sort_scratch_bits", "renamed_scratch");
+        .replace("sort_scratch_bits", "renamed_scratch")
+        .replace("host_fit_words", "renamed_host_fits")
+        .replace("fit_metadata_words", "renamed_device_fits")
+        .replace("plan.renamed_device_fits()", "plan.fit_metadata_words()");
     let renamed_apply_sites = copy_to_sites(&renamed_apply);
     assert_eq!(
         renamed_apply_sites
             .iter()
             .map(|site| site.2)
             .collect::<Vec<_>>(),
-        [4, 32],
+        [
+            ReadbackExtent::Fixed(4),
+            ReadbackExtent::Fixed(32),
+            ReadbackExtent::FitBytesPerColumn(48)
+        ],
         "D2H extent classification must not depend on local binding names"
     );
     assert_fit_digest_source(&renamed_apply, &renamed_apply_sites[1]);
+    assert_fit_words_source(&renamed_apply, &renamed_apply_sites[2]);
     let apply_code = compact_code(apply);
     let first_statement = &apply_code[..apply_sites[0].0];
     assert!(
@@ -720,6 +796,35 @@ fn production_d2h_is_exhaustively_whitelisted_by_structure_and_extent() {
             .is_some_and(|statement| { statement.contains("self.validity_code_error") })
     );
     assert_fit_digest_source(apply, &apply_sites[1]);
+    assert_fit_words_source(apply, &apply_sites[2]);
+    // The extent proof must refuse widening either the host vector or device
+    // source, independently of the count of copy sites.
+    let widened_host = compact_code(apply).replace(
+        ".resize(plan.fit_metadata_words(),0)",
+        ".resize(plan.fit_metadata_words()+1,0)",
+    );
+    assert_ne!(
+        widened_host,
+        compact_code(apply),
+        "host widening negative control must apply"
+    );
+    assert!(std::panic::catch_unwind(|| copy_to_sites(&widened_host)).is_err());
+    let widened_device = compact_code(apply).replace(
+        "uninitialized_async(plan.fit_metadata_words(),",
+        "uninitialized_async(plan.fit_metadata_words()+1,",
+    );
+    assert_ne!(
+        widened_device,
+        compact_code(apply),
+        "device widening negative control must apply"
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_fit_words_source(
+            &widened_device,
+            &copy_to_sites(&widened_device)[2]
+        ))
+        .is_err()
+    );
 
     let seal = braced_body_after(
         &runtime,
@@ -728,7 +833,7 @@ fn production_d2h_is_exhaustively_whitelisted_by_structure_and_extent() {
     let seal_sites = copy_to_sites(seal);
     assert_eq!(
         seal_sites.iter().map(|site| site.2).collect::<Vec<_>>(),
-        [4],
+        [ReadbackExtent::Fixed(4)],
         "disabled normalization may read only the verdict during seal"
     );
     let seal_code = compact_code(seal);
@@ -743,7 +848,7 @@ fn production_d2h_is_exhaustively_whitelisted_by_structure_and_extent() {
     let hash_sites = copy_to_sites(hashes);
     assert_eq!(
         hash_sites.iter().map(|site| site.2).collect::<Vec<_>>(),
-        [32],
+        [ReadbackExtent::Fixed(32)],
         "ready store may read only the canonical Merkle root"
     );
     assert_eq!(
@@ -751,7 +856,7 @@ fn production_d2h_is_exhaustively_whitelisted_by_structure_and_extent() {
             .iter()
             .map(|site| site.2)
             .collect::<Vec<_>>(),
-        [32],
+        [ReadbackExtent::Fixed(32)],
         "Merkle D2H extent classification must not depend on its local binding name"
     );
     let hash_code = compact_code(hashes);
@@ -760,5 +865,69 @@ fn production_d2h_is_exhaustively_whitelisted_by_structure_and_extent() {
             .rsplit(';')
             .next()
             .is_some_and(|statement| statement.contains("self.canonical_content_merkle"))
+    );
+}
+
+#[test]
+fn policy3_uses_the_cpu_classifier_and_exact_admitted_modes_before_both_native_paths() {
+    let shared = source("crates/neoethos-data/src/core/gpu_resident_robust_normalization_v2.rs");
+    let classifier = compact_code(braced_body_after(
+        &shared,
+        "fn search_normalization_column_mode_v3(",
+    ));
+    assert!(classifier.contains("matchsmc_gate_domain(name)"));
+    for mode in ["Robust", "Binary", "SignedState", "SignedContinuous"] {
+        assert!(classifier.contains(&format!("SearchNormalizationColumnModeV3::{mode}")));
+    }
+    assert!(!classifier.contains("starts_with"));
+    assert!(!classifier.contains("ends_with"));
+    let data = compact_code(&source(
+        "crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs",
+    ));
+    assert!(data.contains("search_normalization_column_mode_v3(route.feature_name())"));
+    assert!(data.contains(".with_column_modes_v3(column_modes.clone())?"));
+    assert!(data.contains("execution.smc_materialization,parent_normalization_modes,"));
+    for counter in ["fit_words_readback_count", "fit_words_d2h_bytes"] {
+        assert!(data.contains(&format!("runtime.{counter}()")));
+        assert!(data.contains(&format!("allocation.{counter}.to_le_bytes()")));
+    }
+    let owner = compact_code(&source(
+        "crates/neoethos-gpu-cuda/src/resident_feature_store_v3.rs",
+    ));
+    assert!(owner.contains(".parent_normalization_modes.get(self.next_parent_column..source_end)"));
+    assert!(owner.contains(".with_column_modes_v3(bound_modes)?"));
+    let hip = compact_code(&source(
+        "crates/neoethos-data/src/core/gpu_hip_feature_store_v1.rs",
+    ));
+    assert!(hip.contains("HipFeatureNormalizationV3::preflight("));
+    assert!(hip.contains("search_normalization_column_mode_v3(name)"));
+    assert!(hip.contains("physical.normalization_fit_words()"));
+    assert!(hip.contains("fitted_state_from_device_words("));
+    assert!(!hip.contains("fnfitted_state_from_device_words("));
+    let decoder = compact_code(braced_body_after(
+        &shared,
+        "fn fitted_state_from_device_words(",
+    ));
+    assert!(decoder.contains("names.len().checked_mul(6)==Some(words.len())"));
+    assert!(decoder.contains("(start..end)==training_rows&&fit[5]<=1"));
+    assert!(decoder.contains("SearchNormalizationFittedStateV1::new(names.to_vec(),fits)"));
+}
+
+#[test]
+fn data_compact_readback_total_includes_exact_fit_words_without_double_counting_verdict() {
+    let data = source("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
+    let body = compact_code(braced_body_after(&data, "fn validate_runtime_evidence("));
+    let exact = "evidence.validity_error_d2h_bytes.checked_add(evidence.canonical_root_d2h_bytes).and_then(|bytes|bytes.checked_add(runtime.fit_digest_d2h_bytes())).and_then(|bytes|bytes.checked_add(runtime.fit_words_d2h_bytes()))";
+    assert_eq!(body.matches(exact).count(), 1);
+    assert!(body.contains("evidence.compact_control_plane_d2h_bytes!=exact_compact_d2h_bytes"));
+    assert!(!body.contains("checked_add(runtime.control_error_d2h_bytes())"));
+    let omitted = body.replace(
+        ".and_then(|bytes|bytes.checked_add(runtime.fit_words_d2h_bytes()))",
+        "",
+    );
+    assert_ne!(omitted, body);
+    assert!(
+        !omitted.contains(exact),
+        "old digest-only total must fail the production guard"
     );
 }

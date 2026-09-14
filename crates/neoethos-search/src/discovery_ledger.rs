@@ -18,14 +18,12 @@
 //!     exact same function so a seeded hash matches what the GA produces for an
 //!     equivalent gene (otherwise dedup silently fails).
 //!   - [`crate::genetic::SeenSignatureMemory`] + its file persistence — the GA
-//!     builds its own `SeenSignatureMemory::current()` and (when an on-disk
-//!     `file_path` is configured via `models.seen_signature_runtime.file_path`)
-//!     loads previously-persisted hashes from that file at construction. We seed
-//!     into a `SeenSignatureMemory` and let that same file-persistence path
-//!     carry the hashes to the engine. When no `file_path` is configured (the
-//!     default, in-memory only), the seed step still runs but the engine's fresh
-//!     in-memory set won't see the seeded hashes — set a file_path for true
-//!     cross-run dedup.
+//!     builds its own `SeenSignatureMemory::current()` and loads a configured
+//!     on-disk seen file when present. Under the default in-memory configuration,
+//!     validated ledger hashes move through a one-shot, thread-local hand-off to
+//!     that exact next GA construction. The hand-off is cleared before every
+//!     discovery and therefore cannot become unbound process-global search
+//!     state.
 //!
 //! Purity: the (de)serialization helpers do NOT read the clock. The caller
 //! computes `timestamp_ms` and passes it in, so the module is fully testable.
@@ -38,7 +36,9 @@ use serde::{Deserialize, Serialize};
 use crate::artifact_io::write_json_atomic;
 use crate::data_selection::CanonicalSearchInputReceiptV2;
 use crate::discovery::{DiscoveryConfig, DiscoveryResult};
+use crate::genetic::evolution_math::stage_seen_signature_hashes_for_next_current_on_this_thread;
 use crate::genetic::{Gene, SeenSignatureMemory, gene_signature_hash};
+use crate::run_identity::PopulationAutoSearchAuthorityV1;
 
 /// The first discovery-ledger schema that is cryptographically bound to the
 /// complete canonical search input and the resolved search configuration.
@@ -81,7 +81,9 @@ pub struct DiscoverySearchLedger {
     pub search_input_receipt: CanonicalSearchInputReceiptV2,
     /// Recomputed SHA-256 identity of `search_input_receipt`.
     pub search_input_receipt_sha256: String,
-    /// Exact resolved configuration identity. This is required rather than an
+    /// Full search-selection identity, including population-auto semantics.
+    /// This is distinct from `resolved_config.config_hash`, which identifies
+    /// the resolved-config component of that authority. Required rather than an
     /// `Option`: unattributable state is not valid state.
     pub config_hash: String,
     pub timestamp_ms: i64,
@@ -100,8 +102,8 @@ pub struct DiscoverySearchLedger {
     /// disagreed on `prefilter_top_k` (240 vs 50) and on the payoff floor
     /// (2.0 vs 0.0), and no artifact said which had been in force — so "the run
     /// found nothing" could not be separated from "the run was configured to
-    /// find nothing". Two ledgers with the same `config_hash` are the same
-    /// experiment.
+    /// find nothing". This component has its own validated hash; it must not
+    /// be compared directly with the ledger's full search `config_hash`.
     ///
     pub resolved_config: Option<crate::run_identity::ResolvedConfigStamp>,
     /// MEASUREMENT SLICE (2026-08-09). Accounting for the per-trial per-period
@@ -266,10 +268,12 @@ pub fn load_prior_ledger(
     tf: &str,
     expected_receipt: &CanonicalSearchInputReceiptV2,
     expected_config_hash: &str,
+    expected_resolved_config_hash: &str,
 ) -> Result<Option<DiscoverySearchLedger>> {
     let expected_receipt_sha256 = receipt_identity(expected_receipt)?;
     validate_receipt_display_identity(expected_receipt, symbol, tf)?;
     validate_config_hash(expected_config_hash)?;
+    validate_config_hash(expected_resolved_config_hash)?;
     let path = ledger_path(cache_dir, expected_receipt, expected_config_hash)?;
     if !path.exists() {
         let orphan_manifest =
@@ -336,15 +340,25 @@ pub fn load_prior_ledger(
         symbol.trim().to_ascii_uppercase(),
         tf.trim().to_ascii_uppercase()
     );
-    if let Some(stamp) = &ledger.resolved_config {
-        anyhow::ensure!(
-            stamp.config_hash == expected_config_hash,
-            "discovery ledger resolved-config stamp mismatch in {}: stored `{}`, expected `{}`",
-            path.display(),
-            stamp.config_hash,
-            expected_config_hash
-        );
-    }
+    let stamp = ledger.resolved_config.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "discovery ledger resolved-config stamp is missing in {}",
+            path.display()
+        )
+    })?;
+    stamp.validate().with_context(|| {
+        format!(
+            "validate discovery ledger resolved-config stamp in {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        stamp.config_hash == expected_resolved_config_hash,
+        "discovery ledger resolved-config stamp mismatch in {}: stored `{}`, expected `{}`",
+        path.display(),
+        stamp.config_hash,
+        expected_resolved_config_hash
+    );
     let sidecar_manifest = crate::trial_returns::load_manifest(
         cache_dir,
         symbol,
@@ -375,11 +389,15 @@ pub fn save_discovery_ledger(
     symbol: &str,
     tf: &str,
     expected_receipt: &CanonicalSearchInputReceiptV2,
-    expected_config_hash: &str,
+    search_authority: &PopulationAutoSearchAuthorityV1,
     result: &DiscoveryResult,
     config: &DiscoveryConfig,
     timestamp_ms: i64,
 ) -> Result<()> {
+    search_authority
+        .validate()
+        .context("validate sealed search authority for ledger persistence")?;
+    let expected_config_hash = search_authority.search_config_hash();
     let expected_receipt_sha256 = receipt_identity(expected_receipt)?;
     validate_receipt_display_identity(expected_receipt, symbol, tf)?;
     validate_config_hash(expected_config_hash)?;
@@ -423,40 +441,15 @@ pub fn save_discovery_ledger(
         archive.push(rec);
     }
 
-    // ── MEASUREMENT SLICE (2026-08-09): stamp the resolved configuration ──
-    //
-    // Read through the SAME accessors the search read: the ATR-scaled stop band
-    // from `current_gene_stop_bounds()`, the trailing geometry from the
-    // installed `ExitPolicyOverrides`, the cost model from
-    // `DiscoveryConfig::evaluation_config`. A stamp that re-derived any of them
-    // would record a configuration nobody ran.
-    //
-    let pip_value_per_lot = config.evaluation_config(None).pip_value_per_lot;
-    let inputs = crate::run_identity::payoff_inputs_for_config(config, pip_value_per_lot);
-    let normalize_features = neoethos_data::current_data_runtime_overrides().normalize_features;
-    let resolved_config = crate::run_identity::assert_payoff_floor_reachable(
-        config.target_profile.min_payoff_ratio,
-        &inputs,
-    )
-    .and_then(|ceiling| {
-        crate::run_identity::stamp_resolved_config(
-            config,
-            &inputs,
-            ceiling,
-            pip_value_per_lot,
-            normalize_features,
-        )
-    })
-    .context("resolve exact discovery config before writing its ledger")?;
-    anyhow::ensure!(
-        resolved_config.config_hash == expected_config_hash,
-        "discovery ledger config identity drift: recomputed `{}`, expected `{}`",
-        resolved_config.config_hash,
-        expected_config_hash
-    );
+    // Persist the exact component sealed before GA alongside the full search
+    // identity above. Re-reading ambient costs, stop bounds or normalization
+    // here can describe a different run; comparing these two hash domains can
+    // never establish identity (the full hash also binds selection semantics).
+    let resolved_config = search_authority.resolved_config_stamp().clone();
     tracing::info!(
         target: "neoethos_search::discovery_ledger",
-        config_hash = %resolved_config.config_hash,
+        search_config_hash = %expected_config_hash,
+        resolved_config_hash = %resolved_config.config_hash,
         receipt_sha256 = %expected_receipt_sha256,
         payoff_floor = resolved_config.payoff_floor,
         payoff_ceiling = resolved_config.payoff_ceiling.enforced_ceiling,
@@ -508,8 +501,8 @@ pub fn save_discovery_ledger(
         portfolio,
         archive,
         search_meta: SearchMetadata {
-            population: config.population,
-            generations: config.generations,
+            population: resolved_config.population,
+            generations: resolved_config.generations,
             prefilter_feature_names: names.clone(),
         },
         resolved_config: Some(resolved_config),
@@ -533,12 +526,12 @@ pub fn seed_seen_from_ledger(
     ledger: &DiscoverySearchLedger,
     seen: &mut SeenSignatureMemory,
 ) -> usize {
-    let mut inserted = 0usize;
+    let mut inserted_hashes = Vec::new();
     for rec in ledger.portfolio.iter().chain(ledger.archive.iter()) {
         match rec.hash.parse::<u64>() {
             Ok(h) => {
                 if seen.insert_hash(h) {
-                    inserted += 1;
+                    inserted_hashes.push(h);
                 }
             }
             Err(err) => {
@@ -551,7 +544,10 @@ pub fn seed_seen_from_ledger(
             }
         }
     }
-    inserted
+    if seen.file_path.is_none() && !inserted_hashes.is_empty() {
+        stage_seen_signature_hashes_for_next_current_on_this_thread(&inserted_hashes);
+    }
+    inserted_hashes.len()
 }
 
 #[cfg(test)]
@@ -559,6 +555,77 @@ mod tests {
     use super::*;
 
     const TEST_CONFIG_HASH: &str = "fnv64:0123456789abcdef";
+
+    fn sample_search_authority() -> PopulationAutoSearchAuthorityV1 {
+        sample_search_authority_with_normalization(true)
+    }
+
+    fn sample_search_authority_with_normalization(
+        normalize: bool,
+    ) -> PopulationAutoSearchAuthorityV1 {
+        use crate::population_auto_sizing_receipt_v1::{
+            CpuPopulationAutoCalibrationV1, PopulationAutoSizingRequestV1,
+            PopulationAutoSizingRouteV1, seal_cpu_population_auto_plan_v1,
+            seal_population_auto_sizing_receipt_v1, seal_population_auto_stage1_window_v1,
+        };
+        let config = DiscoveryConfig {
+            population: 200,
+            population_auto: true,
+            max_indicators: 4,
+            evaluation_symbol: "EURUSD".to_owned(),
+            timeframe_label: "M1".to_owned(),
+            evaluation_spread_pips: 1.89,
+            evaluation_commission_per_trade: 10.0,
+            ..DiscoveryConfig::default()
+        };
+        // Synthetic sizing measurements exercise the production authority
+        // builder without running GA, probing a device or claiming live costs.
+        let cpu_plan = seal_cpu_population_auto_plan_v1(
+            CpuPopulationAutoCalibrationV1 {
+                worker_count: 2,
+                calibration_candidates: 8,
+                calibration_elapsed_ns: 1_000_000_000,
+                available_memory_bytes: 8 * 1024 * 1024 * 1024,
+                total_memory_bytes: 8 * 1024 * 1024 * 1024,
+            },
+            25,
+            12,
+            4,
+        )
+        .unwrap();
+        let receipt = seal_population_auto_sizing_receipt_v1(PopulationAutoSizingRequestV1 {
+            population_auto: true,
+            configured_population: 200,
+            resident_parent_rows: 100,
+            evaluation_rows: 25,
+            feature_count: 4,
+            month_capacity: 12,
+            requested_max_indicators: 4,
+            migration_enabled: false,
+            parent_canonical_scope_identity_sha256: "a".repeat(64),
+            parent_dataset_identity_sha256: "b".repeat(64),
+            stage1_window: seal_population_auto_stage1_window_v1(
+                &"b".repeat(64),
+                "selection_stage1",
+                0,
+                25,
+            )
+            .unwrap(),
+            route: PopulationAutoSizingRouteV1::CpuExplicitResearch {
+                contract_identity_sha256: "c".repeat(64),
+                input_receipt_sha256: "d".repeat(64),
+            },
+            cpu_plan: Some(cpu_plan),
+        })
+        .unwrap();
+        crate::run_identity::build_population_auto_search_authority_v1(
+            &config,
+            &receipt,
+            7.393223371457722,
+            normalize,
+        )
+        .unwrap()
+    }
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -585,20 +652,20 @@ mod tests {
     fn other_valid_receipt(
         receipt: &CanonicalSearchInputReceiptV2,
     ) -> CanonicalSearchInputReceiptV2 {
-        let mut value = serde_json::to_value(receipt).expect("receipt JSON");
-        let current = value["feature_plan_identity"]
-            .as_str()
-            .expect("feature plan identity");
-        let replacement = if current == "0".repeat(64) {
-            "1".repeat(64)
-        } else {
-            "0".repeat(64)
-        };
-        value["feature_plan_identity"] = serde_json::Value::String(replacement);
-        CanonicalSearchInputReceiptV2::from_json_bytes(
-            &serde_json::to_vec(&value).expect("receipt bytes"),
-        )
-        .expect("structurally valid alternate receipt")
+        // Produce a different, internally valid plan rather than forging its
+        // hash: the exact plan bytes are now part of the receipt proof.
+        let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame()
+            .select_columns(&[1, 0])
+            .expect("alternate ordered feature projection");
+        let anchor = features.provenance().bindings()[0].dataset_identity();
+        let alternate = CanonicalSearchInputReceiptV2::from_feature_frame(anchor, &features)
+            .expect("valid alternate receipt from actual projected features");
+        alternate.validate().expect("alternate receipt proof");
+        assert_ne!(
+            alternate.identity_sha256().unwrap(),
+            receipt.identity_sha256().unwrap()
+        );
+        alternate
     }
 
     fn sample_ledger(receipt: CanonicalSearchInputReceiptV2) -> DiscoverySearchLedger {
@@ -631,7 +698,7 @@ mod tests {
                 generations: 50,
                 prefilter_feature_names: vec!["rsi_14".to_string(), "atr_20".to_string()],
             },
-            resolved_config: None,
+            resolved_config: Some(sample_search_authority().resolved_config_stamp().clone()),
             trial_returns: None,
         }
     }
@@ -657,8 +724,17 @@ mod tests {
 
         let receipt = sample_receipt();
         let config_hash = TEST_CONFIG_HASH.to_string();
-        let error = load_prior_ledger(&cache, "EURUSD", "M1", &receipt, &config_hash)
-            .expect_err("legacy state must fail closed");
+        let error = load_prior_ledger(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt,
+            &config_hash,
+            &sample_search_authority()
+                .resolved_config_stamp()
+                .config_hash,
+        )
+        .expect_err("legacy state must fail closed");
         assert!(
             error
                 .to_string()
@@ -683,6 +759,7 @@ mod tests {
             &original.base_tf,
             &receipt,
             &original.config_hash,
+            &original.resolved_config.as_ref().unwrap().config_hash,
         )
         .expect("valid ledger")
         .expect("present ledger");
@@ -705,6 +782,7 @@ mod tests {
                 "M1",
                 &receipt,
                 &original.config_hash,
+                &original.resolved_config.as_ref().unwrap().config_hash,
             )
             .expect("absence is not corruption")
             .is_none()
@@ -742,8 +820,15 @@ mod tests {
         std::fs::create_dir_all(wrong_path.parent().unwrap()).unwrap();
         write_json_atomic(&wrong_path, &ledger).unwrap();
 
-        let error = load_prior_ledger(&cache, "EURUSD", "M1", &receipt_b, &ledger.config_hash)
-            .expect_err("copied ledger must not bind to its directory name");
+        let error = load_prior_ledger(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt_b,
+            &ledger.config_hash,
+            &ledger.resolved_config.as_ref().unwrap().config_hash,
+        )
+        .expect_err("copied ledger must not bind to its directory name");
         assert!(error.to_string().contains("receipt mismatch"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -759,8 +844,15 @@ mod tests {
         std::fs::create_dir_all(wrong_path.parent().unwrap()).unwrap();
         write_json_atomic(&wrong_path, &ledger).unwrap();
 
-        let error = load_prior_ledger(&cache, "EURUSD", "M1", &receipt, OTHER_CONFIG_HASH)
-            .expect_err("copied config state must fail closed");
+        let error = load_prior_ledger(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt,
+            OTHER_CONFIG_HASH,
+            &ledger.resolved_config.as_ref().unwrap().config_hash,
+        )
+        .expect_err("copied config state must fail closed");
         assert!(error.to_string().contains("config mismatch"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -774,8 +866,17 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{not-json").unwrap();
 
-        let error = load_prior_ledger(&cache, "EURUSD", "M1", &receipt, TEST_CONFIG_HASH)
-            .expect_err("corruption must fail closed");
+        let error = load_prior_ledger(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt,
+            TEST_CONFIG_HASH,
+            &sample_search_authority()
+                .resolved_config_stamp()
+                .config_hash,
+        )
+        .expect_err("corruption must fail closed");
         assert!(error.to_string().contains("parse discovery ledger"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -809,8 +910,15 @@ mod tests {
         let ledger = sample_ledger(receipt.clone());
         let path = ledger_path(&cache, &receipt, TEST_CONFIG_HASH).unwrap();
         write_json_atomic(&path, &ledger).unwrap();
-        let error = load_prior_ledger(&cache, "EURUSD", "M1", &receipt, TEST_CONFIG_HASH)
-            .expect_err("ledger and sidecar must be one atomic identity claim");
+        let error = load_prior_ledger(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt,
+            TEST_CONFIG_HASH,
+            &ledger.resolved_config.as_ref().unwrap().config_hash,
+        )
+        .expect_err("ledger and sidecar must be one atomic identity claim");
         assert!(
             error
                 .to_string()
@@ -820,7 +928,163 @@ mod tests {
     }
 
     #[test]
+    fn sealed_search_identity_and_distinct_resolved_stamp_round_trip_without_recomputation() {
+        use crate::data_selection::{CanonicalSearchArtifactScopeV2, CanonicalSearchWindowRoleV1};
+        let dir = temp_dir("neoethos_ledger_sealed_authority");
+        let cache = dir.to_string_lossy();
+        let receipt = sample_receipt();
+        let authority = sample_search_authority();
+        let stamp = authority.resolved_config_stamp();
+        assert_ne!(authority.search_config_hash(), stamp.config_hash);
+        let result = DiscoveryResult {
+            selection_scope: CanonicalSearchArtifactScopeV2::for_entire_receipt(
+                CanonicalSearchWindowRoleV1::DiscoveryInput,
+                receipt.clone(),
+            )
+            .unwrap(),
+            search_input_receipt: receipt.clone(),
+            calibration_scope: None,
+            holdout_scope: None,
+            search_config_hash: authority.search_config_hash().to_owned(),
+            cost_band_census: Default::default(),
+            cost_band_by_strategy: Vec::new(),
+            portfolio: Vec::new(),
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: Vec::new(),
+            effective_smc_gate_threshold: 0.0,
+            validation_gates: crate::discovery::DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
+            prop_firm_validation_artifacts: Vec::new(),
+            funnel_profile: None,
+        };
+        // Only archive retention comes from this post-run config. Invalid
+        // ambient-style economics must not replace the already sealed stamp.
+        let config = DiscoveryConfig {
+            population: 1,
+            generations: 1,
+            evaluation_spread_pips: f64::NAN,
+            evaluation_commission_per_trade: f64::NAN,
+            ..DiscoveryConfig::default()
+        };
+        save_discovery_ledger(
+            &cache, "EURUSD", "M1", &receipt, &authority, &result, &config, 123,
+        )
+        .unwrap();
+        let loaded = load_prior_ledger(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt,
+            authority.search_config_hash(),
+            &stamp.config_hash,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded.config_hash, authority.search_config_hash());
+        assert_eq!(loaded.resolved_config.as_ref(), Some(stamp));
+        assert_eq!(loaded.search_meta.population, stamp.population);
+        assert_eq!(loaded.search_meta.generations, stamp.generations);
+        assert_eq!(loaded.timestamp_ms, 123);
+
+        let path = ledger_path(&cache, &receipt, authority.search_config_hash()).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let mut wrong_result = result;
+        wrong_result.search_config_hash = stamp.config_hash.clone();
+        let error = save_discovery_ledger(
+            &cache,
+            "EURUSD",
+            "M1",
+            &receipt,
+            &authority,
+            &wrong_result,
+            &config,
+            124,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match ledger config"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            written,
+            "refusal must preserve prior ledger bytes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ledger_refuses_missing_tampered_or_substituted_resolved_stamp() {
+        let dir = temp_dir("neoethos_ledger_stamp_binding");
+        let cache = dir.to_string_lossy();
+        let receipt = sample_receipt();
+        let authority = sample_search_authority();
+        let expected_stamp = authority.resolved_config_stamp();
+        let mut original = sample_ledger(receipt.clone());
+        original.config_hash = authority.search_config_hash().to_owned();
+        let path = ledger_path(&cache, &receipt, &original.config_hash).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let mut missing = original.clone();
+        missing.resolved_config = None;
+        let mut tampered = original.clone();
+        tampered.resolved_config.as_mut().unwrap().spread_pips += 1.0;
+        let mut substituted = original.clone();
+        let other = sample_search_authority_with_normalization(false);
+        other.validate().unwrap();
+        assert_ne!(other.resolved_config_stamp(), expected_stamp);
+        substituted.resolved_config = Some(other.resolved_config_stamp().clone());
+        for (ledger, expected_error) in [
+            (missing, "stamp is missing"),
+            (tampered, "self-hash mismatch"),
+            (substituted, "resolved-config stamp mismatch"),
+        ] {
+            write_json_atomic(&path, &ledger).unwrap();
+            let error = load_prior_ledger(
+                &cache,
+                "EURUSD",
+                "M1",
+                &receipt,
+                authority.search_config_hash(),
+                &expected_stamp.config_hash,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected_error), "{error:#}");
+        }
+        write_json_atomic(&path, &original).unwrap();
+        assert!(
+            load_prior_ledger(
+                &cache,
+                "EURUSD",
+                "M1",
+                &receipt,
+                authority.search_config_hash(),
+                authority.search_config_hash()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("resolved-config stamp mismatch")
+        );
+        assert!(
+            load_prior_ledger(
+                &cache,
+                "EURUSD",
+                "M1",
+                &receipt,
+                authority.search_config_hash(),
+                ""
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid discovery config hash")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn seed_inserts_known_hash_so_ga_would_skip_it() {
+        crate::genetic::evolution_math::clear_staged_seen_signature_hashes_on_this_thread();
         let ledger = sample_ledger(sample_receipt());
         // Build the seen-memory the way the engine does (`current()` →
         // overrides default to max_entries = 3_000_000). A bare
@@ -844,5 +1108,18 @@ mod tests {
 
         // Re-seeding the same ledger inserts nothing new (idempotent dedup).
         assert_eq!(seed_seen_from_ledger(&ledger, &mut seen), 0);
+
+        // With the shipped `file_path: null` configuration, the real engine
+        // constructs a fresh memory immediately after this helper returns.
+        // The validated exact-ledger hashes must reach that construction once,
+        // rather than dying with the temporary `seen` value above.
+        let engine_seen = SeenSignatureMemory::current();
+        assert!(engine_seen.all.contains(&portfolio_hash));
+        assert!(engine_seen.all.contains(&archive_hash));
+
+        let later_unrelated_engine = SeenSignatureMemory::current();
+        assert!(!later_unrelated_engine.all.contains(&portfolio_hash));
+        assert!(!later_unrelated_engine.all.contains(&archive_hash));
+        crate::genetic::evolution_math::clear_staged_seen_signature_hashes_on_this_thread();
     }
 }

@@ -23,10 +23,8 @@
 //!   `neoethos-app::app_services::embedded_credentials` which is
 //!   binary-specific (the `build.rs` stamps constants per build).
 //!   Kept in `neoethos-app`.
-//! - `readiness()` and `AdapterReadinessSnapshot` — depend on
-//!   `TradingAdapterKind` which lives in `neoethos-app`. Kept there.
-//! - `BrokerSessionState` — runtime concept, not on-disk. Kept in
-//!   `neoethos-app`.
+//! - Runtime connection/readiness state. Consumers derive that from current
+//!   credentials and broker probes; it is not part of this on-disk schema.
 //!
 //! ## Security
 //!
@@ -65,13 +63,8 @@ pub const CTRADER_OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:43001/callback";
 
 const APP_CONFIG_SUBDIR: &str = "neoethos";
 const CREDENTIALS_FILENAME: &str = "broker_credentials.toml";
-// 2026-08-10: the production read of this variable is GONE from this file — it
-// now goes through `env_overrides::broker_credentials_path_override()`, the one
-// registry that owns the name. The only remaining reference is the test harness
-// below, which must still set the variable to exercise the override, so the
-// constant lives in `mod tests` and is aliased from the registry rather than
-// re-spelled as a literal. Two literals for one variable is how a rename
-// silently stops an operator's override applying.
+// The registry still owns the environment-variable name. Credentials use a
+// strict locator: a present but invalid override is NOT the default profile.
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BrokerAccountTarget {
@@ -156,27 +149,23 @@ impl HasSchemaVersion for BrokerSettingsState {
 /// Resolves the path to the broker credentials TOML file.
 ///
 /// Order of resolution:
-/// 1. `$NEOETHOS_BROKER_CREDENTIALS_PATH` if non-empty (env override
+/// 1. `$NEOETHOS_BROKER_CREDENTIALS_PATH` when present (env override
 ///    is AUTHORITATIVE — bypasses the existing-file lookup so tests
 ///    target an isolated temp path without accidentally falling
 ///    through to the operator's real `~/AppData/Roaming/neoethos/
-///    broker_credentials.toml`).
+///    broker_credentials.toml`). Empty or invalid explicit values return an
+///    error before default-path enumeration.
 /// 2. `<dirs::config_dir>/neoethos/broker_credentials.toml`.
 /// 3. `<cwd>/.local/neoethos/broker_credentials.toml`.
 ///
 /// Returns the first candidate that EXISTS. If none exists, returns
 /// the highest-priority candidate so callers can create it there.
 pub fn credentials_file_path() -> Result<PathBuf> {
-    // Routed through the registry getter (2026-08-10) so this file no longer
-    // reads the environment itself. BEHAVIOUR: the getter TRIMS the value; the
-    // inline read did not, so a path pasted with a trailing newline used to
-    // become a path that cannot exist, and the credentials file was silently
-    // created somewhere else.
-    if let Some(custom) = crate::env_overrides::broker_credentials_path_override() {
-        return Ok(PathBuf::from(custom));
+    if let Some(custom) = credentials_profile_path()? {
+        return Ok(custom);
     }
 
-    let candidates = candidate_paths()?;
+    let candidates = candidate_credentials_paths()?;
 
     for candidate in &candidates {
         if candidate.is_file() {
@@ -188,6 +177,39 @@ pub fn credentials_file_path() -> Result<PathBuf> {
         .into_iter()
         .next()
         .context("no candidate path could be resolved for broker credentials")
+}
+
+/// Strict explicit profile shared by filesystem credentials and OAuth tokens.
+/// Absent selects the normal profile; invalid never falls through to it.
+pub fn credentials_profile_path() -> Result<Option<PathBuf>> {
+    let raw = env::var_os(crate::env_overrides::ENV_BROKER_CREDENTIALS_PATH);
+    resolve_credentials_profile(raw.as_deref())
+}
+
+fn resolve_credentials_profile(raw: Option<&std::ffi::OsStr>) -> Result<Option<PathBuf>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let path = raw
+        .to_str()
+        .context("broker credentials profile path is not Unicode")?
+        .trim();
+    anyhow::ensure!(
+        !path.is_empty() && !path.contains('\0'),
+        "broker credentials profile path is empty or contains NUL"
+    );
+    // Never canonicalize: missing files are valid bootstrap destinations and
+    // creating one must not change its OAuth namespace. Alternate spellings may
+    // select separate profiles, but can never select the default token entry.
+    let path =
+        std::path::absolute(path).context("cannot resolve broker credentials profile path")?;
+    anyhow::ensure!(
+        path.file_name().is_some(),
+        "broker credentials profile must select a file"
+    );
+    anyhow::ensure!(
+        path.to_str().is_some(),
+        "resolved broker credentials profile path is not Unicode"
+    );
+    Ok(Some(path))
 }
 
 /// Every candidate path that `credentials_file_path` would try, in
@@ -220,13 +242,6 @@ pub fn candidate_credentials_paths() -> Result<Vec<PathBuf>> {
         anyhow::bail!("unable to determine broker credentials file path on this platform");
     }
     Ok(paths)
-}
-
-/// Backwards-compat wrapper kept so other callers in the workspace
-/// that already use `candidate_paths()` keep working without a
-/// rename sweep. New code should call `candidate_credentials_paths`.
-fn candidate_paths() -> Result<Vec<PathBuf>> {
-    candidate_credentials_paths()
 }
 
 /// Read the TOML at `path` and parse it. Returns the parsed state on
@@ -341,7 +356,6 @@ mod tests {
                 }],
                 ..Default::default()
             },
-            ..Default::default()
         };
         save_to_disk(&path, &original).expect("save");
         let loaded = load_from_disk(&path).expect("load").expect("some");
@@ -377,6 +391,25 @@ mod tests {
             let resolved = credentials_file_path().expect("resolve");
             assert_eq!(resolved, p);
         });
+    }
+
+    #[test]
+    fn invalid_explicit_credentials_profile_never_falls_through_to_defaults() {
+        for raw in ["", " \n ", "bad\0profile"] {
+            assert!(resolve_credentials_profile(Some(std::ffi::OsStr::new(raw))).is_err());
+        }
+        with_env_path(Path::new("  \n "), |_| {
+            assert!(credentials_file_path().is_err());
+        });
+        assert!(resolve_credentials_profile(None).unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_unicode_credentials_profile_is_not_the_default_profile() {
+        use std::os::windows::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_wide(&[0xd800]);
+        assert!(resolve_credentials_profile(Some(&raw)).is_err());
     }
 
     #[test]

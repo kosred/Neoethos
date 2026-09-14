@@ -24,6 +24,9 @@ use std::path::{Path, PathBuf};
 
 const LIGHT_SYMBOLS_CLIENT_MESSAGE_ID_V1: &str = "symbol-contract-light-symbols";
 const FULL_SYMBOL_CLIENT_MESSAGE_ID_V1: &str = "symbol-contract-full-symbol";
+// A symbols-list response contains the broker's entire catalog, not one
+// instrument's cost contract (the latter has the separate 64 KiB bound).
+const MAX_CACHED_SYMBOL_CATALOG_BYTES_V1: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ExactBrokerSymbolEnvironmentArgV1 {
@@ -127,35 +130,15 @@ impl ExactBrokerSymbolContractCaptureCliV1 {
     }
 
     pub fn prepare(self) -> Result<PreparedExactBrokerSymbolContractCaptureV1> {
-        ensure!(
-            self.output_root.is_absolute(),
-            "symbol-contract output-root must be an explicit absolute path"
-        );
-        fs::create_dir_all(&self.output_root).with_context(|| {
-            format!(
-                "create exact broker symbol output root {}",
-                self.output_root.display()
-            )
-        })?;
-        let metadata = fs::symlink_metadata(&self.output_root).with_context(|| {
-            format!(
-                "inspect exact broker symbol output root {}",
-                self.output_root.display()
-            )
-        })?;
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "symbol-contract output-root must be one real directory"
-        );
-        Ok(PreparedExactBrokerSymbolContractCaptureV1 {
-            binding: ExactBrokerSymbolContractBindingV1::new(
+        PreparedExactBrokerSymbolContractCaptureV1::new(
+            ExactBrokerSymbolContractBindingV1::new(
                 self.environment.broker(),
                 self.account_id,
                 self.symbol_id,
                 self.symbol_name,
             )?,
-            output_root: self.output_root,
-        })
+            self.output_root,
+        )
     }
 }
 
@@ -165,6 +148,34 @@ pub struct PreparedExactBrokerSymbolContractCaptureV1 {
 }
 
 impl PreparedExactBrokerSymbolContractCaptureV1 {
+    /// Typed entry shared by the desktop and CLI. Preparation performs no
+    /// broker request; capture remains an explicit later operation.
+    pub fn new(binding: ExactBrokerSymbolContractBindingV1, output_root: PathBuf) -> Result<Self> {
+        ensure!(
+            output_root.is_absolute(),
+            "symbol-contract output-root must be an explicit absolute path"
+        );
+        fs::create_dir_all(&output_root).with_context(|| {
+            format!(
+                "create exact broker symbol output root {}",
+                output_root.display()
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&output_root).with_context(|| {
+            format!(
+                "inspect exact broker symbol output root {}",
+                output_root.display()
+            )
+        })?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "symbol-contract output-root must be one real directory"
+        );
+        Ok(Self {
+            binding,
+            output_root,
+        })
+    }
     pub const fn binding(&self) -> &ExactBrokerSymbolContractBindingV1 {
         &self.binding
     }
@@ -477,6 +488,70 @@ pub fn capture_exact_production_broker_symbol_contract_v1(
     )
 }
 
+/// Reopen a unique, previously captured pair of exact broker responses for
+/// offline *research*. This does not refresh metadata or authorize live orders.
+/// The caller owns the source/account-specific directory; every payload and
+/// content-addressed filename is verified again. Ambiguity is never resolved
+/// by silently choosing a filesystem entry.
+pub fn reopen_cached_research_symbol_contract_v1(
+    prepared: &PreparedExactBrokerSymbolContractCaptureV1,
+) -> Result<Option<ExactBrokerSymbolContractReceiptV1>> {
+    let mut light = Vec::new();
+    let mut full = Vec::new();
+    for entry in fs::read_dir(prepared.output_root())? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let (prefix, destination) = if name.starts_with("bsl1-") {
+            ("bsl1-", &mut light)
+        } else if name.starts_with("bsc1-") {
+            ("bsc1-", &mut full)
+        } else {
+            continue;
+        };
+        let hash = name
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(".json"))
+            .context("cached broker response has a malformed content-addressed name")?;
+        let bytes = if prefix == "bsl1-" {
+            crate::canonical_research_costs::read_regular_file_with_limit(
+                &entry.path(),
+                MAX_CACHED_SYMBOL_CATALOG_BYTES_V1,
+            )
+        } else {
+            crate::canonical_research_costs::read_bounded_regular_file(&entry.path())
+        }
+        .with_context(|| format!("reopen cached broker metadata {}", entry.path().display()))?;
+        ensure!(
+            sha256_hex(&bytes) == hash,
+            "cached broker response bytes differ from their filename digest"
+        );
+        destination.push((hash.to_owned(), entry.path(), bytes));
+    }
+    if light.is_empty() && full.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        light.len() == 1 && full.len() == 1,
+        "offline research needs exactly one captured light/full-symbol pair; found {}/{}; explicitly refresh the source selection",
+        light.len(),
+        full.len()
+    );
+    let (light_symbols_sha256, light_symbols_path, light_bytes) = light.remove(0);
+    let (full_symbol_sha256, full_symbol_path, full_bytes) = full.remove(0);
+    validate_light_symbols_response(prepared.binding(), &light_bytes)?;
+    validate_full_symbol_response(prepared.binding(), &full_bytes)?;
+    Ok(Some(ExactBrokerSymbolContractReceiptV1 {
+        binding: prepared.binding().clone(),
+        light_symbols_sha256,
+        full_symbol_sha256,
+        light_symbols_path,
+        full_symbol_path,
+    }))
+}
+
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExactBrokerSymbolContractReceiptWireV1<'a> {
@@ -541,5 +616,60 @@ mod broker_error_tests {
         assert!(rendered.contains("CANT_ROUTE_REQUEST"));
         assert!(!rendered.contains("clientSecret"));
         assert!(!rendered.contains("accessToken"));
+    }
+
+    #[test]
+    fn research_cache_reopens_exact_bytes_and_refuses_corruption_or_another_account() {
+        let root = tempfile::tempdir().unwrap();
+        let binding =
+            ExactBrokerSymbolContractBindingV1::new(BrokerEnvironment::Demo, 42, 1, "EURUSD")
+                .unwrap();
+        let prepared = PreparedExactBrokerSymbolContractCaptureV1::new(
+            binding.clone(),
+            root.path().to_path_buf(),
+        )
+        .unwrap();
+        assert!(
+            reopen_cached_research_symbol_contract_v1(&prepared)
+                .unwrap()
+                .is_none()
+        );
+        let mut catalog = vec![serde_json::json!({"symbolId": 1, "symbolName": "EURUSD"})];
+        catalog.extend((2..=2500).map(|id| {
+            serde_json::json!({
+                "symbolId": id, "symbolName": format!("SYMBOL_{id}"),
+                "baseAssetId": 1, "quoteAssetId": 2, "symbolCategoryId": 10,
+            })
+        }));
+        let light = serde_json::to_vec(&serde_json::json!({"payloadType": 2115, "clientMsgId": LIGHT_SYMBOLS_CLIENT_MESSAGE_ID_V1,
+            "payload": {"ctidTraderAccountId": 42, "symbol": catalog}})).unwrap();
+        assert!(
+            light.len() > 64 * 1024,
+            "real broker catalogs exceed a single contract's bound"
+        );
+        let full = serde_json::to_vec(&serde_json::json!({"payloadType": 2117, "clientMsgId": FULL_SYMBOL_CLIENT_MESSAGE_ID_V1,
+            "payload": {"ctidTraderAccountId": 42, "symbol": [{"symbolId": 1}]}})).unwrap();
+        let original = publish_validated_broker_symbol_contract_response_v1(
+            root.path(),
+            &binding,
+            &light,
+            &full,
+        )
+        .unwrap();
+        assert_eq!(
+            reopen_cached_research_symbol_contract_v1(&prepared)
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        let wrong = PreparedExactBrokerSymbolContractCaptureV1::new(
+            ExactBrokerSymbolContractBindingV1::new(BrokerEnvironment::Demo, 43, 1, "EURUSD")
+                .unwrap(),
+            root.path().to_path_buf(),
+        )
+        .unwrap();
+        assert!(reopen_cached_research_symbol_contract_v1(&wrong).is_err());
+        fs::write(original.full_symbol_path(), b"{}").unwrap();
+        assert!(reopen_cached_research_symbol_contract_v1(&prepared).is_err());
     }
 }

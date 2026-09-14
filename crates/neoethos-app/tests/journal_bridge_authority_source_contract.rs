@@ -62,7 +62,7 @@ fn bounded_recent_deals_are_not_minted_into_v3_authority() {
 }
 
 #[test]
-fn legacy_reconcile_and_consumers_are_still_behind_the_global_fail_closed_gate() {
+fn journal_consumers_keep_their_distinct_runtime_authority_boundaries() {
     let reconcile = read("src/app_services/journal_reconcile.rs");
     let reconcile_body = item_body(&reconcile, "pub fn reconcile_best_effort(");
     let reconcile_gate = reconcile_body
@@ -74,14 +74,31 @@ fn legacy_reconcile_and_consumers_are_still_behind_the_global_fail_closed_gate()
     assert!(reconcile_gate < local_state);
 
     let live_gate = read("src/app_services/live_gate.rs");
-    let promotion_body = item_body(&live_gate, "pub fn evaluate_for_portfolio(");
-    let capability = promotion_body
-        .find("current_broker_financial_truth_capability_v1")
-        .expect("promotion must require the sealed broker capability");
-    let legacy_query = promotion_body
-        .find("query_closed_trades")
-        .expect("current display-journal query remains explicit legacy code");
-    assert!(capability < legacy_query);
+    let wrapper = item_body(&live_gate, "pub fn evaluate_for_portfolio(");
+    assert!(wrapper.contains("evaluate_for_portfolio_with_settings(portfolio_path, &settings)"));
+    let promotion_body = item_body(&live_gate, "pub fn evaluate_for_portfolio_with_settings(");
+    let disabled = promotion_body.find("if !gate_config.enabled").unwrap();
+    let load = promotion_body
+        .find("load_live_portfolio_json(portfolio_path)")
+        .unwrap();
+    let benchmark = promotion_body
+        .find("refuse_unavailable_final_benchmark(&artifact)")
+        .expect("enabled check must require source-scoped final benchmark evidence");
+    assert!(disabled < load && load < benchmark);
+    let production = live_gate.split("#[cfg(test)]").next().unwrap();
+    for forbidden in [
+        ".oos_metrics()",
+        "fetch_broker_symbols_blocking",
+        "query_closed_trades",
+        "query_equity",
+        "scope_to_demo_environment",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "unavailable final benchmark must not retain a legacy substitute: {forbidden}"
+        );
+    }
+    assert!(!promotion_body.contains("ClosedPositionJournalReceiptV3"));
 
     let live_trading = read("src/app_services/live_trading.rs");
     let capability = live_trading

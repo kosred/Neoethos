@@ -38,10 +38,12 @@ try {
 
     $env:CARGO_BUILD_JOBS = $workerLimit
     if ($acceleratorMode -eq 'cpu_only' -and $cudaArchitectures -eq 'none') {
+        Remove-Item Env:NEOETHOS_CUDA_BUILD_MODE -ErrorAction SilentlyContinue
         Remove-Item Env:NEOETHOS_CUDA_ARCHS -ErrorAction SilentlyContinue
     }
     elseif ($acceleratorMode -eq 'nvidia' -and
         $cudaArchitectures -match '^[1-9][0-9]*(;[1-9][0-9]*)*$') {
+        $env:NEOETHOS_CUDA_BUILD_MODE = 'cross_release_explicit'
         $env:NEOETHOS_CUDA_ARCHS = $cudaArchitectures
     }
     else {

@@ -188,20 +188,6 @@ impl ProductionCTraderLiveAuthBackend {
         Err(anyhow!("failed to bind any cTrader callback port"))
     }
 
-    /// Back-compat: keep the pre-F2 entrypoint working for unit tests
-    /// that don't exercise the state-validation path (see
-    /// `callback_capture_times_out_when_browser_never_redirects`).
-    /// Production `run()` always uses `..._with_state` below.
-    #[allow(dead_code)] // test-only entry point — see doc comment
-    fn capture_authorization_code_with_timeout(
-        &self,
-        listener: TcpListener,
-        expected_path: &str,
-        timeout: Duration,
-    ) -> Result<String> {
-        self.capture_authorization_code_with_state(listener, expected_path, None, timeout)
-    }
-
     fn capture_authorization_code_with_state(
         &self,
         listener: TcpListener,
@@ -923,7 +909,7 @@ pub fn parse_account_list_by_access_token_json(
     let envelope: CTraderAccountListResponseEnvelope = serde_json::from_str(response_json)
         .with_context(|| {
             // v0.4.13 — include the head of the offending body and the
-            // total length so the wizard's "OAuth error: …" surface has
+            // total length so the Broker Setup error surface has
             // enough signal to triage a future schema drift without
             // extra logs. Same diagnostic shape as `parse_open_api_envelope`.
             let total = response_json.len();
@@ -967,7 +953,7 @@ pub fn parse_account_list_by_access_token_json(
         .collect();
 
     // v0.4.13 — both fields are now `Option`. The `access_token` flows
-    // back to the wizard so it can be re-applied if missing on subsequent
+    // back to the caller so it can be re-applied if missing on subsequent
     // legs; empty-string fallback matches the pre-change contract for
     // downstream consumers that read it via direct field access.
     // `permission_scope` is reduced to its display form: a number arrives
@@ -984,7 +970,7 @@ pub fn parse_account_list_by_access_token_json(
     // v0.4.16 — log how many accounts the broker returned, so the
     // 6-of-7 missing-account observation from the 2026-05-19
     // walkthrough is debuggable from the operator's log without
-    // re-running the wizard with a debugger attached. We log the IDs
+    // repeating account discovery with a debugger attached. We log the IDs
     // only (no tokens, no permissionScope) so the line is safe to
     // ship at INFO level.
     let account_ids: Vec<String> = accounts

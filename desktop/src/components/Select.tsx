@@ -1,56 +1,5 @@
-import { useEffect, useState, type CSSProperties } from "react";
-import { dataBootstrap, brokerTimeframes } from "../api";
-import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
-
-// Module-level caches so every dropdown on every screen shares one fetch.
-let symbolsCache: string[] | null = null;
-let tfsCache: string[] | null = null;
-
-/** Force a re-fetch of the symbol list (call after a data download adds pairs). */
-export function invalidateSymbolCache() {
-  symbolsCache = null;
-}
-
-/** Shared option sources (one fetch, cached) for building custom pickers
- *  like the multi-select queue builder on the Discovery screen. */
-export function useSymbolOptions(): string[] {
-  const [opts, setOpts] = useState<string[]>(symbolsCache ?? []);
-  useEffect(() => {
-    if (symbolsCache) {
-      setOpts(symbolsCache);
-      return;
-    }
-    dataBootstrap()
-      .then((d) => {
-        symbolsCache = (d.symbols ?? []).slice().sort();
-        setOpts(symbolsCache);
-      })
-      .catch(() => {});
-  }, []);
-  return opts;
-}
-
-export function useTimeframeOptions(): string[] {
-  const [opts, setOpts] = useState<string[]>(
-    tfsCache ?? [...CANONICAL_BROKER_TIMEFRAMES],
-  );
-  useEffect(() => {
-    if (tfsCache) {
-      setOpts(tfsCache);
-      return;
-    }
-    brokerTimeframes()
-      .then((d) => {
-        const options = d.timeframes?.length
-          ? d.timeframes
-          : [...CANONICAL_BROKER_TIMEFRAMES];
-        tfsCache = options;
-        setOpts(options);
-      })
-      .catch(() => setOpts([...CANONICAL_BROKER_TIMEFRAMES]));
-  }, []);
-  return opts;
-}
+import type { CSSProperties } from "react";
+import { useSymbolOptions, useTimeframeOptions } from "./selectOptions";
 
 type Common = {
   value: string;
@@ -64,19 +13,7 @@ type Common = {
 
 /** Scrollable dropdown of the symbols that actually have local data. */
 export function SymbolSelect({ value, onChange, style, allowConfig, className, title }: Common) {
-  const [opts, setOpts] = useState<string[]>(symbolsCache ?? []);
-  useEffect(() => {
-    if (symbolsCache) {
-      setOpts(symbolsCache);
-      return;
-    }
-    dataBootstrap()
-      .then((d) => {
-        symbolsCache = (d.symbols ?? []).slice().sort();
-        setOpts(symbolsCache);
-      })
-      .catch(() => {});
-  }, []);
+  const opts = useSymbolOptions();
   return (
     <select className={className} title={title} value={value} onChange={(e) => onChange(e.target.value)} style={style}>
       {allowConfig && <option value="">(from config)</option>}
@@ -91,24 +28,7 @@ export function SymbolSelect({ value, onChange, style, allowConfig, className, t
 
 /** Scrollable dropdown of the broker's canonical timeframes. */
 export function TimeframeSelect({ value, onChange, style, allowConfig, className, title }: Common) {
-  const [opts, setOpts] = useState<string[]>(
-    tfsCache ?? [...CANONICAL_BROKER_TIMEFRAMES],
-  );
-  useEffect(() => {
-    if (tfsCache) {
-      setOpts(tfsCache);
-      return;
-    }
-    brokerTimeframes()
-      .then((d) => {
-        const options = d.timeframes?.length
-          ? d.timeframes
-          : [...CANONICAL_BROKER_TIMEFRAMES];
-        tfsCache = options;
-        setOpts(options);
-      })
-      .catch(() => setOpts([...CANONICAL_BROKER_TIMEFRAMES]));
-  }, []);
+  const opts = useTimeframeOptions();
   return (
     <select className={className} title={title} value={value} onChange={(e) => onChange(e.target.value)} style={style}>
       {allowConfig && <option value="">(from config)</option>}

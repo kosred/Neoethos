@@ -235,14 +235,25 @@ pub fn runtime_backend_kind_from_label(label: Option<&str>) -> Option<BackendKin
     if normalized.contains("cuda_kernel") || normalized.contains("cuda_fitness") {
         return Some(BackendKind::CudaKernel);
     }
+    if matches!(normalized.as_str(), "rocm" | "burn_rocm" | "external:rocm") {
+        return Some(BackendKind::NativeRocm);
+    }
+    // Only the exact native neural labels above establish a ROCm backend.
+    // A CUDA tree label with a HIP suffix is not a new tree implementation.
+    if normalized.contains("rocm") || normalized.contains("hip") {
+        return Some(BackendKind::Unavailable);
+    }
     if normalized.contains("tree") && (normalized.contains("gpu") || normalized.contains("cuda")) {
         return Some(BackendKind::NativeTreeGpu);
     }
     if normalized.contains("tree") && normalized.contains("cpu") {
         return Some(BackendKind::NativeTreeCpu);
     }
-    if normalized.contains("wgpu") {
-        return Some(BackendKind::BurnWgpu);
+    if ["wgpu", "vulkan", "metal", "dx12"]
+        .iter()
+        .any(|retired| normalized.contains(retired))
+    {
+        return Some(BackendKind::Unavailable);
     }
     if normalized.contains("burn") && normalized.contains("cpu") {
         return Some(BackendKind::BurnCpu);
@@ -697,11 +708,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_runtime_device_policy_accepts_vendor_aliases() {
+    fn normalize_runtime_device_policy_accepts_only_cuda_aliases() {
         assert_eq!(normalize_runtime_device_policy(" CUDA:1 "), "gpu:1");
-        assert_eq!(normalize_runtime_device_policy("rocm:2"), "gpu:2");
-        assert_eq!(normalize_runtime_device_policy("metal"), "gpu");
-        assert_eq!(normalize_runtime_device_policy("vulkan:0"), "gpu:0");
+        assert_eq!(normalize_runtime_device_policy("nvidia"), "gpu");
+        assert_eq!(normalize_runtime_device_policy("rocm:2"), "rocm:2");
+        assert_eq!(normalize_runtime_device_policy("vulkan:0"), "vulkan:0");
     }
 
     #[test]
@@ -767,6 +778,18 @@ mod tests {
 
     #[test]
     fn runtime_backend_kind_from_label_maps_known_backend_families() {
+        for label in ["rocm", "burn_rocm", "external:rocm"] {
+            assert_eq!(
+                runtime_backend_kind_from_label(Some(label)),
+                Some(BackendKind::NativeRocm)
+            );
+        }
+        for label in ["tree_gpu_rocm", "tree_hip", "cuda_hip", "hip"] {
+            assert_eq!(
+                runtime_backend_kind_from_label(Some(label)),
+                Some(BackendKind::Unavailable)
+            );
+        }
         assert_eq!(
             runtime_backend_kind_from_label(Some("symbios_neat_cpu")),
             Some(BackendKind::NativeCpu)
@@ -781,6 +804,10 @@ mod tests {
         );
         assert_eq!(
             runtime_backend_kind_from_label(Some("neat_unknown")),
+            Some(BackendKind::Unavailable)
+        );
+        assert_eq!(
+            runtime_backend_kind_from_label(Some("burn_wgpu")),
             Some(BackendKind::Unavailable)
         );
     }

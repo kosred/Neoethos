@@ -101,10 +101,27 @@ fn contract_builder_uses_the_resident_v3_classic_subset_as_a_cpu_reference() {
         !contract_builder.contains("CanonicalSearchInput::from_exact_series_receipt("),
         "canonical-contract-build still calls the ordinary full Classic builder"
     );
-    assert!(
-        contract_builder.contains("#[cfg(not(feature = \"gpu-nvidia\"))]"),
-        "non-GPU canonical-contract-build does not fail closed explicitly"
+    let non_gpu_gate = "#[cfg(not(feature = \"gpu-nvidia\"))]\n\
+pub fn build_contract(args: &[String], _settings: &neoethos_core::Settings) -> Result<()>";
+    let non_gpu_start = cli
+        .find(non_gpu_gate)
+        .expect("non-GPU canonical-contract-build must have its own explicit cfg gate");
+    let non_gpu_contract_builder = function_body(
+        &cli[non_gpu_start..],
+        "pub fn build_contract(args: &[String], _settings: &neoethos_core::Settings) -> Result<()>",
     );
+    for required in [
+        "validate_contract_build_args(args)?",
+        "anyhow::bail!(",
+        "requires the gpu-nvidia feature",
+        "ordinary full Classic CPU graph is",
+        "not a substitute",
+    ] {
+        assert!(
+            non_gpu_contract_builder.contains(required),
+            "non-GPU canonical-contract-build does not fail closed with `{required}`"
+        );
+    }
     for preserved in [
         "feature_options.normalization_training_rows = Some(normalization_training_rows)",
         "canonical_discovery_normalization_training_rows(base_row_count)?",

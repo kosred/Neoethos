@@ -355,11 +355,10 @@ fn build_production_manifest_v1()
             // not be reused.
             CLASSIC_VECTOR_TA_SEMANTIC_VERSION_V9,
             vec![
-                SemanticSourceEntryV1::from_bytes(
-                    "semantic-authority/classic-vector-ta-v9",
-                    SemanticSourceKindV1::Utf8Text,
-                    CLASSIC_VECTOR_TA_SEMANTIC_AUTHORITY_V9.as_bytes(),
-                )?,
+                embedded_source!(
+                    "crates/neoethos-data/src/core/feature_registry.rs",
+                    "/src/core/feature_registry.rs"
+                ),
                 embedded_source!(
                     "crates/neoethos-data/src/core/all_indicators.rs",
                     "/src/core/all_indicators.rs"

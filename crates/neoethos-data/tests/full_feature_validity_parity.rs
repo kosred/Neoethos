@@ -353,7 +353,7 @@ fn regime_neutral_prefills_are_warmup_not_observations() {
     let columns = compute_regime_feature_columns_f64(&fixture(40, true)).expect("regime columns");
     let choppiness = columns
         .iter()
-        .find(|column| column.name == "regime_choppiness")
+        .find(|column| column.name == "regime_dreiss_choppiness_index_14_v3")
         .expect("choppiness");
     assert!(
         choppiness.validity[..14]
@@ -372,13 +372,16 @@ fn flat_regime_denominators_are_invalid_but_entropy_zero_is_valid() {
     bars.close.fill(1.0);
     let columns = compute_regime_feature_columns_f64(&bars).expect("regime columns");
     for (name, row) in [
-        ("regime_vol_state", 50),
-        ("regime_trend_strength", 14),
-        ("regime_squeeze", 20),
-        ("regime_mr_vs_momentum", 21),
-        ("regime_rei", 8),
-        ("regime_choppiness", 14),
-        ("regime_cusum_up", 50),
+        ("neoethos_custom_gk_vol_ratio_state_10_50_v3", 50),
+        ("regime_wilder_adx_14_v3", 27),
+        (
+            "neoethos_custom_bollinger_keltner_squeeze_state_20_2_1p5_v3",
+            20,
+        ),
+        ("neoethos_custom_directional_persistence_balance_20_v3", 21),
+        ("neoethos_custom_candle_body_range_balance_8_v3", 8),
+        ("regime_dreiss_choppiness_index_14_v3", 14),
+        ("neoethos_custom_standardized_cusum_up_50_0p5_3_v3", 50),
     ] {
         let column = columns
             .iter()
@@ -394,7 +397,7 @@ fn flat_regime_denominators_are_invalid_but_entropy_zero_is_valid() {
 
     let entropy = columns
         .iter()
-        .find(|column| column.name == "regime_entropy")
+        .find(|column| column.name == "neoethos_custom_equal_width_log_return_entropy_30_10_v3")
         .expect("entropy");
     assert_eq!(entropy.validity[30], FeatureCellValidity::Valid);
     assert_eq!(

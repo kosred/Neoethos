@@ -103,7 +103,7 @@ fn cli_never_manufactures_a_timeframe() {
 #[test]
 fn discover_dry_run_still_requires_direct_canonical_generations() {
     let discover = CLI_MAIN
-        .split_once("fn cmd_discover(args: &[String])")
+        .split_once("fn cmd_discover_on_budgeted_pool(args: &[String])")
         .expect("discover command")
         .1
         .split_once("fn cmd_batch_discover(args: &[String])")
@@ -235,10 +235,10 @@ fn cli_default_symbol_inventory_is_manifest_backed_and_exactly_reported() {
 }
 
 #[test]
-fn dashboard_inventory_uses_manifests_and_surfaces_exact_entries_and_skips() {
+fn dashboard_inventory_uses_manifests_and_preserves_exact_metadata_without_hiding_activity() {
     assert!(
         TUI_DASHBOARD.contains("DatasetDiscovery::scan_metadata"),
-        "dashboard inventory must use bounded canonical manifest discovery"
+        "Dashboard must use bounded canonical metadata discovery"
     );
     for field in [
         "dataset_identity",
@@ -249,18 +249,40 @@ fn dashboard_inventory_uses_manifests_and_surfaces_exact_entries_and_skips() {
     ] {
         assert!(
             TUI_DASHBOARD.contains(field),
-            "dashboard inventory must surface {field}"
+            "inventory must retain {field}"
         );
     }
-    assert!(
-        !TUI_DASHBOARD.contains("starts_with(\"symbol=\")"),
-        "dashboard must not scan the retired symbol=/timeframe= layout"
-    );
+    assert!(!TUI_DASHBOARD.contains("starts_with(\"symbol=\")"));
     assert!(
         TUI_DASHBOARD.contains("InventoryCache")
-            && TUI_DASHBOARD.contains("Duration::from_secs(2)"),
-        "per-frame dashboard draws must not rescan every canonical manifest"
+            && TUI_DASHBOARD.contains("Duration::from_secs(2)")
     );
+    assert!(
+        TUI_DASHBOARD.contains("activity_panel_lines")
+            && TUI_DASHBOARD.contains("height.saturating_sub(1)"),
+        "fixed-height Dashboard must reserve space for activity rather than dumping every hash first"
+    );
+    for field in ["dataset_identity", "generation", "manifest_binding_sha256"] {
+        assert!(
+            TUI_SYMBOLS.contains(field),
+            "Symbols must retain detailed {field}"
+        );
+    }
+}
+
+#[test]
+fn tui_uses_loaded_data_and_cache_roots_and_the_existing_typed_portfolio_loader() {
+    let app = include_str!("../src/tui/app.rs");
+    let funnel = include_str!("../src/tui/pages/funnel.rs");
+    assert!(CLI_MAIN.contains("startup_settings.system.data_dir.clone()"));
+    assert!(CLI_MAIN.contains("startup_settings.system.cache_dir.clone()"));
+    assert!(!CLI_MAIN.contains("tui::run_tui(None)"));
+    assert!(app.contains("with_cache_defaults(&cache_root)"));
+    assert!(TUI_STRATEGIES.contains("load_live_portfolio_json(path)"));
+    assert!(!TUI_STRATEGIES.contains("STRATEGY_ARRAY_KEYS"));
+    assert!(funnel.contains("collect_funnel_files(&shared.cache_root)"));
+    assert!(funnel.contains("ResearchFunnelProjection"));
+    assert!(funnel.contains("NotPromotionEligible"));
 }
 
 #[test]

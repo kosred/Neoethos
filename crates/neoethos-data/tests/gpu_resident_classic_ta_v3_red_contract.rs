@@ -14,17 +14,33 @@ fn read(path: impl AsRef<Path>) -> String {
 }
 
 #[test]
-fn classic_ta_is_now_real_and_the_remaining_capability_census_stays_fail_closed() {
+fn classic_ta_is_real_and_the_complete_capability_census_stays_fail_closed() {
     let contracts = read("crates/neoethos-gpu-contracts/src/resident_feature_store_v3.rs");
     let data = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
+    let preflight =
+        read("crates/neoethos-data/src/core/gpu_only_feature_workspace_preflight_v3.rs");
     let executor = read("crates/neoethos-gpu-cuda/src/resident_classic_ta_v3.rs");
 
     assert!(contracts.contains("Self::ClassicTa"));
     assert!(contracts.contains("Self::Smc"));
     assert!(executor.contains("ResidentFeatureProducerV3::ClassicTa"));
-    assert!(data.contains("resident_classic_ta_capability_v3()?"));
-    assert!(data.contains("resident_smc_capability_v3()?"));
-    assert!(data.contains("EXPECTED_MISSING_AFTER_REAL_RESIDENT_PRODUCERS_V3"));
+    for capability in [
+        "resident_classic_ta_capability_v3()?",
+        "resident_smc_capability_v3()?",
+        "resident_quant_capability_v3()?",
+        "resident_session_capability_v2()?",
+        "resident_regime_capability_v3()?",
+        "resident_footprint_capability_v2()?",
+        "resident_higher_timeframe_capability_v3()?",
+        "resident_robust_normalization_capability_v2()?",
+        "resident_canonical_content_sha256_capability_v3()?",
+        "resident_feature_major_to_bar_major_capability_v3()?",
+    ] {
+        assert!(data.contains(capability), "missing complete capability {capability}");
+    }
+    assert!(preflight.contains(
+        "CURRENT_PENDING_RESIDENT_PRODUCERS_V3: [ResidentFeatureProducerV3; 0] = []"
+    ));
 }
 
 #[test]

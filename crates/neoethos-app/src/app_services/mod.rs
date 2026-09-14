@@ -1,3 +1,4 @@
+pub mod account_risk;
 pub mod backoff;
 pub mod bootstrap_writer;
 // **F-CORE3 cluster consolidation (2026-05-25)**: canonical registry of
@@ -62,6 +63,7 @@ pub mod journal_money_v3;
 pub mod journal_reconcile;
 pub mod journal_stats;
 pub mod journal_store;
+mod live_feature_snapshot;
 pub mod live_gate;
 pub mod live_journal;
 pub mod live_parity;
@@ -87,7 +89,6 @@ pub mod spread_stats;
 pub mod strategy_blacklist;
 pub mod supervisor;
 pub mod tail_risk;
-pub mod trading_types;
 pub mod training;
 pub mod validation;
 

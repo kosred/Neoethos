@@ -109,16 +109,27 @@ fn cubecl_residency_is_scoped_and_the_last_outer_scope_synchronously_cleans_ever
     }
 
     let discovery = read_repo("crates/neoethos-search/src/discovery.rs");
-    for signature in [
+    let holdout = function_body(
+        &discovery,
         "pub fn run_discovery_cycle_with_holdout_and_progress<F>(",
-        "pub fn run_discovery_cycle_with_progress<F>(",
-    ] {
-        let body = function_body(&discovery, signature);
-        assert!(
-            body.contains("cubecl_residency_scope()"),
-            "{signature} must retain CubeCL residency for the run and release it on every exit"
-        );
-    }
+    );
+    assert!(
+        holdout.contains("run_discovery_cycle_with_holdout_and_progress_authorized"),
+        "the public holdout boundary must delegate to the single authorized implementation"
+    );
+    let authorized = function_body(
+        &discovery,
+        "fn run_discovery_cycle_with_holdout_and_progress_authorized<F>(",
+    );
+    assert!(
+        authorized.contains("cubecl_residency_scope()"),
+        "the authorized holdout implementation must retain CubeCL residency for every exit"
+    );
+    let progress = function_body(&discovery, "pub fn run_discovery_cycle_with_progress<F>(");
+    assert!(
+        progress.contains("cubecl_residency_scope()"),
+        "the direct progress run must retain CubeCL residency for every exit"
+    );
 }
 
 #[test]

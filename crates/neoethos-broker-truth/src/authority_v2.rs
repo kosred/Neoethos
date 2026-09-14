@@ -344,6 +344,17 @@ impl BrokerFinancialTruthAuthorityV2 {
     ) -> BrokerTruthAcquisitionPromotionEligibilityV1 {
         self.source_promotion_eligibility
     }
+
+    /// Move the already checked link and owned decoded records into the quote
+    /// replay consumer. This is not a public raw-data or financial-permit API.
+    pub(crate) fn into_verified_quote_replay_inputs(
+        self,
+    ) -> (
+        VerifiedImmutableBrokerTruthAcquisitionLinkV1,
+        UntrustedBrokerFinancialTruthIngressV2,
+    ) {
+        (self._verified_link, self._semantic_ingress)
+    }
 }
 
 /// Exact-reopen and semantically validate one reviewed, content-addressed run.

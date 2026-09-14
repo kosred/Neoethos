@@ -71,9 +71,7 @@ fn known_model_family_matches(name: &str, family: ModelFamily) -> bool {
 
 /// Whether this build contains an NVIDIA CUDA implementation for `name`.
 ///
-/// This is deliberately narrower than [`supports_gpu_for_model`]. A Burn WGPU
-/// build is a valid generic GPU backend, but it cannot satisfy an NVIDIA CUDA
-/// preflight or an exact `gpu:0` CUDA artifact contract.
+/// This NVIDIA-specific query never includes a ROCm implementation.
 pub fn supports_nvidia_cuda_for_model(name: &str, family: ModelFamily) -> bool {
     if !known_model_family_matches(name, family) {
         return false;
@@ -101,25 +99,18 @@ pub fn supports_nvidia_cuda_for_model(name: &str, family: ModelFamily) -> bool {
 
 /// Whether this build contains a GPU code path that `name` can actually use.
 ///
-/// This reporting query includes both CUDA and WGPU. The stricter full-NVIDIA
-/// preflight uses [`supports_nvidia_cuda_for_model`] so WGPU cannot satisfy a
-/// CUDA contract.
+/// CUDA and ROCm are separate implementation authorities, not aliases.
 pub fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
-    if !known_model_family_matches(name, family) {
-        return false;
-    }
-    if supports_nvidia_cuda_for_model(name, family) {
-        return true;
-    }
-    match name {
-        // SAC runs on the selected Burn GPU backend (like Deep/Exit), not the
-        // rlkit/Candle DQN path.
-        "sac" => cfg!(feature = "burn-wgpu-backend"),
-        _ => {
-            matches!(family, ModelFamily::Deep | ModelFamily::Exit)
-                && cfg!(feature = "burn-wgpu-backend")
-        }
-    }
+    supports_nvidia_cuda_for_model(name, family) || supports_rocm_for_model(name, family)
+}
+
+/// The connected ROCm lifetime currently covers BurnDeepExpert's ten generic
+/// neural architectures. Do not advertise the separate Exit/SAC, Candle,
+/// native CUDA kernels or vendor-tree paths as HIP implementations.
+pub fn supports_rocm_for_model(name: &str, family: ModelFamily) -> bool {
+    cfg!(feature = "burn-rocm-backend")
+        && family == ModelFamily::Deep
+        && known_model_family_matches(name, family)
 }
 
 /// Whether the GPU path is the one this model SHOULD take when a card is
@@ -127,6 +118,9 @@ pub fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
 pub fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
     if !known_model_family_matches(name, family) {
         return false;
+    }
+    if supports_rocm_for_model(name, family) {
+        return true;
     }
     match name {
         "lightgbm" => {
@@ -158,17 +152,10 @@ pub fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
                     Ok(crate::common::CudaDevicePolicy::Cpu) | Err(_)
                 )
         }
-        // SAC runs on the selected Burn GPU backend (like Deep/Exit), not the
-        // rlkit/Candle DQN path.
-        "sac" => cfg!(any(
-            feature = "burn-wgpu-backend",
-            feature = "burn-cuda-backend"
-        )),
+        // SAC runs on Burn CUDA (like Deep/Exit), not the rlkit/Candle DQN path.
+        "sac" => cfg!(feature = "burn-cuda-backend"),
         _ => match family {
-            ModelFamily::Deep | ModelFamily::Exit => cfg!(any(
-                feature = "burn-wgpu-backend",
-                feature = "burn-cuda-backend"
-            )),
+            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-cuda-backend"),
             _ => false,
         },
     }
@@ -329,10 +316,8 @@ mod tests {
             ("exit_agent", ModelFamily::Exit),
             ("sac", ModelFamily::Rl),
         ] {
-            let burn_gpu_compiled = cfg!(any(
-                feature = "burn-wgpu-backend",
-                feature = "burn-cuda-backend"
-            ));
+            let burn_gpu_compiled = cfg!(feature = "burn-cuda-backend")
+                || (cfg!(feature = "burn-rocm-backend") && family == ModelFamily::Deep);
             assert_eq!(
                 supports_gpu_for_model(name, family),
                 burn_gpu_compiled,

@@ -1,4 +1,4 @@
-//! Logs page — views the canonical sectioned log (`logs/neoethos.log`).
+//! Logs page — views today's canonical daily sectioned log.
 //! Follows the tail by default; ↑↓/PgUp/PgDn scroll back through history and
 //! `F` jumps back to following the newest lines.
 
@@ -72,16 +72,17 @@ pub(crate) fn read_log_tail(path: &std::path::Path) -> Option<String> {
 }
 
 pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
-    let log_path = std::path::PathBuf::from("logs").join("neoethos.log");
+    let log_path = neoethos_core::logging::canonical_log_path();
+    let log_label = log_path.display().to_string();
     let body = read_log_tail(&log_path)
-        .unwrap_or_else(|| "(canonical log not found at logs/neoethos.log)".to_string());
+        .unwrap_or_else(|| format!("(canonical log not found at {log_label})"));
 
     let all: Vec<&str> = body.lines().collect();
     let total = all.len();
 
     // Reserve the inner height for log lines.
     let block_title = if shared.logs_scroll == 0 {
-        " LOGS — logs/neoethos.log · following tail · [↑↓/PgUp/PgDn] scroll ".to_string()
+        format!(" LOGS — {log_label} · following tail · [↑↓/PgUp/PgDn] scroll ")
     } else {
         format!(
             " LOGS — {} lines back · [F] follow tail · [↑↓] scroll ",

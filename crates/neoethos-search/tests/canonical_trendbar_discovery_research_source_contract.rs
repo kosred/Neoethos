@@ -41,7 +41,7 @@ fn function_body<'a>(source: &'a str, marker: &str) -> &'a str {
 fn canonical_trendbar_research_contract_v3_is_receipt_bound_and_never_a_broker_permit() {
     let source = read("src/canonical_trendbar_research.rs");
     let production = source
-        .split("#[cfg(test)]")
+        .split("#[cfg(test)]\nmod tests")
         .next()
         .expect("canonical trendbar research production source");
 
@@ -124,9 +124,11 @@ fn full_discovery_has_a_separate_research_only_entrypoint_while_broker_entrypoin
     );
     assert!(
         research_entry.contains("validate_against_input")
+            && research_entry.contains("from_explicit_canonical_cpu_research_v1")
+            && research_entry.contains("Some(strict_device_admission)")
             && research_entry.contains("install_canonical_trendbar_research_execution_v3")
             && research_entry.contains("run_discovery_cycle_with_holdout_and_progress_authorized"),
-        "research discovery does not validate/install its exact authority before arithmetic"
+        "research discovery does not validate/seal/install its exact CPU authority before arithmetic"
     );
     assert!(
         !research_entry.contains("current_broker_financial_truth_capability_v1"),
@@ -135,8 +137,71 @@ fn full_discovery_has_a_separate_research_only_entrypoint_while_broker_entrypoin
 }
 
 #[test]
+fn explicit_cpu_research_route_is_scoped_to_the_canonical_research_entrypoint() {
+    let discovery = read("src/discovery.rs");
+    let strict_route = read("src/strict_discovery_device_route_v1.rs");
+    let constructor = "from_explicit_canonical_cpu_research_v1(";
+    assert!(strict_route.contains(constructor));
+    // The pre-cancel regression seals a genuine run inside this explicit
+    // test-only module. It is not a third production authority entrypoint.
+    let test_module = function_body(&discovery, "#[cfg(test)]\nmod walkforward_wave_tests");
+    let production = discovery.replacen(test_module, "", 1);
+    assert_eq!(
+        production.matches(constructor).count(),
+        2,
+        "explicit CPU research authority belongs only to the two receipt-bound research entrypoints"
+    );
+    let research_entry = function_body(
+        &production,
+        "pub fn run_canonical_trendbar_research_discovery_with_holdout_and_progress<F>(",
+    );
+    let quote_entry = function_body(
+        &production,
+        "pub fn run_canonical_trendbar_research_with_quote_holdout_v3<F, P>(",
+    );
+    for entry in [research_entry, quote_entry] {
+        assert_eq!(entry.matches(constructor).count(), 1);
+        let validation = entry
+            .find("contract.validate_against_input(input)?")
+            .unwrap();
+        let admission = entry.find(constructor).unwrap();
+        let execution = entry
+            .find("install_canonical_trendbar_research_execution_v3")
+            .unwrap();
+        assert!(validation < admission && admission < execution);
+    }
+
+    let authorized = function_body(
+        &discovery,
+        "fn run_discovery_cycle_with_holdout_and_progress_authorized<F>(",
+    );
+    assert!(authorized.contains("is_explicit_canonical_cpu_research_v1"));
+    assert!(authorized.contains("StageGpuCapability::CpuOnly"));
+    assert!(authorized.contains("if !explicit_cpu_research"));
+}
+
+#[test]
 fn numerical_search_workers_accept_only_broker_truth_or_the_active_exact_research_scope() {
     let authority = read("src/historical_evaluation_authority.rs");
+    let lookup = function_body(
+        &authority,
+        "pub(crate) fn require_historical_evaluation_authority_v1(",
+    );
+    assert!(!lookup.contains(".validate()") && !lookup.contains("identity_sha256"));
+    let contract = read("src/canonical_trendbar_research.rs");
+    let install = function_body(
+        &contract,
+        "pub(crate) fn install_canonical_trendbar_research_execution_v3(",
+    );
+    assert!(
+        install.find("contract.validate()?").unwrap()
+            < install.find("Arc::new(contract.clone())").unwrap()
+    );
+    let snapshot = function_body(
+        &contract,
+        "pub(crate) fn active_canonical_trendbar_research_execution_v3(",
+    );
+    assert!(snapshot.contains("Arc::clone(&active.contract)"));
     for required in [
         "pub(crate) fn require_historical_evaluation_authority_v1(",
         "current_broker_financial_truth_capability_v1",
@@ -160,7 +225,7 @@ fn numerical_search_workers_accept_only_broker_truth_or_the_active_exact_researc
         ),
         (
             "src/genetic/search_engine.rs",
-            "pub fn validation_genes_population(",
+            "fn validation_genes_scenarios_inner(",
         ),
         (
             "src/gpu_native/prototype_population_oracle.rs",
@@ -186,7 +251,18 @@ fn numerical_search_workers_accept_only_broker_truth_or_the_active_exact_researc
 #[test]
 fn search_input_can_be_built_only_from_the_exact_selected_series_generations() {
     let source = read("src/data_selection.rs");
-    let body = function_body(&source, "pub fn from_exact_series_receipt(");
+    let public_builder = function_body(&source, "pub fn from_exact_series_receipt(");
+    let body = function_body(&source, "fn from_exact_series_receipt_with_builder_v3(");
+
+    for required in [
+        "from_exact_series_receipt_with_builder_v3",
+        "prepare_multitimeframe_features_with_options",
+    ] {
+        assert!(
+            public_builder.contains(required),
+            "exact-series public builder is missing `{required}`"
+        );
+    }
 
     for required in [
         "CanonicalDatasetSeriesReceiptV1",
@@ -194,7 +270,7 @@ fn search_input_can_be_built_only_from_the_exact_selected_series_generations() {
         ".validate()",
         "direct_timeframes()",
         "load_exact_dataset_series_receipt",
-        "prepare_multitimeframe_features_with_options",
+        "build_features(&dataset, base_name, options)",
         "CanonicalSearchInput",
     ] {
         assert!(

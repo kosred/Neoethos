@@ -257,8 +257,11 @@ struct DerivedQuoteValidatedOosStatisticsV1 {
 fn derive_complete_oos_statistics_from_quote_ledgers_v1(
     evidence: &QuoteValidatedOuterHoldoutResearchEvidenceV1,
     oos_window: OosWindow,
-    initial_balance: f64,
 ) -> Result<DerivedQuoteValidatedOosStatisticsV1, QuoteValidatedOosTouchErrorV1> {
+    // Capital and currency are already bound into the upstream receipt. A
+    // second caller-supplied balance could change these statistics without
+    // changing the sealed evidence identity.
+    let initial_balance = evidence.metrics().initial_balance().amount();
     if !initial_balance.is_finite()
         || initial_balance <= 0.0
         || oos_window.start_ms > oos_window.end_ms
@@ -324,7 +327,6 @@ pub fn evaluate_quote_validated_oos_touch_v1(
     expected_effective_search_config_hash: &str,
     expected_holdout_scope_identity_sha256: &str,
     evidence: QuoteValidatedOuterHoldoutResearchEvidenceV1,
-    initial_balance: f64,
 ) -> Result<QuoteValidatedOosTouchEvidenceV1, QuoteValidatedOosTouchErrorV1> {
     if evidence.receipt().quote_replay_receipts().is_empty() {
         return Err(oos_error(
@@ -409,11 +411,7 @@ pub fn evaluate_quote_validated_oos_touch_v1(
             "quote-ledger and immutable acquisition-link receipt sets differ",
         ));
     }
-    let statistics = derive_complete_oos_statistics_from_quote_ledgers_v1(
-        &evidence,
-        oos_window,
-        initial_balance,
-    )?;
+    let statistics = derive_complete_oos_statistics_from_quote_ledgers_v1(&evidence, oos_window)?;
     let mut receipt = QuoteValidatedOosTouchReceiptV1 {
         schema_version: QUOTE_VALIDATED_OOS_TOUCH_SCHEMA_VERSION_V1,
         session_id: session_id.to_string(),

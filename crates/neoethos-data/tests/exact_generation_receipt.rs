@@ -7,7 +7,10 @@ use neoethos_data::core::dataset_manifest::{
 use neoethos_data::{
     BarTimestampConvention, CTraderEnvironment, CanonicalDatasetIdentity,
     CanonicalDatasetSeriesReceiptV1, CanonicalTimeframe, Ohlcv, SelectedDatasetGenerationV1,
-    load_exact_canonical_timeframe, ohlcv_to_vortex_chunks, write_vortex_chunks,
+    load_dataset_for_identity, load_dataset_for_identity_with_timeframes,
+    load_exact_canonical_timeframe, load_exact_dataset_series_receipt, load_symbol_dataset,
+    load_symbol_dataset_with_timeframes, load_symbol_timeframe, ohlcv_to_vortex_chunks,
+    write_vortex_chunks,
 };
 
 const BASE_MS: i64 = 1_700_000_040_000;
@@ -286,6 +289,142 @@ fn pointer_advance_after_pin_keeps_the_original_generation_usable() {
         .lease()
         .reopen_verified()
         .expect("original immutable bytes remain reopenable while pinned");
+}
+
+fn assert_exact_values(actual: &Ohlcv, expected: &Ohlcv) {
+    assert_eq!(actual.timestamp, expected.timestamp);
+    for (actual, expected) in [
+        (&actual.open, &expected.open),
+        (&actual.high, &expected.high),
+        (&actual.low, &expected.low),
+        (&actual.close, &expected.close),
+    ] {
+        assert!(
+            actual
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(expected.iter().map(|v| v.to_bits()))
+        );
+    }
+    assert_eq!(actual.volume, expected.volume);
+}
+
+#[test]
+fn public_dataset_loaders_preserve_complete_values_and_exact_artifact_bindings() {
+    let root = tempfile::tempdir().expect("canonical root");
+    let identity = external_identity("owned-dataset-loaders", CanonicalTimeframe::M1);
+    let publication = publish(
+        root.path(),
+        &identity,
+        None,
+        1.1234567890123,
+        "loader-fixture",
+    );
+    let selected =
+        SelectedDatasetGenerationV1::from_manifest(publication.manifest()).expect("exact receipt");
+    let series = CanonicalDatasetSeriesReceiptV1::new(selected.clone(), vec![selected.clone()])
+        .expect("exact direct series");
+    let canonical = load_exact_canonical_timeframe(root.path(), &selected).expect("reference");
+    let binding = canonical
+        .source_binding("source:test")
+        .expect("exact source binding");
+    let expected = fixture(1.1234567890123);
+
+    let bars = load_symbol_timeframe(root.path(), "EURUSD", "M1").expect("bare OHLCV loader");
+    assert_exact_values(&bars, &expected);
+    let datasets = [
+        load_symbol_dataset(root.path(), "EURUSD").expect("symbol loader"),
+        load_symbol_dataset_with_timeframes(root.path(), "EURUSD", &["M1"])
+            .expect("symbol/timeframe loader"),
+        load_dataset_for_identity(root.path(), &identity).expect("identity loader"),
+        load_dataset_for_identity_with_timeframes(root.path(), &identity, &["M1"])
+            .expect("identity/timeframe loader"),
+        load_exact_dataset_series_receipt(root.path(), &series).expect("exact receipt loader"),
+    ];
+    for dataset in datasets {
+        assert_eq!(dataset.symbol, "EURUSD");
+        assert_eq!(dataset.timeframes(), vec!["M1"]);
+        assert_eq!(dataset.source_artifacts.len(), 1);
+        assert_exact_values(&dataset.frames["M1"], &expected);
+        assert_eq!(
+            dataset.source_artifacts["M1"]
+                .source_binding("source:test")
+                .expect("loaded binding"),
+            binding
+        );
+        dataset.source_artifacts["M1"]
+            .lease()
+            .reopen_verified()
+            .expect("retained reader lease");
+        assert_eq!(
+            dataset
+                .canonical_frame("M1")
+                .expect("feature input")
+                .source_binding("source:test")
+                .expect("feature input binding"),
+            binding
+        );
+    }
+}
+
+#[cfg(not(feature = "gpu-cuda"))]
+#[test]
+fn pinned_series_cpu_materialization_keeps_original_history_and_lease_until_dataset_drop() {
+    let root = tempfile::tempdir().expect("canonical root");
+    let identity = external_identity("owned-pinned-series", CanonicalTimeframe::M1);
+    let original = publish(root.path(), &identity, None, 1.0, "original-generation");
+    let selected =
+        SelectedDatasetGenerationV1::from_manifest(original.manifest()).expect("original receipt");
+    let series = CanonicalDatasetSeriesReceiptV1::new(selected.clone(), vec![selected.clone()])
+        .expect("original direct series");
+    let pinned = neoethos_data::pin_exact_canonical_series_v1(root.path(), series)
+        .expect("pin before new publications");
+    let original_path = original.manifest().generation_path().to_path_buf();
+    let newer = publish(
+        root.path(),
+        &identity,
+        Some(original.generation()),
+        2.0,
+        "newer",
+    );
+    publish(
+        root.path(),
+        &identity,
+        Some(newer.generation()),
+        3.0,
+        "newest",
+    );
+    collect_unreferenced_generations(root.path(), &identity).expect("GC before materialization");
+
+    let dataset = pinned
+        .into_cpu_dataset_without_native_adapter_v1()
+        .expect("decode the consumed original pin, not current");
+    assert_exact_values(&dataset.frames["M1"], &fixture(1.0));
+    let artifact = &dataset.source_artifacts["M1"];
+    assert_eq!(artifact.identity(), &identity);
+    assert_eq!(artifact.generation_id(), selected.generation_id());
+    assert_eq!(artifact.row_count(), 2);
+    let reader = std::sync::Arc::downgrade(artifact.lease());
+    collect_unreferenced_generations(root.path(), &identity).expect("GC after ownership transfer");
+    assert!(
+        original_path.exists(),
+        "the dataset must retain the original generation"
+    );
+    artifact
+        .lease()
+        .reopen_verified()
+        .expect("original bytes stay verified and pinned");
+
+    drop(dataset);
+    assert!(
+        reader.upgrade().is_none(),
+        "dataset drop must release its moved lease"
+    );
+    collect_unreferenced_generations(root.path(), &identity).expect("GC after dataset drop");
+    assert!(
+        !original_path.exists(),
+        "only the released old fixture becomes collectible"
+    );
 }
 
 #[test]

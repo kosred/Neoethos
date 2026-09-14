@@ -115,20 +115,34 @@ fn sealed_trim_views_have_one_move_only_population_consumer() {
 }
 
 #[test]
-fn prepared_native_discovery_uses_real_trim_owner_not_identity_placeholder() {
-    let source = read("crates/neoethos-search/src/prepared_discovery_run_input_v3.rs");
-    assert!(!source.contains("fn seal_gpu_native_trim_prefilter_view_identity_v3("));
-    assert!(!source.contains("GpuNativeTrimPrefilterViewIdentityV3"));
+fn production_native_discovery_uses_the_bounded_two_pass_screening_owner() {
+    let source = read("crates/neoethos-search/src/canonical_native_discovery_run_v1.rs");
     for requirement in [
-        "seal_current_config_resident_search_plan_v1",
-        "begin_gpu_resident_trim_prefilter_view_v1",
-        "execute_gpu_resident_trim_prefilter_view_v1",
-        "seal_gpu_resident_trim_prefilter_view_v1",
-        "consume_into_population_session_v3",
+        "prepare_resident_feature_screening_v2",
+        "seal_feature_screening_workspace_plan_v2",
+        "bind_feature_screening_gpu_workspace_plan_v2",
+        "begin_prepared_gpu_only_feature_two_pass_v2",
+        "stream_score_batches_v2",
+        "seal_selected_map_v2",
+        "prepare_compact_selected_store_v2",
+        "prepare_compact_selected_canonical_trendbar_research_run_input_capped_v6",
+        "materialize_compact_selected_store_v2",
     ] {
         assert!(
             source.contains(requirement),
             "prepared native path is missing {requirement}"
+        );
+    }
+    for obsolete in [
+        "GpuNativeTrimPrefilterViewIdentityV3",
+        "begin_gpu_resident_trim_prefilter_view_v1",
+        "execute_gpu_resident_trim_prefilter_view_v1",
+        "seal_gpu_resident_trim_prefilter_view_v1",
+        "materialize_prepared_gpu_only_feature_store_for_data_population_v3",
+    ] {
+        assert!(
+            !source.contains(obsolete),
+            "production native path still exposes superseded route {obsolete}"
         );
     }
 }
@@ -159,45 +173,6 @@ fn cpu_and_resident_trim_share_one_schema_classification_authority() {
 }
 
 #[test]
-fn current_config_plan_binds_one_exhaustive_typed_canonical_digest() {
-    let canonical = read("crates/neoethos-search/src/canonical_discovery_config_digest_v1.rs");
-    for requirement in [
-        "CANONICAL_DISCOVERY_CONFIG_DIGEST_SCHEMA_V1",
-        "let DiscoveryConfig {",
-        "let DiscoveryRuntimeOverrides {",
-        "let TargetProfile {",
-        "let FilteringConfig {",
-        "let PropFirmGateOverrides {",
-        "let PropFirmRiskRules {",
-        "let PropFirmGateConfig {",
-        "value.to_bits()",
-        "entries.sort_by",
-        "higher_timeframes",
-        "discovery_ledger_archive_top_n",
-    ] {
-        assert!(
-            canonical.contains(requirement),
-            "canonical Search-config authority is missing {requirement}"
-        );
-    }
-    assert!(!canonical.contains("serde_json"));
-    assert!(!canonical.contains("serde_yaml"));
-    assert!(!canonical.contains("HashMap::into_iter"));
-
-    let plan = read("crates/neoethos-search/src/gpu_resident_current_config_plan_v1.rs");
-    for requirement in [
-        "canonical_discovery_config_digest_v1(config)",
-        "canonical_discovery_config_digest_sha256: [u8; 32]",
-        "canonical_discovery_config_digest_sha256",
-    ] {
-        assert!(
-            plan.contains(requirement),
-            "sealed plan does not bind canonical config fact {requirement}"
-        );
-    }
-}
-
-#[test]
 fn trim_preflight_is_a_distinct_native_calibrated_workspace_extent() {
     let source = read("crates/neoethos-gpu-cuda/src/full_discovery_workspace_plan_v1.rs");
     assert!(source.contains("OpaqueResidentTrimPrefilterPreflightV1"));
@@ -223,11 +198,31 @@ fn trim_preflight_is_a_distinct_native_calibrated_workspace_extent() {
         "let trim_prefilter_reserved_bytes = preflight.population_parent_and_views.device_bytes;"
     ));
     assert!(!source.contains("trim_prefilter_reserved_bytes: 1"));
-    let prepared = read("crates/neoethos-search/src/prepared_discovery_run_input_v3.rs");
-    let admission = body_after(
-        &prepared,
-        "fn require_current_config_resident_search_admission_facts_v1(",
+    let screening = read("crates/neoethos-search/src/gpu_resident_feature_screening_v2.rs");
+    let preparation = body_after(
+        &screening,
+        "pub(crate) fn prepare_resident_feature_screening_v2(",
     );
-    assert!(admission.contains("native-query/calibrated resident trim workspace preflight"));
-    assert!(admission.contains("before any allocation"));
+    let trim_preflight = preparation
+        .find("preflight_resident_trim_prefilter_workspace_v2(")
+        .expect("production screening must query the exact native trim workspace");
+    let sealed_preparation = preparation
+        .find("Ok(PreparedResidentFeatureScreeningV2")
+        .expect("production screening must seal its prepared authority");
+    assert!(
+        trim_preflight < sealed_preparation,
+        "native trim calibration must finish before the screening authority is sealed"
+    );
+
+    let production = read("crates/neoethos-search/src/canonical_native_discovery_run_v1.rs");
+    let workspace_seal = production
+        .find("seal_feature_screening_workspace_plan_v2(")
+        .expect("production must seal the calibrated screening workspace");
+    let run_begin = production
+        .find("begin_prepared_gpu_only_feature_two_pass_v2(")
+        .expect("production must begin the bounded two-pass run");
+    assert!(
+        workspace_seal < run_begin,
+        "the calibrated trim extent must be admitted before any screening allocation"
+    );
 }

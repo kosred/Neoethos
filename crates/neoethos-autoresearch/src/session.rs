@@ -1602,6 +1602,45 @@ impl Session {
         self.sweeps.iter().filter(|s| s.kind.is_live()).count()
     }
 
+    /// Live searches that really ran and on which the judge reached a verdict.
+    ///
+    /// This is deliberately stricter than counting `ScreenResult::Failed`:
+    /// proposals refused before execution and per-search infrastructure errors
+    /// are represented as failed screens so that they cannot pass, but neither
+    /// is evidence about the searched market space. `Unavailable` is excluded
+    /// too because the judge explicitly declined to rule while the shuffle null
+    /// was not ready.
+    pub fn live_searches_judged(&self) -> usize {
+        self.sweeps
+            .iter()
+            .filter(|sweep| sweep.kind.is_live())
+            .map(|sweep| {
+                self.screens
+                    .get(&sweep.sweep.0)
+                    .map(|screens| {
+                        screens
+                            .iter()
+                            .enumerate()
+                            .filter(|(slot, screen)| {
+                                matches!(
+                                    screen,
+                                    crate::judge::ScreenResult::Passed { .. }
+                                        | crate::judge::ScreenResult::Failed { .. }
+                                ) && sweep
+                                    .per_search
+                                    .iter()
+                                    .find(|record| record.slot == *slot)
+                                    .is_some_and(|record| {
+                                        record.trials_offered > 0 && record.error.is_none()
+                                    })
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
     pub fn searches_run(&self) -> usize {
         self.sweeps.iter().map(|s| s.per_search.len()).sum()
     }
@@ -3297,5 +3336,58 @@ mod tests {
         assert_eq!(session.live_sweeps_run(), 4);
         assert!(session.block_boundary_due());
         assert_eq!(session.live_sweeps_in_block(BlockId(0)).len(), 4);
+    }
+
+    #[test]
+    fn judged_live_searches_exclude_refusals_errors_unavailable_and_controls() {
+        let failed = crate::judge::ScreenResult::Failed {
+            conjunct: crate::judge::ScreenConjunct::S4Expectancy,
+            detail: "the executed search found no positive expectancy".into(),
+        };
+        let unavailable = crate::judge::ScreenResult::Unavailable {
+            detail: "the shuffle null is not ready".into(),
+        };
+
+        let judged = search(0, "fnv64:judged", None);
+        let mut refused = search(1, "fnv64:refused", None);
+        refused.trials_offered = 0;
+        refused.error = Some("NOT RUN — proposal could not be resolved".into());
+        let mut errored = search(2, "fnv64:errored", None);
+        errored.error = Some("CUDA out of memory".into());
+        let waiting = search(3, "fnv64:waiting", Some(0.4));
+
+        let mut session = Session::default();
+        session.sweeps.push(SweepSummary {
+            sweep: SweepId(1),
+            kind: SweepKind::Live,
+            sweep_hash: "fnv64:live".into(),
+            trials_offered: 30,
+            outcome: SweepOutcome::Completed,
+            per_search: vec![judged, refused, errored, waiting],
+            wall_ms: 1,
+        });
+        session.screens.insert(
+            1,
+            vec![failed.clone(), failed.clone(), failed.clone(), unavailable],
+        );
+
+        session.sweeps.push(SweepSummary {
+            sweep: SweepId(2),
+            kind: SweepKind::Control {
+                control: crate::shuffle::ControlKind::CircularRotation,
+                source_sweep: SweepId(1),
+                block: BlockId(0),
+            },
+            sweep_hash: "fnv64:control".into(),
+            trials_offered: 10,
+            outcome: SweepOutcome::Completed,
+            per_search: vec![search(0, "fnv64:control-search", None)],
+            wall_ms: 1,
+        });
+        // Controls do not normally emit Screened records. Inject one here to
+        // prove the derived count is robust even if a malformed journal does.
+        session.screens.insert(2, vec![failed]);
+
+        assert_eq!(session.live_searches_judged(), 1);
     }
 }

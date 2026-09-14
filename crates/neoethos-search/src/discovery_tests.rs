@@ -2,9 +2,10 @@
 // signal + ramp generators were retired in favour of the canonical
 // real-data fixture in `neoethos_data::test_fixtures`. The fixture
 // is a 100-bar EURUSD M1 sample seeded from a real cTrader Open API
-// capture, which gives every test more realistic warm-up (longest
+// capture, which gives sample-based tests more realistic warm-up (longest
 // indicator window is Hurst-100) and uniform behaviour across the
-// workspace. See task #224.
+// workspace. Explicitly labelled synthetic fixtures below cover temporal
+// geometry that needs more than those 100 captured bars. See task #224.
 use super::*;
 
 // Task #66's ENV_VAR_TEST_LOCK / env_var_test_lock() helper was removed in the
@@ -39,6 +40,43 @@ fn sample_run_input<'a>(
         .expect("receipt-bound canonical search test input")
 }
 
+/// Build the only CPU admission a unit test may use without pretending that
+/// this host has completed a physical CUDA inventory. The admission is bound
+/// to the exact canonical receipt carried by `features`; production entrypoints
+/// still use the real fail-closed device probe.
+fn explicit_cpu_research_admission(
+    features: &FeatureFrame,
+) -> crate::SealedStrictDiscoveryDeviceAdmissionV1 {
+    let anchor = features.provenance().bindings()[0]
+        .dataset_identity()
+        .clone();
+    let receipt = CanonicalSearchInputReceiptV2::from_feature_frame(&anchor, features)
+        .expect("canonical explicit-CPU discovery-test receipt");
+    let assumption_source_sha256 = "a".repeat(64);
+    let contract = crate::CanonicalTrendbarResearchExecutionContractV3::new(
+        receipt,
+        crate::CanonicalTrendbarResearchCostAssumptionsV2 {
+            symbol: "EURUSD",
+            account_currency: "USD",
+            assumption_source_id: "neoethos.test.discovery.explicit-cpu.v1",
+            assumption_source_sha256: &assumption_source_sha256,
+            pip_size: 0.0001,
+            pip_value_per_lot: 10.0,
+            full_spread_pips_assumption: 1.2,
+            slippage_pips_per_fill_assumption: 0.1,
+            commission_account_per_lot_per_fill_assumption: 3.5,
+            swap_long_pips_per_day: -0.2,
+            swap_short_pips_per_day: -0.1,
+            pnl_conversion_fee_rate: 0.0,
+        },
+    )
+    .expect("valid explicit-CPU discovery-test contract");
+    crate::SealedStrictDiscoveryDeviceAdmissionV1::from_explicit_canonical_cpu_research_v1(
+        &contract,
+    )
+    .expect("sealed explicit-CPU discovery-test admission")
+}
+
 fn sample_search_input_receipt() -> CanonicalSearchInputReceiptV2 {
     let features = sample_feature_frame();
     let anchor = features.provenance().bindings()[0]
@@ -67,14 +105,19 @@ fn sample_split_search_scopes() -> (
     let features = sample_feature_frame();
     let ohlcv = sample_ohlcv();
     let input = sample_run_input(&features, &ohlcv);
-    let windows = CanonicalDiscoveryRunInputs::with_holdout(&input)
-        .expect("canonical fixture must produce exact 80/20 scopes");
-    let selection_scope = windows.selection().scope().clone();
-    let holdout_scope = windows
-        .holdout()
-        .expect("canonical fixture must contain a holdout")
-        .scope()
-        .clone();
+    // Retain explicitly legacy two-way diagnostics for compatibility/refusal tests.
+    let selection_scope = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::InSample,
+        &input,
+        0..80,
+    )
+    .unwrap();
+    let holdout_scope = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::Holdout,
+        &input,
+        80..100,
+    )
+    .unwrap();
     (input.receipt().clone(), selection_scope, holdout_scope)
 }
 
@@ -88,12 +131,16 @@ fn sample_split_search_values() -> (
     let features = sample_feature_frame();
     let ohlcv = sample_ohlcv();
     let input = sample_run_input(&features, &ohlcv);
-    let windows = CanonicalDiscoveryRunInputs::with_holdout(&input)
-        .expect("canonical fixture must produce exact 80/20 values");
-    let selection_scope = windows.selection().scope().clone();
-    let holdout = windows
-        .holdout()
-        .expect("canonical fixture must contain holdout values");
+    // Existing two-way diagnostic fixtures are not final-tested V6 exports.
+    let selection_scope = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::InSample,
+        &input,
+        0..80,
+    )
+    .unwrap();
+    let holdout =
+        ScopedDiscoveryInput::owned_range(&input, CanonicalSearchWindowRoleV1::Holdout, 80..100)
+            .unwrap();
     (
         input.receipt().clone(),
         selection_scope,
@@ -104,7 +151,7 @@ fn sample_split_search_values() -> (
 }
 
 #[test]
-fn holdout_split_stores_exact_contiguous_80_20_scopes_and_values() {
+fn holdout_split_stores_exact_contiguous_80_10_10_scopes_and_values() {
     let features = sample_feature_frame();
     let ohlcv = sample_ohlcv();
     let input = sample_run_input(&features, &ohlcv);
@@ -116,8 +163,12 @@ fn holdout_split_stores_exact_contiguous_80_20_scopes_and_values() {
     assert_eq!(input.ohlcv().len(), 100, "fixture must remain 100 rows");
 
     let windows = CanonicalDiscoveryRunInputs::with_holdout(&input)
-        .expect("100 rows must produce an exact 80/20 split");
+        .expect("100 rows must produce an exact 80/10/10 split");
     let selection = windows.selection();
+    let calibration = windows
+        .calibration()
+        .expect("separate selection calibration");
+    let calibration_window = calibration.scope().evaluated_window();
     let holdout = windows
         .holdout()
         .expect("split discovery input must store holdout evidence");
@@ -137,9 +188,9 @@ fn holdout_split_stores_exact_contiguous_80_20_scopes_and_values() {
     assert_eq!(holdout_window.role(), CanonicalSearchWindowRoleV1::Holdout);
     assert_eq!(
         (holdout_window.row_start(), holdout_window.row_end()),
-        (80, 100)
+        (90, 100)
     );
-    assert_eq!(holdout_window.timestamp_start_ms(), timestamps[80]);
+    assert_eq!(holdout_window.timestamp_start_ms(), timestamps[90]);
     assert_eq!(holdout_window.timestamp_end_ms(), timestamps[99]);
 
     assert_eq!(selection.scope().receipt(), input.receipt());
@@ -149,10 +200,26 @@ fn holdout_split_stores_exact_contiguous_80_20_scopes_and_values() {
         selection.ohlcv().timestamp.as_deref(),
         Some(&timestamps[0..80])
     );
-    assert_eq!(holdout.features().timestamps, features.timestamps[80..100]);
+    assert_eq!(
+        calibration_window.role(),
+        CanonicalSearchWindowRoleV1::SelectionValidation
+    );
+    assert_eq!(
+        (calibration_window.row_start(), calibration_window.row_end()),
+        (80, 90)
+    );
+    assert_eq!(
+        calibration.features().timestamps,
+        features.timestamps[80..90]
+    );
+    assert_eq!(calibration.scope().receipt(), input.receipt());
+    assert_eq!(calibration.ohlcv().close, ohlcv.close[80..90]);
+    assert_eq!(selection.ohlcv().close, ohlcv.close[..80]);
+    assert_eq!(holdout.ohlcv().close, ohlcv.close[90..]);
+    assert_eq!(holdout.features().timestamps, features.timestamps[90..100]);
     assert_eq!(
         holdout.ohlcv().timestamp.as_deref(),
-        Some(&timestamps[80..100])
+        Some(&timestamps[90..100])
     );
 }
 
@@ -182,6 +249,90 @@ fn holdout_free_input_stores_exact_full_discovery_scope() {
 }
 
 #[test]
+fn odd_tail_partition_never_duplicates_or_invents_rows() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    let windows = CanonicalDiscoveryRunInputs::with_holdout_at(&input, 81).unwrap();
+    let calibration = windows.calibration().unwrap();
+    let final_tail = windows.holdout().unwrap();
+    assert_eq!(windows.selection().ohlcv().len(), 81);
+    assert_eq!(calibration.ohlcv().len(), 9);
+    assert_eq!(final_tail.ohlcv().len(), 10);
+    let reassembled = [windows.selection(), calibration, final_tail]
+        .into_iter()
+        .flat_map(|window| window.ohlcv().close.iter().copied())
+        .collect::<Vec<_>>();
+    assert!(exact_f64_slice(&reassembled, &ohlcv.close));
+    assert!(CanonicalDiscoveryRunInputs::with_holdout_at(&input, 99).is_err());
+}
+
+#[test]
+fn calibration_and_final_roles_and_timestamp_boundaries_cannot_be_substituted() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let input = sample_run_input(&features, &ohlcv);
+    let windows = CanonicalDiscoveryRunInputs::with_holdout(&input).unwrap();
+    let selection = windows.selection().scope();
+    let calibration = windows.calibration().unwrap().scope();
+    let final_tail = windows.holdout().unwrap().scope();
+    validate_discovery_scope_pair(&input, selection, Some(calibration), Some(final_tail)).unwrap();
+    assert!(
+        validate_discovery_scope_pair(&input, selection, Some(final_tail), Some(calibration))
+            .is_err()
+    );
+    assert!(validate_discovery_scope_pair(&input, selection, None, Some(final_tail)).is_err());
+    let mislabeled = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::Holdout,
+        &input,
+        80..90,
+    )
+    .unwrap();
+    assert!(
+        validate_discovery_scope_pair(&input, selection, Some(&mislabeled), Some(final_tail))
+            .is_err()
+    );
+    let mut wire = serde_json::to_value(calibration).unwrap();
+    wire["evaluated_window"]["timestamp_end_ms"] = serde_json::json!(features.timestamps[89] - 1);
+    let changed: CanonicalSearchArtifactScopeV2 = serde_json::from_value(wire).unwrap();
+    assert!(
+        validate_discovery_scope_pair(&input, selection, Some(&changed), Some(final_tail)).is_err()
+    );
+}
+
+#[test]
+fn changing_final_prices_does_not_change_selection_or_calibration_values() {
+    // Values are explicitly changed in a test fixture, not fabricated production data.
+    // The unchanged feature artifact here isolates only the OHLCV partition seam;
+    // causality of feature production is covered by Data's separate alignment tests.
+    let features = sample_feature_frame();
+    let original = sample_ohlcv();
+    let mut changed = original.clone();
+    for row in 90..100 {
+        changed.open[row] *= 2.0;
+        changed.high[row] *= 2.0;
+        changed.low[row] *= 2.0;
+        changed.close[row] *= 2.0;
+    }
+    let first = sample_run_input(&features, &original);
+    let second = sample_run_input(&features, &changed);
+    let before = CanonicalDiscoveryRunInputs::with_holdout(&first).unwrap();
+    let after = CanonicalDiscoveryRunInputs::with_holdout(&second).unwrap();
+    assert!(exact_f64_slice(
+        &before.selection().ohlcv().close,
+        &after.selection().ohlcv().close
+    ));
+    assert!(exact_f64_slice(
+        &before.calibration().unwrap().ohlcv().close,
+        &after.calibration().unwrap().ohlcv().close
+    ));
+    assert!(!exact_f64_slice(
+        &before.holdout().unwrap().ohlcv().close,
+        &after.holdout().unwrap().ohlcv().close
+    ));
+}
+
+#[test]
 fn holdout_scope_pair_refuses_swapped_roles() {
     let features = sample_feature_frame();
     let ohlcv = sample_ohlcv();
@@ -199,7 +350,7 @@ fn holdout_scope_pair_refuses_swapped_roles() {
     )
     .expect("valid range");
 
-    let error = validate_discovery_scope_pair(&input, &wrong_selection, Some(&wrong_holdout))
+    let error = validate_discovery_scope_pair(&input, &wrong_selection, None, Some(&wrong_holdout))
         .expect_err("swapped selection/holdout roles must be refused");
 
     assert!(
@@ -216,9 +367,15 @@ fn holdout_scope_pair_refuses_gap_and_overlap() {
     let holdout = CanonicalSearchArtifactScopeV2::from_run_input_range(
         CanonicalSearchWindowRoleV1::Holdout,
         &input,
-        80..100,
+        90..100,
     )
     .expect("valid holdout range");
+    let calibration = CanonicalSearchArtifactScopeV2::from_run_input_range(
+        CanonicalSearchWindowRoleV1::SelectionValidation,
+        &input,
+        80..90,
+    )
+    .unwrap();
 
     for (name, selection_range) in [("gap", 0..79), ("overlap", 0..81)] {
         let selection = CanonicalSearchArtifactScopeV2::from_run_input_range(
@@ -227,8 +384,9 @@ fn holdout_scope_pair_refuses_gap_and_overlap() {
             selection_range,
         )
         .expect("valid selection range");
-        let error = validate_discovery_scope_pair(&input, &selection, Some(&holdout))
-            .expect_err("non-contiguous selection/holdout scopes must be refused");
+        let error =
+            validate_discovery_scope_pair(&input, &selection, Some(&calibration), Some(&holdout))
+                .expect_err("non-contiguous selection/holdout scopes must be refused");
         assert!(
             error.to_string().contains("contiguous"),
             "{name} produced unexpected error: {error:#}"
@@ -279,6 +437,12 @@ fn profitable_gene(strategy_id: &str) -> Gene {
         profit_factor: 1.3,
         trades_count: 10,
         consistency: 0.8,
+        // A test helper called `profitable_gene` must carry executable exit
+        // geometry too. Leaving these at Default::default() (= 0) only made
+        // the archived summary look profitable; a real replay quite correctly
+        // rejected it before broker-truth validation.
+        tp_pips: 40.0,
+        sl_pips: 20.0,
         ..Gene::default()
     }
 }
@@ -296,6 +460,7 @@ fn empty_portfolio_is_an_explicit_error() {
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -330,6 +495,7 @@ fn non_empty_portfolio_is_accepted() {
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -361,10 +527,40 @@ fn candidate_truncation_honors_small_explicit_limits() {
 }
 
 #[test]
-fn finalize_candidates_emits_selection_milestones_before_broker_truth_refusal() {
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
-    let config = DiscoveryConfig {
+fn automatic_post_ga_validation_covers_the_returned_archive_not_configured_population() {
+    assert_eq!(DiscoveryConfig::default().candidate_count, 0);
+    let mut settings = neoethos_core::Settings::default();
+    settings.models.prop_search_val_candidates = 0;
+    for population in [16, 200, 3206] {
+        settings.models.prop_search_population = population;
+        let config = DiscoveryConfig::from_settings(&settings);
+        assert_eq!(config.candidate_count, 0);
+        assert_eq!(
+            candidate_truncation_limit(config.candidate_count, 50_000),
+            50_000
+        );
+    }
+    settings.models.prop_search_val_candidates = 7;
+    let config = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(
+        candidate_truncation_limit(config.candidate_count, 50_000),
+        7
+    );
+}
+
+fn finalization_milestone_config() -> DiscoveryConfig {
+    DiscoveryConfig {
+        evaluation_symbol: "EURUSD".to_string(),
+        evaluation_account_currency: "USD".to_string(),
+        evaluation_spread_pips: 0.0,
+        evaluation_commission_per_trade: 0.0,
+        mode: DiscoveryMode::Risky,
+        // This test isolates milestone ordering and the broker-truth boundary;
+        // cost-band and candidate-level stress have their own tests.
+        cost_band_pips: None,
+        // This ordering/authority fixture must not write trial returns into the
+        // repository or user cache; persisted-ledger behavior has separate tests.
+        discovery_ledger_enabled: false,
         candidate_count: 2,
         portfolio_size: 2,
         corr_threshold: 0.9,
@@ -381,29 +577,39 @@ fn finalize_candidates_emits_selection_milestones_before_broker_truth_refusal() 
             ..FilteringConfig::default()
         },
         ..DiscoveryConfig::default()
-    };
+    }
+}
+
+fn run_finalization_milestone_fixture(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+) -> (Result<DiscoveryResult>, Vec<DiscoveryProgress>) {
     // `profitable_gene` is also a compact artifact fixture and intentionally
     // uses broad +/-0.5 thresholds. The canonical EURUSD sample's first
     // feature is `close_minus_open`, whose real magnitude is much smaller, so
     // those artifact-only thresholds produce no signals at all. Pin this
-    // finalization test to two otherwise-identical genes that actually cross
-    // the canonical feature around zero; their identical signals then exercise
-    // the intended correlation-pruning milestone.
+    // finalization fixtures to two otherwise-identical genes that cross zero.
+    // Both must reach candidate WF before any portfolio/correlation selection.
     let mut alpha_1 = profitable_gene("alpha-1");
     alpha_1.long_threshold = 0.0;
     alpha_1.short_threshold = 0.0;
+    alpha_1.tp_pips = 1.0;
+    alpha_1.sl_pips = 20.0;
     let mut alpha_2 = profitable_gene("alpha-2");
     alpha_2.long_threshold = 0.0;
     alpha_2.short_threshold = 0.0;
+    alpha_2.tp_pips = 1.0;
+    alpha_2.sl_pips = 20.0;
     let candidates = vec![alpha_1, alpha_2];
     let signal_config = config.evaluation_config_with_smc_gate(ohlcv.close.last().copied(), 0.75);
-    let candidate_signals = candidates
+    let (candidate_signals, candidate_confidences): (Vec<_>, Vec<_>) = candidates
         .iter()
         .map(|gene| {
-            signals_for_gene_full(&features, &ohlcv, gene, &signal_config)
+            signals_and_confidence_for_gene_full(features, ohlcv, gene, &signal_config)
                 .expect("milestone fixture signal synthesis")
         })
-        .collect::<Vec<_>>();
+        .unzip();
     assert!(
         candidate_signals
             .iter()
@@ -412,64 +618,243 @@ fn finalize_candidates_emits_selection_milestones_before_broker_truth_refusal() 
     );
     assert_eq!(
         candidate_signals[0], candidate_signals[1],
-        "the second milestone gene must be rejected by correlation"
+        "the milestone fixtures must give both genes identical signals"
     );
+    // This direct-finalization fixture has no preceding GA. Supply measured
+    // metrics from these exact genes/values/settings, paired in the same order,
+    // and the timestamps of that same window rather than invented GA scores.
+    let resolver = GeneEvalSettingsResolver::for_slice(
+        config,
+        candidates.iter(),
+        &ohlcv.high,
+        &ohlcv.low,
+        &ohlcv.close,
+    )
+    .expect("milestone fixture evaluation settings");
+    let (months, days) = month_day_indices(&features.timestamps);
+    let candidate_metrics = candidates
+        .iter()
+        .zip(candidate_signals.iter().zip(&candidate_confidences))
+        .map(|(gene, (signals, confidences))| {
+            crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
+                &ohlcv.close,
+                &ohlcv.high,
+                &ohlcv.low,
+                signals,
+                confidences,
+                &months,
+                &days,
+                &features.timestamps,
+                &resolver.settings_for_gene(gene),
+            )
+            .expect("milestone fixture measured candidate metrics")
+            .0
+        })
+        .collect();
+    drop(resolver);
     let mut progress_events = Vec::new();
-    let input = sample_run_input(&features, &ohlcv);
+    let input = sample_run_input(features, ohlcv);
     let selection_scope = CanonicalSearchArtifactScopeV2::from_run_input(
         CanonicalSearchWindowRoleV1::DiscoveryInput,
         &input,
     )
     .expect("canonical full discovery test scope");
-    let strict_device_admission = crate::acquire_strict_discovery_device_admission_v1()
-        .expect("real strict device admission for milestone fixture");
+    let strict_device_admission = explicit_cpu_research_admission(features);
     let population_execution_run =
         crate::population_execution_evidence_v1::begin_exact_population_execution_run_v1(
             strict_device_admission,
             &selection_scope,
-            &features,
-            &ohlcv,
+            features,
+            ohlcv,
         )
         .expect("seal milestone fixture population evidence");
 
     let mut funnel = crate::funnel_profile::FunnelProfile::new("EURUSD", "M1");
-    let error = finalize_candidates_with_progress(
+    let result = finalize_candidates_with_progress(
         candidates,
-        &features,
-        &ohlcv,
+        candidate_metrics,
+        &signal_config,
+        &features.timestamps,
+        features,
+        ohlcv,
         input.receipt(),
         &selection_scope,
         None,
+        None,
+        None,
         "fnv64:0123456789abcdef",
-        &config,
+        config,
         0.75,
         features.names.clone(),
         &population_execution_run,
         &mut funnel,
         |event| progress_events.push(event),
+    );
+    (result, progress_events)
+}
+
+fn assert_pre_walkforward_milestones(progress_events: &[DiscoveryProgress]) {
+    let ranked = progress_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                DiscoveryProgress::CandidatesRanked { candidate_count, truncated_to }
+                    if *candidate_count == 2 && *truncated_to == 2
+            )
+        })
+        .expect("both candidates must be ranked");
+    let filtered = progress_events.iter().position(|event| matches!(
+        event,
+        DiscoveryProgress::CandidatesFiltered { passed_filters, evaluated_candidates, min_trades_required }
+            if *passed_filters == 2 && *evaluated_candidates == 2 && *min_trades_required == 1
+    )).expect("both candidates must reach the min-trades screen");
+    let quality = progress_events.iter().position(|event| matches!(
+        event,
+        DiscoveryProgress::QualityScreened { strict_passed, opportunistic_passed, evaluated_candidates, .. }
+            if *evaluated_candidates == 2 && *strict_passed + *opportunistic_passed == 2
+    )).expect("both candidates must pass quality screening");
+    let walkforward = progress_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                DiscoveryProgress::StageAdvanced {
+                    stage: "candidate_walkforward",
+                    ..
+                }
+            )
+        })
+        .expect("candidate WF must be reached before portfolio selection");
+    assert!(ranked < filtered && filtered < quality && quality < walkforward);
+}
+
+#[test]
+fn finalize_candidates_with_no_wf_windows_returns_only_nonexportable_diagnostics() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let config = finalization_milestone_config();
+    assert_eq!(ohlcv.close.len(), 100);
+    assert_eq!(config.walkforward_splits, 20);
+    assert_eq!(config.embargo_minutes, 120);
+    assert!(ohlcv.close.len() / config.walkforward_splits < 80);
+
+    let (result, progress_events) = run_finalization_milestone_fixture(&features, &ohlcv, &config);
+    let result = result.expect("no eligible WF window yields non-exportable diagnostics");
+    assert_pre_walkforward_milestones(&progress_events);
+    assert!(result.validation_gates.fallback_mode);
+    assert!(!result.validation_gates.walkforward_passed);
+    assert!(!result.validation_gates.cpcv_passed);
+    assert!(!result.validation_gates.is_portfolio_export_ready());
+    assert!(result.canonical_backtest_artifacts.is_empty());
+    assert!(result.walkforward_validation_artifacts.is_empty());
+    assert!(result.forward_test_validation_artifacts.is_empty());
+    assert!(result.prop_firm_validation_artifacts.is_empty());
+    let census = result
+        .funnel_profile
+        .as_ref()
+        .and_then(|funnel| funnel.candidate_census.as_ref())
+        .expect("diagnostic result must retain its actual coverage");
+    assert_eq!(census.quality_evaluated, 2);
+    assert_eq!(census.walkforward_tested, 0);
+    assert_eq!(census.walkforward_passed, 0);
+    assert_eq!(census.walkforward_failed, 0);
+    assert_eq!(census.walkforward_not_tested, 2);
+    assert_eq!(census.portfolio_selected, 0);
+    assert!(progress_events.iter().any(|event| matches!(
+        event,
+        DiscoveryProgress::PortfolioSelected {
+            portfolio_size: 0,
+            rejected_by_correlation: 0,
+            target_portfolio: 2
+        }
+    )));
+    let path = temp_path("no-wf-diagnostic-must-not-export");
+    let error = save_portfolio_json(&path, &result)
+        .expect_err("diagnostic fallback must not export as a validated portfolio");
+    assert!(error.to_string().contains("walkforward_passed"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn finalize_candidates_emits_selection_milestones_before_broker_truth_refusal() {
+    // These 600 rows are SYNTHETIC, UNVERIFIED test values, not a larger broker
+    // capture. The existing fixture constructor explicitly marks that identity.
+    // They only make a real temporal validation window eligible; no historical
+    // financial-authority context is installed by the fixture's CPU admission.
+    let n = 600;
+    let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(n);
+    let close = (0..n)
+        .map(|row| 1.1000 + row as f64 * 0.00005)
+        .collect::<Vec<_>>();
+    let ohlcv = Ohlcv {
+        timestamp: Some(timestamps.clone()),
+        open: close.iter().map(|price| price - 0.00005).collect(),
+        high: close.iter().map(|price| price + 0.0002).collect(),
+        low: close.iter().map(|price| price - 0.0001).collect(),
+        close,
+        volume: Some(vec![1.0; n]),
+    };
+    let data =
+        ndarray::Array2::from_shape_fn((n, 1), |(row, _)| ohlcv.close[row] - ohlcv.open[row]);
+    let features = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+        timestamps.clone(),
+        vec!["synthetic_close_minus_open".to_string()],
+        data,
     )
-    .expect_err("financial validation must require exact broker evidence");
+    .expect("explicitly unverified synthetic temporal fixture");
+    let expected_identity = neoethos_data::CanonicalDatasetIdentity::external(
+        "embedded-ctrader-fixture-unverified",
+        "EURUSD",
+        neoethos_data::CanonicalTimeframe::M1,
+        neoethos_data::BarTimestampConvention::BarOpen,
+    )
+    .expect("unverified fixture identity");
+    assert_eq!(
+        features.provenance().bindings()[0].dataset_identity(),
+        &expected_identity
+    );
+    assert_eq!(
+        features.provenance().bindings()[0].manifest_schema_id(),
+        "neoethos.embedded-test-fixture.v1"
+    );
+    let config = DiscoveryConfig {
+        walkforward_splits: 1,
+        ..finalization_milestone_config()
+    };
+    assert_eq!(config.embargo_minutes, 120);
+    assert!(
+        timestamps
+            .windows(2)
+            .all(|pair| pair[1] - pair[0] == 60_000)
+    );
+    let window = n / config.walkforward_splits;
+    let train_end = (window as f64 * 0.70) as usize;
+    let embargo = embargo_bars_from_timestamps(&timestamps, config.embargo_minutes);
+    let test_start = train_end + embargo;
+    assert_eq!(
+        (window, train_end, embargo, test_start),
+        (600, 420, 120, 540)
+    );
+    assert_eq!(n - test_start, 60);
+    assert!(window >= 80 && train_end >= 40 && n - test_start >= 40);
+
+    let (result, progress_events) = run_finalization_milestone_fixture(&features, &ohlcv, &config);
+    let error =
+        result.expect_err("eligible financial validation must require exact broker evidence");
     assert!(
         error
             .to_string()
             .contains(neoethos_core::BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1),
         "unexpected finalization error: {error:#}"
     );
-    assert!(progress_events.iter().any(|event| matches!(
-        event,
-        DiscoveryProgress::CandidatesRanked { candidate_count, truncated_to }
-            if *candidate_count == 2 && *truncated_to == 2
-    )));
-    assert!(progress_events.iter().any(|event| matches!(
-        event,
-        DiscoveryProgress::CandidatesFiltered { passed_filters, evaluated_candidates, min_trades_required }
-            if *passed_filters == 2 && *evaluated_candidates == 2 && *min_trades_required == 1
-    )));
-    assert!(progress_events.iter().any(|event| matches!(
-        event,
-        DiscoveryProgress::PortfolioSelected { portfolio_size, rejected_by_correlation, target_portfolio }
-            if *portfolio_size == 1 && *rejected_by_correlation == 1 && *target_portfolio == 2
-    )));
+    assert_pre_walkforward_milestones(&progress_events);
+    assert!(
+        !progress_events
+            .iter()
+            .any(|event| matches!(event, DiscoveryProgress::PortfolioSelected { .. })),
+        "broker-truth refusal during candidate WF must precede portfolio selection"
+    );
     assert!(
         !progress_events
             .iter()
@@ -483,6 +868,7 @@ fn portfolio_export_requires_validation_gates() {
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -518,6 +904,7 @@ fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
     let mut result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -660,6 +1047,7 @@ fn holdout_portfolio_export_uses_effective_names_and_stored_selection_scope() {
     let mut result = DiscoveryResult {
         search_input_receipt: input.receipt().clone(),
         selection_scope: selection_scope.clone(),
+        calibration_scope: windows.calibration().map(|window| window.scope().clone()),
         holdout_scope: Some(holdout_scope.clone()),
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -736,6 +1124,7 @@ fn discovery_profile_exports_validation_gate_status() {
     let mut result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -1034,10 +1423,10 @@ fn validation_v2_wire_rejects_unknown_fields_and_legacy_weak_scope() {
     )
     .expect_err("legacy weak v1 must fail closed");
     let message = error.to_string();
-    assert!(message.contains("legacy") || message.contains("version 1"));
     assert!(
-        message.contains("regenerate"),
-        "unexpected error: {message}"
+        message.contains("missing canonical backtest metric payload schema version")
+            && message.contains("unversioned metric artifacts cannot be loaded"),
+        "unexpected strict wire refusal: {message}"
     );
 }
 
@@ -1097,6 +1486,7 @@ fn strict_split_validation_result(portfolio: Vec<Gene>) -> DiscoveryResult {
     DiscoveryResult {
         search_input_receipt: receipt,
         selection_scope,
+        calibration_scope: None,
         holdout_scope: Some(holdout_scope),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_owned(),
         cost_band_by_strategy: Vec::new(),
@@ -1116,253 +1506,27 @@ fn strict_split_validation_result(portfolio: Vec<Gene>) -> DiscoveryResult {
     }
 }
 
-fn snapshot_tree_bytes(
-    root: &std::path::Path,
-) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-    fn visit(
-        root: &std::path::Path,
-        dir: &std::path::Path,
-        out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
-    ) {
-        let mut entries = std::fs::read_dir(dir)
-            .expect("snapshot directory must be readable")
-            .map(|entry| entry.expect("snapshot entry must be readable"))
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let metadata =
-                std::fs::symlink_metadata(&path).expect("snapshot entry metadata must be readable");
-            assert!(
-                !metadata.file_type().is_symlink(),
-                "an authoritative snapshot must never contain a symlink: {}",
-                path.display()
-            );
-            if metadata.is_dir() {
-                visit(root, &path, out);
-            } else {
-                out.insert(
-                    path.strip_prefix(root)
-                        .expect("snapshot entry must remain below root")
-                        .to_path_buf(),
-                    std::fs::read(&path).expect("snapshot member bytes must be readable"),
-                );
-            }
-        }
-    }
-
-    let mut files = std::collections::BTreeMap::new();
-    visit(root, root, &mut files);
-    files
-}
-
 #[test]
-fn validation_snapshot_commits_strict_content_addressed_generation_and_reuses_it_byte_for_byte() {
-    let root = temp_dir("strict-validation-snapshot-idempotent");
-    let alpha = profitable_gene("strict-alpha");
-    let beta = profitable_gene("strict-beta");
-    let result = strict_split_validation_result(vec![beta.clone(), alpha.clone()]);
+fn legacy_validation_snapshot_refuses_without_quote_validated_outer_holdout() {
+    let root = temp_dir("legacy-validation-snapshot-refusal");
+    let result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);
 
-    let first = crate::save_discovery_validation_snapshot(&root, &result)
-        .expect("the complete result must commit one strict snapshot");
+    let error = crate::save_discovery_validation_snapshot(&root, &result)
+        .expect_err("legacy V2 evidence must never mint a promotion snapshot");
     assert!(
-        first.generation_id().starts_with("fnv64-"),
-        "the immutable generation leaf must be content-addressed"
+        error
+            .to_string()
+            .contains("explicit sealed quote-validated outer holdout"),
+        "unexpected snapshot refusal: {error:#}"
     );
-    let current_path = root.join("CURRENT.json");
-    let current_json: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&current_path).expect("CURRENT must be committed last"),
-    )
-    .expect("CURRENT must be strict JSON");
-    let current = current_json
-        .as_object()
-        .expect("CURRENT must be one small object");
-    assert_eq!(
-        current
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>(),
-        ["generation_id", "manifest_hash", "schema_version"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        "CURRENT may select a generation but must not duplicate manifest authority"
-    );
-
-    let loaded = crate::load_discovery_validation_snapshot(&root)
-        .expect("the committed snapshot must validate on read");
-    loaded
-        .validate_against(&result)
-        .expect("reader must revalidate exact scopes/config/genes/evidence");
-    assert_eq!(loaded.pointer(), &first);
-    assert_eq!(loaded.manifest().scope(), result.selection_scope().unwrap());
-    assert_eq!(
-        loaded.manifest().search_config_hash(),
-        STRICT_VALIDATION_SEARCH_CONFIG_HASH
-    );
-    assert_eq!(
-        loaded.manifest().payload().holdout_scope(),
-        result.holdout_scope().unwrap().unwrap()
-    );
-    let strategies = loaded.manifest().payload().strategies();
-    assert_eq!(strategies.len(), 2);
-    let strategy_hashes = strategies
-        .iter()
-        .map(|entry| entry.strategy_identity().exact_gene_hash())
-        .collect::<Vec<_>>();
-    assert!(strategy_hashes.windows(2).all(|pair| pair[0] < pair[1]));
-    for entry in strategies {
-        entry
-            .strategy_identity()
-            .validate_against(entry.gene())
-            .expect("the manifest must carry each exact full gene");
-        assert_eq!(entry.members().len(), 4, "one exact member per kind");
-    }
-
-    let manifest_path = loaded.generation_dir().join("manifest.json");
-    let manifest_json: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&manifest_path).expect("generation manifest must exist"),
-    )
-    .expect("generation manifest must be JSON");
     assert!(
-        manifest_json
-            .get("payload")
-            .and_then(|payload| payload.get("manifest_hash"))
-            .is_none(),
-        "the manifest hash must live only in CURRENT and cannot hash itself"
+        !root.exists(),
+        "authority validation must finish before creating a snapshot directory"
     );
-    assert_eq!(
-        crate::artifact_io::stable_json_hash(&manifest_json).expect("manifest hash"),
-        first.manifest_hash()
-    );
-
-    let before = snapshot_tree_bytes(&root);
-    let second = crate::save_discovery_validation_snapshot(&root, &result)
-        .expect("an exact existing immutable generation must be verified and reused");
-    assert_eq!(second, first);
-    assert_eq!(
-        snapshot_tree_bytes(&root),
-        before,
-        "idempotent reuse is byte exact"
-    );
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn validation_snapshot_new_current_has_no_stale_members_from_the_previous_generation() {
-    let root = temp_dir("strict-validation-snapshot-replacement");
-    let alpha = profitable_gene("strict-alpha");
-    let beta = profitable_gene("strict-beta");
-    let first_result = strict_split_validation_result(vec![alpha.clone(), beta]);
-    let second_result = strict_split_validation_result(vec![alpha]);
-
-    let first =
-        crate::save_discovery_validation_snapshot(&root, &first_result).expect("first generation");
-    let second = crate::save_discovery_validation_snapshot(&root, &second_result)
-        .expect("replacement generation");
-    assert_ne!(first.generation_id(), second.generation_id());
-    assert!(
-        root.join("generations")
-            .join(first.generation_id())
-            .is_dir(),
-        "old immutable generations may remain for audit but are not current"
-    );
-
-    let loaded = crate::load_discovery_validation_snapshot(&root)
-        .expect("CURRENT must select only the replacement generation");
-    assert_eq!(loaded.pointer(), &second);
-    loaded
-        .validate_against(&second_result)
-        .expect("replacement must validate exactly");
-    assert_eq!(loaded.manifest().payload().strategies().len(), 1);
-    assert_eq!(
-        loaded.manifest().payload().all_members().len(),
-        5,
-        "four per-strategy artifacts plus one promotion summary"
-    );
-
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn validation_snapshot_failures_before_current_swap_preserve_previous_authority() {
-    let root = temp_dir("strict-validation-snapshot-fault");
-    let original_result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);
-    let replacement_result = strict_split_validation_result(vec![profitable_gene("strict-beta")]);
-    let original = crate::save_discovery_validation_snapshot(&root, &original_result)
-        .expect("original generation");
-    let current_path = root.join("CURRENT.json");
-    let current_before = std::fs::read(&current_path).expect("original CURRENT");
-
-    for fault in [
-        crate::validation_snapshot::ValidationSnapshotTestFault::AfterFirstMemberWrite,
-        crate::validation_snapshot::ValidationSnapshotTestFault::BeforeCurrentSwap,
-    ] {
-        let error = crate::validation_snapshot::save_discovery_validation_snapshot_with_test_fault(
-            &root,
-            &replacement_result,
-            fault,
-        )
-        .expect_err("an injected staging/commit fault must fail loudly");
-        assert!(error.to_string().contains("injected"), "{error:#}");
-        assert_eq!(
-            std::fs::read(&current_path).expect("CURRENT must remain readable"),
-            current_before,
-            "CURRENT is swapped last and must remain byte-identical on failure"
-        );
-        let loaded = crate::load_discovery_validation_snapshot(&root)
-            .expect("the previous generation must remain authoritative");
-        assert_eq!(loaded.pointer(), &original);
-        loaded.validate_against(&original_result).unwrap();
-    }
-
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn validation_snapshot_existing_content_address_is_verified_never_overwritten() {
-    let root = temp_dir("strict-validation-snapshot-no-overwrite");
-    let old_result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);
-    let current_result = strict_split_validation_result(vec![profitable_gene("strict-beta")]);
-
-    let old_ref =
-        crate::save_discovery_validation_snapshot(&root, &old_result).expect("old generation");
-    let old_loaded = crate::load_discovery_validation_snapshot(&root).unwrap();
-    let relative_member = old_loaded.manifest().payload().strategies()[0].members()[0]
-        .relative_path()
-        .to_path_buf();
-    let current_ref = crate::save_discovery_validation_snapshot(&root, &current_result)
-        .expect("current generation");
-    let tampered_path = root
-        .join("generations")
-        .join(old_ref.generation_id())
-        .join(relative_member);
-    let mut tampered_bytes = std::fs::read(&tampered_path).unwrap();
-    tampered_bytes.extend_from_slice(b" ");
-    std::fs::write(&tampered_path, &tampered_bytes).unwrap();
-
-    let error = crate::save_discovery_validation_snapshot(&root, &old_result)
-        .expect_err("an existing content address with different bytes must refuse");
-    assert!(
-        error.to_string().contains("existing immutable generation"),
-        "{error:#}"
-    );
-    assert_eq!(
-        std::fs::read(&tampered_path).unwrap(),
-        tampered_bytes,
-        "the writer must never repair by overwriting an immutable generation"
-    );
-    let loaded = crate::load_discovery_validation_snapshot(&root)
-        .expect("failed reuse must leave the prior CURRENT authoritative");
-    assert_eq!(loaded.pointer(), &current_ref);
-    loaded.validate_against(&current_result).unwrap();
-
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn validation_snapshot_reader_rejects_extra_members_unknown_current_fields_and_unsafe_paths() {
+fn validation_snapshot_relative_path_validation_rejects_unsafe_values() {
     for unsafe_path in [
         std::path::Path::new("../escape.json"),
         std::path::Path::new("nested/../../escape.json"),
@@ -1381,52 +1545,7 @@ fn validation_snapshot_reader_rejects_extra_members_unknown_current_fields_and_u
         "canonical/fnv64-0123456789abcdef.json",
     ))
     .expect("normal safe relative member path");
-
-    let extra_root = temp_dir("strict-validation-snapshot-extra-member");
-    let result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);
-    crate::save_discovery_validation_snapshot(&extra_root, &result).unwrap();
-    let loaded = crate::load_discovery_validation_snapshot(&extra_root).unwrap();
-    std::fs::write(loaded.generation_dir().join("unexpected.json"), b"{}\n").unwrap();
-    let extra_error = crate::load_discovery_validation_snapshot(&extra_root)
-        .expect_err("unlisted generation members must fail closed");
-    assert!(extra_error.to_string().contains("extra"), "{extra_error:#}");
-
-    let missing_root = temp_dir("strict-validation-snapshot-missing-member");
-    crate::save_discovery_validation_snapshot(&missing_root, &result).unwrap();
-    let loaded = crate::load_discovery_validation_snapshot(&missing_root).unwrap();
-    let missing_member = loaded.manifest().payload().strategies()[0].members()[0]
-        .relative_path()
-        .to_path_buf();
-    std::fs::remove_file(loaded.generation_dir().join(missing_member)).unwrap();
-    let missing_error = crate::load_discovery_validation_snapshot(&missing_root)
-        .expect_err("a missing listed generation member must fail closed");
-    assert!(
-        missing_error.to_string().contains("missing"),
-        "{missing_error:#}"
-    );
-
-    let pointer_root = temp_dir("strict-validation-snapshot-current-unknown");
-    crate::save_discovery_validation_snapshot(&pointer_root, &result).unwrap();
-    let current_path = pointer_root.join("CURRENT.json");
-    let mut current: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&current_path).unwrap()).unwrap();
-    current
-        .as_object_mut()
-        .unwrap()
-        .insert("legacy_fallback".to_owned(), serde_json::Value::Bool(true));
-    std::fs::write(&current_path, serde_json::to_vec_pretty(&current).unwrap()).unwrap();
-    let pointer_error = crate::load_discovery_validation_snapshot(&pointer_root)
-        .expect_err("CURRENT must deny unknown fields");
-    assert!(
-        pointer_error.to_string().contains("unknown field"),
-        "{pointer_error:#}"
-    );
-
-    let _ = std::fs::remove_dir_all(extra_root);
-    let _ = std::fs::remove_dir_all(missing_root);
-    let _ = std::fs::remove_dir_all(pointer_root);
 }
-
 #[cfg(unix)]
 #[test]
 fn validation_snapshot_member_resolution_refuses_symlink_traversal() {
@@ -1592,51 +1711,20 @@ fn complete_promotion_evidence_requires_one_artifact_per_kind_and_strategy() {
 }
 
 #[test]
-fn promotion_summary_v3_binds_exact_composite_scopes_and_validated_hashes() {
+fn promotion_summary_v3_refuses_legacy_evidence_without_sealed_quote_holdout() {
     let alpha = profitable_gene("strict-alpha");
-    let result = strict_split_validation_result(vec![alpha.clone()]);
-    let expected_hashes =
-        discovery_per_kind_evidence_hashes(&result).expect("validated evidence hashes");
+    let result = strict_split_validation_result(vec![alpha]);
     let path = temp_path("strict-promotion-summary-v3");
 
-    save_promotion_summary_json(&path, &result).expect("strict composite promotion summary");
-    let bytes = std::fs::read(&path).expect("read promotion summary v3");
-    let envelope =
-        CanonicalSearchArtifactEnvelopeV2::<PromotionSummaryAuthorityPayloadV3>::from_json_bytes(
-            &bytes,
-        )
-        .expect("strict promotion-summary v3 envelope");
-    envelope
-        .validate_against(
-            PROMOTION_SUMMARY_ARTIFACT_KIND_V3,
-            STRICT_VALIDATION_SEARCH_CONFIG_HASH,
-            &result.search_input_receipt,
-            result
-                .selection_scope()
-                .expect("selection scope")
-                .evaluated_window(),
-        )
-        .expect("outer promotion authority must bind exact selection scope");
-    assert_eq!(
-        envelope.payload().holdout_scope(),
-        result
-            .holdout_scope()
-            .expect("valid result scopes")
-            .expect("promotion requires holdout")
+    let error = save_promotion_summary_json(&path, &result)
+        .expect_err("legacy diagnostics must not mint promotion authority");
+    assert!(
+        error
+            .to_string()
+            .contains("explicit sealed quote-validated outer holdout"),
+        "unexpected promotion refusal: {error:#}"
     );
-    assert_eq!(
-        envelope.payload().validation_evidence_hashes(),
-        &expected_hashes
-    );
-    assert_eq!(envelope.payload().strategy_evidence().len(), 1);
-    assert_eq!(
-        envelope.payload().strategy_evidence()[0]
-            .strategy_identity()
-            .strategy_id(),
-        alpha.strategy_id
-    );
-
-    let _ = std::fs::remove_file(path);
+    assert!(!path.exists(), "refused promotion must not create a file");
 }
 
 #[test]
@@ -1673,6 +1761,7 @@ fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -1720,6 +1809,7 @@ fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -1760,6 +1850,7 @@ fn save_canonical_backtest_artifacts_skips_when_empty() {
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -1802,7 +1893,7 @@ fn discovery_runtime_overrides_defaults_match_legacy_env_defaults() {
     // different searches. All three now agree; see
     // `docs/pending-edits-forbidden-territory.md` §2.
     assert_eq!(defaults.prefilter_top_k, 240);
-    assert!((defaults.prefilter_insample_frac - 0.80).abs() < 1e-9);
+    assert!((defaults.prefilter_insample_frac - 1.0).abs() < 1e-9);
     assert_eq!(defaults.prefilter_min_per_timeframe, 6);
     assert!((defaults.funnel_stage1_pct - 0.25).abs() < 1e-9);
 }
@@ -1864,6 +1955,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -2003,9 +2095,6 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: 0.0,
-        // No CPCV: this fixture is 200-odd rows and the point of the test is the
-        // per-timeframe quota, not the fold refit.
-        cpcv: None,
     };
 
     // Legacy (no quota): top-3 by |corr| are the 3 base columns; no HTF.
@@ -2080,7 +2169,6 @@ fn first_passage_labels_decide_on_a_trending_series_and_are_fully_counted() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: 0.0,
-        cpcv: None,
     };
     let (labels, census) = first_passage_labels(&ohlcv, &spec);
     assert_eq!(labels.long.len(), n);
@@ -2153,7 +2241,6 @@ fn the_round_trip_cost_moves_both_barriers_the_same_way() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: cost,
-        cpcv: None,
     };
     let (_, free) = first_passage_labels(&ohlcv, &spec(0.0));
     let (_, charged) = first_passage_labels(&ohlcv, &spec(0.0005));
@@ -2166,11 +2253,11 @@ fn the_round_trip_cost_moves_both_barriers_the_same_way() {
     );
 }
 
-/// The refit must actually produce several fit windows when CPCV is configured,
-/// and exactly one (the legacy prefix) when it is not. This is the difference
-/// between a contaminated CPCV number and an honest one.
+/// Cheap feature ranking must run once inside the already-separated selection
+/// window. Its final label horizon is embargoed so the target cannot look past
+/// the fit boundary; expensive CPCV belongs to finalist validation.
 #[test]
-fn prefilter_refits_inside_cpcv_folds_and_falls_back_to_a_single_prefix() {
+fn prefilter_uses_one_label_safe_selection_window() {
     let base = PrefilterSpec {
         top_k: 4,
         insample_frac: 0.8,
@@ -2180,39 +2267,21 @@ fn prefilter_refits_inside_cpcv_folds_and_falls_back_to_a_single_prefix() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: 0.0,
-        cpcv: None,
     };
-    let (prefix_windows, available) = prefilter_fit_windows(10_000, &base);
+    let (windows, available) = prefilter_fit_windows(10_000, &base);
     assert_eq!(
-        prefix_windows.len(),
+        windows.len(),
         1,
-        "no CPCV configured means the OLD behaviour: one leading prefix, fit once"
+        "raw columns must be ranked once before the GA"
     );
-    assert_eq!(available, 0);
-
-    let with_cpcv = PrefilterSpec {
-        cpcv: Some((8, 2, 0.01, 0.01, 0)),
-        ..base
-    };
-    let (fold_windows, available) = prefilter_fit_windows(10_000, &with_cpcv);
+    assert_eq!(available, 0, "prefilter does not execute CPCV folds");
+    assert_eq!(windows[0].len(), 7_960);
+    assert_eq!(windows[0].first(), Some(&0));
+    assert_eq!(windows[0].last(), Some(&7_959));
     assert!(
-        fold_windows.len() > 1,
-        "the ranking must be refit inside SEVERAL fold train sets, got {}",
-        fold_windows.len()
+        windows[0].last().copied().unwrap() + base.max_hold_bars < 8_000,
+        "the label horizon must end inside the 80% fit boundary"
     );
-    assert!(
-        fold_windows.len() <= PREFILTER_MAX_REFIT_FOLDS,
-        "the refit is capped at {PREFILTER_MAX_REFIT_FOLDS} folds, got {}",
-        fold_windows.len()
-    );
-    assert_eq!(
-        available, 28,
-        "C(8,2) = 28 folds are available; the run must report how many of them it used"
-    );
-    for window in &fold_windows {
-        assert!(!window.is_empty(), "an empty fit window must not be kept");
-        assert!(window.iter().all(|&i| i < 10_000));
-    }
 }
 
 /// The whole point of the f64 pairwise rewrite: a column whose leading rows are
@@ -2225,7 +2294,11 @@ fn a_nan_prefixed_column_is_ranked_on_its_finite_rows_not_scored_zero() {
     let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(n);
     let mut close = Vec::with_capacity(n);
     for i in 0..n {
-        close.push(1.1000 + (i as f64) * 0.00005 + 0.0002 * ((i as f64) * 0.3).sin());
+        // Alternating market legs make the first-passage label genuinely
+        // non-constant. The old monotonic ramp produced almost exclusively
+        // `+1`, so even a column equal to that label had zero variance and
+        // could not be ranked by Pearson correlation.
+        close.push(1.1000 + 0.0030 * ((i as f64) * 0.05).sin());
     }
     let ohlcv = Ohlcv {
         timestamp: Some(timestamps.clone()),
@@ -2244,9 +2317,19 @@ fn a_nan_prefixed_column_is_ranked_on_its_finite_rows_not_scored_zero() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: 0.0,
-        cpcv: None,
     };
     let (labels, _) = first_passage_labels(&ohlcv, &spec);
+    let distinct_finite_labels = labels
+        .long
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .map(f64::to_bits)
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        distinct_finite_labels.len() > 1,
+        "the correlation fixture itself must have a non-constant target"
+    );
 
     // Column 0: the LONG label itself, with the leading-NaN prefix every aligned
     // higher-timeframe column carries. Column 1: pure noise.
@@ -2372,6 +2455,7 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
     let result = DiscoveryResult {
         search_input_receipt: receipt,
         selection_scope,
+        calibration_scope: None,
         holdout_scope: Some(holdout_scope),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -2419,6 +2503,7 @@ fn discovery_profile_exports_forward_test_artifact_count() {
     let mut result = DiscoveryResult {
         search_input_receipt: receipt,
         selection_scope,
+        calibration_scope: None,
         holdout_scope: Some(holdout_scope.clone()),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -2485,6 +2570,7 @@ fn empty_discovery_result_with_gates(
     DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -2514,91 +2600,19 @@ fn evidence_bridge_mirrors_discovery_validation_gates_with_no_forward_test_artif
 }
 
 #[test]
-fn evidence_bridge_marks_forward_test_passed_when_every_artifact_is_profitable() {
+fn legacy_v2_evidence_bridge_refuses_without_sealed_quote_validated_outer_holdout() {
     let result = strict_split_validation_result(vec![
         profitable_gene("strict-alpha"),
         profitable_gene("strict-beta"),
     ]);
-    let evidence = live_validation_evidence_from_discovery(&result)
-        .expect("complete exact evidence must aggregate");
-    assert_eq!(evidence.forward_test_passed, Some(true));
-}
-
-#[test]
-fn evidence_bridge_marks_forward_test_failed_when_any_artifact_is_unprofitable() {
-    let alpha = profitable_gene("strict-alpha");
-    let beta = profitable_gene("strict-beta");
-    let mut result = strict_split_validation_result(vec![alpha, beta.clone()]);
-    let holdout_scope = result
-        .holdout_scope
-        .as_ref()
-        .expect("holdout scope")
-        .clone();
-    result.forward_test_validation_artifacts[1] =
-        forward_test_artifact_with_metrics(&beta, &holdout_scope, -10.0, 2);
-    let evidence = live_validation_evidence_from_discovery(&result)
-        .expect("complete exact evidence must aggregate");
-    assert_eq!(evidence.forward_test_passed, Some(false));
-}
-
-#[test]
-fn evidence_bridge_marks_forward_test_failed_when_artifact_has_zero_trades() {
-    let alpha = profitable_gene("strict-alpha");
-    let mut result = strict_split_validation_result(vec![alpha.clone()]);
-    let holdout_scope = result
-        .holdout_scope
-        .as_ref()
-        .expect("holdout scope")
-        .clone();
-    result.forward_test_validation_artifacts[0] =
-        forward_test_artifact_with_metrics(&alpha, &holdout_scope, 5.0, 0);
-    let evidence = live_validation_evidence_from_discovery(&result)
-        .expect("complete exact evidence must aggregate");
-    assert_eq!(evidence.forward_test_passed, Some(false));
-}
-
-#[test]
-fn evidence_bridge_propagates_failed_walkforward_and_cpcv() {
-    let mut result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);
-    result.validation_gates.walkforward_passed = false;
-    result.validation_gates.cpcv_passed = false;
-    let evidence = live_validation_evidence_from_discovery(&result)
-        .expect("complete exact evidence must aggregate");
-    assert!(!evidence.walkforward_passed);
-    assert!(!evidence.cpcv_passed);
-}
-
-#[test]
-fn evidence_bridge_marks_prop_firm_passed_when_every_artifact_passes() {
-    let result = strict_split_validation_result(vec![
-        profitable_gene("strict-alpha"),
-        profitable_gene("strict-beta"),
-    ]);
-    let evidence = live_validation_evidence_from_discovery(&result)
-        .expect("complete exact evidence must aggregate");
-    assert_eq!(evidence.prop_firm_passed, Some(true));
-}
-
-#[test]
-fn evidence_bridge_marks_prop_firm_failed_when_any_artifact_fails() {
-    let alpha = profitable_gene("strict-alpha");
-    let beta = profitable_gene("strict-beta");
-    let mut result = strict_split_validation_result(vec![alpha, beta.clone()]);
-    let holdout_scope = result
-        .holdout_scope
-        .as_ref()
-        .expect("holdout scope")
-        .clone();
-    result.prop_firm_validation_artifacts[1] = PropFirmRiskValidationArtifactFile::new(
-        holdout_scope,
-        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
-        &beta,
-        strict_prop_firm_summary(false),
-    )
-    .expect("strict failing prop-firm fixture");
-    let evidence = live_validation_evidence_from_discovery(&result)
-        .expect("complete exact evidence must aggregate");
-    assert_eq!(evidence.prop_firm_passed, Some(false));
+    let error = live_validation_evidence_from_discovery(&result)
+        .expect_err("legacy V2 validation diagnostics must not authorize live execution");
+    assert!(
+        error
+            .to_string()
+            .contains("explicit sealed quote-validated outer holdout"),
+        "unexpected live-evidence refusal: {error:#}"
+    );
 }
 
 #[test]
@@ -2678,6 +2692,7 @@ fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
     let result = DiscoveryResult {
         search_input_receipt: receipt,
         selection_scope,
+        calibration_scope: None,
         holdout_scope: Some(holdout_scope),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -2774,6 +2789,7 @@ fn populated_discovery_result(
     DiscoveryResult {
         search_input_receipt: receipt,
         selection_scope,
+        calibration_scope: None,
         holdout_scope: Some(holdout_scope),
         search_config_hash: STRICT_VALIDATION_SEARCH_CONFIG_HASH.to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -2897,17 +2913,19 @@ fn full_validation_chain_with_complete_producer_evidence_passes_lossy_manifest()
             .starts_with("deferred:")
     );
 
-    // 4. Evidence bridge surfaces the producer-side outcomes.
+    // 4. Legacy producer-side diagnostics do not authorize live execution.
+    // Promotion requires the separate sealed quote-validated outer holdout.
     let mut result_for_evidence = result.clone();
     result_for_evidence.validation_gates.walkforward_passed = true;
     result_for_evidence.validation_gates.cpcv_passed = true;
-    let evidence = live_validation_evidence_from_discovery(&result_for_evidence)
-        .expect("complete exact producer evidence must aggregate");
-    assert!(evidence.walkforward_passed);
-    assert!(evidence.cpcv_passed);
-    assert_eq!(evidence.forward_test_passed, Some(true));
-    assert_eq!(evidence.prop_firm_passed, Some(true));
-    assert!(evidence.live_sim_runtime_model_hash.is_none());
+    let error = live_validation_evidence_from_discovery(&result_for_evidence)
+        .expect_err("legacy producer evidence must not mint live authority");
+    assert!(
+        error
+            .to_string()
+            .contains("explicit sealed quote-validated outer holdout"),
+        "unexpected live-evidence refusal: {error:#}"
+    );
 
     // 5. Profile carries the same data without re-deriving anything.
     let profile = build_discovery_profile(&DiscoveryConfig::default(), &result_for_evidence);
@@ -2963,6 +2981,7 @@ fn discovery_run_profile_leaves_engine_identity_empty_without_a_run_receipt() {
 #[test]
 fn discovery_run_profile_persists_the_full_run_scoped_execution_receipt_v2() {
     let mut result = populated_discovery_result(0, 0, 0, 0);
+    result.funnel_profile = Some(crate::funnel_profile::FunnelProfile::new("EURUSD", "M1"));
     let run = crate::population_engine_run_receipt_v1::begin_population_engine_run_v1(
         &result.selection_scope,
     )
@@ -3036,14 +3055,7 @@ fn discovery_run_profile_exposes_validation_evidence_hashes_and_missing_kinds() 
     assert_eq!(profile.prop_firm_validation_artifacts_observed, 1);
 }
 
-// ─── F-304: pre-flight bail tests (2026-05-28) ────────────────────
-//
-// `run_discovery_cycle_with_progress` must fail loud BEFORE spinning
-// up the GA when `evaluation_symbol` or `evaluation_account_currency`
-// is empty. The previous behaviour was to silently propagate the
-// empty strings into the cost-model NaN-sentinel guard which made
-// every GA candidate produce zero-trade metrics that the sanitizer
-// scrubbed to 0.0 — operator's "no trades found" with no clue why.
+// Discovery configuration fixture shared by the current authority tests.
 
 fn valid_discovery_config() -> DiscoveryConfig {
     DiscoveryConfig {
@@ -3058,69 +3070,6 @@ fn valid_discovery_config() -> DiscoveryConfig {
         portfolio_size: 5,
         ..DiscoveryConfig::default()
     }
-}
-
-fn assert_broker_truth_precedes_legacy_config_math(error: &anyhow::Error) {
-    let message = format!("{error:#}");
-    assert!(
-        message.contains(neoethos_core::BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1),
-        "discovery reached legacy config/cost handling before broker truth: {message}"
-    );
-}
-
-#[test]
-fn run_discovery_cycle_bails_on_empty_evaluation_symbol() {
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
-    let mut cfg = valid_discovery_config();
-    cfg.evaluation_symbol = String::new();
-    let input = sample_run_input(&features, &ohlcv);
-    let err = run_discovery_cycle(&input, &cfg).expect_err("empty symbol must bail");
-    assert_broker_truth_precedes_legacy_config_math(&err);
-}
-
-#[test]
-fn run_discovery_cycle_bails_on_empty_account_currency() {
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
-    let mut cfg = valid_discovery_config();
-    cfg.evaluation_account_currency = String::new();
-    let input = sample_run_input(&features, &ohlcv);
-    let err = run_discovery_cycle(&input, &cfg).expect_err("empty account_currency must bail");
-    assert_broker_truth_precedes_legacy_config_math(&err);
-}
-
-#[test]
-fn run_discovery_cycle_bails_on_nan_spread() {
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
-    let mut cfg = valid_discovery_config();
-    cfg.evaluation_spread_pips = f64::NAN;
-    let input = sample_run_input(&features, &ohlcv);
-    let err = run_discovery_cycle(&input, &cfg).expect_err("NaN spread must bail");
-    assert_broker_truth_precedes_legacy_config_math(&err);
-}
-
-#[test]
-fn run_discovery_cycle_bails_on_nan_commission() {
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
-    let mut cfg = valid_discovery_config();
-    cfg.evaluation_commission_per_trade = f64::NAN;
-    let input = sample_run_input(&features, &ohlcv);
-    let err = run_discovery_cycle(&input, &cfg).expect_err("NaN commission must bail");
-    assert_broker_truth_precedes_legacy_config_math(&err);
-}
-
-#[test]
-fn run_discovery_cycle_bails_on_whitespace_only_currency() {
-    let features = sample_feature_frame();
-    let ohlcv = sample_ohlcv();
-    let mut cfg = valid_discovery_config();
-    cfg.evaluation_account_currency = "   ".to_string();
-    let input = sample_run_input(&features, &ohlcv);
-    let err = run_discovery_cycle(&input, &cfg).expect_err("whitespace-only currency must bail");
-    assert_broker_truth_precedes_legacy_config_math(&err);
 }
 
 #[test]
@@ -3460,6 +3409,11 @@ fn operator_risk_band_reaches_the_discovery_backtest() {
     let mut settings = neoethos_core::Settings::default();
     settings.risk.min_risk_per_trade = 0.05;
     settings.risk.max_risk_per_trade = 0.30;
+    // The default product is PropFirm, whose explicit mode band correctly wins
+    // over the shared fallback. Change that operator-facing band as well so
+    // this test exercises the resolved policy that actually runs.
+    settings.risk.prop_firm_min_risk_per_trade = Some(0.05);
+    settings.risk.prop_firm_max_risk_per_trade = Some(0.30);
 
     let config = DiscoveryConfig::from_settings(&settings);
     assert!((config.risk_per_trade_min - 0.05).abs() < 1e-12);
@@ -3477,6 +3431,164 @@ fn operator_risk_band_reaches_the_discovery_backtest() {
         settings_out.risk_per_trade_max
     );
     assert!((settings_out.risk_per_trade_min - 0.05).abs() < 1e-12);
+    let generation_zero = config.evaluation_config(Some(1.25));
+    assert!((generation_zero.risk_per_trade_min - 0.05).abs() < 1e-12);
+    assert!((generation_zero.risk_per_trade_max - 0.30).abs() < 1e-12);
+}
+
+#[test]
+fn operator_high_quality_confidence_reaches_the_discovery_backtest() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.high_quality_confidence = 0.40;
+
+    let config = DiscoveryConfig::from_settings(&settings);
+    assert!((config.high_quality_confidence - 0.40).abs() < 1e-12);
+
+    let gene = Gene {
+        sl_pips: 20.0,
+        tp_pips: 40.0,
+        ..Default::default()
+    };
+    let settings_out = PopulationTemplateResolver::new(&config, Some(1.25)).template(&gene);
+    assert!(
+        (settings_out.high_quality_confidence - 0.40).abs() < 1e-12,
+        "the backtest must use the operator's confidence normaliser, got {}",
+        settings_out.high_quality_confidence
+    );
+    assert!(
+        (config.evaluation_config(Some(1.25)).high_quality_confidence - 0.40).abs() < 1e-12,
+        "Generation 0 must use the same confidence normaliser"
+    );
+}
+
+#[test]
+fn generation_zero_and_post_ga_share_the_same_run_scoped_execution_policy() {
+    let mut config = valid_discovery_config();
+    config.kill_zones_enabled = false;
+    config.session_spread_pips = Some([0.2, 0.4, 0.6]);
+    config.swap_long_pips_per_day = -0.17;
+    config.swap_short_pips_per_day = 0.09;
+    config.pnl_conversion_fee_rate = 0.0125;
+    config.risk_per_trade_min = 0.01;
+    config.risk_per_trade_max = 0.02;
+    config.high_quality_confidence = 0.50;
+
+    let gene = Gene {
+        sl_pips: 20.0,
+        tp_pips: 40.0,
+        ..Default::default()
+    };
+    let generation_zero = config.evaluation_config(Some(1.25));
+    let post_ga = PopulationTemplateResolver::new(&config, Some(1.25)).template(&gene);
+
+    assert_eq!(
+        generation_zero.kill_zones_enabled,
+        post_ga.kill_zones_enabled
+    );
+    assert_eq!(
+        generation_zero.session_spread_pips,
+        post_ga.session_spread_profile.map(|curve| [
+            curve.asian_pips,
+            curve.overlap_pips,
+            curve.late_ny_pips,
+        ])
+    );
+    assert_eq!(
+        generation_zero.swap_long_pips_per_day.to_bits(),
+        post_ga.swap_long_pips_per_day.to_bits()
+    );
+    assert_eq!(
+        generation_zero.swap_short_pips_per_day.to_bits(),
+        post_ga.swap_short_pips_per_day.to_bits()
+    );
+    assert_eq!(
+        generation_zero.pnl_conversion_fee_rate.to_bits(),
+        post_ga.pnl_conversion_fee_rate.to_bits()
+    );
+    assert_eq!(
+        generation_zero.risk_per_trade_min.to_bits(),
+        post_ga.risk_per_trade_min.to_bits()
+    );
+    assert_eq!(
+        generation_zero.risk_per_trade_max.to_bits(),
+        post_ga.risk_per_trade_max.to_bits()
+    );
+    assert_eq!(
+        generation_zero.high_quality_confidence.to_bits(),
+        post_ga.high_quality_confidence.to_bits()
+    );
+}
+
+#[test]
+fn an_out_of_range_high_quality_confidence_is_refused_to_the_default() {
+    for bad in [0.0, -0.5, 1.5, f64::NAN, f64::INFINITY] {
+        let mut settings = neoethos_core::Settings::default();
+        settings.risk.high_quality_confidence = bad;
+        let config = DiscoveryConfig::from_settings(&settings);
+        assert!(
+            (config.high_quality_confidence - 0.65).abs() < 1e-12,
+            "high_quality_confidence = {bad} must be refused to 0.65, got {}",
+            config.high_quality_confidence
+        );
+    }
+}
+
+#[test]
+fn desktop_preflight_risk_profile_is_the_discovery_config_source() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.min_risk_per_trade = 0.002;
+    settings.risk.max_risk_per_trade = 0.025;
+    settings.risk.risky_min_risk_per_trade = Some(0.04);
+    settings.risk.risky_max_risk_per_trade = Some(0.22);
+    settings.risk.prop_firm_min_risk_per_trade = Some(0.001);
+    settings.risk.prop_firm_max_risk_per_trade = Some(0.008);
+    settings.risk.high_quality_confidence = 0.72;
+
+    let profile = resolve_discovery_risk_profile(&settings);
+    assert_eq!(profile.shared_band, (0.002, 0.025));
+    assert_eq!(profile.risky_band(), (0.04, 0.22));
+    assert_eq!(profile.prop_firm_band(), (0.001, 0.008));
+    assert_eq!(profile.high_quality_confidence, 0.72);
+
+    settings.system.trading_mode = "risky".to_string();
+    let risky = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(
+        (risky.risk_per_trade_min, risky.risk_per_trade_max),
+        profile.risky_band()
+    );
+    assert_eq!(
+        risky.high_quality_confidence,
+        profile.high_quality_confidence
+    );
+
+    settings.system.trading_mode = "prop_firm".to_string();
+    let prop_firm = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(
+        (prop_firm.risk_per_trade_min, prop_firm.risk_per_trade_max),
+        profile.prop_firm_band()
+    );
+}
+
+#[test]
+fn prop_firm_preflight_uses_the_same_gate_resolver_as_discovery() {
+    let config = neoethos_core::config::PropFirmGateConfig {
+        max_daily_loss_pct: Some(0.035),
+        max_overall_drawdown_pct: Some(0.075),
+        profit_target_pct: Some(0.09),
+        min_trading_days: Some(6),
+        window_days: 45,
+        n_windows: 17,
+        pass_rate: 0.55,
+    };
+    let resolved = resolve_prop_firm_discovery_gate(&config);
+    assert_eq!(resolved.rules.max_daily_loss_pct, 0.035);
+    assert_eq!(resolved.rules.max_overall_drawdown_pct, 0.075);
+    assert_eq!(resolved.rules.min_profit_target_pct, 0.09);
+    assert!(resolved.rules.require_profit_target);
+    assert_eq!(resolved.rules.min_trading_days, 6);
+    assert_eq!(resolved.window_days, 45);
+    assert_eq!(resolved.n_windows, 17);
+    assert_eq!(resolved.pass_rate, 0.55);
 }
 
 /// SLICE-2 GUARD (2026-08-08). The raw builder `discovery_backtest_settings`
@@ -3568,7 +3680,11 @@ fn gene_eval_settings_resolver_installs_the_scored_stop_regime() {
         .as_ref()
         .expect("adaptive gene gets the slice base series");
     assert_eq!(base.len(), n, "base series indexed to the resolver's slice");
-    assert!(base.iter().all(|&b| b.is_finite() && b > 0.0));
+    assert!(
+        base[..100].iter().all(|b| b.is_nan()),
+        "the resolver must preserve the unavailable 100-return warm-up"
+    );
+    assert!(base[100..].iter().all(|&b| b.is_finite() && b > 0.0));
     assert!(adaptive.adaptive_rr > 0.0);
 
     let fixed = resolver.settings_for_gene(&fixed_gene);
@@ -3587,6 +3703,8 @@ fn risk_band_is_clamped_and_ordered() {
     let mut settings = neoethos_core::Settings::default();
     settings.risk.min_risk_per_trade = 0.40;
     settings.risk.max_risk_per_trade = 0.10;
+    settings.risk.prop_firm_min_risk_per_trade = None;
+    settings.risk.prop_firm_max_risk_per_trade = None;
     let config = DiscoveryConfig::from_settings(&settings);
     assert!(
         config.risk_per_trade_max >= config.risk_per_trade_min,
@@ -3599,14 +3717,21 @@ fn risk_band_is_clamped_and_ordered() {
     let mut settings = neoethos_core::Settings::default();
     settings.risk.min_risk_per_trade = -1.0;
     settings.risk.max_risk_per_trade = 12.0;
+    settings.risk.prop_firm_min_risk_per_trade = None;
+    settings.risk.prop_firm_max_risk_per_trade = None;
     let config = DiscoveryConfig::from_settings(&settings);
     assert_eq!(config.risk_per_trade_min, 0.0);
     assert_eq!(config.risk_per_trade_max, 1.0);
 
-    // A bare default keeps the historical band so nothing else shifts.
+    // A config-load failure must keep the shipped PropFirm band, not widen it
+    // to the generic BacktestSettings 3% ceiling.
     let d = DiscoveryConfig::default();
-    assert!((d.risk_per_trade_min - 0.005).abs() < 1e-12);
-    assert!((d.risk_per_trade_max - 0.03).abs() < 1e-12);
+    assert!((d.risk_per_trade_min - 0.0).abs() < 1e-12);
+    assert!((d.risk_per_trade_max - 0.01).abs() < 1e-12);
+    let from_settings = DiscoveryConfig::from_settings(&neoethos_core::Settings::default());
+    assert!((d.risk_per_trade_min - from_settings.risk_per_trade_min).abs() < 1e-12);
+    assert!((d.risk_per_trade_max - from_settings.risk_per_trade_max).abs() < 1e-12);
+    assert!((d.high_quality_confidence - from_settings.high_quality_confidence).abs() < 1e-12);
 }
 
 /// Risky and Prop-firm must NOT share one sizing knob. Before 2026-07-21 they
@@ -3680,37 +3805,26 @@ fn unset_mode_band_inherits_the_shared_one() {
 #[test]
 fn mode_band_rejects_nonsense_and_orders_itself() {
     let mut settings = neoethos_core::Settings::default();
+    settings.system.trading_mode = "risky".to_string();
     settings.risk.max_risk_per_trade = 0.03;
 
     // A zero / negative / non-finite max means "not set" -> inherit.
     for bad in [Some(0.0), Some(-0.5), Some(f64::NAN)] {
         settings.risk.risky_max_risk_per_trade = bad;
-        let c = DiscoveryConfig {
-            mode: DiscoveryMode::Risky,
-            ..DiscoveryConfig::from_settings(&settings)
-        }
-        .apply_mode_overrides();
+        let c = DiscoveryConfig::from_settings(&settings);
         assert!((c.risk_per_trade_max - 0.03).abs() < 1e-12, "bad={bad:?}");
     }
 
     // min above max cannot invert the band, and nothing exceeds 100%.
     settings.risk.risky_min_risk_per_trade = Some(0.9);
     settings.risk.risky_max_risk_per_trade = Some(0.2);
-    let c = DiscoveryConfig {
-        mode: DiscoveryMode::Risky,
-        ..DiscoveryConfig::from_settings(&settings)
-    }
-    .apply_mode_overrides();
+    let c = DiscoveryConfig::from_settings(&settings);
     assert!(c.risk_per_trade_max >= c.risk_per_trade_min);
     assert!(c.risk_per_trade_max <= 1.0 && c.risk_per_trade_min >= 0.0);
 
     settings.risk.risky_min_risk_per_trade = None;
     settings.risk.risky_max_risk_per_trade = Some(9.0);
-    let c = DiscoveryConfig {
-        mode: DiscoveryMode::Risky,
-        ..DiscoveryConfig::from_settings(&settings)
-    }
-    .apply_mode_overrides();
+    let c = DiscoveryConfig::from_settings(&settings);
     assert_eq!(c.risk_per_trade_max, 1.0, "capped at 100% of the account");
 }
 
@@ -3742,11 +3856,9 @@ fn a_wiped_out_account_is_rejected_however_well_it_scores() {
 
 #[test]
 fn risky_mode_keeps_the_operators_activity_floor() {
-    // This used to be pinned to 0.001 for risky mode, so
-    // `models.prop_search_val_min_trades_per_day` was set, resolved, passed in —
-    // and discarded — in the one mode actually used. A strategy trading twice a
-    // decade cannot compound a small balance to a large one, so the floor has to
-    // reach the search.
+    // Activity is an optional economic preference. A positive value must reach
+    // the search unchanged; a separate assertion below verifies that zero can
+    // genuinely disable it.
     let mut config = DiscoveryConfig::default();
     config.min_trades_per_day = 1.0;
     config.mode = DiscoveryMode::Risky;
@@ -3761,6 +3873,15 @@ fn risky_mode_keeps_the_operators_activity_floor() {
     // must not be read as risky having become strict.
     assert!(risky.filtering.min_profit_factor <= 0.0);
     assert!(risky.filtering.min_win_rate <= 0.0);
+
+    let mut settings = neoethos_core::Settings::default();
+    settings.system.trading_mode = "risky".to_string();
+    settings.models.prop_search_val_min_trades_per_day = 0.0;
+    assert_eq!(
+        DiscoveryConfig::from_settings(&settings).min_trades_per_day,
+        0.0,
+        "zero must disable the cadence preference rather than being raised to 0.2"
+    );
 
     // One trade a day over a year of weekdays is roughly a year of weekdays'
     // worth of in-market bars, not one trade in total.
@@ -4458,7 +4579,13 @@ fn signal_count_screen_matches_screening_each_candidate_alone() {
     for (got, want) in survivors.iter().zip(expected.iter()) {
         assert_eq!(got.0, want.0, "candidate index (order must be preserved)");
         assert_eq!(got.1, want.1, "gene");
-        assert_eq!(got.2, want.2, "signal vector for candidate {}", want.0);
+        let regenerated = signals_for_gene_full(&features, &ohlcv, &got.1, &eval_config)
+            .expect("the same frozen input regenerates the screened signal");
+        assert_eq!(
+            regenerated, want.2,
+            "signal vector for candidate {}",
+            want.0
+        );
     }
 }
 
@@ -4587,7 +4714,6 @@ fn discovery_config_known_default_vs_settings_divergences() -> &'static [&'stati
         "walkforward_splits",
         "cpcv_max_rows",
         "initial_balance",
-        "risk_per_trade_min",
         "higher_timeframes",
         // `filtering.*` — the opportunistic-candidate lane is entirely OFF
         // on the fallback branch and entirely ON on the configured one.
@@ -5240,24 +5366,12 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
             Profile("/execution/gpu/cuda_precision"),
         ),
         (
-            "NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE",
-            Profile("/execution/gpu/wgpu_device_env"),
-        ),
-        (
-            "NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES",
-            Profile("/execution/gpu/multi_wgpu_devices_env"),
-        ),
-        (
             "NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB",
             Profile("/execution/gpu/gpu_buffer_mb_env"),
         ),
         (
             "NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB",
             Profile("/execution/gpu/host_budget_mb_env"),
-        ),
-        (
-            "NEOETHOS_BOT_SEARCH_USE_IGPU",
-            Profile("/execution/gpu/use_igpu_env"),
         ),
         (
             "NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB",
@@ -5349,6 +5463,7 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
     let empty_result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -5432,6 +5547,7 @@ fn identical_configs_produce_identical_profile_json_apart_from_ambient_state() {
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
         selection_scope: sample_discovery_selection_scope(),
+        calibration_scope: None,
         holdout_scope: None,
         search_config_hash: "fnv64:0123456789abcdef".to_string(),
         cost_band_by_strategy: Vec::new(),
@@ -5846,6 +5962,10 @@ fn the_kill_zone_switch_reaches_the_discovery_backtest() {
         template(&on).kill_zones_enabled,
         "the ON setting must reach the settings template"
     );
+    assert!(
+        on.evaluation_config(None).kill_zones_enabled,
+        "the ON setting must reach Generation 0"
+    );
 
     settings.risk.kill_zones_enabled = false;
     let off = crate::discovery::DiscoveryConfig::from_settings(&settings);
@@ -5858,21 +5978,19 @@ fn the_kill_zone_switch_reaches_the_discovery_backtest() {
         "the OFF setting must reach the settings template — a hardcoded `true` here is \
          exactly the defect this test exists for"
     );
+    assert!(
+        !off.evaluation_config(None).kill_zones_enabled,
+        "the OFF setting must reach Generation 0"
+    );
 
     // And the two runs must be TELLABLE APART afterwards through the one
     // canonical search-config authority every validation envelope carries.
-    let hash_on = crate::run_identity::config_hash_for(
-        &on,
-        on.evaluation_config(None).pip_value_per_lot,
-        false,
-    )
-    .expect("search config hash (on)");
-    let hash_off = crate::run_identity::config_hash_for(
-        &off,
-        off.evaluation_config(None).pip_value_per_lot,
-        false,
-    )
-    .expect("search config hash (off)");
+    let hash_on =
+        crate::canonical_discovery_config_digest_v1::canonical_discovery_config_digest_v1(&on)
+            .expect("canonical discovery config digest (on)");
+    let hash_off =
+        crate::canonical_discovery_config_digest_v1::canonical_discovery_config_digest_v1(&off)
+            .expect("canonical discovery config digest (off)");
     assert_ne!(
         hash_on, hash_off,
         "two runs under opposite weekend policies must not hash identically"

@@ -23,7 +23,7 @@ pub(crate) enum CTraderTickDeltaError {
         row: usize,
         raw_price: i64,
     },
-    NotStrictlyNewestFirst {
+    NotNewestFirst {
         row: usize,
         previous_timestamp_ms: i64,
         timestamp_ms: i64,
@@ -57,13 +57,13 @@ impl fmt::Display for CTraderTickDeltaError {
                 formatter,
                 "cTrader tick row {row} decoded to non-positive raw price {raw_price}"
             ),
-            Self::NotStrictlyNewestFirst {
+            Self::NotNewestFirst {
                 row,
                 previous_timestamp_ms,
                 timestamp_ms,
             } => write!(
                 formatter,
-                "cTrader tick row {row} is not strictly newest-first: previous={previous_timestamp_ms}, decoded={timestamp_ms}"
+                "cTrader tick row {row} is not newest-first: previous={previous_timestamp_ms}, decoded={timestamp_ms}"
             ),
             Self::InvalidConvertedPrice { row, price } => write!(
                 formatter,
@@ -126,7 +126,8 @@ pub(crate) fn validate_ctrader_tick_response_identity(
 /// price are absolute; every later value is a signed delta added to the
 /// previously decoded value. The broker returns newest first, which is
 /// validated here before the caller may reverse the complete result into
-/// canonical ascending order.
+/// chronological order. Multiple real ticks can share one millisecond; a
+/// zero timestamp delta preserves both rows and their original wire order.
 pub(crate) fn decode_ctrader_tick_deltas<I, F>(
     wire_rows: I,
     mut convert_price: F,
@@ -151,8 +152,8 @@ where
             return Err(CTraderTickDeltaError::NegativeTimestamp { row, timestamp_ms });
         }
         if let Some(previous) = previous_timestamp {
-            if timestamp_ms >= previous {
-                return Err(CTraderTickDeltaError::NotStrictlyNewestFirst {
+            if timestamp_ms > previous {
+                return Err(CTraderTickDeltaError::NotNewestFirst {
                     row,
                     previous_timestamp_ms: previous,
                     timestamp_ms,
@@ -262,14 +263,14 @@ mod tests {
 
     #[test]
     fn invalid_wire_order_and_prices_fail_closed() {
-        let order_error = decode_ctrader_tick_deltas([(100, 100), (0, -1)], |raw| raw as f64)
-            .expect_err("equal decoded timestamps are not strictly newest-first");
+        let order_error = decode_ctrader_tick_deltas([(100, 100), (1, -1)], |raw| raw as f64)
+            .expect_err("a positive timestamp delta violates newest-first wire order");
         assert_eq!(
             order_error,
-            CTraderTickDeltaError::NotStrictlyNewestFirst {
+            CTraderTickDeltaError::NotNewestFirst {
                 row: 1,
                 previous_timestamp_ms: 100,
-                timestamp_ms: 100,
+                timestamp_ms: 101,
             }
         );
 
@@ -293,6 +294,19 @@ mod tests {
             decode_ctrader_tick_deltas(std::iter::empty::<(i64, i64)>(), |raw| raw as f64)
                 .expect("an empty tickData list is a valid empty broker result");
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn distinct_ticks_in_the_same_millisecond_are_retained_in_wire_order() {
+        let decoded = decode_ctrader_tick_deltas([(100, 100), (0, -1), (-1, 2)], |raw| raw as f64)
+            .expect("zero millisecond delta is valid broker data");
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|t| (t.timestamp_ms, t.price))
+                .collect::<Vec<_>>(),
+            vec![(100, 100.0), (100, 99.0), (99, 101.0)]
+        );
     }
 
     #[test]
@@ -361,6 +375,8 @@ mod tests {
         assert!(payload.contains("has_more: bool"));
         assert!(payload.contains("tick_data: Vec<TickPayload>"));
         assert!(!payload.contains("symbol_id"));
-        assert!(!payload.contains("#[serde(rename = \"tickData\", default)]"));
+        // Repeated proto fields may be absent for an empty response. Required
+        // identity/hasMore fields above must still remain mandatory.
+        assert!(payload.contains("#[serde(rename = \"tickData\", default)]"));
     }
 }

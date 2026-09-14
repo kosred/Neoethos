@@ -1,59 +1,11 @@
 use crate::native_sass::{
-    ArchRequestSource, CuobjdumpReport, NativeArchInputs, NativeArtifact, NativeSassError,
-    native_cubin_filename, plan_native_architectures, select_exact_native_cubin,
+    CuobjdumpReport, NativeArtifact, NativeSassError, select_exact_native_cubin,
     validate_native_manifest, verify_native_cubin,
 };
 use std::path::Path;
 
 const ELF_CUBIN_FIXTURE: &[u8] = b"\x7fELF\x02\x01\x01\x00native-cubin-fixture";
 const INSPECTED_CUBIN_PATH: &str = "/workspace/native/probe_sm120.cubin";
-
-#[test]
-fn planner_emits_only_exact_requested_or_visible_architectures() {
-    let supported = [80, 86, 89, 90, 100, 120];
-    let detected = plan_native_architectures(NativeArchInputs {
-        explicit_archs: None,
-        detected_archs: &[120, 89, 120],
-        nvcc_supported_archs: &supported,
-    })
-    .expect("every visible architecture is supported by this nvcc fixture");
-    assert_eq!(detected.source, ArchRequestSource::DetectedVisibleDevices);
-    assert_eq!(detected.architectures, vec![89, 120]);
-    assert_eq!(
-        detected
-            .architectures
-            .iter()
-            .map(|&arch| native_cubin_filename("adx_kernel", arch))
-            .collect::<Vec<_>>(),
-        ["adx_kernel_sm89.cubin", "adx_kernel_sm120.cubin"]
-    );
-
-    let explicit = plan_native_architectures(NativeArchInputs {
-        explicit_archs: Some("sm_120, 8.9, sm_120"),
-        detected_archs: &[80],
-        nvcc_supported_archs: &supported,
-    })
-    .expect("the explicit list takes precedence and is canonicalized");
-    assert_eq!(explicit.source, ArchRequestSource::ExplicitList);
-    assert_eq!(explicit.architectures, vec![89, 120]);
-
-    assert!(matches!(
-        plan_native_architectures(NativeArchInputs {
-            explicit_archs: None,
-            detected_archs: &[],
-            nvcc_supported_archs: &supported,
-        }),
-        Err(NativeSassError::NoTargetArchitectures)
-    ));
-    assert!(matches!(
-        plan_native_architectures(NativeArchInputs {
-            explicit_archs: None,
-            detected_archs: &[121],
-            nvcc_supported_archs: &supported,
-        }),
-        Err(NativeSassError::UnsupportedArchitectures { missing, .. }) if missing == vec![121]
-    ));
-}
 
 #[test]
 fn manifest_must_be_the_exact_stem_by_architecture_cartesian_product() {

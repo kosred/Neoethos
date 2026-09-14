@@ -28,16 +28,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # machine without them. A GPU box builds explicitly:
 #
 #   cd desktop && npx tauri build -- --features gpu-nvidia     # CUDA
-#   cd desktop && npx tauri build -- --features gpu-vulkan     # AMD/Intel/any
 #
 # The names mirror `neoethos-cli` one-for-one — no capability may differ
 # between front-ends.
 default = []
 gpu = ["gpu-nvidia"]
 gpu-nvidia = ["neoethos-app/gpu-nvidia"]
-gpu-vulkan = ["neoethos-app/gpu-vulkan"]
-gpu-rocm = ["neoethos-app/gpu-rocm"]
-gpu-apple = ["neoethos-app/gpu-apple"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
@@ -46,7 +42,6 @@ tauri-build = { version = "2.6.3", features = [] }
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
-tauri-plugin-log = "2"
 tokio.workspace = true
 # Native OS file picker for the Data Import "Browse…" button.
 rfd = "0.17"

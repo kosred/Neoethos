@@ -34,12 +34,12 @@ fn prototype_b_native_production_contract_keeps_standalone_feature_cubecl_free()
 #[test]
 fn prototype_b_native_production_contract_routes_both_canonical_callers_directly() {
     for required in [
-        "fn evaluate_population_b_native_only(",
-        "evaluate_population_b_native_only(&inputs, \"population_eval\")",
-        "fn validation_backtest_population_native_only(",
-        "evaluate_population_b_native_only(&inputs, \"validation_eval\")",
-        "#[cfg(all(feature = \"gpu-b-native\", not(feature = \"gpu\")))]",
-        "prototype_b_population_eval::submission_ceiling",
+        "fn evaluate_population_b_when_available(",
+        "evaluate_population_b_when_available(&inputs, evidence, \"population_eval\")",
+        "fn validation_backtest_population_native_only_with_evidence(",
+        "evaluate_population_b_when_available(&inputs, evidence, \"validation_eval\")",
+        "#[cfg(feature = \"gpu-b-adapter\")]",
+        "prototype_b_population_eval::try_evaluate_population_b",
     ] {
         assert!(
             EVAL_RS.contains(required),
@@ -49,7 +49,7 @@ fn prototype_b_native_production_contract_routes_both_canonical_callers_directly
 
     let route = source_between(
         EVAL_RS,
-        "fn evaluate_population_b_native_only(",
+        "fn evaluate_population_b_when_available(",
         "pub fn evaluate_population_core(",
     );
     assert!(route.contains("prototype_b_population_eval::try_evaluate_population_b"));
@@ -72,7 +72,7 @@ fn prototype_b_native_production_contract_routes_both_canonical_callers_directly
 fn prototype_b_native_production_contract_has_no_native_cpu_error_recompute() {
     let validation = source_between(
         EVAL_RS,
-        "fn validation_backtest_population_native_only(",
+        "fn validation_backtest_population_native_only_with_evidence(",
         "// ── Scenarios:",
     );
     assert!(validation.contains("validation_backtest_population_cpu(inputs)"));

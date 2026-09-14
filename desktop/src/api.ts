@@ -18,12 +18,10 @@ import {
   type DataImportBody,
   type DataImportOutcome,
   type DataImportSourceFormat,
-  type SymbolCoverage,
+  type SupervisorConfig,
 } from "./apiContracts";
-import type { EngineRunState } from "./discoveryQueueState";
-
 export { dataFetchBody } from "./apiContracts";
-export type { SymbolCoverage } from "./apiContracts";
+export type { SupervisorConfig } from "./apiContracts";
 
 // ── In-process backend (full neoethos-app axum API over loopback) ─────────────
 // The Tauri shell runs the whole backend in-process and tells us the port via
@@ -69,9 +67,9 @@ async function _check(r: Response): Promise<Response> {
   }
   return r;
 }
-export async function apiGet<T>(path: string): Promise<T> {
+export async function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> {
   const base = await apiBaseUrl();
-  const r = await _check(await fetch(`${base}${path}`));
+  const r = await _check(await fetch(`${base}${path}`, { signal }));
   return r.json() as Promise<T>;
 }
 export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
@@ -92,10 +90,10 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
 // The backend pushes ticks + account snapshots over SSE. We open an
 // EventSource against the in-process server; the browser auto-reconnects.
 // Returns a disposer that closes the stream.
-export async function openSse(
+export async function openSse<T>(
   path: string,
   eventName: string,
-  onData: (data: any) => void,
+  onData: (data: T) => void,
   onStatus?: (connected: boolean) => void,
 ): Promise<() => void> {
   const base = await apiBaseUrl();
@@ -104,7 +102,7 @@ export async function openSse(
   es.addEventListener("error", () => onStatus?.(false));
   es.addEventListener(eventName, (e) => {
     try {
-      onData(JSON.parse((e as MessageEvent).data));
+      onData(JSON.parse((e as MessageEvent<string>).data) as T);
     } catch {
       /* ignore malformed frame */
     }
@@ -115,10 +113,10 @@ export async function openSse(
 export type Tick = {
   symbolId: number;
   symbolName: string;
-  bid: number;
-  ask: number;
-  midPrice: number;
-  brokerTimestampMs: number;
+  bid: number | null;
+  ask: number | null;
+  midPrice: number | null;
+  brokerTimestampMs: number | null;
   receivedAtUnixMs: number;
   freshnessSeconds: number;
 };
@@ -136,7 +134,7 @@ export type StreamPosition = {
   takeProfit: number | null;
   volumeLots: number | null; // cTrader-parity lots (1.17), not raw units
 };
-export type AccountStreamSnap = {
+export type AccountSnapshotValues = {
   balance: number;
   equity: number;
   freeMargin: number;
@@ -144,6 +142,11 @@ export type AccountStreamSnap = {
   currency: string;
   fetchedAtUnixMs: number;
   positions: StreamPosition[];
+};
+/** Response-derived identity, not the currently selected account stamped onto cached values. */
+export type AccountStreamSnap = AccountSnapshotValues & {
+  sourceAccountId: string;
+  sourceEnvironment: "Demo" | "Live";
 };
 export const streamSpots = (onTick: (t: Tick) => void, onStatus?: (c: boolean) => void) =>
   openSse("/live/spots/stream", "tick", onTick, onStatus);
@@ -171,31 +174,6 @@ export type AccountInfo = {
   enabled: boolean;
   label: string; // e.g. "DEMO · Spotware · login 5789955"
 };
-export type Position = {
-  positionId: number;
-  symbolId: number;
-  side: string;
-  volume: number;
-  volumeUnits: number; // raw wire volume — pass THIS to closePosition
-  price: number | null;
-  stopLoss: number | null;
-  takeProfit: number | null;
-};
-export type AccountSnapshot = {
-  accountId: number;
-  balance: number;
-  equity: number;
-  unrealizedPnl: number;
-  currency: string;
-  openPositions: number;
-  positions: Position[];
-  live: boolean;
-  brokerName: string | null;
-  leverage: number | null;
-  login: number | null;
-  accountType: string | null;
-  label: string; // e.g. "LIVE · FTMO · 200k USD · 1:30"
-};
 export type ExecResult = {
   status: string;
   orderId: number | null;
@@ -217,8 +195,6 @@ export const appInfo = () => invoke<AppInfo>("app_info");
 /** Native OS file picker for data import; returns the chosen path or null. */
 export const pickDataFile = () => invoke<string | null>("pick_data_file");
 /** Per-symbol local-history coverage (years + bars) for the given base TF. */
-export const dataCoverage = (symbols: string[], timeframe: string) =>
-  invoke<SymbolCoverage[]>("data_coverage", { symbols, timeframe });
 
 // ── Live cTrader (in-process, auto-auth) ──────────────────────────────────────
 export const brokerStatus = () => invoke<BrokerStatus>("broker_status");
@@ -238,7 +214,6 @@ export const serverSymbols = () =>
   apiGet<{ symbolCount: number; symbols: BrokerSymbol[] }>("/broker/symbols");
 export const selectAccount = (accountId: string, live: boolean, label?: string) =>
   invoke<BrokerStatus>("select_account", { accountId, live, label: label ?? null });
-export const accountSnapshot = () => invoke<AccountSnapshot>("account_snapshot");
 export const placeOrder = (
   symbol: string,
   side: "buy" | "sell",
@@ -297,10 +272,49 @@ export const saveBrokerCredentials = (b: {
 // ══════════════════════════════════════════════════════════════════════════
 
 // ── Engines: Discovery + Training ─────────────────────────────────────────
+export type EngineRunState = "Idle" | "Running" | "Succeeded" | "Degraded" | "Failed" | "Cancelled";
 export type EngineCounter = { name: string; value: number };
+export type CanonicalNativeResearchPublished = {
+  relativePath: string;
+  byteCount: number;
+  fileSha256: string;
+  evidenceIdentitySha256: string;
+  configuredPopulation: number;
+  resolvedPopulation: number;
+  populationCap: number;
+  hardGrowthCap: number;
+  termCap: number;
+  selectedDeviceOrdinal: number;
+  engine: string;
+  parentH2dBytes: number;
+  adaptiveH2dBytes: number;
+  metricRows: number;
+  metricBytes: number;
+  consumerCompletionConfirmed: boolean;
+  replayIdentitySealed: boolean;
+};
+export type CanonicalNativeResearchStatus = {
+  available: boolean;
+  availabilityDetail: string;
+  state: string;
+  stage: string;
+  percent: number;
+  leaseToken: string | null;
+  cancellationRequested: boolean;
+  failureStage: string | null;
+  failureCode: string | null;
+  failureDetail: string | null;
+  published: CanonicalNativeResearchPublished | null;
+};
 export type EnginesStatus = {
   discovery: EngineRunState;
+  discoveryStartAvailable: boolean;
+  discoveryStartUnavailableReason: string | null;
+  discoveryStartMode: "ResearchOnly";
+  historicalEvaluationAvailable: boolean;
+  historicalEvaluationUnavailableReason: string | null;
   training: EngineRunState;
+  canonicalNativeResearch: CanonicalNativeResearchStatus;
   autoTrader?: string;
   auto_trader?: string;
   discoverySummary?: string;
@@ -309,45 +323,125 @@ export type EnginesStatus = {
   training_summary?: string;
   discoveryStage?: string;
   discovery_stage?: string;
-  discoveryPercent?: number;
-  discovery_percent?: number;
+  discoveryPercent?: number | null;
+  discovery_percent?: number | null;
   discoveryCounters?: EngineCounter[];
   discovery_counters?: EngineCounter[];
   ramTotalGb?: number;
   ramAvailableGb?: number;
   featureStoreMb?: number;
 };
-export type StartJob = {
-  symbol?: string;
-  base_tf?: string;
-  higher_tfs?: string[];
-  population?: number;
-  generations?: number;
-  max_indicators?: number;
-  target_candidates?: number;
-  portfolio_size?: number;
-};
 export const enginesStatus = () => apiGet<EnginesStatus>("/engines/status");
 export const discoveryStart = (b: DiscoveryStartBody) => apiPost("/engines/discovery/start", b);
-export const discoveryStop = () => apiPost("/engines/discovery/stop");
-export const trainingStart = (b: StartJob) => apiPost("/engines/training/start", b);
-export const trainingStop = () => apiPost("/engines/training/stop");
+export const discoveryStop = () => apiPost<{ running: boolean; kind: string }>("/engines/discovery/stop");
+export const trainingStop = () => apiPost<{ running: boolean; kind: string }>("/engines/training/stop");
+export type ResearchEvaluationMode = "train_models" | "strategy_only";
+export const trainingStart = (identity: string, mode?: ResearchEvaluationMode) =>
+  apiPost<{ started: boolean; symbol: string; base_tf: string }>("/engines/training/start", {
+    training_handoff: identity,
+    ...(mode === undefined ? {} : { mode }),
+  });
 
 // ── Strategy Lab ──────────────────────────────────────────────────────────
+export type PromotionMetricSet = {
+  sharpe: number;
+  winRate: number;
+  profitFactor: number;
+  maxDrawdownPct: number;
+  trades: number;
+};
+export type PromotionCriterion = {
+  name: string;
+  passed: boolean;
+  actual: number;
+  threshold: number;
+  comparison: string;
+};
+export type PromotionStatus = {
+  symbol: string;
+  baseTf: string;
+  portfolioSize: number;
+  aggregate: PromotionMetricSet | null;
+  decision: {
+    promoted: boolean;
+    criteria: PromotionCriterion[];
+    summary: string;
+  };
+  config: Record<string, boolean | number>;
+};
+export type PromoteResult = {
+  promoted: boolean;
+  symbol: string;
+  baseTf: string;
+  liveModelsPath: string | null;
+  filesCopied: number;
+  message: string;
+};
 const qs = (o: Record<string, string | undefined>) => {
   const p = Object.entries(o).filter(([, v]) => v && v.trim() !== "");
   return p.length ? "?" + p.map(([k, v]) => `${k}=${encodeURIComponent(v!)}`).join("&") : "";
 };
 export const promotionStatus = (symbol?: string, baseTf?: string) =>
-  apiGet<any>("/strategy_lab/promotion" + qs({ symbol, base_tf: baseTf }));
+  apiGet<PromotionStatus>("/strategy_lab/promotion" + qs({ symbol, base_tf: baseTf }));
 export const promoteStrategy = (symbol?: string, baseTf?: string) =>
-  apiPost<any>("/strategy_lab/promote", promoteStrategyBody(symbol, baseTf));
+  apiPost<PromoteResult>("/strategy_lab/promote", promoteStrategyBody(symbol, baseTf));
 
 // ── Autonomous trader ─────────────────────────────────────────────────────
-export const autonomousStatus = () => apiGet<any>("/autonomous/status");
-export const autonomousStart = (b?: unknown) => apiPost("/autonomous/start", b ?? {});
-export const autonomousStop = () => apiPost("/autonomous/stop");
-export const autonomousReplay = (b?: unknown) => apiPost("/autonomous/replay", b ?? {});
+export type LiveEngineStatus = {
+  running: boolean;
+  portfolioPath: string | null;
+  symbol: string | null;
+  baseTf: string | null;
+  genes: number;
+  barsEvaluated: number;
+  lastSignal: string | null;
+  openPositionId: number | null;
+  consecutiveLosses: number;
+  windowWinRatePct: number | null;
+  windowTrades: number;
+  retired: boolean;
+  protectionPolicyIdentity: string | null;
+  trailingEnabled: boolean | null;
+  protectionState: string | null;
+  positionEntryPrice: number | null;
+  initialStopPips: number | null;
+  favorableExtremePrice: number | null;
+  favorableMoveR: number | null;
+  confirmedStopPrice: number | null;
+  lastProtectionError: string | null;
+  lastExitReason: string | null;
+};
+export type AutonomousStatus = {
+  running: boolean;
+  engineCount: number;
+  engines: LiveEngineStatus[];
+};
+export type AutonomousStartResult = {
+  started: string[];
+  skipped: string[];
+  blacklisted: string[];
+  failed: Array<{ portfolio: string; error: string }>;
+  overview: AutonomousStatus;
+};
+export type ReplayStats = {
+  bars_processed: number;
+  signals_evaluated: number;
+  intents_emitted: number;
+  intents_executed: number;
+  intents_blocked: number;
+  positions_opened: number;
+  positions_closed: number;
+  open_positions: number;
+  realized_pnl: number;
+  equity: number;
+  commission_paid: number;
+  max_hold_exits: number;
+  fidelity_warnings: string[];
+};
+export const autonomousStatus = () => apiGet<AutonomousStatus>("/autonomous/status");
+export const autonomousStart = (b?: unknown) => apiPost<AutonomousStartResult>("/autonomous/start", b ?? {});
+export const autonomousStop = () => apiPost<{ stopped: boolean }>("/autonomous/stop");
+export const autonomousReplay = (b?: unknown) => apiPost<ReplayStats>("/autonomous/replay", b ?? {});
 
 export type GateCriterion = { name: string; passed: boolean; actual: number; threshold: number; comparison: string };
 export type GateVerdict = {
@@ -406,36 +500,6 @@ export type RiskInfo = {
 };
 export const riskInfo = () => apiGet<RiskInfo>("/risk");
 export const setRiskPreset = (preset: string) => apiPost("/risk/preset", { preset });
-export type RiskyParams = {
-  startingUsd?: number;
-  targetUsd?: number;
-  riskFraction?: number;
-  winRate?: number;
-  rewardToRisk?: number;
-  tradesPerDay?: number;
-};
-export type RiskyScenario = {
-  startingUsd: number;
-  targetUsd: number;
-  riskFraction: number;
-  winRate: number;
-  rewardToRisk: number;
-  tradesPerDay: number;
-  bestCaseDays: number | null;
-  expectedDays: number | null;
-  conservativeDays: number | null;
-  ruinProbability: number;
-  riskFractionMin: number;
-  riskFractionMax: number;
-};
-export const riskyScenarios = (p: RiskyParams = {}) => {
-  const q = Object.entries(p)
-    .filter(([, v]) => v !== undefined && v !== null && !Number.isNaN(v))
-    .map(([k, v]) => `${k}=${v}`)
-    .join("&");
-  return apiGet<RiskyScenario>(`/risky/scenarios${q ? `?${q}` : ""}`);
-};
-
 // ── Hardware ──────────────────────────────────────────────────────────────
 export type HardwareInfo = {
   cpu: { model: string; coresLogical: number; coresPhysical: number; loadAvg: number };
@@ -462,14 +526,124 @@ export type IntelligenceInfo = {
   artifacts: string[];
   lastTouchedUnixMs: number | null;
   discoveryTargets: DiscoveryTarget[];
-  walkforwardSplits: number | null;
-  walkforwardAvgAccuracy: number | null;
+  trainingHandoffs: TrainingHandoff[];
+  trainingHandoffUnavailable: { identity: string; reason: string }[];
+};
+
+export type TrainingHandoff = {
+  identity: string;
+  symbol: string;
+  baseTf: string;
+  datasetIdentity: string;
+  generation: string;
+  strategyCount: number;
+  plannedModels: string[];
+  oosCutoffMs: number;
+  purgeBars: number;
 };
 export const intelligence = () => apiGet<IntelligenceInfo>("/intelligence");
 
+export type SavedResearchAccount = {
+  netProfit: number | null;
+  sharpe: number | null;
+  winRate: number | null;
+  profitFactor: number | null;
+  expectancy: number | null;
+  tradeCount: number;
+  maxDrawdownFraction: number | null;
+  endingRealizedBalance: number;
+  terminalOpen: boolean;
+  grossUnrealizedAccount: number | null;
+  pendingRoundTripCommissionAccount: number | null;
+  belowMinEntries: number;
+};
+export type SavedResearchReport = {
+  evaluationMode: ResearchEvaluationMode;
+  reportId: string;
+  reportSha256: string;
+  rawFinalScopeSha256: string;
+  lockedFinalInputsSha256: string;
+  firstLockedFinalInputsSha256: string | null;
+  holdoutUse: string;
+  historicalExposure: string;
+  symbol: string;
+  baseTimeframe: string;
+  accountCurrency: string;
+  rowStart: number;
+  rowEnd: number;
+  rows: number;
+  timestampStartMs: number;
+  timestampEndMs: number;
+  trainingCutoffMs: number;
+  blendMode: string | null;
+  blendGateFloor: number | null;
+  blendVetoBelow: number | null;
+  modelHistoryRows: number | null;
+  invalidModelSignalRows: number | null;
+  configuredLiveMlGate: boolean | null;
+  promotionEligible: boolean;
+  geneOnly: SavedResearchAccount;
+  combined: SavedResearchAccount | null;
+};
+export type SavedTrainingResearch = {
+  trainingHandoff: string;
+  status: "candidate_not_ready" | "no_completed_result" | "completed_results";
+  reports: SavedResearchReport[];
+  unavailable: { reportId: string; reason: string }[];
+};
+/** Read existing reports only. This endpoint never starts training or evaluation. */
+export const savedTrainingResearch = (identity: string, signal?: AbortSignal) => {
+  if (!/^[0-9a-f]{64}$/.test(identity)) {
+    return Promise.reject(new Error("Select an exact saved training handoff (64 lowercase hexadecimal characters)."));
+  }
+  return apiGet<SavedTrainingResearch>(`/intelligence/research?training_handoff=${identity}`, signal);
+};
+
 // ── Journal ───────────────────────────────────────────────────────────────
-export const journalStats = () => apiGet<any>("/journal/stats");
-export const journalTrades = () => apiGet<any>("/journal/trades");
+export type JournalStats = {
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  breakeven: number;
+  winRatePct: number;
+  netProfit: number;
+  grossProfit: number;
+  grossLoss: number;
+  profitFactor: number | null;
+  avgWin: number;
+  avgLoss: number;
+  payoffRatio: number | null;
+  expectancy: number;
+  largestWin: number;
+  largestLoss: number;
+  maxConsecutiveWins: number;
+  maxConsecutiveLosses: number;
+  maxDrawdownAbs: number;
+  maxDrawdownPct: number;
+  recoveryFactor: number | null;
+  sharpe: number | null;
+};
+export type ClosedTrade = {
+  schemaVersion: number;
+  recordedAtUnixMs: number;
+  positionId: number;
+  symbol: string;
+  side: string;
+  lots: number;
+  accountId: string | null;
+  environment: string | null;
+  entryTsMs: number | null;
+  entryPrice: number | null;
+  exitTsMs: number | null;
+  exitPrice: number | null;
+  grossProfit: number;
+  commission: number;
+  swap: number;
+  netProfit: number;
+  balanceAfter: number | null;
+};
+export const journalStats = () => apiGet<JournalStats>("/journal/stats");
+export const journalTrades = () => apiGet<ClosedTrade[]>("/journal/trades");
 
 // Per-trade pips / R / MFE-MAE + the breakdowns that locate a problem.
 // Audit #124: this endpoint has existed since 2026-07-30 and until now its
@@ -492,6 +666,8 @@ export type DerivedTrade = {
   captureRatio: number | null;
   entryHourUtc: number | null;
   entryWeekday: string | null;
+  riskPerLot: number | null;
+  riskBasis: string;
 };
 export type BucketSummary = {
   bucket: string;
@@ -500,7 +676,8 @@ export type BucketSummary = {
   winRatePct: number;
   netProfit: number;
   expectancy: number;
-  netPips: number;
+  netPips: number | null;
+  pipsTrades: number;
 };
 export type JournalAnalytics = {
   trades: DerivedTrade[];
@@ -511,11 +688,39 @@ export type JournalAnalytics = {
   avgMfePips: number | null;
   avgCaptureRatio: number | null;
   inactiveHoursUtc: number[];
+  coverage: {
+    tradesTotal: number;
+    withPips: number;
+    withExcursion: number;
+    withRMultiple: number;
+    withDuration: number;
+    missingEntryTime: number;
+    missingPriceSeries: number;
+    riskPerLotBySymbol: Record<string, number>;
+    riskPerLotAllSymbols: number | null;
+    symbolsUsingFallbackRisk: string[];
+    minLossesForSymbolRisk: number;
+  };
 };
 export const journalAnalytics = () => apiGet<JournalAnalytics>("/journal/analytics");
 
 // ── News ──────────────────────────────────────────────────────────────────
-export const newsFeed = (force = false) => apiGet<any>(`/news/feed${force ? "?force=true" : ""}`);
+export type NewsItem = {
+  title: string;
+  link: string;
+  source: string;
+  publishedMs: number | null;
+  blurb: string;
+};
+export type NewsFeed = {
+  items: NewsItem[];
+  aiSummary: string;
+  aiAvailable: boolean;
+  generatedAtMs: number;
+  notice: string;
+};
+export const newsFeed = (force = false) =>
+  apiGet<NewsFeed>(`/news/feed${force ? "?force=true" : ""}`);
 
 // ── Data ──────────────────────────────────────────────────────────────────
 export type DataBootstrap = {
@@ -550,31 +755,126 @@ export const stopActiveDataFetch = (runId: number) =>
   stopDataFetchFollowingActiveRun(runId, requestDataFetchStopOutcome);
 
 // ── Market Watch / watchlist ──────────────────────────────────────────────
-export const getWatchlist = () => apiGet<any>("/watchlist");
-export const setWatchlist = (symbols: string[]) => apiPost("/watchlist", { symbols });
+export type WatchlistView = { symbols: string[] };
+export type WatchlistUpdateResult = {
+  saved: number;
+  symbols: string[];
+  restarted: boolean;
+};
+export const getWatchlist = () => apiGet<WatchlistView>("/watchlist");
+export const setWatchlist = (symbols: string[]) =>
+  apiPost<WatchlistUpdateResult>("/watchlist", { symbols });
 
 // ── AI Desk (Codex / ChatGPT subscription) ────────────────────────────────
-export const codexStatus = () => apiGet<any>("/auth/codex/status");
+export type CodexStatus = {
+  authenticated: boolean;
+  email: string | null;
+  loginInProgress: boolean;
+  lastError: string | null;
+  authPath: string;
+};
+export type CodexStartResult = { authorizeUrl: string; callbackPort: number };
+export const codexStatus = () => apiGet<CodexStatus>("/auth/codex/status");
 // `email` (optional) becomes the OAuth `login_hint` so the operator picks
 // WHICH ChatGPT account to connect. Empty ⇒ the issuer shows its picker.
 export const codexStart = (email?: string) =>
-  apiPost<any>("/auth/codex/start", email ? { email } : {});
-export const codexLogout = () => apiPost("/auth/codex/logout");
+  apiPost<CodexStartResult>("/auth/codex/start", email ? { email } : {});
+export const codexLogout = () => apiPost<{ ok: boolean }>("/auth/codex/logout");
 export const codexChat = (prompt: string, model?: string) =>
   apiPost<{ model: string; response: string; total_tokens: number }>("/codex/chat", { prompt, model });
 
 // ── MCP sidecar (external tool servers for the Supervisor) ────────────────
-export const mcpStatus = () => apiGet<any>("/mcp/status");
+export type McpTool = {
+  server: string;
+  name: string;
+  description: string | null;
+};
+export type McpStatus = {
+  reachable: boolean;
+  url?: string;
+  error?: string;
+  note?: string;
+  health?: unknown;
+  tools?: McpTool[];
+};
+export type McpConfigSaveResult = { saved: boolean; path: string; note: string };
+export const mcpStatus = () => apiGet<McpStatus>("/mcp/status");
 export const mcpConfigGet = () => apiGet<{ exists: boolean; path: string; content: string }>("/mcp/config");
-export const mcpConfigSave = (content: string) => apiPost<any>("/mcp/config", { content });
+export const mcpConfigSave = (content: string) =>
+  apiPost<McpConfigSaveResult>("/mcp/config", { content });
 
 // ── Account / broker detail (history, profile, margin, cashflow) ───────────
 export const brokerProfile = () => apiGet<{ userId: number }>("/broker/profile");
 export const brokerVersion = () => apiGet<{ version: string }>("/broker/version");
-export const ordersHistory = () => apiGet<any>("/broker/orders/history");
-export const cashFlow = () => apiGet<any>("/broker/cashflow");
+export type BrokerHistoricalOrder = {
+  orderId: number;
+  positionId: number | null;
+  symbolId: number;
+  side: string;
+  orderType: string;
+  orderStatus: string;
+  volumeRawCentiUnits: number;
+  executedVolumeRawCentiUnits: number | null;
+  volumeUnits: number;
+  executedVolumeUnits: number | null;
+  volumeLots: number | null;
+  executedVolumeLots: number | null;
+  lotSizeRawCentiUnits: number | null;
+  executionPrice: number | null;
+  limitPrice: number | null;
+  stopPrice: number | null;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  timeInForce: string | null;
+  label: string | null;
+  comment: string | null;
+  clientOrderId: string | null;
+  closingOrder: boolean;
+  isStopOut: boolean;
+  trailingStopLoss: boolean;
+  openTimestampMs: number | null;
+  closeTimestampMs: number | null;
+  expirationTimestampMs: number | null;
+  utcLastUpdateTimestampMs: number | null;
+};
+export type BrokerOrderHistory = {
+  accountId: number;
+  orders: BrokerHistoricalOrder[];
+  hasMore: boolean;
+  lotSizeObservedAtUnixMs: number | null;
+  lotSizeError: string | null;
+};
+export type BrokerCashFlowEntry = {
+  balanceHistoryId: number;
+  operationType: string;
+  operationTypeCode: number;
+  balance: number;
+  delta: number;
+  equity: number | null;
+  changeBalanceTimestampMs: number;
+  externalNote: string | null;
+  balanceVersion: number | null;
+};
+export type BrokerCashFlow = { accountId: number; entries: BrokerCashFlowEntry[] };
+export type BrokerExpectedMarginEntry = {
+  volumeRawCentiUnits: number;
+  volumeUnits: number;
+  volumeLots: number | null;
+  lotSizeRawCentiUnits: number | null;
+  buyMargin: number;
+  sellMargin: number;
+};
+export type BrokerExpectedMargin = {
+  accountId: number;
+  symbolId: number | null;
+  entries: BrokerExpectedMarginEntry[];
+  lotSizeObservedAtUnixMs: number | null;
+  lotSizeError: string | null;
+};
+export const ordersHistory = () => apiGet<BrokerOrderHistory>("/broker/orders/history");
+export const cashFlow = () => apiGet<BrokerCashFlow>("/broker/cashflow");
 export const expectedMargin = (symbolId: number, volume: number) =>
-  apiGet<any>(`/broker/margin/expected?symbolId=${symbolId}&volume=${volume}`);
+  apiGet<BrokerExpectedMargin>(`/broker/margin/expected?symbolId=${symbolId}&volume=${volume}`);
 
 // ── Position protection (move SL/TP, breakeven, trailing) ──────────────────
 export const amendProtection = (
@@ -583,7 +883,7 @@ export const amendProtection = (
   takeProfitPrice?: number | null,
   trailingStopLoss?: boolean,
 ) =>
-  apiPost(
+  apiPost<ExecResult>(
     "/positions/protection",
     amendProtectionBody(positionId, stopLossPrice, takeProfitPrice, trailingStopLoss),
   );
@@ -645,17 +945,80 @@ export const chartHistory = (symbol: string, timeframe: string, beforeMs: number
     `/chart/history?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&beforeMs=${beforeMs}&limit=${limit}`,
   );
 
-export const settings = () => apiGet<any>("/settings");
+export type SettingsView = {
+  dataDir: string;
+  tradingMode: string;
+  discoveryMode: string;
+  effectiveDiscoveryMode: "risky" | "prop_firm" | "strict";
+  tradingModeDivergent: boolean;
+  computeMode: string;
+  searchDevice: string;
+  riskyStartBalance: number;
+  riskyTargetBalance: number;
+  riskyHorizonDays: number;
+  sharedSearchRiskMin: number;
+  sharedSearchRiskMax: number;
+  riskySearchRiskMin: number;
+  riskySearchRiskMax: number;
+  propFirmSearchRiskMin: number;
+  propFirmSearchRiskMax: number;
+  searchHighQualityConfidence: number;
+  propFirmSearchProfitTargetPct: number;
+  propFirmSearchMaxDailyLossPct: number;
+  propFirmSearchMaxDrawdownPct: number;
+  propFirmSearchMinTradingDays: number;
+  propFirmSearchWindowDays: number;
+  propFirmSearchWindowCount: number;
+  propFirmSearchPassRate: number;
+  autoRediscoverOnCull: boolean;
+  newsCalendarEnabled: boolean;
+  newsCalendarSource: string;
+  newsTradingMode: "block_on_news" | "allow_always" | "warn_only";
+  newsTradingModeDisplayName: string;
+  searchPopulation: number;
+  searchPopulationAuto: boolean;
+  searchGenerations: number;
+  searchMaxHours: number;
+  searchMaxIndicators: number;
+  searchPortfolioSize: number;
+  searchCorrThreshold: number;
+  searchMaxRows: number;
+  prefilterTopK: number;
+  convergencePatience: number;
+  stagnationPatience: number;
+  noveltyWeight: number;
+  disableSmcGate: boolean;
+  maxPortfolioRisk: number;
+  liveMlGate: boolean;
+  blendGateFloor: number;
+  blendVetoBelow: number;
+};
+export const settings = () => apiGet<SettingsView>("/settings");
 
 export type SettingsUpdate = {
   dataDir?: string;
   tradingMode?: "risky" | "prop_firm";
   computeMode?: "auto" | "cpu" | "gpu";
+  searchDevice?: "" | "auto" | "cpu" | "cuda_required";
   riskPerTrade?: number;
   maxPortfolioRisk?: number;
   riskyStartBalance?: number;
   riskyTargetBalance?: number;
   riskyHorizonDays?: number;
+  sharedSearchRiskMin?: number;
+  sharedSearchRiskMax?: number;
+  riskySearchRiskMin?: number;
+  riskySearchRiskMax?: number;
+  propFirmSearchRiskMin?: number;
+  propFirmSearchRiskMax?: number;
+  searchHighQualityConfidence?: number;
+  propFirmSearchProfitTargetPct?: number;
+  propFirmSearchMaxDailyLossPct?: number;
+  propFirmSearchMaxDrawdownPct?: number;
+  propFirmSearchMinTradingDays?: number;
+  propFirmSearchWindowDays?: number;
+  propFirmSearchWindowCount?: number;
+  propFirmSearchPassRate?: number;
   // Discovery search knobs (models.prop_search_*)
   searchPopulation?: number;
   // SEARCH-MORE knob: true + CUDA card raises the GA population to the card's
@@ -673,6 +1036,9 @@ export type SettingsUpdate = {
   stagnationPatience?: number;
   noveltyWeight?: number;
   disableSmcGate?: boolean;
+  liveMlGate?: boolean;
+  blendGateFloor?: number;
+  blendVetoBelow?: number;
   // Auto-cull retirement → automatic rediscovery on the same symbol+TF.
   autoRediscoverOnCull?: boolean;
   // News gate config
@@ -680,13 +1046,49 @@ export type SettingsUpdate = {
   newsCalendarSource?: string;
   newsTradingMode?: "block_on_news" | "allow_always" | "warn_only";
 };
-export const updateSettings = (payload: SettingsUpdate) => apiPost<any>("/settings", payload);
+export const updateSettings = (payload: SettingsUpdate) => apiPost<SettingsView>("/settings", payload);
 
 export const brokerTimeframes = () => apiGet<{ count: number; timeframes: string[] }>("/broker/timeframes");
-export const knobCatalog = () => apiGet<any>("/settings/knob-catalog");
-export const settingsRaw = () => apiGet<any>("/settings/raw");
-export const saveSettingsRaw = (yaml: string) => apiPost("/settings/raw", { yaml });
-export const diagnosticsReport = () => apiPost<any>("/diagnostics/report", {});
+export type KnobEntry = {
+  id: string;
+  section: string;
+  label: string;
+  kind: "Int" | "Float" | "Bool" | "Text" | "Enum" | "Path";
+  min?: number;
+  max?: number;
+  enumChoices?: string[];
+  default: string;
+  current: string;
+  helpShort: string;
+  helpLong: string;
+  presetConservative: string;
+  presetBalanced: string;
+  presetAggressive: string;
+};
+export type KnobCatalog = {
+  schemaVersion: number;
+  generatedAtUnixMs: number;
+  knobs: KnobEntry[];
+};
+export type RawSettingsView = { yaml: string; path: string };
+export type RawSettingsSaveResult = {
+  ok: boolean;
+  path: string;
+  backupPath: string;
+};
+export type DiagnosticsReport = {
+  zipPath: string;
+  totalBytes: number;
+  filesIncluded: string[];
+  emailSubject: string;
+  emailBody: string;
+  emailRecipient: string;
+};
+export const knobCatalog = () => apiGet<KnobCatalog>("/settings/knob-catalog");
+export const settingsRaw = () => apiGet<RawSettingsView>("/settings/raw");
+export const saveSettingsRaw = (yaml: string) =>
+  apiPost<RawSettingsSaveResult>("/settings/raw", { yaml });
+export const diagnosticsReport = () => apiPost<DiagnosticsReport>("/diagnostics/report", {});
 export const dataImport = (
   sourcePath: string,
   sourceFormat: DataImportSourceFormat,
@@ -720,6 +1122,8 @@ export type StorageEntry = {
   itemCount: number;
   lastModifiedMs: number | null;
   kind: string;
+  scanStatus: "complete" | "partial" | "missing" | "unavailable";
+  scanError: string | null;
 };
 export const storagePaths = () => apiGet<{ entries: StorageEntry[] }>("/storage/paths");
 export const openPath = (path: string) => invoke("open_path", { path });
@@ -866,16 +1270,30 @@ export const meshSetEnabled = (enabled: boolean) =>
   invoke<MeshStatus>("mesh_set_enabled", { enabled });
 
 // ── Autonomous LLM supervisor ───────────────────────────────────────────────
-export type SupervisorConfig = { enabled: boolean; intervalMinutes: number; maxActionsPerTick: number; directives: string[] };
 export type SupervisorLogEntry = {
   tsMs: number;
   kind: string; // tick | action | error | note
   detail: string;
-  action?: any;
+  action?: unknown;
   result?: string;
 };
+export type SupervisorObservation = {
+  observedAtUnixMs: number;
+  // Same scope-checked account DTO as HTTP/SSE, including response-derived identity.
+  account: AccountStreamSnap | null;
+  accountFailure: { code: string; detail: string; observedAtUnixMs: number } | null;
+  market: { spots: Tick[]; snapshotAtUnixMs: number; symbolCount: number };
+  liveEngines: LiveEngineStatus[];
+  liveEngineError: string | null;
+};
+export type SupervisorStatus = {
+  config: SupervisorConfig;
+  log: SupervisorLogEntry[];
+  cycleRunning: boolean;
+  observation: SupervisorObservation;
+};
 export const supervisorStatus = () =>
-  apiGet<{ config: SupervisorConfig; log: SupervisorLogEntry[] }>("/supervisor/status");
+  apiGet<SupervisorStatus>("/supervisor/status");
 export const supervisorConfig = (b: Partial<SupervisorConfig>) =>
   apiPost<{ config: SupervisorConfig }>("/supervisor/config", b);
 export const supervisorTick = () => apiPost<{ summary: string }>("/supervisor/tick");
@@ -899,12 +1317,32 @@ export type SpreadStats = {
 export const spreadStats = () => apiGet<SpreadStats>("/data/spread-stats");
 
 // ── Strategy report: monthly journal + validation verdict + flags ─────────
+export type RecordedStrategyEvaluation = {
+  policyIdentityHash: string;
+  accountCurrency: string;
+  initialCapital: number;
+  riskPerTradeMin: number;
+  riskPerTradeMax: number;
+  highQualityConfidence: number;
+  confidenceBasis: "signal_threshold_margin";
+  growthGoal: {
+    referenceStartBalance: number;
+    targetBalance: number;
+    horizonDays: number;
+  } | null;
+};
 export type StrategyEntry = {
   mode: string;
+  /** Archived evaluator only; null when the saved policy lacks these fields. */
+  recordedEvaluation: RecordedStrategyEvaluation | null;
+  /** Selected unsealed journal denominator, not a replacement policy balance. */
+  diagnosticInitialCapital: number;
   dir: string;
   symbol: string;
   timeframe: string;
   base: string;
+  strategyId: string;
+  exactGeneHash: string;
   trades: number;
   winRate: number | null;
   profitFactor: number | null;
@@ -915,7 +1353,7 @@ export type StrategyEntry = {
   spanStart: string | null;
   spanEnd: string | null;
   years: number;
-  cagrPct: number;
+  cagrPct: number | null;
   finalFrom1000: number;
   maxDdPct: number;
   flags: string[];
@@ -924,11 +1362,43 @@ export type StrategyEntry = {
 };
 export type MonthRow = { month: string; balance: number; returnPct: number; trades: number };
 export type StrategyReport = StrategyEntry & { monthly: MonthRow[]; yearly: MonthRow[] };
-export const strategyList = () => apiGet<{ count: number; strategies: StrategyEntry[] }>("/strategy/list");
-export const strategyReport = (dir: string, base: string) =>
-  apiGet<StrategyReport>(`/strategy/report?dir=${encodeURIComponent(dir)}&base=${encodeURIComponent(base)}`);
+export const strategyList = () => apiGet<{ count: number; strategies: StrategyEntry[]; unavailable: string[] }>("/strategy/list");
+export const strategyReport = (dir: string, base: string, strategyId: string, exactGeneHash: string) =>
+  apiGet<StrategyReport>(`/strategy/report?dir=${encodeURIComponent(dir)}&base=${encodeURIComponent(base)}&strategy_id=${encodeURIComponent(strategyId)}&exact_gene_hash=${encodeURIComponent(exactGeneHash)}`);
 
 // ── Trade-confirmation / actions queue ────────────────────────────────────
-export const pendingActions = () => apiGet<any>("/actions/pending");
-export const confirmAction = (id: string) => apiPost(`/actions/${id}/confirm`);
-export const rejectAction = (id: string) => apiPost(`/actions/${id}/reject`);
+export type PendingActionKind =
+  | {
+      kind: "close_position";
+      position_id: number;
+      volume_units: number;
+      symbol_hint: string | null;
+    }
+  | {
+      kind: "mcp_call";
+      server: string;
+      tool: string;
+      args: unknown;
+    };
+export type PendingAction = {
+  id: string;
+  schema_version: number;
+  kind: PendingActionKind;
+  reason: string;
+  proposed_at_unix_ms: number;
+  expires_at_unix_ms: number;
+  status: "pending" | "confirmed" | "rejected" | "expired" | "executed" | "failed";
+  result_note: string;
+};
+export type PendingActionsView = { actions: PendingAction[] };
+export const pendingActions = () => apiGet<PendingActionsView>("/actions/pending");
+export const confirmAction = (id: string, volumeUnitsOverride?: number) =>
+  apiPost<{ ok: boolean; action_id: string; status: string }>(
+    `/actions/${encodeURIComponent(id)}/confirm`,
+    volumeUnitsOverride === undefined ? undefined : { volumeUnitsOverride },
+  );
+export const rejectAction = (id: string, reason?: string) =>
+  apiPost<{ ok: boolean; action: PendingAction }>(
+    `/actions/${encodeURIComponent(id)}/reject`,
+    reason === undefined ? undefined : { reason },
+  );

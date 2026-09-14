@@ -19,6 +19,14 @@ constexpr unsigned char kValidityDegenerateV2 = 6U;
 constexpr unsigned char kValidityNonFiniteV2 = 7U;
 constexpr unsigned int kControlNoValidTrainingCellV2 = 1U << 1U;
 constexpr unsigned int kControlValidTrainingCellNonFiniteV2 = 1U << 2U;
+constexpr unsigned int kControlInvalidGateDomainV3 = 1U << 3U;
+// Search policy v3 selects these modes using Data's canonical name classifier.
+// Copy only one bounded batch into kernel arguments: no device-side schema or
+// extra per-column allocation, and no retained host pointer after this call.
+struct ColumnModesV3 {
+  unsigned char modes[kMaxBatchColumnsV2];
+};
+static_assert(sizeof(ColumnModesV3) == 64U, "normalization mode batch ABI");
 constexpr unsigned int kKernelThreadsV2 = 256U;
 constexpr unsigned int kMaxPortableBlocksV2 = 65535U;
 constexpr unsigned int kSha256BlockBytesV2 = 64U;
@@ -277,7 +285,7 @@ __device__ __forceinline__ double robust_median_sorted_v2(
 
 __global__ void robust_fill_training_v2(
     const double* bar_major_values,
-    const unsigned char* bar_major_validity_u4, std::size_t rows,
+    const unsigned char* bar_major_validity_u4,
     std::size_t columns, std::size_t training_start,
     std::size_t training_end, std::size_t column_start,
     std::size_t batch_columns, std::size_t padded_training_rows,
@@ -314,13 +322,17 @@ __global__ void robust_fill_training_v2(
 __global__ void robust_bitonic_stage_v2(
     std::uint64_t* sort_scratch_bits, std::size_t batch_columns,
     std::size_t padded_training_rows, std::size_t merge_width,
-    std::size_t compare_stride) {
+    std::size_t compare_stride, ColumnModesV3 column_modes) {
   const std::size_t work = batch_columns * padded_training_rows;
   std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t stride =
       static_cast<std::size_t>(gridDim.x) * blockDim.x;
   while (index < work) {
+    if (column_modes.modes[index / padded_training_rows] != 0U) {
+      index += stride;
+      continue;
+    }
     const std::size_t local_slot = index % padded_training_rows;
     const std::size_t partner_slot = local_slot ^ compare_stride;
     if (partner_slot > local_slot) {
@@ -346,7 +358,8 @@ __global__ void robust_summarize_values_v2(
     const std::uint64_t* sort_scratch_bits, std::size_t column_start,
     std::size_t batch_columns, std::size_t training_start,
     std::size_t training_end, std::size_t padded_training_rows,
-    std::uint64_t* fit_metadata_words, unsigned int* control_error) {
+    std::uint64_t* fit_metadata_words, unsigned int* control_error,
+    ColumnModesV3 column_modes) {
   std::size_t local_column =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t stride =
@@ -355,9 +368,18 @@ __global__ void robust_summarize_values_v2(
     const std::uint64_t* sorted =
         sort_scratch_bits + local_column * padded_training_rows;
     std::size_t valid_count = 0U;
-    while (valid_count < padded_training_rows &&
-           sorted[valid_count] != kSortSentinelBitsV2) {
-      ++valid_count;
+    const bool preserve_gate = column_modes.modes[local_column] != 0U;
+    if (preserve_gate) {
+      // Gate slots are deliberately not sorted. Invalid cells can be anywhere
+      // in the training interval, so count every slot rather than its prefix.
+      for (std::size_t slot = 0U; slot < training_end - training_start; ++slot) {
+        valid_count += sorted[slot] != kSortSentinelBitsV2 ? 1U : 0U;
+      }
+    } else {
+      while (valid_count < padded_training_rows &&
+             sorted[valid_count] != kSortSentinelBitsV2) {
+        ++valid_count;
+      }
     }
     const std::size_t metadata_offset =
         (column_start + local_column) * kFitWordsV2;
@@ -374,6 +396,15 @@ __global__ void robust_summarize_values_v2(
           kCanonicalNanBitsV2;
       fit_metadata_words[metadata_offset + kFitDegenerateV2] = 1U;
       atomicOr(control_error, kControlNoValidTrainingCellV2);
+      local_column += stride;
+      continue;
+    }
+    if (preserve_gate) {
+      fit_metadata_words[metadata_offset + kFitMedianBitsV2] =
+          robust_to_bits_v2(0.0);
+      fit_metadata_words[metadata_offset + kFitScaleBitsV2] =
+          robust_to_bits_v2(1.0);
+      fit_metadata_words[metadata_offset + kFitDegenerateV2] = 0U;
       local_column += stride;
       continue;
     }
@@ -417,7 +448,7 @@ __global__ void robust_summarize_values_v2(
 __global__ void robust_make_deviations_v2(
     std::uint64_t* sort_scratch_bits, const std::uint64_t* fit_metadata_words,
     std::size_t column_start, std::size_t batch_columns,
-    std::size_t padded_training_rows) {
+    std::size_t padded_training_rows, ColumnModesV3 column_modes) {
   const std::size_t work = batch_columns * padded_training_rows;
   std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -425,6 +456,10 @@ __global__ void robust_make_deviations_v2(
       static_cast<std::size_t>(gridDim.x) * blockDim.x;
   while (index < work) {
     const std::size_t local_column = index / padded_training_rows;
+    if (column_modes.modes[local_column] != 0U) {
+      index += stride;
+      continue;
+    }
     const std::size_t local_slot = index % padded_training_rows;
     const std::size_t metadata_offset =
         (column_start + local_column) * kFitWordsV2;
@@ -446,12 +481,16 @@ __global__ void robust_make_deviations_v2(
 __global__ void robust_finalize_fit_v2(
     const std::uint64_t* sorted_deviation_bits, std::size_t column_start,
     std::size_t batch_columns, std::size_t padded_training_rows,
-    std::uint64_t* fit_metadata_words) {
+    std::uint64_t* fit_metadata_words, ColumnModesV3 column_modes) {
   std::size_t local_column =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t stride =
       static_cast<std::size_t>(gridDim.x) * blockDim.x;
   while (local_column < batch_columns) {
+    if (column_modes.modes[local_column] != 0U) {
+      local_column += stride;
+      continue;
+    }
     const std::size_t metadata_offset =
         (column_start + local_column) * kFitWordsV2;
     const std::size_t valid_count = static_cast<std::size_t>(
@@ -480,10 +519,46 @@ __global__ void robust_finalize_fit_v2(
   }
 }
 
+// Check representation across the whole column, including holdout, without
+// estimating a statistic from it. This mirrors the CPU gate precondition.
+__global__ void robust_validate_gates_v3(
+    const double* bar_major_values, const unsigned char* bar_major_validity_u4,
+    std::size_t rows, std::size_t columns, std::size_t column_start,
+    std::size_t batch_columns, ColumnModesV3 column_modes,
+    unsigned int* control_error) {
+  const std::size_t work = rows * batch_columns;
+  std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  while (index < work) {
+    const std::size_t local_column = index % batch_columns;
+    const unsigned char mode = column_modes.modes[local_column];
+    const std::size_t cell =
+        (index / batch_columns) * columns + column_start + local_column;
+    if (mode != 0U &&
+        robust_validity_at_v2(bar_major_validity_u4, cell) == kValidityValidV2) {
+      const double value = bar_major_values[cell];
+      const bool in_domain = robust_finite_bits_v2(robust_to_bits_v2(value)) &&
+          (mode == 3U || value == 0.0 || value == 1.0 ||
+           (mode == 2U && value == -1.0));
+      if (!in_domain) {
+        atomicOr(control_error, kControlInvalidGateDomainV3);
+      }
+    }
+    index += stride;
+  }
+}
+
 __global__ void robust_apply_in_place_v2(
     double* bar_major_values, unsigned char* bar_major_validity_u4,
     std::size_t rows, std::size_t columns, std::size_t column_start,
-    std::size_t batch_columns, const std::uint64_t* fit_metadata_words) {
+    std::size_t batch_columns, const std::uint64_t* fit_metadata_words,
+    ColumnModesV3 column_modes, const unsigned int* control_error) {
+  // Earlier kernels in this stream have completed. A semantic failure never
+  // authorizes transformed output; the owning caller must reject its receipt.
+  if (robust_atomic_load_word_v2(control_error) != 0U) {
+    return;
+  }
   const std::size_t work = rows * batch_columns;
   std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -508,8 +583,10 @@ __global__ void robust_apply_in_place_v2(
           fit_metadata_words[metadata_offset + kFitMedianBitsV2]);
       const double scale = robust_from_bits_v2(
           fit_metadata_words[metadata_offset + kFitScaleBitsV2]);
-      const double normalized =
-          __ddiv_rn(__dsub_rn(bar_major_values[cell], median), scale);
+      // Identity gates retain signed zero and their exact raw event meaning.
+      const double normalized = column_modes.modes[local_column] != 0U
+          ? bar_major_values[cell]
+          : __ddiv_rn(__dsub_rn(bar_major_values[cell], median), scale);
       if (robust_finite_bits_v2(robust_to_bits_v2(normalized))) {
         const double clip = robust_from_bits_v2(kClipBitsV2);
         bar_major_values[cell] =
@@ -555,7 +632,7 @@ int robust_launch_status_v2() {
 int robust_launch_sort_v2(std::uint64_t* sort_scratch_bits,
                           std::size_t batch_columns,
                           std::size_t padded_training_rows,
-                          cudaStream_t stream) {
+                          ColumnModesV3 column_modes, cudaStream_t stream) {
   const std::size_t work = batch_columns * padded_training_rows;
   const unsigned int blocks = robust_blocks_v2(work);
   for (std::size_t merge_width = 2U;
@@ -564,7 +641,7 @@ int robust_launch_sort_v2(std::uint64_t* sort_scratch_bits,
          compare_stride != 0U; compare_stride >>= 1U) {
       robust_bitonic_stage_v2<<<blocks, kKernelThreadsV2, 0, stream>>>(
           sort_scratch_bits, batch_columns, padded_training_rows, merge_width,
-          compare_stride);
+          compare_stride, column_modes);
       const int status = robust_launch_status_v2();
       if (status != static_cast<int>(cudaSuccess)) {
         return status;
@@ -579,18 +656,20 @@ int robust_launch_sort_v2(std::uint64_t* sort_scratch_bits,
 
 }  // namespace
 
-extern "C" int neoethos_resident_robust_normalize_bar_major_f64_u4_v2(
+extern "C" int neoethos_resident_robust_normalize_bar_major_f64_u4_v3(
     double* bar_major_values, unsigned char* bar_major_validity_u4,
     std::size_t packed_validity_allocated_bytes, std::size_t rows,
     std::size_t columns, std::size_t training_start,
     std::size_t training_end, std::size_t padded_training_rows,
     std::uint64_t* sort_scratch_bits, std::size_t sort_scratch_slots,
     std::uint64_t* fit_metadata_words, std::size_t fit_metadata_word_count,
+    const unsigned char* host_column_modes, std::size_t column_mode_count,
     unsigned int* control_error, cudaStream_t stream) {
   const std::size_t canonical_training_end = static_cast<std::size_t>(
       std::floor(static_cast<double>(rows) * (1.0 - 0.2)));
   if (bar_major_values == nullptr || bar_major_validity_u4 == nullptr ||
       sort_scratch_bits == nullptr || fit_metadata_words == nullptr ||
+      host_column_modes == nullptr || column_mode_count != columns ||
       control_error == nullptr || stream == nullptr || rows == 0U ||
       columns == 0U || training_start >= training_end || training_end > rows ||
       training_start != 0U || training_end != canonical_training_end ||
@@ -603,6 +682,12 @@ extern "C" int neoethos_resident_robust_normalize_bar_major_f64_u4_v2(
               alignof(unsigned int) !=
           0U) {
     return static_cast<int>(cudaErrorInvalidValue);
+  }
+  // Validate the full host schema before any device mutation or launch.
+  for (std::size_t column = 0U; column < columns; ++column) {
+    if (host_column_modes[column] > 3U) {
+      return static_cast<int>(cudaErrorInvalidValue);
+    }
   }
   const std::size_t max_batch_columns =
       columns < kMaxBatchColumnsV2 ? columns : kMaxBatchColumnsV2;
@@ -631,18 +716,30 @@ extern "C" int neoethos_resident_robust_normalize_bar_major_f64_u4_v2(
     const std::size_t remaining = columns - column_start;
     const std::size_t batch_columns =
         remaining < kMaxBatchColumnsV2 ? remaining : kMaxBatchColumnsV2;
+    ColumnModesV3 column_modes{};
+    bool has_robust_column = false;
+    bool has_gate_column = false;
+    for (std::size_t local_column = 0U; local_column < batch_columns;
+         ++local_column) {
+      const unsigned char mode = host_column_modes[column_start + local_column];
+      column_modes.modes[local_column] = mode;
+      has_robust_column = has_robust_column || mode == 0U;
+      has_gate_column = has_gate_column || mode != 0U;
+    }
     const std::size_t sort_work = batch_columns * padded_training_rows;
     const unsigned int sort_blocks = robust_blocks_v2(sort_work);
     robust_fill_training_v2<<<sort_blocks, kKernelThreadsV2, 0, stream>>>(
-        bar_major_values, bar_major_validity_u4, rows, columns, training_start,
+        bar_major_values, bar_major_validity_u4, columns, training_start,
         training_end, column_start, batch_columns, padded_training_rows,
         sort_scratch_bits, control_error);
     int status = robust_launch_status_v2();
     if (status != static_cast<int>(cudaSuccess)) {
       return status;
     }
-    status = robust_launch_sort_v2(sort_scratch_bits, batch_columns,
-                                   padded_training_rows, stream);
+    status = has_robust_column
+        ? robust_launch_sort_v2(sort_scratch_bits, batch_columns,
+                                padded_training_rows, column_modes, stream)
+        : static_cast<int>(cudaSuccess);
     if (status != static_cast<int>(cudaSuccess)) {
       return status;
     }
@@ -650,36 +747,49 @@ extern "C" int neoethos_resident_robust_normalize_bar_major_f64_u4_v2(
     const unsigned int column_blocks = robust_blocks_v2(batch_columns);
     robust_summarize_values_v2<<<column_blocks, kKernelThreadsV2, 0, stream>>>(
         sort_scratch_bits, column_start, batch_columns, training_start,
-        training_end, padded_training_rows, fit_metadata_words, control_error);
+        training_end, padded_training_rows, fit_metadata_words, control_error,
+        column_modes);
     status = robust_launch_status_v2();
     if (status != static_cast<int>(cudaSuccess)) {
       return status;
     }
     robust_make_deviations_v2<<<sort_blocks, kKernelThreadsV2, 0, stream>>>(
         sort_scratch_bits, fit_metadata_words, column_start, batch_columns,
-        padded_training_rows);
+        padded_training_rows, column_modes);
     status = robust_launch_status_v2();
     if (status != static_cast<int>(cudaSuccess)) {
       return status;
     }
-    status = robust_launch_sort_v2(sort_scratch_bits, batch_columns,
-                                   padded_training_rows, stream);
+    status = has_robust_column
+        ? robust_launch_sort_v2(sort_scratch_bits, batch_columns,
+                                padded_training_rows, column_modes, stream)
+        : static_cast<int>(cudaSuccess);
     if (status != static_cast<int>(cudaSuccess)) {
       return status;
     }
     robust_finalize_fit_v2<<<column_blocks, kKernelThreadsV2, 0, stream>>>(
         sort_scratch_bits, column_start, batch_columns, padded_training_rows,
-        fit_metadata_words);
+        fit_metadata_words, column_modes);
     status = robust_launch_status_v2();
     if (status != static_cast<int>(cudaSuccess)) {
       return status;
     }
 
     const std::size_t apply_work = rows * batch_columns;
+    if (has_gate_column) {
+      robust_validate_gates_v3<<<robust_blocks_v2(apply_work), kKernelThreadsV2,
+                                 0, stream>>>(
+          bar_major_values, bar_major_validity_u4, rows, columns, column_start,
+          batch_columns, column_modes, control_error);
+      status = robust_launch_status_v2();
+      if (status != static_cast<int>(cudaSuccess)) {
+        return status;
+      }
+    }
     robust_apply_in_place_v2<<<robust_blocks_v2(apply_work), kKernelThreadsV2,
                                0, stream>>>(
         bar_major_values, bar_major_validity_u4, rows, columns, column_start,
-        batch_columns, fit_metadata_words);
+        batch_columns, fit_metadata_words, column_modes, control_error);
     status = robust_launch_status_v2();
     if (status != static_cast<int>(cudaSuccess)) {
       return status;

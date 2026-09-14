@@ -1,4 +1,4 @@
-//! Native variable-width Higher-Timeframe Alignment semantic-v3.
+//! Native variable-width Higher-Timeframe Alignment semantic-v4 on the v3 ABI.
 //!
 //! Direct-timeframe parent feature batches move into this executor together
 //! with their resident OHLCV/timestamp source. Alignment copies only device
@@ -48,10 +48,12 @@ const LOGICAL_VALIDITY_BYTES_PER_CELL_V3: usize = 1;
 const F64_BYTES_V3: usize = std::mem::size_of::<f64>();
 const U64_BYTES_V3: usize = std::mem::size_of::<u64>();
 
-pub const RESIDENT_HTF_SEMANTIC_VERSION_V3: u32 = 3;
+// The struct/function ABI remains v3. This number identifies the current
+// mathematics carried by that ABI and intentionally advances independently.
+pub const RESIDENT_HTF_SEMANTIC_VERSION_V3: u32 = 4;
 pub const RESIDENT_HTF_IMPLEMENTATION_ID_V3: &str =
-    "neoethos.cuda.resident-higher-timeframe-alignment.semantic-v3";
-pub const RESIDENT_HTF_EXACT_MATH_AUTHORITY_V3: &str = "neoethos.higher-timeframe-alignment.cpu-oracle.semantic-v3;direct-source-only;selected-parent-order;cpu-producer-order;fixed-open-plus-period-v1;calendar-next-direct-bar-open-v1;forward-fill=true;fixed-max-age=2x-period;logical-validity-preserved;zero-feature-d2h";
+    "neoethos.cuda.resident-higher-timeframe-alignment.semantic-v4";
+pub const RESIDENT_HTF_EXACT_MATH_AUTHORITY_V3: &str = "neoethos.higher-timeframe-alignment.cpu-oracle.semantic-v4;direct-source-only;selected-parent-order;cpu-producer-order;fixed-open-plus-period-v1;calendar-next-direct-bar-open-observed-span-expiry-v1;forward-fill=true;fixed-max-age=2x-period;logical-validity-preserved;zero-feature-d2h";
 pub const RESIDENT_HTF_CANONICAL_QNAN_BITS_V3: u64 = 0x7ff8_0000_0000_0000;
 const RESIDENT_HTF_LOGICAL_VALIDITY_SCHEMA_V3: &str =
     "neoethos.feature-cell-validity.logical-u8.codes-0-through-9.v3";
@@ -75,7 +77,7 @@ impl ResidentHigherTimeframeAvailabilityRuleV3 {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::FixedOpenPlusPeriod => "fixed_open_plus_period_v1",
-            Self::NextDirectBarOpen => "next_direct_bar_open_v1",
+            Self::NextDirectBarOpen => "next_direct_bar_open_observed_span_expiry_v1",
         }
     }
 
@@ -144,7 +146,7 @@ impl SealedResidentHigherTimeframeSourceClosureV3 {
 pub fn seal_resident_higher_timeframe_source_closure_v3()
 -> SealedResidentHigherTimeframeSourceClosureV3 {
     let mut implementation = Sha256::new();
-    implementation.update(b"neoethos.gpu-cuda.resident-htf.f64.semantic-v3\0");
+    implementation.update(b"neoethos.gpu-cuda.resident-htf.f64.semantic-v4\0");
     implementation.update(include_bytes!("resident_higher_timeframe_alignment_v3.rs"));
     implementation.update(include_bytes!(
         "../native/resident_higher_timeframe_alignment_v3_abi.cuh"

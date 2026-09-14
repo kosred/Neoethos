@@ -19,7 +19,13 @@ use crate::tui::theme;
 /// Move the Strategies selection / validate the selected portfolio. Returns
 /// whether the key was consumed.
 pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
-    let portfolios = scan_portfolios();
+    let portfolios = match scan_portfolios(&shared.cache_root) {
+        Ok(portfolios) => portfolios,
+        Err(error) => {
+            shared.status = error;
+            return true;
+        }
+    };
     if portfolios.is_empty() {
         return false;
     }
@@ -108,7 +114,17 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let portfolios = scan_portfolios();
+    let portfolios = match scan_portfolios(&shared.cache_root) {
+        Ok(portfolios) => portfolios,
+        Err(error) => {
+            Paragraph::new(Line::styled(
+                format!("Portfolio inventory unavailable: {error}"),
+                theme::sell_style(),
+            ))
+            .render(inner, buf);
+            return;
+        }
+    };
     if portfolios.is_empty() {
         let lines = vec![
             Line::raw(""),
@@ -123,7 +139,10 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
             ),
             Line::raw(""),
             Line::styled(
-                "    neoethos-cli batch-discover --root <data> --out-dir cache/discovery",
+                format!(
+                    "  Configured discovery cache: {}",
+                    shared.cache_root.join("discovery").display()
+                ),
                 theme::accent_style(),
             ),
             Line::raw(""),
@@ -168,7 +187,13 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
         .map(|p| {
             Row::new(vec![
                 Cell::from(p.name.clone()).style(theme::accent_style()),
-                Cell::from(p.strategies.to_string()).style(theme::primary_style()),
+                Cell::from(
+                    p.strategies
+                        .as_ref()
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|_| "?".to_owned()),
+                )
+                .style(theme::primary_style()),
                 Cell::from(format_size(p.bytes)).style(theme::muted_style()),
                 Cell::from(p.modified.clone()).style(theme::muted_style()),
             ])
@@ -198,20 +223,34 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
     draw_details(detail_area, buf, &portfolios[sel]);
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Deserialize)]
 struct StratMetrics {
+    strategy_id: String,
+    initial_capital: f64,
     net_profit: f64,
+    #[serde(rename = "total_return_pct")]
     return_pct: f64,
+    #[serde(rename = "sharpe_ratio")]
     sharpe: f64,
+    #[serde(rename = "max_drawdown_pct")]
     max_dd: f64,
+    #[serde(rename = "win_rate")]
     win: f64,
 }
 
-/// (mtime, len) → (initial_capital, metrics) cache for the quality sidecar —
-/// same rationale as `count_cache`: draw_details runs per frame, and the
-/// sidecar can be megabytes; re-reading + token-scanning it 30×/s hammers
-/// the disk for data that only changes when discovery rewrites the file.
-type QualityEntry = (u64, u64, f64, Vec<StratMetrics>);
+type FileStamp = Option<(std::time::SystemTime, u64)>;
+
+/// Cache the ID-bound display projection, not the large receipt/equity arrays.
+/// Both files participate: changing the selected portfolio must invalidate an
+/// unchanged sidecar, and neither file is decoded on every redraw.
+#[derive(Clone)]
+struct QualityEntry {
+    portfolio_stamp: FileStamp,
+    quality_source: PathBuf,
+    quality_stamp: FileStamp,
+    metrics: Result<Vec<StratMetrics>, String>,
+}
+
 fn quality_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, QualityEntry>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<PathBuf, QualityEntry>>,
@@ -219,71 +258,126 @@ fn quality_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBu
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn load_quality(path: &std::path::Path) -> (f64, Vec<StratMetrics>) {
-    let meta = std::fs::metadata(path).ok();
-    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let mtime = meta
-        .as_ref()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+fn file_stamp(path: &std::path::Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+#[derive(serde::Deserialize)]
+struct ResearchQualityProjection {
+    schema_version: u32,
+    artifact_class: String,
+    promotion_eligibility: String,
+    discovery_result: ResearchQualityBody,
+}
+
+#[derive(serde::Deserialize)]
+struct ResearchQualityBody {
+    quality_metrics: Vec<StratMetrics>,
+}
+
+fn load_quality(portfolio_path: &std::path::Path) -> Result<Vec<StratMetrics>, String> {
+    let name = portfolio_path.to_string_lossy();
+    let stem = name
+        .strip_suffix(".live_portfolio.json")
+        .ok_or_else(|| "Selected artifact is not a live portfolio".to_string())?;
+    let sidecar = PathBuf::from(format!("{stem}.quality.json"));
+    // Only a missing legacy sidecar permits the current App producer's
+    // embedded research source. A malformed/unreadable existing sidecar fails.
+    let embedded =
+        !sidecar.try_exists().map_err(|error| error.to_string())? && stem.ends_with(".research");
+    let quality_source = if embedded {
+        PathBuf::from(format!("{stem}.json"))
+    } else {
+        sidecar
+    };
+    let portfolio_stamp = file_stamp(portfolio_path);
+    let quality_stamp = file_stamp(&quality_source);
     if let Ok(cache) = quality_cache().lock() {
-        if let Some((c_mtime, c_len, initial, metrics)) = cache.get(path) {
-            if *c_mtime == mtime && *c_len == len {
-                return (*initial, metrics.clone());
+        if let Some(entry) = cache.get(portfolio_path) {
+            if entry.portfolio_stamp == portfolio_stamp
+                && entry.quality_source == quality_source
+                && entry.quality_stamp == quality_stamp
+            {
+                return entry.metrics.clone();
             }
         }
     }
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let metrics = extract_strategy_metrics(&text);
-    let initial = scan_numbers(&text, "initial_capital")
-        .first()
-        .copied()
-        .unwrap_or(0.0);
+    let metrics = (|| {
+        let portfolio =
+            neoethos_search::live_portfolio::load_live_portfolio_json(portfolio_path)
+                .map_err(|_| "Selected portfolio identity is unavailable or invalid".to_string())?;
+        let selected_ids: Vec<String> = portfolio
+            .genes
+            .into_iter()
+            .map(|gene| gene.strategy_id)
+            .collect();
+        let reader = std::io::BufReader::new(
+            std::fs::File::open(&quality_source)
+                .map_err(|_| "Quality diagnostics are missing or unreadable".to_owned())?,
+        );
+        let rows = if embedded {
+            let projection: ResearchQualityProjection = serde_json::from_reader(reader)
+                .map_err(|_| "Research quality rows are incomplete or malformed".to_owned())?;
+            if projection.schema_version != 3
+                || projection.artifact_class != "research_only"
+                || projection.promotion_eligibility != "not_promotion_eligible"
+            {
+                return Err("Unsupported research quality envelope".to_owned());
+            }
+            projection.discovery_result.quality_metrics
+        } else {
+            serde_json::from_reader(reader)
+                .map_err(|_| "Quality sidecar rows are incomplete or malformed".to_owned())?
+        };
+        bind_strategy_metrics(rows, &selected_ids)
+    })();
     if let Ok(mut cache) = quality_cache().lock() {
-        cache.insert(path.to_path_buf(), (mtime, len, initial, metrics.clone()));
+        cache.insert(
+            portfolio_path.to_path_buf(),
+            QualityEntry {
+                portfolio_stamp,
+                quality_source,
+                quality_stamp,
+                metrics: metrics.clone(),
+            },
+        );
     }
-    (initial, metrics)
+    metrics
 }
 
 fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
     if area.height == 0 {
         return;
     }
-    let quality_path = p
-        .path
-        .to_string_lossy()
-        .strip_suffix(".live_portfolio.json")
-        .map(|stem| PathBuf::from(format!("{stem}.quality.json")));
-    let (initial, metrics) = quality_path
-        .as_deref()
-        .map(load_quality)
-        .unwrap_or_else(|| (0.0, Vec::new()));
-    let total_net: f64 = metrics.iter().map(|m| m.net_profit).sum();
+    let metrics = load_quality(&p.path);
+    let lines = quality_detail_lines(
+        &p.name,
+        metrics.as_deref().map_err(String::as_str),
+        area.height.saturating_sub(4) as usize,
+    );
+    Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(theme::BORDER)),
+        )
+        .render(area, buf);
+}
 
-    // Header carries the money view: starting capital + Σ net € across the
-    // portfolio (the €-view the operator wanted, not just ratios).
-    let mut header = vec![
-        Span::styled(
-            format!(" {} ", p.name),
-            theme::accent_style().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("· {} strat  ", p.strategies), theme::muted_style()),
-    ];
-    if initial > 0.0 {
+fn quality_detail_lines(
+    name: &str,
+    metrics: Result<&[StratMetrics], &str>,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let mut header = vec![Span::styled(
+        format!(" {name} "),
+        theme::accent_style().add_modifier(Modifier::BOLD),
+    )];
+    if let Ok(rows) = metrics {
         header.push(Span::styled(
-            format!("start €{}  ", fmt_eur(initial)),
-            theme::caption_style(),
-        ));
-        let net_style = if total_net >= 0.0 {
-            theme::buy_style()
-        } else {
-            Style::default().fg(theme::SELL)
-        };
-        header.push(Span::styled(
-            format!("Σnet €{}  ", fmt_eur(total_net)),
-            net_style.add_modifier(Modifier::BOLD),
+            format!("· {} selected  ", rows.len()),
+            theme::muted_style(),
         ));
     }
     header.push(Span::styled(
@@ -292,21 +386,36 @@ fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
     ));
     let mut lines: Vec<Line> = vec![Line::from(header)];
 
+    let metrics = match metrics {
+        Ok(rows) => rows,
+        Err(reason) => {
+            lines.push(Line::styled(
+                format!("  Per-strategy metrics unavailable: {reason}"),
+                theme::warn_style(),
+            ));
+            return lines;
+        }
+    };
     if metrics.is_empty() {
         lines.push(Line::styled(
-            "  No .quality.json sidecar — re-run discovery to regenerate per-strategy metrics.",
+            "  No selected strategies with quality metrics.",
             theme::caption_style(),
         ));
     } else {
+        // These are independently sized IS backtests, not a shared-account
+        // ledger. Neither a sidecar nor a research projection is OOS proof.
+        lines.push(Line::styled(
+            "  Unsealed IS diagnostics · full balance per strategy · account units · NOT portfolio PnL",
+            theme::caption_style(),
+        ));
         lines.push(Line::from(vec![Span::styled(
             format!(
-                "  {:<4}{:>10}{:>8}{:>8}{:>7}{:>7}",
-                "#", "Net €", "Ret%", "Sharpe", "DD%", "Win%"
+                "  {:<20}{:>10}{:>10}{:>8}{:>8}{:>7}{:>7}",
+                "Strategy ID", "Start", "Net", "Ret%", "Sharpe", "DD%", "Win%"
             ),
             theme::caption_style().add_modifier(Modifier::BOLD),
         )]));
-        let max_rows = area.height.saturating_sub(3) as usize;
-        for (i, m) in metrics.iter().take(max_rows).enumerate() {
+        for m in metrics.iter().take(max_rows) {
             let dd_pct = m.max_dd * 100.0;
             // Operator's low-DD lens: green ≤6%, amber ≤10%, red above.
             let dd_style = if dd_pct <= 6.0 {
@@ -322,53 +431,86 @@ fn draw_details(area: Rect, buf: &mut Buffer, p: &PortfolioSummary) {
                 Style::default().fg(theme::SELL)
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<4}", i + 1), theme::muted_style()),
-                Span::styled(format!("{:>10}", fmt_eur(m.net_profit)), net_style),
-                Span::styled(format!("{:>7.1}%", m.return_pct), theme::primary_style()),
+                Span::styled(format!("  {:<20.20}", m.strategy_id), theme::muted_style()),
+                Span::styled(
+                    format!("{:>10}", fmt_money(m.initial_capital)),
+                    theme::muted_style(),
+                ),
+                Span::styled(format!("{:>10}", fmt_money(m.net_profit)), net_style),
+                Span::styled(
+                    format!("{:>7.1}%", m.return_pct * 100.0),
+                    theme::primary_style(),
+                ),
                 Span::styled(format!("{:>8.2}", m.sharpe), theme::primary_style()),
                 Span::styled(format!("{:>6.1}%", dd_pct), dd_style),
                 Span::styled(format!("{:>6.0}%", m.win * 100.0), theme::muted_style()),
             ]));
         }
     }
-    Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(theme::BORDER)),
-        )
-        .render(area, buf);
+    lines
 }
 
-/// Robustly pull per-strategy metrics from a quality.json sidecar by scanning
-/// for field tokens (no schema dependency — works across writer shapes). Zips
-/// the parallel sharpe/PF/DD/win arrays in document order.
-fn extract_strategy_metrics(text: &str) -> Vec<StratMetrics> {
-    let net = scan_numbers(text, "net_profit");
-    let ret = scan_numbers(text, "total_return_pct");
-    let sharpe = scan_numbers(text, "sharpe_ratio");
-    let dd = scan_numbers(text, "max_drawdown_pct");
-    let win = scan_numbers(text, "win_rate");
-    let n = net
-        .len()
-        .min(ret.len())
-        .min(sharpe.len())
-        .min(dd.len())
-        .min(win.len());
-    (0..n)
-        .map(|i| StratMetrics {
-            net_profit: net[i],
-            return_pct: ret[i],
-            sharpe: sharpe[i],
-            max_dd: dd[i],
-            win: win[i],
+/// Keep every metric attached to its selected object/ID. Unknown large fields
+/// are skipped by serde; no token-order or row-index join is permitted.
+#[cfg(test)]
+fn extract_strategy_metrics(
+    text: &str,
+    selected_ids: &[String],
+) -> Result<Vec<StratMetrics>, String> {
+    let rows: Vec<StratMetrics> = serde_json::from_str(text)
+        .map_err(|_| "Quality sidecar rows are incomplete or malformed".to_string())?;
+    bind_strategy_metrics(rows, selected_ids)
+}
+
+fn bind_strategy_metrics(
+    rows: Vec<StratMetrics>,
+    selected_ids: &[String],
+) -> Result<Vec<StratMetrics>, String> {
+    let selected: std::collections::HashSet<&str> =
+        selected_ids.iter().map(String::as_str).collect();
+    if selected.len() != selected_ids.len() || selected.iter().any(|id| id.trim().is_empty()) {
+        return Err("Selected strategy IDs are missing or ambiguous".to_string());
+    }
+    let mut by_id = std::collections::HashMap::with_capacity(selected.len());
+    for row in rows {
+        if !selected.contains(row.strategy_id.as_str()) {
+            continue;
+        }
+        if row.initial_capital <= 0.0
+            || [
+                row.initial_capital,
+                row.net_profit,
+                row.return_pct * 100.0,
+                row.sharpe,
+                row.max_dd * 100.0,
+                row.win * 100.0,
+            ]
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "Invalid quality metrics for selected ID {}",
+                row.strategy_id
+            ));
+        }
+        let id = row.strategy_id.clone();
+        if by_id.insert(id.clone(), row).is_some() {
+            return Err(format!("Ambiguous quality rows for selected ID {id}"));
+        }
+    }
+    selected_ids
+        .iter()
+        .map(|id| {
+            by_id
+                .remove(id)
+                .ok_or_else(|| format!("No quality row for selected ID {id}"))
         })
         .collect()
 }
 
 /// Compact money formatting for the narrow details panel: thousands as `k`,
 /// millions as `M`, with sign preserved.
-fn fmt_eur(v: f64) -> String {
+fn fmt_money(v: f64) -> String {
     let a = v.abs();
     if a >= 1_000_000.0 {
         format!("{:.2}M", v / 1_000_000.0)
@@ -379,198 +521,153 @@ fn fmt_eur(v: f64) -> String {
     }
 }
 
-fn scan_numbers(text: &str, key: &str) -> Vec<f64> {
-    let pat = format!("\"{key}\"");
-    let mut out = Vec::new();
-    let mut idx = 0;
-    while let Some(p) = text[idx..].find(&pat) {
-        let after = idx + p + pat.len();
-        let rest = text[after..].trim_start_matches([':', ' ', '\t', '\n', '\r']);
-        let num: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
-            .collect();
-        if let Ok(v) = num.parse::<f64>() {
-            out.push(v);
-        }
-        idx = after;
-    }
-    out
-}
-
 struct PortfolioSummary {
     name: String,
-    strategies: usize,
+    strategies: Result<usize, String>,
     bytes: u64,
     modified: String,
-    /// Real mtime for sorting — the display string is time-of-day only,
-    /// so sorting by it would order yesterday-23:59 above today-08:00.
-    modified_secs: u64,
     path: PathBuf,
 }
 
-fn scan_portfolios() -> Vec<PortfolioSummary> {
-    let mut out: Vec<PortfolioSummary> = Vec::new();
-    let candidates = [
-        PathBuf::from("cache").join("discovery"),
-        PathBuf::from("cache"),
-    ];
-    for dir in candidates.iter() {
-        let Ok(read) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in read.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy().to_string();
-            if !name_str.ends_with(".live_portfolio.json") {
-                continue;
-            }
-            let path = entry.path();
-            let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            let strategies = count_strategies(&path);
-            let modified_secs = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let modified = if modified_secs > 0 {
-                format_ts(modified_secs)
-            } else {
-                "—".to_string()
-            };
-            out.push(PortfolioSummary {
-                name: name_str,
-                strategies,
-                bytes,
-                modified,
-                modified_secs,
-                path,
-            });
-        }
-    }
-    out.sort_by(|a, b| b.modified_secs.cmp(&a.modified_secs));
-    out
+/// Existing producer locations under the configured cache only; no CWD guesses
+/// and no recursive scan into models, temporary trees or unrelated profiles.
+pub(super) fn artifact_dirs(cache_root: &std::path::Path) -> [PathBuf; 6] {
+    [
+        cache_root.to_path_buf(),
+        cache_root.join("discovery"),
+        cache_root.join("discovery").join("research"),
+        cache_root.join("auto_loop"),
+        cache_root.join("schedule"),
+        cache_root.join("discovery_test"),
+    ]
 }
 
-/// Array fields, in preference order, that hold the strategy objects in
-/// the various portfolio shapes we write:
-///   - `portfolio`  — the curated set (modern `discovery.rs` output)
-///   - `best_genes` — legacy knowledge-artifact files
-///   - `genes`      — GA checkpoints / `strategy_gene` dumps
-///   - `candidates` / `survivors` / `strategies` — other writers
-/// A bare `[...]` array (no wrapper object) is also handled.
-const STRATEGY_ARRAY_KEYS: &[&str] = &[
-    // CanonicalSearchArtifactEnvelopeV2 owns the portfolio array here.
-    "payload",
-    "portfolio",
-    "best_genes",
-    "genes",
-    "strategies",
-    "candidates",
-    "survivors",
-];
+pub(super) fn collect_artifact_files(
+    cache_root: &std::path::Path,
+    accepts: impl Fn(&str) -> bool,
+) -> Result<Vec<PathBuf>, String> {
+    let mut found = Vec::new();
+    for dir in artifact_dirs(cache_root) {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(&accepts)
+            {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            if metadata.is_file() {
+                let modified = metadata
+                    .modified()
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                found.push((modified, path));
+            }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found.dedup_by(|a, b| a.1 == b.1);
+    Ok(found.into_iter().map(|(_, path)| path).collect())
+}
 
-/// (mtime_secs, len) → count cache so the 71 MB knowledge file isn't
-/// re-read and re-scanned on every redraw. Keyed per path; a changed
-/// mtime or size invalidates the entry.
-fn count_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, u64, usize)>>
-{
+fn scan_portfolios(cache_root: &std::path::Path) -> Result<Vec<PortfolioSummary>, String> {
+    collect_artifact_files(cache_root, |name| name.ends_with(".live_portfolio.json"))?
+        .into_iter()
+        .map(|path| {
+            let metadata =
+                std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| format_ts(duration.as_secs()))
+                .unwrap_or_else(|| "—".to_owned());
+            Ok(PortfolioSummary {
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                strategies: count_strategies(&path),
+                bytes: metadata.len(),
+                modified,
+                path,
+            })
+        })
+        .collect()
+}
+
+type PortfolioFileCensus = Result<(usize, usize), String>;
+type PortfolioCensusCache = Option<(std::time::Instant, PathBuf, PortfolioFileCensus)>;
+
+/// A file census, NOT a certificate that these portfolios can trade.
+/// Cache this compact Dashboard projection for two seconds, including errors;
+/// redraws must not enumerate all producer directories every frame.
+pub(super) fn portfolio_file_counts(cache_root: &std::path::Path) -> PortfolioFileCensus {
+    static CACHE: std::sync::Mutex<PortfolioCensusCache> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    cached_portfolio_file_counts(&mut cache, cache_root, std::time::Instant::now, || {
+        let files = scan_portfolios(cache_root)?;
+        Ok((
+            files.len(),
+            files.iter().filter(|file| file.strategies.is_err()).count(),
+        ))
+    })
+}
+
+fn cached_portfolio_file_counts(
+    cache: &mut PortfolioCensusCache,
+    cache_root: &std::path::Path,
+    clock: impl Fn() -> std::time::Instant,
+    scan: impl FnOnce() -> PortfolioFileCensus,
+) -> PortfolioFileCensus {
+    if let Some((at, root, counts)) = cache.as_ref() {
+        if root == cache_root
+            && clock().saturating_duration_since(*at) < std::time::Duration::from_secs(2)
+        {
+            return counts.clone();
+        }
+    }
+    let counts = scan();
+    // TTL starts after the scan, so a slow decode still receives a full pause.
+    *cache = Some((clock(), cache_root.to_path_buf(), counts.clone()));
+    counts
+}
+
+type CountEntry = (FileStamp, Result<usize, String>);
+
+fn count_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, CountEntry>> {
     static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, u64, usize)>>,
+        std::sync::Mutex<std::collections::HashMap<PathBuf, CountEntry>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn count_strategies(path: &std::path::Path) -> usize {
-    let meta = std::fs::metadata(path).ok();
-    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let mtime = meta
-        .as_ref()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
+fn count_strategies(path: &std::path::Path) -> Result<usize, String> {
+    let stamp = file_stamp(path);
     if let Ok(cache) = count_cache().lock() {
-        if let Some(&(c_mtime, c_len, c_count)) = cache.get(path) {
-            if c_mtime == mtime && c_len == len {
-                return c_count;
+        if let Some((cached_stamp, count)) = cache.get(path) {
+            if *cached_stamp == stamp {
+                return count.clone();
             }
         }
     }
-
-    let count = compute_strategy_count(path);
+    // The same validated V6/legacy loader used by selected quality details.
+    // A random payload/array or malformed artifact is unknown, never zero.
+    let count = neoethos_search::live_portfolio::load_live_portfolio_json(path)
+        .map(|portfolio| portfolio.genes.len())
+        .map_err(|error| format!("Portfolio unavailable: {error:#}"));
     if let Ok(mut cache) = count_cache().lock() {
-        cache.insert(path.to_path_buf(), (mtime, len, count));
-    }
-    count
-}
-
-fn compute_strategy_count(path: &std::path::Path) -> usize {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return 0;
-    };
-    let trimmed = text.trim_start();
-    // Two shapes in the wild: a bare `[ {...}, … ]` array, or an object
-    // that wraps the strategies in one of `STRATEGY_ARRAY_KEYS`. Locate
-    // the relevant array's opening `[`, then count the objects directly
-    // inside it.
-    let array_start = if trimmed.starts_with('[') {
-        Some(0)
-    } else {
-        STRATEGY_ARRAY_KEYS.iter().find_map(|key| {
-            let needle = format!("\"{key}\"");
-            let kpos = trimmed.find(&needle)?;
-            trimmed[kpos..].find('[').map(|rel| kpos + rel)
-        })
-    };
-    let Some(start) = array_start else {
-        return 0;
-    };
-    count_objects_in_array(&trimmed[start..])
-}
-
-/// `s` begins at the `[` of a strategy array. Count the objects whose
-/// opening `{` sits at the array's immediate element depth. String-aware
-/// so braces inside quoted values (indicator names, notes) don't inflate
-/// the count; stops at the array's matching `]`.
-fn count_objects_in_array(s: &str) -> usize {
-    let mut in_str = false;
-    let mut escaped = false;
-    let mut bracket_depth: i32 = 0; // [] nesting
-    let mut brace_depth: i32 = 0; // {} nesting
-    let mut count = 0usize;
-    for ch in s.chars() {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_str = true,
-            '[' => bracket_depth += 1,
-            ']' => {
-                bracket_depth -= 1;
-                if bracket_depth == 0 {
-                    break;
-                }
-            }
-            '{' => {
-                if bracket_depth == 1 && brace_depth == 0 {
-                    count += 1;
-                }
-                brace_depth += 1;
-            }
-            '}' => brace_depth -= 1,
-            _ => {}
-        }
+        cache.insert(path.to_path_buf(), (stamp, count.clone()));
     }
     count
 }
@@ -602,75 +699,255 @@ fn format_ts(unix: u64) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn counts_wrapped_best_genes_object() {
-        // The legacy knowledge-artifact shape that used to report 0 — an object
-        // whose strategies live in a `best_genes` array.
-        let json = r#"{
-            "generated_at": "2026-02-16T19:59:16Z",
-            "symbol": "EURUSD",
-            "best_genes": [
-                {"indicators": ["CDLSHORTLINE"], "score": 1.2},
-                {"indicators": ["CDLKICKING"], "score": 0.9},
-                {"indicators": ["CDLTRISTAR"], "score": 0.7}
-            ]
-        }"#;
-        let start = json.find('[').unwrap();
-        assert_eq!(count_objects_in_array(&json[start..]), 3);
+    fn quality_row(id: &str, net: f64, return_fraction: f64) -> serde_json::Value {
+        serde_json::json!({
+            "strategy_id": id,
+            "initial_capital": 10_000.0,
+            "net_profit": net,
+            "total_return_pct": return_fraction,
+            "sharpe_ratio": 1.5,
+            "max_drawdown_pct": 0.06,
+            "win_rate": 0.55,
+            // An actual writer field ignored by the compact display projection.
+            "equity_curve": [10_000.0, 10_000.0 + net]
+        })
+    }
+
+    fn details_text(metrics: Result<&[StratMetrics], &str>) -> String {
+        quality_detail_lines("fixture.live_portfolio.json", metrics, 10)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn counts_bare_array() {
-        let json = r#"[ {"a":1}, {"b":2} ]"#;
-        assert_eq!(count_objects_in_array(json), 2);
+    fn selected_quality_rows_are_id_bound_and_standalone_profits_are_not_added() {
+        // All three rows belong to the quality census, but only A/B were
+        // selected. Each replay used the same complete 10,000-unit balance;
+        // neither 903,000 nor 3,000 is a measured shared-account portfolio PnL.
+        let text = serde_json::to_string(&vec![
+            quality_row("selected-b", 2_000.0, 0.20),
+            quality_row("unselected-outlier", 900_000.0, 90.0),
+            quality_row("selected-a", 1_000.0, 0.10),
+        ])
+        .unwrap();
+        let metrics =
+            extract_strategy_metrics(&text, &["selected-a".to_string(), "selected-b".to_string()])
+                .unwrap();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].strategy_id, "selected-a");
+        assert_eq!(metrics[0].net_profit, 1_000.0);
+        assert_eq!(metrics[1].strategy_id, "selected-b");
+        assert_eq!(metrics[1].net_profit, 2_000.0);
+        assert!(metrics.iter().all(|row| row.initial_capital == 10_000.0));
+
+        let rendered = details_text(Ok(&metrics));
+        assert!(rendered.contains("2 selected"));
+        assert!(rendered.contains("Unsealed IS diagnostics"));
+        assert!(rendered.contains("full balance per strategy"));
+        assert!(rendered.contains("account units"));
+        assert!(rendered.contains("NOT portfolio PnL"));
+        assert!(rendered.contains("1.0k"));
+        assert!(rendered.contains("2.0k"));
+        assert!(rendered.contains("10.0%"), "0.10 must render as 10.0%");
+        assert!(rendered.contains("20.0%"));
+        assert!(!rendered.contains("0.1%"));
+        assert!(!rendered.contains("unselected-outlier"));
+        assert!(!rendered.contains("900.0k"));
+        assert!(!rendered.contains("903.0k"));
+        assert!(!rendered.contains("3.0k"));
+        assert!(!rendered.contains("Σnet"));
+        assert!(!rendered.contains('€'));
     }
 
     #[test]
-    fn counts_receipt_bound_portfolio_envelope_payload() {
-        let json = r#"{
-            "schema_version": 1,
-            "artifact_kind": "neoethos.search-portfolio.v1",
-            "scope": {"opaque": true},
-            "payload": [ {"strategy_id":"a"}, {"strategy_id":"b"} ]
-        }"#;
-        let key = STRATEGY_ARRAY_KEYS
-            .iter()
-            .find(|key| json.contains(&format!("\"{key}\"")))
-            .expect("envelope payload key");
-        assert_eq!(*key, "payload");
-        let key_pos = json.find("\"payload\"").unwrap();
-        let start = key_pos + json[key_pos..].find('[').unwrap();
-        assert_eq!(count_objects_in_array(&json[start..]), 2);
+    fn missing_or_ambiguous_selected_quality_ids_are_unavailable() {
+        let selected = ["selected-a".to_string(), "selected-b".to_string()];
+        for rows in [
+            vec![quality_row("selected-a", 1_000.0, 0.10)],
+            vec![
+                quality_row("selected-a", 1_000.0, 0.10),
+                quality_row("selected-b", 2_000.0, 0.20),
+                quality_row("selected-a", 4_000.0, 0.40),
+            ],
+        ] {
+            let error = extract_strategy_metrics(&serde_json::to_string(&rows).unwrap(), &selected)
+                .expect_err("missing or duplicate selected ID must not guess a row");
+            let rendered = details_text(Err(&error));
+            assert!(rendered.contains("Per-strategy metrics unavailable"));
+            assert!(!rendered.contains("1.0k"));
+            assert!(!rendered.contains("2.0k"));
+        }
+        assert!(extract_strategy_metrics("[]", &["".to_string()]).is_err());
+        assert!(
+            extract_strategy_metrics("[]", &["selected-a".to_string(), "selected-a".to_string()])
+                .is_err()
+        );
     }
 
     #[test]
-    fn prefers_portfolio_over_candidates() {
-        // Modern discovery output carries both; the STRATEGIES column
-        // should reflect the curated `portfolio`, not the wider pool.
-        let json = r#"{
-            "portfolio": [ {"id":1}, {"id":2} ],
-            "candidates": [ {"id":3}, {"id":4}, {"id":5}, {"id":6} ]
-        }"#;
-        let trimmed = json.trim_start();
-        let key = STRATEGY_ARRAY_KEYS
-            .iter()
-            .find(|k| trimmed.contains(&format!("\"{k}\"")))
-            .unwrap();
-        assert_eq!(*key, "portfolio");
-        let kpos = trimmed.find("\"portfolio\"").unwrap();
-        let start = kpos + trimmed[kpos..].find('[').unwrap();
-        assert_eq!(count_objects_in_array(&trimmed[start..]), 2);
+    fn incomplete_quality_objects_never_borrow_another_rows_numbers() {
+        let mut first = quality_row("selected-a", 1_000.0, 0.10);
+        first.as_object_mut().unwrap().remove("total_return_pct");
+        let text =
+            serde_json::to_string(&vec![first, quality_row("selected-b", 2_000.0, 0.20)]).unwrap();
+        let error =
+            extract_strategy_metrics(&text, &["selected-a".to_string(), "selected-b".to_string()])
+                .expect_err("object-bound decoding must reject the former token-scan cross-wire");
+        assert!(details_text(Err(&error)).contains("incomplete or malformed"));
     }
 
     #[test]
-    fn ignores_braces_inside_strings() {
-        // A brace inside a quoted value must not inflate the count.
-        let json = r#"[ {"note":"a { brace } here"}, {"note":"plain"} ]"#;
-        assert_eq!(count_objects_in_array(json), 2);
+    fn selected_quality_display_preserves_zero_and_negative_results() {
+        let text = serde_json::to_string(&vec![
+            quality_row("zero", 0.0, 0.0),
+            quality_row("loss", -1_000.0, -0.10),
+        ])
+        .unwrap();
+        let metrics =
+            extract_strategy_metrics(&text, &["zero".to_string(), "loss".to_string()]).unwrap();
+        assert_eq!(metrics[0].net_profit, 0.0);
+        assert_eq!(metrics[1].net_profit, -1_000.0);
+        let rendered = details_text(Ok(&metrics));
+        assert!(rendered.contains("-1.0k"));
+        assert!(rendered.contains("-10.0%"));
+        assert!(!rendered.contains("Σnet"));
     }
 
     #[test]
-    fn empty_array_is_zero() {
-        assert_eq!(count_objects_in_array("[]"), 0);
+    fn configured_research_cache_uses_real_writer_portfolio_and_rejects_fake_arrays() {
+        let root = std::env::temp_dir().join(format!(
+            "neoethos-tui-portfolio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let research = root.join("discovery/research");
+        std::fs::create_dir_all(&research).unwrap();
+        let portfolio = research.join("actual.research.live_portfolio.json");
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../neoethos-search/test_fixtures/strategy_report_v6/8510cec7a31d6c18b3ed61709a9315fee0ea2e4c9b7c4fb2220f73d314d7f02d.research.live_portfolio.json"
+        ));
+        std::fs::write(&portfolio, bytes).unwrap();
+        std::fs::write(research.join("actual.research.json"), include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../neoethos-search/test_fixtures/strategy_report_v6/8510cec7a31d6c18b3ed61709a9315fee0ea2e4c9b7c4fb2220f73d314d7f02d.research.json"))).unwrap();
+        std::fs::write(research.join("actual.research.costs.json"), b"{}").unwrap();
+        let invalid = research.join("invalid.live_portfolio.json");
+        std::fs::write(&invalid, br#"{"payload":[{},{}],"candidates":[{},{}]}"#).unwrap();
+        assert_eq!(count_strategies(&portfolio).unwrap(), 2);
+        let quality = load_quality(&portfolio).unwrap();
+        assert_eq!(quality.len(), 2);
+        assert_eq!(quality[0].strategy_id, "report-selected-a");
+        assert_eq!(quality[0].net_profit, 50.0);
+        assert_eq!(quality[1].strategy_id, "report-selected-b");
+        assert_eq!(quality[1].net_profit, 100.0);
+        assert!(
+            quality
+                .iter()
+                .all(|row| row.strategy_id != "report-not-selected")
+        );
+        let rendered = details_text(Ok(&quality));
+        assert!(rendered.contains("NOT portfolio PnL"));
+        assert!(!rendered.contains("27.0k"));
+        let sidecar = research.join("actual.research.quality.json");
+        std::fs::write(&sidecar, b"malformed existing sidecar").unwrap();
+        assert!(
+            load_quality(&portfolio).is_err(),
+            "malformed sidecar must not silently fall back"
+        );
+        std::fs::remove_file(sidecar).unwrap();
+        assert_eq!(load_quality(&portfolio).unwrap().len(), 2);
+        assert!(count_strategies(&invalid).is_err());
+        assert_eq!(portfolio_file_counts(&root).unwrap(), (2, 1));
+        assert_eq!(scan_portfolios(&root).unwrap().len(), 2);
+        // A different configured root must not reuse this profile's file list/count.
+        let other = root.join("other-cache");
+        std::fs::create_dir(&other).unwrap();
+        assert_eq!(portfolio_file_counts(&other).unwrap(), (0, 0));
+        std::fs::write(&portfolio, b"{}").unwrap();
+        assert!(
+            count_strategies(&portfolio).is_err(),
+            "changed file invalidates cached count"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn portfolio_census_is_root_bound_and_caches_success_and_errors_for_two_seconds() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let now = Cell::new(start);
+        let scans = Cell::new(0);
+        let mut cache = None;
+        let first = std::path::Path::new("first-configured-cache");
+        let second = std::path::Path::new("second-configured-cache");
+        let read = |cache: &mut PortfolioCensusCache,
+                    root: &std::path::Path,
+                    result: PortfolioFileCensus| {
+            cached_portfolio_file_counts(
+                cache,
+                root,
+                || now.get(),
+                || {
+                    scans.set(scans.get() + 1);
+                    result
+                },
+            )
+        };
+
+        assert_eq!(read(&mut cache, first, Ok((2, 1))), Ok((2, 1)));
+        now.set(start + Duration::from_millis(1_999));
+        assert_eq!(
+            read(&mut cache, first, Err("must not scan".into())),
+            Ok((2, 1))
+        );
+        assert_eq!(scans.get(), 1);
+
+        let unavailable = Err("unreadable configured cache".to_owned());
+        assert_eq!(read(&mut cache, second, unavailable.clone()), unavailable);
+        assert_eq!(read(&mut cache, second, Ok((0, 0))), unavailable);
+        assert_eq!(scans.get(), 2, "a cached error remains unknown, not zero");
+        assert_eq!(read(&mut cache, first, Ok((3, 0))), Ok((3, 0)));
+        assert_eq!(
+            scans.get(),
+            3,
+            "changing roots cannot reuse another inventory"
+        );
+
+        now.set(start + Duration::from_millis(3_999));
+        assert_eq!(read(&mut cache, first, unavailable.clone()), unavailable);
+        assert_eq!(scans.get(), 4, "exactly two seconds must refresh");
+        now.set(start + Duration::from_millis(5_998));
+        assert_eq!(read(&mut cache, first, Ok((0, 0))), unavailable);
+        assert_eq!(scans.get(), 4);
+        now.set(start + Duration::from_millis(5_999));
+        assert_eq!(read(&mut cache, first, Ok((0, 0))), Ok((0, 0)));
+        assert_eq!(scans.get(), 5, "expired errors must permit recovery");
+    }
+
+    #[test]
+    fn portfolio_inventory_reports_unreadable_location_instead_of_false_zero() {
+        let root = std::env::temp_dir().join(format!(
+            "neoethos-tui-invalid-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&root, b"not a directory").unwrap();
+        assert!(portfolio_file_counts(&root).is_err());
+        std::fs::remove_file(root).unwrap();
     }
 }

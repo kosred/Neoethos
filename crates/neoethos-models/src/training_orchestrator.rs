@@ -36,6 +36,15 @@ fn training_cancel_requested() -> bool {
         .unwrap_or(false)
 }
 
+fn training_feature_control() -> neoethos_data::FeatureBuildControl {
+    training_cancel_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .map(neoethos_data::FeatureBuildControl::new)
+        .unwrap_or_default()
+}
+
 use crate::base::ExpertModel;
 use crate::burn_models::{active_burn_backend_name, normalize_burn_device_policy};
 use crate::ensemble::{
@@ -75,7 +84,6 @@ use neoethos_core::{AcceleratorBackend, HardwareExecutionPlan, Settings, Workloa
 use neoethos_data::{
     CanonicalDatasetSeriesReceiptV1, CanonicalTimeframe, FeatureBuildOptions, FeatureFrame, Ohlcv,
     SymbolDataset, load_exact_dataset_series_receipt, load_symbol_dataset,
-    prepare_multitimeframe_features_with_options,
 };
 use neoethos_execution_budget::CpuLease;
 use neoethos_search::genetic::{ParentSelectionPolicy, SurvivorSelectionPolicy};
@@ -96,12 +104,49 @@ enum TrainingLabelEconomics {
     },
 }
 
+/// Resolve the actual forward-looking label horizon once for label creation,
+/// OOS purging, candidate handoff identity, and the persisted runtime profile.
+pub(crate) fn effective_label_horizon_bars_v1(settings: &Settings) -> usize {
+    if settings.models.label_horizon_bars > 0 {
+        settings.models.label_horizon_bars
+    } else {
+        settings.risk.meta_label_max_hold_bars.max(1)
+    }
+}
+
+fn purged_training_prefix_v1(
+    timestamps: &[i64],
+    cutoff: i64,
+    settings: &Settings,
+) -> (usize, usize, usize) {
+    let in_sample = timestamps
+        .iter()
+        .take_while(|&&timestamp| timestamp < cutoff)
+        .count();
+    let purge = effective_label_horizon_bars_v1(settings);
+    (in_sample, purge, in_sample.saturating_sub(purge))
+}
+
+fn final_model_training_rows_v1(
+    total_rows: usize,
+    purged_rows: Option<usize>,
+) -> Result<std::ops::Range<usize>> {
+    let end = purged_rows.unwrap_or(total_rows);
+    anyhow::ensure!(
+        end > 0 && end <= total_rows,
+        "final model training range is empty or outside its input"
+    );
+    // Without an external OOS lock this is an explicit final deployment
+    // refit, not held-out performance evidence. Inner HPO fits stay isolated.
+    Ok(0..end)
+}
+
 pub struct TrainingOrchestrator {
     pub settings: neoethos_core::Settings,
     pub models_dir: PathBuf,
     /// v0.5 ML-integration Stage 4 — leak-free OOS-locked retrain. When `Some(ms)`,
     /// each symbol's training frame + labels are truncated to rows with
-    /// `timestamp < ms`, minus a `label_horizon_bars` purge (the triple-barrier
+    /// `timestamp < ms`, minus the effective label-horizon purge (the triple-barrier
     /// label looks forward), BEFORE the warmup drop + train/val split. The
     /// resulting experts have seen ZERO bars at/after the cutoff, so a blend that
     /// uses them can be validated on `[ms, end)` without look-ahead. Callers MUST
@@ -164,7 +209,48 @@ fn reject_legacy_rllib_model_params_v1(
 }
 
 fn is_supported_orchestrator_burn_device_policy(policy: &str) -> bool {
-    matches!(policy, "auto" | "cpu" | "gpu") || policy.starts_with("gpu:")
+    matches!(policy, "auto" | "cpu" | "gpu")
+        || policy.starts_with("gpu:")
+        || is_explicit_rocm_policy(policy)
+}
+
+fn is_explicit_rocm_policy(policy: &str) -> bool {
+    let policy = policy.trim().to_ascii_lowercase();
+    matches!(policy.as_str(), "rocm" | "hip")
+        || policy.starts_with("rocm:")
+        || policy.starts_with("hip:")
+}
+
+fn requested_rocm_model_ordinal_v1(
+    settings: &Settings,
+    name: &str,
+    family: ModelFamily,
+    params: &HashMap<String, String>,
+) -> Result<Option<usize>> {
+    let Some(policy) = params
+        .get("device")
+        .filter(|policy| is_explicit_rocm_policy(policy))
+    else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !matches!(
+            settings
+                .system
+                .enable_gpu_preference
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "cpu" | "false" | "0" | "no" | "off"
+        ),
+        "model `{name}` explicitly requests ROCm but GPU execution is explicitly disabled"
+    );
+    let ordinal = crate::common::parse_rocm_device_ordinal(policy)?;
+    anyhow::ensure!(
+        crate::registry::supports_rocm_for_model(canonical_model_name(name), family),
+        "model `{name}` has no compiled ROCm training route; only supported Burn Deep experts in a gpu-rocm build may request ROCm"
+    );
+    Ok(Some(ordinal))
 }
 
 fn model_requires_cuda_in_full_nvidia_run(name: &str, family: ModelFamily) -> bool {
@@ -328,6 +414,9 @@ fn plan_insert(
 
 fn burn_policy_from_workload_device(device: &str) -> String {
     let normalized = device.trim().to_ascii_lowercase();
+    if is_explicit_rocm_policy(&normalized) {
+        return crate::common::normalize_rocm_device_policy(&normalized);
+    }
     if normalized.is_empty() || normalized == "cpu" {
         return "cpu".to_string();
     }
@@ -395,6 +484,14 @@ impl TrainingOrchestrator {
             .trim()
             .to_ascii_lowercase();
         let system_device = self.settings.system.device.trim().to_ascii_lowercase();
+        // Preserve explicit vendor intent even in a build without that vendor:
+        // the checked planner must refuse it, not normalize it to auto/CPU.
+        if is_explicit_rocm_policy(&system_device) {
+            return system_device;
+        }
+        if is_explicit_rocm_policy(&gpu_pref) {
+            return gpu_pref;
+        }
         let normalized_system_device = normalize_burn_device_policy(&system_device);
         match gpu_pref.as_str() {
             "false" | "cpu" => "cpu".to_string(),
@@ -437,15 +534,40 @@ impl TrainingOrchestrator {
         }
     }
 
-    /// Validate the complete configured model expansion and its exact CUDA/CPU
+    fn validate_nvidia_model_config_v1(&self, config: &ModelConfig) -> Result<()> {
+        let canonical = canonical_model_name(&config.name);
+        anyhow::ensure!(
+            crate::registry::supports_nvidia_cuda_for_model(canonical, config.capability_family),
+            "full NVIDIA model `{}` has no compiled NVIDIA CUDA implementation in this build",
+            config.name
+        );
+
+        let policy = self.full_nvidia_device_policy_for_config(config)?;
+        let parsed = crate::common::parse_cuda_device_policy(&policy).with_context(|| {
+            format!(
+                "full NVIDIA model `{}` has invalid device policy `{policy}`",
+                config.name
+            )
+        })?;
+        anyhow::ensure!(
+            policy.trim().contains(':')
+                && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
+            "full NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
+            config.name
+        );
+        Ok(())
+    }
+
+    /// Validate the complete configured model expansion and its exact CUDA-only
     /// routing before a canonical full run spends time building features or
     /// searching. This is deliberately stricter than ordinary CPU-capable
-    /// training: every compiled CUDA surface must target ordinal zero, while
-    /// every model without a CUDA implementation is explicitly pinned to CPU.
+    /// training: every selected model must have a compiled NVIDIA CUDA
+    /// implementation and target exact CUDA ordinal zero. There is no CPU
+    /// substitution.
     pub fn preflight_full_nvidia_cuda_training(&self) -> Result<Vec<String>> {
         let dispatch_plan = self.create_dispatch_plan()?;
         self.validate_dispatch_plan(&dispatch_plan)?;
-        let hardware_plan = self.hardware_execution_plan();
+        let hardware_plan = self.hardware_execution_plan(&dispatch_plan)?;
         anyhow::ensure!(
             hardware_plan.gpu_enabled
                 && hardware_plan.primary_backend == AcceleratorBackend::Cuda
@@ -504,47 +626,7 @@ impl TrainingOrchestrator {
         );
         let mut planned_models = Vec::with_capacity(configs.len());
         for config in configs {
-            let requires_cuda =
-                model_requires_cuda_in_full_nvidia_run(&config.name, config.capability_family);
-            if requires_cuda {
-                anyhow::ensure!(
-                    crate::registry::supports_gpu_for_model(
-                        canonical_model_name(&config.name),
-                        config.capability_family,
-                    ),
-                    "full NVIDIA build lacks the CUDA implementation required by model `{}`",
-                    config.name
-                );
-                let policy = self.full_nvidia_device_policy_for_config(&config)?;
-                let parsed =
-                    crate::common::parse_cuda_device_policy(&policy).with_context(|| {
-                        format!(
-                            "full NVIDIA model `{}` has invalid device policy `{policy}`",
-                            config.name
-                        )
-                    })?;
-                anyhow::ensure!(
-                    policy.trim().contains(':')
-                        && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
-                    "full NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
-                    config.name
-                );
-            } else {
-                let policy = config.params.get("device").with_context(|| {
-                    format!(
-                        "CPU-only model `{}` lacks an explicit CPU device policy",
-                        config.name
-                    )
-                })?;
-                anyhow::ensure!(
-                    matches!(
-                        crate::common::parse_cuda_device_policy(policy)?,
-                        crate::common::CudaDevicePolicy::Cpu
-                    ),
-                    "CPU-only model `{}` was planned on non-CPU device `{policy}`",
-                    config.name
-                );
-            }
+            self.validate_nvidia_model_config_v1(&config)?;
             planned_models.push(config.name);
         }
         Ok(planned_models)
@@ -553,7 +635,7 @@ impl TrainingOrchestrator {
     fn configured_training_plan_v1(&self) -> Result<(Vec<ModelConfig>, HardwareExecutionPlan)> {
         let dispatch_plan = self.create_dispatch_plan()?;
         self.validate_dispatch_plan(&dispatch_plan)?;
-        let hardware_plan = self.hardware_execution_plan();
+        let hardware_plan = self.hardware_execution_plan(&dispatch_plan)?;
         let configs =
             self.build_training_configs_with_hardware_plan(&dispatch_plan, &hardware_plan)?;
         anyhow::ensure!(
@@ -607,11 +689,11 @@ impl TrainingOrchestrator {
     /// NVIDIA training run. Unlike the full-ensemble preflight, this does not
     /// invent missing voters that are outside the configured plan; every model
     /// that is present still has to resolve to its real CUDA implementation on
-    /// ordinal zero or to an explicit CPU-only policy.
+    /// ordinal zero. There is no CPU substitution in an NVIDIA-labelled run.
     pub fn preflight_configured_nvidia_training(&self) -> Result<Vec<String>> {
         let dispatch_plan = self.create_dispatch_plan()?;
         self.validate_dispatch_plan(&dispatch_plan)?;
-        let hardware_plan = self.hardware_execution_plan();
+        let hardware_plan = self.hardware_execution_plan(&dispatch_plan)?;
         anyhow::ensure!(
             hardware_plan.gpu_enabled
                 && hardware_plan.primary_backend == AcceleratorBackend::Cuda
@@ -629,57 +711,11 @@ impl TrainingOrchestrator {
             "configured NVIDIA training resolved an empty model plan"
         );
 
-        let mut configured_cuda_models = 0_usize;
         let mut planned_models = Vec::with_capacity(configs.len());
         for config in configs {
-            let requires_cuda =
-                model_requires_cuda_in_full_nvidia_run(&config.name, config.capability_family);
-            if requires_cuda {
-                configured_cuda_models += 1;
-                anyhow::ensure!(
-                    crate::registry::supports_gpu_for_model(
-                        canonical_model_name(&config.name),
-                        config.capability_family,
-                    ),
-                    "configured NVIDIA build lacks the CUDA implementation required by model `{}`",
-                    config.name
-                );
-                let policy = self.full_nvidia_device_policy_for_config(&config)?;
-                let parsed =
-                    crate::common::parse_cuda_device_policy(&policy).with_context(|| {
-                        format!(
-                            "configured NVIDIA model `{}` has invalid device policy `{policy}`",
-                            config.name
-                        )
-                    })?;
-                anyhow::ensure!(
-                    policy.trim().contains(':')
-                        && matches!(parsed, crate::common::CudaDevicePolicy::Gpu { ordinal: 0 }),
-                    "configured NVIDIA model `{}` must request exact CUDA ordinal 0, got `{policy}`",
-                    config.name
-                );
-            } else {
-                let policy = config.params.get("device").with_context(|| {
-                    format!(
-                        "CPU-only model `{}` lacks an explicit CPU device policy",
-                        config.name
-                    )
-                })?;
-                anyhow::ensure!(
-                    matches!(
-                        crate::common::parse_cuda_device_policy(policy)?,
-                        crate::common::CudaDevicePolicy::Cpu
-                    ),
-                    "CPU-only model `{}` was planned on non-CPU device `{policy}`",
-                    config.name
-                );
-            }
+            self.validate_nvidia_model_config_v1(&config)?;
             planned_models.push(config.name);
         }
-        anyhow::ensure!(
-            configured_cuda_models > 0,
-            "configured NVIDIA training plan contains no CUDA-backed model"
-        );
         Ok(planned_models)
     }
 
@@ -742,6 +778,10 @@ impl TrainingOrchestrator {
         let (pip_size, round_trip_cost_pips) = {
             let search_input = search_input.as_run_input()?;
             screening_contract.validate_against_input(&search_input)?;
+            crate::promotion_candidate_training_v1::validate_series_against_search_v1(
+                series,
+                search_input.receipt(),
+            )?;
             (
                 screening_contract.pip_size(),
                 screening_contract.screening_round_trip_cost_pips(),
@@ -801,6 +841,10 @@ impl TrainingOrchestrator {
     {
         series.validate()?;
         screening_contract.validate_against_receipt(input_receipt)?;
+        crate::promotion_candidate_training_v1::validate_series_against_search_v1(
+            series,
+            input_receipt,
+        )?;
         let pip_size = screening_contract.pip_size();
         let round_trip_cost_pips = screening_contract.screening_round_trip_cost_pips();
         let symbol = series.anchor().identity().symbol_name();
@@ -895,12 +939,12 @@ impl TrainingOrchestrator {
                 .timestamp
                 .as_ref()
                 .context("OOS-lock requires base-tf timestamps")?;
-            let in_sample = timestamps.iter().take_while(|&&t| t < cutoff).count();
-            // Purge the last `label_horizon_bars` IS rows whose triple-barrier
-            // label looks forward across the cutoff. Normalization is fitted
-            // to this same purged prefix, never to the OOS suffix or purge rows.
-            let purge = self.settings.models.label_horizon_bars;
-            let keep = in_sample.saturating_sub(purge);
+            // Purge the effective label horizon, including the configured-zero
+            // fallback. Both barrier and terminal labels look forward.
+            // Normalization is fitted to this same purged prefix, never to
+            // the OOS suffix or purge rows.
+            let (in_sample, purge, keep) =
+                purged_training_prefix_v1(timestamps, cutoff, &self.settings);
             if keep < 256 {
                 anyhow::bail!(
                     "OOS-lock: only {keep} in-sample rows before {cutoff} (after a {purge}-bar \
@@ -914,12 +958,40 @@ impl TrainingOrchestrator {
         let opts = FeatureBuildOptions {
             higher_tfs: higher_tfs.clone(),
             prefix_base_features: self.settings.system.multi_resolution_prefix_base,
-            normalization_training_rows: oos_training_boundary.map(|(_, _, _, keep)| 0..keep),
+            normalization_training_rows: Some(final_model_training_rows_v1(
+                base_ohlcv.len(),
+                oos_training_boundary.map(|(_, _, _, keep)| keep),
+            )?),
             drop_columns_without_normalization_training_support: true,
             ..FeatureBuildOptions::default()
         };
-        let mut frame = lease
-            .scope(|| prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts))?;
+        let raw_model_frame = Arc::new(lease.scope(|| {
+            neoethos_data::prepare_multitimeframe_features_raw_with_options(
+                &dataset, base_tf, &opts,
+            )
+        })?);
+        let normalize = self.settings.models.data_runtime.normalize_features;
+        let mut frame = if normalize {
+            let training_rows = opts
+                .normalization_training_rows
+                .clone()
+                .context("model normalization requires an explicit final training row range")?;
+            let fit = lease.scope(|| {
+                raw_model_frame.fit_normalization(training_rows, true, &training_feature_control())
+            })?;
+            raw_model_frame.with_fitted_normalization(&fit)?
+        } else {
+            raw_model_frame.shared_view()?
+        };
+        let canonical_base = dataset.canonical_frame(base_tf)?;
+        let anchor = canonical_base.artifact().identity();
+        let model_feature_input =
+            crate::runtime::feature_input::ModelFeatureInputV1::from_training_frame(
+                anchor,
+                &frame,
+                self.oos_lock_from_ms,
+                effective_label_horizon_bars_v1(&self.settings),
+            )?;
         let mut labels = match label_economics {
             TrainingLabelEconomics::BrokerFinancialTruth => {
                 self.derive_labels(base_ohlcv, symbol)?
@@ -1016,6 +1088,12 @@ impl TrainingOrchestrator {
             budgeted_labels,
             budgeted_source_rows,
         )?);
+        let preprocessing = Arc::new(ModelFoldPreprocessing {
+            raw_frame: raw_model_frame,
+            selector: TrainingOrchestrator::new(self.settings.clone(), PathBuf::new()),
+            base_ohlcv: base_ohlcv.clone(),
+            normalize,
+        });
         let models_dir = self.models_dir.clone();
         let settings = self.settings.clone();
         let symbol = symbol.to_string();
@@ -1040,6 +1118,7 @@ impl TrainingOrchestrator {
                     payload,
                     model_lease,
                     &hmm_observations,
+                    &preprocessing,
                 )
             },
         )?;
@@ -1048,6 +1127,12 @@ impl TrainingOrchestrator {
             "Successfully trained models: {:?}",
             trained.successful_models
         );
+        if trained.failed_models.is_empty() && !trained.successful_models.is_empty() {
+            crate::runtime::feature_input::write_model_feature_input_v1(
+                &self.models_dir,
+                &model_feature_input,
+            )?;
+        }
         Ok(TrainingRunSummary {
             planned_models,
             completed_models: trained.successful_models,
@@ -1200,7 +1285,7 @@ impl TrainingOrchestrator {
     }
 
     fn build_training_configs(&self, dispatch_plan: &DispatchPlan) -> Result<Vec<ModelConfig>> {
-        let hardware_plan = self.hardware_execution_plan();
+        let hardware_plan = self.hardware_execution_plan(dispatch_plan)?;
         self.build_training_configs_with_hardware_plan(dispatch_plan, &hardware_plan)
     }
 
@@ -1225,8 +1310,9 @@ impl TrainingOrchestrator {
                     entry.family,
                     hardware_plan,
                     &mut params,
-                );
+                )?;
                 pin_cpu_only_model_device(&entry.name, entry.family, &mut params);
+                self.apply_mlp_capacity_intent(&entry.name, &mut params);
                 Ok(ModelConfig {
                     name: entry.name.clone(),
                     model_type: self.map_model_type(&entry.name)?,
@@ -1238,13 +1324,65 @@ impl TrainingOrchestrator {
             .collect()
     }
 
-    fn hardware_execution_plan(&self) -> HardwareExecutionPlan {
+    fn hardware_execution_plan(
+        &self,
+        dispatch_plan: &DispatchPlan,
+    ) -> Result<HardwareExecutionPlan> {
+        let mut requested = BTreeSet::new();
+        for entry in &dispatch_plan.entries {
+            let mut params = self.default_model_params(&entry.name);
+            self.inject_runtime_model_params(&entry.name, &mut params);
+            self.apply_model_param_overrides(&entry.name, &mut params);
+            if let Some(ordinal) =
+                requested_rocm_model_ordinal_v1(&self.settings, &entry.name, entry.family, &params)?
+            {
+                requested.insert(ordinal);
+            }
+        }
         if let Some(plan) = &self.sealed_hardware_plan_v1 {
-            return plan.clone();
+            // Do not recapture ambient hardware when resuming a sealed plan.
+            // Per-model assignment below requires its exact retained ordinal.
+            return Ok(plan.clone());
         }
         let mut probe = HardwareProbe::new();
         let profile = probe.detect();
-        HardwareExecutionPlan::from_settings_and_profile(&self.settings, profile)
+        let mut plan = HardwareExecutionPlan::from_settings_and_profile(&self.settings, profile);
+        for ordinal in requested {
+            self.capture_rocm_planning_device_v1(&mut plan, ordinal)?;
+        }
+        Ok(plan)
+    }
+
+    fn capture_rocm_planning_device_v1(
+        &self,
+        plan: &mut HardwareExecutionPlan,
+        ordinal: usize,
+    ) -> Result<()> {
+        #[cfg(feature = "burn-rocm-backend")]
+        {
+            let id = plan
+                .profile
+                .accelerator_devices
+                .iter()
+                .map(|device| device.id)
+                .max()
+                .map_or(Some(0), |id| id.checked_add(1))
+                .context("hardware inventory identifier overflow")?;
+            let device = crate::burn_rocm_backend::planning_device(ordinal, id)?;
+            tracing::info!(target: "neoethos_models::training", ordinal, name = %device.name,
+                memory_gb = device.memory_gb, "captured explicit ROCm neural planning device; live allocation admission remains mandatory");
+            plan.profile.gpu_names.push(device.name.clone());
+            plan.profile.gpu_mem_gb.push(device.memory_gb);
+            plan.profile.accelerator_devices.push(device);
+            plan.profile.num_gpus = plan.profile.accelerator_devices.len();
+            plan.gpu_enabled = true;
+            Ok(())
+        }
+        #[cfg(not(feature = "burn-rocm-backend"))]
+        {
+            let _ = (plan, ordinal);
+            anyhow::bail!("ROCm model planning requires a gpu-rocm build")
+        }
     }
 
     fn apply_hardware_plan_params(
@@ -1253,7 +1391,8 @@ impl TrainingOrchestrator {
         family: ModelFamily,
         plan: &HardwareExecutionPlan,
         params: &mut HashMap<String, String>,
-    ) {
+    ) -> Result<()> {
+        let rocm_ordinal = requested_rocm_model_ordinal_v1(&self.settings, name, family, params)?;
         let workload = match family {
             ModelFamily::Tree => Some(WorkloadKind::TreeTraining),
             ModelFamily::Deep | ModelFamily::Exit => Some(WorkloadKind::DeepTraining),
@@ -1263,9 +1402,18 @@ impl TrainingOrchestrator {
             }
             _ => None,
         };
-        let Some(workload) = workload.and_then(|kind| plan.workload(kind)) else {
-            return;
+        let Some(mut workload) = workload.and_then(|kind| plan.workload(kind)).cloned() else {
+            return Ok(());
         };
+        if let Some(ordinal) = rocm_ordinal {
+            workload = plan.explicit_rocm_deep_workload_v1(ordinal)?;
+        }
+        anyhow::ensure!(
+            !(cfg!(feature = "burn-rocm-backend")
+                && family == ModelFamily::Deep
+                && workload.backend == AcceleratorBackend::Cuda),
+            "model `{name}` has a CUDA workload but this Burn build is ROCm; explicit vendor substitution is forbidden"
+        );
         params.insert(
             "__planned_backend".to_string(),
             workload.backend.as_str().to_string(),
@@ -1361,6 +1509,7 @@ impl TrainingOrchestrator {
                  reach training"
             );
         }
+        Ok(())
     }
 
     fn epochs_from_seconds(seconds: u64, default_epochs: usize) -> usize {
@@ -1392,14 +1541,6 @@ impl TrainingOrchestrator {
 
     fn min_calibration_rows(&self) -> usize {
         self.settings.models.calibration_min_rows.max(32)
-    }
-
-    fn effective_label_horizon_bars(&self) -> usize {
-        if self.settings.models.label_horizon_bars > 0 {
-            self.settings.models.label_horizon_bars
-        } else {
-            self.settings.risk.meta_label_max_hold_bars.max(1)
-        }
     }
 
     fn holdout_pct(&self) -> f64 {
@@ -1475,6 +1616,33 @@ impl TrainingOrchestrator {
                 params.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
+    }
+
+    fn apply_mlp_capacity_intent(&self, name: &str, params: &mut HashMap<String, String>) {
+        if canonical_model_name(name) != "mlp"
+            || !matches!(
+                params.get("__planned_backend").map(String::as_str),
+                Some("cuda" | "rocm")
+            )
+        {
+            return;
+        }
+        // Only generated native GPU architectures grow with live free VRAM. A user
+        // capacity policy or hidden-width override remains authoritative.
+        if params.contains_key("capacity_mode") {
+            return;
+        }
+        let fixed_width = [name, canonical_model_name(name)].into_iter().any(|key| {
+            self.settings
+                .models
+                .model_param_overrides
+                .get(key)
+                .is_some_and(|overrides| overrides.contains_key("hidden_dim"))
+        });
+        params.insert(
+            "capacity_mode".to_string(),
+            if fixed_width { "fixed" } else { "auto" }.to_string(),
+        );
     }
 
     fn transformer_hidden_dim(&self) -> usize {
@@ -1794,16 +1962,10 @@ impl TrainingOrchestrator {
             return Ok(frame.clone());
         }
 
-        // TR-1 fix: feature selection must run only on train-split (first 80%) to
-        // prevent the L1 selector from seeing validation/test rows and overfitting.
-        let total_rows = frame.n_samples();
-        let train_end = (total_rows * 4 / 5).max(1);
-        let train_frame = frame.row_window(0, train_end)?;
-        let train_labels: Vec<i32> = labels[..train_end.min(labels.len())].to_vec();
-
-        // Sample up to the configured limit from within the train portion only
+        // Callers now pass the exact final purged training set or one inner
+        // fold's training set. Selection never receives the validation rows.
         let (sampled_frame, sampled_labels, sample_start) =
-            self.recent_sample_from(&train_frame, &train_labels)?;
+            self.recent_sample_from(frame, labels)?;
         let sampled_source_rows = &source_row_indices
             [sample_start..sample_start.saturating_add(sampled_frame.n_samples())];
         let mut score_map = HashMap::<String, f64>::new();
@@ -1834,7 +1996,12 @@ impl TrainingOrchestrator {
         }
 
         let mut ranked = score_map.into_iter().collect::<Vec<_>>();
-        ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
 
         let positive = ranked
             .iter()
@@ -2767,7 +2934,7 @@ impl TrainingOrchestrator {
             "neat" => HashMap::from([
                 (
                     "population".to_string(),
-                    self.settings.models.evo_population.max(48).to_string(),
+                    self.settings.models.rl_population_size.to_string(),
                 ),
                 (
                     "generations".to_string(),
@@ -2982,7 +3149,7 @@ impl TrainingOrchestrator {
         }
 
         let mut labels = vec![0; n];
-        let hold_bars = self.effective_label_horizon_bars();
+        let hold_bars = effective_label_horizon_bars_v1(&self.settings);
         let atr_period = self.settings.risk.atr_period.max(2);
         let min_distance = self.settings.risk.meta_label_min_dist.max(1e-6);
         // What a round trip costs, in price.
@@ -3347,6 +3514,29 @@ fn parse_usize_param(params: &HashMap<String, String>, key: &str, default: usize
         .unwrap_or(default)
 }
 
+/// Read one required positive integer without inventing a fallback capacity.
+///
+/// NEAT's population is supplied by `models.rl_population_size` through
+/// `default_model_params`. If that value is lost or malformed between config
+/// resolution and model construction, the run must stop instead of silently
+/// choosing a second hardcoded population.
+fn require_usize_param(params: &HashMap<String, String>, key: &str, model: &str) -> Result<usize> {
+    match params.get(key) {
+        None => anyhow::bail!(
+            "{model}: required parameter `{key}` is missing; it must come from the resolved model configuration"
+        ),
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if value > 0 => Ok(value),
+            Ok(_) => anyhow::bail!(
+                "{model}: required parameter `{key}` is 0; a positive capacity is required"
+            ),
+            Err(err) => anyhow::bail!(
+                "{model}: required parameter `{key}` = `{raw}` is not a positive integer: {err}"
+            ),
+        },
+    }
+}
+
 fn parse_u64_param(params: &HashMap<String, String>, key: &str, default: u64) -> u64 {
     params
         .get(key)
@@ -3442,11 +3632,7 @@ fn training_runtime_profile(
     higher_timeframes: Vec<String>,
     label_geometry: &ResolvedLabelGeometry,
 ) -> TrainingRuntimeProfile {
-    let effective_label_horizon_bars = if settings.models.label_horizon_bars > 0 {
-        settings.models.label_horizon_bars
-    } else {
-        settings.risk.meta_label_max_hold_bars.max(1)
-    };
+    let effective_label_horizon_bars = effective_label_horizon_bars_v1(settings);
     let requested_backend = parse_string_param(&config.params, "backend");
     let requested_device = parse_string_param(&config.params, "device");
     let planned_backend = parse_string_param(&config.params, "__planned_backend");
@@ -4088,7 +4274,7 @@ fn build_expert_model(
         ModelType::Neat => Ok(Box::new(
             NeatExpert::with_config(
                 input_dim.max(1),
-                parse_usize_param(params, "population", 96),
+                require_usize_param(params, "population", "neat")?,
                 parse_usize_param(params, "generations", 48),
             )
             .with_device_policy(
@@ -4300,10 +4486,28 @@ fn generate_hpo_candidate_params(
         }
         "mlp" | "transformer" | "patchtst" | "timesnet" | "nbeats" | "nbeatsx_nf" | "tide"
         | "tide_nf" | "tabnet" | "kan" => {
-            params.insert(
-                "hidden_dim".to_string(),
-                sample_usize(&[128, 192, 256, 384, 512], trial_idx, trials, backend, 2).to_string(),
-            );
+            // CUDA MLP auto capacity is resolved against the actual training
+            // shape/device; fixed capacity must not be overwritten by HPO.
+            if canonical_model_name(&config.name) != "mlp"
+                || !base_params.contains_key("capacity_mode")
+            {
+                params.insert(
+                    "hidden_dim".to_string(),
+                    sample_usize(&[128, 192, 256, 384, 512], trial_idx, trials, backend, 2)
+                        .to_string(),
+                );
+            }
+            if canonical_model_name(&config.name) == "mlp"
+                && base_params.get("capacity_mode").map(String::as_str) == Some("auto")
+            {
+                params.insert(
+                    "capacity_fraction".to_string(),
+                    format!(
+                        "{:.6}",
+                        sample_f64(0.25, 1.0, trial_idx, trials, backend, 2)
+                    ),
+                );
+            }
             params.insert(
                 "dropout".to_string(),
                 format!(
@@ -4558,9 +4762,166 @@ fn enforce_planned_resource_caps(params: &mut HashMap<String, String>) {
     );
 }
 
+struct ModelFoldPreprocessing {
+    raw_frame: Arc<FeatureFrame>,
+    selector: TrainingOrchestrator,
+    base_ohlcv: Ohlcv,
+    normalize: bool,
+}
+
+struct PreparedModelFold {
+    train: FeatureFrame,
+    train_labels: Vec<i32>,
+    validation: FeatureFrame,
+    validation_labels: Vec<i32>,
+}
+
+/// Fit both unsupervised normalization and supervised L1 inside this fold.
+/// Its immutable raw parent is shared with all other folds and the final fit.
+fn prepare_model_fold(
+    preprocessing: &ModelFoldPreprocessing,
+    raw: &Arc<FeatureFrame>,
+    labels: &[i32],
+    train_indices: &[usize],
+    validation_indices: &[usize],
+    lease: &CpuLease,
+) -> Result<PreparedModelFold> {
+    anyhow::ensure!(
+        raw.normalization_fitted_state().is_none() && raw.n_samples() == labels.len(),
+        "inner model validation requires exact raw input and matching labels"
+    );
+    let source_rows = raw
+        .project_columns(&[0], 0..raw.n_samples())?
+        .row_ids
+        .iter()
+        .map(|row| usize::try_from(*row).context("model fold source row does not fit usize"))
+        .collect::<Result<Vec<_>>>()?;
+    let validation_sources = validation_indices
+        .iter()
+        .map(|&row| {
+            source_rows
+                .get(row)
+                .copied()
+                .context("model fold validation row outside raw input")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !validation_sources.is_empty()
+            && validation_sources.windows(2).all(|pair| pair[0] < pair[1]),
+        "model validation source rows must be nonempty and strictly ordered"
+    );
+    let horizon = effective_label_horizon_bars_v1(&preprocessing.selector.settings);
+    let train_indices = train_indices
+        .iter()
+        .copied()
+        .filter_map(|row| {
+            let source = match source_rows.get(row) {
+                Some(source) => *source,
+                None => {
+                    return Some(Err(anyhow::anyhow!(
+                        "model fold training row outside raw input"
+                    )));
+                }
+            };
+            let next_validation =
+                validation_sources.partition_point(|validation| *validation < source);
+            if validation_sources
+                .get(next_validation)
+                .is_some_and(|validation| {
+                    source
+                        .checked_add(horizon)
+                        .is_none_or(|label_end| label_end >= *validation)
+                })
+            {
+                None
+            } else {
+                Some(Ok(row))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !train_indices.is_empty(),
+        "model fold has no training rows after exact label-horizon purge"
+    );
+    let train_labels = train_indices
+        .iter()
+        .map(|&row| labels[row])
+        .collect::<Vec<_>>();
+    let validation_labels = validation_indices
+        .iter()
+        .map(|&row| labels[row])
+        .collect::<Vec<_>>();
+    let train_sources = train_indices
+        .iter()
+        .map(|&row| source_rows[row])
+        .collect::<Vec<_>>();
+    let raw_train = Arc::new(raw.shared_select_rows(&train_indices)?);
+    let raw_validation = Arc::new(raw.shared_select_rows(validation_indices)?);
+    let (train, validation) = if preprocessing.normalize {
+        let fit = lease.scope(|| {
+            raw_train.fit_normalization(0..raw_train.n_samples(), true, &training_feature_control())
+        })?;
+        (
+            raw_train.with_fitted_normalization(&fit)?,
+            raw_validation.with_fitted_normalization(&fit)?,
+        )
+    } else {
+        (raw_train.shared_view()?, raw_validation.shared_view()?)
+    };
+    // A constant/unsupported training column is not made usable by future
+    // validation observations. Dense eligibility is decided on TRAIN only.
+    let mut eligible = Vec::new();
+    for column in 0..train.n_features() {
+        training_feature_control().checkpoint()?;
+        let values = train.project_columns(&[column], 0..train.n_samples())?;
+        if values.columns[0]
+            .validity
+            .iter()
+            .all(|cell| cell.is_valid())
+        {
+            eligible.push(column);
+        }
+    }
+    anyhow::ensure!(
+        !eligible.is_empty(),
+        "model fold has no fully supported training features"
+    );
+    let train = train.select_columns(&eligible)?;
+    let validation = validation.select_columns(&eligible)?;
+    let train = preprocessing.selector.apply_feature_selection(
+        &train,
+        &train_labels,
+        &train_sources,
+        &preprocessing.base_ohlcv,
+        lease,
+    )?;
+    let indices = validation
+        .names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let selected = train
+        .names
+        .iter()
+        .map(|name| {
+            indices.get(name.as_str()).copied().with_context(|| {
+                format!("fold-selected model feature `{name}` absent from validation")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PreparedModelFold {
+        train,
+        train_labels,
+        validation: validation.select_columns(&selected)?,
+        validation_labels,
+    })
+}
+
 fn select_hpo_dataset(
     payload: &TrainingPayload,
     max_rows: usize,
+    preprocessing: &ModelFoldPreprocessing,
 ) -> Result<(FeatureFrame, Vec<i32>, Option<usize>)> {
     if payload.frame.n_samples() != payload.labels.len() {
         anyhow::bail!(
@@ -4578,23 +4939,20 @@ fn select_hpo_dataset(
     }
     if max_rows == 0 || payload.frame.n_samples() <= max_rows {
         return Ok((
-            payload.frame.as_ref().clone(),
+            preprocessing
+                .raw_frame
+                .shared_select_rows(&payload.source_row_indices)?,
             payload.labels.as_ref().clone(),
             None,
         ));
     }
 
     let start = payload.frame.n_samples().saturating_sub(max_rows);
-    let frame = payload.frame.row_window(start, payload.frame.n_samples())?;
+    let frame = preprocessing
+        .raw_frame
+        .shared_select_rows(&payload.source_row_indices[start..])?;
     let labels = payload.labels[start..].to_vec();
     Ok((frame, labels, Some(max_rows)))
-}
-
-/// Row-gather helper for the non-contiguous CombinatorialPurgedCV index sets
-/// (the purged train fold is a union of groups with holes from purge/embargo,
-/// so a contiguous `slice` cannot express it).
-fn take_frame_rows(frame: &FeatureFrame, idx: &[usize]) -> Result<FeatureFrame> {
-    frame.select_rows(idx)
 }
 
 /// Stage 1(c): score each HPO candidate with CombinatorialPurgedCV instead of a
@@ -4619,6 +4977,7 @@ fn optimize_model_config_cpcv(
     accuracy_weight: f64,
     row_budget_applied: Option<usize>,
     hpo_rows_applied: Option<usize>,
+    preprocessing: &ModelFoldPreprocessing,
 ) -> Result<Option<(HashMap<String, String>, OptimizationReport)>> {
     const N_SPLITS: usize = 6;
     const N_TEST_GROUPS: usize = 2;
@@ -4637,6 +4996,13 @@ fn optimize_model_config_cpcv(
         return Ok(None);
     }
     let n_paths = splits.len();
+    let raw = Arc::new(hpo_frame.clone());
+    let prepared_folds = splits
+        .iter()
+        .map(|(train, validation)| {
+            prepare_model_fold(preprocessing, &raw, hpo_labels, train, validation, lease)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut best_params = base_params.clone();
     let mut best_score = f64::NEG_INFINITY; // mean-minus-stdev aggregate
@@ -4655,26 +5021,14 @@ fn optimize_model_config_cpcv(
         let mut repr_metrics: Option<ValidationMetrics> = None;
         let mut fold_error: Option<String> = None;
 
-        for (train_idx, test_idx) in &splits {
-            let train_frame = match take_frame_rows(hpo_frame, train_idx) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    fold_error = Some(error.to_string());
-                    break;
-                }
-            };
-            let test_frame = match take_frame_rows(hpo_frame, test_idx) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    fold_error = Some(error.to_string());
-                    break;
-                }
-            };
-            let train_labels: Vec<i32> = train_idx.iter().map(|&i| hpo_labels[i]).collect();
-            let test_labels: Vec<i32> = test_idx.iter().map(|&i| hpo_labels[i]).collect();
+        for prepared in &prepared_folds {
+            let train_frame = &prepared.train;
+            let test_frame = &prepared.validation;
+            let train_labels = &prepared.train_labels;
+            let test_labels = &prepared.validation_labels;
 
             let mut model =
-                match build_expert_model(config, hpo_frame.n_features(), &candidate_params) {
+                match build_expert_model(config, train_frame.n_features(), &candidate_params) {
                     Ok(model) => model,
                     Err(error) => {
                         fold_error = Some(error.to_string());
@@ -4804,6 +5158,7 @@ fn optimize_model_config(
     lease: &CpuLease,
     base_tf: &str,
     row_budget_applied: Option<usize>,
+    preprocessing: &ModelFoldPreprocessing,
 ) -> Result<(HashMap<String, String>, OptimizationReport)> {
     let backend = hpo_backend_from_params(&config.params);
     let trials_requested = if supports_hpo(config.model_type) {
@@ -4818,8 +5173,11 @@ fn optimize_model_config(
     let accuracy_weight = accuracy_weight_from_params(&config.params);
     let embargo_rows =
         embargo_rows_for_timeframe(base_tf, embargo_minutes_from_params(&config.params));
-    let (hpo_frame, hpo_labels, hpo_rows_applied) =
-        select_hpo_dataset(payload, hpo_max_rows_from_params(&config.params))?;
+    let (hpo_frame, hpo_labels, hpo_rows_applied) = select_hpo_dataset(
+        payload,
+        hpo_max_rows_from_params(&config.params),
+        preprocessing,
+    )?;
 
     // Stage 1(c): CombinatorialPurgedCV HPO scoring for the heavy boosters.
     // `apply_overfit_overrides` sets `__ml_cpcv` only for thick-enough heavy
@@ -4839,6 +5197,7 @@ fn optimize_model_config(
             accuracy_weight,
             row_budget_applied,
             hpo_rows_applied,
+            preprocessing,
         )? {
             return Ok(result);
         }
@@ -4846,7 +5205,7 @@ fn optimize_model_config(
         // valid purged paths (e.g. dataset still too small after gating).
     }
 
-    let Some((train_frame, train_labels, val_frame, val_labels)) =
+    let Some((train_frame, _split_train_labels, val_frame, _split_val_labels)) =
         time_series_holdout_split(&hpo_frame, &hpo_labels, holdout_pct, embargo_rows, 256, 64)?
     else {
         // Audit B10: the no-HPO small-data path used to emit `trials: vec![]`
@@ -4887,6 +5246,22 @@ fn optimize_model_config(
         return Ok((base_params, report));
     };
 
+    let raw = Arc::new(hpo_frame);
+    let prepared = prepare_model_fold(
+        preprocessing,
+        &raw,
+        &hpo_labels,
+        &(0..train_frame.n_samples()).collect::<Vec<_>>(),
+        &((raw.n_samples() - val_frame.n_samples())..raw.n_samples()).collect::<Vec<_>>(),
+        lease,
+    )?;
+    let PreparedModelFold {
+        train: train_frame,
+        train_labels,
+        validation: val_frame,
+        validation_labels: val_labels,
+    } = prepared;
+
     let mut best_params = base_params.clone();
     let mut best_metrics = None;
     let mut best_score = f64::NEG_INFINITY;
@@ -4907,7 +5282,7 @@ fn optimize_model_config(
         };
 
         let mut model =
-            match build_expert_model(config, payload.frame.n_features(), &candidate_params) {
+            match build_expert_model(config, train_frame.n_features(), &candidate_params) {
                 Ok(model) => model,
                 Err(error) => {
                     trials.push(OptimizationTrialRecord {
@@ -5142,6 +5517,7 @@ fn train_model_dispatch(
     // from the versioned feature frame before generic feature selection.
     // `Err(reason)` is surfaced loudly only if hmm_regime is dispatched.
     hmm_observations: &std::result::Result<ndarray::Array2<f64>, String>,
+    preprocessing: &ModelFoldPreprocessing,
 ) -> Result<()> {
     let artifact_dir = model_artifact_dir(models_dir, symbol, base_tf, &config.name);
 
@@ -5150,8 +5526,14 @@ fn train_model_dispatch(
         // selection respects the gated budget.
         let gated = apply_overfit_overrides(settings, config, payload.frame.n_samples());
         let config = &gated;
-        let (selected_params, optimization_report) =
-            optimize_model_config(config, payload, lease, base_tf, row_budget_applied)?;
+        let (selected_params, optimization_report) = optimize_model_config(
+            config,
+            payload,
+            lease,
+            base_tf,
+            row_budget_applied,
+            preprocessing,
+        )?;
         let effective_config = ModelConfig {
             name: config.name.clone(),
             model_type: config.model_type,
@@ -5396,14 +5778,29 @@ fn train_model_dispatch(
                 "interpretability_needed",
                 model.config.interpretability_needed,
             );
-            model.fit_from_frame(payload.frame.as_ref(), symbol, lease)?;
+            let raw_swarm = preprocessing
+                .raw_frame
+                .shared_select_rows(&payload.source_row_indices)?;
+            let price_name = raw_swarm.model_base_feature_name("quant_close")?;
+            let price_index = raw_swarm
+                .names
+                .iter()
+                .position(|name| name == &price_name)
+                .context("recorded Swarm base-price feature disappeared")?;
+            let raw_swarm = raw_swarm.select_columns(&[price_index])?;
+            let swarm_payload = TrainingPayload::from_frame_with_source_rows(
+                raw_swarm,
+                payload.labels.as_ref().clone(),
+                payload.source_row_indices.as_ref().clone(),
+            )?;
+            model.fit_from_frame(swarm_payload.frame.as_ref(), symbol, lease)?;
             persist_training_artifacts(
                 &artifact_dir,
                 settings,
                 config,
                 symbol,
                 base_tf,
-                payload,
+                &swarm_payload,
                 row_budget_applied,
                 None,
                 |staged_dir| model.save(staged_dir),
@@ -5492,6 +5889,164 @@ mod tests {
     use crate::registry::get_model_capability;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn ordinary_final_refit_uses_explicit_complete_training_input_without_claiming_oos() {
+        let range = final_model_training_rows_v1(12, None).unwrap();
+        assert_eq!(range, 0..12);
+        assert_eq!(final_model_training_rows_v1(12, Some(6)).unwrap(), 0..6);
+        assert!(final_model_training_rows_v1(12, Some(13)).is_err());
+        let raw = Arc::new(
+            neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+                neoethos_data::test_fixtures::canonical_test_timestamps(12),
+                vec![
+                    neoethos_data::FeatureColumnF64::new(
+                        "signal",
+                        (0..12).map(|row| row as f64).collect(),
+                        vec![neoethos_data::FeatureCellValidity::Valid; 12],
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        let fit = raw
+            .fit_normalization(range, true, &neoethos_data::FeatureBuildControl::default())
+            .unwrap();
+        let frame = raw.with_fitted_normalization(&fit).unwrap();
+        let anchor = frame.provenance().bindings()[0].dataset_identity();
+        let contract = crate::runtime::feature_input::ModelFeatureInputV1::from_training_frame(
+            anchor, &frame, None, 2,
+        )
+        .unwrap();
+        contract.validate().unwrap();
+        assert_eq!(
+            contract
+                .producer_receipt()
+                .normalization_fitted_state()
+                .unwrap()
+                .training_rows()
+                .unwrap(),
+            0..12
+        );
+    }
+
+    #[test]
+    fn inner_fold_normalization_and_supervised_selection_ignore_validation_values_and_labels() {
+        use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
+        let width = WorkerLimit::new(1).unwrap();
+        let lease = CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .unwrap();
+        let fixture = |changed: bool| {
+            let columns = ["signal", "oscillator", "counter"]
+                .into_iter()
+                .enumerate()
+                .map(|(column, name)| {
+                    neoethos_data::FeatureColumnF64::new(
+                        name,
+                        (0..96)
+                            .map(|row| {
+                                if changed && (32..48).contains(&row) {
+                                    1.0e8 + row as f64
+                                } else {
+                                    match column {
+                                        0 => row as f64,
+                                        1 => (row as f64).sin(),
+                                        _ => -(row as f64),
+                                    }
+                                }
+                            })
+                            .collect(),
+                        vec![neoethos_data::FeatureCellValidity::Valid; 96],
+                    )
+                    .unwrap()
+                })
+                .collect();
+            Arc::new(
+                neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+                    neoethos_data::test_fixtures::canonical_test_timestamps(96),
+                    columns,
+                )
+                .unwrap(),
+            )
+        };
+        let original = fixture(false);
+        let altered = fixture(true);
+        let mut settings = neoethos_core::Settings::default();
+        settings.models.label_horizon_bars = 2;
+        settings.models.l1_feature_selection_enabled = true;
+        settings.models.l1_feature_selection_min_features = 1;
+        settings.models.l1_feature_selection_max_features = 1;
+        settings.models.l1_feature_selection_sample_limit = 64;
+        settings.models.l1_feature_selection_per_regime = false;
+        let base = Ohlcv {
+            timestamp: Some(original.timestamps.clone()),
+            open: vec![1.0; 96],
+            high: vec![1.2; 96],
+            low: vec![0.8; 96],
+            close: vec![1.01; 96],
+            volume: None,
+        };
+        let context = ModelFoldPreprocessing {
+            raw_frame: Arc::clone(&original),
+            selector: TrainingOrchestrator::new(settings, PathBuf::new()),
+            base_ohlcv: base,
+            normalize: true,
+        };
+        let labels = (0..96).map(|row| row % 3 - 1).collect::<Vec<i32>>();
+        let mut altered_labels = labels.clone();
+        for label in &mut altered_labels[32..48] {
+            *label = (*label + 2) % 3 - 1;
+        }
+        // A chronological holdout and a genuinely noncontiguous CPCV train set.
+        for train in [
+            (0..32).collect::<Vec<_>>(),
+            (0..32).chain(48..96).collect::<Vec<_>>(),
+        ] {
+            let validation = (32..48).collect::<Vec<_>>();
+            let first =
+                prepare_model_fold(&context, &original, &labels, &train, &validation, &lease)
+                    .unwrap();
+            let second = prepare_model_fold(
+                &context,
+                &altered,
+                &altered_labels,
+                &train,
+                &validation,
+                &lease,
+            )
+            .unwrap();
+            assert_eq!(
+                first.train.n_features(),
+                1,
+                "L1 must actually execute within this fold"
+            );
+            assert_eq!(first.train.names, second.train.names);
+            assert_eq!(
+                first.train.normalization_fitted_state(),
+                second.train.normalization_fitted_state()
+            );
+            assert_eq!(first.train.names, first.validation.names);
+            assert_eq!(
+                first.train.normalization_fitted_state(),
+                first.validation.normalization_fitted_state()
+            );
+            assert_eq!(
+                first.train.to_dense_samples_major().unwrap(),
+                second.train.to_dense_samples_major().unwrap()
+            );
+            let ids = first
+                .train
+                .project_columns(&[0], 0..first.train.n_samples())
+                .unwrap();
+            assert!(
+                !ids.row_ids.contains(&30) && !ids.row_ids.contains(&31),
+                "labels whose actual source horizon reaches validation must be purged"
+            );
+            assert_ne!(first.validation_labels, second.validation_labels);
+        }
+    }
+
     fn orchestrator_with_models(models: &[&str]) -> TrainingOrchestrator {
         let mut settings = neoethos_core::Settings::default();
         settings.models.ml_models = models.iter().map(|name| (*name).to_string()).collect();
@@ -5516,6 +6071,260 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    fn canonical_training_binding_fixture(
+        root: &Path,
+    ) -> neoethos_search::data_selection::CanonicalSearchInput {
+        use neoethos_data::core::dataset_manifest::ProducerProvenanceEnvelopeV1;
+        use neoethos_data::{
+            BarTimestampConvention, CanonicalDatasetIdentity, CanonicalOhlcvPublishRequest,
+            CanonicalVolumeRef, publish_canonical_ohlcv_generation,
+        };
+        use neoethos_feature_contracts::{
+            DatasetFeatureArtifactProvenanceV1, FeatureNodeV1, FeatureOutputV1, FeaturePlanV1,
+        };
+
+        let anchor = CanonicalDatasetIdentity::external(
+            "models-training-binding-test",
+            "EURUSD",
+            CanonicalTimeframe::M1,
+            BarTimestampConvention::BarOpen,
+        )
+        .unwrap();
+        let bars = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+        let provenance = ProducerProvenanceEnvelopeV1::new(
+            "neoethos.models-training-binding-test.v1",
+            anchor.canonical_bytes(),
+        )
+        .unwrap();
+        publish_canonical_ohlcv_generation(CanonicalOhlcvPublishRequest {
+            configured_root: root,
+            identity: &anchor,
+            expected_generation: None,
+            provenance: &provenance,
+            ohlcv: &bars,
+            volume: CanonicalVolumeRef::Absent,
+            rows_per_chunk: 128,
+        })
+        .unwrap();
+        let dataset =
+            neoethos_data::load_dataset_for_identity_with_timeframes(root, &anchor, &["M1"])
+                .unwrap();
+        let base = dataset.canonical_frame("M1").unwrap();
+        let source_id = "source:models-training-binding-test";
+        let source = FeatureNodeV1::source(
+            source_id,
+            anchor.clone(),
+            "neoethos.models-training-binding-test.close.v1",
+            1,
+            vec![FeatureOutputV1::f64("close", 1).unwrap()],
+            [1; 32],
+        )
+        .unwrap();
+        let plan = FeaturePlanV1::new(vec![source], vec!["close".to_owned()]).unwrap();
+        let provenance = DatasetFeatureArtifactProvenanceV1::new(
+            &plan,
+            vec![base.source_binding(source_id).unwrap()],
+        )
+        .unwrap();
+        let features = FeatureFrame::from_columns(
+            base.ohlcv().timestamp.clone().unwrap(),
+            vec![
+                neoethos_data::FeatureColumnF64::new(
+                    "close",
+                    base.ohlcv().close.clone(),
+                    vec![neoethos_data::FeatureCellValidity::Valid; base.len()],
+                )
+                .unwrap(),
+            ],
+            plan,
+            provenance,
+        )
+        .unwrap();
+        neoethos_search::data_selection::CanonicalSearchInput::from_prepared_canonical_frame(
+            anchor, base, features,
+        )
+        .unwrap()
+    }
+
+    fn assert_canonical_training_series_binding_before_io(receipt_only: bool) {
+        use crate::promotion_candidate_training_v1::{
+            PromotionCandidateTrainingRefusalCodeV1, PromotionCandidateTrainingRefusalV1,
+        };
+        use neoethos_data::{
+            BarTimestampConvention, CanonicalDatasetIdentity, SelectedDatasetGenerationV1,
+        };
+        use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
+        use neoethos_search::{
+            CanonicalTrendbarResearchCostAssumptionsV2,
+            CanonicalTrendbarResearchExecutionContractV3,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture_root = unique_test_dir("canonical_binding_fixture");
+        std::fs::create_dir(&fixture_root).unwrap();
+        let input = canonical_training_binding_fixture(&fixture_root);
+        let receipt = input.receipt().unwrap();
+        let series = crate::promotion_candidate_training_v1_tests::exact_series(&receipt);
+        let contract = CanonicalTrendbarResearchExecutionContractV3::new(
+            receipt.clone(),
+            CanonicalTrendbarResearchCostAssumptionsV2 {
+                symbol: "EURUSD",
+                account_currency: "USD",
+                assumption_source_id: "neoethos.models-training-binding-test.v1",
+                assumption_source_sha256: &"5".repeat(64),
+                pip_size: 0.0001,
+                pip_value_per_lot: 10.0,
+                full_spread_pips_assumption: 1.0,
+                slippage_pips_per_fill_assumption: 0.1,
+                commission_account_per_lot_per_fill_assumption: 3.5,
+                swap_long_pips_per_day: -0.2,
+                swap_short_pips_per_day: -0.1,
+                pnl_conversion_fee_rate: 0.0,
+            },
+        )
+        .unwrap();
+        let missing_root = unique_test_dir("canonical_binding_absent");
+        assert!(!missing_root.exists());
+        let mut orchestrator = orchestrator_with_models(&["bayes_logit"]);
+        orchestrator.models_dir = missing_root.join("models");
+        orchestrator.data_root_override = Some(missing_root.join("data"));
+        orchestrator.settings.system.multi_resolution_enabled = false;
+        orchestrator.settings.system.higher_timeframes.clear();
+        let width = WorkerLimit::new(1).unwrap();
+        let lease = CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .unwrap();
+        let progress_count = Arc::new(AtomicUsize::new(0));
+        let invoke = |selected: &CanonicalDatasetSeriesReceiptV1| {
+            let progress_count = Arc::clone(&progress_count);
+            let progress = move |_| {
+                progress_count.fetch_add(1, Ordering::SeqCst);
+            };
+            if receipt_only {
+                orchestrator.train_canonical_series_receipt_with_progress(
+                    selected,
+                    CanonicalTimeframe::M1,
+                    &receipt,
+                    &contract,
+                    &lease,
+                    progress,
+                )
+            } else {
+                orchestrator.train_canonical_series_with_progress(
+                    selected,
+                    CanonicalTimeframe::M1,
+                    input.clone(),
+                    &contract,
+                    &lease,
+                    progress,
+                )
+            }
+        };
+        // The positive control passes the new binding check and reaches the
+        // unchanged exact loader. No fixture files are present at this root.
+        let exact_error = invoke(&series).unwrap_err();
+        assert!(
+            exact_error
+                .to_string()
+                .contains("failed to reopen exact selected generation"),
+            "exact matching input must reach the loader: {exact_error:#}"
+        );
+        assert!(
+            exact_error
+                .downcast_ref::<PromotionCandidateTrainingRefusalV1>()
+                .is_none()
+        );
+
+        let original = series.anchor();
+        assert_ne!(
+            original.generation_id(),
+            format!("g1-{}.vortex", "3".repeat(64))
+        );
+        assert_ne!(original.manifest_binding_sha256(), "4".repeat(64));
+        let replacement = |identity, generation: &str, manifest: &str| {
+            let selected =
+                SelectedDatasetGenerationV1::new(identity, generation, manifest).unwrap();
+            CanonicalDatasetSeriesReceiptV1::new(selected.clone(), vec![selected]).unwrap()
+        };
+        let identity = |namespace, symbol, timeframe| {
+            CanonicalDatasetIdentity::external(
+                namespace,
+                symbol,
+                timeframe,
+                BarTimestampConvention::BarOpen,
+            )
+            .unwrap()
+        };
+        let extra = SelectedDatasetGenerationV1::new(
+            identity(
+                "models-training-binding-test",
+                "EURUSD",
+                CanonicalTimeframe::M5,
+            ),
+            original.generation_id(),
+            original.manifest_binding_sha256(),
+        )
+        .unwrap();
+        let mismatches = [
+            replacement(
+                original.identity().clone(),
+                &format!("g1-{}.vortex", "3".repeat(64)),
+                original.manifest_binding_sha256(),
+            ),
+            replacement(
+                original.identity().clone(),
+                original.generation_id(),
+                &"4".repeat(64),
+            ),
+            replacement(
+                identity("foreign-training-series", "EURUSD", CanonicalTimeframe::M1),
+                original.generation_id(),
+                original.manifest_binding_sha256(),
+            ),
+            replacement(
+                identity(
+                    "models-training-binding-test",
+                    "GBPUSD",
+                    CanonicalTimeframe::M1,
+                ),
+                original.generation_id(),
+                original.manifest_binding_sha256(),
+            ),
+            CanonicalDatasetSeriesReceiptV1::new(original.clone(), vec![original.clone(), extra])
+                .unwrap(),
+        ];
+        for (case, mismatch) in mismatches.iter().enumerate() {
+            mismatch.validate().unwrap();
+            let error = invoke(mismatch).unwrap_err();
+            let refusal = error
+                .downcast_ref::<PromotionCandidateTrainingRefusalV1>()
+                .unwrap_or_else(|| {
+                    panic!("case {case} reached I/O instead of exact binding: {error:#}")
+                });
+            assert_eq!(
+                refusal.code(),
+                PromotionCandidateTrainingRefusalCodeV1::InputReceiptMismatch
+            );
+        }
+        assert_eq!(progress_count.load(Ordering::SeqCst), 0);
+        assert!(
+            !missing_root.exists(),
+            "neither rejection nor missing-input control may write artifacts"
+        );
+        drop(input);
+        std::fs::remove_dir_all(&fixture_root).expect("cleanup exact binding fixture");
+    }
+
+    #[test]
+    fn canonical_training_receipt_rejects_foreign_series_before_io() {
+        assert_canonical_training_series_binding_before_io(true);
+    }
+
+    #[test]
+    fn canonical_training_input_rejects_foreign_series_before_io() {
+        assert_canonical_training_series_binding_before_io(false);
     }
 
     fn test_training_payload(
@@ -5853,6 +6662,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "burn-rocm-backend"))]
     fn hardware_plan_params_reach_the_deep_trainer_contract() {
         use neoethos_core::system::{
             AcceleratorBackend, AcceleratorDevice, AcceleratorDeviceClass,
@@ -5884,14 +6694,18 @@ mod tests {
             timestamp: "test".to_string(),
             platform_label: "test".to_string(),
         };
-        let plan =
-            HardwareExecutionPlan::from_settings_and_profile(&orchestrator.settings, profile);
+        let plan = HardwareExecutionPlan::from_settings_and_profile(
+            &orchestrator.settings,
+            profile.clone(),
+        );
         let workload = plan
             .workload(WorkloadKind::DeepTraining)
             .expect("deep-training workload should exist");
         let mut params = HashMap::from([("batch_size".to_string(), "17".to_string())]);
 
-        orchestrator.apply_hardware_plan_params("mlp", ModelFamily::Deep, &plan, &mut params);
+        orchestrator
+            .apply_hardware_plan_params("mlp", ModelFamily::Deep, &plan, &mut params)
+            .unwrap();
 
         assert_eq!(
             params.get("__planned_cpu_threads"),
@@ -5913,6 +6727,207 @@ mod tests {
         assert_eq!(
             params.get("memory_budget_gb"),
             Some(&format!("{:.6}", workload.memory_budget_gb))
+        );
+        let dispatch = orchestrator.create_dispatch_plan().unwrap();
+        let configs = orchestrator
+            .build_training_configs_with_hardware_plan(&dispatch, &plan)
+            .unwrap();
+        let mlp = configs.iter().find(|config| config.name == "mlp").unwrap();
+        assert_eq!(mlp.params["capacity_mode"], "auto");
+        let fractions: Vec<_> = (1..8)
+            .map(|trial| {
+                let candidate = generate_hpo_candidate_params(mlp, &mlp.params, trial, 8, "tpe");
+                let fraction = candidate["capacity_fraction"].parse::<f64>().unwrap();
+                assert!((0.25..=1.0).contains(&fraction));
+                assert_eq!(candidate["hidden_dim"], mlp.params["hidden_dim"]);
+                fraction
+            })
+            .collect();
+        assert!(fractions.windows(2).any(|pair| pair[0] != pair[1]));
+
+        orchestrator.settings.models.model_param_overrides.insert(
+            "mlp".into(),
+            HashMap::from([("hidden_dim".into(), "37".into())]),
+        );
+        let configs = orchestrator
+            .build_training_configs_with_hardware_plan(&dispatch, &plan)
+            .unwrap();
+        let mlp = configs.iter().find(|config| config.name == "mlp").unwrap();
+        assert_eq!(mlp.params["capacity_mode"], "fixed");
+        assert_eq!(mlp.params["hidden_dim"], "37");
+        for trial in 1..8 {
+            let candidate = generate_hpo_candidate_params(mlp, &mlp.params, trial, 8, "tpe");
+            assert_eq!(candidate["hidden_dim"], "37");
+        }
+
+        orchestrator.settings.models.model_param_overrides.clear();
+        orchestrator.settings.system.enable_gpu_preference = "cpu".into();
+        let cpu_plan =
+            HardwareExecutionPlan::from_settings_and_profile(&orchestrator.settings, profile);
+        let configs = orchestrator
+            .build_training_configs_with_hardware_plan(&dispatch, &cpu_plan)
+            .unwrap();
+        let mlp = configs.iter().find(|config| config.name == "mlp").unwrap();
+        assert!(!mlp.params.contains_key("capacity_mode"));
+    }
+
+    #[test]
+    fn rocm_planning_refuses_unsupported_families_disabled_gpu_and_malformed_ordinals() {
+        let mut orchestrator = orchestrator_with_models(&["mlp"]);
+        orchestrator.settings.system.enable_gpu_preference = "auto".into();
+        for (name, family) in [
+            ("xgboost", ModelFamily::Tree),
+            ("exit_agent", ModelFamily::Exit),
+            ("sac", ModelFamily::Rl),
+            ("neuro_evo", ModelFamily::Evolutionary),
+        ] {
+            let params = HashMap::from([("device".into(), "rocm:3".into())]);
+            assert!(
+                requested_rocm_model_ordinal_v1(&orchestrator.settings, name, family, &params)
+                    .is_err()
+            );
+        }
+        for policy in ["rocm:", "rocm:-1", "hip:65536", "rocm:1x"] {
+            let params = HashMap::from([("device".into(), policy.into())]);
+            assert!(
+                requested_rocm_model_ordinal_v1(
+                    &orchestrator.settings,
+                    "mlp",
+                    ModelFamily::Deep,
+                    &params
+                )
+                .is_err()
+            );
+        }
+        orchestrator.settings.system.enable_gpu_preference = "cpu".into();
+        orchestrator.settings.system.device = "rocm:3".into();
+        assert_eq!(orchestrator.preferred_burn_device_policy(), "rocm:3");
+        let error = orchestrator.preflight_configured_training().unwrap_err();
+        assert!(
+            error.to_string().contains("explicitly disabled"),
+            "{error:#}"
+        );
+        assert_eq!(burn_policy_from_workload_device("rocm:3"), "rocm:3");
+        assert_eq!(burn_policy_from_workload_device("cuda:3"), "gpu:3");
+        assert_eq!(burn_policy_from_workload_device("cpu"), "cpu");
+    }
+
+    #[test]
+    #[cfg(not(feature = "burn-rocm-backend"))]
+    fn rocm_planning_public_preflight_refuses_missing_backend_before_hardware_probe() {
+        let mut orchestrator = orchestrator_with_models(&["mlp"]);
+        orchestrator.settings.system.enable_gpu_preference = "auto".into();
+        orchestrator.settings.models.model_param_overrides.insert(
+            "mlp".into(),
+            HashMap::from([("device".into(), "rocm:3".into())]),
+        );
+        let error = orchestrator.preflight_configured_training().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no compiled ROCm training route"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "burn-rocm-backend")]
+    fn rocm_planning_sealed_inventory_reaches_exact_deep_device_and_capacity_without_recapture() {
+        use neoethos_core::system::{
+            AcceleratorDevice, AcceleratorDeviceClass, HARDWARE_PROFILE_SCHEMA_VERSION,
+            HardwareProfile, TrainingPrecision,
+        };
+        let mut orchestrator = orchestrator_with_models(&["mlp"]);
+        orchestrator.settings.system.enable_gpu_preference = "auto".into();
+        orchestrator.settings.models.model_param_overrides.insert(
+            "mlp".into(),
+            HashMap::from([
+                ("device".into(), "hip:3".into()),
+                ("memory_budget_gb".into(), "999999".into()),
+            ]),
+        );
+        // Pure host policy fixture, not a claim that HIP/device execution occurred.
+        let inventory = HardwareProfile {
+            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
+            cpu_cores: 8,
+            total_ram_gb: 32.0,
+            available_ram_gb: 16.0,
+            gpu_names: vec!["host policy fixture".into()],
+            num_gpus: 1,
+            gpu_mem_gb: vec![128.0],
+            timestamp: "fixture".into(),
+            platform_label: "fixture".into(),
+            accelerator_devices: vec![AcceleratorDevice {
+                id: 17,
+                name: "host policy fixture".into(),
+                backend: AcceleratorBackend::Rocm,
+                device_class: AcceleratorDeviceClass::Other,
+                backend_index: 3,
+                memory_gb: 128.0,
+                supported_precisions: vec![TrainingPrecision::Fp32],
+                compute_capability: None,
+                source: "test-only".into(),
+            }],
+        };
+        let plan =
+            HardwareExecutionPlan::from_settings_and_profile(&orchestrator.settings, inventory);
+        orchestrator = orchestrator.with_sealed_hardware_plan_v1(plan.clone());
+        let (configs, retained) = orchestrator.configured_training_plan_v1().unwrap();
+        assert_eq!(
+            retained, plan,
+            "sealed planning must not call a live HIP probe"
+        );
+        let mlp = configs.iter().find(|config| config.name == "mlp").unwrap();
+        assert_eq!(mlp.params["__planned_backend"], "rocm");
+        assert_eq!(mlp.params["__planned_device"], "rocm:3");
+        assert_eq!(mlp.params["device"], "rocm:3");
+        assert_eq!(mlp.params["memory_budget_gb"], "102.400000");
+        assert_eq!(mlp.params["batch_size"], "2048");
+        assert_eq!(mlp.params["training_precision"], "fp32");
+        assert_eq!(mlp.params["capacity_mode"], "auto");
+        assert_eq!(
+            configs
+                .iter()
+                .find(|config| config.name == "hmm_regime")
+                .unwrap()
+                .params["device"],
+            "cpu"
+        );
+        assert!(orchestrator.validate_nvidia_model_config_v1(mlp).is_err());
+        let mut missing = plan.clone();
+        missing.profile.accelerator_devices.clear();
+        orchestrator.sealed_hardware_plan_v1 = Some(missing);
+        assert!(orchestrator.preflight_configured_training().is_err());
+        orchestrator.sealed_hardware_plan_v1 = Some(plan.clone());
+        let mut cuda = plan.clone();
+        let workload = cuda
+            .workloads
+            .iter_mut()
+            .find(|workload| workload.workload == WorkloadKind::DeepTraining)
+            .unwrap();
+        workload.backend = AcceleratorBackend::Cuda;
+        workload.device = "cuda:3".into();
+        let mut params = HashMap::new();
+        assert!(
+            orchestrator
+                .apply_hardware_plan_params("mlp", ModelFamily::Deep, &cuda, &mut params)
+                .is_err()
+        );
+        orchestrator
+            .settings
+            .models
+            .model_param_overrides
+            .get_mut("mlp")
+            .unwrap()
+            .insert("device".into(), "cpu".into());
+        let (configs, _) = orchestrator.configured_training_plan_v1().unwrap();
+        assert_eq!(
+            configs
+                .iter()
+                .find(|config| config.name == "mlp")
+                .unwrap()
+                .params["device"],
+            "cpu"
         );
     }
 
@@ -6038,6 +7053,35 @@ mod tests {
     }
 
     #[test]
+    fn neat_population_comes_from_rl_population_size() {
+        let mut orchestrator = orchestrator_with_models(&["neat"]);
+        orchestrator.settings.models.rl_population_size = 137;
+        // This is the CR-FM-NES/neuro-evolution setting. It used to feed NEAT
+        // too, which gave one population two unrelated configuration sources.
+        orchestrator.settings.models.evo_population = 999;
+
+        let params = orchestrator.default_model_params("neat");
+        assert_eq!(params.get("population").map(String::as_str), Some("137"));
+    }
+
+    #[test]
+    fn building_neat_without_the_configured_population_is_refused() {
+        let config = ModelConfig {
+            name: "neat".to_string(),
+            model_type: ModelType::Neat,
+            capability_family: crate::runtime::capabilities::ModelFamily::Evolutionary,
+            capability_state: CapabilityState::Verified,
+            params: HashMap::new(),
+        };
+
+        let error = match build_expert_model(&config, 4, &HashMap::new()) {
+            Ok(_) => panic!("missing NEAT population must not select a fallback literal"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("population"), "{error:#}");
+    }
+
+    #[test]
     fn derive_labels_uses_meta_label_max_hold_bars_when_model_horizon_is_zero() {
         let mut orchestrator = orchestrator_with_models(&["lightgbm"]);
         orchestrator.settings.models.label_use_triple_barrier = false;
@@ -6060,6 +7104,90 @@ mod tests {
             .derive_labels_test_oracle(&ohlcv, "EURUSD", 0.0001)
             .expect("aligned OHLCV should derive labels");
         assert_eq!(labels[0], 1);
+    }
+
+    #[test]
+    fn effective_label_horizon_prefers_explicit_value_then_positive_fallback() {
+        let mut settings = Settings::default();
+        for (configured, fallback, expected) in [(0, 3, 3), (2, 3, 2), (0, 0, 1)] {
+            settings.models.label_horizon_bars = configured;
+            settings.risk.meta_label_max_hold_bars = fallback;
+            assert_eq!(effective_label_horizon_bars_v1(&settings), expected);
+        }
+    }
+
+    #[test]
+    fn zero_horizon_purge_keeps_fitted_normalization_and_labels_before_oos() {
+        let mut orchestrator = orchestrator_with_models(&["lightgbm"]);
+        orchestrator.settings.models.label_horizon_bars = 0;
+        orchestrator.settings.risk.meta_label_max_hold_bars = 3;
+        orchestrator.settings.models.label_use_triple_barrier = false;
+        orchestrator.settings.risk.backtest_spread_pips = 0.0;
+        orchestrator.settings.risk.slippage_pips = 0.0;
+        let rows = 300;
+        let cutoff_row = 280;
+        let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(rows);
+        let cutoff = timestamps[cutoff_row];
+        let (in_sample, purge, keep) =
+            purged_training_prefix_v1(&timestamps, cutoff, &orchestrator.settings);
+        assert_eq!((in_sample, purge, keep), (280, 3, 277));
+        assert!(
+            keep >= 256,
+            "fixture clears the unchanged OOS prefix minimum"
+        );
+
+        let before = (0..rows)
+            .map(|row| 1.1 + row as f64 * 0.000_000_1)
+            .collect::<Vec<_>>();
+        let mut changed = before.clone();
+        for value in &mut changed[cutoff_row..] {
+            *value += 0.1;
+        }
+        let labels = |close: &[f64]| {
+            let bars = Ohlcv {
+                timestamp: Some(timestamps.clone()),
+                open: close.to_vec(),
+                high: close.to_vec(),
+                low: close.to_vec(),
+                close: close.to_vec(),
+                volume: None,
+            };
+            orchestrator
+                .derive_labels_test_oracle(&bars, "EURUSD", 0.0001)
+                .unwrap()
+        };
+        let before_labels = labels(&before);
+        let changed_labels = labels(&changed);
+        assert_eq!(&before_labels[..keep], &changed_labels[..keep]);
+        assert_ne!(
+            &before_labels[keep..in_sample],
+            &changed_labels[keep..in_sample],
+            "the three purged labels genuinely see across the cutoff"
+        );
+
+        let normalized = |values: Vec<f64>| {
+            neoethos_data::test_fixtures::ctrader_test_normalized_feature_frame_from_columns(
+                timestamps.clone(),
+                vec![
+                    neoethos_data::FeatureColumnF64::new(
+                        "quant_close",
+                        values,
+                        vec![neoethos_data::FeatureCellValidity::Valid; rows],
+                    )
+                    .unwrap(),
+                ],
+                FeatureBuildOptions {
+                    normalization_training_rows: Some(0..keep),
+                    ..FeatureBuildOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        let before_frame = normalized(before);
+        let changed_frame = normalized(changed);
+        let fit = before_frame.normalization_fitted_state().unwrap();
+        assert_eq!(fit.training_rows().unwrap(), 0..277);
+        assert_eq!(Some(fit), changed_frame.normalization_fitted_state());
     }
 
     #[test]

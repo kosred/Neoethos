@@ -4,11 +4,12 @@
 //! can only be minted by the future resident-store/session bridge. No pointer,
 //! event, selected count or selected-column list is exposed outside gpu-cuda.
 
-use crate::PopulationSession;
+use crate::data_population_workspace_plan_v1::SealedNativeCudaDataPopulationPreflightFactsV1;
 use crate::resident_feature_store_v3::{
-    ResidentFeatureStoreConsumerLeaseV3, ResidentFeatureStoreCudaErrorV3,
-    ResidentFeatureStoreImportV3, ResidentPopulationSessionV3,
+    ResidentFeatureStoreCudaErrorV3, ResidentFeatureStoreImportV3, ResidentPopulationSessionV3,
 };
+use cust::error::CudaError;
+use cust::memory::LockedBuffer;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::ffi::c_void;
@@ -16,6 +17,9 @@ use std::mem;
 use std::ptr::NonNull;
 
 const ABI_VERSION_V1: u32 = 1;
+pub(crate) const SCREENING_IMPORT_ABI_VERSION_V2: u32 = 2;
+const SCORE_BATCH_ABI_VERSION_V2: u32 = 2;
+const SELECTED_MAP_READ_ABI_VERSION_V2: u32 = 2;
 const STATUS_OK_V1: i32 = 0;
 const STAGE_LABELS_V1: u32 = 1;
 const STAGE_LABEL_GUARD_V1: u32 = 2;
@@ -27,6 +31,10 @@ const STAGE_ASCENDING_MAP_V1: u32 = 7;
 const STAGE_DEVICE_SEAL_V1: u32 = 8;
 const MAX_GRID_X_V1: u64 = i32::MAX as u64;
 const LAUNCH_THREADS_V1: u64 = 256;
+const LABEL_CENSUS_COUNTER_COUNT_V1: u64 = 12;
+const MAXIMUM_REFIT_FOLDS_V1: u64 = 8;
+const FOLD_DESCRIPTOR_BYTES_V1: u64 = 80;
+const DEVICE_SEAL_BYTES_V1: u64 = 88;
 
 pub const RESIDENT_TRIM_PREFILTER_CUDA_MATH_FLAGS_V1: [&str; 4] = [
     "--fmad=false",
@@ -54,6 +62,37 @@ impl From<ResidentFeatureStoreCudaErrorV3> for ResidentTrimPrefilterDeviceErrorV
     fn from(error: ResidentFeatureStoreCudaErrorV3) -> Self {
         Self::Population(error)
     }
+}
+
+impl From<CudaError> for ResidentTrimPrefilterDeviceErrorV1 {
+    fn from(error: CudaError) -> Self {
+        Self::Population(error.into())
+    }
+}
+
+/// Number of label-safe rows in the single configured selection-prefix fit.
+///
+/// This is planning geometry, not device evaluation evidence. `selection_rows`
+/// already excludes the outer holdout and incorporates the configured suffix
+/// cap. A result below three means keep every column, as in CPU Discovery.
+pub fn resident_trim_prefilter_prefix_fit_rows_v1(
+    selection_rows: u64,
+    insample_fraction: f64,
+    max_hold_bars: u64,
+) -> Result<u64, ResidentTrimPrefilterDeviceErrorV1> {
+    if selection_rows > (1_u64 << 53)
+        || !insample_fraction.is_finite()
+        || insample_fraction <= 0.0
+        || insample_fraction > 1.0
+    {
+        return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+            "selection-prefix fit geometry",
+        ));
+    }
+    let requested_end = (insample_fraction * selection_rows as f64).floor() as u64;
+    Ok(requested_end
+        .min(selection_rows)
+        .saturating_sub(max_hold_bars.max(1)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,11 +265,75 @@ struct RawResidentTrimPrefilterViewsV1 {
     cuda_build_manifest_sha256: [u8; 32],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawResidentTrimPrefilterScoreBatchV2 {
+    abi_version: u32,
+    reserved: u32,
+    batch_values_bar_major: *const f64,
+    batch_validity_u4: *const u8,
+    batch_row_count: u64,
+    batch_column_count: u64,
+    local_batch_stride: u64,
+    global_parent_column_start: u64,
+    global_parent_ordinals_device: *const u32,
+    batch_ready_event: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawResidentTrimPrefilterSelectedMapReadV2 {
+    abi_version: u32,
+    reserved: u32,
+    selected_capacity: u64,
+    selected_count: u64,
+    selected_map_readback_bytes: u64,
+    selected_global_parent_ordinals_host: *mut u32,
+    selected_map_readback_ready_event: *mut c_void,
+}
+
 const _: [(); 560] = [(); mem::size_of::<RawResidentTrimPrefilterImportV1>()];
 const _: [(); 608] = [(); mem::size_of::<RawResidentTrimPrefilterPlanV1>()];
 const _: [(); 200] = [(); mem::size_of::<RawResidentTrimPrefilterAllocationReceiptV1>()];
 const _: [(); 56] = [(); mem::size_of::<RawResidentTrimPrefilterReadyEventV1>()];
 const _: [(); 344] = [(); mem::size_of::<RawResidentTrimPrefilterViewsV1>()];
+const _: [(); 72] = [(); mem::size_of::<RawResidentTrimPrefilterScoreBatchV2>()];
+const _: [(); 48] = [(); mem::size_of::<RawResidentTrimPrefilterSelectedMapReadV2>()];
+const _: [(); 0] = [(); mem::offset_of!(RawResidentTrimPrefilterScoreBatchV2, abi_version)];
+const _: [(); 4] = [(); mem::offset_of!(RawResidentTrimPrefilterScoreBatchV2, reserved)];
+const _: [(); 8] =
+    [(); mem::offset_of!(RawResidentTrimPrefilterScoreBatchV2, batch_values_bar_major)];
+const _: [(); 16] = [(); mem::offset_of!(RawResidentTrimPrefilterScoreBatchV2, batch_validity_u4)];
+const _: [(); 24] = [(); mem::offset_of!(RawResidentTrimPrefilterScoreBatchV2, batch_row_count)];
+const _: [(); 32] = [(); mem::offset_of!(RawResidentTrimPrefilterScoreBatchV2, batch_column_count)];
+const _: [(); 40] = [(); mem::offset_of!(RawResidentTrimPrefilterScoreBatchV2, local_batch_stride)];
+const _: [(); 48] = [(); mem::offset_of!(
+    RawResidentTrimPrefilterScoreBatchV2,
+    global_parent_column_start
+)];
+const _: [(); 56] = [(); mem::offset_of!(
+    RawResidentTrimPrefilterScoreBatchV2,
+    global_parent_ordinals_device
+)];
+const _: [(); 64] = [(); mem::offset_of!(RawResidentTrimPrefilterScoreBatchV2, batch_ready_event)];
+const _: [(); 0] = [(); mem::offset_of!(RawResidentTrimPrefilterSelectedMapReadV2, abi_version)];
+const _: [(); 4] = [(); mem::offset_of!(RawResidentTrimPrefilterSelectedMapReadV2, reserved)];
+const _: [(); 8] =
+    [(); mem::offset_of!(RawResidentTrimPrefilterSelectedMapReadV2, selected_capacity)];
+const _: [(); 16] =
+    [(); mem::offset_of!(RawResidentTrimPrefilterSelectedMapReadV2, selected_count)];
+const _: [(); 24] = [(); mem::offset_of!(
+    RawResidentTrimPrefilterSelectedMapReadV2,
+    selected_map_readback_bytes
+)];
+const _: [(); 32] = [(); mem::offset_of!(
+    RawResidentTrimPrefilterSelectedMapReadV2,
+    selected_global_parent_ordinals_host
+)];
+const _: [(); 40] = [(); mem::offset_of!(
+    RawResidentTrimPrefilterSelectedMapReadV2,
+    selected_map_readback_ready_event
+)];
 
 impl Default for RawResidentTrimPrefilterViewsV1 {
     fn default() -> Self {
@@ -306,6 +409,17 @@ unsafe extern "C" {
     fn enqueue_resident_trim_prefilter_stage_v1(
         run: *mut NativeResidentTrimPrefilterRunV1,
         stage: u32,
+    ) -> i32;
+    fn enqueue_resident_trim_prefilter_score_batch_v2(
+        run: *mut NativeResidentTrimPrefilterRunV1,
+        batch: *const RawResidentTrimPrefilterScoreBatchV2,
+    ) -> i32;
+    fn seal_resident_trim_prefilter_selected_map_v2(
+        run: *mut NativeResidentTrimPrefilterRunV1,
+    ) -> i32;
+    fn read_resident_trim_prefilter_selected_map_v2(
+        run: *mut NativeResidentTrimPrefilterRunV1,
+        read: *mut RawResidentTrimPrefilterSelectedMapReadV2,
     ) -> i32;
     fn seal_resident_trim_prefilter_views_v1(
         run: *mut NativeResidentTrimPrefilterRunV1,
@@ -436,7 +550,7 @@ impl ResidentTrimPrefilterNativePlanV1 {
             || bindings.maximum_refit_folds != 8
             || !fields.insample_fraction.is_finite()
             || fields.insample_fraction <= 0.0
-            || fields.insample_fraction >= 1.0
+            || fields.insample_fraction > 1.0
             || !fields.stop_atr_multiplier.is_finite()
             || fields.stop_atr_multiplier <= 0.0
             || !fields.reward_risk_ratio.is_finite()
@@ -533,7 +647,8 @@ fn require_hash_v1(
 /// Opaque parent import. Its constructor stays gpu-cuda-private so Search can
 /// only receive it by consuming the already-admitted resident session.
 pub struct ResidentTrimPrefilterParentImportV1 {
-    pub(crate) owner: Option<Box<ResidentFeatureStoreImportV3>>,
+    pub(crate) owner: Option<Box<dyn Any + Send>>,
+    pub(crate) import_abi_version: u32,
     pub(crate) selected_cuda_ordinal: u32,
     pub(crate) parent_row_count: u64,
     pub(crate) parent_column_count: u64,
@@ -855,14 +970,34 @@ impl ResidentTrimPrefilterNativeScratchBytesV1 {
                 "scratch-query column count",
             ));
         }
+        Self::query_from_raw_admission_v2(
+            parent.admitted_run_stream,
+            parent.selected_cuda_ordinal,
+            parent_column_count,
+            prefilter_active,
+        )
+    }
+
+    fn query_from_raw_admission_v2(
+        admitted_run_stream: NonNull<c_void>,
+        selected_cuda_ordinal: u32,
+        parent_column_count: u64,
+        prefilter_active: bool,
+    ) -> Result<Self, ResidentTrimPrefilterDeviceErrorV1> {
+        if parent_column_count == 0 {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                "scratch-query column count",
+            ));
+        }
         let mut cub_select_scratch_bytes = 0_u64;
         let mut cub_radix_sort_scratch_bytes = 0_u64;
-        // SAFETY: the opaque parent retains the exact admitted stream and
-        // context. The query allocates nothing and performs no synchronization.
+        // SAFETY: the handle is retained by the move-only native admission;
+        // the query allocates nothing, enqueues no work and synchronizes
+        // nothing. The native side also verifies the selected ordinal.
         let status = unsafe {
             query_resident_trim_prefilter_scratch_v1(
-                parent.admitted_run_stream.as_ptr(),
-                parent.selected_cuda_ordinal,
+                admitted_run_stream.as_ptr(),
+                selected_cuda_ordinal,
                 parent_column_count,
                 u32::from(prefilter_active),
                 &mut cub_select_scratch_bytes,
@@ -883,6 +1018,397 @@ impl ResidentTrimPrefilterNativeScratchBytesV1 {
     pub const fn cub_radix_sort_scratch_bytes(self) -> u64 {
         self.cub_radix_sort_scratch_bytes
     }
+}
+
+/// Allocation-free inputs for the trim/prefilter device-memory preflight.
+/// Search supplies only resolved semantic extents; gpu-cuda remains the one
+/// authority for native scratch and byte arithmetic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentTrimPrefilterWorkspacePreflightRequestV2 {
+    pub selection_row_count: u64,
+    pub parent_column_count: u64,
+    pub schema_metadata_bytes: u64,
+    pub timeframe_group_count: u64,
+    pub prefilter_active: bool,
+}
+
+/// Native trim bytes before they are bound to the complete screening-stage
+/// reserve. This split removes the former circular dependency: native scratch
+/// is queried first, the complete Data screening peak is then calculated, and
+/// only that exact reserve can seal the native allocation receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnboundResidentTrimPrefilterWorkspacePreflightV2 {
+    selection_row_count: u64,
+    parent_column_count: u64,
+    schema_metadata_bytes: u64,
+    timeframe_group_count: u64,
+    prefilter_active: bool,
+    long_labels_bytes: u64,
+    short_labels_bytes: u64,
+    label_census_bytes: u64,
+    fold_descriptor_bytes: u64,
+    column_score_bytes: u64,
+    column_instability_bytes: u64,
+    column_rankability_bytes: u64,
+    radix_key_ping_pong_bytes: u64,
+    radix_index_ping_pong_bytes: u64,
+    timeframe_group_counter_bytes: u64,
+    selected_column_map_bytes: u64,
+    selected_column_count_bytes: u64,
+    cub_select_scratch_bytes: u64,
+    cub_radix_sort_scratch_bytes: u64,
+    device_seal_bytes: u64,
+    retained_device_bytes: u64,
+    peak_device_bytes: u64,
+    unbound_preflight_identity_sha256: [u8; 32],
+}
+
+impl UnboundResidentTrimPrefilterWorkspacePreflightV2 {
+    pub const fn parent_column_count(&self) -> u64 {
+        self.parent_column_count
+    }
+
+    pub const fn schema_metadata_bytes(&self) -> u64 {
+        self.schema_metadata_bytes
+    }
+
+    pub const fn peak_device_bytes(&self) -> u64 {
+        self.peak_device_bytes
+    }
+
+    pub const fn retained_device_bytes(&self) -> u64 {
+        self.retained_device_bytes
+    }
+
+    pub const fn unbound_preflight_identity_sha256(&self) -> [u8; 32] {
+        self.unbound_preflight_identity_sha256
+    }
+
+    pub fn bind_screening_workspace_reserve_v2(
+        self,
+        screening_workspace_reserve_bytes: u64,
+    ) -> Result<SealedResidentTrimPrefilterWorkspacePreflightV2, ResidentTrimPrefilterDeviceErrorV1>
+    {
+        if screening_workspace_reserve_bytes == 0
+            || self.peak_device_bytes > screening_workspace_reserve_bytes
+        {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                "screening workspace undercharges native trim/prefilter",
+            ));
+        }
+        let allocation_plan_sha256 = trim_workspace_identity_v2(
+            b"neoethos.resident-trim-prefilter-memory.v2",
+            &[
+                self.selection_row_count,
+                self.parent_column_count,
+                self.long_labels_bytes,
+                self.short_labels_bytes,
+                self.label_census_bytes,
+                self.fold_descriptor_bytes,
+                self.column_score_bytes,
+                self.column_instability_bytes,
+                self.column_rankability_bytes,
+                self.schema_metadata_bytes,
+                self.radix_key_ping_pong_bytes,
+                self.radix_index_ping_pong_bytes,
+                self.timeframe_group_counter_bytes,
+                self.selected_column_map_bytes,
+                self.selected_column_count_bytes,
+                self.cub_select_scratch_bytes,
+                self.cub_radix_sort_scratch_bytes,
+                self.device_seal_bytes,
+                self.retained_device_bytes,
+                self.peak_device_bytes,
+                screening_workspace_reserve_bytes,
+            ],
+        );
+        Ok(SealedResidentTrimPrefilterWorkspacePreflightV2 {
+            fields: ResidentTrimPrefilterNativeMemoryFieldsV1 {
+                long_labels_bytes: self.long_labels_bytes,
+                short_labels_bytes: self.short_labels_bytes,
+                label_census_bytes: self.label_census_bytes,
+                fold_descriptor_bytes: self.fold_descriptor_bytes,
+                column_score_bytes: self.column_score_bytes,
+                column_instability_bytes: self.column_instability_bytes,
+                column_rankability_bytes: self.column_rankability_bytes,
+                state_template_timeframe_metadata_bytes: self.schema_metadata_bytes,
+                radix_key_ping_pong_bytes: self.radix_key_ping_pong_bytes,
+                radix_index_ping_pong_bytes: self.radix_index_ping_pong_bytes,
+                timeframe_group_counter_bytes: self.timeframe_group_counter_bytes,
+                selected_column_map_bytes: self.selected_column_map_bytes,
+                selected_column_count_bytes: self.selected_column_count_bytes,
+                cub_select_scratch_bytes: self.cub_select_scratch_bytes,
+                cub_radix_sort_scratch_bytes: self.cub_radix_sort_scratch_bytes,
+                device_seal_bytes: self.device_seal_bytes,
+                retained_device_bytes: self.retained_device_bytes,
+                peak_device_bytes: self.peak_device_bytes,
+                full_discovery_reserve_bytes: screening_workspace_reserve_bytes,
+                allocation_plan_sha256,
+            },
+            unbound_preflight_identity_sha256: self.unbound_preflight_identity_sha256,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SealedResidentTrimPrefilterWorkspacePreflightV2 {
+    fields: ResidentTrimPrefilterNativeMemoryFieldsV1,
+    unbound_preflight_identity_sha256: [u8; 32],
+}
+
+impl SealedResidentTrimPrefilterWorkspacePreflightV2 {
+    pub const fn peak_device_bytes(&self) -> u64 {
+        self.fields.peak_device_bytes
+    }
+
+    pub const fn screening_workspace_reserve_bytes(&self) -> u64 {
+        self.fields.full_discovery_reserve_bytes
+    }
+
+    pub const fn allocation_plan_sha256(&self) -> [u8; 32] {
+        self.fields.allocation_plan_sha256
+    }
+
+    pub const fn unbound_preflight_identity_sha256(&self) -> [u8; 32] {
+        self.unbound_preflight_identity_sha256
+    }
+}
+
+impl ResidentTrimPrefilterSearchMemoryReceiptV1
+    for SealedResidentTrimPrefilterWorkspacePreflightV2
+{
+    fn resident_trim_prefilter_native_memory_fields_v1(
+        &self,
+    ) -> ResidentTrimPrefilterNativeMemoryFieldsV1 {
+        self.fields.clone()
+    }
+}
+
+pub fn preflight_resident_trim_prefilter_workspace_v2(
+    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
+    request: ResidentTrimPrefilterWorkspacePreflightRequestV2,
+) -> Result<UnboundResidentTrimPrefilterWorkspacePreflightV2, ResidentTrimPrefilterDeviceErrorV1> {
+    if request.selection_row_count < 2
+        || request.parent_column_count == 0
+        || request.schema_metadata_bytes == 0
+        || request.timeframe_group_count == 0
+        || request.timeframe_group_count > request.parent_column_count
+        || native_facts.selected_device_ordinal() == u32::MAX
+        || native_facts.run_stream_handle_v2() == 0
+    {
+        return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+            "trim/prefilter workspace preflight inputs",
+        ));
+    }
+    let admitted_run_stream = NonNull::new(native_facts.run_stream_handle_v2() as *mut c_void)
+        .ok_or(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+            "trim/prefilter admitted stream",
+        ))?;
+    let scratch = ResidentTrimPrefilterNativeScratchBytesV1::query_from_raw_admission_v2(
+        admitted_run_stream,
+        native_facts.selected_device_ordinal(),
+        request.parent_column_count,
+        request.prefilter_active,
+    )?;
+    let active_bytes = |unit: u64, field: &'static str| {
+        if request.prefilter_active {
+            request.parent_column_count.checked_mul(unit).ok_or(
+                ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(field),
+            )
+        } else {
+            Ok(0)
+        }
+    };
+    let long_labels_bytes = if request.prefilter_active {
+        request.selection_row_count.checked_mul(8).ok_or(
+            ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("long labels"),
+        )?
+    } else {
+        0
+    };
+    let short_labels_bytes = long_labels_bytes;
+    let label_census_bytes = if request.prefilter_active {
+        LABEL_CENSUS_COUNTER_COUNT_V1 * 8
+    } else {
+        0
+    };
+    let fold_descriptor_bytes = if request.prefilter_active {
+        MAXIMUM_REFIT_FOLDS_V1 * FOLD_DESCRIPTOR_BYTES_V1
+    } else {
+        0
+    };
+    let column_score_bytes = active_bytes(8, "column scores")?;
+    let column_instability_bytes = column_score_bytes;
+    let column_rankability_bytes = active_bytes(1, "column rankability")?;
+    let radix_key_ping_pong_bytes = active_bytes(16, "radix key ping-pong")?;
+    let radix_index_ping_pong_bytes = active_bytes(8, "radix index ping-pong")?;
+    let timeframe_group_counter_bytes = if request.prefilter_active {
+        request.timeframe_group_count.checked_mul(4).ok_or(
+            ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("timeframe group counters"),
+        )?
+    } else {
+        0
+    };
+    let selected_column_map_bytes = request.parent_column_count.checked_mul(4).ok_or(
+        ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("selected-column map"),
+    )?;
+    let selected_column_count_bytes = 8;
+    let cub_select_scratch_bytes = scratch.cub_select_scratch_bytes();
+    let cub_radix_sort_scratch_bytes = scratch.cub_radix_sort_scratch_bytes();
+    let retained_device_bytes = checked_sum_trim_workspace_v2(
+        &[
+            selected_column_map_bytes,
+            selected_column_count_bytes,
+            DEVICE_SEAL_BYTES_V1,
+        ],
+        "trim/prefilter retained bytes",
+    )?;
+    let peak_device_bytes = checked_sum_trim_workspace_v2(
+        &[
+            long_labels_bytes,
+            short_labels_bytes,
+            label_census_bytes,
+            fold_descriptor_bytes,
+            column_score_bytes,
+            column_instability_bytes,
+            column_rankability_bytes,
+            radix_key_ping_pong_bytes,
+            radix_index_ping_pong_bytes,
+            timeframe_group_counter_bytes,
+            selected_column_map_bytes,
+            selected_column_count_bytes,
+            cub_select_scratch_bytes,
+            cub_radix_sort_scratch_bytes,
+            DEVICE_SEAL_BYTES_V1,
+        ],
+        "trim/prefilter peak bytes",
+    )?;
+    let unbound_preflight_identity_sha256 = trim_workspace_identity_v2(
+        b"neoethos.resident-trim-prefilter-unbound-preflight.v2",
+        &[
+            request.selection_row_count,
+            request.parent_column_count,
+            request.schema_metadata_bytes,
+            request.timeframe_group_count,
+            u64::from(request.prefilter_active),
+            cub_select_scratch_bytes,
+            cub_radix_sort_scratch_bytes,
+            retained_device_bytes,
+            peak_device_bytes,
+        ],
+    );
+    Ok(UnboundResidentTrimPrefilterWorkspacePreflightV2 {
+        selection_row_count: request.selection_row_count,
+        parent_column_count: request.parent_column_count,
+        schema_metadata_bytes: request.schema_metadata_bytes,
+        timeframe_group_count: request.timeframe_group_count,
+        prefilter_active: request.prefilter_active,
+        long_labels_bytes,
+        short_labels_bytes,
+        label_census_bytes,
+        fold_descriptor_bytes,
+        column_score_bytes,
+        column_instability_bytes,
+        column_rankability_bytes,
+        radix_key_ping_pong_bytes,
+        radix_index_ping_pong_bytes,
+        timeframe_group_counter_bytes,
+        selected_column_map_bytes,
+        selected_column_count_bytes,
+        cub_select_scratch_bytes,
+        cub_radix_sort_scratch_bytes,
+        device_seal_bytes: DEVICE_SEAL_BYTES_V1,
+        retained_device_bytes,
+        peak_device_bytes,
+        unbound_preflight_identity_sha256,
+    })
+}
+
+fn checked_sum_trim_workspace_v2(
+    values: &[u64],
+    field: &'static str,
+) -> Result<u64, ResidentTrimPrefilterDeviceErrorV1> {
+    values.iter().try_fold(0_u64, |sum, value| {
+        sum.checked_add(*value)
+            .ok_or(ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                field,
+            ))
+    })
+}
+
+fn trim_workspace_identity_v2(domain: &[u8], values: &[u64]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for value in values {
+        hasher.update(value.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentTrimPrefilterScoreBatchAddressV2 {
+    local_offset: u64,
+    global_parent_ordinal: u32,
+}
+
+impl ResidentTrimPrefilterScoreBatchAddressV2 {
+    pub const fn local_offset(&self) -> u64 {
+        self.local_offset
+    }
+
+    pub const fn global_parent_ordinal(&self) -> u32 {
+        self.global_parent_ordinal
+    }
+}
+
+pub fn checked_resident_trim_prefilter_score_batch_address_v2(
+    row: u64,
+    local_column: u64,
+    batch_column_count: u64,
+    local_batch_stride: u64,
+    global_parent_column_start: u64,
+    global_parent_ordinals: &[u32],
+) -> Result<ResidentTrimPrefilterScoreBatchAddressV2, ResidentTrimPrefilterDeviceErrorV1> {
+    if batch_column_count == 0
+        || local_column >= batch_column_count
+        || local_batch_stride < batch_column_count
+        || usize::try_from(batch_column_count)
+            .ok()
+            .is_none_or(|column_count| global_parent_ordinals.len() < column_count)
+    {
+        return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+            "V2 score-batch shape",
+        ));
+    }
+    let local_offset = row
+        .checked_mul(local_batch_stride)
+        .and_then(|base| base.checked_add(local_column))
+        .ok_or(ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+            "V2 score-batch local offset",
+        ))?;
+    let _global_parent_column_end = global_parent_column_start
+        .checked_add(batch_column_count)
+        .ok_or(ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+            "V2 score-batch global extent",
+        ))?;
+    let local_column = usize::try_from(local_column).map_err(|_| {
+        ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("V2 score-batch local column")
+    })?;
+    Ok(ResidentTrimPrefilterScoreBatchAddressV2 {
+        local_offset,
+        global_parent_ordinal: global_parent_ordinals[local_column],
+    })
+}
+
+pub(crate) struct ResidentTrimPrefilterScoreBatchDeviceViewV2 {
+    pub(crate) batch_values_bar_major: NonNull<f64>,
+    pub(crate) batch_validity_u4: NonNull<u8>,
+    pub(crate) batch_row_count: u64,
+    pub(crate) batch_column_count: u64,
+    pub(crate) local_batch_stride: u64,
+    pub(crate) global_parent_column_start: u64,
+    pub(crate) global_parent_ordinals_device: NonNull<u32>,
+    pub(crate) batch_ready_event: NonNull<c_void>,
 }
 
 /// Opaque native owner. Every stage is enqueued on the imported run stream.
@@ -957,7 +1483,7 @@ pub fn begin_resident_trim_prefilter_device_run_v1(
 ) -> Result<ResidentTrimPrefilterDeviceRunV1, ResidentTrimPrefilterDeviceErrorV1> {
     validate_one_shot_identities_v1(&parent_import, &sealed_schema, &full_admission, &plan)?;
     let raw_import = RawResidentTrimPrefilterImportV1 {
-        abi_version: ABI_VERSION_V1,
+        abi_version: parent_import.import_abi_version,
         selected_cuda_ordinal: parent_import.selected_cuda_ordinal,
         parent_row_count: parent_import.parent_row_count,
         parent_column_count: parent_import.parent_column_count,
@@ -974,7 +1500,7 @@ pub fn begin_resident_trim_prefilter_device_run_v1(
             .owner
             .as_deref_mut()
             .map_or(std::ptr::null_mut(), |owner| {
-                owner as *mut ResidentFeatureStoreImportV3 as *mut c_void
+                owner as *mut dyn Any as *mut c_void
             }),
         schema_lifetime_owner: sealed_schema
             .owner
@@ -1145,6 +1671,231 @@ pub fn enqueue_trim_prefilter_device_seal_v1(
     enqueue_stage_v1(run, STAGE_DEVICE_SEAL_V1, "enqueue device seal")
 }
 
+pub(crate) fn enqueue_score_batch_v2(
+    run: &mut ResidentTrimPrefilterDeviceRunV1,
+    batch: ResidentTrimPrefilterScoreBatchDeviceViewV2,
+) -> Result<(), ResidentTrimPrefilterDeviceErrorV1> {
+    if run.next_stage != STAGE_CORRELATIONS_V1
+        || run.state != ResidentTrimPrefilterRunStateV1::InFlight
+    {
+        return Err(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation);
+    }
+    let raw_batch = RawResidentTrimPrefilterScoreBatchV2 {
+        abi_version: SCORE_BATCH_ABI_VERSION_V2,
+        reserved: 0,
+        batch_values_bar_major: batch.batch_values_bar_major.as_ptr(),
+        batch_validity_u4: batch.batch_validity_u4.as_ptr(),
+        batch_row_count: batch.batch_row_count,
+        batch_column_count: batch.batch_column_count,
+        local_batch_stride: batch.local_batch_stride,
+        global_parent_column_start: batch.global_parent_column_start,
+        global_parent_ordinals_device: batch.global_parent_ordinals_device.as_ptr(),
+        batch_ready_event: batch.batch_ready_event.as_ptr(),
+    };
+    // SAFETY: the batch owner retains every device pointer and its ready event
+    // until this same-stream enqueue has accepted the dependency.
+    let status =
+        unsafe { enqueue_resident_trim_prefilter_score_batch_v2(run.native.as_ptr(), &raw_batch) };
+    if status != STATUS_OK_V1 {
+        run.state = ResidentTrimPrefilterRunStateV1::Poisoned;
+        return Err(ResidentTrimPrefilterDeviceErrorV1::Native {
+            operation: "enqueue_resident_trim_prefilter_score_batch_v2",
+            status,
+        });
+    }
+    run.same_stream_enqueue_count = run.same_stream_enqueue_count.checked_add(1).ok_or(
+        ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("V2 score-batch enqueue count"),
+    )?;
+    Ok(())
+}
+
+#[must_use = "the sealed selected map must be read exactly once before compact materialization"]
+pub struct SealedResidentTrimPrefilterSelectedMapV2 {
+    native: NonNull<NativeResidentTrimPrefilterRunV1>,
+    parent_import: Option<ResidentTrimPrefilterParentImportV1>,
+    sealed_schema: Option<SealedResidentColumnClassificationV1>,
+    full_admission: Option<ResidentTrimPrefilterFullDiscoveryAdmissionV1>,
+    selected_capacity: u64,
+    parent_column_count: u64,
+    selection_row_start: u64,
+    selection_row_end: u64,
+    holdout_row_start: u64,
+    holdout_row_end: u64,
+    plan_identity_sha256: [u8; 32],
+    selected_map_readback_ready_event: NonNull<c_void>,
+    armed: bool,
+}
+
+impl SealedResidentTrimPrefilterSelectedMapV2 {
+    pub fn selected_capacity(&self) -> u64 {
+        self.selected_capacity
+    }
+}
+
+#[must_use = "the bounded selected map must size the compact resident store"]
+pub struct BoundedResidentTrimPrefilterSelectedMapReadV2 {
+    selected_capacity: u64,
+    selected_count: u64,
+    selected_map_sha256: [u8; 32],
+    selected_map_readback_bytes: u64,
+    selected_global_parent_ordinals: Vec<u32>,
+}
+
+impl BoundedResidentTrimPrefilterSelectedMapReadV2 {
+    pub fn selected_capacity(&self) -> u64 {
+        self.selected_capacity
+    }
+
+    pub fn selected_count(&self) -> u64 {
+        self.selected_count
+    }
+
+    pub fn capacity_covers_actual_v2(&self) -> bool {
+        self.selected_count <= self.selected_capacity
+    }
+
+    pub const fn selected_map_sha256(&self) -> [u8; 32] {
+        self.selected_map_sha256
+    }
+
+    pub const fn selected_map_readback_bytes(&self) -> u64 {
+        self.selected_map_readback_bytes
+    }
+
+    pub fn selected_global_parent_ordinals(&self) -> &[u32] {
+        &self.selected_global_parent_ordinals
+    }
+}
+
+pub fn seal_selected_map_v2(
+    mut run: ResidentTrimPrefilterDeviceRunV1,
+) -> Result<SealedResidentTrimPrefilterSelectedMapV2, ResidentTrimPrefilterDeviceErrorV1> {
+    if run.next_stage != STAGE_CORRELATIONS_V1
+        || run.state != ResidentTrimPrefilterRunStateV1::InFlight
+    {
+        return Err(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation);
+    }
+    // SAFETY: the native run uniquely owns all screening buffers and retains
+    // the imported parent/schema owners through the final same-stream seal.
+    let status = unsafe { seal_resident_trim_prefilter_selected_map_v2(run.native.as_ptr()) };
+    if status != STATUS_OK_V1 {
+        run.state = ResidentTrimPrefilterRunStateV1::Poisoned;
+        return Err(ResidentTrimPrefilterDeviceErrorV1::Native {
+            operation: "seal_resident_trim_prefilter_selected_map_v2",
+            status,
+        });
+    }
+    run.state = ResidentTrimPrefilterRunStateV1::Sealed;
+    let output = SealedResidentTrimPrefilterSelectedMapV2 {
+        native: run.native,
+        parent_import: run.parent_import.take(),
+        sealed_schema: run.sealed_schema.take(),
+        full_admission: run.full_admission.take(),
+        selected_capacity: run.expected_views.parent_column_count,
+        parent_column_count: run.expected_views.parent_column_count,
+        selection_row_start: run.expected_views.selection_row_start,
+        selection_row_end: run.expected_views.selection_row_end,
+        holdout_row_start: run.expected_views.holdout_row_start,
+        holdout_row_end: run.expected_views.holdout_row_end,
+        plan_identity_sha256: run.expected_views.plan_identity_sha256,
+        selected_map_readback_ready_event: run.expected_views.trim_prefilter_ready_event,
+        armed: true,
+    };
+    mem::forget(run);
+    Ok(output)
+}
+
+pub fn read_bounded_selected_map_v2(
+    mut sealed: SealedResidentTrimPrefilterSelectedMapV2,
+) -> Result<BoundedResidentTrimPrefilterSelectedMapReadV2, ResidentTrimPrefilterDeviceErrorV1> {
+    let selected_capacity = sealed.selected_capacity;
+    let selected_capacity_usize = usize::try_from(selected_capacity).map_err(|_| {
+        ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("V2 selected-map capacity")
+    })?;
+    let initial_host_map = vec![0_u32; selected_capacity_usize];
+    let mut selected_host = LockedBuffer::from_slice(&initial_host_map)
+        .map_err(ResidentFeatureStoreCudaErrorV3::from)?;
+    let mut raw_read = RawResidentTrimPrefilterSelectedMapReadV2 {
+        abi_version: SELECTED_MAP_READ_ABI_VERSION_V2,
+        reserved: 0,
+        selected_capacity,
+        selected_count: 0,
+        selected_map_readback_bytes: 0,
+        selected_global_parent_ordinals_host: selected_host.as_mut_ptr(),
+        selected_map_readback_ready_event: sealed.selected_map_readback_ready_event.as_ptr(),
+    };
+    // SAFETY: the sealed owner retains the native run and event, while the
+    // page-locked destination remains live through the bounded native wait.
+    let status = unsafe {
+        read_resident_trim_prefilter_selected_map_v2(sealed.native.as_ptr(), &mut raw_read)
+    };
+    if status != STATUS_OK_V1 {
+        // An error may follow a queued D2H copy but precede confirmed event
+        // completion. Retain its pinned destination, just as the armed sealed
+        // owner retains the native run; freeing it here has no completion proof.
+        mem::forget(selected_host);
+        return Err(ResidentTrimPrefilterDeviceErrorV1::Native {
+            operation: "read_resident_trim_prefilter_selected_map_v2",
+            status,
+        });
+    }
+    // The native bounded read completed its ready event, so release is now
+    // ordered after the only permitted device-to-host control transfer.
+    let release_status =
+        unsafe { enqueue_resident_trim_prefilter_release_v1(sealed.native.as_ptr()) };
+    require_native_ok_v1("enqueue_resident_trim_prefilter_release_v1", release_status)?;
+    sealed.armed = false;
+
+    let selected_count_usize = usize::try_from(raw_read.selected_count).map_err(|_| {
+        ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("V2 selected-map count")
+    })?;
+    let expected_readback_bytes = raw_read.selected_count.checked_mul(4).ok_or(
+        ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("V2 selected-map bytes"),
+    )?;
+    if raw_read.abi_version != SELECTED_MAP_READ_ABI_VERSION_V2
+        || raw_read.selected_capacity != selected_capacity
+        || raw_read.selected_count == 0
+        || raw_read.selected_count > selected_capacity
+        || raw_read.selected_map_readback_bytes != expected_readback_bytes
+        || selected_count_usize > selected_host.len()
+    {
+        return Err(ResidentTrimPrefilterDeviceErrorV1::IdentityMismatch(
+            "bounded V2 selected-map receipt",
+        ));
+    }
+    let selected_global_parent_ordinals = selected_host[..selected_count_usize].to_vec();
+    if selected_global_parent_ordinals
+        .iter()
+        .any(|&parent| u64::from(parent) >= sealed.parent_column_count)
+        || selected_global_parent_ordinals
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ResidentTrimPrefilterDeviceErrorV1::IdentityMismatch(
+            "ascending V2 selected-map ordinals",
+        ));
+    }
+    let mut selected_map_hasher = Sha256::new();
+    selected_map_hasher.update(b"neoethos.resident-trim-prefilter-selected-map.v1\0");
+    selected_map_hasher.update(sealed.plan_identity_sha256);
+    selected_map_hasher.update(raw_read.selected_count.to_le_bytes());
+    selected_map_hasher.update(sealed.selection_row_start.to_le_bytes());
+    selected_map_hasher.update(sealed.selection_row_end.to_le_bytes());
+    selected_map_hasher.update(sealed.holdout_row_start.to_le_bytes());
+    selected_map_hasher.update(sealed.holdout_row_end.to_le_bytes());
+    for parent in &selected_global_parent_ordinals {
+        selected_map_hasher.update(parent.to_le_bytes());
+    }
+    let selected_map_sha256 = selected_map_hasher.finalize().into();
+    Ok(BoundedResidentTrimPrefilterSelectedMapReadV2 {
+        selected_capacity,
+        selected_count: raw_read.selected_count,
+        selected_map_sha256,
+        selected_map_readback_bytes: raw_read.selected_map_readback_bytes,
+        selected_global_parent_ordinals,
+    })
+}
+
 /// Opaque device handoff. No selected count or pointer accessor is public.
 #[must_use = "resident trim/prefilter views must be consumed by the next same-run stage"]
 pub struct SealedResidentTrimPrefilterDeviceViewsV1 {
@@ -1161,9 +1912,9 @@ pub struct SealedResidentTrimPrefilterDeviceViewsV1 {
 
 /// Move-only ownership carrier joining the native population session to the
 /// exact compact-column map that selected it. It deliberately exposes neither
-/// owner as an executable population API: the next resident Search slice must
-/// consume both together and bind the device map before numerical evaluation.
-#[must_use = "the trimmed population carrier must be consumed by resident Search"]
+/// owner as an executable population API. Repeated Search instead consumes
+/// the separately materialized compact Data owner.
+#[must_use = "the trimmed population carrier retains in-flight GPU lifetimes"]
 pub struct ResidentTrimmedPopulationSessionV1 {
     population_session: Option<ResidentPopulationSessionV3>,
     trim_native: NonNull<NativeResidentTrimPrefilterRunV1>,
@@ -1176,62 +1927,6 @@ pub struct ResidentTrimmedPopulationSessionV1 {
 }
 
 impl ResidentTrimmedPopulationSessionV1 {
-    pub(crate) fn take_population_session_for_slice2_v3(
-        &mut self,
-    ) -> Result<PopulationSession, ResidentTrimPrefilterDeviceErrorV1> {
-        self.population_session
-            .as_mut()
-            .ok_or(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation)?
-            .take_population_session_for_slice2_v3()
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn restore_population_session_from_slice2_v3(
-        &mut self,
-        session: PopulationSession,
-    ) -> Result<(), PopulationSession> {
-        match self.population_session.as_mut() {
-            Some(owner) => owner.restore_population_session_from_slice2_v3(session),
-            None => Err(session),
-        }
-    }
-
-    pub(crate) fn complete_resident_search_slice2_v3(
-        mut self,
-        session: PopulationSession,
-    ) -> Result<ResidentFeatureStoreConsumerLeaseV3, ResidentTrimPrefilterDeviceErrorV1> {
-        self.restore_population_session_from_slice2_v3(session)
-            .map_err(|_| ResidentTrimPrefilterDeviceErrorV1::RunStateViolation)?;
-        let status =
-            unsafe { enqueue_resident_trim_prefilter_release_v1(self.trim_native.as_ptr()) };
-        require_native_ok_v1("enqueue_resident_trim_prefilter_release_v1", status)?;
-        let population = self
-            .population_session
-            .take()
-            .ok_or(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation)?;
-        self.armed = false;
-        if let Some(owner) = self.parent_import.take() {
-            mem::forget(owner);
-        }
-        if let Some(owner) = self.sealed_schema.take() {
-            mem::forget(owner);
-        }
-        if let Some(owner) = self.full_admission.take() {
-            mem::forget(owner);
-        }
-        population.record_consumer_completion().map_err(Into::into)
-    }
-
-    /// Move the complete trim/population authority and a separately minted
-    /// calibration receipt into the fail-closed Slice 2 Search chain. No raw
-    /// CUDA handle or detached child owner is exposed.
-    pub fn begin_resident_search_slice2_v3(
-        self,
-        calibration: crate::resident_search_slice2_v3::ResidentArchiveKnnCalibrationReceiptV2,
-    ) -> crate::resident_search_slice2_v3::ResidentSearchGenerationChainV3 {
-        crate::resident_search_slice2_v3::start_resident_search_slice2_v3(self, calibration)
-    }
-
     pub const fn selected_compact_to_parent_columns_device(&self) -> bool {
         !self
             .views
@@ -1350,10 +2045,23 @@ impl SealedResidentTrimPrefilterDeviceViewsV1 {
         let mut parent_import = self.parent_import.take().expect("sealed parent import");
         let sealed_schema = self.sealed_schema.take().expect("sealed schema owner");
         let full_admission = self.full_admission.take().expect("sealed admission owner");
-        let resident_import = *parent_import
+        let resident_import_owner = parent_import
             .owner
             .take()
             .expect("sealed parent retains the typed V3 import");
+        let resident_import = match resident_import_owner.downcast::<ResidentFeatureStoreImportV3>()
+        {
+            Ok(resident_import) => *resident_import,
+            Err(owner) => {
+                parent_import.owner = Some(owner);
+                mem::forget(parent_import);
+                mem::forget(sealed_schema);
+                mem::forget(full_admission);
+                return Err(ResidentTrimPrefilterDeviceErrorV1::IdentityMismatch(
+                    "materialized resident parent import",
+                ));
+            }
+        };
         let population_session = match resident_import.consume_into_population_session_v3() {
             Ok(session) => session,
             Err(error) => {
@@ -1491,6 +2199,10 @@ fn validate_one_shot_identities_v1(
     plan: &ResidentTrimPrefilterNativePlanV1,
 ) -> Result<(), ResidentTrimPrefilterDeviceErrorV1> {
     if parent.owner.is_none()
+        || !matches!(
+            parent.import_abi_version,
+            ABI_VERSION_V1 | SCREENING_IMPORT_ABI_VERSION_V2
+        )
         || schema.owner.is_none()
         || admission.owner.is_none()
         || parent.selected_cuda_ordinal != schema.selected_cuda_ordinal
@@ -1583,6 +2295,25 @@ impl Drop for ResidentTrimPrefilterDeviceRunV1 {
         // Until a same-stream consumer exists, every armed state leaks rather
         // than freeing a live borrowed parent or creating an implicit sync.
         leak_ambiguous_resident_trim_prefilter_run_v1(self);
+    }
+}
+
+impl Drop for SealedResidentTrimPrefilterSelectedMapV2 {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(owner) = self.parent_import.take() {
+                mem::forget(owner);
+            }
+            if let Some(owner) = self.sealed_schema.take() {
+                mem::forget(owner);
+            }
+            if let Some(owner) = self.full_admission.take() {
+                mem::forget(owner);
+            }
+            // An abandoned or failed bounded read leaves native completion
+            // ambiguous. Retain the run and borrowed owners rather than free
+            // buffers that may still be referenced by queued CUDA work.
+        }
     }
 }
 

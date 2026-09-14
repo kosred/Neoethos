@@ -37,9 +37,20 @@ fn quant_v3_pins_one_sun_openlibm_cpu_authority_and_immutable_receipt() {
 
 #[test]
 fn quant_v3_cuda_mirror_uses_only_explicit_rn_edges_and_no_native_log() {
-    let source = read("crates/neoethos-gpu-cuda/native/resident_quant_v3.cu");
+    let quant = read("crates/neoethos-gpu-cuda/native/resident_quant_v3.cu");
+    let exact_log = read("crates/neoethos-gpu-cuda/native/resident_exact_log_v3.cuh");
     for required in [
         "quant_log_positive_f64_v3",
+        "#include \"resident_exact_log_v3.cuh\"",
+        "neoethos_exact_math_v3::exact_log_positive_f64_v3(value, output)",
+    ] {
+        assert!(
+            quant.contains(required),
+            "CUDA Quant mirror omitted `{required}`"
+        );
+    }
+    for required in [
+        "exact_log_positive_f64_v3",
         "__dadd_rn",
         "__dsub_rn",
         "__dmul_rn",
@@ -48,13 +59,13 @@ fn quant_v3_cuda_mirror_uses_only_explicit_rn_edges_and_no_native_log() {
         "8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD",
     ] {
         assert!(
-            source.contains(required),
-            "CUDA authority omitted `{required}`"
+            exact_log.contains(required),
+            "shared CUDA exact-log authority omitted `{required}`"
         );
     }
     for forbidden in [" log(", "::log(", " log2(", " log10(", "__log"] {
         assert!(
-            !source.contains(forbidden),
+            !quant.contains(forbidden) && !exact_log.contains(forbidden),
             "CUDA used native `{forbidden}`"
         );
     }

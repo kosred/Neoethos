@@ -79,7 +79,7 @@ records `scenarios_source: "system.risky_* (single)"`.
 | `models.discovery_runtime.prop_firm_gate.max_daily_loss_pct` | `Option<f64>` | `None` → FTMO `0.05` | `config.rs:1559` |
 | `models.discovery_runtime.prop_firm_gate.max_overall_drawdown_pct` | `Option<f64>` | `None` → FTMO `0.10` | `config.rs:1562` |
 | `models.discovery_runtime.prop_firm_gate.profit_target_pct` | `Option<f64>` | `None` → FTMO `0.10` | `config.rs:1567` |
-| `models.discovery_runtime.prop_firm_gate.min_trading_days` | `Option<usize>` | `None` → FTMO `10` | `config.rs:1570` |
+| `models.discovery_runtime.prop_firm_gate.min_trading_days` | `Option<usize>` | `None` → FTMO 2-Step `4` | `config.rs:1570` |
 | `models.discovery_runtime.prop_firm_gate.window_days` | `usize` | `60` | `config.rs:1575` |
 
 ### 1.3 The startup refusals — a zero goal is not a goal

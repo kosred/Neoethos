@@ -77,8 +77,8 @@ const BUDGET_ROWS: usize = 200_000;
 /// loop falls back to one whole-vocabulary pass. The tests below branch on this
 /// rather than assuming, so they assert something true on every machine.
 fn can_stream() -> bool {
-    neoethos_data::core::hpc_ta::streaming_batch_columns(BUDGET_ROWS) > 0
-        && neoethos_data::core::hpc_ta::extended_sweep_space_len() > 0
+    let sizing = neoethos_data::core::hpc_ta::streaming_working_set_sizing(BUDGET_ROWS);
+    sizing.batch_columns > 0 && sizing.space_len > 0
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -286,9 +286,15 @@ fn run_end_range_assertion_catches_a_local_index_that_escaped() {
 /// stand in for the real one without pretending the working set does nothing.
 fn names_for(batch: &neoethos_data::core::hpc_ta::SweepBatch) -> Vec<String> {
     batch
-        .pairs
+        .base_indicator_ids
         .iter()
-        .map(|pair| format!("{}_{}", pair.id, pair.period))
+        .map(|id| (*id).to_string())
+        .chain(
+            batch
+                .pairs
+                .iter()
+                .map(|pair| format!("{}_{}", pair.id, pair.period)),
+        )
         .collect()
 }
 
@@ -377,6 +383,58 @@ fn the_sweep_advances_and_carries_survivors_across_batches() {
         assert!(
             cursors_built.contains(&survivor.source_cursor),
             "every survivor must name the batch that produced it"
+        );
+    }
+}
+
+#[test]
+fn the_sweep_retains_every_completed_batch_without_survivors() {
+    if !can_stream() {
+        return;
+    }
+
+    let mut cursors_built = Vec::new();
+    let outcome = run_streaming_working_set(
+        &StreamingPlan::streaming(0),
+        BUDGET_ROWS,
+        |batch| {
+            let batch = batch.expect("the streaming path always installs a working set");
+            cursors_built.push(batch.cursor);
+            Ok(frame(&names_for(&batch)))
+        },
+        |features| {
+            Ok(FakeResult {
+                names: features.names.clone(),
+                portfolio: Vec::new(),
+            })
+        },
+    )
+    .expect("a completed negative research batch is evidence, not an error");
+
+    assert!(outcome.streamed);
+    assert!(outcome.batches.is_empty());
+    assert!(!cursors_built.is_empty());
+    assert_eq!(
+        outcome.completed_without_survivors.len(),
+        cursors_built.len(),
+        "every completed negative batch must reach the research caller"
+    );
+    assert_eq!(
+        outcome.ledger.count_of(BatchOutcome::EmptyPortfolio),
+        cursors_built.len()
+    );
+    assert_eq!(outcome.ledger.batches_seen(), cursors_built.len());
+    assert_eq!(outcome.ledger.batches_rejected(), cursors_built.len());
+    for (negative, cursor) in outcome
+        .completed_without_survivors
+        .iter()
+        .zip(cursors_built.iter().copied())
+    {
+        assert_eq!(negative.cursor, cursor);
+        assert!(negative.result.portfolio.is_empty());
+        assert!(
+            !negative.result.names.is_empty(),
+            "the exact batch vocabulary must remain attached to negative evidence"
         );
     }
 }

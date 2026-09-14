@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 neoethos-data = { path = "../neoethos-data" }
+neoethos-feature-contracts = { path = "../neoethos-feature-contracts" }
 neoethos-core = { path = "../neoethos-core" }
 neoethos-search = { path = "../neoethos-search" }
 neoethos-execution-budget = { path = "../neoethos-execution-budget" }
@@ -25,10 +26,12 @@ ndarray = { version = "0.17.2", features = ["rayon", "serde"] }
 tracing = "0.1.42"
 anyhow = "1.0.100"
 
-# Tree model dependencies
-polars = { version = "0.52.0", features = ["lazy", "dtype-datetime", "rolling_window", "timezones"] }
+# Tree/model inputs use `neoethos_data::FeatureFrame`; the former Polars
+# DataFrame compatibility surface was fully retired. Keep storage/scan concerns
+# in neoethos-data, whose canonical on-disk format is Vortex.
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 sha2.workspace = true
 libc = "0.2.189"
 seq-macro = "0.3.6"
@@ -62,13 +65,8 @@ sklears = { version = "0.1.2", optional = true, features = ["tree"] }
 # candle-core/cuda and rlkit/cuda, so this bump changes the kernels behind the
 # DQN/RL models. Compile parity is not sufficient; needs a card run.
 candle-core = { version = "0.10.2", optional = true }
-# cubecl 0.10 — pure defaults. Defaults already include cubecl-core,
-# cubecl-cuda?, cubecl-cpu?, cubecl-hip?, cubecl-wgpu? (all optional —
-# only activated when something else turns them on). NO explicit
-# runtime feature forced from here; the consumer (burn-wgpu via its
-# own defaults) decides which runtime to pull. This avoids the
-# wgpu/Naga SPIR-V path that crashes the AMD Vulkan Windows driver
-# (gfx-rs/wgpu issues #6329/#7198/#5733), confirmed 2026-05-26.
+# CubeCL 0.10. CUDA is enabled explicitly by the CUDA feature aggregates below;
+# no WGPU/Vulkan or HIP runtime is selected by this crate.
 cubecl = { version = "=0.10.0", optional = true }
 cubecl-common = { version = "=0.10.0", optional = true }
 cudarc = { version = "0.19.0", optional = true, default-features = false, features = [
@@ -95,40 +93,18 @@ symbios-genetics = "0.1.3"
 # variational --include=*.rs crates/` matched NOTHING. The three statistical
 # experts this project ships — `elasticnet` and `logistic`
 # (statistical/linear_impl.rs) and `bayes_logit` (statistical/bayesian_impl.rs)
-# — are hand-rolled on ndarray + polars and never referenced linfa. Nothing in
+# — are hand-rolled on ndarray + typed `neoethos_data::FeatureFrame` inputs and
+# never referenced linfa. Nothing in
 # the registry (runtime/capabilities.rs KNOWN_MODEL_NAMES) declares a
 # clustering model, so linfa-clustering had no promised capability behind it
 # either. Removed: pure compile-time cost, zero behaviour change.
 extended-isolation-forest = { version = "0.2.0", optional = true, features = ["serde"] }
 
-# Burn framework — Vulkan Tier-1 perf push (2026-05-25).
-#
-# burn 0.20→0.21 + cubecl 0.9→0.10, with FULL default features
-# preserved across all three crates so we don't accidentally drop
-# performance-critical defaults like `autotune` (the kernel
-# auto-selector that gives 1.5-3× matmul speedups), `fusion`
-# (element-wise + reduction op fusion, 70×+ on fusable subgraphs),
-# or the cubecl kernel variants that autotune picks between.
-#
-# `vulkan` is added on top of the defaults — it pulls cubecl-spirv
-# for direct Naga→SPIR-V compilation (~5-15% kernel-launch win) and
-# is the only path to AMD/Intel GPUs since cuda is NVIDIA-only.
-# `autodiff` on `burn` is needed because we use Autodiff<Wgpu> in
-# the training pipeline.
-# burn / burn-ndarray / burn-wgpu — PURE defaults.
-#
-# burn-wgpu defaults = [std, autotune, fusion, burn-cubecl/default,
-# cubecl/default]. Autotune + fusion (the perf features we want) are
-# IN the defaults. NO need to override anything. Adding `vulkan` or
-# `cubecl-spirv` would force the SPIR-V shader path which crashes the
-# AMD Vulkan Windows driver on Naga-generated shaders. Leaving the
-# defaults lets wgpu pick the safer WGSL path on AMD.
-#
-# `autodiff` on burn is the only explicit feature — we use Autodiff<Wgpu>
-# in the training pipeline.
-burn = { version = "0.21", features = ["autodiff"] }
+# Burn core plus the CPU ndarray backend. `autodiff` supports the training
+# pipeline; native CUDA is the only optional accelerator backend and is declared
+# separately below.
+burn = { version = "0.21", default-features = false, features = ["std", "autodiff"] }
 burn-ndarray = { version = "0.21" }
-burn-wgpu = { version = "0.21", optional = true }
 # Native CUDA backend for the Burn neural models (TabNet/KAN/N-BEATS/TiDE/
 # TimesNet/transformer). Reuses the SAME cubecl 0.10.0 + cubecl-cuda stack the
 # discovery kernels already build, so there is no version split. It is
@@ -136,6 +112,8 @@ burn-wgpu = { version = "0.21", optional = true }
 # it runs Burn neural models on the selected CUDA card in f32 (Ampere-native).
 # That separate CUDA surface requires its own mandatory RTX lifecycle matrix.
 burn-cuda = { version = "0.21", optional = true }
+burn-rocm = { version = "0.21", optional = true }
+cubecl-hip-sys = { version = "=7.14.6085000", optional = true }
 num_cpus = "1.17.0"
 rand = "0.9.2"
 # `small_rng` is NOT in rand 0.8's default features, and
@@ -160,14 +138,15 @@ rand08 = { package = "rand", version = "0.8", optional = true, features = [
 # warned about.)
 rand_distr = "0.5"
 rayon = "1.11.0"
-chrono = "0.4.44"
 rand_xoshiro = "0.7.0"
 nalgebra = "0.33.0"
 
 [dev-dependencies]
 burn-fusion = { version = "0.21", features = ["test-util"] }
 quote = "1.0.47"
-rusqlite = "0.37.0"
+# Dev-only parser for Nsight Systems' exported SQLite evidence database. Keep
+# SQLite self-contained so compiling tests does not require a host sqlite3.lib.
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 syn = { version = "2.0.119", features = ["full", "visit"] }
 
 [features]
@@ -211,7 +190,7 @@ neuro-evolution = ["dep:crfmnes", "dep:rand08"]
 # unified the two. The card therefore compiled these kernels while the feature
 # that names them was broken. Same defect class as the aggregate comment
 # below: naming the dependency instead of the capability.
-neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl", "dep:cubecl-common", "cubecl/cuda"]
+neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl", "dep:cubecl-common", "dep:cudarc", "cubecl/cuda"]
 reinforcement-learning = ["dep:rlkit", "dep:candle-core"]
 reinforcement-learning-cuda = ["reinforcement-learning", "rlkit/cuda", "candle-core/cuda"]
 adaptive-models = ["dep:irithyll"]
@@ -238,9 +217,12 @@ statistical-gpu = [
 ]
 anomaly-detection = ["dep:extended-isolation-forest"]
 
-# Burn pure-Rust deep learning (production backend)
-burn-wgpu-backend = ["dep:burn-wgpu"]
-burn-cuda-backend = ["dep:burn-cuda", "dep:cubecl", "dep:cubecl-common", "cubecl/cuda"]
+# Burn CUDA deep learning backend.
+burn-cuda-backend = ["dep:burn-cuda", "dep:cubecl", "dep:cubecl-common", "dep:cudarc", "cubecl/cuda"]
+# Compile-selected native HIP neural backend. This does not relabel CUDA-only
+# tree, Candle, statistical or neuro-evolution learners as ROCm implementations.
+burn-rocm-backend = ["dep:burn-rocm", "dep:cubecl", "dep:cubecl-common", "dep:cubecl-hip-sys", "cubecl/hip"]
+gpu-rocm = ["burn-rocm-backend"]
 # REMOVED 2026-08-03: `burn-backend = []`. An empty feature with zero
 # `cfg(feature = "burn-backend")` sites anywhere in crates/ or desktop/ — it
 # enabled nothing, gated nothing, and was carried in `pure-rust-ml` below. A
@@ -251,9 +233,7 @@ burn-cuda-backend = ["dep:burn-cuda", "dep:cubecl", "dep:cubecl-common", "cubecl
 # that is burn's own and is unaffected.)
 pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", "swarm-forecasting", "statistical-models", "anomaly-detection"]
 
-# #205 vendor-aware GPU aggregates. Each maps the per-library GPU flags
-# above to a single feature the top-level binary can enable. Picking
-# the wrong vendor for the host (e.g. `gpu-cuda` without NVIDIA) makes
+# CUDA GPU aggregate. Picking the wrong vendor for the host makes
 # the LINK step fail — that's better than silently shipping a binary
 # that crashes at startup because libcuda.dll is absent.
 #
@@ -263,17 +243,7 @@ pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", 
 #                  aggregate below; `ort` is gone entirely as of 2026-08-09.
 #                  A manifest comment that lists a feature the manifest does
 #                  not enable is the same defect this batch exists to remove.)
-# - gpu-vulkan  →  Cross-vendor path: burn-wgpu(Vulkan ICD). Works on
-#                  AMD Radeon, Intel Arc/Iris, NVIDIA (via Vulkan
-#                  driver), and even Apple Silicon (MoltenVK shim).
-#                  Does NOT cover candle/cubecl/lightgbm — those are
-#                  NVIDIA-CUDA-only today, so on a non-NVIDIA box only
-#                  Burn-driven training accelerates. Document this gap.
-# - gpu-rocm    →  AMD discrete (Linux only). candle 0.x has a `cuda`
-#                  feature but not `rocm`; for ROCm we currently fall
-#                  back to burn-wgpu(Vulkan) which works on RDNA cards
-#                  via radv/amdvlk. Real ROCm support is a candle
-#                  upstream blocker.
+# ROCm/HIP remains future work and is not aliased to another backend.
 gpu-cuda = [
     "neoethos-core/gpu-cuda",
     "neuro-evolution",
@@ -329,5 +299,3 @@ gpu-cuda = [
     "xgb/cuda",
     "candle-core/cuda",
 ]
-gpu-vulkan = ["burn-wgpu-backend", "neoethos-core/gpu-wgpu"]
-gpu-rocm = ["burn-wgpu-backend", "neoethos-core/gpu-rocm"]

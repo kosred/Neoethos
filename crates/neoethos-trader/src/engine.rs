@@ -65,10 +65,11 @@ pub struct EngineConfig {
     /// before 2026-08-10 — stop, target and time stop were its only exits while
     /// both of the paths it claims to mirror also move the stop after `+1R`.
     ///
-    /// The replay helpers resolve it from `models.exit_policy` via
-    /// `EvaluationConfig`, the same single recipient discovery and live read, so
-    /// a run with the policy OFF is byte-identical to the old behaviour and a run
-    /// with it ON models what the strategy was actually scored under.
+    /// Standalone/stub replay may resolve this from `models.exit_policy`.
+    /// Portfolio and blend replay must overwrite that ambient value with the
+    /// immutable policy sealed into the live-portfolio artifact, so a strategy
+    /// cannot be replayed with today's settings after being scored under a
+    /// different exit.
     pub trailing: Option<crate::position::TrailingPolicy>,
 }
 
@@ -216,12 +217,10 @@ impl EngineConfig {
         );
         // ── The exit the strategy was SCORED under (audit #227) ──────────────
         //
-        // `models.exit_policy` is the single recipient for the break-even /
-        // trailing geometry: discovery reads it through `EvaluationConfig`
-        // (`strategy_gene.rs:905-913`) and the live loop reads it directly
-        // (`live_trading.rs:762`, `:1479-1493`). The replay read it NOWHERE, so
-        // it modelled a strategy whose stop never moves against two paths on
-        // which it does — while its own module header claimed parity.
+        // This ambient value is used only by standalone/stub replay. Real
+        // portfolio/blend replay immediately replaces it through
+        // `pin_artifact_exit_policy`, using the v4 artifact that discovery
+        // sealed and live execution consumes.
         //
         // Same field, third reader. `trailing_enabled: false` (the shipped
         // default) leaves `trailing: None`, i.e. byte-identical to every replay
@@ -257,6 +256,43 @@ impl EngineConfig {
             None
         };
         Ok(cfg)
+    }
+
+    /// Replace any ambient replay trailing value with the policy carried by a
+    /// validated live-portfolio artifact.
+    ///
+    /// The assignment is atomic: invalid enabled geometry returns an error and
+    /// leaves the existing config untouched. A validated artifact should never
+    /// reach that branch, but failing closed here protects this crate from a
+    /// future loader or schema regression.
+    pub(crate) fn pin_artifact_exit_policy(
+        &mut self,
+        exit: neoethos_core::config::ExitPolicyConfig,
+        pip_size: f64,
+    ) -> anyhow::Result<()> {
+        let pinned = if exit.trailing_enabled {
+            Some(
+                crate::position::TrailingPolicy::new(
+                    exit.trailing_be_trigger_r,
+                    exit.trailing_stop_multiplier,
+                    exit.trailing_min_lock_pips,
+                    pip_size,
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "live-portfolio exit policy enables trailing but its geometry is not executable: trigger_r={}, stop_multiplier={}, min_lock_pips={}, pip_size={}",
+                        exit.trailing_be_trigger_r,
+                        exit.trailing_stop_multiplier,
+                        exit.trailing_min_lock_pips,
+                        pip_size
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        self.trailing = pinned;
+        Ok(())
     }
 }
 
@@ -460,5 +496,59 @@ impl<S: SignalEngine, R: RiskGate, E: ExecutionAdapter> AutonomousEngine<S, R, E
             }
             self.refresh_account();
         }
+    }
+}
+
+#[cfg(test)]
+mod artifact_exit_policy_tests {
+    use super::EngineConfig;
+
+    fn enabled_policy() -> neoethos_core::config::ExitPolicyConfig {
+        neoethos_core::config::ExitPolicyConfig {
+            trailing_enabled: true,
+            trailing_be_trigger_r: 2.5,
+            trailing_stop_multiplier: 0.75,
+            trailing_min_lock_pips: 4.0,
+        }
+    }
+
+    #[test]
+    fn artifact_policy_replaces_ambient_trailing_geometry_exactly() {
+        let mut cfg = EngineConfig::default();
+        cfg.pin_artifact_exit_policy(enabled_policy(), 0.0001)
+            .expect("valid sealed policy");
+
+        let pinned = cfg.trailing.expect("trailing is armed");
+        assert_eq!(pinned.be_trigger_r, 2.5);
+        assert_eq!(pinned.stop_multiplier, 0.75);
+        assert_eq!(pinned.min_lock_pips, 4.0);
+        assert_eq!(pinned.pip_size, 0.0001);
+    }
+
+    #[test]
+    fn disabled_artifact_policy_removes_an_ambient_trail() {
+        let mut cfg = EngineConfig::default();
+        cfg.pin_artifact_exit_policy(enabled_policy(), 0.0001)
+            .expect("valid ambient policy");
+
+        let mut disabled = enabled_policy();
+        disabled.trailing_enabled = false;
+        cfg.pin_artifact_exit_policy(disabled, 0.0001)
+            .expect("disabled policy needs no geometry");
+
+        assert!(cfg.trailing.is_none());
+    }
+
+    #[test]
+    fn invalid_enabled_artifact_policy_fails_without_mutating_the_config() {
+        let mut cfg = EngineConfig::default();
+        cfg.pin_artifact_exit_policy(enabled_policy(), 0.0001)
+            .expect("valid starting policy");
+        let before = cfg.trailing;
+
+        let mut invalid = enabled_policy();
+        invalid.trailing_be_trigger_r = f64::NAN;
+        assert!(cfg.pin_artifact_exit_policy(invalid, 0.0001).is_err());
+        assert_eq!(cfg.trailing, before);
     }
 }

@@ -204,8 +204,12 @@ pub(crate) fn admit_regime_input_v3(
         });
     }
 
-    let mut greatest = 0.0_f64;
-    let mut greatest_location = (0_usize, RegimeOhlcFieldV3::Open);
+    // The exact power-of-two scale is part of every downstream Regime value.
+    // It therefore must be fixed from information available at the first row;
+    // deriving it from a later maximum would rewrite the already-computed
+    // prefix whenever future prices cross a binary exponent boundary.
+    let mut first_row_greatest = 0.0_f64;
+    let mut first_row_greatest_location = (0_usize, RegimeOhlcFieldV3::Open);
     for row in 0..row_count {
         let fields = [
             (RegimeOhlcFieldV3::Open, ohlcv.open[row]),
@@ -220,9 +224,9 @@ pub(crate) fn admit_regime_input_v3(
             if value <= 0.0 {
                 return Err(RegimeInputRefusalV3::NonPositiveOhlc { row, field });
             }
-            if value > greatest {
-                greatest = value;
-                greatest_location = (row, field);
+            if row == 0 && value > first_row_greatest {
+                first_row_greatest = value;
+                first_row_greatest_location = (row, field);
             }
         }
         if ohlcv.low[row] > ohlcv.open[row].min(ohlcv.close[row])
@@ -232,11 +236,11 @@ pub(crate) fn admit_regime_input_v3(
         }
     }
 
-    let anchor_exponent = -binary_floor_exponent_v3(greatest);
+    let anchor_exponent = -binary_floor_exponent_v3(first_row_greatest);
     let scale_anchor = exact_power_of_two_v3(anchor_exponent).ok_or(
         RegimeInputRefusalV3::ScaleRangeUnsupported {
-            row: greatest_location.0,
-            field: greatest_location.1,
+            row: first_row_greatest_location.0,
+            field: first_row_greatest_location.1,
         },
     )?;
     for row in 0..row_count {

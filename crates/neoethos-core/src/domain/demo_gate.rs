@@ -1,20 +1,13 @@
 //! Demo forward-test promotion gate.
 //!
-//! This is the SECOND gate a strategy must clear, distinct from the backtest
-//! [`promotion_gate`](super::promotion_gate). The backtest gate asks "were the
-//! historical metrics good enough?"; this gate asks the harder, out-of-sample
-//! question: "did the strategy actually HOLD UP on a live demo account, within
-//! a tolerance of what the backtest promised?".
+//! Optional operational check, distinct from historical OOS validation and
+//! broker/risk admission. Disabled by default: demo fills can check integration
+//! but neither a fixed trade count nor matching demo metrics prove profitability
+//! or guarantee the same execution on a real account.
 //!
-//! Locked design decision (docs/v0.5-autonomous-trader-design.md §9, decision
-//! #5): the gate is TRADE-COUNT based, not calendar based — a strategy is
-//! promotion-eligible only after at least `min_demo_trades` (default 100) REAL
-//! demo fills AND its live forward metrics land within `forward_tolerance`
-//! (default 20%) of the backtest metrics it was promoted on. Calendar time is
-//! the wrong unit: a scalper hits 100 trades in a week, a swing strategy in
-//! months — both need the same statistical confidence before risking real
-//! money. The operator still approves the final real-money switch; this gate
-//! only marks ELIGIBILITY, never an automatic promotion.
+//! When explicitly enabled, the operator's trade-count and degradation
+//! thresholds apply. Disabling this check does not waive portfolio validation,
+//! account binding, position sizing, or the other live execution controls.
 //!
 //! Reuses [`PromotionMetrics`] + [`CriterionResult`] so the UI renders the same
 //! per-criterion evidence ("live PF 1.40 vs backtest 1.60 floor 1.28 — pass").
@@ -45,11 +38,10 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase", default)]
 pub struct DemoForwardGateConfig {
     /// When false, the gate is a no-op pass (the operator can still gate
-    /// manually). Default true.
+    /// manually). Default false.
     pub enabled: bool,
-    /// Minimum number of REAL demo fills before the live metrics are
-    /// statistically meaningful. Default 100 — a great live Sharpe over 6
-    /// trades is noise, exactly as `min_trades` guards the backtest gate.
+    /// Operator-selected minimum demo fills when enabled. Default 100 is an
+    /// operational threshold, not a universal statistical-confidence level.
     #[serde(alias = "min_demo_trades")]
     pub min_demo_trades: u64,
     /// Allowed degradation of live-vs-backtest, as a fraction. 0.20 = the live
@@ -63,7 +55,7 @@ pub struct DemoForwardGateConfig {
 impl Default for DemoForwardGateConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             min_demo_trades: 100,
             forward_tolerance: 0.20,
         }
@@ -76,16 +68,30 @@ impl Default for DemoForwardGateConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DemoForwardDecision {
+    pub enabled: bool,
     pub eligible: bool,
     pub criteria: Vec<CriterionResult>,
     pub summary: String,
+}
+
+impl DemoForwardDecision {
+    /// A skipped demo check is not a declaration that live trading is safe.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            eligible: true,
+            criteria: Vec::new(),
+            summary: "Optional demo check disabled; OOS, broker and risk checks still apply."
+                .to_string(),
+        }
+    }
 }
 
 /// Evaluate a strategy's LIVE demo forward-test against the BACKTEST metrics it
 /// was promoted on.
 ///
 /// `demo_trades` is the count of real demo fills observed so far (the gate's
-/// statistical-significance floor). `live` is the metrics computed from those
+/// operator-selected operational floor). `live` is the metrics computed from those
 /// demo fills; `backtest` is the metrics the backtest gate already approved.
 ///
 /// AND semantics: a single failed criterion blocks eligibility, so the operator
@@ -98,11 +104,7 @@ pub fn evaluate_demo_forward_gate(
     config: &DemoForwardGateConfig,
 ) -> DemoForwardDecision {
     if !config.enabled {
-        return DemoForwardDecision {
-            eligible: true,
-            criteria: Vec::new(),
-            summary: "Demo forward gate disabled — eligibility not enforced.".to_string(),
-        };
+        return DemoForwardDecision::disabled();
     }
 
     let tol = config.forward_tolerance.max(0.0);
@@ -176,6 +178,7 @@ pub fn evaluate_demo_forward_gate(
     };
 
     DemoForwardDecision {
+        enabled: true,
         eligible,
         criteria,
         summary,
@@ -185,6 +188,13 @@ pub fn evaluate_demo_forward_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn enabled_config() -> DemoForwardGateConfig {
+        DemoForwardGateConfig {
+            enabled: true,
+            ..Default::default()
+        }
+    }
 
     fn backtest() -> PromotionMetrics {
         PromotionMetrics {
@@ -206,8 +216,7 @@ mod tests {
             max_drawdown_pct: 11.5,
             trades: 140,
         };
-        let d =
-            evaluate_demo_forward_gate(140, &live, &backtest(), &DemoForwardGateConfig::default());
+        let d = evaluate_demo_forward_gate(140, &live, &backtest(), &enabled_config());
         assert!(d.eligible, "should be eligible: {}", d.summary);
         assert!(d.criteria.iter().all(|c| c.passed));
     }
@@ -215,8 +224,7 @@ mod tests {
     #[test]
     fn too_few_demo_trades_is_not_yet() {
         let live = backtest(); // metrics fine, but only 40 trades
-        let d =
-            evaluate_demo_forward_gate(40, &live, &backtest(), &DemoForwardGateConfig::default());
+        let d = evaluate_demo_forward_gate(40, &live, &backtest(), &enabled_config());
         assert!(!d.eligible);
         assert!(d.summary.starts_with("Not yet"), "summary: {}", d.summary);
         // The trade-count criterion is the one that failed.
@@ -230,8 +238,7 @@ mod tests {
             profit_factor: 1.10,
             ..backtest()
         };
-        let d =
-            evaluate_demo_forward_gate(200, &live, &backtest(), &DemoForwardGateConfig::default());
+        let d = evaluate_demo_forward_gate(200, &live, &backtest(), &enabled_config());
         assert!(!d.eligible);
         assert!(d.summary.starts_with("Blocked"), "summary: {}", d.summary);
     }
@@ -243,8 +250,7 @@ mod tests {
             max_drawdown_pct: 13.0,
             ..backtest()
         };
-        let d =
-            evaluate_demo_forward_gate(200, &live, &backtest(), &DemoForwardGateConfig::default());
+        let d = evaluate_demo_forward_gate(200, &live, &backtest(), &enabled_config());
         assert!(!d.eligible);
     }
 
@@ -262,13 +268,15 @@ mod tests {
     // ─── 2026-08-04: the last gate before real money now has a recipient ──
 
     #[test]
-    fn demo_forward_gate_default_matches_the_previously_hardcoded_literals() {
-        // `live_gate.rs` passed `&DemoForwardGateConfig::default()`. Pin the
-        // literals so routing the gate through config shifted no verdict.
+    fn demo_check_is_opt_in_and_does_not_require_fills_by_default() {
         let d = DemoForwardGateConfig::default();
-        assert!(d.enabled);
+        assert!(!d.enabled);
         assert_eq!(d.min_demo_trades, 100);
         assert_eq!(d.forward_tolerance, 0.20);
+        let decision = evaluate_demo_forward_gate(0, &backtest(), &backtest(), &d);
+        assert!(!decision.enabled);
+        assert!(decision.eligible);
+        assert!(decision.criteria.is_empty());
     }
 
     #[test]
@@ -292,6 +300,7 @@ mod tests {
         let yaml = "\
 ml_models: [lightgbm]
 demo_forward_gate:
+  enabled: true
   min_demo_trades: 400
 ";
         let models: crate::config::ModelsConfig =
@@ -304,10 +313,7 @@ demo_forward_gate:
         // 200 demo fills clears the shipped floor of 100 but not the
         // operator's 400 — the verdict has to move, not just the echo.
         let live = backtest();
-        assert!(
-            evaluate_demo_forward_gate(200, &live, &backtest(), &DemoForwardGateConfig::default())
-                .eligible
-        );
+        assert!(evaluate_demo_forward_gate(200, &live, &backtest(), &enabled_config()).eligible);
         let d = evaluate_demo_forward_gate(200, &live, &backtest(), &models.demo_forward_gate);
         assert!(
             !d.eligible,

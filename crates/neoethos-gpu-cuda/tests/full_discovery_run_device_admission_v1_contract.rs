@@ -464,7 +464,7 @@ fn admitted_full_workspace_consumes_into_one_opaque_v3_run_device_carrier() {
         conversion,
         &[
             "seal_gpu_only_run_device_admission_v3(",
-            "FullDiscoveryRunDeviceAdmissionRequestV3",
+            "GpuOnlyRunDeviceAdmissionRequestV3",
             "source_admission_identity_sha256:",
             "workspace_plan_identity_sha256,",
             "selected_device_ordinal,",
@@ -493,7 +493,7 @@ fn admitted_full_workspace_consumes_into_one_opaque_v3_run_device_carrier() {
     let resident = read("src/resident_feature_store_v3.rs");
     let request = section(
         &resident,
-        "struct FullDiscoveryRunDeviceAdmissionRequestV3 {",
+        "struct GpuOnlyRunDeviceAdmissionRequestV3 {",
         "\n}",
     );
     require_all(
@@ -509,6 +509,7 @@ fn admitted_full_workspace_consumes_into_one_opaque_v3_run_device_carrier() {
             "exact_math_authority:",
             "primary_context:",
             "run_stream:",
+            "full_discovery_trim_admission:",
         ],
     );
     assert!(

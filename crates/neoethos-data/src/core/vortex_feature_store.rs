@@ -17,12 +17,13 @@ use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, ToCanonical};
 use vortex_buffer::Buffer;
 
+use crate::FeatureBuildControl;
 use crate::core::dataset_manifest::sha256_file;
 use crate::core::feature_run_lease::FeatureRunLease;
 use crate::core::features::{FeatureCellValidity, FeatureColumnF64};
 use crate::core::timestamps::validate_canonical_millisecond_timestamps;
 use crate::core::vortex_io::{
-    read_vortex_file_metadata, read_vortex_projection_range, write_vortex_chunks_fallible,
+    read_vortex_file_metadata, read_vortex_projection_range, write_vortex_chunks_fallible_guarded,
 };
 
 const FILE_NAME: &str = "features.vortex";
@@ -33,6 +34,10 @@ const SCHEMA_DOMAIN: &[u8] = b"neoethos.vortex-feature-store.schema.v1\0";
 const IDENTITY_DOMAIN: &[u8] = b"neoethos.vortex-feature-store.identity.v1\0";
 const DEFAULT_CHUNK_ROWS: usize = 8_192;
 const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const SCRATCH_DISK_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// A wide TF may have thousands of physical fields. Bound the INPUT batch as
+// well as the writer's buffered output; neither bound removes a feature/row.
+const MAX_FEATURE_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VortexFeatureStoreOptions {
@@ -224,6 +229,23 @@ impl VortexFeatureStore {
         columns: &[FeatureColumnF64],
         options: VortexFeatureStoreOptions,
     ) -> Result<Arc<Self>> {
+        Self::create_with_control(
+            lease,
+            timestamps,
+            columns,
+            options,
+            &FeatureBuildControl::default(),
+        )
+    }
+
+    pub(crate) fn create_with_control(
+        lease: Arc<FeatureRunLease>,
+        timestamps: &[i64],
+        columns: &[FeatureColumnF64],
+        options: VortexFeatureStoreOptions,
+        control: &FeatureBuildControl,
+    ) -> Result<Arc<Self>> {
+        control.checkpoint()?;
         validate_options(options)?;
         validate_source(timestamps, columns)?;
         let path = lease.run_dir().join(FILE_NAME);
@@ -233,12 +255,50 @@ impl VortexFeatureStore {
             path.display()
         );
 
+        let chunk_rows = bounded_feature_chunk_rows(columns.len(), options.chunk_rows)?;
         let ranges = (0..timestamps.len())
-            .step_by(options.chunk_rows)
-            .map(|start| start..(start + options.chunk_rows).min(timestamps.len()));
-        let chunks = ranges.map(|range| build_chunk(timestamps, columns, range));
-        let stats = write_vortex_chunks_fallible(&path, chunks)
+            .step_by(chunk_rows)
+            .map(|start| start..(start + chunk_rows).min(timestamps.len()));
+        let chunks = ranges.map(|range| {
+            control.report(
+                "vortex_write_rows",
+                format!("{} columns", columns.len()),
+                range.start,
+                timestamps.len(),
+            )?;
+            build_chunk(timestamps, columns, range, control)
+        });
+        let disk_allowance = Mutex::new(0_u64);
+        let before_write = |bytes: usize| -> std::io::Result<()> {
+            control.checkpoint().map_err(std::io::Error::other)?;
+            // Live free space on the actual scratch volume, not an assumed
+            // compression ratio or the data-root drive. This is a guard, not
+            // an OS reservation against unrelated applications' allocations.
+            // Refresh after at most 32 MiB of encoded writes, not one OS call
+            // per tiny encoding buffer. Each byte still spends this allowance.
+            let mut allowance = disk_allowance
+                .lock()
+                .map_err(|_| std::io::Error::other("Vortex disk allowance poisoned"))?;
+            if *allowance == 0 || bytes as u64 > *allowance {
+                let available = crate::core::source_snapshot::available_disk_bytes(lease.run_dir())
+                    .map_err(std::io::Error::other)?;
+                require_scratch_disk_headroom(available, bytes as u64)
+                    .map_err(std::io::Error::other)?;
+                *allowance = available
+                    .saturating_sub(SCRATCH_DISK_RESERVE_BYTES)
+                    .min(MAX_FEATURE_CHUNK_BYTES as u64);
+            }
+            *allowance = allowance.saturating_sub(bytes as u64);
+            Ok(())
+        };
+        let stats = write_vortex_chunks_fallible_guarded(&path, chunks, u64::MAX, before_write)
             .with_context(|| format!("write Vortex feature store {}", path.display()))?;
+        control.report(
+            "vortex_write_rows",
+            format!("{} columns", columns.len()),
+            timestamps.len(),
+            timestamps.len(),
+        )?;
         ensure!(
             stats.row_count == timestamps.len() as u64,
             "Vortex feature writer reported {} rows for {} input rows",
@@ -246,10 +306,11 @@ impl VortexFeatureStore {
             timestamps.len()
         );
 
-        Self::open(
+        Self::open_with_control(
             lease,
             columns.iter().map(|column| column.name.clone()).collect(),
             options.decoded_cache_bytes,
+            control,
         )
     }
 
@@ -258,6 +319,21 @@ impl VortexFeatureStore {
         expected_names: Vec<String>,
         decoded_cache_bytes: usize,
     ) -> Result<Arc<Self>> {
+        Self::open_with_control(
+            lease,
+            expected_names,
+            decoded_cache_bytes,
+            &FeatureBuildControl::default(),
+        )
+    }
+
+    fn open_with_control(
+        lease: Arc<FeatureRunLease>,
+        expected_names: Vec<String>,
+        decoded_cache_bytes: usize,
+        control: &FeatureBuildControl,
+    ) -> Result<Arc<Self>> {
+        control.report("vortex_verify", "file hash and row identity", 0, 1)?;
         validate_names(&expected_names)?;
         let path = lease.run_dir().join(FILE_NAME);
         ensure!(
@@ -272,8 +348,10 @@ impl VortexFeatureStore {
             .context("Vortex feature row count does not fit usize")?;
         ensure!(n_samples > 0, "Vortex feature store must not be empty");
         let file_sha256 = sha256_file(&path)?;
+        control.checkpoint()?;
         let schema_sha256 = schema_hash(&expected_names);
-        let identity_sha256 = identity_hash_from_file(&path, n_samples)?;
+        let identity_sha256 = identity_hash_from_file(&path, n_samples, control)?;
+        control.report("vortex_verify", "file hash and row identity", 1, 1)?;
         Ok(Arc::new(Self {
             lease,
             path,
@@ -442,14 +520,23 @@ impl VortexFeatureStore {
                 values.len() == reason_codes.len(),
                 "feature `{name}` value/reason length mismatch"
             );
+            // ArrayRef::is_valid(row) asks a chunked array to reconstruct its
+            // complete validity expression on EVERY cell. Decode that bitmap
+            // once per projected column, then check each reason against it.
+            // This preserves all null/reason checks and exact f64 values.
+            let physical_validity = value_array
+                .validity_mask()
+                .with_context(|| format!("decode feature `{name}` validity bitmap"))?;
+            ensure!(
+                physical_validity.len() == values.len(),
+                "feature `{name}` value/bitmap length mismatch"
+            );
             let mut validity = Vec::with_capacity(reason_codes.len());
             for (row, code) in reason_codes.into_iter().enumerate() {
                 let reason = FeatureCellValidity::from_code(code).with_context(|| {
                     format!("feature `{name}` row {row} has unknown validity code {code}")
                 })?;
-                let physical_valid = value_array
-                    .is_valid(row)
-                    .with_context(|| format!("inspect feature `{name}` row {row} validity"))?;
+                let physical_valid = physical_validity.value(row);
                 ensure!(
                     physical_valid == reason.is_valid(),
                     "feature `{name}` row {row} null bitmap disagrees with validity reason {reason:?}"
@@ -603,10 +690,32 @@ impl DecodedChunkCache {
     }
 }
 
+fn bounded_feature_chunk_rows(columns: usize, requested_rows: usize) -> Result<usize> {
+    let bytes_per_row = columns
+        .checked_mul(10)
+        .and_then(|bytes| bytes.checked_add(16))
+        .context("Vortex feature chunk width overflow")?;
+    let rows = requested_rows.min(MAX_FEATURE_CHUNK_BYTES / bytes_per_row);
+    ensure!(rows > 0, "Vortex feature schema cannot fit one bounded row");
+    Ok(rows)
+}
+
+fn require_scratch_disk_headroom(available: u64, next_write: u64) -> Result<()> {
+    let required = SCRATCH_DISK_RESERVE_BYTES
+        .checked_add(next_write)
+        .context("Vortex scratch disk requirement overflow")?;
+    ensure!(
+        available >= required,
+        "Vortex scratch disk exhausted: available_bytes={available}, next_write_bytes={next_write}, reserved_free_bytes={SCRATCH_DISK_RESERVE_BYTES}; stopped before consuming the system reserve; free space or use a bounded streaming search, no input history or indicators were removed"
+    );
+    Ok(())
+}
+
 fn build_chunk(
     timestamps: &[i64],
     columns: &[FeatureColumnF64],
     range: Range<usize>,
+    control: &FeatureBuildControl,
 ) -> Result<ArrayRef> {
     let len = range.len();
     let mut names = Vec::with_capacity(2 + columns.len() * 2);
@@ -627,6 +736,7 @@ fn build_chunk(
     arrays.push(PrimitiveArray::new(Buffer::from(row_ids), Validity::NonNullable).into_array());
 
     for column in columns {
+        control.checkpoint()?;
         names.push(FieldName::from(column.name.as_str()));
         let physical_values = range
             .clone()
@@ -767,10 +877,15 @@ fn schema_hash(names: &[String]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn identity_hash_from_file(path: &Path, n_samples: usize) -> Result<[u8; 32]> {
+fn identity_hash_from_file(
+    path: &Path,
+    n_samples: usize,
+    control: &FeatureBuildControl,
+) -> Result<[u8; 32]> {
     let mut hasher = new_identity_hasher(n_samples)?;
     let mut previous_timestamp = None;
     for start in (0..n_samples).step_by(DEFAULT_CHUNK_ROWS) {
+        control.checkpoint()?;
         let end = (start + DEFAULT_CHUNK_ROWS).min(n_samples);
         let start_u64 = u64::try_from(start).context("identity range start does not fit u64")?;
         let end_u64 = u64::try_from(end).context("identity range end does not fit u64")?;
@@ -879,6 +994,198 @@ fn decoded_weight(batch: &VortexFeatureBatch) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_chunked_validity_matches_every_scalar_bit_with_bounded_timing_evidence() -> Result<()> {
+        use vortex_array::arrays::ChunkedArray;
+        const ROWS: usize = 8192;
+        const CHUNK_ROWS: usize = 128;
+        for mode in ["all_valid", "all_invalid", "mixed"] {
+            let expected = (0..ROWS)
+                .map(|row| match mode {
+                    "all_valid" => true,
+                    "all_invalid" => false,
+                    _ => row % 11 < 5,
+                })
+                .collect::<Vec<_>>();
+            let chunks = (0..ROWS)
+                .step_by(CHUNK_ROWS)
+                .map(|start| {
+                    PrimitiveArray::new(
+                        Buffer::from(vec![1.0_f64; CHUNK_ROWS]),
+                        Validity::from_iter(expected[start..start + CHUNK_ROWS].iter().copied()),
+                    )
+                    .into_array()
+                })
+                .collect();
+            let array =
+                ChunkedArray::try_new(chunks, DType::Primitive(PType::F64, Nullability::Nullable))?
+                    .into_array();
+            let start = std::time::Instant::now();
+            let scalar = (0..ROWS)
+                .map(|row| array.is_valid(row).map_err(anyhow::Error::new))
+                .collect::<Result<Vec<_>>>()?;
+            let scalar_micros = start.elapsed().as_micros();
+            let start = std::time::Instant::now();
+            let mask = array.validity_mask()?;
+            let bulk = (0..ROWS).map(|row| mask.value(row)).collect::<Vec<_>>();
+            let bulk_micros = start.elapsed().as_micros();
+            assert_eq!(scalar, expected);
+            assert_eq!(bulk, expected);
+            // Record measured work, but don't turn scheduler noise into a
+            // flaky timing assertion or claim this is an end-to-end benchmark.
+            eprintln!(
+                "VORTEX_VALIDITY_COMPARE mode={mode} rows={ROWS} chunks={} scalar_us={scalar_micros} bulk_us={bulk_micros}",
+                ROWS / CHUNK_ROWS
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_projection_preserves_all_reason_codes_and_rejects_bitmap_disagreement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let timestamps = (0..128)
+            .map(|row| 1_704_067_200_000_i64 + row * 60_000)
+            .collect::<Vec<_>>();
+        let reasons = (0..128)
+            .map(|row| FeatureCellValidity::from_code((row % 10) as u8).unwrap())
+            .collect::<Vec<_>>();
+        let column = FeatureColumnF64::new("signal", vec![-0.0; 128], reasons)?;
+        let lease = Arc::new(FeatureRunLease::create(temp.path(), "bulk-validity")?);
+        let store = VortexFeatureStore::create(
+            lease,
+            &timestamps,
+            &[column.clone()],
+            VortexFeatureStoreOptions {
+                chunk_rows: 8,
+                decoded_cache_bytes: 0,
+            },
+        )?;
+        let projected = store.project(&[0], 3..125)?;
+        assert_eq!(projected.columns[0].validity, column.validity[3..125]);
+        assert_eq!(
+            projected.columns[0]
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            column.values[3..125]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        drop(store);
+
+        let corrupt_lease = Arc::new(FeatureRunLease::create(temp.path(), "bitmap-disagreement")?);
+        let names = FieldNames::from(
+            [
+                TIMESTAMP_FIELD,
+                ROW_ID_FIELD,
+                "signal",
+                "__neoethos_validity__signal",
+            ]
+            .into_iter()
+            .map(FieldName::from)
+            .collect::<Vec<_>>(),
+        );
+        let arrays = vec![
+            PrimitiveArray::new(Buffer::from(timestamps.clone()), Validity::NonNullable)
+                .into_array(),
+            PrimitiveArray::new(
+                Buffer::from((0..128_u64).collect::<Vec<_>>()),
+                Validity::NonNullable,
+            )
+            .into_array(),
+            PrimitiveArray::new(Buffer::from(vec![1.0_f64; 128]), Validity::AllInvalid)
+                .into_array(),
+            PrimitiveArray::new(
+                Buffer::from(vec![FeatureCellValidity::Valid.code(); 128]),
+                Validity::NonNullable,
+            )
+            .into_array(),
+        ];
+        let chunk = StructArray::try_new(names, arrays, 128, Validity::NonNullable)?.into_array();
+        write_vortex_chunks_fallible_guarded(
+            &corrupt_lease.run_dir().join(FILE_NAME),
+            std::iter::once(Ok(chunk)),
+            u64::MAX,
+            |_| Ok(()),
+        )?;
+        let store = VortexFeatureStore::open(corrupt_lease, vec!["signal".to_owned()], 0)?;
+        let error = store
+            .project(&[0], 0..128)
+            .expect_err("bitmap/reason disagreement must remain rejected");
+        assert!(
+            error.to_string().contains("null bitmap disagrees"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wide_feature_chunks_bound_bytes_without_removing_rows_or_columns() -> Result<()> {
+        for columns in [1, 100, 1011, 9099] {
+            let rows = bounded_feature_chunk_rows(columns, 8192)?;
+            assert!(rows > 0 && rows <= 8192);
+            assert!(rows * (columns * 10 + 16) <= MAX_FEATURE_CHUNK_BYTES);
+        }
+        assert!(bounded_feature_chunk_rows(usize::MAX, 8192).is_err());
+        assert!(bounded_feature_chunk_rows(1, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_disk_guard_preserves_the_system_reserve_and_names_the_cause() {
+        assert!(require_scratch_disk_headroom(SCRATCH_DISK_RESERVE_BYTES + 8, 8).is_ok());
+        let error = require_scratch_disk_headroom(SCRATCH_DISK_RESERVE_BYTES + 7, 8).unwrap_err();
+        assert!(error.to_string().contains("available_bytes="));
+        assert!(error.to_string().contains("reserved_free_bytes="));
+        assert!(require_scratch_disk_headroom(u64::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn stop_mid_vortex_write_publishes_nothing_and_releases_scratch() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempfile::tempdir()?;
+        let lease = Arc::new(FeatureRunLease::create(temp.path(), "cancel-writer")?);
+        let run_dir = lease.run_dir().to_path_buf();
+        let timestamps = (0..8)
+            .map(|i| 1_704_067_200_000 + i * 60_000)
+            .collect::<Vec<_>>();
+        let column =
+            FeatureColumnF64::new("signal", vec![1.; 8], vec![FeatureCellValidity::Valid; 8])?;
+        let flag = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&flag);
+        let control = FeatureBuildControl::new(flag).with_observer(move |event| {
+            // The first two real chunks have returned from writer.push.
+            if event.stage == "vortex_write_rows" && event.completed == 4 {
+                signal.store(true, Ordering::Release);
+            }
+        });
+        let error = VortexFeatureStore::create_with_control(
+            Arc::clone(&lease),
+            &timestamps,
+            &[column],
+            VortexFeatureStoreOptions {
+                chunk_rows: 2,
+                decoded_cache_bytes: 0,
+            },
+            &control,
+        )
+        .expect_err("a stopped writer cannot publish a store");
+        assert!(crate::FeatureBuildCancelled::matches(&error), "{error:#}");
+        assert!(
+            std::fs::read_dir(&run_dir)?.next().is_none(),
+            "staged file leaked"
+        );
+        drop(lease);
+        assert!(
+            !run_dir.exists(),
+            "scratch lease retained after workers returned"
+        );
+        Ok(())
+    }
 
     fn cache_key() -> CacheKey {
         CacheKey {

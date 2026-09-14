@@ -435,7 +435,8 @@ fn red_cpu_v3_must_replace_the_untrusted_legacy_bridge() {
     let cpu = read("crates/neoethos-data/src/core/regime_detection.rs");
     for token in [
         "pub const REGIME_SEMANTIC_VERSION: u32 = 3;",
-        "pub const REGIME_FEATURE_NAMES_V3: [&str; 14]",
+        "pub const REGIME_COLUMN_COUNT_V3: usize = 14;",
+        "pub const REGIME_FEATURE_NAMES_V3: [&str; REGIME_COLUMN_COUNT_V3]",
         "pub const REGIME_OPERATION_SCHEDULE_V1: &str",
         "pub const REGIME_SEMANTIC_V3_FIXTURE_SHA256: &str",
         "pub const REGIME_V2_ARTIFACT_MIGRATION_POLICY: &str",

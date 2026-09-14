@@ -153,8 +153,8 @@ pub struct GeneticSearchRuntimeOverrides {
     /// disables novelty scoring (default).
     pub novelty_weight: f64,
     /// Exact `k` for mean k-nearest-neighbor novelty over the current
-    /// population plus the permanent archive. It is explicit because changing
-    /// `k` changes selection and therefore the run identity.
+    /// population. It is explicit because changing `k` changes selection and
+    /// therefore the run identity.
     pub novelty_neighbors: usize,
     /// Number of stagnant generations the search tolerates before
     /// triggering the SOFT diversity kick / gate-relaxation. Always at

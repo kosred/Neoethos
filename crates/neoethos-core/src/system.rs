@@ -1,12 +1,13 @@
 use crate::config::Settings;
 use crate::contracts::{DeviceAssignment, RuntimeDegradedReason};
+use anyhow::{Context, Result};
 use neoethos_execution_budget::{
     BudgetCap, BudgetCapProvenance, CapacityDetection, CoordinationScope, ExecutionBudgetRequest,
     LogicalThreadCount, ResolutionError, ResolvedExecutionBudget, WorkerLimit,
     installed_process_budget, resolve_execution_budget,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+#[cfg(feature = "gpu-cuda")]
 use std::process::Command;
 use sysinfo::{ProcessesToUpdate, System, get_current_pid};
 
@@ -20,12 +21,10 @@ mod backends;
 pub use backends::AcceleratorBackend;
 use backends::{choose_primary_backend, normalize_accelerator_preference};
 
-/// Current schema version of `hardware_profile.json`. Per D4
-/// versioning policy: bumped only when fields are removed /
-/// renamed / type-changed in a way `#[serde(default)]` can't
-/// bridge. Adding new optional fields stays at v1.
+/// Current schema version of `hardware_profile.json`. Version 2 removes the
+/// retired Vulkan/WGPU/ROCm backend variants and their runtime override fields.
 pub const HARDWARE_PROFILE_SCHEMA_VERSION: crate::schema_version::SchemaVersion =
-    crate::schema_version::SchemaVersion::new(1);
+    crate::schema_version::SchemaVersion::new(2);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HardwareProfile {
@@ -56,28 +55,20 @@ impl crate::schema_version::HasSchemaVersion for HardwareProfile {
 
 pub struct HardwareProbe {
     sys: System,
-    #[allow(dead_code)] // consumed by backend-specific probe features
-    runtime_overrides: HardwareRuntimeOverrides,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HardwareRuntimeOverrides {
     pub training_precision: Option<TrainingPrecision>,
     pub cuda_precisions: Option<Vec<TrainingPrecision>>,
-    pub rocm_precisions: Option<Vec<TrainingPrecision>>,
-    pub wgpu_precisions: Option<Vec<TrainingPrecision>>,
-    pub wgpu_device_names: Vec<String>,
 }
 
 impl HardwareRuntimeOverrides {
     // REMOVED 2026-08-03: `from_env()`. Zero callers — `from_settings` below is
     // what production installs (system.rs:311 and :651). It read six env vars
-    // that therefore did nothing: NEOETHOS_BOT_CPU_BUDGET,
-    // NEOETHOS_BOT_TRAIN_PRECISION (plus a FOREX_TRAIN_PRECISION alias),
-    // NEOETHOS_BOT_CUDA_PRECISIONS, _ROCM_PRECISIONS, _WGPU_PRECISIONS and
-    // _WGPU_DEVICES. Every one has a config field on `system.hardware`, so
-    // nothing is lost — but anyone who set one and watched precision not change
-    // was fighting a function with no caller.
+    // that therefore did nothing. CUDA precision remains a typed config field;
+    // the former ROCm/WGPU variables are retired because those backends are no
+    // longer part of the active runtime surface.
     //
     // CPU width is no longer installed through this compatibility struct.
     // `ExecutionBudgetInputs` keeps the persistent, legacy, and parent caps
@@ -90,9 +81,6 @@ impl HardwareRuntimeOverrides {
         Self {
             training_precision: c.training_precision,
             cuda_precisions: c.cuda_precisions.clone(),
-            rocm_precisions: c.rocm_precisions.clone(),
-            wgpu_precisions: c.wgpu_precisions.clone(),
-            wgpu_device_names: c.wgpu_device_names.clone(),
         }
     }
 
@@ -102,12 +90,7 @@ impl HardwareRuntimeOverrides {
     ) -> Option<Vec<TrainingPrecision>> {
         match backend {
             AcceleratorBackend::Cuda => self.cuda_precisions.clone(),
-            AcceleratorBackend::Rocm => self.rocm_precisions.clone(),
-            AcceleratorBackend::Wgpu
-            | AcceleratorBackend::Vulkan
-            | AcceleratorBackend::Metal
-            | AcceleratorBackend::Dx12 => self.wgpu_precisions.clone(),
-            AcceleratorBackend::Cpu => None,
+            AcceleratorBackend::Cpu | AcceleratorBackend::Rocm => None,
         }
     }
 }
@@ -270,28 +253,11 @@ pub enum AcceleratorDeviceClass {
 
 impl AcceleratorDevice {
     pub fn device_string(&self) -> String {
-        if let Some(selector) = self.cubecl_wgpu_selector() {
-            format!("{}:{selector}", self.backend.as_str())
-        } else {
-            format!("{}:{}", self.backend.as_str(), self.backend_index)
-        }
+        format!("{}:{}", self.backend.as_str(), self.backend_index)
     }
 
     pub fn supports_precision(&self, precision: TrainingPrecision) -> bool {
         self.supported_precisions.contains(&precision)
-    }
-
-    pub fn cubecl_wgpu_selector(&self) -> Option<String> {
-        if !self.backend.is_wgpu_family() {
-            return None;
-        }
-        let kind = match self.device_class {
-            AcceleratorDeviceClass::DiscreteGpu => "discrete",
-            AcceleratorDeviceClass::IntegratedGpu => "integrated",
-            AcceleratorDeviceClass::VirtualGpu => "virtual",
-            AcceleratorDeviceClass::Other => "default",
-        };
-        Some(format!("{kind}:{}", self.backend_index))
     }
 }
 
@@ -509,16 +475,18 @@ impl HardwareExecutionPlan {
         let cuda_devices = profile.devices_for_backend(AcceleratorBackend::Cuda);
         let has_gpu = !profile.accelerator_devices.is_empty();
         let gpu_allowed = !matches!(preference.as_str(), "cpu" | "off");
-        let gpu_forced = matches!(
-            preference.as_str(),
-            "gpu" | "cuda" | "rocm" | "wgpu" | "vulkan" | "metal" | "dx12"
-        );
+        let gpu_forced = !matches!(preference.as_str(), "auto" | "cpu" | "off");
         let primary_backend = choose_primary_backend(&preference, &profile);
         let gpu_enabled = has_gpu && gpu_allowed && primary_backend.is_gpu();
-        let backend_devices = profile.devices_for_planned_backend(primary_backend);
+        let backend_devices = profile.devices_for_backend(primary_backend);
         let preferred_precision =
             choose_training_precision(&profile, primary_backend, runtime_overrides);
         let mut warnings = Vec::new();
+        if !matches!(preference.as_str(), "auto" | "cpu" | "off" | "gpu" | "cuda") {
+            warnings.push(format!(
+                "Accelerator preference {preference:?} is retired or unsupported; CUDA is the only active GPU backend and the plan fails closed to CPU."
+            ));
+        }
         if gpu_forced && !has_gpu {
             warnings.push(
                 "GPU was requested but no accelerator device was detected; using CPU plans."
@@ -531,13 +499,6 @@ impl HardwareExecutionPlan {
                     .to_string(),
             );
         }
-        if primary_backend == AcceleratorBackend::Rocm {
-            warnings.push(
-                "ROCm deep planning applies to Burn/deep workloads; current search/RL native tensor paths still require an implemented ROCm runtime and therefore use CPU fallback."
-                    .to_string(),
-            );
-        }
-
         let cpu_budget = resolved_budget.effective_worker_limit.get();
         let host_memory_budget_gb = profile.available_ram_gb.max(1.0);
         let device_ids: Vec<usize> = if gpu_enabled {
@@ -575,18 +536,11 @@ impl HardwareExecutionPlan {
                 .as_str(),
             "cpu" | "off" | "false"
         );
-        let search_gpu_enabled = gpu_enabled
-            && search_gpu_requested
-            && (primary_backend == AcceleratorBackend::Cuda || primary_backend.is_wgpu_family());
+        let search_gpu_enabled = gpu_enabled && search_gpu_requested;
         let search_device = if !search_gpu_enabled {
             "cpu".to_string()
-        } else if primary_backend == AcceleratorBackend::Cuda {
-            "cuda:all".to_string()
         } else {
-            backend_devices
-                .first()
-                .map(|device| device.device_string())
-                .unwrap_or_else(|| "cpu".to_string())
+            "cuda:all".to_string()
         };
         let search_device_ids = if search_gpu_enabled {
             backend_devices.iter().map(|device| device.id).collect()
@@ -673,7 +627,7 @@ impl HardwareExecutionPlan {
                 0.45,
                 0.80,
             ),
-            notes: vec!["Search evaluation uses the compiled CubeCL CUDA or WGPU runtime for GA offspring generation, signal synthesis, and the stateful backtest loop; price-normalized backtest arithmetic remains FP32 for pip-safe parity. ROCm stays an explicit CPU fallback until its runtime path is implemented.".to_string()],
+            notes: vec!["Search evaluation uses the compiled CubeCL CUDA runtime for GA offspring generation, signal synthesis, and the stateful f64 backtest loop. ROCm/HIP remains future work and is not exposed as an executable backend.".to_string()],
         });
         workloads.push(WorkloadExecutionPlan {
             workload: WorkloadKind::TreeTraining,
@@ -792,7 +746,7 @@ impl HardwareExecutionPlan {
                 } else if !primary_backend.is_gpu() {
                     "the chosen primary backend is CPU"
                 } else {
-                    "the primary backend has no search runtime — search needs CUDA or a wgpu-family backend"
+                    "the primary backend has no search runtime — search requires CUDA"
                 }
             ));
         }
@@ -922,6 +876,47 @@ impl HardwareExecutionPlan {
         self.workloads.iter().find(|plan| plan.workload == kind)
     }
 
+    /// Resolve one explicitly requested ROCm neural assignment from the retained
+    /// inventory. This does not enable ROCm for the global planner's other
+    /// workloads. The caller must establish its model/backend capability first.
+    pub fn explicit_rocm_deep_workload_v1(&self, ordinal: usize) -> Result<WorkloadExecutionPlan> {
+        let mut devices = self.profile.accelerator_devices.iter().filter(|device| {
+            device.backend == AcceleratorBackend::Rocm && device.backend_index == ordinal
+        });
+        let device = devices
+            .next()
+            .context("requested ROCm device is absent from the sealed hardware inventory")?;
+        anyhow::ensure!(
+            devices.next().is_none(),
+            "ambiguous ROCm ordinal in hardware inventory"
+        );
+        anyhow::ensure!(
+            device.memory_gb.is_finite()
+                && device.memory_gb > 0.0
+                && device.supports_precision(TrainingPrecision::Fp32),
+            "ROCm neural assignment requires positive measured memory and FP32 support"
+        );
+        let mut workload = self
+            .workload(WorkloadKind::DeepTraining)
+            .context("missing deep-training CPU/resource grant")?
+            .clone();
+        // Reuse the same capacity policy, restricted to the requested device:
+        // another smaller card must not cap this ordinal's workload.
+        let mut selected = self.profile.clone();
+        selected.accelerator_devices = vec![device.clone()];
+        workload.backend = AcceleratorBackend::Rocm;
+        workload.device = device.device_string();
+        workload.device_ids = vec![device.id];
+        workload.precision = TrainingPrecision::Fp32;
+        workload.batch_size = training_batch_size(true, device.memory_gb);
+        workload.memory_budget_gb =
+            planned_memory_budget_gb(&selected, AcceleratorBackend::Rocm, 0.55, 0.80);
+        workload.notes = vec![
+            "Explicit Burn ROCm neural assignment; measured capacity is not a reservation; live training admission rechecks free VRAM.".to_string(),
+        ];
+        Ok(workload)
+    }
+
     pub fn profile_id(&self) -> String {
         self.profile.stable_id()
     }
@@ -1032,6 +1027,16 @@ fn clamp_memory_figures_to_reported_cgroup(
     limit_total: u64,
     limit_available: u64,
 ) -> (u64, u64) {
+    // `sysinfo` can report a zeroed cgroup record on hosts where there is no
+    // usable process limit (observed on Windows).  The total is the authority
+    // for whether a cgroup is actually constraining this process; clamping the
+    // available figure independently would turn that zeroed record into a
+    // false "0 bytes free" result and force every adaptive budget to its
+    // emergency floor.
+    if limit_total == 0 || limit_total >= host_total {
+        return (host_total, host_available);
+    }
+
     (
         tighter_of(host_total, limit_total),
         host_available.min(limit_available),
@@ -1102,6 +1107,63 @@ pub fn available_memory_bytes() -> u64 {
     clamp_to_cgroup(&sys, sys.total_memory(), sys.available_memory()).1
 }
 
+/// Additional host allocation capacity at the instant of the probe.
+///
+/// Windows can exhaust commit while physical RAM remains available. Bound new
+/// allocations by physical availability, the calling process's remaining
+/// commit capacity, and its unreserved virtual address space. Page-file size
+/// or free swap is not a substitute for the process commit figure.
+///
+/// Other platforms retain the existing physical/cgroup probe. Zero means no
+/// measured allocation headroom (including probe failure), not permission to
+/// invent an emergency allowance. This is a snapshot, not a reservation or a
+/// guarantee that a later allocation succeeds. UI physical-RAM reporting keeps
+/// using [`available_memory_bytes`].
+pub fn allocation_headroom_bytes() -> u64 {
+    #[cfg(windows)]
+    {
+        match windows_memory_status() {
+            Ok(status) => windows_allocation_headroom(
+                status.ullAvailPhys,
+                status.ullAvailPageFile,
+                status.ullAvailVirtual,
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    target: "neoethos_core::system",
+                    %error,
+                    "Windows allocation-headroom probe failed; no new host allocation is admitted"
+                );
+                0
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        available_memory_bytes()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_allocation_headroom(physical: u64, process_commit: u64, virtual_address: u64) -> u64 {
+    physical.min(process_commit).min(virtual_address)
+}
+
+#[cfg(windows)]
+fn windows_memory_status()
+-> windows::core::Result<windows::Win32::System::SystemInformation::MEMORYSTATUSEX> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a correctly sized, initialized, exclusively borrowed structure
+    // remains alive for this synchronous Win32 call; no pointer is retained.
+    unsafe { GlobalMemoryStatusEx(&mut status)? };
+    Ok(status)
+}
+
 /// Total RAM in bytes available to this process. Pairs with
 /// [`available_memory_bytes`] so callers (and the UI resource strip) can show
 /// a "X of Y GB free" readout — and inside a container both report the
@@ -1117,16 +1179,9 @@ pub fn total_memory_bytes() -> u64 {
 
 impl HardwareProbe {
     pub fn new() -> Self {
-        Self::with_runtime_overrides(current_hardware_runtime_overrides().clone())
-    }
-
-    pub fn with_runtime_overrides(runtime_overrides: HardwareRuntimeOverrides) -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
-        Self {
-            sys,
-            runtime_overrides,
-        }
+        Self { sys }
     }
 
     pub fn detect(&mut self) -> HardwareProfile {
@@ -1176,32 +1231,10 @@ impl HardwareProbe {
 
     fn detect_accelerator_devices(&self) -> Vec<AcceleratorDevice> {
         #[allow(unused_mut)] // CPU-only builds compile every backend block out.
-        let mut devices = Vec::new();
+        let mut devices: Vec<AcceleratorDevice> = Vec::new();
         #[cfg(feature = "gpu-cuda")]
         devices.extend(self.detect_nvidia_accelerators());
-        #[cfg(feature = "gpu-rocm")]
-        devices.extend(self.detect_rocm_accelerators(devices.len()));
-        #[cfg(feature = "gpu-wgpu")]
-        {
-            let detected = self.detect_wgpu_accelerators();
-            if detected.is_empty() {
-                devices.extend(self.detect_wgpu_hint_accelerators(devices.len()));
-            } else {
-                devices.extend(detected);
-            }
-        }
         devices
-    }
-
-    #[cfg(feature = "gpu-wgpu")]
-    fn detect_wgpu_accelerators(&self) -> Vec<AcceleratorDevice> {
-        let Some(infos) = probe_wgpu_adapter_infos() else {
-            return Vec::new();
-        };
-        let precision_override = self
-            .runtime_overrides
-            .precision_override(AcceleratorBackend::Wgpu);
-        normalize_wgpu_adapter_infos(&infos, precision_override.as_deref())
     }
 
     #[cfg(feature = "gpu-cuda")]
@@ -1324,206 +1357,16 @@ impl HardwareProbe {
 
         Vec::new()
     }
-
-    #[cfg(feature = "gpu-rocm")]
-    fn detect_rocm_accelerators(&self, id_offset: usize) -> Vec<AcceleratorDevice> {
-        // GROUP H remediation: 2s timeout (operator directive 2026-05-25).
-        let rocminfo = run_hw_probe_with_timeout(Command::new("rocminfo"));
-        if let Some(output) = rocminfo
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let names = stdout
-                .lines()
-                .filter_map(|line| {
-                    line.split_once("Marketing Name:")
-                        .map(|(_, value)| value.trim().to_string())
-                })
-                .filter(|name| !name.is_empty())
-                .collect::<Vec<_>>();
-            if !names.is_empty() {
-                return names
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, name)| AcceleratorDevice {
-                        id: id_offset + idx,
-                        name,
-                        backend: AcceleratorBackend::Rocm,
-                        device_class: AcceleratorDeviceClass::DiscreteGpu,
-                        backend_index: idx,
-                        memory_gb: 0.0,
-                        supported_precisions: self
-                            .runtime_overrides
-                            .precision_override(AcceleratorBackend::Rocm)
-                            .unwrap_or_else(|| {
-                                vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16]
-                            }),
-                        compute_capability: None,
-                        source: "rocminfo".to_string(),
-                    })
-                    .collect();
-            }
-        }
-
-        Vec::new()
-    }
-
-    #[cfg(feature = "gpu-wgpu")]
-    fn detect_wgpu_hint_accelerators(&self, id_offset: usize) -> Vec<AcceleratorDevice> {
-        self.runtime_overrides
-            .wgpu_device_names
-            .iter()
-            .enumerate()
-            .map(|(idx, name)| AcceleratorDevice {
-                id: id_offset + idx,
-                name: name.clone(),
-                backend: AcceleratorBackend::Wgpu,
-                device_class: AcceleratorDeviceClass::Other,
-                backend_index: idx,
-                memory_gb: 0.0,
-                supported_precisions: self
-                    .runtime_overrides
-                    .precision_override(AcceleratorBackend::Wgpu)
-                    .unwrap_or_else(|| vec![TrainingPrecision::Fp32]),
-                compute_capability: None,
-                source: "hardware_runtime_overrides.wgpu_device_names".to_string(),
-            })
-            .collect()
-    }
-}
-
-#[cfg(feature = "gpu-wgpu")]
-fn wgpu_probe_backends() -> wgpu::Backends {
-    #[cfg(target_os = "macos")]
-    {
-        wgpu::Backends::METAL
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        wgpu::Backends::BROWSER_WEBGPU
-    }
-    #[cfg(all(not(target_os = "macos"), not(target_family = "wasm")))]
-    {
-        // CubeCL's AutoGraphicsApi selects Vulkan on Windows and Linux. Probe
-        // the same backend so reported ordinals match WgpuDevice selection.
-        wgpu::Backends::VULKAN
-    }
-}
-
-#[cfg(feature = "gpu-wgpu")]
-fn probe_wgpu_adapter_infos() -> Option<Vec<wgpu::AdapterInfo>> {
-    const WGPU_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let backends = wgpu_probe_backends();
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            });
-            pollster::block_on(instance.enumerate_adapters(backends))
-                .into_iter()
-                .map(|adapter| adapter.get_info())
-                .collect::<Vec<_>>()
-        }))
-        .ok();
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(WGPU_PROBE_TIMEOUT) {
-        Ok(Some(infos)) => Some(infos),
-        Ok(None) => {
-            tracing::warn!(
-                target: "neoethos_core::system",
-                "WGPU adapter enumeration panicked; treating WGPU as unavailable"
-            );
-            None
-        }
-        Err(_) => {
-            tracing::warn!(
-                target: "neoethos_core::system",
-                timeout_ms = WGPU_PROBE_TIMEOUT.as_millis() as u64,
-                "WGPU adapter enumeration timed out; treating WGPU as unavailable"
-            );
-            None
-        }
-    }
-}
-
-#[cfg(feature = "gpu-wgpu")]
-fn normalize_wgpu_adapter_infos(
-    infos: &[wgpu::AdapterInfo],
-    precision_override: Option<&[TrainingPrecision]>,
-) -> Vec<AcceleratorDevice> {
-    let mut discrete_index = 0usize;
-    let mut integrated_index = 0usize;
-    let mut virtual_index = 0usize;
-    let mut other_index = 0usize;
-    let mut devices = Vec::new();
-
-    for info in infos {
-        let backend = match info.backend {
-            wgpu::Backend::Vulkan => AcceleratorBackend::Vulkan,
-            wgpu::Backend::Metal => AcceleratorBackend::Metal,
-            wgpu::Backend::Dx12 => AcceleratorBackend::Dx12,
-            wgpu::Backend::Gl | wgpu::Backend::BrowserWebGpu => AcceleratorBackend::Wgpu,
-            wgpu::Backend::Noop => continue,
-        };
-        let (device_class, backend_index) = match info.device_type {
-            wgpu::DeviceType::DiscreteGpu => {
-                let index = discrete_index;
-                discrete_index += 1;
-                (AcceleratorDeviceClass::DiscreteGpu, index)
-            }
-            wgpu::DeviceType::IntegratedGpu => {
-                let index = integrated_index;
-                integrated_index += 1;
-                (AcceleratorDeviceClass::IntegratedGpu, index)
-            }
-            wgpu::DeviceType::VirtualGpu => {
-                let index = virtual_index;
-                virtual_index += 1;
-                (AcceleratorDeviceClass::VirtualGpu, index)
-            }
-            wgpu::DeviceType::Other => {
-                let index = other_index;
-                other_index += 1;
-                (AcceleratorDeviceClass::Other, index)
-            }
-            wgpu::DeviceType::Cpu => continue,
-        };
-        let id = devices.len();
-        devices.push(AcceleratorDevice {
-            id,
-            name: info.name.clone(),
-            backend,
-            device_class,
-            backend_index,
-            // wgpu does not expose reliable dedicated VRAM. In particular,
-            // Windows reports shared-memory iGPU values inconsistently.
-            memory_gb: 0.0,
-            supported_precisions: precision_override
-                .map(<[TrainingPrecision]>::to_vec)
-                .unwrap_or_else(|| vec![TrainingPrecision::Fp32]),
-            compute_capability: None,
-            source: format!(
-                "wgpu:{:?}:vendor={:#06x}:device={:#06x}:driver={}",
-                info.backend, info.vendor, info.device, info.driver
-            ),
-        });
-    }
-    devices
 }
 
 /// GROUP H remediation (operator directive 2026-05-25, F-890):
-/// run an external hardware-probe subprocess (`nvidia-smi`,
-/// `rocminfo`, `rocm-smi`) with a hard 2-second timeout. On a healthy
-/// host they answer in <100 ms; on a broken-NVML or zombie-rocm-smi
-/// install they can otherwise hang the entire backend's startup
+/// run the external `nvidia-smi` hardware probe with a hard 2-second
+/// timeout. On a healthy host it answers in <100 ms; on a broken NVML
+/// installation it can otherwise hang the entire backend's startup
 /// path. We spawn on a separate thread and accept that the
 /// subprocess may continue running in the background — the main
 /// process is unblocked which is what matters.
-#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+#[cfg(feature = "gpu-cuda")]
 fn run_hw_probe_with_timeout(mut cmd: Command) -> Option<std::process::Output> {
     const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1583,29 +1426,11 @@ impl HardwareProfile {
             .collect()
     }
 
-    pub fn wgpu_native_devices(&self) -> Vec<&AcceleratorDevice> {
-        self.accelerator_devices
-            .iter()
-            .filter(|device| device.backend.is_wgpu_family())
-            .collect()
-    }
-
-    pub fn wgpu_capable_devices(&self) -> Vec<&AcceleratorDevice> {
-        self.accelerator_devices
-            .iter()
-            .filter(|device| device.backend.is_wgpu_family())
-            .collect()
-    }
-
     pub fn devices_for_planned_backend(
         &self,
         backend: AcceleratorBackend,
     ) -> Vec<&AcceleratorDevice> {
-        if backend.is_wgpu_family() {
-            self.wgpu_capable_devices()
-        } else {
-            self.devices_for_backend(backend)
-        }
+        self.devices_for_backend(backend)
     }
 }
 
@@ -1750,11 +1575,6 @@ pub fn planned_memory_budget_gb(
         .fold(f64::INFINITY, f64::min);
     let capacity_gb = if min_dedicated_gb.is_finite() {
         min_dedicated_gb
-    } else if backend.is_wgpu_family() && !devices.is_empty() {
-        // wgpu intentionally does not report dedicated VRAM. This is an
-        // allocation allowance derived from currently available shared host
-        // memory, not a claim about physical VRAM capacity.
-        (profile.available_ram_gb.max(1.0) * 0.25).clamp(1.0, 8.0)
     } else {
         0.0
     };
@@ -1936,62 +1756,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "gpu-wgpu")]
-    fn wgpu_adapter_info(
-        name: &str,
-        backend: wgpu::Backend,
-        device_type: wgpu::DeviceType,
-        vendor: u32,
-        device: u32,
-    ) -> wgpu::AdapterInfo {
-        wgpu::AdapterInfo {
-            name: name.to_string(),
-            vendor,
-            device,
-            device_type,
-            device_pci_bus_id: String::new(),
-            driver: "test-driver".to_string(),
-            driver_info: "1.0".to_string(),
-            backend,
-            subgroup_min_size: 32,
-            subgroup_max_size: 64,
-            transient_saves_memory: false,
-        }
-    }
-
-    #[cfg(feature = "gpu-wgpu")]
-    #[test]
-    fn wgpu_adapter_info_maps_integrated_gpu_without_fake_vram() {
-        let infos = vec![
-            wgpu_adapter_info(
-                "AMD Radeon Graphics",
-                wgpu::Backend::Vulkan,
-                wgpu::DeviceType::IntegratedGpu,
-                0x1002,
-                0x1638,
-            ),
-            wgpu_adapter_info(
-                "Microsoft Basic Render Driver",
-                wgpu::Backend::Vulkan,
-                wgpu::DeviceType::Cpu,
-                0,
-                0,
-            ),
-        ];
-
-        let devices = normalize_wgpu_adapter_infos(&infos, None);
-
-        assert_eq!(devices.len(), 1, "software adapters are not accelerators");
-        assert_eq!(devices[0].backend, AcceleratorBackend::Vulkan);
-        assert_eq!(
-            devices[0].device_class,
-            AcceleratorDeviceClass::IntegratedGpu
-        );
-        assert_eq!(devices[0].backend_index, 0);
-        assert_eq!(devices[0].memory_gb, 0.0, "shared memory is not fake VRAM");
-        assert!(devices[0].source.contains("wgpu"));
-    }
-
     fn profile(gpus: usize, vram_gb: f64) -> HardwareProfile {
         HardwareProfile {
             schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
@@ -2020,6 +1784,49 @@ mod tests {
                 .collect(),
             timestamp: "test".to_string(),
             platform_label: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn explicit_rocm_deep_plan_scales_only_the_selected_device_and_preserves_other_workloads() {
+        let mut inventory = profile(2, 2.0);
+        for device in &mut inventory.accelerator_devices {
+            device.backend = AcceleratorBackend::Rocm;
+        }
+        inventory.accelerator_devices[1].id = 17;
+        inventory.accelerator_devices[1].backend_index = 3;
+        inventory.accelerator_devices[1].memory_gb = 128.0;
+        let plan =
+            HardwareExecutionPlan::from_settings_and_profile(&Settings::default(), inventory);
+        let before = plan.clone();
+        let small = plan.explicit_rocm_deep_workload_v1(0).unwrap();
+        let large = plan.explicit_rocm_deep_workload_v1(3).unwrap();
+        assert_eq!(small.batch_size, 256);
+        assert_eq!(large.batch_size, 2048);
+        assert_eq!(small.memory_budget_gb, 1.6);
+        assert_eq!(large.memory_budget_gb, 102.4);
+        assert_eq!(large.device, "rocm:3");
+        assert_eq!(large.device_ids, vec![17]);
+        assert_eq!(large.device_assignment().backend, BackendKind::NativeRocm);
+        let original = plan.workload(WorkloadKind::DeepTraining).unwrap();
+        assert_eq!(large.cpu_threads, original.cpu_threads);
+        assert_eq!(large.requested_cpu_threads, original.requested_cpu_threads);
+        assert_eq!(large.precision, TrainingPrecision::Fp32);
+        assert_eq!(
+            plan, before,
+            "explicit per-model resolution must not enable other workloads"
+        );
+        assert!(plan.explicit_rocm_deep_workload_v1(1).is_err());
+        let mut duplicate = plan.clone();
+        duplicate
+            .profile
+            .accelerator_devices
+            .push(duplicate.profile.accelerator_devices[1].clone());
+        assert!(duplicate.explicit_rocm_deep_workload_v1(3).is_err());
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut changed = plan.clone();
+            changed.profile.accelerator_devices[1].memory_gb = invalid;
+            assert!(changed.explicit_rocm_deep_workload_v1(3).is_err());
         }
     }
 
@@ -2111,51 +1918,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "gpu-wgpu")]
-    #[test]
-    fn hardware_plan_assigns_integrated_wgpu_to_strategy_search() {
-        let mut settings = Settings::default();
-        settings.system.enable_gpu_preference = "gpu".to_string();
-        settings.models.prop_search_device = "auto".to_string();
-        let profile = HardwareProfile {
-            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
-            cpu_cores: 12,
-            total_ram_gb: 32.0,
-            available_ram_gb: 20.0,
-            gpu_names: vec!["AMD Radeon Graphics".to_string()],
-            num_gpus: 1,
-            gpu_mem_gb: vec![0.0],
-            accelerator_devices: vec![AcceleratorDevice {
-                id: 0,
-                name: "AMD Radeon Graphics".to_string(),
-                backend: AcceleratorBackend::Vulkan,
-                device_class: AcceleratorDeviceClass::IntegratedGpu,
-                backend_index: 0,
-                memory_gb: 0.0,
-                supported_precisions: vec![TrainingPrecision::Fp32],
-                compute_capability: None,
-                source: "test-wgpu".to_string(),
-            }],
-            timestamp: "test".to_string(),
-            platform_label: "test".to_string(),
-        };
-
-        let plan = HardwareExecutionPlan::from_settings_and_profile(&settings, profile);
-        let search = plan
-            .workload(WorkloadKind::StrategySearch)
-            .expect("strategy-search plan should exist");
-
-        assert_eq!(search.backend, AcceleratorBackend::Wgpu);
-        assert_eq!(search.device, "vulkan:integrated:0");
-        assert_eq!(search.device_ids, vec![0]);
-        assert_eq!(search.memory_budget_gb, 4.0);
-        assert!(
-            search.memory_budget_gb < 20.0,
-            "shared-memory allowance must remain below available host RAM"
-        );
-        assert!(search.runtime_degraded_reason().is_none());
-    }
-
     #[test]
     fn hardware_plan_falls_back_to_cpu_when_gpu_requested_but_missing() {
         let mut settings = Settings::default();
@@ -2196,32 +1958,6 @@ mod tests {
                 .precision_policy
                 .precision,
             TrainingPrecision::Bf16
-        );
-    }
-
-    #[cfg(feature = "gpu-wgpu")]
-    #[test]
-    fn hardware_probe_consumes_typed_wgpu_overrides() {
-        let runtime_overrides = HardwareRuntimeOverrides {
-            wgpu_precisions: Some(vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16]),
-            wgpu_device_names: vec!["wgpu-test-device".to_string()],
-            ..HardwareRuntimeOverrides::default()
-        };
-        let probe = HardwareProbe::with_runtime_overrides(runtime_overrides);
-
-        let devices = probe.detect_wgpu_hint_accelerators(10);
-
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].id, 10);
-        assert_eq!(devices[0].name, "wgpu-test-device");
-        assert_eq!(devices[0].backend, AcceleratorBackend::Wgpu);
-        assert_eq!(
-            devices[0].supported_precisions,
-            vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16]
-        );
-        assert_eq!(
-            devices[0].source,
-            "hardware_runtime_overrides.wgpu_device_names"
         );
     }
 
@@ -2268,84 +2004,28 @@ mod tests {
     }
 
     #[test]
-    fn workload_assignment_records_cpu_degradation_when_gpu_path_falls_back() {
-        let mut settings = Settings::default();
-        settings.system.enable_gpu_preference = "rocm".to_string();
-        let profile = HardwareProfile {
-            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
-            cpu_cores: 64,
-            total_ram_gb: 256.0,
-            available_ram_gb: 192.0,
-            gpu_names: vec!["AMD GPU".to_string()],
-            num_gpus: 1,
-            gpu_mem_gb: vec![24.0],
-            accelerator_devices: vec![AcceleratorDevice {
-                id: 0,
-                name: "AMD GPU".to_string(),
-                backend: AcceleratorBackend::Rocm,
-                device_class: AcceleratorDeviceClass::DiscreteGpu,
-                backend_index: 0,
-                memory_gb: 24.0,
-                supported_precisions: vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16],
-                compute_capability: None,
-                source: "test".to_string(),
-            }],
-            timestamp: "test".to_string(),
-            platform_label: "test".to_string(),
-        };
-        let plan = HardwareExecutionPlan::from_settings_and_profile(&settings, profile);
+    fn retired_gpu_preferences_fail_closed_even_when_cuda_is_present() {
+        for retired in ["vulkan", "wgpu", "rocm", "hip", "metal", "dx12", "amd"] {
+            let mut settings = Settings::default();
+            settings.system.enable_gpu_preference = retired.to_string();
+            settings.models.prop_search_device = "auto".to_string();
+            let plan =
+                HardwareExecutionPlan::from_settings_and_profile(&settings, profile(1, 24.0));
 
-        let assignment = plan
-            .workload_assignment(WorkloadKind::StrategySearch)
-            .expect("search workload assignment should exist");
-
-        assert_eq!(assignment.device_assignment.backend, BackendKind::NativeCpu);
-        assert_eq!(assignment.device_assignment.device, "cpu");
-        assert_eq!(
-            assignment.runtime_degraded_reason.unwrap().code,
-            "gpu_path_unavailable"
-        );
-    }
-
-    #[test]
-    fn hardware_plan_keeps_rocm_as_primary_backend_when_only_rocm_is_available() {
-        let mut settings = Settings::default();
-        settings.system.enable_gpu_preference = "rocm".to_string();
-        let profile = HardwareProfile {
-            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
-            cpu_cores: 64,
-            total_ram_gb: 256.0,
-            available_ram_gb: 192.0,
-            gpu_names: vec!["AMD GPU".to_string()],
-            num_gpus: 1,
-            gpu_mem_gb: vec![24.0],
-            accelerator_devices: vec![AcceleratorDevice {
-                id: 0,
-                name: "AMD GPU".to_string(),
-                backend: AcceleratorBackend::Rocm,
-                device_class: AcceleratorDeviceClass::DiscreteGpu,
-                backend_index: 0,
-                memory_gb: 24.0,
-                supported_precisions: vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16],
-                compute_capability: None,
-                source: "test".to_string(),
-            }],
-            timestamp: "test".to_string(),
-            platform_label: "test".to_string(),
-        };
-
-        let plan = HardwareExecutionPlan::from_settings_and_profile(&settings, profile);
-
-        assert!(plan.gpu_enabled);
-        assert_eq!(plan.primary_backend, AcceleratorBackend::Rocm);
-        assert_eq!(
-            plan.workload(WorkloadKind::DeepTraining).unwrap().device,
-            "rocm:0"
-        );
-        assert_eq!(
-            plan.workload(WorkloadKind::StrategySearch).unwrap().backend,
-            AcceleratorBackend::Cpu
-        );
+            assert!(!plan.gpu_enabled, "{retired} must not alias CUDA");
+            assert_eq!(plan.primary_backend, AcceleratorBackend::Cpu);
+            let assignment = plan
+                .workload_assignment(WorkloadKind::StrategySearch)
+                .expect("search workload assignment should exist");
+            assert_eq!(assignment.device_assignment.backend, BackendKind::NativeCpu);
+            assert_eq!(assignment.device_assignment.device, "cpu");
+            assert!(
+                plan.warnings
+                    .iter()
+                    .any(|warning| warning.contains(retired)),
+                "the retired value must be named in the plan warning"
+            );
+        }
     }
 
     /// A container limit must win, and a non-limit must not.
@@ -2376,13 +2056,37 @@ mod tests {
     }
 
     #[test]
-    fn reported_zero_cgroup_headroom_clamps_available_but_not_total_memory() {
+    fn zeroed_or_unconstrained_cgroup_report_leaves_host_memory_untouched() {
         const HOST_TOTAL: u64 = 64 * 1024 * 1024 * 1024;
         const HOST_AVAILABLE: u64 = 32 * 1024 * 1024 * 1024;
 
         assert_eq!(
             clamp_memory_figures_to_reported_cgroup(HOST_TOTAL, HOST_AVAILABLE, 0, 0),
-            (HOST_TOTAL, 0)
+            (HOST_TOTAL, HOST_AVAILABLE)
+        );
+        assert_eq!(
+            clamp_memory_figures_to_reported_cgroup(HOST_TOTAL, HOST_AVAILABLE, HOST_TOTAL, 0,),
+            (HOST_TOTAL, HOST_AVAILABLE)
+        );
+        assert_eq!(
+            clamp_memory_figures_to_reported_cgroup(HOST_TOTAL, HOST_AVAILABLE, HOST_TOTAL * 2, 0,),
+            (HOST_TOTAL, HOST_AVAILABLE)
+        );
+    }
+
+    #[test]
+    fn real_cgroup_limit_clamps_total_and_available_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const HOST_TOTAL: u64 = 64 * GIB;
+        const HOST_AVAILABLE: u64 = 32 * GIB;
+
+        assert_eq!(
+            clamp_memory_figures_to_reported_cgroup(HOST_TOTAL, HOST_AVAILABLE, 12 * GIB, 4 * GIB),
+            (12 * GIB, 4 * GIB)
+        );
+        assert_eq!(
+            clamp_memory_figures_to_reported_cgroup(HOST_TOTAL, HOST_AVAILABLE, 12 * GIB, 0),
+            (12 * GIB, 0)
         );
     }
 
@@ -2397,5 +2101,59 @@ mod tests {
         );
         assert_eq!(preferred_cgroup_memory_limits(None, Some(root)), Some(root));
         assert_eq!(preferred_cgroup_memory_limits(None, None), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_live_memory_probe_is_not_zeroed_by_cgroup_placeholder() {
+        let total = total_memory_bytes();
+        let available = available_memory_bytes();
+
+        eprintln!("windows_live_memory_probe total_bytes={total} available_bytes={available}");
+        assert!(total > 0, "Windows total-memory probe returned zero");
+        assert!(
+            available > 0,
+            "Windows available-memory probe was zeroed by a phantom cgroup report"
+        );
+        assert!(available <= total);
+    }
+
+    #[test]
+    fn allocation_headroom_uses_the_tightest_windows_limit() {
+        assert_eq!(windows_allocation_headroom(8_000, 500, 100_000), 500);
+        assert_eq!(windows_allocation_headroom(500, 8_000, 100_000), 500);
+        assert_eq!(windows_allocation_headroom(8_000, 8_000, 500), 500);
+        assert_eq!(windows_allocation_headroom(u64::MAX, 500, u64::MAX), 500);
+    }
+
+    #[test]
+    fn allocation_headroom_does_not_replace_exhaustion_with_a_floor() {
+        for limits in [(0, 8_000, 8_000), (8_000, 0, 8_000), (8_000, 8_000, 0)] {
+            assert_eq!(windows_allocation_headroom(limits.0, limits.1, limits.2), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn allocation_headroom_reads_the_real_windows_process_snapshot() {
+        let status = windows_memory_status().expect("live Win32 memory snapshot");
+        let headroom = windows_allocation_headroom(
+            status.ullAvailPhys,
+            status.ullAvailPageFile,
+            status.ullAvailVirtual,
+        );
+        eprintln!(
+            "windows_allocation_headroom physical={} process_commit={} virtual_address={} admitted={headroom}",
+            status.ullAvailPhys, status.ullAvailPageFile, status.ullAvailVirtual
+        );
+        assert_eq!(status.dwLength as usize, std::mem::size_of_val(&status));
+        assert!(status.ullTotalPhys > 0);
+        assert!(status.ullAvailPhys <= status.ullTotalPhys);
+        assert!(status.ullAvailPageFile <= status.ullTotalPageFile);
+        assert!(headroom <= status.ullAvailPhys);
+        assert!(headroom <= status.ullAvailPageFile);
+        assert!(headroom <= status.ullAvailVirtual);
+        // A second call is volatile; compare only the stable physical ceiling.
+        assert!(allocation_headroom_bytes() <= status.ullTotalPhys);
     }
 }

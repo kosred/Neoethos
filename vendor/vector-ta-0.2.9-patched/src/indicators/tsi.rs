@@ -484,60 +484,14 @@ pub unsafe fn tsi_scalar_classic(
     first: usize,
     out: &mut [f64],
 ) -> Result<(), TsiError> {
-    let n = data.len();
-    let warmup_end = first + long + short;
-
-    if first + 1 >= n {
-        return Ok(());
-    }
-
-    let long_alpha = 2.0 / (long as f64 + 1.0);
-    let short_alpha = 2.0 / (short as f64 + 1.0);
-    let long_1minus = 1.0 - long_alpha;
-    let short_1minus = 1.0 - short_alpha;
-
-    let mut prev = data[first];
-
-    if first + 1 >= n || !data[first + 1].is_finite() {
-        return Ok(());
-    }
-
-    let first_momentum = data[first + 1] - prev;
-    prev = data[first + 1];
-
-    let mut ema_long_num = first_momentum;
-    let mut ema_short_num = first_momentum;
-    let mut ema_long_den = first_momentum.abs();
-    let mut ema_short_den = first_momentum.abs();
-
-    for i in (first + 2)..n {
-        let cur = data[i];
-        if !cur.is_finite() {
-            out[i] = f64::NAN;
-            continue;
-        }
-
-        let momentum = cur - prev;
-        prev = cur;
-
-        ema_long_num = long_alpha * momentum + long_1minus * ema_long_num;
-
-        ema_short_num = short_alpha * ema_long_num + short_1minus * ema_short_num;
-
-        ema_long_den = long_alpha * momentum.abs() + long_1minus * ema_long_den;
-
-        ema_short_den = short_alpha * ema_long_den + short_1minus * ema_short_den;
-
-        if i >= warmup_end {
-            out[i] = if ema_short_den == 0.0 {
-                f64::NAN
-            } else {
-                (100.0 * (ema_short_num / ema_short_den)).clamp(-100.0, 100.0)
-            };
-        }
-    }
-
-    Ok(())
+    // Keep one scalar arithmetic authority for every parameter tuple.  The
+    // former 25/13 fast path returned immediately when `data[first + 1]` was
+    // non-finite, while the general path correctly scanned forward to the next
+    // finite observation.  That made the default API all-NaN after a single
+    // initial gap even though the same formula with explicit parameters
+    // recovered.  Delegating preserves the public compatibility symbol without
+    // retaining a second state machine that can drift again.
+    tsi_compute_into_inline(data, long, short, first, out)
 }
 
 #[cfg(all(feature = "nightly-avx", target_arch = "x86_64"))]

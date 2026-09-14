@@ -36,7 +36,7 @@ const M15_MILLIS: i64 = 15 * 60 * 1_000;
 const FIXTURE_ROWS: usize = 1_200;
 const CONFIGURED_POPULATION: usize = 200;
 const MAX_INDICATORS: usize = 5;
-const NATIVE_AUTO_HARD_GROWTH_CAP: usize = 16_384;
+const NATIVE_SIGNED_EXTENT_CAP: usize = i32::MAX as usize;
 const METRIC_WIDTH: usize = 11;
 const METRIC_ROW_BYTES: u64 = 104;
 
@@ -358,7 +358,7 @@ fn assert_published_result(
     assert!(published.resolved_population() <= published.population_cap());
     assert_eq!(
         published.hard_growth_cap(),
-        published.population_cap().min(NATIVE_AUTO_HARD_GROWTH_CAP)
+        published.population_cap().min(NATIVE_SIGNED_EXTENT_CAP)
     );
     assert!(published.resolved_population() <= published.hard_growth_cap());
     assert!(published.stage1_row_end() > published.stage1_row_start());

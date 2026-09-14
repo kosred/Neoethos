@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::{error::Error as StdError, fmt};
 
 use anyhow::{Context as _, Result, bail};
+use neoethos_dataset_contracts::CanonicalTimeframe;
 use neoethos_feature_contracts::{
     DatasetFeatureArtifactProvenanceV1, FeatureOperationTagV1, FeaturePlanV1,
 };
@@ -28,9 +29,12 @@ use neoethos_gpu_cuda::resident_classic_ta_v3::{
     resident_classic_ta_capability_v3,
 };
 use neoethos_gpu_cuda::resident_feature_store_v3::{
-    GpuOnlyRunDeviceAdmissionV3, ResidentFeatureColumnBindingV3, ResidentFeatureCompactHashesV3,
-    ResidentFeatureLayoutEvidenceV3, ResidentFeatureStoreAssemblerV3,
-    ResidentFeatureStoreCudaErrorV3, ResidentFeatureStoreImportV3, ResidentFeatureStoreOwnerV3,
+    CompactSelectedStoreAllocationExtentV2, GpuOnlyRunDeviceAdmissionV3,
+    ResidentFeatureColumnBindingV3, ResidentFeatureCompactHashesV3,
+    ResidentFeatureLayoutEvidenceV3, ResidentFeatureScreeningErrorV2,
+    ResidentFeatureScreeningPassV2, ResidentFeatureScreeningRunRecoveryV2,
+    ResidentFeatureStoreAssemblerV3, ResidentFeatureStoreCudaErrorV3, ResidentFeatureStoreImportV3,
+    ResidentFeatureStoreOwnerV3, ResidentTrimPrefilterScreeningSchemaUploadV2,
     resident_canonical_content_sha256_capability_v3,
     resident_feature_major_to_bar_major_capability_v3,
 };
@@ -52,16 +56,25 @@ use neoethos_gpu_cuda::resident_robust_normalization_v2::{
 use neoethos_gpu_cuda::resident_session_v2::resident_session_capability_v2;
 use neoethos_gpu_cuda::resident_smc_v3::{
     PendingResidentSmcBatchV3, RESIDENT_SMC_COLUMN_NAMES_V3, ResidentSmcMaterializationV3,
+    begin_resident_smc_compact_store_v2, begin_resident_smc_screening_pass_v2,
     begin_resident_smc_store_v3, preflight_resident_smc_memory_v4, prepare_resident_smc_parent_v3,
     resident_smc_capability_v3,
 };
+use neoethos_gpu_cuda::resident_trim_prefilter_v1::{
+    BoundedResidentTrimPrefilterSelectedMapReadV2, ResidentTrimPrefilterDeviceErrorV1,
+    ResidentTrimPrefilterDeviceRunV1, ResidentTrimPrefilterInputsV1,
+    UnboundResidentTrimPrefilterWorkspacePreflightV2, read_bounded_selected_map_v2,
+    seal_selected_map_v2 as seal_native_selected_map_v2,
+};
 use neoethos_gpu_cuda::{
-    AdmittedNativeCudaDataPopulationRunV1, DataPopulationWorkspacePlanErrorV1,
-    DataPopulationWorkspacePreflightRequestV1, FullDiscoveryWorkspacePlanErrorV1,
+    AdmittedNativeCudaDataPopulationRunV1, AdmittedNativeCudaFeatureScreeningRunV2,
+    DataPopulationWorkspacePlanErrorV1, DataPopulationWorkspacePreflightRequestV1,
+    FeatureScreeningWorkspacePreflightRequestV2, FullDiscoveryWorkspacePlanErrorV1,
     PopulationGeneStorePlanV1, PopulationMetricsOnlyPlanV1, SealedDataPopulationGpuWorkspacePlanV1,
-    SealedNativeCudaDataPopulationPreflightFactsV1,
+    SealedFeatureScreeningGpuWorkspacePlanV2, SealedNativeCudaDataPopulationPreflightFactsV1,
     full_discovery_workspace_plan_v1::AdmittedNativeCudaFullDiscoveryRunV1,
-    seal_data_population_gpu_workspace_plan_v1,
+    seal_data_population_gpu_workspace_plan_v1, seal_feature_screening_gpu_workspace_plan_v2,
+    upgrade_feature_screening_run_to_data_population_v2,
 };
 use sha2::{Digest, Sha256};
 use vector_ta::cuda::F64_EXACT_MATH_AUTHORITY_V3;
@@ -83,6 +96,7 @@ use super::gpu_resident_feature_recipe_v4::{
 };
 use super::gpu_resident_higher_timeframe_alignment_v3::{
     HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION_V3, PendingResidentHigherTimeframeRuntimeV3,
+    PreparedResidentHigherTimeframeAppendV3,
     PreparedResidentHigherTimeframeDirectParentCaptureTemplateV3,
     ValidatedResidentHigherTimeframeDirectParentCaptureV3,
     preflight_resident_higher_timeframe_alignment_v3,
@@ -93,7 +107,9 @@ use super::gpu_resident_quant_v3::{
 };
 use super::gpu_resident_regime_v3::{PreparedResidentRegimeInputV3, preflight_resident_regime_v3};
 use super::gpu_resident_robust_normalization_v2::{
-    PreparedResidentRobustNormalizationInputV2, prepare_resident_robust_normalization_input_v2,
+    PreparedResidentRobustNormalizationInputV2, ResidentRobustNormalizationReplayRecipeV2,
+    fitted_state_from_device_words, prepare_resident_robust_normalization_input_v2,
+    search_normalization_column_mode_v3,
 };
 use super::gpu_resident_session_v2::{
     PreparedResidentSessionRuntimeV2, preflight_current_native_resident_session_v2,
@@ -102,6 +118,7 @@ use super::hpc_ta::{
     IndicatorComputePolicy, prepare_classic_ta_gpu_exact_parity_run_plan_v3,
     prepare_classic_ta_run_plan,
 };
+use super::normalization::SearchNormalizationFittedStateV1;
 use super::pinned_canonical_series_v1::MaterializedPinnedResidentCanonicalSourcesV1;
 use super::pinned_source_projection_v1::{
     CanonicalPinnedSourceProjectionV1, derive_pinned_source_projection_v1,
@@ -208,6 +225,20 @@ impl From<DataPopulationWorkspacePlanErrorV1> for GpuOnlyFeatureMaterializationE
     }
 }
 
+impl From<ResidentFeatureScreeningErrorV2> for GpuOnlyFeatureMaterializationErrorV3 {
+    fn from(error: ResidentFeatureScreeningErrorV2) -> Self {
+        Self::Other(anyhow::anyhow!(
+            "resident feature screening failed: {error:?}"
+        ))
+    }
+}
+
+impl From<ResidentTrimPrefilterDeviceErrorV1> for GpuOnlyFeatureMaterializationErrorV3 {
+    fn from(error: ResidentTrimPrefilterDeviceErrorV1) -> Self {
+        Self::Other(anyhow::anyhow!("resident trim/prefilter failed: {error:?}"))
+    }
+}
+
 /// Crate-owned resolved inputs. There is no public constructor: Data derives
 /// this from the immutable feature recipe, exact route projections and
 /// producer ledgers. The moved gpu-cuda run-device carrier is the sole owner of
@@ -226,6 +257,7 @@ pub(crate) struct ResolvedGpuOnlyFeatureMaterializationPlanV3 {
     normalization_scratch_bytes: u64,
     fit_metadata_bytes: u64,
     robust_normalization_input: Option<PreparedResidentRobustNormalizationInputV2>,
+    robust_normalization_replay_v2: ResidentRobustNormalizationReplayRecipeV2,
     feature_identity: ResidentFeatureIdentityTemplateV4,
 }
 
@@ -234,6 +266,7 @@ struct ResolvedResidentProducerBatchMemoryV3 {
     producer: ResidentFeatureProducerV3,
     first_column: usize,
     column_count: usize,
+    produced_column_count: usize,
     additional_retained_bytes: u64,
     scratch_bytes: u64,
 }
@@ -280,6 +313,8 @@ pub(crate) struct RobustNormalizationAllocationReceiptV2 {
     control_error_d2h_bytes: u64,
     fit_digest_readback_count: u64,
     fit_digest_d2h_bytes: u64,
+    fit_words_readback_count: u64,
+    fit_words_d2h_bytes: u64,
     parent_input_h2d_bytes: u64,
     feature_value_d2h_bytes: u64,
 }
@@ -486,6 +521,19 @@ impl BoundRobustNormalizationComponentReceiptV2 {
                 "normalization fit-digest D2H bytes",
             )? != allocation.fit_digest_d2h_bytes
             || checked_u64(
+                runtime.fit_words_readback_count(),
+                "normalization fit-word readbacks",
+            )? != allocation.fit_words_readback_count
+            || checked_u64(
+                runtime.fit_words_d2h_bytes(),
+                "normalization fit-word D2H bytes",
+            )? != allocation.fit_words_d2h_bytes
+            || runtime
+                .fit_metadata_words_v3()
+                .len()
+                .checked_mul(std::mem::size_of::<u64>())
+                != Some(runtime.fit_words_d2h_bytes())
+            || checked_u64(
                 runtime.parent_input_h2d_bytes(),
                 "normalization parent input H2D bytes",
             )? != allocation.parent_input_h2d_bytes
@@ -515,6 +563,7 @@ impl BoundRobustNormalizationComponentReceiptV2 {
             .validity_error_d2h_bytes
             .checked_add(evidence.canonical_root_d2h_bytes)
             .and_then(|bytes| bytes.checked_add(runtime.fit_digest_d2h_bytes()))
+            .and_then(|bytes| bytes.checked_add(runtime.fit_words_d2h_bytes()))
             .ok_or_else(|| {
                 GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
                     "resident compact control-plane D2H accounting overflowed"
@@ -538,6 +587,31 @@ impl BoundRobustNormalizationComponentReceiptV2 {
         self.validate_runtime_receipt(&runtime)?;
         Ok(())
     }
+
+    fn portable_fitted_state(
+        &self,
+        names: &[String],
+        evidence: &ResidentFeatureLayoutEvidenceV3,
+    ) -> std::result::Result<
+        Option<SearchNormalizationFittedStateV1>,
+        GpuOnlyFeatureMaterializationErrorV3,
+    > {
+        let runtime = evidence
+            .robust_normalization_runtime_receipt_v2
+            .as_ref()
+            .ok_or(GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch)?;
+        self.validate_runtime_receipt(runtime)?;
+        if !runtime.enabled() {
+            return Ok(None);
+        }
+        fitted_state_from_device_words(
+            names,
+            self.sealed.runtime_plan.training_rows(),
+            runtime.fit_metadata_words_v3(),
+        )
+        .map(Some)
+        .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)
+    }
 }
 
 fn seal_robust_normalization_component_receipt_v2(
@@ -556,12 +630,18 @@ fn seal_robust_normalization_component_receipt_v2(
     {
         return Err(GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch);
     }
+    let column_modes = plan
+        .planned_routes
+        .iter()
+        .map(|route| search_normalization_column_mode_v3(route.feature_name()))
+        .collect::<Vec<_>>();
     let runtime_plan = ResidentRobustNormalizationPlanV2::preflight(
         prepared.row_count(),
         prepared.feature_column_count(),
         prepared.training_rows(),
         prepared.enabled(),
-    )?;
+    )?
+    .with_column_modes_v3(column_modes.clone())?;
     if runtime_plan.padded_training_rows() != prepared.padded_training_rows()
         || runtime_plan.normalization_scratch_bytes() != prepared.normalization_scratch_bytes()
         || runtime_plan.fit_metadata_bytes() != prepared.fit_metadata_bytes()
@@ -621,6 +701,11 @@ fn seal_robust_normalization_component_receipt_v2(
         control_error_d2h_bytes: one_if_enabled * std::mem::size_of::<u32>() as u64,
         fit_digest_readback_count: one_if_enabled,
         fit_digest_d2h_bytes: one_if_enabled * 32,
+        fit_words_readback_count: one_if_enabled,
+        fit_words_d2h_bytes: checked_u64(
+            runtime_plan.fit_metadata_bytes(),
+            "normalization fit-word D2H bytes",
+        )?,
         parent_input_h2d_bytes: 0,
         feature_value_d2h_bytes: 0,
     };
@@ -651,6 +736,10 @@ fn seal_robust_normalization_component_receipt_v2(
     identity.update(plan.dataset_recipe_sha256);
     identity.update(plan.feature_plan_schema_sha256);
     identity.update(plan.route_plan_sha256);
+    identity.update(super::normalization::SEARCH_NORMALIZATION_POLICY_VERSION.to_le_bytes());
+    for mode in column_modes {
+        identity.update([mode as u8]);
+    }
     identity.update(capability.implementation_sha256());
     identity.update(capability.exact_math_authority().as_bytes());
     identity.update(allocation.semantic_version.to_le_bytes());
@@ -677,6 +766,8 @@ fn seal_robust_normalization_component_receipt_v2(
     identity.update(allocation.control_error_d2h_bytes.to_le_bytes());
     identity.update(allocation.fit_digest_readback_count.to_le_bytes());
     identity.update(allocation.fit_digest_d2h_bytes.to_le_bytes());
+    identity.update(allocation.fit_words_readback_count.to_le_bytes());
+    identity.update(allocation.fit_words_d2h_bytes.to_le_bytes());
     identity.update(allocation.parent_input_h2d_bytes.to_le_bytes());
     identity.update(allocation.feature_value_d2h_bytes.to_le_bytes());
     let component_identity_sha256 = identity.finalize().into();
@@ -1638,9 +1729,13 @@ fn exact_resident_working_set_extent_request_v3(
         {
             bail!("producer batch schema does not match the exact admitted route range")
         }
-        let columns = checked_u64(batch.column_count, "producer batch columns")?;
+        let selected_columns = checked_u64(batch.column_count, "producer batch columns")?;
+        let produced_columns = checked_u64(
+            batch.produced_column_count,
+            "producer emitted batch columns",
+        )?;
         let cells = rows
-            .checked_mul(columns)
+            .checked_mul(produced_columns)
             .context("producer batch cell count overflow")?;
         let value_and_logical_validity_bytes = cells
             .checked_mul(9)
@@ -1651,7 +1746,7 @@ fn exact_resident_working_set_extent_request_v3(
         max_live_producer_bytes = max_live_producer_bytes.max(exact_retained_bytes);
         max_live_producer_scratch_bytes = max_live_producer_scratch_bytes.max(batch.scratch_bytes);
         max_pointer_table_bytes = max_pointer_table_bytes.max(
-            columns
+            selected_columns
                 .checked_mul(4 * u64::BITS as u64 / 8)
                 .context("producer pointer-table byte count overflow")?,
         );
@@ -1721,6 +1816,7 @@ pub struct GpuOnlyFeatureMaterializationAdmissionV3 {
     feature_major_to_bar_major: SealedFeatureMajorToBarMajorComponentReceiptV3,
     canonical_content_sha256: SealedCanonicalContentSha256ComponentReceiptV3,
     feature_identity: ResidentFeatureIdentityTemplateV4,
+    produced_higher_timeframe_column_count_v2: usize,
 }
 
 impl GpuOnlyFeatureMaterializationAdmissionV3 {
@@ -1760,6 +1856,51 @@ impl GpuOnlyFeatureMaterializationAdmissionV3 {
                 feature_major_to_bar_major: self.feature_major_to_bar_major,
                 canonical_content_sha256: self.canonical_content_sha256,
                 feature_identity: self.feature_identity,
+                produced_higher_timeframe_column_count_v2: self
+                    .produced_higher_timeframe_column_count_v2,
+            },
+            assembler,
+            pending_smc_batch,
+        ))
+    }
+
+    fn begin_compact_materialization_v2(
+        self,
+        parent_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+        selected_global_parent_ordinals: Vec<u32>,
+        compact_extent: CompactSelectedStoreAllocationExtentV2,
+        smc_materialization: ResidentSmcMaterializationV3,
+    ) -> std::result::Result<
+        (
+            GpuOnlyFeatureMaterializationSealTokenV3,
+            ResidentFeatureStoreAssemblerV3,
+            PendingResidentSmcBatchV3,
+        ),
+        GpuOnlyFeatureMaterializationErrorV3,
+    > {
+        if self.authority != DATA_GPU_ONLY_ADMISSION_AUTHORITY_V3 {
+            return Err(GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch);
+        }
+        let (assembler, pending_smc_batch) = begin_resident_smc_compact_store_v2(
+            self.run_device,
+            parent_column_bindings,
+            selected_global_parent_ordinals,
+            self.contract.working_set(),
+            compact_extent,
+            smc_materialization,
+        )?;
+        Ok((
+            GpuOnlyFeatureMaterializationSealTokenV3 {
+                authority: self.authority,
+                contract: self.contract,
+                footprint: self.footprint,
+                regime: self.regime,
+                robust_normalization: self.robust_normalization,
+                feature_major_to_bar_major: self.feature_major_to_bar_major,
+                canonical_content_sha256: self.canonical_content_sha256,
+                feature_identity: self.feature_identity,
+                produced_higher_timeframe_column_count_v2: self
+                    .produced_higher_timeframe_column_count_v2,
             },
             assembler,
             pending_smc_batch,
@@ -1780,6 +1921,7 @@ pub(crate) struct GpuOnlyFeatureMaterializationSealTokenV3 {
     feature_major_to_bar_major: SealedFeatureMajorToBarMajorComponentReceiptV3,
     canonical_content_sha256: SealedCanonicalContentSha256ComponentReceiptV3,
     feature_identity: ResidentFeatureIdentityTemplateV4,
+    produced_higher_timeframe_column_count_v2: usize,
 }
 
 /// Stable semantic marker exposed to Search only after Data has revalidated
@@ -1885,6 +2027,7 @@ pub struct SealedGpuResidentFeatureStoreV3 {
     contract: SealedResidentFeatureStoreV3,
     final_feature_plan_v3_sha256: [u8; 32],
     normalization_fit_sha256: [u8; 32],
+    normalization_fitted_state: Option<SearchNormalizationFittedStateV1>,
     source_provenance_sha256: [u8; 32],
     footprint: SealedFootprintComponentReceiptV2,
     regime: SealedRegimeComponentReceiptV3,
@@ -1895,6 +2038,7 @@ pub struct SealedGpuResidentFeatureStoreV3 {
     source_provenance: DatasetFeatureArtifactProvenanceV1,
     pinned_source_projection_v1: CanonicalPinnedSourceProjectionV1,
     resident_sources: MaterializedPinnedResidentCanonicalSourcesV1,
+    produced_higher_timeframe_column_count_v2: usize,
     owner: Arc<ResidentFeatureStoreOwnerV3>,
 }
 
@@ -1923,6 +2067,12 @@ impl SealedGpuResidentFeatureStoreV3 {
 
     pub const fn normalization_fit_sha256(&self) -> [u8; 32] {
         self.normalization_fit_sha256
+    }
+
+    /// Portable name-aware training fits reconstructed from the completed
+    /// device receipt. This is distinct from the native transport digest.
+    pub fn normalization_fitted_state(&self) -> Option<&SearchNormalizationFittedStateV1> {
+        self.normalization_fitted_state.as_ref()
     }
 
     pub const fn source_provenance_sha256(&self) -> [u8; 32] {
@@ -2035,12 +2185,18 @@ impl SealedGpuResidentFeatureStoreV3 {
         let runtime_normalization_fit_sha256 = self
             .robust_normalization
             .validate_runtime_evidence(&runtime_layout_evidence)?;
-        let htf_route_count = self
-            .admission
-            .planned_routes()
-            .iter()
-            .filter(|route| route.producer() == ResidentFeatureProducerV3::HigherTimeframeAlignment)
-            .count();
+        let runtime_fitted_state = self
+            .robust_normalization
+            .portable_fitted_state(self.feature_plan.final_outputs(), &runtime_layout_evidence)?;
+        if runtime_fitted_state != self.normalization_fitted_state {
+            return Err(GpuOnlyFeatureMaterializationErrorV3::PrimaryContextBuildIdentityMismatch);
+        }
+        if let Some(fitted) = &self.normalization_fitted_state {
+            fitted
+                .validate_plan(&self.feature_plan)
+                .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)?;
+        }
+        let htf_route_count = self.produced_higher_timeframe_column_count_v2;
         let htf_runtime_evidence_matches = runtime_layout_evidence
             .higher_timeframe_runtime_receipt_v3
             .as_ref()
@@ -2153,6 +2309,7 @@ pub(crate) fn seal_current_resident_producer_capability_manifest_v3()
 #[derive(Debug)]
 pub(crate) struct GpuOnlyFeatureRecipePreflightV3 {
     plan: ResolvedGpuOnlyFeatureMaterializationPlanV3,
+    produced_higher_timeframe_column_count_v2: usize,
     footprint: SealedFootprintComponentReceiptV2,
     regime: SealedRegimeComponentReceiptV3,
     robust_normalization: SealedRobustNormalizationComponentReceiptV2,
@@ -2214,14 +2371,182 @@ pub(crate) fn preflight_gpu_only_feature_recipe_v3(
     )?;
     let robust_normalization =
         seal_robust_normalization_component_receipt_v2(&plan, robust_normalization_input)?;
+    let produced_higher_timeframe_column_count_v2 = plan
+        .planned_routes
+        .iter()
+        .filter(|route| route.producer() == ResidentFeatureProducerV3::HigherTimeframeAlignment)
+        .count();
     Ok(GpuOnlyFeatureRecipePreflightV3 {
         plan,
+        produced_higher_timeframe_column_count_v2,
         footprint,
         regime,
         robust_normalization,
         feature_major_to_bar_major,
         canonical_content_sha256,
     })
+}
+
+fn project_gpu_only_feature_recipe_preflight_v2(
+    preflight: GpuOnlyFeatureRecipePreflightV3,
+    selected_global_parent_ordinals: &[u32],
+) -> std::result::Result<
+    (
+        GpuOnlyFeatureRecipePreflightV3,
+        Vec<ResidentFeatureColumnBindingV3>,
+        Vec<ResidentFeatureRouteV3>,
+    ),
+    GpuOnlyFeatureMaterializationErrorV3,
+> {
+    let GpuOnlyFeatureRecipePreflightV3 {
+        plan,
+        produced_higher_timeframe_column_count_v2,
+        footprint,
+        regime,
+        robust_normalization: _,
+        feature_major_to_bar_major: _,
+        canonical_content_sha256: _,
+    } = preflight;
+    let ResolvedGpuOnlyFeatureMaterializationPlanV3 {
+        dataset_recipe_sha256,
+        feature_plan_schema_sha256: parent_feature_plan_schema_sha256,
+        route_plan_sha256: parent_route_plan_sha256,
+        row_count,
+        planned_routes: parent_routes,
+        producer_capabilities,
+        producer_batches: parent_batches,
+        regime_scale_anchor_bits,
+        regime_input_identity_sha256,
+        normalization_scratch_bytes: _,
+        fit_metadata_bytes: _,
+        robust_normalization_input: _,
+        robust_normalization_replay_v2,
+        feature_identity,
+    } = plan;
+    if selected_global_parent_ordinals.is_empty()
+        || parent_feature_plan_schema_sha256 == [0; 32]
+        || parent_route_plan_sha256 == [0; 32]
+    {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!("compact projection requires a sealed nonempty parent recipe"),
+        ));
+    }
+    let parent_column_bindings = parent_routes
+        .iter()
+        .map(ResidentFeatureColumnBindingV3::from_admitted_route)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let (feature_identity, planned_routes) = feature_identity
+        .project_selected_routes_v2(
+            &parent_routes,
+            selected_global_parent_ordinals,
+            &producer_capabilities,
+        )
+        .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)?;
+
+    let mut producer_batches = Vec::new();
+    let mut compact_first_column = 0_usize;
+    let mut parent_next_column = 0_usize;
+    for batch in parent_batches {
+        if batch.first_column != parent_next_column
+            || batch.column_count == 0
+            || batch.produced_column_count < batch.column_count
+        {
+            return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+                anyhow::anyhow!("parent producer batch ledger drifted before compact replay"),
+            ));
+        }
+        let parent_end = batch
+            .first_column
+            .checked_add(batch.column_count)
+            .ok_or_else(|| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "parent producer batch extent overflowed"
+                ))
+            })?;
+        let selected_count = selected_global_parent_ordinals
+            .iter()
+            .filter(|&&ordinal| {
+                usize::try_from(ordinal)
+                    .ok()
+                    .is_some_and(|ordinal| ordinal >= batch.first_column && ordinal < parent_end)
+            })
+            .count();
+        if selected_count > 0 {
+            producer_batches.push(ResolvedResidentProducerBatchMemoryV3 {
+                producer: batch.producer,
+                first_column: compact_first_column,
+                column_count: selected_count,
+                produced_column_count: batch.produced_column_count,
+                additional_retained_bytes: batch.additional_retained_bytes,
+                scratch_bytes: batch.scratch_bytes,
+            });
+            compact_first_column = compact_first_column
+                .checked_add(selected_count)
+                .ok_or_else(|| {
+                    GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                        "compact producer batch census overflowed"
+                    ))
+                })?;
+        }
+        parent_next_column = parent_end;
+    }
+    if parent_next_column != parent_routes.len()
+        || compact_first_column != planned_routes.len()
+        || compact_first_column != selected_global_parent_ordinals.len()
+    {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!("compact producer batches do not cover the sealed selected map"),
+        ));
+    }
+    let robust_normalization_input = robust_normalization_replay_v2
+        .prepare_for_feature_width_v2(planned_routes.len())
+        .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)?;
+    let normalization_scratch_bytes = checked_u64(
+        robust_normalization_input.normalization_scratch_bytes(),
+        "compact normalization scratch bytes",
+    )?;
+    let fit_metadata_bytes = checked_u64(
+        robust_normalization_input.fit_metadata_bytes(),
+        "compact normalization fit metadata bytes",
+    )?;
+    let mut plan = ResolvedGpuOnlyFeatureMaterializationPlanV3 {
+        dataset_recipe_sha256,
+        feature_plan_schema_sha256: feature_identity.feature_plan_schema_sha256(),
+        route_plan_sha256: feature_identity.route_plan_sha256(),
+        row_count,
+        planned_routes,
+        producer_capabilities,
+        producer_batches,
+        regime_scale_anchor_bits,
+        regime_input_identity_sha256,
+        normalization_scratch_bytes,
+        fit_metadata_bytes,
+        robust_normalization_input: Some(robust_normalization_input),
+        robust_normalization_replay_v2,
+        feature_identity,
+    };
+    let feature_major_to_bar_major = seal_feature_major_to_bar_major_component_receipt_v3(&plan)?;
+    let canonical_content_sha256 = seal_canonical_content_sha256_component_receipt_v3(&plan)?;
+    let robust_normalization_input = plan.robust_normalization_input.take().ok_or(
+        GpuOnlyFeatureMaterializationErrorV3::A2ProducerFactoryNotIntegrated {
+            component: "compact move-only resident robust-normalization input",
+        },
+    )?;
+    let robust_normalization =
+        seal_robust_normalization_component_receipt_v2(&plan, robust_normalization_input)?;
+    Ok((
+        GpuOnlyFeatureRecipePreflightV3 {
+            plan,
+            produced_higher_timeframe_column_count_v2,
+            footprint,
+            regime,
+            robust_normalization,
+            feature_major_to_bar_major,
+            canonical_content_sha256,
+        },
+        parent_column_bindings,
+        parent_routes,
+    ))
 }
 
 pub(crate) fn bind_gpu_only_run_device_v3(
@@ -2233,6 +2558,7 @@ pub(crate) fn bind_gpu_only_run_device_v3(
 > {
     let GpuOnlyFeatureRecipePreflightV3 {
         plan,
+        produced_higher_timeframe_column_count_v2,
         footprint,
         regime,
         robust_normalization,
@@ -2282,6 +2608,7 @@ pub(crate) fn bind_gpu_only_run_device_v3(
         feature_major_to_bar_major,
         canonical_content_sha256,
         feature_identity,
+        produced_higher_timeframe_column_count_v2,
     })
 }
 
@@ -2312,9 +2639,20 @@ pub(crate) fn seal_gpu_resident_feature_store_v3(
     let normalization_fit_sha256 = seal_token
         .robust_normalization
         .validate_runtime_evidence(&evidence)?;
+    let normalization_names = owner
+        .column_bindings()
+        .iter()
+        .map(|binding| binding.feature_name.clone())
+        .collect::<Vec<_>>();
+    let normalization_fitted_state = seal_token
+        .robust_normalization
+        .portable_fitted_state(&normalization_names, &evidence)?;
     let finalized_identity = seal_token
         .feature_identity
-        .finalize_after_normalization_v4(normalization_fit_sha256)
+        .finalize_after_normalization_v4(
+            normalization_fit_sha256,
+            normalization_fitted_state.as_ref(),
+        )
         .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)?;
     let (feature_plan, source_provenance, resident_sources) = finalized_identity.into_parts();
     let pinned_source_projection_v1 = derive_pinned_source_projection_v1(&resident_sources)
@@ -2414,6 +2752,7 @@ pub(crate) fn seal_gpu_resident_feature_store_v3(
         contract,
         final_feature_plan_v3_sha256,
         normalization_fit_sha256,
+        normalization_fitted_state,
         source_provenance_sha256,
         footprint: seal_token.footprint,
         regime: seal_token.regime,
@@ -2424,6 +2763,8 @@ pub(crate) fn seal_gpu_resident_feature_store_v3(
         source_provenance,
         pinned_source_projection_v1,
         resident_sources,
+        produced_higher_timeframe_column_count_v2: seal_token
+            .produced_higher_timeframe_column_count_v2,
         owner,
     })
 }
@@ -2601,8 +2942,140 @@ fn resident_footprint_producer_draft_v4(row_count: usize) -> Result<ResidentProd
 /// runtime continuation and release-bound native capability before the
 /// admitted run-device carrier is consumed.
 #[derive(Debug)]
+struct ResolvedResidentProducerPassV2 {
+    drafts: Vec<ResidentProducerDraftV4>,
+    materialization: CrateOwnedResidentMaterializationV3,
+    regime_scale_anchor_bits: u64,
+    regime_input_identity_sha256: [u8; 32],
+}
+
+fn resolve_resident_producer_pass_v2(
+    resident_sources: &MaterializedPinnedResidentCanonicalSourcesV1,
+    base_timeframe: CanonicalTimeframe,
+    profile: FeatureProfile,
+    budget_rows: usize,
+    row_count: usize,
+) -> std::result::Result<ResolvedResidentProducerPassV2, GpuOnlyFeatureMaterializationErrorV3> {
+    let base_source = resident_sources.base().frame();
+    let regime_input = preflight_resident_regime_v3(base_source.ohlcv())?;
+    let classic_run_plan = match profile {
+        FeatureProfile::Full => {
+            prepare_classic_ta_run_plan(budget_rows, IndicatorComputePolicy::GpuOnly)?
+        }
+        FeatureProfile::Standard | FeatureProfile::HPC | FeatureProfile::Adaptive => {
+            prepare_classic_ta_gpu_exact_parity_run_plan_v3(budget_rows)?
+        }
+    };
+    let ResidentClassicTaPlanV3 {
+        recipe: classic_ta_recipe,
+        local_draft: classic_local_draft,
+    } = preflight_resident_classic_ta_v3(&classic_run_plan, row_count)?;
+    let classic_ta_memory = preflight_resident_classic_ta_memory_v4(&classic_ta_recipe)?;
+    let classic_draft = classic_local_draft
+        .into_resident_feature_recipe_draft_v4(&classic_ta_recipe, &classic_ta_memory)?;
+    let (quant_draft, quant_runtime) =
+        preflight_current_native_resident_quant_v3(base_source.ohlcv(), base_timeframe)?
+            .into_recipe_parts();
+    let (session_draft, session_runtime) =
+        preflight_current_native_resident_session_v2(base_source.ohlcv())?.into_recipe_parts();
+    let mut htf_host_parents = Vec::with_capacity(resident_sources.direct_parents().len());
+    let mut htf_capture_templates = Vec::with_capacity(resident_sources.direct_parents().len());
+    for direct_parent in resident_sources.direct_parents() {
+        let parent_rows = direct_parent.frame().len();
+        let smc_memory = preflight_resident_smc_memory_v4(parent_rows)?;
+        let smc_draft = resident_smc_producer_draft_v4(parent_rows)?;
+        let ResidentClassicTaPlanV3 {
+            recipe: parent_classic_recipe,
+            local_draft: parent_classic_local_draft,
+        } = preflight_resident_classic_ta_v3(&classic_run_plan, parent_rows)?;
+        let parent_classic_memory =
+            preflight_resident_classic_ta_memory_v4(&parent_classic_recipe)?;
+        let parent_classic_draft = parent_classic_local_draft
+            .into_resident_feature_recipe_draft_v4(
+                &parent_classic_recipe,
+                &parent_classic_memory,
+            )?;
+        let (parent_quant_draft, parent_quant_runtime) =
+            preflight_current_native_resident_quant_v3(
+                direct_parent.frame().ohlcv(),
+                direct_parent.timeframe(),
+            )?
+            .into_recipe_parts();
+        let (parent_session_draft, parent_session_runtime) =
+            preflight_current_native_resident_session_v2(direct_parent.frame().ohlcv())?
+                .into_recipe_parts();
+        let parent_regime_input = preflight_resident_regime_v3(direct_parent.frame().ohlcv())?;
+        let parent_regime_memory = preflight_resident_regime_memory_v4(parent_rows)?;
+        let parent_regime_draft =
+            resident_regime_producer_draft_v4(parent_rows, parent_regime_input.evidence().1)?;
+        let parent_footprint_memory = preflight_resident_footprint_memory_v4(parent_rows)?;
+        let parent_footprint_draft = resident_footprint_producer_draft_v4(parent_rows)?;
+        let (host_parent, capture_template) =
+            prepare_resident_higher_timeframe_direct_parent_owner_v3(
+                direct_parent,
+                smc_draft,
+                smc_memory,
+                parent_classic_draft,
+                parent_classic_recipe,
+                parent_classic_memory,
+                parent_quant_draft,
+                parent_quant_runtime,
+                parent_session_draft,
+                parent_session_runtime,
+                parent_regime_draft,
+                parent_regime_input,
+                parent_regime_memory,
+                parent_footprint_draft,
+                parent_footprint_memory,
+            )?;
+        htf_host_parents.push(host_parent);
+        htf_capture_templates.push(capture_template);
+    }
+    let base_open_ms = base_source
+        .ohlcv()
+        .timestamp
+        .as_deref()
+        .context("canonical resident base source is missing timestamp_ms")?;
+    let (htf_draft, htf_runtime) = preflight_resident_higher_timeframe_alignment_v3(
+        base_timeframe,
+        base_open_ms,
+        htf_host_parents,
+        resident_higher_timeframe_capability_v3()?,
+    )?
+    .into_recipe_and_runtime();
+    let (_, regime_scale_anchor_bits, regime_input_identity_sha256) = regime_input.evidence();
+    Ok(ResolvedResidentProducerPassV2 {
+        drafts: vec![
+            resident_smc_producer_draft_v4(row_count)?,
+            classic_draft,
+            quant_draft,
+            session_draft,
+            resident_regime_producer_draft_v4(row_count, regime_scale_anchor_bits)?,
+            resident_footprint_producer_draft_v4(row_count)?,
+            htf_draft,
+        ],
+        materialization: CrateOwnedResidentMaterializationV3 {
+            regime_input: Some(regime_input),
+            smc_materialization: None,
+            classic_ta_recipe: Some(classic_ta_recipe),
+            classic_ta_memory: Some(classic_ta_memory),
+            quant_runtime: Some(quant_runtime),
+            session_runtime: Some(session_runtime),
+            htf_runtime: Some(htf_runtime),
+            htf_capture_templates: Some(htf_capture_templates),
+        },
+        regime_scale_anchor_bits,
+        regime_input_identity_sha256,
+    })
+}
+
+#[derive(Debug)]
 struct CrateOwnedResidentProducerFactoryV3 {
     materialization: CrateOwnedResidentMaterializationV3,
+    base_timeframe: CanonicalTimeframe,
+    profile: FeatureProfile,
+    budget_rows: usize,
+    row_count: usize,
 }
 
 #[derive(Debug)]
@@ -2633,106 +3106,16 @@ impl CrateOwnedResidentProducerFactoryV3 {
         let budget_rows = recipe_assembly.budget_rows();
         let base_timeframe = recipe_assembly.base_timeframe();
         let profile = recipe_assembly.profile();
-        let base_source = recipe_assembly.resident_sources().base().frame();
-        let regime_input = preflight_resident_regime_v3(base_source.ohlcv())?;
-        let classic_run_plan = match profile {
-            FeatureProfile::Full => {
-                prepare_classic_ta_run_plan(budget_rows, IndicatorComputePolicy::GpuOnly)?
-            }
-            FeatureProfile::Standard | FeatureProfile::HPC | FeatureProfile::Adaptive => {
-                prepare_classic_ta_gpu_exact_parity_run_plan_v3(budget_rows)?
-            }
-        };
-        let ResidentClassicTaPlanV3 {
-            recipe: classic_ta_recipe,
-            local_draft: classic_local_draft,
-        } = preflight_resident_classic_ta_v3(&classic_run_plan, row_count)?;
-        let classic_ta_memory = preflight_resident_classic_ta_memory_v4(&classic_ta_recipe)?;
-        let classic_draft = classic_local_draft
-            .into_resident_feature_recipe_draft_v4(&classic_ta_recipe, &classic_ta_memory)?;
-        let (quant_draft, quant_runtime) =
-            preflight_current_native_resident_quant_v3(base_source.ohlcv(), base_timeframe)?
-                .into_recipe_parts();
-        let (session_draft, session_runtime) =
-            preflight_current_native_resident_session_v2(base_source.ohlcv())?.into_recipe_parts();
-        let mut htf_host_parents =
-            Vec::with_capacity(recipe_assembly.resident_sources().direct_parents().len());
-        let mut htf_capture_templates =
-            Vec::with_capacity(recipe_assembly.resident_sources().direct_parents().len());
-        for direct_parent in recipe_assembly.resident_sources().direct_parents() {
-            let parent_rows = direct_parent.frame().len();
-            let smc_memory = preflight_resident_smc_memory_v4(parent_rows)?;
-            let smc_draft = resident_smc_producer_draft_v4(parent_rows)?;
-            let ResidentClassicTaPlanV3 {
-                recipe: parent_classic_recipe,
-                local_draft: parent_classic_local_draft,
-            } = preflight_resident_classic_ta_v3(&classic_run_plan, parent_rows)?;
-            let parent_classic_memory =
-                preflight_resident_classic_ta_memory_v4(&parent_classic_recipe)?;
-            let parent_classic_draft = parent_classic_local_draft
-                .into_resident_feature_recipe_draft_v4(
-                    &parent_classic_recipe,
-                    &parent_classic_memory,
-                )?;
-            let (parent_quant_draft, parent_quant_runtime) =
-                preflight_current_native_resident_quant_v3(
-                    direct_parent.frame().ohlcv(),
-                    direct_parent.timeframe(),
-                )?
-                .into_recipe_parts();
-            let (parent_session_draft, parent_session_runtime) =
-                preflight_current_native_resident_session_v2(direct_parent.frame().ohlcv())?
-                    .into_recipe_parts();
-            let parent_regime_input = preflight_resident_regime_v3(direct_parent.frame().ohlcv())?;
-            let parent_regime_memory = preflight_resident_regime_memory_v4(parent_rows)?;
-            let parent_regime_draft =
-                resident_regime_producer_draft_v4(parent_rows, parent_regime_input.evidence().1)?;
-            let parent_footprint_memory = preflight_resident_footprint_memory_v4(parent_rows)?;
-            let parent_footprint_draft = resident_footprint_producer_draft_v4(parent_rows)?;
-            let (host_parent, capture_template) =
-                prepare_resident_higher_timeframe_direct_parent_owner_v3(
-                    direct_parent,
-                    smc_draft,
-                    smc_memory,
-                    parent_classic_draft,
-                    parent_classic_recipe,
-                    parent_classic_memory,
-                    parent_quant_draft,
-                    parent_quant_runtime,
-                    parent_session_draft,
-                    parent_session_runtime,
-                    parent_regime_draft,
-                    parent_regime_input,
-                    parent_regime_memory,
-                    parent_footprint_draft,
-                    parent_footprint_memory,
-                )?;
-            htf_host_parents.push(host_parent);
-            htf_capture_templates.push(capture_template);
-        }
-        let base_open_ms = base_source
-            .ohlcv()
-            .timestamp
-            .as_deref()
-            .context("canonical resident base source is missing timestamp_ms")?;
-        let (htf_draft, htf_runtime) = preflight_resident_higher_timeframe_alignment_v3(
+        let resolved_pass = resolve_resident_producer_pass_v2(
+            recipe_assembly.resident_sources(),
             base_timeframe,
-            base_open_ms,
-            htf_host_parents,
-            resident_higher_timeframe_capability_v3()?,
-        )?
-        .into_recipe_and_runtime();
-
-        recipe_assembly.append_owner_draft(resident_smc_producer_draft_v4(row_count)?)?;
-        recipe_assembly.append_owner_draft(classic_draft)?;
-        recipe_assembly.append_owner_draft(quant_draft)?;
-        recipe_assembly.append_owner_draft(session_draft)?;
-        recipe_assembly.append_owner_draft(resident_regime_producer_draft_v4(
+            profile,
+            budget_rows,
             row_count,
-            regime_input.evidence().1,
-        )?)?;
-        recipe_assembly.append_owner_draft(resident_footprint_producer_draft_v4(row_count)?)?;
-        recipe_assembly.append_owner_draft(htf_draft)?;
+        )?;
+        for draft in resolved_pass.drafts {
+            recipe_assembly.append_owner_draft(draft)?;
+        }
         let transform_capabilities = ResidentTransformCapabilityDraftV4::from_owner_capabilities(
             resident_robust_normalization_capability_v2()?,
             resident_canonical_content_sha256_capability_v3()?,
@@ -2752,6 +3135,7 @@ impl CrateOwnedResidentProducerFactoryV3 {
             planned_routes.len(),
         )
         .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)?;
+        let robust_normalization_replay_v2 = robust_normalization_input.replay_recipe_v2();
         let normalization_scratch_bytes = checked_u64(
             robust_normalization_input.normalization_scratch_bytes(),
             "normalization scratch bytes",
@@ -2766,11 +3150,11 @@ impl CrateOwnedResidentProducerFactoryV3 {
                 producer: batch.producer(),
                 first_column: batch.first_column(),
                 column_count: batch.column_count(),
+                produced_column_count: batch.column_count(),
                 additional_retained_bytes: batch.additional_retained_bytes(),
                 scratch_bytes: batch.scratch_bytes(),
             })
             .collect();
-        let (_, regime_scale_anchor_bits, regime_input_identity_sha256) = regime_input.evidence();
         let plan = ResolvedGpuOnlyFeatureMaterializationPlanV3 {
             dataset_recipe_sha256: feature_identity.dataset_recipe_sha256(),
             feature_plan_schema_sha256: feature_identity.feature_plan_schema_sha256(),
@@ -2779,26 +3163,47 @@ impl CrateOwnedResidentProducerFactoryV3 {
             planned_routes,
             producer_capabilities,
             producer_batches,
-            regime_scale_anchor_bits,
-            regime_input_identity_sha256,
+            regime_scale_anchor_bits: resolved_pass.regime_scale_anchor_bits,
+            regime_input_identity_sha256: resolved_pass.regime_input_identity_sha256,
             normalization_scratch_bytes,
             fit_metadata_bytes,
             robust_normalization_input: Some(robust_normalization_input),
+            robust_normalization_replay_v2,
             feature_identity,
         };
         let factory = Self {
-            materialization: CrateOwnedResidentMaterializationV3 {
-                regime_input: Some(regime_input),
-                smc_materialization: None,
-                classic_ta_recipe: Some(classic_ta_recipe),
-                classic_ta_memory: Some(classic_ta_memory),
-                quant_runtime: Some(quant_runtime),
-                session_runtime: Some(session_runtime),
-                htf_runtime: Some(htf_runtime),
-                htf_capture_templates: Some(htf_capture_templates),
-            },
+            materialization: resolved_pass.materialization,
+            base_timeframe,
+            profile,
+            budget_rows,
+            row_count,
         };
         Ok((plan, factory))
+    }
+
+    fn replay_from_immutable_sources_v2(
+        &self,
+        resident_sources: &MaterializedPinnedResidentCanonicalSourcesV1,
+    ) -> std::result::Result<Self, GpuOnlyFeatureMaterializationErrorV3> {
+        let replay = resolve_resident_producer_pass_v2(
+            resident_sources,
+            self.base_timeframe,
+            self.profile,
+            self.budget_rows,
+            self.row_count,
+        )?;
+        if replay.drafts.len() != 7 {
+            return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+                anyhow::anyhow!("immutable resident recipe replay changed its producer census"),
+            ));
+        }
+        Ok(Self {
+            materialization: replay.materialization,
+            base_timeframe: self.base_timeframe,
+            profile: self.profile,
+            budget_rows: self.budget_rows,
+            row_count: self.row_count,
+        })
     }
 
     fn prepare_smc(
@@ -2934,6 +3339,175 @@ impl CrateOwnedResidentMaterializationV3 {
     }
 }
 
+#[derive(Debug)]
+struct PreparedResidentProducerExecutionV2 {
+    smc_materialization: ResidentSmcMaterializationV3,
+    post_smc: PreparedResidentPostSmcProducerExecutionV2,
+}
+
+#[derive(Debug)]
+struct PreparedResidentPostSmcProducerExecutionV2 {
+    classic_ta_recipe: ResidentClassicTaRecipeV3,
+    classic_ta_memory: ResidentClassicTaPreDeviceMemoryReceiptV4,
+    classic_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    quant_runtime: PreparedResidentQuantRuntimeV3,
+    quant_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    session_runtime: PreparedResidentSessionRuntimeV2,
+    session_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    regime_input: PreparedResidentRegimeInputV3,
+    regime_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    footprint_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    htf_append: PreparedResidentHigherTimeframeAppendV3,
+}
+
+fn prepare_resident_producer_execution_v2(
+    preflight: &GpuOnlyFeatureRecipePreflightV3,
+    producers: &mut CrateOwnedResidentProducerFactoryV3,
+    run_device: &GpuOnlyRunDeviceAdmissionV3,
+) -> std::result::Result<PreparedResidentProducerExecutionV2, GpuOnlyFeatureMaterializationErrorV3>
+{
+    let smc_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Smc)?;
+    let classic_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::ClassicTa)?;
+    let quant_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Quant)?;
+    let session_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Session)?;
+    let regime_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Regime)?;
+    let footprint_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Footprint)?;
+    let htf_bindings =
+        preflight.exact_bindings_for(ResidentFeatureProducerV3::HigherTimeframeAlignment)?;
+    let (classic_ta_recipe, classic_ta_memory) = producers.take_classic_ta_runtime()?;
+    let quant_runtime = producers.take_quant_runtime()?;
+    let session_runtime = producers.take_session_runtime()?;
+    let (htf_runtime, htf_capture_templates) = producers.take_higher_timeframe_runtime()?;
+    let regime_input = producers.take_regime_input()?;
+    producers.prepare_smc(
+        run_device,
+        preflight.resident_sources().base().frame(),
+        smc_bindings,
+    )?;
+    let direct_parents = preflight.resident_sources().direct_parents();
+    if direct_parents.len() != htf_capture_templates.len() || direct_parents.is_empty() {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!(
+                "resident HTF direct-parent source and capture-template censuses disagree"
+            ),
+        ));
+    }
+    let mut htf_captures: Vec<ValidatedResidentHigherTimeframeDirectParentCaptureV3> =
+        Vec::with_capacity(direct_parents.len());
+    for (direct_parent, capture_template) in direct_parents.iter().zip(htf_capture_templates) {
+        let (parent_smc_bindings, pending_capture) =
+            capture_template.into_smc_preparation_parts_v3();
+        let parent_smc =
+            prepare_smc_materialization_v3(run_device, direct_parent.frame(), parent_smc_bindings)?;
+        htf_captures.push(pending_capture.capture_direct_parent_v3(run_device, parent_smc)?);
+    }
+    let htf_append = htf_runtime
+        .bind_captured_parents_v3(run_device, htf_captures)?
+        .bind_current_native_v3(run_device, htf_bindings)?;
+    Ok(PreparedResidentProducerExecutionV2 {
+        smc_materialization: producers.take_smc_materialization()?,
+        post_smc: PreparedResidentPostSmcProducerExecutionV2 {
+            classic_ta_recipe,
+            classic_ta_memory,
+            classic_bindings,
+            quant_runtime,
+            quant_bindings,
+            session_runtime,
+            session_bindings,
+            regime_input,
+            regime_bindings,
+            footprint_bindings,
+            htf_append,
+        },
+    })
+}
+
+fn append_post_smc_producers_v2(
+    post_smc: PreparedResidentPostSmcProducerExecutionV2,
+    assembler: &mut ResidentFeatureStoreAssemblerV3,
+) -> std::result::Result<(), GpuOnlyFeatureMaterializationErrorV3> {
+    assembler.append_resident_classic_ta_recipe_v4(
+        post_smc.classic_ta_recipe,
+        post_smc.classic_bindings,
+        post_smc.classic_ta_memory,
+    )?;
+    let _quant_receipt = post_smc
+        .quant_runtime
+        .append_to(assembler, post_smc.quant_bindings)?;
+    while !assembler.try_retire_completed_batch()? {
+        std::thread::yield_now();
+    }
+    let (_session_admission, _session_receipt) = post_smc
+        .session_runtime
+        .append_to(assembler, post_smc.session_bindings)?;
+    while !assembler.try_retire_completed_batch()? {
+        std::thread::yield_now();
+    }
+    let _regime_receipt = post_smc
+        .regime_input
+        .append_to(assembler, post_smc.regime_bindings)?;
+    while !assembler.try_retire_completed_batch()? {
+        std::thread::yield_now();
+    }
+    let _footprint_receipt = assembler.append_resident_footprint_v2(post_smc.footprint_bindings)?;
+    while !assembler.try_retire_completed_batch()? {
+        std::thread::yield_now();
+    }
+    let (_htf_admission, _htf_receipt) = post_smc.htf_append.append_to(assembler)?;
+    Ok(())
+}
+
+fn score_resident_producers_v2(
+    pending_smc_batch: PendingResidentSmcBatchV3,
+    post_smc: PreparedResidentPostSmcProducerExecutionV2,
+    screening: &mut ResidentFeatureScreeningPassV2,
+    normalization_template: &ResidentRobustNormalizationPlanV2,
+) -> std::result::Result<(), GpuOnlyFeatureMaterializationErrorV3> {
+    pending_smc_batch.score_to_screening_v2(screening, normalization_template)?;
+    while !screening.try_retire_completed_batch_v2()? {
+        std::thread::yield_now();
+    }
+    screening.score_resident_classic_ta_recipe_v2(
+        post_smc.classic_ta_recipe,
+        post_smc.classic_bindings,
+        post_smc.classic_ta_memory,
+        normalization_template,
+    )?;
+    let _quant_receipt = post_smc.quant_runtime.score_to_screening_v2(
+        screening,
+        post_smc.quant_bindings,
+        normalization_template,
+    )?;
+    while !screening.try_retire_completed_batch_v2()? {
+        std::thread::yield_now();
+    }
+    let (_session_admission, _session_receipt) = post_smc.session_runtime.score_to_screening_v2(
+        screening,
+        post_smc.session_bindings,
+        normalization_template,
+    )?;
+    while !screening.try_retire_completed_batch_v2()? {
+        std::thread::yield_now();
+    }
+    let _regime_receipt = post_smc.regime_input.score_to_screening_v2(
+        screening,
+        post_smc.regime_bindings,
+        normalization_template,
+    )?;
+    while !screening.try_retire_completed_batch_v2()? {
+        std::thread::yield_now();
+    }
+    let _footprint_receipt = screening
+        .score_resident_footprint_v2(post_smc.footprint_bindings, normalization_template)?;
+    while !screening.try_retire_completed_batch_v2()? {
+        std::thread::yield_now();
+    }
+    let (_htf_admission, _htf_receipt) = post_smc
+        .htf_append
+        .score_to_screening_v2(screening, normalization_template)?;
+    Ok(())
+}
+
 fn prepare_smc_materialization_v3(
     run_device: &GpuOnlyRunDeviceAdmissionV3,
     source: &CanonicalOhlcvFrame,
@@ -3003,6 +3577,23 @@ pub struct PreparedGpuOnlyFeatureMaterializationV3 {
 }
 
 impl PreparedGpuOnlyFeatureMaterializationV3 {
+    /// Metadata-only bound from this exact immutable source/route recipe.
+    pub fn canonical_feature_plan_max_bytes_v3(
+        &self,
+    ) -> std::result::Result<usize, GpuOnlyFeatureMaterializationErrorV3> {
+        self.preflight
+            .plan
+            .feature_identity
+            .canonical_feature_plan_max_bytes_v3()
+            .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)
+    }
+
+    pub const fn normalization_enabled_v3(&self) -> bool {
+        self.preflight
+            .plan
+            .feature_identity
+            .normalization_enabled_v3()
+    }
     /// Exact hardware-independent Data allocation extent for the immutable
     /// recipe carried by this token. Full-run workspace admission may account
     /// for these bytes before a CUDA ordinal or free-memory snapshot is bound.
@@ -3015,6 +3606,215 @@ impl PreparedGpuOnlyFeatureMaterializationV3 {
     /// plan/content identities remain versioned separately for CPU and GPU.
     pub const fn pinned_source_projection_v1(&self) -> &CanonicalPinnedSourceProjectionV1 {
         &self.pinned_source_projection_v1
+    }
+
+    /// Ordered metadata for Search's one canonical host-side schema
+    /// classification. Feature values remain Data-owned and device-only.
+    pub fn ordered_feature_names_v2(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.preflight
+            .plan
+            .planned_routes
+            .iter()
+            .map(ResidentFeatureRouteV3::feature_name)
+    }
+
+    /// Read only the two actual millisecond timestamps at an end-exclusive
+    /// interval of the already-pinned canonical base. This neither materializes
+    /// features nor infers elapsed time from a timeframe or a row count.
+    pub fn pinned_base_timestamp_bounds_ms_v1(
+        &self,
+        row_start: usize,
+        row_end: usize,
+    ) -> Result<(i64, i64)> {
+        let base = self.preflight.resident_sources().base().frame();
+        let timestamps = base
+            .ohlcv()
+            .timestamp
+            .as_deref()
+            .context("pinned resident base is missing timestamp_ms")?;
+        if timestamps.len() != base.len() || row_start >= row_end || row_end > base.len() {
+            bail!("pinned resident timestamp interval is empty, out of range, or not row-aligned");
+        }
+        let last_index = row_end
+            .checked_sub(1)
+            .context("pinned resident timestamp end-exclusive index underflowed")?;
+        let first_ms = timestamps[row_start];
+        let last_ms = timestamps[last_index];
+        if last_ms <= first_ms {
+            bail!("pinned resident timestamp interval requires two distinct ordered timestamps");
+        }
+        Ok((first_ms, last_ms))
+    }
+
+    /// Bind Search's canonical column classification to Data's immutable
+    /// parent recipe. The first identity is the external canonical source
+    /// contract receipt; all recipe/normalization/source identities are minted
+    /// here so Search cannot substitute them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_feature_screening_schema_upload_v2(
+        &self,
+        canonical_source_contract_receipt_sha256: [u8; 32],
+        ordered_feature_schema_sha256: [u8; 32],
+        column_classification_content_sha256: [u8; 32],
+        column_class_flags: Vec<u8>,
+        timeframe_group_ids: Vec<u32>,
+        template_force_keep_flags: Vec<u8>,
+        timeframe_group_count: u64,
+    ) -> std::result::Result<
+        ResidentTrimPrefilterScreeningSchemaUploadV2,
+        GpuOnlyFeatureMaterializationErrorV3,
+    > {
+        let plan = &self.preflight.plan;
+        let column_count = plan.planned_routes.len();
+        if canonical_source_contract_receipt_sha256 == [0; 32]
+            || ordered_feature_schema_sha256 == [0; 32]
+            || column_classification_content_sha256 == [0; 32]
+            || column_class_flags.len() != column_count
+            || timeframe_group_ids.len() != column_count
+            || template_force_keep_flags.len() != column_count
+        {
+            return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+                anyhow::anyhow!(
+                    "screening classification does not match the prepared parent recipe"
+                ),
+            ));
+        }
+        let parent_bindings = plan
+            .planned_routes
+            .iter()
+            .map(ResidentFeatureColumnBindingV3::from_admitted_route)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut expected_schema = Sha256::new();
+        expected_schema.update(b"neoethos.ordered-prefilter-feature-schema.v1");
+        expected_schema.update((parent_bindings.len() as u64).to_le_bytes());
+        for binding in &parent_bindings {
+            expected_schema.update((binding.feature_name.len() as u64).to_le_bytes());
+            expected_schema.update(binding.feature_name.as_bytes());
+        }
+        if <[u8; 32]>::from(expected_schema.finalize()) != ordered_feature_schema_sha256 {
+            return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+                anyhow::anyhow!("screening ordered schema identity drifted from Data routes"),
+            ));
+        }
+        let mut parent_recipe = Sha256::new();
+        parent_recipe.update(b"neoethos.data.prepared-screening-parent-recipe.v2");
+        parent_recipe.update(plan.dataset_recipe_sha256);
+        parent_recipe.update(plan.feature_plan_schema_sha256);
+        parent_recipe.update(plan.route_plan_sha256);
+        parent_recipe.update((plan.row_count as u64).to_le_bytes());
+        parent_recipe.update((column_count as u64).to_le_bytes());
+        parent_recipe.update(self.pinned_source_projection_v1.identity_sha256());
+        let parent_recipe_identity_sha256 = parent_recipe.finalize().into();
+
+        ResidentTrimPrefilterScreeningSchemaUploadV2::new(
+            canonical_source_contract_receipt_sha256,
+            parent_recipe_identity_sha256,
+            self.preflight
+                .robust_normalization
+                .component_identity_sha256,
+            plan.route_plan_sha256,
+            self.pinned_source_projection_v1.identity_sha256(),
+            ordered_feature_schema_sha256,
+            column_classification_content_sha256,
+            column_class_flags,
+            timeframe_group_ids,
+            template_force_keep_flags,
+            timeframe_group_count,
+        )
+        .map_err(Into::into)
+    }
+
+    /// Seal the exact bounded first-pass workspace. The unfiltered resident
+    /// cube and population store are intentionally absent; only one producer
+    /// batch and its scoring/normalization buffers coexist with the parent and
+    /// native trim state.
+    pub fn seal_feature_screening_workspace_plan_v2(
+        &self,
+        native_admission_facts: SealedNativeCudaDataPopulationPreflightFactsV1,
+        trim_prefilter: UnboundResidentTrimPrefilterWorkspacePreflightV2,
+    ) -> std::result::Result<
+        SealedFeatureScreeningGpuWorkspacePlanV2,
+        GpuOnlyFeatureMaterializationErrorV3,
+    > {
+        let max_batch_column_count = self
+            .preflight
+            .plan
+            .producer_batches
+            .iter()
+            .map(|batch| batch.produced_column_count)
+            .max()
+            .ok_or_else(|| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "prepared screening recipe has no producer batch"
+                ))
+            })?;
+        let normalization_template = &self.preflight.robust_normalization.runtime_plan;
+        let batch_normalization = ResidentRobustNormalizationPlanV2::preflight(
+            normalization_template.rows(),
+            max_batch_column_count,
+            normalization_template.training_rows(),
+            normalization_template.enabled(),
+        )?;
+        let pointer_table_bytes = max_batch_column_count
+            .checked_mul(4)
+            .and_then(|entries| entries.checked_mul(std::mem::size_of::<u64>()))
+            .ok_or_else(|| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "screening pointer-table bytes overflowed"
+                ))
+            })?;
+        let classic_ta_capability = self
+            .preflight
+            .plan
+            .producer_capabilities
+            .capabilities()
+            .iter()
+            .find(|capability| capability.producer() == ResidentFeatureProducerV3::ClassicTa)
+            .cloned()
+            .ok_or_else(|| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "prepared resident recipe lacks its Classic TA capability"
+                ))
+            })?;
+        seal_feature_screening_gpu_workspace_plan_v2(FeatureScreeningWorkspacePreflightRequestV2 {
+            native_admission_facts,
+            parent_row_count: self.workspace_extent.row_count(),
+            parent_column_count: self.workspace_extent.column_count(),
+            parent_dataset_bytes: self.workspace_extent.parent_dataset_bytes(),
+            max_live_producer_bytes: self.workspace_extent.max_live_producer_bytes(),
+            max_live_producer_scratch_bytes: self
+                .workspace_extent
+                .max_live_producer_scratch_bytes(),
+            max_batch_column_count: u64::try_from(max_batch_column_count).map_err(|_| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "screening batch width does not fit u64"
+                ))
+            })?,
+            normalization_scratch_bytes: u64::try_from(
+                batch_normalization.normalization_scratch_bytes(),
+            )
+            .map_err(|_| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "screening normalization scratch does not fit u64"
+                ))
+            })?,
+            normalization_fit_metadata_bytes: u64::try_from(
+                batch_normalization.fit_metadata_bytes(),
+            )
+            .map_err(|_| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "screening normalization metadata does not fit u64"
+                ))
+            })?,
+            pointer_table_bytes: u64::try_from(pointer_table_bytes).map_err(|_| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "screening pointer-table bytes do not fit u64"
+                ))
+            })?,
+            trim_prefilter,
+            classic_ta_capability,
+        })
+        .map_err(|error| GpuOnlyFeatureMaterializationErrorV3::Other(error.into()))
     }
 
     /// Seal the exact current-stage Data+population workspace using Data's
@@ -3077,6 +3877,562 @@ pub fn prepare_gpu_only_feature_materialization_v3(
         preflight,
         producers,
     })
+}
+
+/// Seal the only extent that may size a post-selection resident allocation.
+/// The parent width is validation evidence and is intentionally discarded by
+/// the move-only gpu-cuda authority.
+pub fn compact_selected_store_allocation_extent_v2(
+    row_count: usize,
+    parent_column_count: usize,
+    selected_column_count: usize,
+) -> std::result::Result<CompactSelectedStoreAllocationExtentV2, GpuOnlyFeatureMaterializationErrorV3>
+{
+    CompactSelectedStoreAllocationExtentV2::seal_compact_v2(
+        row_count,
+        parent_column_count,
+        selected_column_count,
+    )
+    .map_err(Into::into)
+}
+
+#[must_use = "the prepared two-pass continuation must stream every producer batch"]
+#[derive(Debug)]
+pub struct PreparedGpuOnlyFeatureTwoPassContinuationV2 {
+    preflight: GpuOnlyFeatureRecipePreflightV3,
+    replay_producers: CrateOwnedResidentProducerFactoryV3,
+    screening: ResidentFeatureScreeningPassV2,
+    pending_smc_batch: PendingResidentSmcBatchV3,
+    post_smc: PreparedResidentPostSmcProducerExecutionV2,
+    normalization_template: ResidentRobustNormalizationPlanV2,
+    pinned_source_projection_v1: CanonicalPinnedSourceProjectionV1,
+}
+
+#[must_use = "the scored continuation must seal and read the bounded selected map"]
+pub struct ScoredGpuOnlyFeatureTwoPassContinuationV2 {
+    preflight: GpuOnlyFeatureRecipePreflightV3,
+    replay_producers: CrateOwnedResidentProducerFactoryV3,
+    native_run: ResidentTrimPrefilterDeviceRunV1,
+    recovery: ResidentFeatureScreeningRunRecoveryV2,
+    pinned_source_projection_v1: CanonicalPinnedSourceProjectionV1,
+}
+
+impl fmt::Debug for ScoredGpuOnlyFeatureTwoPassContinuationV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScoredGpuOnlyFeatureTwoPassContinuationV2")
+            .field(
+                "parent_column_count",
+                &self.preflight.plan.planned_routes.len(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "the sealed selected-map receipt must size one compact resident store"]
+pub struct SealedResidentSelectedMapReceiptV2 {
+    selected_map: BoundedResidentTrimPrefilterSelectedMapReadV2,
+    preflight: GpuOnlyFeatureRecipePreflightV3,
+    replay_producers: CrateOwnedResidentProducerFactoryV3,
+    run_device: GpuOnlyRunDeviceAdmissionV3,
+    pinned_source_projection_v1: CanonicalPinnedSourceProjectionV1,
+    row_count: usize,
+    parent_column_count: usize,
+}
+
+impl fmt::Debug for SealedResidentSelectedMapReceiptV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedResidentSelectedMapReceiptV2")
+            .field("row_count", &self.row_count)
+            .field("parent_column_count", &self.parent_column_count)
+            .field("selected_column_count", &self.selected_column_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SealedResidentSelectedMapReceiptV2 {
+    pub fn selected_column_count(&self) -> usize {
+        usize::try_from(self.selected_map.selected_count()).unwrap_or(0)
+    }
+
+    pub const fn selected_map_sha256(&self) -> [u8; 32] {
+        self.selected_map.selected_map_sha256()
+    }
+
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    pub const fn parent_column_count(&self) -> usize {
+        self.parent_column_count
+    }
+}
+
+/// Selected-map authority after the parent recipe has been projected but
+/// before population sizing seals the exact compact workspace. Search may
+/// inspect only the compact extent and immutable source projection.
+#[must_use = "seal and bind the selected Data+population workspace"]
+pub struct PreparedCompactSelectedStoreV2 {
+    selected_map: BoundedResidentTrimPrefilterSelectedMapReadV2,
+    preflight: GpuOnlyFeatureRecipePreflightV3,
+    replay_producers: CrateOwnedResidentProducerFactoryV3,
+    run_device: GpuOnlyRunDeviceAdmissionV3,
+    pinned_source_projection_v1: CanonicalPinnedSourceProjectionV1,
+    parent_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    parent_column_count: usize,
+    workspace_extent: ResidentWorkingSetExtentV3,
+}
+
+impl fmt::Debug for PreparedCompactSelectedStoreV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedCompactSelectedStoreV2")
+            .field("row_count", &self.workspace_extent.row_count())
+            .field(
+                "selected_column_count",
+                &self.workspace_extent.column_count(),
+            )
+            .field("parent_column_count", &self.parent_column_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedCompactSelectedStoreV2 {
+    /// Metadata-only bound after the genuine selected-route projection.
+    pub fn canonical_feature_plan_max_bytes_v3(
+        &self,
+    ) -> std::result::Result<usize, GpuOnlyFeatureMaterializationErrorV3> {
+        self.preflight
+            .plan
+            .feature_identity
+            .canonical_feature_plan_max_bytes_v3()
+            .map_err(GpuOnlyFeatureMaterializationErrorV3::Other)
+    }
+
+    pub const fn normalization_enabled_v3(&self) -> bool {
+        self.preflight
+            .plan
+            .feature_identity
+            .normalization_enabled_v3()
+    }
+
+    pub fn ordered_feature_names_v2(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.preflight
+            .plan
+            .planned_routes
+            .iter()
+            .map(ResidentFeatureRouteV3::feature_name)
+    }
+    pub const fn workspace_extent(&self) -> &ResidentWorkingSetExtentV3 {
+        &self.workspace_extent
+    }
+
+    pub const fn pinned_source_projection_v1(&self) -> &CanonicalPinnedSourceProjectionV1 {
+        &self.pinned_source_projection_v1
+    }
+
+    pub fn seal_data_population_workspace_plan_v1(
+        &self,
+        native_admission_facts: SealedNativeCudaDataPopulationPreflightFactsV1,
+        max_ordered_index_count: usize,
+        max_adaptive_row_count: usize,
+        gene_plan: PopulationGeneStorePlanV1,
+        metrics_plan: PopulationMetricsOnlyPlanV1,
+    ) -> std::result::Result<
+        SealedDataPopulationGpuWorkspacePlanV1,
+        GpuOnlyFeatureMaterializationErrorV3,
+    > {
+        let classic_ta_capability = self
+            .preflight
+            .plan
+            .producer_capabilities
+            .capabilities()
+            .iter()
+            .find(|capability| capability.producer() == ResidentFeatureProducerV3::ClassicTa)
+            .cloned()
+            .ok_or_else(|| {
+                GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                    "compact resident recipe lacks its Classic TA capability"
+                ))
+            })?;
+        seal_data_population_gpu_workspace_plan_v1(DataPopulationWorkspacePreflightRequestV1 {
+            native_admission_facts,
+            data_extent: self.workspace_extent.clone(),
+            max_ordered_index_count,
+            max_adaptive_row_count,
+            gene_plan,
+            metrics_plan,
+            classic_ta_capability,
+        })
+        .map_err(Into::into)
+    }
+
+    pub fn bind_data_population_workspace_v2(
+        self,
+        plan: SealedDataPopulationGpuWorkspacePlanV1,
+    ) -> std::result::Result<AdmittedCompactSelectedStoreV2, GpuOnlyFeatureMaterializationErrorV3>
+    {
+        let limits = plan.limits();
+        if limits.data_extent_identity_sha256() != self.workspace_extent.identity_sha256()
+            || limits.parent_row_count() != self.workspace_extent.row_count()
+            || limits.feature_count() != self.workspace_extent.column_count()
+        {
+            return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+                anyhow::anyhow!(
+                    "selected Data+population workspace does not match the compact recipe"
+                ),
+            ));
+        }
+        let admitted = upgrade_feature_screening_run_to_data_population_v2(self.run_device, plan)?;
+        Ok(AdmittedCompactSelectedStoreV2 {
+            selected_map: self.selected_map,
+            preflight: self.preflight,
+            replay_producers: self.replay_producers,
+            run_device: admitted.into_gpu_only_run_device_admission_v3(),
+            pinned_source_projection_v1: self.pinned_source_projection_v1,
+            parent_column_bindings: self.parent_column_bindings,
+            parent_column_count: self.parent_column_count,
+            workspace_extent: self.workspace_extent,
+        })
+    }
+}
+
+#[must_use = "materialize the admitted compact resident store"]
+pub struct AdmittedCompactSelectedStoreV2 {
+    selected_map: BoundedResidentTrimPrefilterSelectedMapReadV2,
+    preflight: GpuOnlyFeatureRecipePreflightV3,
+    replay_producers: CrateOwnedResidentProducerFactoryV3,
+    run_device: GpuOnlyRunDeviceAdmissionV3,
+    pinned_source_projection_v1: CanonicalPinnedSourceProjectionV1,
+    parent_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    parent_column_count: usize,
+    workspace_extent: ResidentWorkingSetExtentV3,
+}
+
+impl fmt::Debug for AdmittedCompactSelectedStoreV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdmittedCompactSelectedStoreV2")
+            .field("row_count", &self.workspace_extent.row_count())
+            .field(
+                "selected_column_count",
+                &self.workspace_extent.column_count(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn prepare_compact_selected_store_v2(
+    sealed: SealedResidentSelectedMapReceiptV2,
+) -> std::result::Result<PreparedCompactSelectedStoreV2, GpuOnlyFeatureMaterializationErrorV3> {
+    let SealedResidentSelectedMapReceiptV2 {
+        selected_map,
+        preflight,
+        replay_producers,
+        run_device,
+        pinned_source_projection_v1,
+        row_count,
+        parent_column_count,
+    } = sealed;
+    let selected_global_parent_ordinals = selected_map.selected_global_parent_ordinals().to_vec();
+    if selected_global_parent_ordinals.is_empty()
+        || row_count != preflight.plan.row_count
+        || parent_column_count != preflight.plan.planned_routes.len()
+    {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!("compact preparation lost its sealed selected-map authority"),
+        ));
+    }
+    let (preflight, parent_column_bindings, _parent_routes) =
+        project_gpu_only_feature_recipe_preflight_v2(preflight, &selected_global_parent_ordinals)?;
+    let workspace_extent = exact_resident_working_set_extent_request_v3(&preflight.plan)?.seal()?;
+    if workspace_extent.row_count() != u64::try_from(row_count).unwrap_or(u64::MAX)
+        || workspace_extent.column_count()
+            != u64::try_from(selected_global_parent_ordinals.len()).unwrap_or(u64::MAX)
+    {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!("compact projected extent drifted from the selected map"),
+        ));
+    }
+    Ok(PreparedCompactSelectedStoreV2 {
+        selected_map,
+        preflight,
+        replay_producers,
+        run_device,
+        pinned_source_projection_v1,
+        parent_column_bindings,
+        parent_column_count,
+        workspace_extent,
+    })
+}
+
+/// Begin the bounded screening pass. Search supplies the metadata-only schema
+/// and a closure that resolves its own trim plan from the opaque imported
+/// identities; Data keeps all feature production and allocation authority.
+pub fn begin_prepared_gpu_only_feature_two_pass_v2(
+    prepared: PreparedGpuOnlyFeatureMaterializationV3,
+    admitted_run: AdmittedNativeCudaFeatureScreeningRunV2,
+    screening_schema: ResidentTrimPrefilterScreeningSchemaUploadV2,
+    begin_trim: impl FnOnce(
+        ResidentTrimPrefilterInputsV1,
+    ) -> anyhow::Result<ResidentTrimPrefilterDeviceRunV1>,
+) -> std::result::Result<
+    PreparedGpuOnlyFeatureTwoPassContinuationV2,
+    GpuOnlyFeatureMaterializationErrorV3,
+> {
+    begin_prepared_gpu_only_feature_two_pass_inner_v2(
+        prepared,
+        admitted_run,
+        screening_schema,
+        begin_trim,
+    )
+}
+
+fn begin_prepared_gpu_only_feature_two_pass_inner_v2<BeginTrim>(
+    prepared: PreparedGpuOnlyFeatureMaterializationV3,
+    admitted_run: AdmittedNativeCudaFeatureScreeningRunV2,
+    screening_schema: ResidentTrimPrefilterScreeningSchemaUploadV2,
+    begin_trim: BeginTrim,
+) -> std::result::Result<
+    PreparedGpuOnlyFeatureTwoPassContinuationV2,
+    GpuOnlyFeatureMaterializationErrorV3,
+>
+where
+    BeginTrim:
+        FnOnce(ResidentTrimPrefilterInputsV1) -> anyhow::Result<ResidentTrimPrefilterDeviceRunV1>,
+{
+    let run_device = admitted_run.into_gpu_only_run_device_admission_v3();
+    let materialized_projection =
+        derive_pinned_source_projection_v1(prepared.preflight.resident_sources())
+            .map_err(|error| GpuOnlyFeatureMaterializationErrorV3::Other(error.into()))?;
+    if prepared.pinned_source_projection_v1 != materialized_projection {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!("prepared screening source projection drifted from pinned leases"),
+        ));
+    }
+    let replay_producers = prepared
+        .producers
+        .replay_from_immutable_sources_v2(prepared.preflight.resident_sources())?;
+    let PreparedGpuOnlyFeatureMaterializationV3 {
+        workspace_extent,
+        pinned_source_projection_v1,
+        preflight,
+        mut producers,
+    } = prepared;
+    let parent_column_bindings = preflight
+        .plan
+        .planned_routes
+        .iter()
+        .map(ResidentFeatureColumnBindingV3::from_admitted_route)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let normalization_template = preflight.robust_normalization.runtime_plan.clone();
+    let parent_normalization_modes = preflight
+        .plan
+        .planned_routes
+        .iter()
+        .map(|route| search_normalization_column_mode_v3(route.feature_name()))
+        .collect();
+    let execution =
+        prepare_resident_producer_execution_v2(&preflight, &mut producers, &run_device)?;
+    let max_live_producer_bytes = usize::try_from(workspace_extent.max_live_producer_bytes())
+        .map_err(|_| {
+            GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                "screening max-live producer bytes do not fit this process"
+            ))
+        })?;
+    let max_live_producer_scratch_bytes =
+        usize::try_from(workspace_extent.max_live_producer_scratch_bytes()).map_err(|_| {
+            GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                "screening max-live scratch bytes do not fit this process"
+            ))
+        })?;
+    let pointer_table_bytes = usize::try_from(workspace_extent.pointer_and_schema_metadata_bytes())
+        .map_err(|_| {
+            GpuOnlyFeatureMaterializationErrorV3::Other(anyhow::anyhow!(
+                "screening pointer-table bytes do not fit this process"
+            ))
+        })?;
+    let (prepared_screening, inputs, pending_smc_batch) = begin_resident_smc_screening_pass_v2(
+        run_device,
+        parent_column_bindings,
+        screening_schema,
+        max_live_producer_bytes,
+        max_live_producer_scratch_bytes,
+        pointer_table_bytes,
+        execution.smc_materialization,
+        parent_normalization_modes,
+    )?;
+    let native_run = begin_trim(inputs).map_err(GpuOnlyFeatureMaterializationErrorV3::Other)?;
+    let screening = prepared_screening.bind_native_run_v2(native_run)?;
+    Ok(PreparedGpuOnlyFeatureTwoPassContinuationV2 {
+        preflight,
+        replay_producers,
+        screening,
+        pending_smc_batch,
+        post_smc: execution.post_smc,
+        normalization_template,
+        pinned_source_projection_v1,
+    })
+}
+
+pub fn stream_score_batches_v2(
+    prepared: PreparedGpuOnlyFeatureTwoPassContinuationV2,
+) -> std::result::Result<
+    ScoredGpuOnlyFeatureTwoPassContinuationV2,
+    GpuOnlyFeatureMaterializationErrorV3,
+> {
+    stream_score_batches_inner_v2(prepared)
+}
+
+fn stream_score_batches_inner_v2(
+    prepared: PreparedGpuOnlyFeatureTwoPassContinuationV2,
+) -> std::result::Result<
+    ScoredGpuOnlyFeatureTwoPassContinuationV2,
+    GpuOnlyFeatureMaterializationErrorV3,
+> {
+    let PreparedGpuOnlyFeatureTwoPassContinuationV2 {
+        preflight,
+        replay_producers,
+        mut screening,
+        pending_smc_batch,
+        post_smc,
+        normalization_template,
+        pinned_source_projection_v1,
+    } = prepared;
+    score_resident_producers_v2(
+        pending_smc_batch,
+        post_smc,
+        &mut screening,
+        &normalization_template,
+    )?;
+    let (native_run, recovery) = screening.finish_score_stream_v2()?;
+    Ok(ScoredGpuOnlyFeatureTwoPassContinuationV2 {
+        preflight,
+        replay_producers,
+        native_run,
+        recovery,
+        pinned_source_projection_v1,
+    })
+}
+
+pub fn seal_selected_map_v2(
+    scored: ScoredGpuOnlyFeatureTwoPassContinuationV2,
+) -> std::result::Result<SealedResidentSelectedMapReceiptV2, GpuOnlyFeatureMaterializationErrorV3> {
+    seal_selected_map_inner_v2(scored)
+}
+
+fn seal_selected_map_inner_v2(
+    scored: ScoredGpuOnlyFeatureTwoPassContinuationV2,
+) -> std::result::Result<SealedResidentSelectedMapReceiptV2, GpuOnlyFeatureMaterializationErrorV3> {
+    let ScoredGpuOnlyFeatureTwoPassContinuationV2 {
+        preflight,
+        replay_producers,
+        native_run,
+        recovery,
+        pinned_source_projection_v1,
+    } = scored;
+    let row_count = preflight.plan.row_count;
+    let parent_column_count = preflight.plan.planned_routes.len();
+    let sealed_native = seal_native_selected_map_v2(native_run)?;
+    let selected_map = read_bounded_selected_map_v2(sealed_native)?;
+    if !selected_map.capacity_covers_actual_v2()
+        || selected_map.selected_count() == 0
+        || selected_map.selected_map_sha256() == [0; 32]
+        || usize::try_from(selected_map.selected_capacity()).ok() != Some(parent_column_count)
+    {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!("bounded selected-map receipt drifted from the parent recipe"),
+        ));
+    }
+    let run_device = recovery.recover_run_device_v2()?;
+    Ok(SealedResidentSelectedMapReceiptV2 {
+        selected_map,
+        preflight,
+        replay_producers,
+        run_device,
+        pinned_source_projection_v1,
+        row_count,
+        parent_column_count,
+    })
+}
+
+pub fn materialize_compact_selected_store_v2(
+    admitted: AdmittedCompactSelectedStoreV2,
+) -> std::result::Result<SealedGpuResidentFeatureStoreV3, GpuOnlyFeatureMaterializationErrorV3> {
+    let selected_column_count =
+        usize::try_from(admitted.workspace_extent.column_count()).unwrap_or(0);
+    let selected_map_sha256 = admitted.selected_map.selected_map_sha256();
+    let compact_extent = compact_selected_store_allocation_extent_v2(
+        usize::try_from(admitted.workspace_extent.row_count()).unwrap_or(0),
+        admitted.parent_column_count,
+        selected_column_count,
+    )?;
+    materialize_compact_selected_store_inner_v2(
+        admitted,
+        compact_extent,
+        selected_column_count,
+        selected_map_sha256,
+    )
+}
+
+fn materialize_compact_selected_store_inner_v2(
+    admitted: AdmittedCompactSelectedStoreV2,
+    compact_extent: CompactSelectedStoreAllocationExtentV2,
+    selected_column_count: usize,
+    selected_map_sha256: [u8; 32],
+) -> std::result::Result<SealedGpuResidentFeatureStoreV3, GpuOnlyFeatureMaterializationErrorV3> {
+    let AdmittedCompactSelectedStoreV2 {
+        selected_map,
+        preflight,
+        mut replay_producers,
+        run_device,
+        pinned_source_projection_v1,
+        parent_column_bindings,
+        parent_column_count: _,
+        workspace_extent,
+    } = admitted;
+    let row_count = usize::try_from(workspace_extent.row_count()).unwrap_or(0);
+    if selected_column_count == 0
+        || selected_column_count != usize::try_from(selected_map.selected_count()).unwrap_or(0)
+        || selected_map_sha256 == [0; 32]
+        || selected_map_sha256 != selected_map.selected_map_sha256()
+        || row_count != preflight.plan.row_count
+        || selected_column_count != preflight.plan.planned_routes.len()
+        || run_device.data_population_limits().is_none_or(|limits| {
+            limits.data_extent_identity_sha256() != workspace_extent.identity_sha256()
+        })
+    {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!("compact materialization lost its sealed selected-map authority"),
+        ));
+    }
+    let materialized_projection = derive_pinned_source_projection_v1(preflight.resident_sources())
+        .map_err(|error| GpuOnlyFeatureMaterializationErrorV3::Other(error.into()))?;
+    if pinned_source_projection_v1 != materialized_projection {
+        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
+            anyhow::anyhow!("compact replay source projection drifted from pinned leases"),
+        ));
+    }
+    let execution =
+        prepare_resident_producer_execution_v2(&preflight, &mut replay_producers, &run_device)?;
+    let selected_global_parent_ordinals = selected_map.selected_global_parent_ordinals().to_vec();
+    let admission = bind_gpu_only_run_device_v3(preflight, run_device)?;
+    let (seal_token, mut assembler, pending_smc_batch) = admission
+        .begin_compact_materialization_v2(
+            parent_column_bindings,
+            selected_global_parent_ordinals,
+            compact_extent,
+            execution.smc_materialization,
+        )?;
+    pending_smc_batch.append_to(&mut assembler)?;
+    while !assembler.try_retire_completed_batch()? {
+        std::thread::yield_now();
+    }
+    append_post_smc_producers_v2(execution.post_smc, &mut assembler)?;
+    seal_token.apply_resident_robust_normalization_v2(&mut assembler)?;
+    let owner = assembler.seal()?;
+    seal_gpu_resident_feature_store_v3(seal_token, owner)
 }
 
 /// Compatibility entrypoint for callers that already own the admitted full
@@ -3146,78 +4502,16 @@ fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(
         preflight,
         mut producers,
     } = prepared;
-    let smc_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Smc)?;
-    let classic_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::ClassicTa)?;
-    let quant_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Quant)?;
-    let session_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Session)?;
-    let regime_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Regime)?;
-    let footprint_bindings = preflight.exact_bindings_for(ResidentFeatureProducerV3::Footprint)?;
-    let htf_bindings =
-        preflight.exact_bindings_for(ResidentFeatureProducerV3::HigherTimeframeAlignment)?;
-    let (classic_ta_recipe, classic_ta_memory) = producers.take_classic_ta_runtime()?;
-    let quant_runtime = producers.take_quant_runtime()?;
-    let session_runtime = producers.take_session_runtime()?;
-    let (htf_runtime, htf_capture_templates) = producers.take_higher_timeframe_runtime()?;
-    let regime_input = producers.take_regime_input()?;
-    producers.prepare_smc(
-        &run_device,
-        preflight.resident_sources().base().frame(),
-        smc_bindings,
-    )?;
-    let direct_parents = preflight.resident_sources().direct_parents();
-    if direct_parents.len() != htf_capture_templates.len() || direct_parents.is_empty() {
-        return Err(GpuOnlyFeatureMaterializationErrorV3::Other(
-            anyhow::anyhow!(
-                "resident HTF direct-parent source and capture-template censuses disagree"
-            ),
-        ));
-    }
-    let mut htf_captures: Vec<ValidatedResidentHigherTimeframeDirectParentCaptureV3> =
-        Vec::with_capacity(direct_parents.len());
-    for (direct_parent, capture_template) in direct_parents.iter().zip(htf_capture_templates) {
-        let (parent_smc_bindings, pending_capture) =
-            capture_template.into_smc_preparation_parts_v3();
-        let parent_smc = prepare_smc_materialization_v3(
-            &run_device,
-            direct_parent.frame(),
-            parent_smc_bindings,
-        )?;
-        htf_captures.push(pending_capture.capture_direct_parent_v3(&run_device, parent_smc)?);
-    }
-    let prepared_htf_append = htf_runtime
-        .bind_captured_parents_v3(&run_device, htf_captures)?
-        .bind_current_native_v3(&run_device, htf_bindings)?;
+    let execution =
+        prepare_resident_producer_execution_v2(&preflight, &mut producers, &run_device)?;
     let admission = bind_gpu_only_run_device_v3(preflight, run_device)?;
-    let smc_materialization = producers.take_smc_materialization()?;
     let (seal_token, mut assembler, pending_smc_batch) =
-        admission.begin_materialization(smc_materialization)?;
+        admission.begin_materialization(execution.smc_materialization)?;
     pending_smc_batch.append_to(&mut assembler)?;
     while !assembler.try_retire_completed_batch()? {
         std::thread::yield_now();
     }
-    assembler.append_resident_classic_ta_recipe_v4(
-        classic_ta_recipe,
-        classic_bindings,
-        classic_ta_memory,
-    )?;
-    let _quant_receipt = quant_runtime.append_to(&mut assembler, quant_bindings)?;
-    while !assembler.try_retire_completed_batch()? {
-        std::thread::yield_now();
-    }
-    let (_session_admission, _session_receipt) =
-        session_runtime.append_to(&mut assembler, session_bindings)?;
-    while !assembler.try_retire_completed_batch()? {
-        std::thread::yield_now();
-    }
-    let _regime_receipt = regime_input.append_to(&mut assembler, regime_bindings)?;
-    while !assembler.try_retire_completed_batch()? {
-        std::thread::yield_now();
-    }
-    let _footprint_receipt = assembler.append_resident_footprint_v2(footprint_bindings)?;
-    while !assembler.try_retire_completed_batch()? {
-        std::thread::yield_now();
-    }
-    let (_htf_admission, _htf_receipt) = prepared_htf_append.append_to(&mut assembler)?;
+    append_post_smc_producers_v2(execution.post_smc, &mut assembler)?;
     seal_token.apply_resident_robust_normalization_v2(&mut assembler)?;
     let owner = assembler.seal()?;
     seal_gpu_resident_feature_store_v3(seal_token, owner)
@@ -3226,6 +4520,52 @@ fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_runtime_fit_decode_checks_schema_scope_gate_and_every_word() {
+        // Pure transport/portable-state test. These literal words are not a
+        // native receipt or device-execution evidence.
+        let names = vec!["smc_eqh".to_owned(), "continuous".to_owned()];
+        let words = [
+            0,
+            80,
+            0.0_f64.to_bits(),
+            1.0_f64.to_bits(),
+            79,
+            0,
+            0,
+            80,
+            2.0_f64.to_bits(),
+            4.0_f64.to_bits(),
+            78,
+            0,
+        ];
+        let state = fitted_state_from_device_words(&names, 0..80, &words).unwrap();
+        assert_eq!(state.column_names(), names);
+        assert_eq!(state.training_rows().unwrap(), 0..80);
+        assert_eq!(state.fits()[1].median, 2.0);
+        assert_eq!(state.fits()[1].scale, 4.0);
+        for (word, value) in [
+            (0, 1),
+            (1, 79),
+            (2, 1.0_f64.to_bits()),
+            (3, 2.0_f64.to_bits()),
+            (4, 0),
+            (5, 2),
+        ] {
+            let mut bad = words;
+            bad[word] = value;
+            assert!(
+                fitted_state_from_device_words(&names, 0..80, &bad).is_err(),
+                "word {word}"
+            );
+        }
+        assert!(fitted_state_from_device_words(&names, 0..80, &words[..11]).is_err());
+        let mut duplicate = names.clone();
+        duplicate[1] = duplicate[0].clone();
+        assert!(fitted_state_from_device_words(&duplicate, 0..80, &words).is_err());
+        assert!(fitted_state_from_device_words(&names, 0..79, &words).is_err());
+    }
 
     #[test]
     fn current_a2_capability_census_is_complete_and_canonical() {

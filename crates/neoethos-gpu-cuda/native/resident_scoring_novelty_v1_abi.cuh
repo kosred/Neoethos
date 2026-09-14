@@ -9,10 +9,28 @@
 
 namespace neoethos::resident_scoring_novelty_v1 {
 
+#if defined(__HIP_PLATFORM_AMD__)
+// Distinct HIP wire protocol; NVIDIA retains its original ABI value.
+constexpr std::uint32_t NEO_RESIDENT_SCORING_NOVELTY_ABI_V1 = 0x00010001u;
+#else
 constexpr std::uint32_t NEO_RESIDENT_SCORING_NOVELTY_ABI_V1 = 1;
+#endif
+// Only the plan grows. Existing population imports, receipts and seals retain ABI1.
+#if defined(__HIP_PLATFORM_AMD__)
+// Distinct HIP wire protocol; NVIDIA retains its original ABI value.
+constexpr std::uint32_t NEO_RESIDENT_SCORING_PLAN_ABI_V2 = 0x00010002u;
+#else
+constexpr std::uint32_t NEO_RESIDENT_SCORING_PLAN_ABI_V2 = 2;
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+constexpr std::uint32_t NEO_RESIDENT_SCORING_ADMISSION_ABI_V3 = 0x00010002u;
+#else
+constexpr std::uint32_t NEO_RESIDENT_SCORING_ADMISSION_ABI_V3 = 2u;
+#endif
 constexpr std::uint32_t NEO_RESIDENT_SCORING_VERSION_V1 = 5;
 constexpr std::uint32_t NEO_RESIDENT_SCORING_PROPFIRM_V4 = 1;
 constexpr std::uint32_t NEO_RESIDENT_SCORING_RISKY_GROWTH_V5 = 2;
+constexpr std::uint32_t NEO_RESIDENT_SCORING_RISKY_GROWTH_GOAL_V6 = 3;
 inline constexpr std::uint8_t NEO_RESIDENT_CUDA_MATH_SEMANTICS_SHA256_V2[32] = {
     0xaa, 0x03, 0x90, 0xaa, 0xb6, 0xb1, 0xfd, 0x8e,
     0xd9, 0x59, 0x7d, 0x5d, 0x7b, 0xa0, 0x60, 0xc2,
@@ -54,7 +72,11 @@ struct NeoResidentScoringNoveltyGeneScalarV1 {
 /// events are pre-owned by that session and retained by `population_lifetime_owner`.
 struct NeoResidentScoringNoveltyPopulationImportV1 {
   std::uint32_t abi_version;
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint32_t selected_hip_ordinal;
+#else
   std::uint32_t selected_cuda_ordinal;
+#endif
   cudaStream_t admitted_run_stream;
   cudaEvent_t metrics_ready_event;
   cudaEvent_t scoring_novelty_ready_event;
@@ -68,14 +90,30 @@ struct NeoResidentScoringNoveltyPopulationImportV1 {
   std::uint32_t max_terms_per_gene;
   std::uint32_t reserved;
   std::uint64_t full_discovery_reserve_bytes;
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_device_identity_sha256[32];
+#else
   std::uint8_t cuda_device_identity_sha256[32];
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_lease_identity_sha256[32];
+#else
   std::uint8_t primary_context_identity_sha256[32];
+#endif
   std::uint8_t run_stream_identity_sha256[32];
   std::uint8_t metric_semantics_sha256[32];
   std::uint8_t gene_schema_sha256[32];
   std::uint8_t scenario_order_semantics_sha256[32];
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_build_manifest_sha256[32];
+#else
   std::uint8_t cuda_build_manifest_sha256[32];
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_math_flags_sha256[32];
+#else
   std::uint8_t cuda_math_flags_sha256[32];
+#endif
   std::uint8_t resident_input_content_sha256[32];
   std::uint8_t gene_content_sha256[32];
   std::uint8_t metric_content_sha256[32];
@@ -92,17 +130,38 @@ struct NeoResidentScoringNoveltyPlanV1 {
   std::uint32_t max_terms_per_gene;
   std::uint32_t reserved_extents;
   std::uint64_t novelty_weight_bits;
+  std::uint64_t initial_equity_bits;
+  std::uint64_t span_days_bits;
+  std::uint64_t goal_start_balance_bits;
+  std::uint64_t goal_target_balance_bits;
+  std::uint64_t goal_horizon_days_bits;
   std::uint8_t metric_semantics_sha256[32];
   std::uint8_t scoring_semantics_sha256[32];
   std::uint8_t novelty_semantics_sha256[32];
   std::uint8_t scenario_order_semantics_sha256[32];
   std::uint8_t gene_schema_sha256[32];
   std::uint8_t rank_semantics_sha256[32];
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_device_identity_sha256[32];
+#else
   std::uint8_t cuda_device_identity_sha256[32];
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_lease_identity_sha256[32];
+#else
   std::uint8_t primary_context_identity_sha256[32];
+#endif
   std::uint8_t run_stream_identity_sha256[32];
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_build_manifest_sha256[32];
+#else
   std::uint8_t cuda_build_manifest_sha256[32];
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_math_flags_sha256[32];
+#else
   std::uint8_t cuda_math_flags_sha256[32];
+#endif
   std::uint8_t plan_identity_sha256[32];
 };
 
@@ -128,12 +187,24 @@ struct NeoResidentScoringNoveltyAllocationReceiptV1 {
 /// generation/evaluation kernel is launched.
 struct NeoResidentScoringAdmissionV2 {
   std::uint32_t abi_version;
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint32_t selected_hip_ordinal;
+#else
   std::uint32_t selected_cuda_ordinal;
+#endif
   cudaStream_t admitted_run_stream;
   cudaEvent_t scoring_novelty_ready_event;
   std::uint64_t full_discovery_reserve_bytes;
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_device_identity_sha256[32];
+#else
   std::uint8_t cuda_device_identity_sha256[32];
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_lease_identity_sha256[32];
+#else
   std::uint8_t primary_context_identity_sha256[32];
+#endif
   std::uint8_t run_stream_identity_sha256[32];
 };
 
@@ -175,8 +246,16 @@ struct NeoResidentScoredDecisionRowsV1 {
   std::uint8_t novelty_semantics_sha256[32];
   std::uint8_t scenario_order_semantics_sha256[32];
   std::uint8_t rank_semantics_sha256[32];
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_build_manifest_sha256[32];
+#else
   std::uint8_t cuda_build_manifest_sha256[32];
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_math_flags_sha256[32];
+#else
   std::uint8_t cuda_math_flags_sha256[32];
+#endif
 };
 
 static_assert(sizeof(void*) == 8, "resident scoring/novelty V1 requires 64-bit ABI");
@@ -186,7 +265,7 @@ static_assert(sizeof(NeoResidentScoringNoveltyGeneScalarV1) == 72,
               "gene scalar ABI changed");
 static_assert(sizeof(NeoResidentScoringNoveltyPopulationImportV1) == 488,
                "population import ABI changed");
-static_assert(sizeof(NeoResidentScoringNoveltyPlanV1) == 432,
+static_assert(sizeof(NeoResidentScoringNoveltyPlanV1) == 472,
                "scoring plan ABI changed");
 static_assert(sizeof(NeoResidentScoringNoveltyAllocationReceiptV1) == 128,
               "allocation receipt ABI changed");

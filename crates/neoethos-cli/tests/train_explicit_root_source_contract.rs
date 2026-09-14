@@ -44,7 +44,10 @@ fn tui_train_passes_root_as_an_argument_instead_of_child_environment_state() {
         "shared.status = \"Spawned train\"",
     );
 
-    assert!(launch.contains("\"--root\".to_string()"));
+    let arguments = between(&source, "fn build_launch_args(", "pub fn launch_now");
+    assert!(arguments.contains("\"--root\".to_string()"));
+    assert!(arguments.contains("form.value_for(\"Data root\")"));
+    assert!(launch.contains("build_launch_args(&shared.train_form)"));
     assert!(launch.contains("shared.jobs.spawn(\"train\", args)"));
     assert!(!launch.contains("spawn_with_env"));
     assert!(!launch.contains("NEOETHOS_BOT_DATA_ROOT"));

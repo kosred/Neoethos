@@ -3,13 +3,13 @@ fn resident_population_auto_v2_surface_is_available_to_the_staged_cuda_route() {
     use crate::resident_population_auto_sizing_receipt_v2::{
         ResidentPopulationAutoSizingReceiptV2, ResidentPopulationAutoSizingRequestV2,
         evaluation_config_from_canonical_trendbar_contract_v2,
-        seal_resident_population_auto_for_canonical_trendbar_research_v2,
+        seal_resident_population_auto_for_compact_canonical_trendbar_research_with_hard_cap_v2,
     };
 
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ResidentPopulationAutoSizingReceiptV2>();
     assert_send_sync::<ResidentPopulationAutoSizingRequestV2>();
-    let _ = seal_resident_population_auto_for_canonical_trendbar_research_v2;
+    let _ = seal_resident_population_auto_for_compact_canonical_trendbar_research_with_hard_cap_v2;
     let _ = evaluation_config_from_canonical_trendbar_contract_v2;
 }
 
@@ -72,7 +72,7 @@ fn resident_v2_distinguishes_requested_effective_and_typed_adaptive_evidence() {
 }
 
 #[test]
-fn v5_exposes_only_the_native_generation_zero_milestone() {
+fn compact_v6_exposes_only_the_native_generation_zero_milestone() {
     use crate::prepared_discovery_run_input_v3::{
         ResidentGenerationZeroMilestoneV1,
         run_prepared_canonical_trendbar_research_generation_zero_v5,
@@ -84,15 +84,19 @@ fn v5_exposes_only_the_native_generation_zero_milestone() {
         run_prepared_canonical_trendbar_research_generation_zero_v5::<fn(crate::DiscoveryProgress)>;
 
     let source = include_str!("prepared_discovery_run_input_v3.rs");
-    assert!(source.contains("V5 requires one admitted native CUDA run"));
     assert!(!source.contains("PreparedCanonicalDiscoveryRunInputV5::Cpu"));
     assert!(!source.contains("config.evaluation_config"));
     assert!(source.contains("does not yet have a resident adaptive-threshold reduction"));
     assert!(source.contains("does not yet have a resident median-ATR gene-band reduction"));
     assert!(source.contains("clear_adaptive_threshold_ladder"));
     assert!(source.contains("clear_gene_stop_atr_scale"));
-    assert!(source.contains("requires resident trim/remap before sizing"));
-    assert!(source.contains("requires resident feature prefilter/remap before sizing"));
+    assert!(
+        !source.contains("compact V6 Generation-0 still requires resident row trim before sizing")
+    );
+    assert!(source.contains("ResidentFeatureScreeningScopeV2"));
+    assert!(source.contains("screening_scope"));
+    assert!(source.contains("upgrade the same screening CUDA run to compact Data+population"));
+    assert!(!source.contains("prepare_staged_canonical_trendbar_research_run_input_v5"));
     assert!(source.contains("payoff floor is unreachable"));
     assert!(source.contains("does not yet carry the canonical discovery-ledger seed authority"));
 }

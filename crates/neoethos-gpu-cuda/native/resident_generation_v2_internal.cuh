@@ -40,6 +40,26 @@ struct ResidentGenerationDevicePublishResultV2 {
 class ResidentGenerationPreparedAdvanceV2;
 class ResidentGenerationTerminalLifecycleV2;
 
+// Physical C-row evaluator chunks are accumulated into admitted P-row storage
+// on the same stream. Only exact complete coverage can be exported for a single
+// global scoring pass; these native-only borrows grant no host payload access.
+std::int32_t begin_resident_generation_metrics_v3(
+    resident_generation_v1::NeoResidentGenerationRunV1* run,
+    const resident_generation_v2::NeoResidentGenerationGeneViewV2* view,
+    cudaStream_t stream);
+std::int32_t append_resident_generation_metrics_v3(
+    resident_generation_v1::NeoResidentGenerationRunV1* run,
+    const resident_generation_v2::NeoResidentGenerationGeneViewV2* view,
+    cudaStream_t stream, std::uint64_t logical_offset, std::uint64_t active_count,
+    const resident_generation_v1::NeoResidentGenerationMetricRowV1* rows,
+    const std::uint64_t* scenario_ids);
+std::int32_t export_resident_generation_metrics_v3(
+    resident_generation_v1::NeoResidentGenerationRunV1* run,
+    const resident_generation_v2::NeoResidentGenerationGeneViewV2* view,
+    cudaStream_t stream,
+    const resident_generation_v1::NeoResidentGenerationMetricRowV1** rows,
+    const std::uint64_t** scenario_ids);
+
 std::int32_t enqueue_resident_generation_offspring_from_scored_rows_v2(
     resident_generation_v1::NeoResidentGenerationRunV1* generation,
     const ResidentGenerationScoredRowsV2* scored_rows,
@@ -262,3 +282,17 @@ static_assert(std::is_standard_layout_v<ResidentGenerationTerminalLifecycleV2>,
               "terminal lifecycle proof must remain standard-layout");
 
 }  // namespace neoethos::resident_generation_v2_internal
+
+namespace neoethos::resident_archive_knn_v2 {
+struct NeoResidentArchiveKnnOwnerV2;
+struct NeoResidentArchiveKnnTerminalV2;
+
+/// Non-minting borrow from the exact archive owner after terminal validation.
+/// A ready event alone is insufficient: the owner, run, context and complete
+/// committed terminal tuple must all match before any population payload copy.
+const resident_generation_v2_internal::ResidentGenerationTerminalLifecycleV2*
+borrow_completed_archive_terminal_lifecycle_v3(
+    const NeoResidentArchiveKnnOwnerV2* owner,
+    const resident_generation_v1::NeoResidentGenerationRunV1* generation,
+    const NeoResidentArchiveKnnTerminalV2* expected_terminal);
+}  // namespace neoethos::resident_archive_knn_v2

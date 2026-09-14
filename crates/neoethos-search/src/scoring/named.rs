@@ -61,7 +61,41 @@ pub struct ScoringVersion(pub u32);
 /// [`ga_fitness_growth`] — expected Kelly log-growth over the evaluation
 /// window — instead of borrowing the prop-firm consistency formula. PropFirm /
 /// Strict discovery still uses [`ga_fitness`] (v4 math, unchanged).
-pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(5);
+/// v6: Risky discovery binds the configured goal/deadline to measured realized
+/// balance growth. The v5 function remains only for explicitly legacy callers.
+pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(6);
+
+pub use neoethos_gpu_contracts::resident_search_scoring_v2::RiskyGrowthGoal;
+
+/// Risky GA v6: continuous squared relative log-shortfall of the observed
+/// realized-balance growth pace against the requested deadline.
+///
+/// `pace = log(1 + net / actual_initial_equity) * horizon / observed_days`.
+/// `score = 1 - max(1 - pace / log(target / start), 0)^2`.
+/// No hypothetical Kelly bet replaces the confidence-sized simulation. There
+/// is no arbitrary drawdown weight or additional trade-frequency gate here;
+/// existing validation/risk constraints still apply. Zero trades retain the
+/// explicit exploration penalty, and an observed wipeout is never rewarded.
+///
+/// This is a screening PACE PROXY, not a probability or evidence that a goal
+/// was achieved. It extrapolates a realized balance rate (not marked wealth),
+/// ignores terminal open PnL, and must not be presented as a replay at the
+/// reference starting capital. Above-goal pace saturates; below goal the
+/// continuous gradient remains. Target changes need not reorder candidates
+/// whose only difference is return, but do change selection pressure.
+pub fn ga_fitness_goal(
+    metrics: &[f64; 11],
+    initial_equity: f64,
+    span_days: f64,
+    goal: RiskyGrowthGoal,
+) -> f64 {
+    neoethos_gpu_contracts::resident_search_scoring_v2::score_risky_ga_fitness_goal_v6(
+        metrics,
+        initial_equity,
+        span_days,
+        goal,
+    )
+}
 
 // ---------------------------------------------------------------------------
 // ga_fitness — was `genetic::evolution_math::score_from_metrics`
@@ -215,6 +249,148 @@ pub fn quality_score(metrics: &[f64; 11]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn goal() -> RiskyGrowthGoal {
+        RiskyGrowthGoal {
+            start_balance: 100.0,
+            target_balance: 50_000.0,
+            horizon_days: 180.0,
+        }
+    }
+
+    #[test]
+    fn goal_pace_uses_actual_net_and_sizing_not_hypothetical_kelly() {
+        let lost_money = metrics(-2_000.0, 1.0, 0.5, 0.6, 2.0, -20.0, 100.0, 0.5);
+        let earned_money = metrics(2_000.0, 1.0, 0.5, 0.6, 2.0, 20.0, 100.0, 0.5);
+        assert!(
+            (ga_fitness_growth(&lost_money) - ga_fitness_growth(&earned_money) + 0.001).abs()
+                < 1e-12
+        );
+        assert!(ga_fitness_goal(&lost_money, 10_000.0, 180.0, goal()) < 0.0);
+        assert!(ga_fitness_goal(&earned_money, 10_000.0, 180.0, goal()) > 0.0);
+        let mut different_summary = earned_money;
+        different_summary[4] = 0.3;
+        different_summary[5] = 1.1;
+        assert_eq!(
+            ga_fitness_goal(&earned_money, 10_000.0, 180.0, goal()),
+            ga_fitness_goal(&different_summary, 10_000.0, 180.0, goal())
+        );
+    }
+
+    #[test]
+    fn goal_pace_binds_span_deadline_and_reference_target() {
+        let row = metrics(10_000.0, 1.0, 0.2, 0.6, 2.0, 100.0, 100.0, 0.5);
+        let base = ga_fitness_goal(&row, 10_000.0, 180.0, goal());
+        assert!(ga_fitness_goal(&row, 10_000.0, 90.0, goal()) > base);
+        assert!(
+            ga_fitness_goal(
+                &row,
+                10_000.0,
+                180.0,
+                RiskyGrowthGoal {
+                    horizon_days: 90.0,
+                    ..goal()
+                }
+            ) < base
+        );
+        assert!(
+            ga_fitness_goal(
+                &row,
+                10_000.0,
+                180.0,
+                RiskyGrowthGoal {
+                    target_balance: 100_000.0,
+                    ..goal()
+                }
+            ) < base
+        );
+        // The same actual growth rate on differently sized measured windows.
+        let mut longer = row;
+        longer[0] = 30_000.0; // 4x over twice the time of 2x.
+        assert!((ga_fitness_goal(&longer, 10_000.0, 360.0, goal()) - base).abs() < 1e-14);
+    }
+
+    #[test]
+    fn goal_pace_has_continuous_gradient_below_target_and_saturates_above_it() {
+        let mut row = metrics(100.0, 1.0, 0.2, 0.6, 2.0, 1.0, 100.0, 0.5);
+        let first = ga_fitness_goal(&row, 100.0, 180.0, goal());
+        row[0] = 1_000.0;
+        let second = ga_fitness_goal(&row, 100.0, 180.0, goal());
+        assert!(first > 0.0 && first < second && second < 1.0);
+        row[0] = 49_900.0;
+        assert_eq!(ga_fitness_goal(&row, 100.0, 180.0, goal()), 1.0);
+        row[0] = 500_000.0;
+        assert_eq!(ga_fitness_goal(&row, 100.0, 180.0, goal()), 1.0);
+    }
+
+    #[test]
+    fn goal_pace_rejects_bad_context_and_bankruptcy_without_mutating_metrics() {
+        let row = metrics(100.0, 1.0, 0.2, 0.6, 2.0, 1.0, 100.0, 0.5);
+        for span in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                ga_fitness_goal(&row, 100.0, span, goal()),
+                f64::NEG_INFINITY
+            );
+        }
+        for initial in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                ga_fitness_goal(&row, initial, 180.0, goal()),
+                f64::NEG_INFINITY
+            );
+        }
+        for invalid in [
+            RiskyGrowthGoal {
+                start_balance: 0.0,
+                ..goal()
+            },
+            RiskyGrowthGoal {
+                target_balance: 100.0,
+                ..goal()
+            },
+            RiskyGrowthGoal {
+                horizon_days: 0.0,
+                ..goal()
+            },
+            RiskyGrowthGoal {
+                target_balance: f64::INFINITY,
+                ..goal()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+            assert_eq!(
+                ga_fitness_goal(&row, 100.0, 180.0, invalid),
+                f64::NEG_INFINITY
+            );
+        }
+        let mut wiped = row;
+        wiped[0] = -100.0;
+        assert_eq!(
+            ga_fitness_goal(&wiped, 100.0, 180.0, goal()),
+            f64::NEG_INFINITY
+        );
+        wiped = row;
+        wiped[3] = 1.0;
+        assert_eq!(
+            ga_fitness_goal(&wiped, 100.0, 180.0, goal()),
+            f64::NEG_INFINITY
+        );
+        let mut no_trades = row;
+        no_trades[8] = 0.0;
+        assert_eq!(ga_fitness_goal(&no_trades, 100.0, 180.0, goal()), -100.0);
+    }
+
+    #[test]
+    fn goal_pace_uses_actual_simulation_capital_and_preserves_reference_ratio() {
+        let row = metrics(1_000.0, 1.0, 0.2, 0.6, 2.0, 10.0, 100.0, 0.5);
+        let base = ga_fitness_goal(&row, 10_000.0, 180.0, goal());
+        assert!(ga_fitness_goal(&row, 100.0, 180.0, goal()) > base);
+        let equivalent_ratio = RiskyGrowthGoal {
+            start_balance: 10_000.0,
+            target_balance: 5_000_000.0,
+            ..goal()
+        };
+        assert!((ga_fitness_goal(&row, 10_000.0, 180.0, equivalent_ratio) - base).abs() < 1e-14);
+    }
 
     /// Helper: build a canonical `[f64; 11]` from named fields.
     fn metrics(

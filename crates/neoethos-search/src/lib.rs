@@ -39,11 +39,7 @@ mod prefilter_schema_v1;
 // lands later, reintroduce a fresh helper at that time.
 
 pub mod backend;
-#[cfg(any(
-    test,
-    feature = "gpu-b-adapter",
-    feature = "resident-search-slice2-compile-contract"
-))]
+#[cfg(any(test, feature = "gpu-b-adapter"))]
 mod canonical_discovery_config_digest_v1;
 mod canonical_native_discovery_request_v1;
 mod canonical_native_discovery_run_v1;
@@ -53,7 +49,19 @@ mod canonical_native_generation_zero_publication_v1;
 mod canonical_native_generation_zero_publication_v1_tests;
 #[cfg(test)]
 mod canonical_native_generation_zero_result_size_plan_v1_tests;
+mod canonical_native_generation_zero_result_schema_v1 {
+    pub const SCHEMA: &str = "neoethos.canonical-native-generation-zero-research-result.v1";
+    pub const VERSION: u16 = 1;
+}
+#[cfg(any(test, all(target_os = "linux", feature = "gpu-cuda")))]
 mod canonical_native_generation_zero_result_v1;
+#[cfg(not(any(test, all(target_os = "linux", feature = "gpu-cuda"))))]
+mod canonical_native_generation_zero_result_v1 {
+    pub use crate::canonical_native_generation_zero_result_schema_v1::{
+        SCHEMA as CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_SCHEMA_V1,
+        VERSION as CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_VERSION_V1,
+    };
+}
 mod canonical_native_root_io_v1;
 mod canonical_native_runtime_authority_v1;
 pub mod canonical_trendbar_research;
@@ -68,29 +76,18 @@ mod exact_resident_dataset_authority_v1_contract;
 pub mod engine_identity;
 pub mod eval;
 pub mod eval_telemetry;
-#[cfg(any(
-    test,
-    feature = "gpu-b-adapter",
-    feature = "resident-search-slice2-compile-contract"
-))]
-pub mod gpu_resident_current_config_plan_v1;
-#[cfg(any(
-    feature = "gpu-b-native",
-    feature = "resident-search-slice2-compile-contract"
-))]
+#[cfg(feature = "gpu-b-native")]
 pub mod resident_search_slice2_v3 {
-    pub use crate::gpu_resident_current_config_plan_v1::FullResidentDiscoveryDeadlineReceiptV1;
     pub use neoethos_gpu_cuda::resident_search_slice2_v3::{
-        ResidentArchiveKnnCalibrationReceiptV2, ResidentSearchArchiveStagedV3,
+        ResidentSearchArchiveStagedV3, ResidentSearchExecutionPlanV3,
         ResidentSearchGenerationChainV3, ResidentSearchRankEnqueuedV3,
         ResidentSearchRejectedAuthorityV3, ResidentSearchTerminalPendingV3,
         ResidentSearchTerminalReceiptV3, ResidentSearchTransitionErrorV3,
         ResidentSearchTryCompleteV3,
     };
 }
-#[cfg(feature = "gpu-b-native")]
-#[path = "gpu_full_discovery/gpu_resident_trim_prefilter_view_v1.rs"]
-pub mod gpu_resident_trim_prefilter_view_v1;
+#[cfg(all(target_os = "linux", feature = "gpu-cuda"))]
+mod gpu_resident_feature_screening_v2;
 mod native_population_residency_receipt_v1;
 mod population_auto_sizing_receipt_v1;
 #[cfg(all(test, feature = "gpu-b-adapter"))]
@@ -112,6 +109,8 @@ pub mod resident_population_auto_sizing_receipt_v2;
 #[cfg(all(test, feature = "gpu-cuda"))]
 #[path = "resident_population_auto_sizing_receipt_v2_contract.rs"]
 mod resident_population_auto_sizing_receipt_v2_contract;
+#[cfg(any(test, feature = "gpu-cuda"))]
+mod resident_selection_scope_v2;
 mod strict_discovery_device_route_v1;
 #[cfg(test)]
 #[path = "strict_discovery_device_route_v1_contract.rs"]
@@ -143,6 +142,7 @@ pub mod live_portfolio;
 pub mod orchestration;
 pub mod parity;
 pub mod portfolio;
+mod post_ga;
 pub mod quality;
 mod quote_validated_outer_holdout_v1;
 // **Scoring unification — Phase A (operator-approved 2026-05-25)**
@@ -170,8 +170,6 @@ pub mod regime;
 //                     produces is falsifiable.
 pub mod run_identity;
 pub mod stop_target;
-#[cfg(feature = "strategy-db")]
-pub mod strategy_db;
 pub mod trial_returns;
 pub mod validation;
 pub mod validation_snapshot;
@@ -232,6 +230,7 @@ pub use exact_resident_dataset_authority_v1::{
 };
 pub use native_population_residency_receipt_v1::NativePopulationResidencyReceiptV1;
 pub use population_auto_sizing_receipt_v1::{
+    CPU_POPULATION_AUTO_TARGET_GENERATION_NS_V1, CpuPopulationAutoPlanV1,
     POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V1, PopulationAutoCpuAuthorityV1,
     PopulationAutoSizingErrorCodeV1, PopulationAutoSizingErrorV1, PopulationAutoSizingReceiptV1,
     PopulationAutoSizingRouteV1, PopulationAutoStage1WindowV1,
@@ -240,6 +239,8 @@ pub use population_engine_run_receipt_v1::{
     POPULATION_ENGINE_RUN_RECEIPT_SCHEMA_VERSION_V1, PopulationEngineRunReceiptErrorCodeV1,
     PopulationEngineRunReceiptErrorV1, PopulationEngineRunReceiptV1,
 };
+#[cfg(all(feature = "gpu-cuda", any(test, target_os = "linux")))]
+pub use population_execution_evidence_v1::retained_compact_v3::ExactResidentCompactMetricsV3;
 pub use population_execution_run_receipt_v2::ExactPopulationExecutionRunReceiptV2;
 #[cfg(feature = "gpu-cuda")]
 pub use prepared_discovery_run_input_v3::{
@@ -249,23 +250,27 @@ pub use prepared_discovery_run_input_v3::{
     ResidentGenerationZeroMilestoneV1, dispatch_canonical_discovery_data_preparation_v3,
     dispatch_staged_canonical_discovery_data_preparation_v4,
     prepare_canonical_discovery_run_input_v3, prepare_staged_canonical_discovery_run_input_v4,
-    prepare_staged_canonical_trendbar_research_run_input_v5,
-    run_prepared_canonical_trendbar_research_generation_zero_v5,
     run_prepared_canonical_discovery_with_holdout_and_progress_v3,
+    run_prepared_canonical_trendbar_research_generation_zero_v5,
     run_prepared_canonical_trendbar_research_with_cpu_training_handoff_v3,
     run_prepared_canonical_trendbar_research_with_holdout_and_progress_v3,
 };
+#[cfg(all(feature = "gpu-cuda", any(test, target_os = "linux")))]
+pub use prepared_discovery_run_input_v3::{
+    ResidentRepeatedSearchResultV3, run_prepared_canonical_trendbar_research_resident_search_v5,
+};
 pub use process_execution_lease_v1::{
     ProcessExecutionBusyV1, ProcessExecutionKindV1, ProcessExecutionLeaseTransitionErrorV1,
-    ProcessExecutionLeaseV1, try_acquire_process_execution_lease_v1,
-};
-#[cfg(feature = "gpu-cuda")]
-pub use strict_resident_feature_store_v3::{
-    StrictResidentPopulationExecutionRunV3, consume_strict_resident_population_execution_run_v3,
+    ProcessExecutionLeaseV1, active_process_execution_kind_v1,
+    try_acquire_process_execution_lease_v1,
 };
 pub use strict_discovery_device_route_v1::{
     ExactCudaDeviceOrdinalV1, SealedNoCompatibleGpuProbeReceiptV1,
     SealedStrictDiscoveryDeviceAdmissionV1, acquire_strict_discovery_device_admission_v1,
+};
+#[cfg(feature = "gpu-cuda")]
+pub use strict_resident_feature_store_v3::{
+    StrictResidentPopulationExecutionRunV3, consume_strict_resident_population_execution_run_v3,
 };
 // `pub use challenge::{ChallengeOptimizer, ChallengeTarget};` — DELETED 2026-05-26.
 pub use data_selection::{
@@ -297,7 +302,8 @@ pub use discovery::{
     discovery_per_kind_evidence_hashes, discovery_validation_evidence_manifest,
     discovery_validation_evidence_manifest_excluding_live_sim, ensure_non_empty_portfolio,
     ensure_portfolio_export_ready, faithful_oos_eval, live_validation_evidence_from_discovery,
-    run_canonical_trendbar_research_discovery_with_holdout_and_progress, run_discovery_cycle,
+    run_canonical_trendbar_research_discovery_with_holdout_and_progress,
+    run_canonical_trendbar_research_with_quote_holdout_v3, run_discovery_cycle,
     run_discovery_cycle_with_holdout, run_discovery_cycle_with_holdout_and_progress,
     run_discovery_cycle_with_progress,
     run_discovery_cycle_with_quote_validated_outer_holdout_and_progress,
@@ -365,9 +371,9 @@ pub use genetic::{
     signals_for_gene, signals_for_gene_full, take_elites,
 };
 pub use live_portfolio::{
-    LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, current_retired_rules,
-    install_retired_rules_from_settings, load_live_portfolio_json, project_features_to_effective,
-    save_live_portfolio_json,
+    LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, LiveSizingEvidenceV1,
+    current_retired_rules, install_retired_rules_from_settings, load_live_portfolio_json,
+    project_features_to_effective, save_live_portfolio_json,
 };
 pub use neoethos_core::contracts::DeterminismPolicy;
 pub use orchestration::{BatchDiscoverySummary, DiscoveryOrchestrator};
@@ -378,17 +384,22 @@ pub use quality::{
     install_quality_runtime_overrides_from_settings,
 };
 pub use quote_validated_outer_holdout_v1::{
-    LockedPortfolioOuterHoldoutReplaySetV1, QUOTE_VALIDATED_OUTER_HOLDOUT_SCHEMA_VERSION_V1,
+    CanonicalSignalAccountRiskPolicyV3, CanonicalSignalExitPolicyV2, LockedCanonicalSignalPlanV3,
+    LockedPortfolioOuterHoldoutReplaySetV1, LockedPortfolioOuterHoldoutReplaySetV3,
+    QUOTE_VALIDATED_OUTER_HOLDOUT_SCHEMA_VERSION_V1, QuoteEntryFinancialInputsV3,
+    QuoteEntrySizingEvidenceV3, QuoteReplayLotConstraintsV3, QuoteValidatedDecisionProvenanceV3,
     QuoteValidatedOuterHoldoutArtifactClassV1, QuoteValidatedOuterHoldoutErrorCodeV1,
     QuoteValidatedOuterHoldoutErrorV1, QuoteValidatedOuterHoldoutMetricsV1,
     QuoteValidatedOuterHoldoutPromotionEligibilityV1, QuoteValidatedOuterHoldoutReceiptV1,
-    QuoteValidatedOuterHoldoutResearchEvidenceV1, QuoteValidatedOuterHoldoutTradeOutcomeV1,
-    canonical_locked_portfolio_identity_sha256_v1, evaluate_locked_portfolio_outer_holdout_v1,
+    QuoteValidatedOuterHoldoutResearchEvidenceV1, QuoteValidatedOuterHoldoutResearchEvidenceV3,
+    QuoteValidatedOuterHoldoutTradeOutcomeV1, canonical_locked_portfolio_identity_sha256_v1,
+    evaluate_locked_portfolio_outer_holdout_v1, evaluate_locked_portfolio_outer_holdout_v3,
 };
 pub use stop_target::{
     StopDistanceError, StopTargetRuntimeOverrides, StopTargetSettings, adaptive_base_pips_series,
     adaptive_sl_tp_pips_series, adaptive_stops_enabled, adaptive_stops_rr,
-    compute_stop_distance_series, current_stop_target_runtime_overrides, infer_stop_target_pips,
+    compute_stop_distance_series, current_stop_target_runtime_overrides,
+    effective_adaptive_reward_risk, infer_stop_target_pips,
     install_stop_target_runtime_overrides_from_settings,
 };
 pub use validation::{

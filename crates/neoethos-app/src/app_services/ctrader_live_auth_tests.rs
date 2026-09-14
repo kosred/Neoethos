@@ -60,9 +60,10 @@ fn callback_capture_times_out_when_browser_never_redirects() {
     let backend = ProductionCTraderLiveAuthBackend;
 
     let err = backend
-        .capture_authorization_code_with_timeout(
+        .capture_authorization_code_with_state(
             listener,
             "/callback",
+            None,
             std::time::Duration::from_millis(10),
         )
         .expect_err("missing browser callback should time out");

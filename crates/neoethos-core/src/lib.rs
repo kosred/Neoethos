@@ -10,6 +10,7 @@ pub mod domain;
 pub mod env_overrides;
 pub mod execution;
 pub mod logging;
+pub mod research_conversion_fee;
 pub mod resolved_config;
 pub mod scheduler;
 pub mod schema_version;
@@ -64,7 +65,7 @@ pub use contracts::{
 };
 pub use domain::PropFirmConstraints;
 pub use domain::{
-    DEFAULT_RISKY_TRADES_PER_DAY, KillSwitchTier, MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
+    DEFAULT_MONTHLY_LOSS_CAP_FRACTION, DEFAULT_RISKY_TRADES_PER_DAY, KillSwitchTier,
     RiskyModeConfig, RiskyModeManager, RiskyStage, build_logarithmic_stages,
 };
 pub use schema_version::{
@@ -75,6 +76,6 @@ pub use system::{
     AcceleratorBackend, AcceleratorDevice, CpuBudget, CpuCapacityDiagnostics,
     ExecutionBudgetInputError, ExecutionBudgetInputs, GpuBudget, HardwareExecutionPlan,
     HardwareRuntimeOverrides, PrecisionPolicy, ResolvedWorkloadAssignment, TrainingPrecision,
-    WorkloadDemand, WorkloadExecutionPlan, WorkloadKind, available_memory_bytes,
-    total_memory_bytes,
+    WorkloadDemand, WorkloadExecutionPlan, WorkloadKind, allocation_headroom_bytes,
+    available_memory_bytes, total_memory_bytes,
 };

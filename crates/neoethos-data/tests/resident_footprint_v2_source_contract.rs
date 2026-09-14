@@ -193,7 +193,7 @@ fn data_owns_move_only_footprint_preflight_lifetime_and_runtime_validation() {
 }
 
 #[test]
-fn capability_census_advances_to_five_of_ten_only_after_receipt_wiring() {
+fn capability_census_is_complete_after_all_receipts_are_wired() {
     let data = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
     let preflight =
         read("crates/neoethos-data/src/core/gpu_only_feature_workspace_preflight_v3.rs");
@@ -207,7 +207,12 @@ fn capability_census_advances_to_five_of_ten_only_after_receipt_wiring() {
         &[
             "resident_classic_ta_capability_v3()?",
             "resident_smc_capability_v3()?",
+            "resident_quant_capability_v3()?",
+            "resident_session_capability_v2()?",
+            "resident_regime_capability_v3()?",
             "resident_footprint_capability_v2()?",
+            "resident_higher_timeframe_capability_v3()?",
+            "resident_robust_normalization_capability_v2()?",
             "resident_canonical_content_sha256_capability_v3()?",
             "resident_feature_major_to_bar_major_capability_v3()?",
         ],
@@ -217,29 +222,18 @@ fn capability_census_advances_to_five_of_ten_only_after_receipt_wiring() {
         "pub const CURRENT_PENDING_RESIDENT_PRODUCERS_V3:",
         "];",
     );
-    for producer in [
-        "ResidentFeatureProducerV3::Quant",
-        "ResidentFeatureProducerV3::Session",
-        "ResidentFeatureProducerV3::Regime",
-        "ResidentFeatureProducerV3::HigherTimeframeAlignment",
-        "ResidentFeatureProducerV3::RobustNormalization",
-    ] {
-        assert!(pending.contains(producer), "missing pending {producer}");
-    }
-    assert_eq!(pending.matches("ResidentFeatureProducerV3::").count(), 5);
-    assert!(!pending.contains("ResidentFeatureProducerV3::Footprint"));
+    assert_eq!(pending.matches("ResidentFeatureProducerV3::").count(), 0);
+    assert!(pending.trim().ends_with("0] = ["));
 }
 
 #[test]
-fn cuda_translation_unit_is_build_linked_and_full_workspace_stays_red() {
+fn cuda_translation_unit_is_build_linked_and_full_workspace_is_connected() {
     let build = read("crates/neoethos-gpu-cuda/build.rs");
     let library = read("crates/neoethos-gpu-cuda/src/lib.rs");
-    let red = read(
-        "crates/neoethos-data/tests/gpu_only_feature_workspace_preflight_v3_source_contract.rs",
-    );
+    let data = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
     assert!(build.contains("native/resident_footprint_v2.cu"));
     assert!(library.contains("#[cfg(feature = \"cuda\")]\npub mod resident_footprint_v2;"));
-    assert!(red.contains("red_data_component_receipt_must_consume_the_preflight"));
-    assert!(red.contains("#[ignore = \"RED: complete producers"));
-    assert!(red.contains("footprint: SealedFootprintComponentReceiptV2"));
+    assert!(data.contains("footprint: SealedFootprintComponentReceiptV2"));
+    assert!(data.contains("footprint.validate_working_set(&working_set)?"));
+    assert!(data.contains("footprint: seal_token.footprint"));
 }

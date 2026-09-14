@@ -6,12 +6,8 @@
 //! DTOs. This keeps the server module decoupled from the business code:
 //! you can mock `AppApiState` in a test by constructing it with stub data.
 //!
-//! For the Phase 1 milestone the state holds an `Option<TradingSnapshot>`
-//! that the server fills with synthetic-but-realistic numbers when no
-//! live broker session is wired in. As soon as we plumb the real
-//! `TradingSession` accessors through (next session), we swap the
-//! `Option` for an `Arc<TradingSession>` or a dedicated read-snapshot
-//! channel.
+//! Account values start unknown. Only a verified broker response whose scope
+//! still matches the persisted execution selection may populate the cache.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +18,8 @@ use crate::app_services::canonical_native_discovery::{
     CanonicalNativeResearchSnapshotV1, CanonicalNativeResearchStateV1,
     CanonicalNativeResearchTerminalSnapshotV1,
 };
-use crate::app_services::jobs::{CancellationFlag, JobKind};
+use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+use crate::app_services::jobs::{CancellationFlag, JobKind, JobSnapshot};
 use crate::server::codex::CodexFlowState;
 use crate::server::engines_control::EngineRunState;
 use neoethos_core::Settings;
@@ -159,6 +156,12 @@ pub fn current_config_path() -> PathBuf {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountSnapshotPayload {
+    /// Identity retained from the verified broker response/request, never current settings.
+    /// Internal status provenance; the existing account wire DTO remains unchanged.
+    #[serde(skip)]
+    pub(crate) source_account_id: i64,
+    #[serde(skip)]
+    pub(crate) source_environment: crate::app_services::ctrader_live_auth::CTraderEnvironment,
     pub balance: f64,
     pub equity: f64,
     pub free_margin: f64,
@@ -171,6 +174,32 @@ pub struct AccountSnapshotPayload {
     /// fresh or stale.
     pub fetched_at_unix_ms: i64,
     pub positions: Vec<PositionPayload>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRefreshFailure {
+    pub code: String,
+    pub detail: String,
+    pub observed_at_unix_ms: i64,
+}
+
+impl AccountRefreshFailure {
+    fn from_error(error: &anyhow::Error) -> Self {
+        let code = if error
+            .downcast_ref::<neoethos_core::BrokerFinancialTruthErrorV1>()
+            .is_some()
+        {
+            neoethos_core::BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1
+        } else {
+            "account_refresh_failed"
+        };
+        Self {
+            code: code.to_owned(),
+            detail: format!("{error:#}"),
+            observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -237,7 +266,7 @@ pub struct AppApiState {
     /// router stays Send + Sync without an extra lock.
     config_path: Arc<PathBuf>,
     /// **2026-05-25 — operator directive "uniform push everywhere"**:
-    /// broadcast channel fired on every `set_account` write. The
+    /// broadcast channel fired on every accepted account refresh. The
     /// `/account/snapshot/stream` SSE endpoint subscribes here and
     /// forwards account updates to Flutter as they arrive — same
     /// pattern as `live_spots::SPOT_BROADCAST` for ticks. Capacity
@@ -271,11 +300,17 @@ pub struct AppApiState {
     /// discovered strategies can trade concurrently (each is internally
     /// multi-timeframe). Empty when idle.
     pub live_trading: Arc<std::sync::Mutex<Vec<crate::app_services::live_trading::Handle>>>,
+    /// Process-lifetime, account-keyed risk ownership shared by every live
+    /// portfolio engine. Strategy workers never own independent account limits.
+    pub account_risk: Arc<crate::app_services::account_risk::AccountRiskRegistry>,
 }
 
 #[derive(Default)]
 pub(crate) struct AppApiInner {
     pub account: Option<AccountSnapshotPayload>,
+    pub account_failure: Option<AccountRefreshFailure>,
+    account_scope: Option<(i64, CTraderEnvironment)>,
+    account_failures: usize,
     pub discovery: EngineSlot,
     pub training: EngineSlot,
     pub canonical_native_research: CanonicalNativeResearchSlotV1,
@@ -292,25 +327,43 @@ pub(crate) struct AppApiInner {
     pub symbol_catalog: HashMap<i64, String>,
 }
 
+impl AppApiInner {
+    fn retain_account_scope(
+        &mut self,
+        resolved: anyhow::Result<(i64, CTraderEnvironment)>,
+    ) -> anyhow::Result<(i64, CTraderEnvironment)> {
+        let current = resolved.as_ref().ok().copied();
+        if current.is_none() || self.account_scope != current {
+            self.account = None;
+            self.account_failure = None;
+            self.account_failures = 0;
+            self.account_scope = current;
+        }
+        resolved
+    }
+}
+
 /// In-memory tracking of one engine's lifecycle. `state` is what
 /// `/engines/status` returns; `cancel` lets `/engines/{kind}/stop`
-/// signal the running job; `summary` is the latest one-line status
-/// from the job's progress reports.
+/// signal the running job; `summary` preserves the reported status and,
+/// for a degraded outcome, its warning/error details.
 #[derive(Debug, Clone, Default)]
 pub struct EngineSlot {
     pub state: EngineRunState,
+    /// Existing process-lease identity; late observations cannot replace a new run.
+    lease_token: Option<u64>,
     pub cancel: Option<CancellationFlag>,
     pub summary: String,
     /// F-340 (Feature #14): live discovery/training progress mirrored
     /// from the `JobSnapshot` the ServiceEvent drainer processes.
     /// `stage` is the coarse phase label (e.g. `"search_generations"`),
-    /// empty when idle. `percent` is 0.0..=1.0, 0.0 when idle.
-    /// `counters` is the live `(name, value)` counter list, empty when
-    /// idle. Reset to defaults whenever the engine reaches a terminal
-    /// (non-Running) state so `/engines/status` reports clean numbers
-    /// the instant a run finishes.
+    /// empty when idle. `percent` is 0.0..=1.0 when measured and `None`
+    /// when the engine cannot report a fraction (including input preparation).
+    /// `counters` retains the latest observed run census after termination.
+    /// Only stage/percent are live-only; installing the next run clears its
+    /// predecessor's counters so the UI cannot mix separate searches.
     pub stage: String,
-    pub percent: f64,
+    pub percent: Option<f64>,
     pub counters: Vec<(String, u64)>,
 }
 
@@ -383,6 +436,7 @@ impl AppApiState {
             account_refresh_tx,
             account_refresh_rx: Arc::new(std::sync::Mutex::new(Some(account_refresh_rx))),
             live_trading: Arc::new(std::sync::Mutex::new(Vec::new())),
+            account_risk: Arc::new(crate::app_services::account_risk::AccountRiskRegistry::new()),
         }
     }
 
@@ -464,13 +518,14 @@ impl AppApiState {
     /// router fixtures in `account.rs` so axum handler tests can hit
     /// `/account/snapshot` without spinning up a real bridge task.
     /// Production paths leave the inner cache empty and let the bridge
-    /// fill it via `set_account` once the broker session is up.
+    /// fill it via the scope-checked refresh completion boundary.
     #[cfg(test)]
     pub fn with_seed_account(mut self, snapshot: AccountSnapshotPayload) -> Self {
-        Arc::get_mut(&mut self.inner)
+        let inner = Arc::get_mut(&mut self.inner)
             .expect("seeded test state must not be shared yet")
-            .get_mut()
-            .account = Some(snapshot);
+            .get_mut();
+        inner.account_scope = Some((snapshot.source_account_id, snapshot.source_environment));
+        inner.account = Some(snapshot);
         self
     }
 
@@ -478,33 +533,103 @@ impl AppApiState {
     /// session hasn't produced one yet — the route turns this into a
     /// `503 Service Unavailable` so the Flutter side can render a
     /// "waiting for broker…" placeholder.
+    #[cfg(test)]
     pub async fn account(&self) -> Option<AccountSnapshotPayload> {
         self.inner.read().await.account.clone()
     }
 
-    /// Overwrite the cached snapshot AND publish to the broadcast
-    /// channel so any subscribed SSE clients receive the new state
-    /// immediately. Called from the bridge polling loop on every
-    /// successful `refresh_once`.
-    ///
-    /// **2026-05-25**: the stale `#[allow(dead_code)]` (left from
-    /// pre-bridge-wiring days) was removed — the function is now
-    /// used both by the bridge AND by the SSE push fanout.
-    pub async fn set_account(&self, snapshot: AccountSnapshotPayload) {
-        self.inner.write().await.account = Some(snapshot.clone());
-        // Best-effort push. `send` returns `Err` when there are no
-        // subscribers — fine; the cache write above still serves the
-        // polling GET path so nothing is lost.
-        let _ = self.account_broadcast.send(snapshot);
+    /// Read the cached snapshot and its latest refresh failure atomically.
+    pub async fn account_observation(
+        &self,
+    ) -> (
+        Option<AccountSnapshotPayload>,
+        Option<AccountRefreshFailure>,
+    ) {
+        let inner = self.inner.read().await;
+        (inner.account.clone(), inner.account_failure.clone())
     }
 
-    /// Wipe the cached snapshot — used by the bridge when refresh
-    /// fails repeatedly so `/account/snapshot` flips back to 503
-    /// instead of serving last-known-good numbers from a session
-    /// the broker has since invalidated. Without this the dashboard
-    /// could lie for hours after `CH_ACCESS_TOKEN_INVALID`.
-    pub async fn clear_account(&self) {
-        self.inner.write().await.account = None;
+    /// Observe only the currently selected account, including its failure state.
+    /// Call from the blocking pool: the resolver may read persisted selection.
+    /// Resolving under the cache lock orders readers and publishers, but does not
+    /// make external settings-file writers part of an atomic account switch.
+    pub(crate) fn current_account_observation(
+        &self,
+        resolve_scope: impl FnOnce() -> anyhow::Result<(i64, CTraderEnvironment)>,
+    ) -> anyhow::Result<(
+        Option<AccountSnapshotPayload>,
+        Option<AccountRefreshFailure>,
+    )> {
+        let mut inner = self.inner.blocking_write();
+        inner.retain_account_scope(resolve_scope())?;
+        Ok((inner.account.clone(), inner.account_failure.clone()))
+    }
+
+    /// Accept a completed refresh only for its still-current request scope.
+    /// Response identity is checked independently before publishing. A late
+    /// foreign failure cannot overwrite current failure evidence or clear a
+    /// current snapshot. Three consecutive accepted failures retain the existing
+    /// stale-cache policy; counters reset when selection changes or refresh works.
+    /// Call on the blocking pool, with no await between resolution and mutation.
+    pub(crate) fn complete_account_refresh(
+        &self,
+        request_scope: Option<(i64, CTraderEnvironment)>,
+        result: anyhow::Result<AccountSnapshotPayload>,
+        resolve_scope: impl FnOnce() -> anyhow::Result<(i64, CTraderEnvironment)>,
+    ) -> anyhow::Result<bool> {
+        const STALE_THRESHOLD: usize = 3;
+        let mut inner = self.inner.blocking_write();
+        let current = inner.retain_account_scope(resolve_scope())?;
+        if request_scope != Some(current) {
+            return Ok(false);
+        }
+        match result {
+            Ok(snapshot) => {
+                if (snapshot.source_account_id, snapshot.source_environment) != current {
+                    return Ok(false);
+                }
+                inner.account = Some(snapshot.clone());
+                inner.account_failure = None;
+                inner.account_failures = 0;
+                // Keep the response timestamp, and order push publication with
+                // the cache write. No subscribers is an ordinary outcome.
+                let _ = self.account_broadcast.send(snapshot);
+            }
+            Err(error) => {
+                inner.account_failure = Some(AccountRefreshFailure::from_error(&error));
+                inner.account_failures = inner.account_failures.saturating_add(1);
+                tracing::warn!(
+                    target: "neoethos_app::server::bridge",
+                    error = %error,
+                    consecutive_failures = inner.account_failures,
+                    "Current account refresh failed; retained values are not confirmed current."
+                );
+                if inner.account_failures >= STALE_THRESHOLD {
+                    inner.account = None;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub async fn set_account_failure(&self, error: &anyhow::Error) {
+        self.inner.write().await.account_failure = Some(AccountRefreshFailure::from_error(error));
+    }
+
+    /// Test seeding only; production publishes through `complete_account_refresh`.
+    #[cfg(test)]
+    pub async fn set_account(&self, snapshot: AccountSnapshotPayload) {
+        let scope = (snapshot.source_account_id, snapshot.source_environment);
+        let state = self.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || {
+                state.complete_account_refresh(Some(scope), Ok(snapshot), || Ok(scope))
+            })
+            .await
+            .expect("test account publisher")
+            .expect("test account scope")
+        );
     }
 
     // ─── Symbol catalog accessors ──────────────────────────────────────
@@ -552,6 +677,11 @@ impl AppApiState {
 
     // ─── Engine slot accessors ────────────────────────────────────────
 
+    /// One internally consistent observation for the Discovery status response.
+    pub(crate) async fn discovery_observation(&self) -> EngineSlot {
+        self.inner.read().await.discovery.clone()
+    }
+
     /// Read the current run state for the given engine.
     pub async fn engine_state(&self, kind: JobKind) -> EngineRunState {
         let inner = self.inner.read().await;
@@ -567,7 +697,7 @@ impl AppApiState {
         }
     }
 
-    /// Read the latest one-line summary for the given engine.
+    /// Read the latest summary and any degraded-outcome details for the engine.
     pub async fn engine_summary(&self, kind: JobKind) -> String {
         let inner = self.inner.read().await;
         match kind {
@@ -584,20 +714,23 @@ impl AppApiState {
 
     /// F-340 (Feature #14): read the live progress triple
     /// `(stage, percent, counters)` for the given engine. Returns
-    /// `("", 0.0, [])` for any engine that is idle / has been reset
-    /// on terminal.
-    pub async fn engine_progress(&self, kind: JobKind) -> (String, f64, Vec<(String, u64)>) {
+    /// `("", None, [])` before the first run. A terminal engine retains its
+    /// observed counters, but has no live stage or percent.
+    pub async fn engine_progress(
+        &self,
+        kind: JobKind,
+    ) -> (String, Option<f64>, Vec<(String, u64)>) {
         let inner = self.inner.read().await;
         let slot = match kind {
             JobKind::Discovery => &inner.discovery,
             JobKind::Training => &inner.training,
             JobKind::CanonicalNativeResearch => {
                 let Some(snapshot) = inner.canonical_native_research.snapshot.as_ref() else {
-                    return (String::new(), 0.0, Vec::new());
+                    return (String::new(), None, Vec::new());
                 };
                 return (
                     snapshot.stage().to_owned(),
-                    f64::from(snapshot.percent_basis_points()) / 10_000.0,
+                    Some(f64::from(snapshot.percent_basis_points()) / 10_000.0),
                     Vec::new(),
                 );
             }
@@ -608,7 +741,7 @@ impl AppApiState {
     /// Mark an engine as Running and remember its cancel flag so a
     /// later `/stop` can signal it. Called by the discovery/training
     /// `start` endpoints right after `start_*_job` returns.
-    pub async fn install_engine(&self, kind: JobKind, cancel: CancellationFlag) {
+    pub async fn install_engine(&self, kind: JobKind, cancel: CancellationFlag, lease_token: u64) {
         let mut inner = self.inner.write().await;
         let slot = match kind {
             JobKind::Discovery => &mut inner.discovery,
@@ -616,51 +749,22 @@ impl AppApiState {
             JobKind::CanonicalNativeResearch => return,
         };
         slot.state = EngineRunState::Running;
+        slot.lease_token = Some(lease_token);
         slot.cancel = Some(cancel);
         slot.summary = "starting…".to_string();
+        slot.stage.clear();
+        slot.percent = None;
+        slot.counters.clear();
     }
 
-    /// Reflect the latest ServiceEvent-derived state into the slot.
-    /// Called from the engines_control state-drainer task.
-    pub async fn update_engine(&self, kind: JobKind, state: EngineRunState, summary: String) {
-        let mut inner = self.inner.write().await;
-        let slot = match kind {
-            JobKind::Discovery => &mut inner.discovery,
-            JobKind::Training => &mut inner.training,
-            JobKind::CanonicalNativeResearch => return,
-        };
-        slot.state = state;
-        if !summary.is_empty() {
-            slot.summary = summary;
-        }
-        // Once we hit a terminal state, drop the cancel flag — there's
-        // nothing left to cancel.
-        if !matches!(state, EngineRunState::Running) {
-            slot.cancel = None;
-            // F-340 (Feature #14): also wipe the live progress so
-            // `/engines/status` reports `("", 0.0, [])` the instant a
-            // run finishes — a stale "search_generations / 0.83" line
-            // hanging around after a Succeeded run would mislead the UI.
-            slot.stage.clear();
-            slot.percent = 0.0;
-            slot.counters.clear();
-        }
-    }
-
-    /// F-340 (Feature #14): mirror the live `JobSnapshot` progress
-    /// (`stage`, `percent`, `counters`) into the engine slot. Called by
-    /// the engines_control ServiceEvent drainer alongside
-    /// [`update_engine`] on every non-terminal update so
-    /// `/engines/status` exposes the rich counters the discovery job
-    /// accumulates. `percent` is clamped to 0.0..=1.0. Terminal cleanup
-    /// is handled by [`update_engine`], so this setter only ever writes
-    /// "live" values.
-    pub async fn set_engine_progress(
+    /// Publish one worker observation atomically, including terminal counters.
+    /// A failure synthesized without a report preserves the last actual census;
+    /// `install_engine` is the boundary that clears previous-run evidence.
+    pub(crate) async fn update_engine_snapshot(
         &self,
         kind: JobKind,
-        stage: String,
-        percent: f64,
-        counters: Vec<(String, u64)>,
+        snapshot: &JobSnapshot,
+        lease_token: u64,
     ) {
         let mut inner = self.inner.write().await;
         let slot = match kind {
@@ -668,24 +772,46 @@ impl AppApiState {
             JobKind::Training => &mut inner.training,
             JobKind::CanonicalNativeResearch => return,
         };
-        slot.stage = stage;
-        slot.percent = percent.clamp(0.0, 1.0);
-        slot.counters = counters;
-    }
-
-    /// Defensive guard: if the ServiceEvent channel closes without a
-    /// terminal event (shouldn't happen in practice but worth
-    /// covering), flip Running → Idle so the UI doesn't get stuck.
-    pub async fn finalize_engine_if_running(&self, kind: JobKind) {
-        let mut inner = self.inner.write().await;
-        let slot = match kind {
-            JobKind::Discovery => &mut inner.discovery,
-            JobKind::Training => &mut inner.training,
-            JobKind::CanonicalNativeResearch => return,
+        if slot.lease_token != Some(lease_token) {
+            return;
+        }
+        slot.state = EngineRunState::from(snapshot.state);
+        let running = slot.state == EngineRunState::Running;
+        let summary = if running && !snapshot.progress.message.is_empty() {
+            &snapshot.progress.message
+        } else {
+            &snapshot.report.summary
         };
-        if matches!(slot.state, EngineRunState::Running) {
-            slot.state = EngineRunState::Idle;
+        if !summary.is_empty() {
+            slot.summary.clone_from(summary);
+        }
+        if slot.state == EngineRunState::Degraded {
+            // The wire has one summary field. Keep the producer's refusal
+            // reason as well as its completed-research census; never infer a
+            // calibration verdict from counts or recast it as a worker crash.
+            slot.summary = std::iter::once(summary)
+                .chain(&snapshot.report.warnings)
+                .chain(&snapshot.report.errors)
+                .filter(|detail| !detail.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        if running || !snapshot.report.counters.is_empty() {
+            slot.counters.clone_from(&snapshot.report.counters);
+        }
+        if running {
+            slot.stage.clone_from(&snapshot.progress.stage);
+            slot.percent = snapshot
+                .progress
+                .percent
+                .map(f64::from)
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 1.0));
+        } else {
             slot.cancel = None;
+            slot.stage.clear();
+            slot.percent = None;
         }
     }
 
@@ -797,6 +923,423 @@ fn native_engine_state_v1(state: CanonicalNativeResearchStateV1) -> EngineRunSta
 impl Default for AppApiState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod account_scope_tests {
+    use super::*;
+
+    fn observed(scope: (i64, CTraderEnvironment), balance: f64) -> AccountSnapshotPayload {
+        AccountSnapshotPayload {
+            source_account_id: scope.0,
+            source_environment: scope.1,
+            balance,
+            equity: balance,
+            free_margin: balance,
+            used_margin: 0.0,
+            currency: "USD".into(),
+            fetched_at_unix_ms: 123_456,
+            positions: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_foreign_success_and_errors_preserve_current_state_and_failure_count() {
+        let old_scope = (11, CTraderEnvironment::Demo);
+        for new_scope in [
+            (22, CTraderEnvironment::Demo),
+            (11, CTraderEnvironment::Live),
+        ] {
+            for failed in [false, true] {
+                let state = AppApiState::new();
+                let selection = Arc::new(std::sync::Mutex::new(old_scope));
+                let mut events = state.subscribe_account();
+                let (release, delayed) = tokio::sync::oneshot::channel::<()>();
+                let old_state = state.clone();
+                let old_selection = selection.clone();
+                let old = tokio::spawn(async move {
+                    delayed.await.unwrap();
+                    tokio::task::spawn_blocking(move || {
+                        for _ in 0..3 {
+                            let result = if failed {
+                                Err(anyhow::anyhow!("old account failure"))
+                            } else {
+                                Ok(observed(old_scope, 111.0))
+                            };
+                            assert!(
+                                !old_state
+                                    .complete_account_refresh(Some(old_scope), result, || {
+                                        Ok(*old_selection.lock().unwrap())
+                                    })
+                                    .unwrap()
+                            );
+                        }
+                    })
+                    .await
+                    .unwrap();
+                });
+                *selection.lock().unwrap() = new_scope;
+                let current = state.clone();
+                tokio::task::spawn_blocking(move || {
+                    assert!(
+                        current
+                            .complete_account_refresh(
+                                Some(new_scope),
+                                Ok(observed(new_scope, 222.0)),
+                                || Ok(new_scope)
+                            )
+                            .unwrap()
+                    );
+                    assert!(
+                        current
+                            .complete_account_refresh(
+                                Some(new_scope),
+                                Err(anyhow::anyhow!("current failure")),
+                                || Ok(new_scope)
+                            )
+                            .unwrap()
+                    );
+                })
+                .await
+                .unwrap();
+                assert_eq!(events.try_recv().unwrap().balance, 222.0);
+                release.send(()).unwrap();
+                old.await.unwrap();
+                let current = state.clone();
+                tokio::task::spawn_blocking(move || {
+                    let (saved, failure) = current
+                        .current_account_observation(|| Ok(new_scope))
+                        .unwrap();
+                    let saved = saved.unwrap();
+                    assert_eq!(
+                        (saved.source_account_id, saved.source_environment),
+                        new_scope
+                    );
+                    assert_eq!(saved.balance, 222.0);
+                    assert_eq!(saved.fetched_at_unix_ms, 123_456);
+                    assert_eq!(failure.unwrap().detail, "current failure");
+                    // Old failures must not spend the new account's three-failure budget.
+                    for attempt in 2..=3 {
+                        assert!(
+                            current
+                                .complete_account_refresh(
+                                    Some(new_scope),
+                                    Err(anyhow::anyhow!("current failure")),
+                                    || Ok(new_scope)
+                                )
+                                .unwrap()
+                        );
+                        let (saved, failure) = current
+                            .current_account_observation(|| Ok(new_scope))
+                            .unwrap();
+                        assert_eq!(saved.is_some(), attempt < 3);
+                        assert!(failure.is_some());
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn both_request_and_response_identity_are_required_before_publication() {
+        let scope = (22, CTraderEnvironment::Demo);
+        let other = (11, CTraderEnvironment::Demo);
+        let state = AppApiState::new();
+        let mut events = state.subscribe_account();
+        state
+            .complete_account_refresh(Some(scope), Ok(observed(scope, 222.0)), || Ok(scope))
+            .unwrap();
+        events.try_recv().unwrap();
+        for (requested, response) in [
+            (Some(other), scope),
+            (None, scope),
+            (Some(scope), other),
+            (Some(scope), (22, CTraderEnvironment::Live)),
+        ] {
+            assert!(
+                !state
+                    .complete_account_refresh(requested, Ok(observed(response, 999.0)), || Ok(
+                        scope
+                    ))
+                    .unwrap()
+            );
+        }
+        assert!(
+            !state
+                .complete_account_refresh(None, Err(anyhow::anyhow!("unqualified failure")), || Ok(
+                    scope
+                ))
+                .unwrap()
+        );
+        let (saved, failure) = state.current_account_observation(|| Ok(scope)).unwrap();
+        assert_eq!(saved.unwrap().balance, 222.0);
+        assert!(failure.is_none());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn read_rechecks_selection_even_without_a_new_broker_completion() {
+        let old = (11, CTraderEnvironment::Demo);
+        for current in [
+            (22, CTraderEnvironment::Demo),
+            (11, CTraderEnvironment::Live),
+        ] {
+            let state = AppApiState::new();
+            state
+                .complete_account_refresh(Some(old), Ok(observed(old, 111.0)), || Ok(old))
+                .unwrap();
+            state
+                .complete_account_refresh(Some(old), Err(anyhow::anyhow!("old failure")), || {
+                    Ok(old)
+                })
+                .unwrap();
+            let (saved, failure) = state.current_account_observation(|| Ok(current)).unwrap();
+            assert!(saved.is_none());
+            assert!(failure.is_none());
+            assert!(
+                !state
+                    .complete_account_refresh(Some(old), Ok(observed(old, 999.0)), || Ok(current))
+                    .unwrap()
+            );
+            assert!(
+                state
+                    .current_account_observation(|| Ok(current))
+                    .unwrap()
+                    .0
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_selection_clears_unqualified_values_for_read_and_completion() {
+        let scope = (11, CTraderEnvironment::Demo);
+        for on_read in [true, false] {
+            let state = AppApiState::new();
+            state
+                .complete_account_refresh(Some(scope), Ok(observed(scope, 111.0)), || Ok(scope))
+                .unwrap();
+            let resolve = || Err(anyhow::anyhow!("no unique persisted execution account"));
+            let error = if on_read {
+                state.current_account_observation(resolve).unwrap_err()
+            } else {
+                state
+                    .complete_account_refresh(Some(scope), Ok(observed(scope, 999.0)), resolve)
+                    .unwrap_err()
+            };
+            assert_eq!(error.to_string(), "no unique persisted execution account");
+            let (saved, failure) = state.current_account_observation(|| Ok(scope)).unwrap();
+            assert!(saved.is_none(), "unknown is not a zero or an old balance");
+            assert!(failure.is_none());
+        }
+    }
+
+    #[test]
+    fn accepted_success_preserves_timestamp_and_resets_current_failure_budget() {
+        let scope = (11, CTraderEnvironment::Demo);
+        let state = AppApiState::new();
+        let mut events = state.subscribe_account();
+        for _ in 0..2 {
+            state
+                .complete_account_refresh(
+                    Some(scope),
+                    Err(anyhow::anyhow!("auth unavailable")),
+                    || Ok(scope),
+                )
+                .unwrap();
+        }
+        assert!(
+            state
+                .complete_account_refresh(Some(scope), Ok(observed(scope, 444.0)), || Ok(scope))
+                .unwrap()
+        );
+        let (saved, failure) = state.current_account_observation(|| Ok(scope)).unwrap();
+        assert_eq!(saved.unwrap().fetched_at_unix_ms, 123_456);
+        assert!(failure.is_none());
+        assert_eq!(events.try_recv().unwrap().fetched_at_unix_ms, 123_456);
+        state
+            .complete_account_refresh(
+                Some(scope),
+                Err(anyhow::anyhow!("first failure after success")),
+                || Ok(scope),
+            )
+            .unwrap();
+        assert!(
+            state
+                .current_account_observation(|| Ok(scope))
+                .unwrap()
+                .0
+                .is_some()
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_census_tests {
+    use super::*;
+    use crate::app_services::jobs::JobState;
+
+    #[tokio::test]
+    async fn degraded_research_retains_reason_and_census_without_success_or_active_stop() {
+        let state = AppApiState::new();
+        for kind in [JobKind::Discovery, JobKind::Training] {
+            state.install_engine(kind, CancellationFlag::new(), 1).await;
+            let mut snapshot = JobSnapshot::new(kind);
+            snapshot.state = JobState::Degraded;
+            snapshot.report.summary = "research saved: 1 report, 0 handoffs".into();
+            snapshot.report.warnings = vec![
+                "portfolio/handoff refused: no calibration-surviving strategies".into(),
+            ];
+            snapshot.report.errors = vec!["requested output unavailable".into()];
+            snapshot.report.counters = vec![
+                ("working_set_saved_results".into(), 1),
+                ("working_set_training_handoffs".into(), 0),
+                ("working_set_publication_failures".into(), 1),
+            ];
+            // A repeated terminal observation must not append diagnostics twice.
+            for _ in 0..2 {
+                state.update_engine_snapshot(kind, &snapshot, 1).await;
+                assert_eq!(state.engine_state(kind).await, EngineRunState::Degraded);
+                assert_eq!(state.engine_state(kind).await.as_str(), "Degraded");
+                assert_eq!(
+                    state.engine_summary(kind).await,
+                    "research saved: 1 report, 0 handoffs\nportfolio/handoff refused: no calibration-surviving strategies\nrequested output unavailable"
+                );
+                assert_eq!(
+                    state.engine_progress(kind).await,
+                    (String::new(), None, snapshot.report.counters.clone())
+                );
+                assert!(!state.cancel_engine(kind).await);
+            }
+            state.install_engine(kind, CancellationFlag::new(), 2).await;
+            state.update_engine_snapshot(kind, &snapshot, 1).await;
+            assert_eq!(state.engine_state(kind).await, EngineRunState::Running);
+            assert_eq!(state.engine_summary(kind).await, "starting…");
+            assert!(state.engine_progress(kind).await.2.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_old_run_updates_cannot_replace_new_discovery_or_mix_its_observation() {
+        let state = AppApiState::new();
+        state
+            .install_engine(JobKind::Discovery, CancellationFlag::new(), 1)
+            .await;
+        let mut old = JobSnapshot::new(JobKind::Discovery);
+        old.state = JobState::Succeeded;
+        old.report.summary = "old result".into();
+        old.report.counters = vec![("walkforward_tested".into(), 200)];
+        state
+            .update_engine_snapshot(JobKind::Discovery, &old, 1)
+            .await;
+        let old_observation = state.discovery_observation().await;
+
+        state
+            .install_engine(JobKind::Discovery, CancellationFlag::new(), 2)
+            .await;
+        let mut new = JobSnapshot::new(JobKind::Discovery);
+        new.state = JobState::Running;
+        new.progress.stage = "search_generations".into();
+        new.progress.message = "new run".into();
+        new.report.counters = vec![("candidates_evaluated".into(), 12)];
+        state
+            .update_engine_snapshot(JobKind::Discovery, &new, 2)
+            .await;
+        for terminal in [JobState::Succeeded, JobState::Failed, JobState::Cancelled] {
+            old.state = terminal;
+            state
+                .update_engine_snapshot(JobKind::Discovery, &old, 1)
+                .await;
+            let current = state.discovery_observation().await;
+            assert_eq!(current.state, EngineRunState::Running);
+            assert_eq!(current.summary, "new run");
+            assert_eq!(current.stage, "search_generations");
+            assert_eq!(current.counters, new.report.counters);
+        }
+        assert_eq!(old_observation.state, EngineRunState::Succeeded);
+        assert_eq!(old_observation.summary, "old result");
+        assert_eq!(
+            old_observation.counters,
+            vec![("walkforward_tested".into(), 200)]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_census_survives_every_outcome_until_the_next_same_engine_run() {
+        let state = AppApiState::new();
+        for outcome in [
+            JobState::Succeeded,
+            JobState::Failed,
+            JobState::Cancelled,
+            JobState::Degraded,
+        ] {
+            state
+                .install_engine(JobKind::Discovery, CancellationFlag::new(), 1)
+                .await;
+            assert!(state.engine_progress(JobKind::Discovery).await.2.is_empty());
+            let mut snapshot = JobSnapshot::new(JobKind::Discovery);
+            snapshot.state = outcome;
+            snapshot.progress.stage = "obsolete_live_stage".into();
+            snapshot.progress.percent = Some(0.75);
+            snapshot.report.counters = vec![("walkforward_tested".into(), 37)];
+            state
+                .update_engine_snapshot(JobKind::Discovery, &snapshot, 1)
+                .await;
+            assert_eq!(
+                state.engine_state(JobKind::Discovery).await,
+                EngineRunState::from(outcome)
+            );
+            assert_eq!(
+                state.engine_progress(JobKind::Discovery).await,
+                (String::new(), None, snapshot.report.counters.clone())
+            );
+            assert!(!state.cancel_engine(JobKind::Discovery).await);
+            state
+                .install_engine(JobKind::Training, CancellationFlag::new(), 2)
+                .await;
+            assert_eq!(
+                state.engine_progress(JobKind::Discovery).await.2,
+                snapshot.report.counters
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_terminal_report_preserves_observed_counts_without_inventing_completion() {
+        let state = AppApiState::new();
+        state
+            .install_engine(JobKind::Discovery, CancellationFlag::new(), 1)
+            .await;
+        let mut snapshot = JobSnapshot::new(JobKind::Discovery);
+        snapshot.state = JobState::Running;
+        snapshot.report.counters = vec![("walkforward_tested".into(), 12)];
+        state
+            .update_engine_snapshot(JobKind::Discovery, &snapshot, 1)
+            .await;
+        let mut failed = JobSnapshot::new(JobKind::Discovery);
+        failed.state = JobState::Failed;
+        failed.report.summary = "channel closed before terminal evidence".into();
+        state
+            .update_engine_snapshot(JobKind::Discovery, &failed, 1)
+            .await;
+        assert_eq!(
+            state.engine_state(JobKind::Discovery).await,
+            EngineRunState::Failed
+        );
+        assert_eq!(
+            state.engine_progress(JobKind::Discovery).await,
+            (String::new(), None, snapshot.report.counters)
+        );
     }
 }
 

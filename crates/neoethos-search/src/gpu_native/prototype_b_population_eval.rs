@@ -228,6 +228,8 @@ fn candidates_for_pre_parent_free_memory(
     pre_parent_free_memory_bytes: u64,
     resident_parent_rows: usize,
     evaluation_rows: usize,
+    ordered_index_capacity: usize,
+    adaptive_row_capacity: usize,
     feature_count: usize,
     month_capacity: usize,
     gene_count: usize,
@@ -238,9 +240,11 @@ fn candidates_for_pre_parent_free_memory(
             "month capacity does not fit the strict native u32 plan".to_owned(),
         )
     })?;
-    let parent = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(
+    let parent = PopulationParentDevicePlanV1::checked_from_parent_and_view_extents_v1(
         resident_parent_rows,
         feature_count,
+        ordered_index_capacity,
+        adaptive_row_capacity,
     )?;
     let genes =
         PopulationGeneStorePlanV1::checked_from_gene_extents_v1(gene_count, gene_term_count)?;
@@ -332,9 +336,14 @@ pub(crate) fn population_auto_plan_for_pre_parent_free_memory_v1(
             "configured population × sealed term cap overflows usize",
         )
     })?;
-    let parent = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(
+    // Stage 1 is a contiguous range, so it has no ordered-index allocation.
+    // Candidate generation may select adaptive stops, therefore its maximum
+    // retained adaptive capacity is the exact Stage-1 evaluation extent.
+    let parent = PopulationParentDevicePlanV1::checked_from_parent_and_view_extents_v1(
         resident_parent_rows,
         feature_count,
+        0,
+        evaluation_rows,
     )
     .map_err(|source| auto_sizing_error_from_cuda_v1("strict parent plan", source))?;
     let one_gene = PopulationGeneStorePlanV1::checked_from_gene_extents_v1(1, term_cap)
@@ -539,6 +548,8 @@ pub(crate) fn runtime_submission_ceiling_for_admitted_ordinal_v1(
     admitted: &crate::ExactCudaDeviceOrdinalV1,
     resident_parent_rows: usize,
     evaluation_rows: usize,
+    ordered_index_capacity: usize,
+    adaptive_row_capacity: usize,
     feature_count: usize,
     month_capacity: usize,
     gene_count: usize,
@@ -548,6 +559,8 @@ pub(crate) fn runtime_submission_ceiling_for_admitted_ordinal_v1(
         admitted.pre_parent_free_memory_bytes(),
         resident_parent_rows,
         evaluation_rows,
+        ordered_index_capacity,
+        adaptive_row_capacity,
         feature_count,
         month_capacity,
         gene_count,
@@ -613,6 +626,8 @@ struct LimitKey {
     pre_parent_free_memory_bytes: u64,
     resident_parent_rows: usize,
     evaluation_rows: usize,
+    ordered_index_capacity: usize,
+    adaptive_row_capacity: usize,
     feature_count: usize,
     month_capacity: usize,
     gene_count: usize,
@@ -917,6 +932,8 @@ fn evaluate_scenarios_b_raw_v1(
         pre_parent_free_memory_bytes: admitted_ordinal.pre_parent_free_memory_bytes(),
         resident_parent_rows: evidence.parent_row_count(),
         evaluation_rows,
+        ordered_index_capacity: evidence.ordered_index_capacity_v1(),
+        adaptive_row_capacity: evidence.adaptive_row_capacity_v1(),
         feature_count: evidence.feature_count(),
         month_capacity: crate::eval::current_backtest_runtime_overrides().month_capacity,
         gene_count: n_genes,
@@ -933,6 +950,8 @@ fn evaluate_scenarios_b_raw_v1(
         admitted_ordinal,
         limit_key.resident_parent_rows,
         limit_key.evaluation_rows,
+        limit_key.ordered_index_capacity,
+        limit_key.adaptive_row_capacity,
         limit_key.feature_count,
         limit_key.month_capacity,
         limit_key.gene_count,
@@ -1094,10 +1113,37 @@ mod capacity_detection_tests {
         genes: usize,
         terms: usize,
     ) -> Sizing {
+        sizing_with_view_capacities(
+            free,
+            resident_parent_rows,
+            evaluation_rows,
+            0,
+            evaluation_rows,
+            features,
+            months,
+            genes,
+            terms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sizing_with_view_capacities(
+        free: u64,
+        resident_parent_rows: usize,
+        evaluation_rows: usize,
+        ordered_index_capacity: usize,
+        adaptive_row_capacity: usize,
+        features: usize,
+        months: usize,
+        genes: usize,
+        terms: usize,
+    ) -> Sizing {
         candidates_for_pre_parent_free_memory(
             free,
             resident_parent_rows,
             evaluation_rows,
+            ordered_index_capacity,
+            adaptive_row_capacity,
             features,
             months,
             genes,
@@ -1115,10 +1161,37 @@ mod capacity_detection_tests {
         genes: usize,
         terms: usize,
     ) -> (usize, usize, usize) {
-        match sizing(
+        fits_with_view_capacities(
             free,
             resident_parent_rows,
             evaluation_rows,
+            0,
+            evaluation_rows,
+            features,
+            months,
+            genes,
+            terms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fits_with_view_capacities(
+        free: u64,
+        resident_parent_rows: usize,
+        evaluation_rows: usize,
+        ordered_index_capacity: usize,
+        adaptive_row_capacity: usize,
+        features: usize,
+        months: usize,
+        genes: usize,
+        terms: usize,
+    ) -> (usize, usize, usize) {
+        match sizing_with_view_capacities(
+            free,
+            resident_parent_rows,
+            evaluation_rows,
+            ordered_index_capacity,
+            adaptive_row_capacity,
             features,
             months,
             genes,
@@ -1178,31 +1251,37 @@ mod capacity_detection_tests {
             Sizing::Fits { .. }
         ));
 
-        let full = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(
+        let full = PopulationParentDevicePlanV1::checked_from_parent_and_view_extents_v1(
             RESIDENT_PARENT_ROWS,
             FEATURES,
+            0,
+            STAGE1_ROWS,
         )
         .expect("full parent plan");
-        assert_eq!(full.total_device_bytes(), 15_187_640_160);
+        assert_eq!(full.total_device_bytes(), 15_172_951_920);
     }
 
     #[test]
     fn resident_parent_and_evaluation_extents_change_independent_terms() {
         const GIB: u64 = 1024 * 1024 * 1024;
 
-        let (memory, time, chosen) = fits(
+        let (memory, time, chosen) = fits_with_view_capacities(
             24 * GIB,
-            100_000,
+            2_000_000,
             843_456,
+            0,
+            0,
             64,
             MONTHS,
             DEFAULT_GENES,
             DEFAULT_TERMS,
         );
-        let (same_memory, shorter_time, shorter_chosen) = fits(
+        let (same_memory, shorter_time, shorter_chosen) = fits_with_view_capacities(
             24 * GIB,
-            100_000,
+            2_000_000,
             1_686_912,
+            0,
+            0,
             64,
             MONTHS,
             DEFAULT_GENES,
@@ -1216,19 +1295,23 @@ mod capacity_detection_tests {
         assert_eq!(chosen, time);
         assert_eq!(shorter_chosen, shorter_time);
 
-        let (small_parent_memory, same_time, small_parent_chosen) = fits(
+        let (small_parent_memory, same_time, small_parent_chosen) = fits_with_view_capacities(
             2 * GIB,
-            1_000,
             4_096,
+            4_096,
+            0,
+            0,
             1_800,
             MONTHS,
             DEFAULT_GENES,
             DEFAULT_TERMS,
         );
-        let (large_parent_memory, same_time_again, large_parent_chosen) = fits(
+        let (large_parent_memory, same_time_again, large_parent_chosen) = fits_with_view_capacities(
             2 * GIB,
             50_000,
             4_096,
+            0,
+            0,
             1_800,
             MONTHS,
             DEFAULT_GENES,
@@ -1299,10 +1382,10 @@ mod capacity_detection_tests {
     fn month_capacity_is_charged_by_the_authoritative_scenario_plan() {
         const FREE: u64 = 1024 * 1024 * 1024;
         let (default_memory, _, _) =
-            fits(FREE, 1_000, 4_096, 64, MONTHS, DEFAULT_GENES, DEFAULT_TERMS);
+            fits(FREE, 4_096, 4_096, 64, MONTHS, DEFAULT_GENES, DEFAULT_TERMS);
         let (doubled_memory, _, _) = fits(
             FREE,
-            1_000,
+            4_096,
             4_096,
             64,
             2 * MONTHS,
@@ -1316,7 +1399,7 @@ mod capacity_detection_tests {
     fn smaller_admitted_snapshot_produces_a_smaller_memory_ceiling() {
         let (large_memory, large_time, large_chosen) = fits(
             4 * 1024 * 1024 * 1024,
-            1_000,
+            4_096,
             4_096,
             64,
             MONTHS,
@@ -1325,7 +1408,7 @@ mod capacity_detection_tests {
         );
         let (small_memory, small_time, small_chosen) = fits(
             2 * 1024 * 1024 * 1024,
-            1_000,
+            4_096,
             4_096,
             64,
             MONTHS,
@@ -1340,13 +1423,14 @@ mod capacity_detection_tests {
 
     #[test]
     fn one_to_fifteen_scenario_capacity_is_a_real_fit_not_immutable_no_room() {
-        let fixed = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(1, 1)
-            .expect("one-row parent")
-            .total_device_bytes()
-            + PopulationGeneStorePlanV1::checked_from_gene_extents_v1(1, 1)
-                .expect("one-gene store")
+        let fixed =
+            PopulationParentDevicePlanV1::checked_from_parent_and_view_extents_v1(1, 1, 0, 1)
+                .expect("one-row parent")
                 .total_device_bytes()
-            + ALLOCATOR_RESERVE_BYTES_V1;
+                + PopulationGeneStorePlanV1::checked_from_gene_extents_v1(1, 1)
+                    .expect("one-gene store")
+                    .total_device_bytes()
+                + ALLOCATOR_RESERVE_BYTES_V1;
         let desired_budget = fixed + 15 * 4_000;
         let snapshot = desired_budget.div_ceil(7) * 10;
         let (memory, _, chosen) = fits(snapshot, 1, 1, 1, MONTHS, 1, 1);
@@ -1356,13 +1440,14 @@ mod capacity_detection_tests {
 
     #[test]
     fn zero_scenario_capacity_has_a_distinct_fail_loud_classification() {
-        let fixed = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(1, 1)
-            .expect("one-row parent")
-            .total_device_bytes()
-            + PopulationGeneStorePlanV1::checked_from_gene_extents_v1(1, 1)
-                .expect("one-gene store")
+        let fixed =
+            PopulationParentDevicePlanV1::checked_from_parent_and_view_extents_v1(1, 1, 0, 1)
+                .expect("one-row parent")
                 .total_device_bytes()
-            + ALLOCATOR_RESERVE_BYTES_V1;
+                + PopulationGeneStorePlanV1::checked_from_gene_extents_v1(1, 1)
+                    .expect("one-gene store")
+                    .total_device_bytes()
+                + ALLOCATOR_RESERVE_BYTES_V1;
         let snapshot = fixed.div_ceil(7) * 10;
         match sizing(snapshot, 1, 1, 1, MONTHS, 1, 1) {
             Sizing::NoScenarioRoom {
@@ -1435,6 +1520,8 @@ mod capacity_detection_tests {
             pre_parent_free_memory_bytes: 23_000_000_000,
             resident_parent_rows: 1_049_160,
             evaluation_rows: 262_290,
+            ordered_index_capacity: 0,
+            adaptive_row_capacity: 262_290,
             feature_count: 1_800,
             month_capacity: 240,
             gene_count: 200,
@@ -1521,7 +1608,7 @@ mod capacity_detection_tests {
             .expect("admission must seal a CUDA ordinal");
         assert!(admitted.pre_parent_free_memory_bytes() > 0);
         let ceiling = runtime_submission_ceiling_for_admitted_ordinal_v1(
-            admitted, 1_049_160, 262_290, 1_800, 240, 200, 3_200,
+            admitted, 1_049_160, 262_290, 0, 262_290, 1_800, 240, 200, 3_200,
         )
         .expect("the admitted RTX route must fit the exact strict plan");
         assert!(ceiling >= 16, "admitted strict ceiling is {ceiling}");

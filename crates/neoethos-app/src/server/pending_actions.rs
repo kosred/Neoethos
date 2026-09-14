@@ -108,9 +108,10 @@ pub async fn confirm(
                 )
                     .into_response();
             }
-            let result =
-                tokio::task::spawn_blocking(move || close_position_blocking(pos_id, vol, None))
-                    .await;
+            let result = tokio::task::spawn_blocking(move || {
+                close_position_blocking(pos_id, vol, None, None)
+            })
+            .await;
             match result {
                 Ok(Ok(outcome)) => {
                     let note = format!(

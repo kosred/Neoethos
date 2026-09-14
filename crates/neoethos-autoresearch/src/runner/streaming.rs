@@ -67,8 +67,8 @@ pub struct StreamingSweepExecutor {
     streaming_requested: bool,
     dataset_receipt: DatasetReceiptV1,
     /// Installed only by an explicit caller after the finalist is locked. The
-    /// ordinary trendbar-only `run()` route leaves this absent and OOS
-    /// preflight refuses before spending the touch.
+    /// ordinary trendbar-only `run()` route leaves this absent while preparing
+    /// quote coverage. Actual OOS evaluation requires it before reading prices.
     quote_validated_oos_replay: Option<LockedPortfolioOuterHoldoutReplaySetV1>,
     /// Where per-search discovery ledgers are written before their matrices are
     /// copied into the session store.
@@ -443,6 +443,30 @@ pub(super) fn validate_search_receipt_against_dataset_receipt(
     dataset_receipt: &DatasetReceiptV1,
     search_receipt: &CanonicalSearchInputReceiptV2,
 ) -> Result<()> {
+    validate_feature_receipt_artifacts(dataset_receipt, search_receipt)?;
+    for binding in search_receipt.source_bindings() {
+        for segment in binding.segments() {
+            anyhow::ensure!(
+                segment.timestamp_end_ms() < dataset_receipt.in_sample_window.end_exclusive_ms,
+                "canonical search receipt for {} reaches timestamp {} at/after frozen OOS cutoff {}",
+                binding.dataset_identity(),
+                segment.timestamp_end_ms(),
+                dataset_receipt.in_sample_window.end_exclusive_ms
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reuse the exact same artifact-identity checks for screening and the final
+/// holdout. Their allowed time ranges differ; neither may substitute a source.
+fn validate_feature_receipt_artifacts(
+    dataset_receipt: &DatasetReceiptV1,
+    search_receipt: &CanonicalSearchInputReceiptV2,
+) -> Result<()> {
+    dataset_receipt
+        .validate()
+        .context("validating the frozen autoresearch dataset receipt")?;
     let search_anchor = search_receipt
         .validate()
         .context("validating the canonical search input receipt")?;
@@ -505,12 +529,6 @@ pub(super) fn validate_search_receipt_against_dataset_receipt(
                     && segment.timestamp_end_ms() <= direct.timestamp_end_ms,
                 "canonical search receipt consumed a source segment outside frozen direct artifact {direct_identity}"
             );
-            anyhow::ensure!(
-                segment.timestamp_end_ms() < dataset_receipt.in_sample_window.end_exclusive_ms,
-                "canonical search receipt for {direct_identity} reaches timestamp {} at/after frozen OOS cutoff {}",
-                segment.timestamp_end_ms(),
-                dataset_receipt.in_sample_window.end_exclusive_ms
-            );
         }
     }
     Ok(())
@@ -524,6 +542,28 @@ fn sha256_hex(value: &[u8; 32]) -> String {
         encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+fn validate_oos_receipt_against_dataset_receipt(
+    dataset_receipt: &DatasetReceiptV1,
+    search_receipt: &CanonicalSearchInputReceiptV2,
+) -> Result<()> {
+    validate_feature_receipt_artifacts(dataset_receipt, search_receipt)?;
+    // The post-lock frame includes the causal IS prefix to warm indicators,
+    // with normalization still fitted only on IS. Its final scored scope is
+    // bound separately as Holdout; no source may read beyond the frozen end.
+    for binding in search_receipt.source_bindings() {
+        for segment in binding.segments() {
+            anyhow::ensure!(
+                segment.timestamp_end_ms() <= dataset_receipt.oos_window.end_ms,
+                "canonical OOS receipt for {} reaches timestamp {} beyond frozen holdout end {}",
+                binding.dataset_identity(),
+                segment.timestamp_end_ms(),
+                dataset_receipt.oos_window.end_ms
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reproduce discovery's effective config identity after its hardware-aware
@@ -738,14 +778,14 @@ impl SweepExecutor for StreamingSweepExecutor {
                     .canonical_frame(&base_tf)?
                     .prefix_before_timestamp_ms(in_sample_end_exclusive_ms)
                     .context("clip pinned autoresearch batch base before the OOS window")?;
-                let mut frame = neoethos_data::with_extended_sweep_working_set(batch, || {
-                    neoethos_data::prepare_multitimeframe_features_before_with_options(
+                let mut frame =
+                    neoethos_data::prepare_multitimeframe_features_before_batch_with_options(
                         &batch_dataset,
                         &base_tf,
                         &feature_options,
                         in_sample_end_exclusive_ms,
-                    )
-                })?;
+                        batch,
+                    )?;
                 if let Some(permutation) = permutation {
                     apply_shuffle_control(&permutation, &mut frame).context(
                         "applying the shuffle control's permutation to the feature block",
@@ -800,18 +840,17 @@ impl SweepExecutor for StreamingSweepExecutor {
         let outcome = neoethos_search::orchestration::run_streaming_working_set(
             &plan,
             base.close.len(),
-            // The ONLY sanctioned build entry point: it installs the batch as
-            // the working set and restores the previous one afterwards, even on
-            // panic.
+            // The immutable batch is captured into this build's run plan; no
+            // process-global state can leak between concurrent search slots.
             |batch| {
-                let mut frame = neoethos_data::with_extended_sweep_working_set(batch, || {
-                    neoethos_data::prepare_multitimeframe_features_before_with_options(
+                let mut frame =
+                    neoethos_data::prepare_multitimeframe_features_before_batch_with_options(
                         dataset,
                         &base_tf,
                         &feature_options,
                         in_sample_end_exclusive_ms,
-                    )
-                })?;
+                        batch,
+                    )?;
                 // THE SHUFFLE CONTROL, applied at the only correct point: after
                 // the features exist and before the search sees them. Prices,
                 // labels, costs, exit geometry, gene encoding and the GA seed
@@ -1252,6 +1291,13 @@ impl SweepExecutor for StreamingSweepExecutor {
         config: &DiscoveryConfig,
         portfolio: &super::PromotionPortfolio,
     ) -> Result<QuoteValidatedOosTouchEvidenceV1> {
+        // Shape-only preflight is also used to request missing quote coverage.
+        // Requiring replay there would prevent acquisition. Require it here,
+        // before the actual evaluation can materialize any held-out prices.
+        anyhow::ensure!(
+            self.quote_validated_oos_replay.is_some(),
+            "sealed quote replay is not installed; OOS evaluation cannot read held-out prices"
+        );
         // Re-asserted rather than assumed: the runner calls this first, and a
         // check that only runs when somebody remembers to call it is not a
         // check.
@@ -1335,10 +1381,7 @@ impl SweepExecutor for StreamingSweepExecutor {
             &features,
         )
         .context("binding the full causal OOS feature frame to its exact canonical receipt")?;
-        validate_search_receipt_against_dataset_receipt(
-            &self.dataset_receipt,
-            &oos_search_receipt,
-        )?;
+        validate_oos_receipt_against_dataset_receipt(&self.dataset_receipt, &oos_search_receipt)?;
         let oos_run_input =
             CanonicalSearchRunInputV2::new(oos_search_receipt, &features, &full_base)
                 .context("binding the final OOS feature frame to canonical trendbars")?;
@@ -1377,7 +1420,7 @@ impl SweepExecutor for StreamingSweepExecutor {
                 &ordered_signals,
                 &oos_effective_search_config_hash,
                 &oos_scope,
-                config.initial_balance,
+                config.initial_account_balance()?,
                 evaluation.pip_value_per_lot,
                 replay_set,
             )
@@ -1394,7 +1437,6 @@ impl SweepExecutor for StreamingSweepExecutor {
             &oos_effective_search_config_hash,
             &expected_holdout_scope_identity_sha256,
             quote_validated_outer_holdout,
-            config.initial_balance,
         )
         .map_err(anyhow::Error::new)
     }
@@ -1894,6 +1936,59 @@ mod tests {
     }
 
     #[test]
+    fn oos_receipt_reaches_the_frozen_holdout_but_search_receipt_cannot() {
+        let frozen = dataset_receipt("generation-a");
+        let exact = canonical_search_receipt(&frozen, "generation-a");
+        let mut full: serde_json::Value =
+            serde_json::from_slice(&exact.to_json_bytes().unwrap()).unwrap();
+        full["source_bindings"][0]["segments"][0]["row_end"] = 1001.into();
+        full["source_bindings"][0]["segments"][0]["timestamp_end_ms"] = 1000.into();
+        let full =
+            CanonicalSearchInputReceiptV2::from_json_bytes(&serde_json::to_vec(&full).unwrap())
+                .unwrap();
+        validate_search_receipt_against_dataset_receipt(&frozen, &exact).unwrap();
+        assert!(validate_search_receipt_against_dataset_receipt(&frozen, &full).is_err());
+        validate_oos_receipt_against_dataset_receipt(&frozen, &full)
+            .expect("only the post-lock OOS consumer may use the frozen full causal frame");
+    }
+
+    #[test]
+    fn oos_receipt_still_requires_the_exact_frozen_artifacts() {
+        let frozen = dataset_receipt("generation-a");
+        let exact = canonical_search_receipt(&frozen, "generation-a");
+        for field in ["manifest_sha256", "generation_id", "vortex_sha256"] {
+            let mut foreign: serde_json::Value =
+                serde_json::from_slice(&exact.to_json_bytes().unwrap()).unwrap();
+            foreign["source_bindings"][0][field] = "fe".repeat(32).into();
+            let foreign = CanonicalSearchInputReceiptV2::from_json_bytes(
+                &serde_json::to_vec(&foreign).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                validate_oos_receipt_against_dataset_receipt(&frozen, &foreign).is_err(),
+                "OOS cannot substitute {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn oos_receipt_cannot_read_past_the_frozen_holdout_even_from_the_same_artifact() {
+        let mut frozen = dataset_receipt("generation-a");
+        frozen.direct_timeframes[0].row_count = 1002;
+        frozen.direct_timeframes[0].timestamp_end_ms = 1001;
+        frozen.validate().unwrap();
+        let exact = canonical_search_receipt(&frozen, "generation-a");
+        let mut outside: serde_json::Value =
+            serde_json::from_slice(&exact.to_json_bytes().unwrap()).unwrap();
+        outside["source_bindings"][0]["segments"][0]["row_end"] = 1002.into();
+        outside["source_bindings"][0]["segments"][0]["timestamp_end_ms"] = 1001.into();
+        let outside =
+            CanonicalSearchInputReceiptV2::from_json_bytes(&serde_json::to_vec(&outside).unwrap())
+                .unwrap();
+        assert!(validate_oos_receipt_against_dataset_receipt(&frozen, &outside).is_err());
+    }
+
+    #[test]
     fn search_receipt_must_match_the_frozen_session_anchor_and_generation() {
         let frozen = dataset_receipt("generation-a");
         let exact = canonical_search_receipt(&frozen, "generation-a");
@@ -2101,6 +2196,8 @@ mod tests {
         neoethos_search::discovery::DiscoveryResult {
             search_input_receipt: receipt,
             selection_scope,
+            // This legacy V5 batch-binding fixture is not a V6 live export.
+            calibration_scope: None,
             holdout_scope: Some(holdout_scope),
             search_config_hash: EFFECTIVE_SEARCH_CONFIG_HASH.to_owned(),
             cost_band_by_strategy: Vec::new(),
@@ -2303,6 +2400,7 @@ mod tests {
                     canonical_portfolio: vec![gene(&[1])],
                 },
             ],
+            completed_without_survivors: Vec::new(),
             canonical: neoethos_search::orchestration::batch_ledger::CanonicalFeatureIndex::new(),
             ledger: neoethos_search::orchestration::batch_ledger::StreamingRunLedger::new(),
             streamed: true,
@@ -2932,6 +3030,7 @@ mod tests {
             neoethos_search::discovery::DiscoveryResult,
         > = neoethos_search::orchestration::StreamingRunOutcome {
             batches: Vec::new(),
+            completed_without_survivors: Vec::new(),
             canonical: neoethos_search::orchestration::batch_ledger::CanonicalFeatureIndex::new(),
             ledger: neoethos_search::orchestration::batch_ledger::StreamingRunLedger::new(),
             streamed: false,

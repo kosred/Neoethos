@@ -16,6 +16,7 @@ use neoethos_broker_truth::{
 use sha2::{Digest, Sha256};
 
 pub const BROKER_DEAL_MONEY_SCHEMA_VERSION_V1: u32 = 1;
+pub(crate) const MAX_EXACT_BROKER_VOLUME: i64 = (1_i64 << 53) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrokerDealMoneyErrorCodeV1 {
@@ -174,6 +175,7 @@ impl BrokerSymbolVolumeScaleEvidenceV1 {
                 "broker symbol volume-scale identity is incomplete or invalid",
             ));
         }
+        broker_lots_from_wire_volume_v1(0, lot_size_raw_centi_units)?;
 
         let mut payload = Vec::new();
         append_string(&mut payload, &environment);
@@ -443,6 +445,29 @@ fn deal_identity_sha256(
     sha256_hex("neoethos-broker-deal-money-evidence-v1", &payload)
 }
 
+/// Dimensional conversion only: both inputs are broker centi-units. Callers
+/// must bind the lot size to the same environment/account/symbol first. This
+/// arithmetic does not create broker evidence or historical authority.
+/// Zero is valid for an unfilled order; closing-deal evidence requires > 0.
+pub fn broker_lots_from_wire_volume_v1(
+    volume_raw_centi_units: i64,
+    lot_size_raw_centi_units: i64,
+) -> Result<f64, BrokerDealMoneyErrorV1> {
+    if !(0..=MAX_EXACT_BROKER_VOLUME).contains(&volume_raw_centi_units) {
+        return Err(money_error(
+            BrokerDealMoneyErrorCodeV1::InvalidFilledVolume,
+            "broker volume must be a nonnegative, exactly representable centi-unit integer",
+        ));
+    }
+    if !(1..=MAX_EXACT_BROKER_VOLUME).contains(&lot_size_raw_centi_units) {
+        return Err(money_error(
+            BrokerDealMoneyErrorCodeV1::InvalidContract,
+            "broker lotSize must be a positive, exactly representable centi-unit integer",
+        ));
+    }
+    Ok(volume_raw_centi_units as f64 / lot_size_raw_centi_units as f64)
+}
+
 pub fn build_broker_deal_money_evidence_v1(
     deal: &BrokerDealWireSnapshotV1,
     volume_scale: &BrokerSymbolVolumeScaleEvidenceV1,
@@ -533,8 +558,10 @@ pub fn build_broker_deal_money_evidence_v1(
         broker_conversion_fee_account_currency_signed as f64 / divisor;
     let component_sum_account_currency = component_sum_raw_scaled as f64 / divisor;
     let contract_units_per_lot = volume_scale.contract_units_per_lot();
-    let actual_filled_lots =
-        deal.filled_volume_raw_centi_units as f64 / volume_scale.lot_size_raw_centi_units as f64;
+    let actual_filled_lots = broker_lots_from_wire_volume_v1(
+        deal.filled_volume_raw_centi_units,
+        volume_scale.lot_size_raw_centi_units,
+    )?;
     if !contract_units_per_lot.is_finite()
         || contract_units_per_lot <= 0.0
         || !actual_filled_lots.is_finite()

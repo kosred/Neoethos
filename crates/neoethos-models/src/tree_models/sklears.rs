@@ -14,7 +14,8 @@ use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 use crate::tree_models::common::{
     build_tree_runtime_predictions, default_training_summary, ensure_feature_columns_match,
-    read_runtime_metadata, read_tree_json_artifact, tree_artifact_paths, tree_runtime_metadata,
+    read_runtime_metadata, read_tree_json_artifact, required_tree_training_summary,
+    tree_artifact_paths, tree_runtime_metadata, validate_tree_training_summary,
     write_runtime_metadata, write_tree_json_artifact,
 };
 
@@ -360,10 +361,8 @@ impl SklearsTreeExpert {
         }
     }
 
-    fn stored_training_summary(&self) -> TrainingSummaryMetadata {
-        self.training_summary
-            .clone()
-            .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
+    fn stored_training_summary(&self) -> Result<TrainingSummaryMetadata> {
+        required_tree_training_summary(self.training_summary.as_ref(), "sklears-tree")
     }
 
     fn ensure_runtime_state_ready(&self) -> Result<()> {
@@ -374,21 +373,7 @@ impl SklearsTreeExpert {
         if self.feature_columns.is_empty() {
             bail!("sklears-tree model is missing feature columns");
         }
-        let summary = self
-            .training_summary
-            .as_ref()
-            .context("sklears-tree model is missing training summary metadata")?;
-        if summary.dataset_rows == 0 {
-            bail!("sklears-tree training summary must record non-zero dataset_rows");
-        }
-        if summary.dataset_rows != summary.train_rows + summary.val_rows {
-            bail!(
-                "sklears-tree training summary is inconsistent: dataset_rows={} train_rows={} val_rows={}",
-                summary.dataset_rows,
-                summary.train_rows,
-                summary.val_rows
-            );
-        }
+        required_tree_training_summary(self.training_summary.as_ref(), "sklears-tree")?;
         validate_tree_node(root, self.feature_columns.len())?;
         Ok(())
     }
@@ -453,7 +438,7 @@ impl ExpertModel for SklearsTreeExpert {
         let runtime_artifact = SklearsRuntimeArtifact {
             schema_version: SKLEARS_F64_ARTIFACT_SCHEMA_VERSION,
             feature_columns: self.feature_columns.clone(),
-            training_summary: self.stored_training_summary(),
+            training_summary: self.stored_training_summary()?,
         };
         write_tree_json_artifact(
             &path.join(SKLEARS_RUNTIME_FILE_NAME),
@@ -465,7 +450,7 @@ impl ExpertModel for SklearsTreeExpert {
             &tree_runtime_metadata(
                 "sklears_tree",
                 self.feature_columns.clone(),
-                self.stored_training_summary(),
+                self.stored_training_summary()?,
             )?,
         )?;
         Ok(())
@@ -522,14 +507,7 @@ impl ExpertModel for SklearsTreeExpert {
                 path.display()
             );
         };
-        if metadata.training_summary.dataset_rows == 0 {
-            bail!("sklears-tree runtime metadata must record non-zero dataset_rows");
-        }
-        if metadata.training_summary.dataset_rows
-            != metadata.training_summary.train_rows + metadata.training_summary.val_rows
-        {
-            bail!("sklears-tree runtime metadata training summary is inconsistent");
-        }
+        validate_tree_training_summary(&metadata.training_summary, "sklears-tree runtime metadata")?;
         validate_tree_artifact(&artifact, metadata.feature_columns.len())?;
         self.max_depth = artifact.max_depth;
         self.min_samples_split = artifact.min_samples_split;
@@ -673,7 +651,7 @@ mod tests {
         let mut metadata: crate::runtime::artifacts::RuntimeArtifactMetadata =
             serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
                 .expect("deserialize metadata");
-        metadata.training_summary = TrainingSummaryMetadata::raw_for_validation(9, 8, 0);
+        metadata.training_summary = TrainingSummaryMetadata::raw_for_validation(9, 8, 0, 0);
         std::fs::write(
             &metadata_path,
             serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),

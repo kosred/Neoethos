@@ -87,7 +87,7 @@ impl SpotTickDto {
 }
 
 #[derive(Debug, Serialize)]
-struct SpotsResponse {
+pub(crate) struct SpotsResponse {
     spots: Vec<SpotTickDto>,
     #[serde(rename = "snapshotAtUnixMs")]
     snapshot_at_unix_ms: i64,
@@ -152,7 +152,7 @@ pub async fn stream(
     )
 }
 
-pub async fn list(State(_state): State<AppApiState>) -> Response {
+pub(crate) fn snapshot() -> SpotsResponse {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -165,12 +165,15 @@ pub async fn list(State(_state): State<AppApiState>) -> Response {
         .into_iter()
         .map(|t| SpotTickDto::from_tick(t, now_ms))
         .collect();
-    Json(SpotsResponse {
+    SpotsResponse {
         spots,
         snapshot_at_unix_ms: now_ms,
         symbol_count: count,
-    })
-    .into_response()
+    }
+}
+
+pub async fn list(State(_state): State<AppApiState>) -> Response {
+    Json(snapshot()).into_response()
 }
 
 #[cfg(test)]

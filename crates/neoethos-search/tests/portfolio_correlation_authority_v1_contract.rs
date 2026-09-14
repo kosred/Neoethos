@@ -140,35 +140,50 @@ fn first_candidate_and_every_pair_use_one_fail_closed_gate() {
     let discovery = source("src/discovery.rs");
     let canonical_selection = section(
         &discovery,
-        "let mut portfolio = Vec::new();",
-        "progress_fn(DiscoveryProgress::PortfolioSelected",
+        "fn select_walkforward_diverse_candidates_with_signals(",
+        "\nfn publish_completed_quality_chunk",
     );
     let best_effort_selection = section(
         &discovery,
-        "for ((_, gene), sig) in best_effort_fallback {",
+        "for (candidate_idx, gene) in best_effort_fallback {",
         "funnel.record_stage(\"fallback_best_effort\"",
     );
 
-    for selection in [canonical_selection, best_effort_selection] {
+    for (selection, rankability_call, acceptance) in [
+        (
+            canonical_selection,
+            "portfolio_signal_is_correlation_rankable_v1(&candidate.signals)",
+            "selected.push(candidate)",
+        ),
+        (
+            best_effort_selection,
+            "portfolio_signal_is_correlation_rankable_v1(&sig)",
+            "portfolio_signals.push(sig)",
+        ),
+    ] {
         require_all(
             selection,
             &[
-                "portfolio_signal_is_correlation_rankable_v1(&sig)",
+                rankability_call,
                 "pairwise_portfolio_correlation_decision_v1(",
                 "PortfolioCorrelationDecisionV1::Accept",
             ],
         );
-        let rankability = selection
-            .find("portfolio_signal_is_correlation_rankable_v1(&sig)")
-            .expect("rankability gate");
-        let accept = selection
-            .find("portfolio_signals.push(sig)")
-            .expect("portfolio acceptance");
+        let rankability = selection.find(rankability_call).expect("rankability gate");
+        let accept = selection.find(acceptance).expect("portfolio acceptance");
         assert!(
             rankability < accept,
             "rankability must be checked before even the first candidate is accepted"
         );
     }
+    require_all(
+        canonical_selection,
+        &[
+            "let diverse = rankable",
+            "&& selected.iter().all(|existing|",
+            "if diverse {",
+        ],
+    );
 }
 
 #[test]
@@ -191,18 +206,115 @@ fn threshold_equality_rejects_and_greedy_candidate_order_is_preserved() {
 
     let selection = section(
         &discovery,
-        "for (idx, ((_, gene), sig)) in filtered.into_iter().zip(signals_map).enumerate() {",
-        "progress_fn(DiscoveryProgress::PortfolioSelected",
+        "fn select_walkforward_diverse_candidates_with_signals(",
+        "\nfn publish_completed_quality_chunk",
+    );
+    require_all(
+        selection,
+        &[
+            "for (mut candidate, summary) in candidates.into_iter().zip(summaries)",
+            "if !summary.passed",
+            "if selected.len() >= portfolio_size",
+            "candidate.signals = load_signals(&candidate.gene)?",
+        ],
     );
     let compare = selection
-        .find("for existing in &portfolio_signals")
+        .find("selected.iter().all(|existing|")
         .expect("ranked greedy comparison loop");
     let accept = selection
-        .find("portfolio_signals.push(sig)")
+        .find("selected.push(candidate)")
         .expect("ranked greedy acceptance");
+    let walkforward_gate = selection
+        .find("if !summary.passed")
+        .expect("completed mode-aware WF verdict gate");
+    let capacity_gate = selection
+        .find("if selected.len() >= portfolio_size")
+        .expect("portfolio capacity gate");
+    let signal_load = selection
+        .find("candidate.signals = load_signals(&candidate.gene)?")
+        .expect("lazy exact-gene signal load");
     assert!(
-        compare < accept,
-        "candidate order must remain greedy and stable"
+        walkforward_gate < capacity_gate
+            && capacity_gate < signal_load
+            && signal_load < compare
+            && compare < accept,
+        "WF failure or exhausted capacity must skip signal loading; accepted candidates remain greedy and stable"
+    );
+    assert!(
+        !selection.contains(".sort"),
+        "the selection helper must retain the supplied ranked candidate order"
+    );
+
+    let finalizer = section(
+        &discovery,
+        "fn finalize_candidates_with_progress<F>(",
+        "enum CorrelationUndefinedV1",
+    );
+    require_all(
+        finalizer,
+        &[
+            "let selection_candidates = filtered",
+            "|(idx, (candidate_idx, gene))| WalkforwardSelectionCandidate",
+            "signals: Vec::new()",
+            "prop_firm_pass_rates.get(idx).copied()",
+            "&candidate_wf,",
+            "config.portfolio_size,",
+            "config.corr_threshold,",
+            "for candidate in selected",
+            "portfolio_candidate_indices.push(candidate.candidate_idx)",
+            "portfolio_signals.push(candidate.signals)",
+            "signals_for_gene_full_with_smc(",
+            "&eval_config_for_signals",
+        ],
+    );
+    // rustfmt may wrap this method chain; preserve the exact shared-context
+    // requirement without making a line break a regression.
+    let compact_finalizer = finalizer.split_whitespace().collect::<String>();
+    let shared_smc = "account_smc.as_ref().expect(\"selected candidates have shared SMC\")"
+        .split_whitespace()
+        .collect::<String>();
+    assert!(compact_finalizer.contains(&shared_smc));
+    let walkforward = finalizer
+        .find("let candidate_wf = discovery_walkforward_verdicts(")
+        .expect("all admitted survivors' WF evaluation");
+    let select = finalizer
+        .find("let selected = select_walkforward_diverse_candidates_with_signals(")
+        .expect("connected canonical correlation selection");
+    let publish = finalizer
+        .find("progress_fn(DiscoveryProgress::PortfolioSelected")
+        .expect("selected portfolio milestone");
+    assert!(
+        walkforward < select && select < publish,
+        "the actual finalizer must complete candidate WF before correlation/capacity selection"
+    );
+
+    let candidate_evaluation = section(
+        finalizer,
+        "let candidate_wf = discovery_walkforward_verdicts(",
+        "drop(wf_candidates)",
+    );
+    require_all(
+        candidate_evaluation,
+        &[
+            "&wf_candidates,",
+            "features,",
+            "ohlcv,",
+            "config,",
+            "effective_smc_gate_threshold,",
+            "population_execution_run,",
+        ],
+    );
+    let verdict_projection = section(
+        &discovery,
+        "impl WalkforwardVerdict {",
+        "fn discovery_walkforward_verdicts<F>(",
+    );
+    require_all(
+        verdict_projection,
+        &[
+            "tested: summary.walk_forward_splits > 0",
+            "passed: walkforward_summary_passed(summary, mode)",
+        ],
     );
 }
 

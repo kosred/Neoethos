@@ -325,25 +325,42 @@ pub fn month_keys_spanning(first_ms: i64, last_ms: i64) -> Vec<i64> {
 /// Buckets by ENTRY time, matching `quality::analyze_monthly_consistency`, so a
 /// month's number here is the same month's number there. Values are
 /// `pnl / initial_balance`.
+///
+/// Invalid money, a noncontiguous or unordered grid, and nonfinite calculated
+/// returns are errors, never repaired with a guessed balance or plausible zeros.
+/// An empty grid is valid and counts every finite-P&L trade as outside it.
 pub fn period_returns(
     trades: &[Trade],
     period_keys: &[i64],
     initial_balance: f64,
-) -> (Vec<f64>, usize) {
+) -> Result<(Vec<f64>, usize)> {
+    anyhow::ensure!(
+        initial_balance.is_finite() && initial_balance > 0.0,
+        "trial period returns require finite positive initial balance, got {initial_balance}"
+    );
+    for (index, pair) in period_keys.windows(2).enumerate() {
+        anyhow::ensure!(
+            pair[0].checked_add(1) == Some(pair[1]),
+            "trial period grid must be ascending and contiguous: keys {} and {} at indices {index} and {}",
+            pair[0],
+            pair[1],
+            index + 1
+        );
+    }
+
     let mut out = vec![0.0_f64; period_keys.len()];
     let mut outside = 0usize;
-    if period_keys.is_empty() {
-        return (out, trades.len());
-    }
-    let base = period_keys[0];
-    let balance = if initial_balance.is_finite() && initial_balance.abs() > f64::EPSILON {
-        initial_balance
-    } else {
-        // Never divide by zero and never silently emit NaN into a file whose
-        // whole purpose is to be statistically usable.
-        1.0
-    };
-    for trade in trades {
+    let base = period_keys.first().copied();
+    for (trade_index, trade) in trades.iter().enumerate() {
+        anyhow::ensure!(
+            trade.pnl.is_finite(),
+            "trial period returns require finite P&L: trade {trade_index} has {}",
+            trade.pnl
+        );
+        let Some(base) = base else {
+            outside += 1;
+            continue;
+        };
         if trade.entry_time <= 0 {
             outside += 1;
             continue;
@@ -353,14 +370,27 @@ pub fn period_returns(
             continue;
         };
         let key = (dt.year() as i64) * 12 + dt.month() as i64;
-        let idx = key - base;
-        if idx < 0 || idx as usize >= out.len() {
+        let Some(idx) = key
+            .checked_sub(base)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|&idx| idx < out.len())
+        else {
             outside += 1;
             continue;
-        }
-        out[idx as usize] += trade.pnl / balance;
+        };
+        let trade_return = trade.pnl / initial_balance;
+        anyhow::ensure!(
+            trade_return.is_finite(),
+            "trial period return overflow for trade {trade_index} in month {key}"
+        );
+        let aggregate = out[idx] + trade_return;
+        anyhow::ensure!(
+            aggregate.is_finite(),
+            "trial period aggregate overflow for month {key} at trade {trade_index}"
+        );
+        out[idx] = aggregate;
     }
-    (out, outside)
+    Ok((out, outside))
 }
 
 /// Strip Windows' extended-length (`\\?\`) prefix from an absolute path.
@@ -942,20 +972,20 @@ mod tests {
     fn other_valid_receipt(
         receipt: &CanonicalSearchInputReceiptV2,
     ) -> CanonicalSearchInputReceiptV2 {
-        let mut value = serde_json::to_value(receipt).expect("receipt JSON");
-        let current = value["feature_plan_identity"]
-            .as_str()
-            .expect("feature plan identity");
-        let replacement = if current == "0".repeat(64) {
-            "1".repeat(64)
-        } else {
-            "0".repeat(64)
-        };
-        value["feature_plan_identity"] = serde_json::Value::String(replacement);
-        CanonicalSearchInputReceiptV2::from_json_bytes(
-            &serde_json::to_vec(&value).expect("receipt bytes"),
-        )
-        .expect("structurally valid alternate receipt")
+        // Produce a different, internally valid plan rather than forging its
+        // hash: the exact plan bytes are now part of the receipt proof.
+        let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame()
+            .select_columns(&[1, 0])
+            .expect("alternate ordered feature projection");
+        let anchor = features.provenance().bindings()[0].dataset_identity();
+        let alternate = CanonicalSearchInputReceiptV2::from_feature_frame(anchor, &features)
+            .expect("valid alternate receipt from actual projected features");
+        alternate.validate().expect("alternate receipt proof");
+        assert_ne!(
+            alternate.identity_sha256().unwrap(),
+            receipt.identity_sha256().unwrap()
+        );
+        alternate
     }
 
     fn trade(entry_ms: i64, pnl: f64) -> Trade {
@@ -1002,12 +1032,14 @@ mod tests {
     #[test]
     fn returns_bucket_by_entry_month_as_fractions_of_balance() {
         let keys = month_keys_spanning(JAN_2024, MAR_2024);
-        let trades = vec![
+        let mut trades = vec![
             trade(JAN_2024, 100.0),
             trade(JAN_2024, -40.0),
             trade(MAR_2024, 20.0),
         ];
-        let (r, outside) = period_returns(&trades, &keys, 1000.0);
+        // The January gain closes in March but remains attributed to ENTRY.
+        trades[0].exit_time = Some(MAR_2024);
+        let (r, outside) = period_returns(&trades, &keys, 1000.0).unwrap();
         assert_eq!(outside, 0);
         assert!((r[0] - 0.06).abs() < 1e-12, "Jan = (100 - 40)/1000");
         assert_eq!(r[1], 0.0, "Feb had no trades");
@@ -1019,16 +1051,109 @@ mod tests {
         let keys = month_keys_spanning(JAN_2024, JAN_2024);
         // One inside January, one in March, one with no timestamp.
         let trades = vec![trade(JAN_2024, 10.0), trade(MAR_2024, 10.0), trade(0, 10.0)];
-        let (r, outside) = period_returns(&trades, &keys, 100.0);
+        let (r, outside) = period_returns(&trades, &keys, 100.0).unwrap();
         assert_eq!(outside, 2);
         assert!((r[0] - 0.1).abs() < 1e-12);
     }
 
     #[test]
-    fn zero_balance_never_produces_nan_in_a_statistics_file() {
+    fn invalid_balance_is_refused_instead_of_fabricating_period_returns() {
         let keys = month_keys_spanning(JAN_2024, JAN_2024);
-        let (r, _) = period_returns(&[trade(JAN_2024, 5.0)], &keys, 0.0);
-        assert!(r[0].is_finite());
+        for balance in [
+            0.0,
+            -0.0,
+            -100.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            for grid in [keys.as_slice(), &[]] {
+                let error = period_returns(&[trade(JAN_2024, 5.0)], grid, balance)
+                    .expect_err("invalid capital cannot produce statistically usable returns");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("finite positive initial balance")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_positive_balance_uses_the_actual_denominator() {
+        let keys = month_keys_spanning(JAN_2024, JAN_2024);
+        let balance = f64::MIN_POSITIVE;
+        let (returns, outside) =
+            period_returns(&[trade(JAN_2024, balance / 2.0)], &keys, balance).unwrap();
+        assert_eq!(
+            returns,
+            vec![0.5],
+            "half the actual capital is a 50% return"
+        );
+        assert_eq!(outside, 0);
+    }
+
+    #[test]
+    fn nonfinite_pnl_is_refused_even_outside_or_without_a_month_grid() {
+        let keys = month_keys_spanning(JAN_2024, JAN_2024);
+        for pnl in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for entry in [JAN_2024, MAR_2024, 0] {
+                for grid in [keys.as_slice(), &[]] {
+                    let error = period_returns(&[trade(entry, pnl)], grid, 1000.0)
+                        .expect_err("invalid P&L cannot be hidden by an out-of-grid timestamp");
+                    assert!(error.to_string().contains("finite P&L"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_period_grids_are_refused_before_any_return_is_reported() {
+        let january = 2024 * 12 + 1;
+        for grid in [
+            vec![january, january + 2],
+            vec![january + 1, january],
+            vec![january, january],
+            vec![i64::MAX, i64::MIN],
+        ] {
+            let error = period_returns(&[], &grid, 1000.0)
+                .expect_err("gaps, reversed months, duplicates and integer wrap are not a grid");
+            assert!(error.to_string().contains("ascending and contiguous"));
+        }
+    }
+
+    #[test]
+    fn empty_or_distant_valid_grids_account_for_every_finite_trade() {
+        let trades = [trade(JAN_2024, 10.0), trade(MAR_2024, -5.0), trade(0, 0.0)];
+        assert_eq!(period_returns(&trades, &[], 1000.0).unwrap(), (vec![], 3));
+        assert_eq!(period_returns(&[], &[], 1000.0).unwrap(), (vec![], 0));
+        // The distance to these contiguous keys exceeds i64: it is outside,
+        // not an unchecked subtraction that panics or wraps into an index.
+        assert_eq!(
+            period_returns(&trades, &[i64::MIN, i64::MIN + 1], 1000.0).unwrap(),
+            (vec![0.0, 0.0], 3)
+        );
+    }
+
+    #[test]
+    fn individual_period_return_overflow_is_refused() {
+        let keys = month_keys_spanning(JAN_2024, JAN_2024);
+        for pnl in [f64::MAX, -f64::MAX] {
+            let error = period_returns(&[trade(JAN_2024, pnl)], &keys, 0.5)
+                .expect_err("finite money divided by finite capital can still overflow");
+            assert!(error.to_string().contains("period return overflow"));
+        }
+    }
+
+    #[test]
+    fn aggregate_period_return_overflow_is_refused() {
+        let keys = month_keys_spanning(JAN_2024, JAN_2024);
+        for pnl in [f64::MAX, -f64::MAX] {
+            let trades = [trade(JAN_2024, pnl), trade(JAN_2024, pnl)];
+            let error = period_returns(&trades, &keys, 1.0)
+                .expect_err("finite individual returns cannot justify an infinite monthly sum");
+            assert!(error.to_string().contains("period aggregate overflow"));
+        }
     }
 
     #[test]

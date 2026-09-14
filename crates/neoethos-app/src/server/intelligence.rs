@@ -1,15 +1,20 @@
 //! `/intelligence` — what the model swarm currently knows.
 //!
-//! Surfaces the contents of the `models/` directory plus the
-//! `model_targets.json` written by the last completed discovery run,
-//! in a shape the Flutter Intelligence screen can render directly.
+//! Surfaces installed models and exact Discovery training selections.
 //! Read-only — the actual training happens via `/engines/training/*`.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::app_services::training::handoff::{
+    self, TrainingHandoffSummary, TrainingHandoffUnavailable,
+};
+use crate::app_services::training::{
+    CombinedResearchReportsDto, load_saved_final_research_context,
+    read_saved_final_research_reports_with_context,
+};
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State, rejection::QueryRejection};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
@@ -31,13 +36,11 @@ pub struct IntelligenceDto {
     /// mtime of the most-recently-touched artifact, Unix-millis.
     /// `None` when the directory is empty.
     pub last_touched_unix_ms: Option<u64>,
-    /// Targets list from the latest discovery (`model_targets.json`).
-    /// Empty when discovery hasn't run yet, or when the file failed
-    /// to parse.
+    /// Strategies from validated, immutable Discovery training handoffs.
+    /// Empty before publication; unavailable handoffs are reported separately.
     pub discovery_targets: Vec<DiscoveryTargetDto>,
-    /// Top-level metrics from `walkforward_metrics.json` if present.
-    pub walkforward_splits: Option<u32>,
-    pub walkforward_avg_accuracy: Option<f64>,
+    pub training_handoffs: Vec<TrainingHandoffSummary>,
+    pub training_handoff_unavailable: Vec<TrainingHandoffUnavailable>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -64,14 +67,161 @@ pub async fn intelligence(State(_state): State<AppApiState>) -> Response {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchQuery {
+    training_handoff: String,
+}
+
+/// Explicit, selected-handoff read. This is deliberately not part of the
+/// periodically polled intelligence inventory. Strategy reports need no models;
+/// combined reports verify their installed tree without loading models or prices.
+pub async fn research(
+    State(state): State<AppApiState>,
+    query: Result<Query<ResearchQuery>, QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => {
+            return research_error_response(ResearchReadError {
+                status: StatusCode::BAD_REQUEST,
+                message: "Select one training handoff using the training_handoff query field.",
+                source: anyhow::anyhow!(error.body_text()),
+            });
+        }
+    };
+    // Validate before config or filesystem access. Reuse the same canonical
+    // selector policy as Discovery -> Training, rather than accepting a path.
+    if let Err(source) = handoff::handoff_path(Path::new(""), &query.training_handoff) {
+        return research_error_response(ResearchReadError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Select a canonical lowercase training handoff identity, not a path.",
+            source,
+        });
+    }
+    let config_path = state.config_path().to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let settings = Settings::from_yaml(config_path).map_err(|source| ResearchReadError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "Could not read the app configuration for the selected research report.",
+            source: source.into(),
+        })?;
+        // This is the same root used by the typed TrainingRequest producer.
+        // Settings currently has no alternative models-directory authority.
+        read_selected_research(
+            &settings.system.data_dir,
+            &Path::new("models").join("candidates"),
+            &query.training_handoff,
+        )
+    })
+    .await;
+    let mut response = match result {
+        Ok(Ok(dto)) => Json(dto).into_response(),
+        Ok(Err(error)) => research_error_response(error),
+        Err(error) => internal_panic("Loading selected saved research", error),
+    };
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+#[derive(Debug)]
+struct ResearchReadError {
+    status: StatusCode,
+    message: &'static str,
+    source: anyhow::Error,
+}
+
+fn research_error_response(error: ResearchReadError) -> Response {
+    // Keep the complete validation chain; no broker operation occurs here and
+    // these failures must not be translated into a trading-permission message.
+    (
+        error.status,
+        Json(serde_json::json!({
+            "error": error.message,
+            "detail": format!("{:#}", error.source),
+        })),
+    )
+        .into_response()
+}
+
+fn io_error_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+    })
+}
+
+fn read_selected_research(
+    data_root: &Path,
+    candidate_root: &Path,
+    identity: &str,
+) -> Result<CombinedResearchReportsDto, ResearchReadError> {
+    handoff::handoff_path(data_root, identity).map_err(|source| ResearchReadError {
+        status: StatusCode::BAD_REQUEST,
+        message: "Select a canonical lowercase training handoff identity, not a path.",
+        source,
+    })?;
+    // Qualify missing/invalid selection separately from missing report evidence.
+    // Carry this exact checked projection into the report phase; do not discard
+    // it and decode/validate the same large handoff again in this request.
+    let context = load_saved_final_research_context(data_root, identity).map_err(|source| {
+        ResearchReadError {
+            status: match io_error_kind(&source) {
+                Some(std::io::ErrorKind::NotFound) => StatusCode::NOT_FOUND,
+                Some(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                None => StatusCode::BAD_REQUEST,
+            },
+            message: "The selected Discovery training handoff is missing or invalid.",
+            source,
+        }
+    })?;
+    // The reader owns any required model verification once for all attempts.
+    read_saved_final_research_reports_with_context(data_root, candidate_root, context)
+        .map_err(candidate_read_error)
+}
+
+fn candidate_read_error(source: anyhow::Error) -> ResearchReadError {
+    ResearchReadError {
+        status: if io_error_kind(&source).is_some() {
+            StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        message: "The selected candidate research could not be verified. Its saved evidence may be incomplete or invalid.",
+        source,
+    }
+}
+
 fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
     // The backend currently scans the hardcoded "models" path so the
     // Flutter screen surfaces the same artifacts every run.
     // If Settings ever grows a `models_dir` we'll switch over here.
     // F-553/F-576 closure (2026-05-25): resolved via the process-wide
     // install so a non-default `--config` flag still works.
-    let _settings = Settings::from_yaml(super::state::current_config_path()).ok();
-    let models_dir = std::path::PathBuf::from("models");
+    let settings = Settings::from_yaml(super::state::current_config_path())?;
+    scan_intelligence_at(&settings.system.data_dir, Path::new("models"))
+}
+
+fn scan_intelligence_at(data_root: &Path, models_dir: &Path) -> anyhow::Result<IntelligenceDto> {
+    let inventory = handoff::list(data_root)?;
+    let training_handoffs = inventory.available;
+    let training_handoff_unavailable = inventory.unavailable;
+    let mut discovery_targets = Vec::new();
+    for summary in &training_handoffs {
+        for strategy in &summary.strategies {
+            discovery_targets.push(DiscoveryTargetDto {
+                symbol: summary.symbol.clone(),
+                base_tf: summary.base_tf.clone(),
+                strategy_id: strategy.strategy_id.clone(),
+                sharpe: Some(strategy.sharpe),
+                win_rate: Some(strategy.win_rate),
+            });
+        }
+    }
     // Absolute path so out-of-process helpers (the P2P mesh sidecar) can locate
     // the model store to transfer trained models. Falls back to the relative
     // form if the CWD is somehow unreadable.
@@ -86,7 +236,7 @@ fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
         .or_else(|| {
             std::env::current_dir()
                 .ok()
-                .map(|c| c.join("models").display().to_string())
+                .map(|c| c.join(models_dir).display().to_string())
         })
         .unwrap_or_else(|| models_dir.display().to_string());
     if !models_dir.exists() {
@@ -96,9 +246,9 @@ fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
             artifact_count: 0,
             artifacts: Vec::new(),
             last_touched_unix_ms: None,
-            discovery_targets: Vec::new(),
-            walkforward_splits: None,
-            walkforward_avg_accuracy: None,
+            discovery_targets,
+            training_handoffs,
+            training_handoff_unavailable,
         });
     }
 
@@ -108,9 +258,6 @@ fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64);
 
-    let discovery_targets = parse_model_targets(&models_dir);
-    let (wf_splits, wf_avg) = parse_walkforward(&models_dir);
-
     Ok(IntelligenceDto {
         models_dir: models_dir_str,
         models_dir_exists: true,
@@ -118,10 +265,14 @@ fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
         artifacts,
         last_touched_unix_ms,
         discovery_targets,
-        walkforward_splits: wf_splits,
-        walkforward_avg_accuracy: wf_avg,
+        training_handoffs,
+        training_handoff_unavailable,
     })
 }
+
+#[cfg(test)]
+#[path = "intelligence_research_tests.rs"]
+mod research_tests;
 
 /// Scan the models directory for TRAINED MODELS (2026-07-17 fix — operator:
 /// "τα βλέπει σαν αρχείο αλλά δεν τα αξιοποιεί").
@@ -157,6 +308,9 @@ fn scan_models_dir(models_dir: &Path) -> (Vec<String>, Option<SystemTime>) {
                 touch(entry.metadata().ok());
             } else if path.is_dir() {
                 let symbol = entry.file_name().to_string_lossy().to_string();
+                if symbol == "candidates" {
+                    continue;
+                } // candidate trees are not deployed experts
                 let Ok(tf_dirs) = std::fs::read_dir(&path) else {
                     continue;
                 };
@@ -202,64 +356,6 @@ fn is_artifact(name: &str) -> bool {
     [".joblib", ".pkl", ".pt", ".cbm", ".onnx", ".json"]
         .iter()
         .any(|ext| lower.ends_with(ext))
-}
-
-fn parse_model_targets(models_dir: &Path) -> Vec<DiscoveryTargetDto> {
-    let path = models_dir.join("model_targets.json");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Vec::new();
-    };
-
-    // The shape is `{ "EURUSD/M1": [{strategy_id, sharpe, win_rate, ...}, ...] }`.
-    // We flatten that to a Vec for the wire.
-    let mut out = Vec::new();
-    if let Some(obj) = value.as_object() {
-        for (key, val) in obj {
-            let (symbol, base_tf) = match key.split_once('/') {
-                Some((s, t)) => (s.to_string(), t.to_string()),
-                None => (key.clone(), String::new()),
-            };
-            if let Some(list) = val.as_array() {
-                for entry in list {
-                    let strategy_id = entry
-                        .get("strategy_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if strategy_id.is_empty() {
-                        continue;
-                    }
-                    out.push(DiscoveryTargetDto {
-                        symbol: symbol.clone(),
-                        base_tf: base_tf.clone(),
-                        strategy_id,
-                        sharpe: entry.get("sharpe").and_then(|v| v.as_f64()),
-                        win_rate: entry.get("win_rate").and_then(|v| v.as_f64()),
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-fn parse_walkforward(models_dir: &Path) -> (Option<u32>, Option<f64>) {
-    let path = models_dir.join("walkforward_metrics.json");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return (None, None);
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return (None, None);
-    };
-    let splits = value
-        .get("walkforward_splits")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
-    let avg = value.get("avg_accuracy").and_then(|v| v.as_f64());
-    (splits, avg)
 }
 
 #[cfg(test)]

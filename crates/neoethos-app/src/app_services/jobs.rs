@@ -98,9 +98,20 @@ impl JobSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CancellationFlag {
     requested: Arc<AtomicBool>,
+    budget_cancellation: neoethos_core::execution_budget::CancellationToken,
+}
+
+impl std::fmt::Debug for CancellationFlag {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CancellationFlag")
+            .field("requested", &self.is_requested())
+            .field("budget_cancelled", &self.budget_cancellation.is_cancelled())
+            .finish()
+    }
 }
 
 impl CancellationFlag {
@@ -110,6 +121,9 @@ impl CancellationFlag {
 
     pub fn request(&self) {
         self.requested.store(true, Ordering::SeqCst);
+        // An atomic flag alone cannot wake a thread waiting on the broker's
+        // condition variable. Use its existing cancellation notification path.
+        self.budget_cancellation.cancel();
     }
 
     pub fn is_requested(&self) -> bool {
@@ -120,6 +134,11 @@ impl CancellationFlag {
     /// can poll cancellation mid-run instead of only at coarse phase boundaries.
     pub fn cancel_arc(&self) -> Arc<AtomicBool> {
         self.requested.clone()
+    }
+
+    /// Same job cancellation for queued CPU admissions, shared across clones.
+    pub fn cpu_budget_token(&self) -> &neoethos_core::execution_budget::CancellationToken {
+        &self.budget_cancellation
     }
 }
 
@@ -237,7 +256,58 @@ mod tests {
         let cancel = CancellationFlag::new();
 
         assert!(!cancel.is_requested());
+        assert!(!cancel.cpu_budget_token().is_cancelled());
+        let cloned = cancel.clone();
+        let raw = cancel.cancel_arc();
         cancel.request();
         assert!(cancel.is_requested());
+        assert!(cloned.is_requested());
+        assert!(raw.load(Ordering::SeqCst));
+        assert!(cloned.cpu_budget_token().is_cancelled());
+    }
+
+    #[test]
+    fn job_stop_wakes_budget_waiter_while_original_lease_remains_held() {
+        use neoethos_core::execution_budget::{
+            AcquireError, CpuPermitBroker, CpuPermitRequest, WorkerLimit,
+        };
+        let width = WorkerLimit::new(2).unwrap();
+        let broker = CpuPermitBroker::new(width);
+        let held = broker.acquire(CpuPermitRequest::local(width)).unwrap();
+        let cancel = CancellationFlag::new();
+        let waiting_cancel = cancel.clone();
+        let waiting_broker = broker.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let result = waiting_broker
+                .acquire_cancellable(
+                    CpuPermitRequest::local(width),
+                    waiting_cancel.cpu_budget_token(),
+                )
+                .map(|_lease| ());
+            send.send(result).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while broker.snapshot().queued_total == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let queued_before_stop = broker.snapshot().queued_total;
+        cancel.request();
+        // Receive BEFORE dropping held: releasing the original reservation
+        // must not be the event that wakes this cancelled waiter.
+        let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+        let before_release = broker.snapshot();
+        // Cleanup even on a regression, so a failed assertion cannot leave
+        // the test worker blocked behind its own unreleased lease.
+        drop(held);
+        waiter.join().unwrap();
+        assert_eq!(queued_before_stop, 1);
+        assert!(matches!(result.unwrap(), Err(AcquireError::Cancelled)));
+        assert_eq!(before_release.queued_total, 0);
+        assert_eq!(before_release.available_permits, 0);
+        assert_eq!(before_release.live_reserved_sum, 2);
+        let after_release = broker.snapshot();
+        assert_eq!(after_release.available_permits, 2);
+        assert_eq!(after_release.live_reserved_sum, 0);
     }
 }

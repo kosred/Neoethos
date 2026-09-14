@@ -4,11 +4,10 @@
 //! Trading systems are notoriously unforgiving about hardcoded
 //! per-symbol constants. JPY pairs use a 0.01 pip; metals use 0.01 too
 //! but with different lot sizes; indices and crypto each have their
-//! own contract conventions. The previous heuristic (`split_symbol_parts`
-//! + `if quote == "JPY"`) was right for the common cases but couldn't
-//! tell EURJPY's *quote-conversion rate to USD* — that rate is what
-//! turns "JPY pips per lot" into "USD per lot", and for cross pairs
-//! you need real broker data to get it right.
+//! own contract conventions. The previous `split_symbol_parts` plus
+//! `quote == "JPY"` heuristic was right for common cases but could not
+//! determine EURJPY's quote-conversion rate to USD. Cross pairs require
+//! real broker data for that conversion.
 //!
 //! This module is the typed boundary:
 //!
@@ -95,10 +94,9 @@ pub struct SymbolMetadata {
     /// The cTrader broker hands us these values for every symbol it
     /// streams via `ProtoOASymbol`. Backtest cost models that ignore
     /// them ship strategies whose live PnL silently lags by the swap
-    /// + fee delta. The audit-finding F-CY3-2 + F-CY3-3 chain
-    /// motivated lifting these onto the canonical metadata table so
-    /// the GA fitness function has the same cost view the live
-    /// trader does.
+    /// and fee delta. Audit findings F-CY3-2 and F-CY3-3 motivated lifting
+    /// these onto the canonical metadata table so the GA fitness function
+    /// has the same cost view as the live trader.
     ///
     /// Daily SWAP charge for a long position, in **pips per day**.
     /// Positive value = CREDIT (broker pays you for holding overnight).
@@ -369,73 +367,30 @@ impl SymbolMetadata {
         }
     }
 
-    /// **Phase D.2e (2026-05-28)** — convenience wrapper that returns
-    /// the per-lot commission in **account currency** instead of the
-    /// type-mixed return of `commission_per_lot_quote_ccy` (which
-    /// returns USD for types 1+2 and quote-ccy for types 3+4).
+    /// Return the per-lot commission in **account currency** instead of the
+    /// type-mixed return of `commission_per_lot_quote_ccy` (which returns USD
+    /// for types 1+2 and quote currency for types 3+4).
     ///
     /// Inputs:
     ///   - `account_currency`: the deposit currency of the trading account
     ///   - `live_price`: a recent close (broker tick or last bar); only
     ///     used by types 1 and 3 which need notional volume
-    ///   - `quote_to_account_rate`: spot FX rate from the symbol's
-    ///     quote currency to the account currency. For a USD account
-    ///     this doubles as quote→USD which is the rate type 1 needs;
-    ///     for type 3+4 it converts the quote-currency result.
+    ///   - `quote_to_account_rate`: spot FX rate from the symbol's quote
+    ///     currency to the account currency
+    ///   - `usd_to_account_rate`: spot FX rate from USD to the account
+    ///     currency; required for USD-denominated commission types on a
+    ///     non-USD account
     ///
     /// Returns `None` when:
     ///   - the broker hasn't supplied commission_type / rate_decimal
-    ///   - type 1 needs a non-USD quote rate but `account_currency != "USD"`
-    ///   - type 1 or 2 are USD-denominated but `account_currency != "USD"`
-    ///     (we'd need a separate USD→account rate that current callers
-    ///     don't supply — future D.2f work)
+    ///   - type 1 needs a quote→USD conversion that cannot be derived from the
+    ///     supplied quote→account and USD→account rates
+    ///   - type 1 or 2 are USD-denominated but the USD→account rate is missing
     ///   - type 3 or 4 cross-currency but `quote_to_account_rate` is None
     ///
     /// Falling back to None (rather than synthesising a default) is the
     /// fail-loud path the operator's "no hardcoded numbers" rule demands.
     pub fn commission_per_lot_account_ccy(
-        &self,
-        account_currency: &str,
-        live_price: Option<f64>,
-        quote_to_account_rate: Option<f64>,
-    ) -> Option<f64> {
-        // F-300 (2026-05-28): thin back-compat wrapper. The original
-        // D.2e helper bailed for type 1/2 on non-USD accounts because
-        // it had no USD→account rate. `commission_per_lot_account_ccy_v2`
-        // takes that rate explicitly; this old entrypoint passes None
-        // so existing call sites get identical behaviour. New callers
-        // (strategy_gene.rs cost model) should use _v2 directly.
-        self.commission_per_lot_account_ccy_v2(
-            account_currency,
-            live_price,
-            quote_to_account_rate,
-            None,
-        )
-    }
-
-    /// **Phase D.2f (2026-05-28)** — extended account-ccy commission
-    /// helper that accepts a separate `usd_to_account_rate` so type 1
-    /// (UsdPerMillionUsd) and type 2 (UsdPerLot) commissions can be
-    /// converted to a non-USD account currency. D.2e left a gap where
-    /// EUR / GBP / JPY account operators always fell into the
-    /// $7/lot synthetic warn for FX majors — there are NO USD-quoted
-    /// FX majors on EUR/GBP/JPY accounts where the existing helper
-    /// could complete the math.
-    ///
-    /// Signature additions vs `commission_per_lot_account_ccy`:
-    /// - `usd_to_account_rate`: spot FX rate from USD → account
-    ///   currency. When `account_currency == "USD"`, ignored (the
-    ///   identity is implicit). When `account_currency != "USD"` AND
-    ///   the symbol is type 1/2 (USD-denominated commission), this
-    ///   rate completes the conversion.
-    ///
-    /// Type 1 also benefits from this for non-USD-quoted symbols on
-    /// non-USD accounts: the inner `commission_per_lot_quote_ccy` can
-    /// now use a synthesised quote→USD rate when both halves are
-    /// available (quote→account via `quote_to_account_rate` and USD→
-    /// account via the new param), via the identity quote→USD =
-    /// (quote→account) / (USD→account).
-    pub fn commission_per_lot_account_ccy_v2(
         &self,
         account_currency: &str,
         live_price: Option<f64>,
@@ -555,49 +510,6 @@ impl SymbolMetadata {
         }
         Some(lots)
     }
-
-    /// Compute the gross PnL in **account currency** for an open
-    /// position. Currently unused (the broker is authoritative via
-    /// `ProtoOAPositionUnrealizedPnL.netUnrealizedPnL`), but exposed
-    /// so the backtest can reuse the same formula and the live
-    /// drift-detection circuit-breaker (currently dead per E.2 audit
-    /// finding) can be re-armed.
-    ///
-    /// `entry_price` and `exit_price` are in the symbol's quote
-    /// currency. For a BUY: PnL = (exit - entry) × contract × lots ×
-    /// quote_to_account. For a SELL: invert sign.
-    pub fn position_pnl_account(
-        &self,
-        entry_price: f64,
-        exit_price: f64,
-        lots: f64,
-        is_buy: bool,
-        account_currency: &str,
-        quote_to_account_rate: Option<f64>,
-        live_price_for_base_account: Option<f64>,
-    ) -> Option<f64> {
-        if !entry_price.is_finite() || !exit_price.is_finite() {
-            return None;
-        }
-        if !lots.is_finite() || lots <= 0.0 {
-            return None;
-        }
-        let price_delta_pips = (exit_price - entry_price) / self.pip_size;
-        let signed_pips = if is_buy {
-            price_delta_pips
-        } else {
-            -price_delta_pips
-        };
-        let pip_value_account = self.pip_value_in_account(
-            account_currency,
-            quote_to_account_rate,
-            live_price_for_base_account,
-        );
-        if !pip_value_account.is_finite() {
-            return None;
-        }
-        Some(signed_pips * lots * pip_value_account)
-    }
 }
 
 /// Disk-backed table. Loaded once per process; subsequent lookups are
@@ -702,8 +614,8 @@ pub fn canonical_symbol(symbol: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// Process-wide cache of the on-disk metadata. Layered on top of the
-/// baked-in defaults: `lookup` checks disk first, then baked-in.
+/// Process-wide cache of the on-disk metadata. Production never falls back to
+/// the test-only baked-in table.
 static GLOBAL_TABLE: OnceLock<SymbolMetadataTable> = OnceLock::new();
 
 /// Resolve the canonical metadata file path. Operators can override
@@ -1283,60 +1195,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn position_pnl_account_buy_positive_move_gbp_account() {
-        // Buy EURUSD at 1.0800, exits at 1.0820 → +20 pips.
-        // 0.1 lot × 20 pips × $10/pip × 0.79 (USD→GBP) = +£15.80.
-        let eurusd = baked_in_default("EURUSD").unwrap();
-        let pnl = eurusd
-            .position_pnl_account(
-                1.0800,
-                1.0820,
-                0.1,
-                /* is_buy */ true,
-                "GBP",
-                Some(0.79),
-                None,
-            )
-            .expect("ok");
-        assert!((pnl - 15.80).abs() < 0.01, "expected ≈£15.80, got £{pnl}");
-    }
-
-    #[test]
-    fn position_pnl_account_sell_negative_move_is_profit() {
-        // Sell EURUSD at 1.0820, exits at 1.0800 → +20 pips for a short.
-        let eurusd = baked_in_default("EURUSD").unwrap();
-        let pnl = eurusd
-            .position_pnl_account(
-                1.0820, 1.0800, 0.1, /* is_buy */ false, "USD", None, None,
-            )
-            .expect("ok");
-        // pip_value $10/lot, 0.1 lot, 20 pips → $20.
-        assert!((pnl - 20.0).abs() < 1e-6, "expected $20, got ${pnl}");
-    }
-
-    #[test]
-    fn position_pnl_account_usdjpy_uses_pip_size_0_01() {
-        // USDJPY pip_size = 0.01. Buy at 149.00, exits at 149.20 → +20 pips.
-        // pip_value_quote = 0.01 × 100_000 = 1000 JPY/lot.
-        // 0.1 lot × 20 × 1000 = 2000 JPY. On USD account
-        // with live price 149.0 (using base==account fallback), the
-        // pip_value_in_account = 1000 / 149 ≈ 6.71 USD/lot → 0.1 × 20 × 6.71 ≈ $13.42.
-        let usdjpy = baked_in_default("USDJPY").unwrap();
-        let pnl = usdjpy
-            .position_pnl_account(
-                149.00,
-                149.20,
-                0.1,
-                /* is_buy */ true,
-                "USD",
-                None,
-                Some(149.0),
-            )
-            .expect("ok");
-        assert!((pnl - 13.42).abs() < 0.05, "expected ≈$13.42, got ${pnl}");
-    }
-
     // ─── Phase D.2d commission helper (2026-05-28) ────────────────────
     //
     // `commission_per_lot_quote_ccy` should return the commission in
@@ -1473,7 +1331,7 @@ mod tests {
         m.commission_type = Some(1);
         m.commission_rate_decimal = Some(45.0);
         let c = m
-            .commission_per_lot_account_ccy("USD", Some(1.10), None)
+            .commission_per_lot_account_ccy("USD", Some(1.10), None, None)
             .expect("commission");
         assert!((c - 4.95).abs() < 1e-9, "expected $4.95, got ${c}");
     }
@@ -1489,7 +1347,7 @@ mod tests {
         m.commission_rate_decimal = Some(45.0);
         // price 150 JPY/USD, quote_to_account = JPY→USD ≈ 1/150.
         let c = m
-            .commission_per_lot_account_ccy("USD", Some(150.0), Some(1.0 / 150.0))
+            .commission_per_lot_account_ccy("USD", Some(150.0), Some(1.0 / 150.0), None)
             .expect("commission");
         assert!((c - 4.50).abs() < 1e-6, "expected $4.50, got ${c}");
     }
@@ -1505,7 +1363,7 @@ mod tests {
         m.commission_rate_decimal = Some(0.02); // 0.02 %
         // price 20_000, notional = 20_000 EUR, commission = 4.00 EUR.
         let c = m
-            .commission_per_lot_account_ccy("EUR", Some(20_000.0), None)
+            .commission_per_lot_account_ccy("EUR", Some(20_000.0), None, None)
             .expect("commission");
         assert!((c - 4.0).abs() < 1e-9);
     }
@@ -1520,7 +1378,7 @@ mod tests {
         m.commission_type = Some(3);
         m.commission_rate_decimal = Some(0.02);
         let c = m
-            .commission_per_lot_account_ccy("USD", Some(20_000.0), Some(1.08))
+            .commission_per_lot_account_ccy("USD", Some(20_000.0), Some(1.08), None)
             .expect("commission");
         assert!((c - 4.32).abs() < 1e-6, "expected ~$4.32, got ${c}");
     }
@@ -1533,7 +1391,7 @@ mod tests {
         m.commission_type = Some(1);
         m.commission_rate_decimal = Some(45.0);
         assert!(
-            m.commission_per_lot_account_ccy("EUR", Some(1.10), Some(1.20))
+            m.commission_per_lot_account_ccy("EUR", Some(1.10), Some(1.20), None)
                 .is_none()
         );
     }
@@ -1547,7 +1405,7 @@ mod tests {
         m.commission_type = Some(3);
         m.commission_rate_decimal = Some(0.02);
         assert!(
-            m.commission_per_lot_account_ccy("USD", Some(20_000.0), None)
+            m.commission_per_lot_account_ccy("USD", Some(20_000.0), None, None)
                 .is_none()
         );
     }
@@ -1557,7 +1415,7 @@ mod tests {
         let m = baked_in_default("EURUSD").unwrap();
         // No commission_type set → must bail.
         assert!(
-            m.commission_per_lot_account_ccy("USD", Some(1.10), None)
+            m.commission_per_lot_account_ccy("USD", Some(1.10), None, None)
                 .is_none()
         );
     }
@@ -1565,7 +1423,7 @@ mod tests {
     // ─── F-300 D.2f: USD↔account-ccy extension ───────────────────────
 
     #[test]
-    fn account_commission_v2_eurusd_eur_account_with_usd_rate() {
+    fn account_commission_eurusd_eur_account_with_usd_rate() {
         // EURUSD type 1 ($45/M USD) on an EUR account.
         // Notional in USD at price 1.10 = 100_000 × 1.10 = $110_000.
         // Commission in USD per lot = 45 × 110_000 / 1_000_000 = $4.95.
@@ -1574,7 +1432,7 @@ mod tests {
         m.commission_type = Some(1);
         m.commission_rate_decimal = Some(45.0);
         let c = m
-            .commission_per_lot_account_ccy_v2(
+            .commission_per_lot_account_ccy(
                 "EUR",
                 Some(1.10),
                 None,       // quote (USD) → EUR not needed; quote IS USD
@@ -1585,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn account_commission_v2_usdjpy_eur_account_with_two_legs() {
+    fn account_commission_usdjpy_eur_account_with_two_legs() {
         // Type 1, $45/M USD on USDJPY (quote=JPY), EUR account.
         // notional USD = 100_000 × 1.0 (USDJPY base IS USD, formula
         // contract_size × price × quote_to_usd = 100k × 150 × 1/150 = 100k)
@@ -1601,7 +1459,7 @@ mod tests {
         m.commission_type = Some(1);
         m.commission_rate_decimal = Some(45.0);
         let c = m
-            .commission_per_lot_account_ccy_v2(
+            .commission_per_lot_account_ccy(
                 "EUR",
                 Some(150.0),
                 Some(0.00625), // JPY → EUR
@@ -1612,31 +1470,25 @@ mod tests {
     }
 
     #[test]
-    fn account_commission_v2_falls_back_to_none_without_usd_rate() {
+    fn account_commission_falls_back_to_none_without_usd_rate() {
         // Type 1 on non-USD account WITHOUT usd_to_account_rate must
         // still bail — F-300 is opt-in only when the operator supplies
         // the extra rate; not supplying it means no synthesised data.
         let mut m = baked_in_default("EURUSD").unwrap();
         m.commission_type = Some(1);
         m.commission_rate_decimal = Some(45.0);
-        let c = m.commission_per_lot_account_ccy_v2("EUR", Some(1.10), None, None);
+        let c = m.commission_per_lot_account_ccy("EUR", Some(1.10), None, None);
         assert!(c.is_none(), "must bail without USD→account rate");
     }
 
     #[test]
-    fn account_commission_v2_back_compat_with_v1_for_usd_account() {
-        // The old helper (no usd_to_account_rate) and the new one
-        // (None for usd_to_account_rate) must produce IDENTICAL
-        // results for the standard USD-account, USD-quoted case.
+    fn account_commission_usd_account_needs_no_usd_conversion_rate() {
         let mut m = baked_in_default("EURUSD").unwrap();
         m.commission_type = Some(1);
         m.commission_rate_decimal = Some(45.0);
-        let v1 = m
-            .commission_per_lot_account_ccy("USD", Some(1.10), None)
-            .expect("v1");
-        let v2 = m
-            .commission_per_lot_account_ccy_v2("USD", Some(1.10), None, None)
-            .expect("v2");
-        assert!((v1 - v2).abs() < 1e-9, "v1={v1} v2={v2}");
+        let commission = m
+            .commission_per_lot_account_ccy("USD", Some(1.10), None, None)
+            .expect("USD is the identity conversion");
+        assert!((commission - 4.95).abs() < 1e-9);
     }
 }

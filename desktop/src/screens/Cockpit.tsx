@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
-import KChart, { KLINE_INDICATORS } from "../components/KChart";
+import KChart from "../components/KChart";
+import { KLINE_DISPLAY_INDICATORS } from "../components/chartOptions";
 import PositionsTable from "../components/PositionsTable";
 import {
   serverSymbols,
   brokerTimeframes,
+  getWatchlist,
+  setWatchlist,
   placeOrder,
   closePosition,
   refreshAccount,
@@ -11,15 +14,34 @@ import {
   type BrokerSymbol,
   type ExecResult,
 } from "../api";
-import { useSpotStream, useAccountStream } from "../hooks";
+import { useSpotStream, useAccountStream, usePoll } from "../hooks";
 import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
+import { useBrokerUi } from "../brokerUiContext";
+import BrokerUnavailable from "../components/BrokerUnavailable";
 
 const fmt = (v: number | undefined, d = 2) =>
   v === undefined ? "—" : v.toLocaleString(undefined, { maximumFractionDigits: d });
 
 export default function Cockpit() {
-  const { ticks, connected } = useSpotStream();
-  const { snap } = useAccountStream();
+  const { access } = useBrokerUi();
+  if (!access.requestsEnabled) return (
+    <div className="screen">
+      <h1>Market &amp; positions</h1>
+      <BrokerUnavailable />
+      <p className="muted">Balance, equity and positions are unknown. Broker charts and streams are not requested until setup is available.</p>
+      <button type="button" disabled>Place order</button>
+    </div>
+  );
+  // Reset account/quote state when the selected account or environment changes.
+  return <ConfiguredCockpit key={access.key} />;
+}
+
+function ConfiguredCockpit() {
+  const { access } = useBrokerUi();
+  const { ticks, connected, error: quoteError } = useSpotStream();
+  const { snap, error: accountStreamError } = useAccountStream(access.scope);
+  const { error: accountRefreshError, reload: reloadAccount } = usePoll(refreshAccount, 5000);
+  const [metadataError, setMetadataError] = useState("");
   const [universe, setUniverse] = useState<BrokerSymbol[]>([]);
   const [symbol, setSymbol] = useState("EURUSD");
   const [tf, setTf] = useState("H1");
@@ -28,6 +50,11 @@ export default function Cockpit() {
   ]);
   const [indicator, setIndicator] = useState("");
   const [filter, setFilter] = useState("");
+  const [watchlist, setLocalWatchlist] = useState<Set<string>>(new Set());
+  const [watchlistLoaded, setWatchlistLoaded] = useState(false);
+  const [manageWatchlist, setManageWatchlist] = useState(false);
+  const [watchBusy, setWatchBusy] = useState(false);
+  const [watchMsg, setWatchMsg] = useState("");
 
   // order ticket
   const [side, setSide] = useState<"buy" | "sell">("buy");
@@ -42,39 +69,38 @@ export default function Cockpit() {
   const [editId, setEditId] = useState<number | null>(null);
   const [editSl, setEditSl] = useState<number | "">("");
   const [editTp, setEditTp] = useState<number | "">("");
-  const [editTrail, setEditTrail] = useState(false);
+  const [editTrail, setEditTrail] = useState<"unchanged" | "enable" | "disable">("unchanged");
+  const [protectionChanged, setProtectionChanged] = useState({ sl: false, tp: false });
   const positions = snap?.positions ?? [];
 
   useEffect(() => {
-    serverSymbols().then((u) => setUniverse(u.symbols)).catch(() => {});
-    brokerTimeframes().then((r) => r.timeframes.length && setTfs(r.timeframes)).catch(() => {});
-  }, []);
-
-  // The account stream only delivers snapshots when the server PUSHES one.
-  // Kick a refresh on mount + every 5s so balance/equity and the positions
-  // strip are live even if nothing else triggers a push (this was the old
-  // "No open positions" bug when landing directly on the cockpit).
-  useEffect(() => {
-    const kick = () => refreshAccount().catch(() => {});
-    kick();
-    const id = setInterval(kick, 5000);
-    return () => clearInterval(id);
+    serverSymbols().then((u) => setUniverse(u.symbols)).catch((error) => setMetadataError(`Broker symbol list unavailable: ${error}`));
+    brokerTimeframes().then((r) => r.timeframes.length && setTfs(r.timeframes)).catch((error) => setMetadataError(`Broker timeframe list unavailable: ${error}`));
+    getWatchlist()
+      .then((result) => {
+        const symbols: string[] = Array.isArray(result) ? result : (result?.symbols ?? []);
+        setLocalWatchlist(new Set(symbols.map((value) => value.toUpperCase())));
+      })
+      .catch((error) => setWatchMsg(`Could not load watchlist: ${error}`))
+      .finally(() => setWatchlistLoaded(true));
   }, []);
 
   const place = async () => {
+    if (busy || !snap || accountRefreshError || accountStreamError || !Number.isFinite(lots) || lots <= 0) return;
     setBusy(true); setMsg("");
     try {
       const r: ExecResult = await placeOrder(symbol, side, lots, sl === "" ? undefined : Number(sl), tp === "" ? undefined : Number(tp));
       setMsg(`${r.status}${r.positionId ? ` · #${r.positionId}` : ""}${r.message ? ` · ${r.message}` : ""}`);
-      refreshAccount().catch(() => {});
+      await reloadAccount();
     } catch (e) { setMsg(`Error: ${e}`); } finally { setBusy(false); }
   };
   const onClose = async (id: number, vol: number) => {
+    if (busy) return;
     setBusy(true);
     try {
-      await closePosition(id, Math.round(vol));
-      if (editId === id) setEditId(null);
-      refreshAccount().catch(() => {});
+      const response = await closePosition(id, Math.round(vol));
+      setMsg(`Close response: ${response.status}${response.message ? ` · ${response.message}` : ""}`);
+      await reloadAccount();
     }
     catch (e) { setMsg(`Close error: ${e}`); } finally { setBusy(false); }
   };
@@ -86,23 +112,23 @@ export default function Cockpit() {
     setEditId(positionId);
     setEditSl(p.stopLoss ?? "");
     setEditTp(p.takeProfit ?? "");
-    setEditTrail(false);
+    setEditTrail("unchanged");
+    setProtectionChanged({ sl: false, tp: false });
   };
 
   const saveProtection = async () => {
-    if (editId == null) return;
+    if (busy || editId == null) return;
     setBusy(true);
     setMsg("Updating SL/TP…");
     try {
-      const r: any = await amendProtection(
+      const r = await amendProtection(
         editId,
-        editSl === "" ? null : Number(editSl),
-        editTp === "" ? null : Number(editTp),
-        editTrail,
+        !protectionChanged.sl || editSl === "" ? null : Number(editSl),
+        !protectionChanged.tp || editTp === "" ? null : Number(editTp),
+        editTrail === "unchanged" ? undefined : editTrail === "enable",
       );
-      setMsg(`✓ Protection updated${r?.message ? ` · ${r.message}` : ""}`);
-      setEditId(null);
-      refreshAccount().catch(() => {});
+      setMsg(`Protection response: ${r.status}${r.message ? ` · ${r.message}` : ""}`);
+      await reloadAccount();
     } catch (e) {
       setMsg(`SL/TP update failed: ${e}`);
     } finally {
@@ -112,8 +138,34 @@ export default function Cockpit() {
 
   const editPos = editId != null ? positions.find((p) => p.positionId === editId) : undefined;
 
+  const toggleWatch = (name: string) => {
+    setLocalWatchlist((current) => {
+      const next = new Set(current);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
+  const saveWatchlist = async () => {
+    setWatchBusy(true);
+    setWatchMsg(`Updating ${watchlist.size} live subscriptions…`);
+    try {
+      await setWatchlist([...watchlist]);
+      setWatchMsg(`Live watchlist updated · ${watchlist.size} symbols subscribed.`);
+      setManageWatchlist(false);
+    } catch (error) {
+      setWatchMsg(`Watchlist update failed: ${error}`);
+    } finally {
+      setWatchBusy(false);
+    }
+  };
+
+  const visibleUniverse = manageWatchlist || !watchlistLoaded || watchlist.size === 0
+    ? universe
+    : universe.filter((entry) => watchlist.has(entry.symbolName) || entry.symbolName === symbol);
   const groups: Record<string, BrokerSymbol[]> = {};
-  for (const s of universe) {
+  for (const s of visibleUniverse) {
     if (filter && !s.symbolName.toUpperCase().includes(filter.toUpperCase())) continue;
     (groups[s.assetClass || "Other"] ??= []).push(s);
   }
@@ -122,10 +174,34 @@ export default function Cockpit() {
 
   return (
     <div className="cockpit">
+      {metadataError && <div className="banner warn" role="alert">{metadataError}</div>}
+      {quoteError && <div className="banner warn" role="alert">{quoteError}</div>}
+      {(accountRefreshError || accountStreamError) && <div className="banner warn" role="alert">
+        <div className="section-heading-row"><span>Account values and open positions are not confirmed current. Orders remain blocked while account validation fails.</span><button onClick={() => void reloadAccount()}>Refresh account</button></div>
+        <details><summary>Account refresh error details</summary><div className="break-anywhere small">{accountRefreshError || accountStreamError}</div></details>
+      </div>}
       <div className="ck-grid">
         {/* Market Watch */}
         <div className="ck-watch">
+          <div className="ck-watch-head">
+            <span className="ck-label">Watchlist · {watchlist.size}</span>
+            <button
+              type="button"
+              className="link"
+              onClick={() => setManageWatchlist((current) => !current)}
+            >
+              {manageWatchlist ? "Done" : "Manage"}
+            </button>
+          </div>
           <input className="ck-filter" placeholder="filter…" value={filter} onChange={(e) => setFilter(e.target.value)} />
+          {manageWatchlist && (
+            <div className="ck-watch-actions">
+              <button type="button" className="primary" disabled={watchBusy} onClick={saveWatchlist}>Save</button>
+              <button type="button" disabled={watchBusy} onClick={() => setLocalWatchlist(new Set(universe.map((entry) => entry.symbolName)))}>All</button>
+              <button type="button" disabled={watchBusy} onClick={() => setLocalWatchlist(new Set())}>Clear</button>
+            </div>
+          )}
+          {watchMsg && <div className="ck-msg" role="status">{watchMsg}</div>}
           <div className="ck-watch-list">
             {Object.keys(groups).sort().map((cls) => (
               <div key={cls}>
@@ -133,10 +209,20 @@ export default function Cockpit() {
                 {groups[cls].map((s) => {
                   const t = ticks[s.symbolName];
                   return (
-                    <button key={s.symbolId} className={`ck-sym${symbol === s.symbolName ? " on" : ""}`} onClick={() => setSymbol(s.symbolName)}>
-                      <span>{s.symbolName}</span>
-                      <span className="mono">{t ? t.midPrice?.toFixed(5) : "—"}</span>
-                    </button>
+                    <div key={s.symbolId} className={`ck-sym-row${symbol === s.symbolName ? " on" : ""}`}>
+                      {manageWatchlist && (
+                        <input
+                          type="checkbox"
+                          checked={watchlist.has(s.symbolName)}
+                          aria-label={`Subscribe ${s.symbolName}`}
+                          onChange={() => toggleWatch(s.symbolName)}
+                        />
+                      )}
+                      <button type="button" className="ck-sym" onClick={() => setSymbol(s.symbolName)}>
+                        <span>{s.symbolName}</span>
+                        <span className="mono">{t?.midPrice?.toFixed(5) ?? "—"}</span>
+                      </button>
+                    </div>
                   );
                 })}
               </div>
@@ -153,10 +239,34 @@ export default function Cockpit() {
             </select>
             <select value={indicator} onChange={(e) => setIndicator(e.target.value)}>
               <option value="">indicator</option>
-              {KLINE_INDICATORS.map((n) => <option key={n.v} value={n.v}>{n.l}</option>)}
+              {KLINE_DISPLAY_INDICATORS.map((indicatorOption) => (
+                <option key={indicatorOption.value} value={indicatorOption.value}>
+                  {indicatorOption.label}
+                </option>
+              ))}
             </select>
             <span className="spacer" />
-            <span className={`stream-pill ${connected ? "on" : ""}`}>{connected ? "● live" : "○"}</span>
+            {watchlistLoaded && !watchlist.has(symbol) && (
+              <button
+                type="button"
+                className="link"
+                disabled={watchBusy}
+                onClick={() => {
+                  const next = new Set(watchlist);
+                  next.add(symbol);
+                  setLocalWatchlist(next);
+                  setWatchBusy(true);
+                  setWatchMsg(`Subscribing ${symbol}…`);
+                  setWatchlist([...next])
+                    .then(() => setWatchMsg(`${symbol} added to the live watchlist.`))
+                    .catch((error) => setWatchMsg(`Subscribe failed: ${error}`))
+                    .finally(() => setWatchBusy(false));
+                }}
+              >
+                Add live stream
+              </button>
+            )}
+            <span className={`stream-pill ${connected ? "on" : ""}`} title="This is the UI event-stream connection, not a broker-freshness guarantee.">{connected ? "● UI update stream connected" : "○ UI update stream disconnected"}</span>
           </div>
           <div className="ck-chart-host">
             {!symbol || !tf
@@ -178,13 +288,14 @@ export default function Cockpit() {
             <label className="ck-field">Lots<input type="number" min="0.01" step="0.01" value={lots} onChange={(e) => setLots(Math.max(0, Number(e.target.value)))} /></label>
             <label className="ck-field">SL pips<input type="number" min="0" value={sl} onChange={(e) => setSl(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} /></label>
             <label className="ck-field">TP pips<input type="number" min="0" value={tp} onChange={(e) => setTp(e.target.value === "" ? "" : Math.max(0, Number(e.target.value)))} /></label>
-            <button className="primary" style={{ width: "100%", marginTop: 6 }} disabled={busy} onClick={place}>
+            <button className="primary" style={{ width: "100%", marginTop: 6 }} disabled={busy || !snap || !!accountRefreshError || !!accountStreamError || !Number.isFinite(lots) || lots <= 0} onClick={place}>
               {busy ? "…" : `${side.toUpperCase()} ${symbol} ${lots}`}
             </button>
             {msg && <div className="ck-msg">{msg}</div>}
           </div>
           <div className="ck-account">
             <div className="ck-label">Account</div>
+            <p className="muted small">{snap ? `Snapshot: ${new Date(snap.fetchedAtUnixMs).toLocaleString()}` : "No account snapshot received."}</p>
             <div className="ck-kv"><span>Balance</span><b className="mono">{fmt(snap?.balance)} {cur}</b></div>
             <div className="ck-kv"><span>Equity</span><b className="mono">{fmt(snap?.equity)} {cur}</b></div>
             <div className="ck-kv"><span>Used margin</span><b className="mono">{fmt(snap?.usedMargin)} {cur}</b></div>
@@ -207,17 +318,21 @@ export default function Cockpit() {
                   XTIUSD / XBRUSD / NAT.GAS are in the operator's watchlist.
                   Clamping these at zero would block a valid stop in exactly the
                   market where a stop matters most. */}
-              <label>SL price<input type="number" step="0.00001" value={editSl} onChange={(e) => setEditSl(e.target.value === "" ? "" : Number(e.target.value))} /></label>
-              <label>TP price<input type="number" step="0.00001" value={editTp} onChange={(e) => setEditTp(e.target.value === "" ? "" : Number(e.target.value))} /></label>
-              <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                <input type="checkbox" checked={editTrail} onChange={(e) => setEditTrail(e.target.checked)} /> Trailing
+              <label>SL price<input type="number" step="0.00001" value={editSl} onChange={(e) => { setEditSl(e.target.value === "" ? "" : Number(e.target.value)); setProtectionChanged((current) => ({ ...current, sl: true })); }} /></label>
+              <label>TP price<input type="number" step="0.00001" value={editTp} onChange={(e) => { setEditTp(e.target.value === "" ? "" : Number(e.target.value)); setProtectionChanged((current) => ({ ...current, tp: true })); }} /></label>
+              <label>Broker trailing
+                <select value={editTrail} onChange={(e) => setEditTrail(e.target.value as typeof editTrail)}>
+                  <option value="unchanged">Leave unchanged</option><option value="enable">Enable</option><option value="disable">Disable</option>
+                </select>
               </label>
-              <button className="primary" disabled={busy} onClick={saveProtection}>Update SL/TP</button>
+              <button className="primary" disabled={busy || (!protectionChanged.sl && !protectionChanged.tp)} onClick={saveProtection}>Update SL/TP</button>
               <button disabled={busy} onClick={() => setEditId(null)}>Cancel</button>
             </div>
+            <p className="muted small">Only edited prices are sent. Blank means leave unchanged, not remove protection. To change broker trailing, explicitly edit the SL price as well.</p>
           </div>
         )}
-        <PositionsTable live={positions} currency={cur} onClose={onClose} onEdit={onEdit} busy={busy} />
+        {snap ? <PositionsTable live={positions} currency={cur} onClose={onClose} onEdit={onEdit} busy={busy} />
+          : <p className="banner warn">Open positions are unknown until an account snapshot is received.</p>}
       </div>
     </div>
   );

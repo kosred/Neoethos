@@ -25,7 +25,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Named prop-firm preset. Drives the default values in `RiskConfig`,
-/// `PropFirmRules`, and the discovery-side challenge gate. The runtime
+/// the live `RiskManager`, and the discovery-side challenge gate. The runtime
 /// itself is firm-agnostic — it just reads numeric thresholds from
 /// whichever preset is active.
 ///
@@ -110,20 +110,20 @@ pub struct PropFirmConstraints {
     /// directive 2026-05-14). Live strategies that drop below this
     /// monthly should be flagged for review.
     pub min_monthly_net_profit_pct: f32,
-    /// Minimum trading days per challenge cycle (FTMO: 4 trading days
-    /// for the Aggressive variant, 10 for Standard).
+    /// Minimum trading days per challenge cycle (FTMO 2-Step: 4).
     pub min_trading_days: u32,
 }
 
 impl PropFirmConstraints {
-    /// Canonical FTMO Trader Challenge values plus operator's 4%
-    /// monthly profit floor.
+    /// Current FTMO 2-Step values plus the operator's 4% monthly profit
+    /// floor. The FTMO 1-Step product has different daily/trailing rules and
+    /// must not be represented by this preset.
     pub const FTMO_STANDARD: Self = Self {
         max_daily_loss_pct: 0.05,
         max_overall_drawdown_pct: 0.10,
         challenge_profit_target_pct: 0.10,
         min_monthly_net_profit_pct: 0.04, // operator directive
-        min_trading_days: 10,
+        min_trading_days: 4,
     };
 
     /// MyForexFunds Rapid / Evaluation defaults (approximate).
@@ -263,7 +263,7 @@ pub struct PropFirmChallengeDefaults {
 impl PropFirmChallengeDefaults {
     pub const FTMO_STANDARD: Self = Self {
         daily_target_trading_days: 20,
-        relaxed_min_trading_days: 5,
+        relaxed_min_trading_days: 4,
         target_trading_days: 22,
         max_trading_days: 60,
     };
@@ -555,7 +555,7 @@ mod tests {
         let challenge = PropFirmChallengeDefaults::FTMO_STANDARD;
         let runtime = PropFirmRuntimeDefaults::FTMO_STANDARD;
 
-        assert!(challenge.relaxed_min_trading_days < constraints.min_trading_days);
+        assert!(challenge.relaxed_min_trading_days <= constraints.min_trading_days);
         assert!(challenge.max_trading_days > constraints.min_trading_days);
         assert!(challenge.daily_target_trading_days <= challenge.target_trading_days);
         assert!(runtime.daily_dd_warning_pct < runtime.daily_dd_stop_trading_pct);

@@ -1,16 +1,18 @@
 import { hardwareInfo } from "../api";
 import { usePoll } from "../hooks";
 
-const gb = (mb: number) => `${(mb / 1024).toFixed(1)} GB`;
+// The backend's legacy *Mb fields contain MiB (bytes / 1024²).
+const gib = (mib: number) => `${(mib / 1024).toFixed(1)} GiB`;
 
 export default function Hardware() {
-  const { data, error } = usePoll(hardwareInfo, 3000);
+  const { data, error, loading, reload } = usePoll(hardwareInfo, 3000);
 
   return (
     <div className="screen">
       <h1>Hardware</h1>
       <p className="sub">Compute resources available to discovery &amp; training</p>
-      {error && <div className="banner warn">{error}</div>}
+      {loading && !data && <p className="muted" role="status">Detecting hardware…</p>}
+      {error && <div className="banner warn" role="alert">Hardware could not refresh. Retained readings may be stale. {error} <button onClick={() => void reload()}>Retry</button></div>}
       {data && (
         <>
           <h2>CPU</h2>
@@ -21,9 +23,9 @@ export default function Hardware() {
           </div>
           <h2>Memory</h2>
           <div className="settings-grid">
-            <div className="kv"><span>Total</span><b>{gb(data.ram.totalMb)}</b></div>
-            <div className="kv"><span>Used</span><b>{gb(data.ram.usedMb)}</b></div>
-            <div className="kv"><span>Available</span><b>{gb(data.ram.availableMb)}</b></div>
+            <div className="kv"><span>Total</span><b>{gib(data.ram.totalMb)}</b></div>
+            <div className="kv"><span>Used</span><b>{gib(data.ram.usedMb)}</b></div>
+            <div className="kv"><span>Available</span><b>{gib(data.ram.availableMb)}</b></div>
           </div>
           <h2>GPU</h2>
           <div className="settings-grid">
@@ -47,13 +49,15 @@ export default function Hardware() {
           {data.gpuSupport?.compiled && !data.gpu.available && (
             <div className="banner warn">
               This build has the <b>{data.gpuSupport.backend.toUpperCase()}</b> lane compiled in,
-              but no usable card was detected — work runs on the CPU.
+              but no usable card was detected. A selected GPU run must fail closed;
+              CPU research is a separate explicit execution choice.
             </div>
           )}
           {data.gpuSupport?.compiled && data.gpu.available && (
             <div className="banner info">
-              ✓ GPU lane <b>{data.gpuSupport.backend.toUpperCase()}</b> compiled in and a card is
-              present — discovery and training can use it.
+              GPU lane <b>{data.gpuSupport.backend.toUpperCase()}</b> is compiled in and a card is
+              present. This is hardware detection, not proof that Discovery or training ran on the GPU.
+              Device execution, memory admission and numerical validation still have to pass.
             </div>
           )}
         </>

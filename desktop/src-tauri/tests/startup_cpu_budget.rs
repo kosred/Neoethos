@@ -33,6 +33,14 @@ fn desktop_installs_and_retains_custom_runtime_before_tauri_builder() {
     let runtime = prepare
         .find("DesktopRuntimeGuard::build")
         .expect("desktop builds its retained Tokio runtime");
+    let logging = prepare
+        .find("neoethos_core::logging::setup_logging(false)")
+        .expect("desktop installs the shared release and debug logger");
+    assert!(config < logging && logging < runtime);
+    assert!(
+        !source.contains("tauri_plugin_log::Builder"),
+        "a second process-global logger would conflict with the shared tracing bridge"
+    );
     let tauri_runtime = prepare
         .find("install_for_tauri")
         .expect("desktop installs the managed runtime for Tauri");
@@ -58,6 +66,8 @@ fn desktop_first_run_seeds_exact_embedded_files_before_managed_tauri_runtime() {
     let data_root = unique_temp_root("seed");
     let output = Command::new(env!("CARGO_BIN_EXE_neoethos-desktop"))
         .env("NEOETHOS_USER_DATA_DIR", &data_root)
+        .env("LOG_DIR", data_root.join("logs"))
+        .env_remove("RUST_LOG")
         .args(["--cpu-threads", "3", "--startup-diagnostics"])
         .output()
         .expect("run desktop startup diagnostic");
@@ -75,6 +85,14 @@ fn desktop_first_run_seeds_exact_embedded_files_before_managed_tauri_runtime() {
         expected_capped_workers(3)
     )));
     assert!(stderr.contains("tauri_async_runtime_installed"));
+    let log_files = std::fs::read_dir(data_root.join("logs"))
+        .expect("desktop startup must create its runtime log directory")
+        .map(|entry| entry.expect("runtime log entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(log_files.len(), 1);
+    let runtime_log = std::fs::read_to_string(&log_files[0]).expect("read full runtime log");
+    assert!(runtime_log.contains("Logging initialized (verbose=false)"));
+    assert!(runtime_log.contains("> [SYSTEM] SUCCESS setup_logging"));
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert_eq!(
@@ -94,6 +112,8 @@ fn desktop_rejects_malformed_parent_cap_before_runtime_installation() {
     let data_root = unique_temp_root("invalid-cap");
     let output = Command::new(env!("CARGO_BIN_EXE_neoethos-desktop"))
         .env("NEOETHOS_USER_DATA_DIR", &data_root)
+        .env("LOG_DIR", data_root.join("logs"))
+        .env_remove("RUST_LOG")
         .args(["--cpu-threads", "invalid", "--startup-diagnostics"])
         .output()
         .expect("run invalid desktop startup diagnostic");

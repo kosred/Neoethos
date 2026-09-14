@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "predev:tauri": "cargo build --manifest-path ../mcp/Cargo.toml --bin neoethos-mcp",
+    "dev:tauri": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",

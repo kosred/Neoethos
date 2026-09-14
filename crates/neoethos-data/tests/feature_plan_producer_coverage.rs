@@ -4,8 +4,8 @@ use neoethos_data::core::dataset_manifest::{
     DatasetTimestampRange, ProducerProvenanceEnvelopeV1, PublishRequest, publish_vortex_generation,
 };
 use neoethos_data::core::feature_registry::{
-    FeatureSource, PRODUCTION_FEATURE_PRODUCER_ORDER, ProductionFeatureProducerId,
-    feature_column_metadata, production_feature_producer_manifest_v1,
+    CLASSIC_VECTOR_TA_SEMANTIC_VERSION_V9, FeatureSource, PRODUCTION_FEATURE_PRODUCER_ORDER,
+    ProductionFeatureProducerId, feature_column_metadata, production_feature_producer_manifest_v1,
 };
 use neoethos_data::{
     BarTimestampConvention, CanonicalDatasetIdentity, CanonicalTimeframe, FeatureProfile, Ohlcv,
@@ -123,7 +123,10 @@ fn every_production_family_is_visible_through_column_metadata() {
         ("rsi", FeatureSource::ClassicTechnicalAnalysis),
         ("quant_log_return", FeatureSource::Quantitative),
         ("session_london_open_dist", FeatureSource::Session),
-        ("regime_vol_state", FeatureSource::Regime),
+        (
+            "neoethos_custom_gk_vol_ratio_state_10_50_v3",
+            FeatureSource::Regime,
+        ),
         ("fp_effort_result_div", FeatureSource::Footprint),
     ];
 
@@ -259,7 +262,7 @@ fn classic_vector_ta_validity_contract_has_its_own_semantic_version() {
         .expect("classic/vector-ta manifest row");
     assert_eq!(
         row.semantic_version(),
-        7,
-        "Evasive Supertrend's canonical four-output base and atr_length sweeps replace the old anonymous band-only receipt; existing classic feature artifacts must fail closed and be regenerated under a new content-addressed identity"
+        CLASSIC_VECTOR_TA_SEMANTIC_VERSION_V9,
+        "the production manifest must expose the current composite Classic-TA semantic authority"
     );
 }

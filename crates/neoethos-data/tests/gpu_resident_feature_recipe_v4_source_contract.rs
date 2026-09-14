@@ -401,7 +401,11 @@ fn mutation_audit_rejects_clone_derive_and_any_public_resolved_field() {
 #[test]
 fn column_schema_seal_does_not_create_runtime_or_plan_authority() {
     let source = read_or_empty("src/core/gpu_resident_feature_recipe_v4.rs");
-    assert!(source.contains("pub(crate) struct SealedResidentColumnSchemaV4"));
+    let column_seal = section(
+        &source,
+        "pub(crate) struct SealedResidentColumnSchemaV4",
+        "/// Complete pre-device recipe",
+    );
     for forbidden in [
         "GpuOnlyResidentAdmissionV3",
         "FeaturePlanV1",
@@ -412,7 +416,7 @@ fn column_schema_seal_does_not_create_runtime_or_plan_authority() {
         "source_provenance",
     ] {
         assert!(
-            !source.contains(forbidden),
+            !column_seal.contains(forbidden),
             "column-only seal overclaimed authority through {forbidden:?}"
         );
     }

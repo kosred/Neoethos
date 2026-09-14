@@ -90,11 +90,61 @@ fn reconcile_response_parses_positions_and_pending_orders() {
     assert_eq!(reconcile.positions[0].position_id, 9001);
     assert_eq!(reconcile.positions[0].trade_side, "BUY");
     assert_eq!(reconcile.positions[0].symbol_id, 14);
+    assert_eq!(reconcile.positions[0].volume_raw_centi_units, 2500);
     assert!((reconcile.positions[0].volume - 25.0).abs() < 1e-9);
     assert_eq!(reconcile.pending_orders[0].order_id, 8001);
     assert_eq!(reconcile.pending_orders[0].trade_side, "SELL");
     assert_eq!(reconcile.pending_orders[0].order_type, "LIMIT");
     assert!((reconcile.pending_orders[0].limit_price.unwrap_or_default() - 1.099).abs() < 1e-9);
+}
+
+#[test]
+fn reconcile_response_preserves_exact_positive_position_wire_volume() {
+    // The odd value above 2^53 cannot survive a round-trip through display f64.
+    for wire_volume in [1_i64, 2501, 9_007_199_254_740_993, i64::MAX] {
+        let response = serde_json::json!({
+            "payloadType": 2125,
+            "payload": {
+                "ctidTraderAccountId": 712345,
+                "position": [{
+                    "positionId": 9001,
+                    "tradeData": {
+                        "symbolId": 14,
+                        "volume": wire_volume,
+                        "tradeSide": 1
+                    }
+                }]
+            }
+        });
+        let reconcile = parse_reconcile_response(&response.to_string()).expect("positive volume");
+        let position = &reconcile.positions[0];
+        assert_eq!(position.volume_raw_centi_units, wire_volume);
+        assert_eq!(position.volume, wire_volume as f64 / 100.0);
+    }
+}
+
+#[test]
+fn reconcile_response_rejects_non_positive_position_wire_volume() {
+    for wire_volume in [0_i64, -1, i64::MIN] {
+        let response = serde_json::json!({
+            "payloadType": 2125,
+            "payload": {
+                "ctidTraderAccountId": 712345,
+                "position": [{
+                    "positionId": 9001,
+                    "tradeData": {
+                        "symbolId": 14,
+                        "volume": wire_volume,
+                        "tradeSide": 1
+                    }
+                }]
+            }
+        });
+        let error = parse_reconcile_response(&response.to_string())
+            .expect_err("an open position must have positive remaining wire volume");
+        assert!(error.to_string().contains("position 9001"));
+        assert!(error.to_string().contains("non-positive centi-unit volume"));
+    }
 }
 
 #[test]
@@ -204,6 +254,24 @@ fn deal_list_response_parses_recent_deals() {
         deals[0].pnl_conversion_fee_state,
         Some(crate::app_services::broker_deal_economics::BrokerPnlConversionFeeV1::NotApplied)
     );
+}
+
+#[test]
+fn deal_list_bundle_preserves_broker_pagination_evidence() {
+    let response = serde_json::json!({
+        "payloadType": 2134,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "deal": [],
+            "hasMore": true
+        }
+    });
+
+    let bundle = parse_deal_list_bundle_response(&response.to_string()).expect("deal-list bundle");
+
+    assert_eq!(bundle.account_id, 712345);
+    assert!(bundle.deals.is_empty());
+    assert!(bundle.has_more, "hasMore must never be discarded");
 }
 
 #[test]
@@ -532,6 +600,7 @@ fn unrealized_pnl_rows_must_match_open_broker_positions_exactly_once() {
             position_id: 9001,
             symbol_id: 14,
             trade_side: "BUY".to_string(),
+            volume_raw_centi_units: 100_000,
             volume: 1_000.0,
             open_timestamp_ms: None,
             price: Some(1.1),
@@ -571,26 +640,6 @@ fn unrealized_pnl_rows_must_match_open_broker_positions_exactly_once() {
         ],
     };
     assert!(reconcile_broker_unrealized_pnl(&reconcile, &duplicated).is_err());
-}
-
-#[test]
-fn stub_runtime_backend_records_request_and_surfaces_failure() {
-    let backend = StubCTraderAccountRuntimeBackend::failure("runtime probe failed");
-    let request = CTraderAccountRuntimeRequest {
-        client_id: "client".to_string(),
-        client_secret: "secret".to_string(),
-        access_token: "access".to_string(),
-        environment: CTraderEnvironment::Demo,
-        account_id: "712345".to_string(),
-        return_protection_orders: true,
-    };
-
-    let error = backend
-        .load_account_runtime(&request)
-        .expect_err("stub backend should fail");
-
-    assert!(error.to_string().contains("runtime probe failed"));
-    assert_eq!(backend.last_request(), Some(request));
 }
 
 struct StubTransport {
@@ -645,8 +694,15 @@ fn parses_order_list_response() {
     assert_eq!(o.order_status, "FILLED");
     assert_eq!(o.order_type, "LIMIT");
     assert_eq!(o.time_in_force.as_deref(), Some("GOOD_TILL_CANCEL"));
-    assert_eq!(o.volume_lots, 10.0); // 1000 cents / 100
-    assert_eq!(o.executed_volume_lots, Some(10.0));
+    let wire = serde_json::to_value(o).expect("history API row");
+    assert_eq!(
+        wire["volumeLots"],
+        serde_json::Value::Null,
+        "a raw order has no broker lotSize; base units must not be labelled as lots"
+    );
+    assert_eq!(wire["executedVolumeLots"], serde_json::Value::Null);
+    assert_eq!(wire["volumeUnits"], 10.0); // 1000 centi-units / 100
+    assert_eq!(wire["executedVolumeUnits"], 10.0);
     assert_eq!(o.close_timestamp_ms, Some(1700000001000));
     assert!(!o.is_stop_out);
 }
@@ -690,7 +746,13 @@ fn parses_expected_margin() {
       "margin":[{"volume":10000000,"buyMargin":33333,"sellMargin":33333}]}}"#;
     let b = parse_expected_margin_response(json).unwrap();
     let e = &b.entries[0];
-    assert_eq!(e.volume_lots, 100000.0); // 10_000_000 cents / 100
+    let wire = serde_json::to_value(e).expect("margin API row");
+    assert_eq!(
+        wire["volumeLots"],
+        serde_json::Value::Null,
+        "moneyDigits cannot provide the missing broker lotSize"
+    );
+    assert_eq!(wire["volumeUnits"], 100000.0); // 10_000_000 centi-units / 100
     assert!((e.buy_margin - 333.33).abs() < 1e-6); // / 10^2
     assert!((e.sell_margin - 333.33).abs() < 1e-6);
 }
@@ -705,4 +767,208 @@ fn parses_ctid_profile_only_user_id() {
 fn parses_version() {
     let json = r#"{"payloadType":2105,"payload":{"version":"4.2.1"}}"#;
     assert_eq!(parse_version_response(json).unwrap().version, "4.2.1");
+}
+
+fn empty_runtime_responses(account: i64) -> Vec<serde_json::Value> {
+    let rows = [
+        ("app-auth-1", 2101, serde_json::json!({})),
+        (
+            "account-auth-1",
+            2103,
+            serde_json::json!({"ctidTraderAccountId": account}),
+        ),
+        (
+            "trader-1",
+            2122,
+            serde_json::json!({"ctidTraderAccountId": account,
+            "trader": {"balance": 100000, "moneyDigits": 2, "depositAssetId": 8}}),
+        ),
+        (
+            "reconcile-1",
+            2125,
+            serde_json::json!({"ctidTraderAccountId": account,
+            "position": [], "order": []}),
+        ),
+        (
+            "deals-1",
+            2134,
+            serde_json::json!({"ctidTraderAccountId": account,
+            "deal": [], "hasMore": false}),
+        ),
+        (
+            "unrealized-pnl-1",
+            2188,
+            serde_json::json!({"ctidTraderAccountId": account,
+            "moneyDigits": 2, "positionUnrealizedPnL": []}),
+        ),
+        (
+            "asset-list-1",
+            2113,
+            serde_json::json!({"ctidTraderAccountId": account,
+            "asset": [{"assetId": 8, "name": "USD", "digits": 2}]}),
+        ),
+    ];
+    rows.into_iter()
+        .map(|(id, kind, payload)| {
+            serde_json::json!({
+                "clientMsgId": id, "payloadType": kind, "payload": payload
+            })
+        })
+        .collect()
+}
+
+fn empty_runtime_request(environment: CTraderEnvironment) -> CTraderAccountRuntimeRequest {
+    CTraderAccountRuntimeRequest {
+        client_id: "fixture-client".to_owned(),
+        client_secret: "fixture-secret".to_owned(),
+        access_token: "fixture-access".to_owned(),
+        environment,
+        account_id: "712345".to_owned(),
+        return_protection_orders: true,
+    }
+}
+
+fn runtime_transport(rows: Vec<serde_json::Value>) -> StubTransport {
+    StubTransport::with_responses(rows.into_iter().map(|row| Ok(row.to_string())).collect())
+}
+
+#[test]
+fn runtime_accepts_matching_empty_account_snapshots_in_both_environments() {
+    for environment in [CTraderEnvironment::Demo, CTraderEnvironment::Live] {
+        let transport = runtime_transport(empty_runtime_responses(712345));
+        let snapshot =
+            load_account_runtime_with_transport(&transport, &empty_runtime_request(environment))
+                .unwrap();
+        assert_eq!(snapshot.environment, environment);
+        assert_eq!(snapshot.trader.account_id, 712345);
+        assert_eq!(snapshot.trader.balance, 1000.0);
+        assert_eq!(snapshot.deposit_asset_name, "USD");
+        assert_eq!(snapshot.unrealized_pnl, 0.0);
+        assert!(snapshot.reconcile.positions.is_empty());
+        assert!(snapshot.recent_deals.is_empty());
+        assert_eq!(transport.sent_len(), 7);
+    }
+}
+
+#[test]
+fn runtime_rejects_each_foreign_account_envelope_even_when_rows_are_empty() {
+    for environment in [CTraderEnvironment::Demo, CTraderEnvironment::Live] {
+        for index in 1..7 {
+            let mut rows = empty_runtime_responses(712345);
+            rows[index]["payload"]["ctidTraderAccountId"] = serde_json::json!(99);
+            let transport = runtime_transport(rows);
+            let error = load_account_runtime_with_transport(
+                &transport,
+                &empty_runtime_request(environment),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("response identity differs"),
+                "response {index}: {error:#}"
+            );
+            assert_eq!(transport.sent_len(), 7);
+        }
+    }
+}
+
+#[test]
+fn runtime_rejects_missing_or_malformed_account_identity_before_row_parsing() {
+    for index in 1..7 {
+        for identity in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("712345")),
+            Some(serde_json::json!(712345.5)),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!(u64::MAX)),
+            Some(serde_json::json!(0)),
+            Some(serde_json::json!(-1)),
+        ] {
+            let mut rows = empty_runtime_responses(712345);
+            let payload = rows[index]["payload"].as_object_mut().unwrap();
+            match identity {
+                Some(value) => {
+                    payload.insert("ctidTraderAccountId".to_owned(), value);
+                }
+                None => {
+                    payload.remove("ctidTraderAccountId");
+                }
+            }
+            let error = load_account_runtime_with_transport(
+                &runtime_transport(rows),
+                &empty_runtime_request(CTraderEnvironment::Demo),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("response identity differs"),
+                "response {index}: {error:#}"
+            );
+        }
+    }
+    for (index, field) in [(4, "deal"), (6, "asset")] {
+        let mut rows = empty_runtime_responses(712345);
+        rows[index]["payload"]["ctidTraderAccountId"] = serde_json::json!(99);
+        rows[index]["payload"][field] = serde_json::json!("malformed rows");
+        let error = load_account_runtime_with_transport(
+            &runtime_transport(rows),
+            &empty_runtime_request(CTraderEnvironment::Demo),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("response identity differs"));
+    }
+}
+
+#[test]
+fn runtime_rejects_invalid_requested_account_before_transport() {
+    for account in ["", "not-an-id", "9223372036854775808", "0", "-1"] {
+        let mut request = empty_runtime_request(CTraderEnvironment::Demo);
+        request.account_id = account.to_owned();
+        let transport = StubTransport::with_responses(Vec::new());
+        let error = load_account_runtime_with_transport(&transport, &request).unwrap_err();
+        assert!(format!("{error:#}").contains("cTrader account id"));
+        assert_eq!(transport.sent_len(), 0);
+    }
+}
+
+#[test]
+fn runtime_preserves_broker_error_and_payload_type_diagnostics_before_identity() {
+    for index in [4, 6] {
+        for (code, attempts) in [("ACCESS_DENIED", 3_usize), ("BLOCKED_PAYLOAD_TYPE", 1)] {
+            let mut rows = empty_runtime_responses(712345);
+            rows[index]["payloadType"] = serde_json::json!(CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE);
+            rows[index]["payload"] = serde_json::json!({"errorCode": code,
+                "description": "fixture broker refusal"});
+            if code == "BLOCKED_PAYLOAD_TYPE" {
+                rows[index]["payload"]["retryAfter"] = serde_json::json!(120);
+            }
+            // The existing resilient transport repeats the complete sequence
+            // three times except for the broker's explicit rate-limit refusal.
+            // Supply each attempted response; never mask an exhausted fixture
+            // by changing the production retry or account-identity policy.
+            let responses = (0..attempts).flat_map(|_| rows.iter().cloned()).collect();
+            let transport = runtime_transport(responses);
+            let error = load_account_runtime_with_transport(
+                &transport,
+                &empty_runtime_request(CTraderEnvironment::Demo),
+            )
+            .unwrap_err();
+            let detail = format!("{error:#}");
+            assert!(detail.contains(code), "{detail}");
+            assert!(detail.contains("fixture broker refusal"), "{detail}");
+            assert_eq!(transport.sent_len(), 7 * attempts);
+            if code == "BLOCKED_PAYLOAD_TYPE" {
+                assert!(detail.contains("retryAfter=120s"), "{detail}");
+            }
+        }
+        let mut rows = empty_runtime_responses(712345);
+        rows[index]["payloadType"] = serde_json::json!(CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE);
+        let transport = runtime_transport(rows);
+        let error = load_account_runtime_with_transport(
+            &transport,
+            &empty_runtime_request(CTraderEnvironment::Demo),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unexpected cTrader payload type"));
+        assert_eq!(transport.sent_len(), 7);
+    }
 }

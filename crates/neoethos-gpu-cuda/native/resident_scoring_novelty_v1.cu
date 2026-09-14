@@ -1,9 +1,12 @@
 #include "resident_scoring_novelty_v1_abi.cuh"
+#include "resident_backend_identity_v3.cuh"
 #include "resident_archive_knn_v2_abi.cuh"
+#include "resident_archive_layout_v3.hpp"
+#include "resident_backend_math_v3.cuh"
 #include "resident_scoring_novelty_v2_internal.cuh"
 #include "resident_search_generation_v2_abi.cuh"
 
-#include <cub/cub.cuh>
+#include "resident_parallel_primitives_v1.cuh"
 #include <cuda_runtime.h>
 
 #include <cfloat>
@@ -13,6 +16,8 @@
 #include <cstring>
 #include <limits>
 #include <new>
+
+namespace backend_identity_v3 = ::neoethos::resident_backend_identity_v3;
 
 namespace neoethos::resident_scoring_novelty_v1 {
 namespace {
@@ -127,7 +132,7 @@ bool checked_feature_word_count_v1(std::uint64_t feature_count,
 bool validate_import_v1(const NeoResidentScoringNoveltyPopulationImportV1* import) {
   return import != nullptr &&
          import->abi_version == NEO_RESIDENT_SCORING_NOVELTY_ABI_V1 &&
-         import->selected_cuda_ordinal != std::numeric_limits<std::uint32_t>::max() &&
+         backend_identity_v3::selected_device_ordinal(*import) != std::numeric_limits<std::uint32_t>::max() &&
          import->admitted_run_stream != nullptr && import->metrics_ready_event != nullptr &&
          import->scoring_novelty_ready_event != nullptr &&
          import->metrics_ready_event != import->scoring_novelty_ready_event &&
@@ -138,14 +143,14 @@ bool validate_import_v1(const NeoResidentScoringNoveltyPopulationImportV1* impor
          import->max_terms_per_gene != 0 &&
          import->max_terms_per_gene <= import->feature_count &&
          import->full_discovery_reserve_bytes != 0 &&
-         all_identity_bytes_present_v1(import->cuda_device_identity_sha256) &&
-         all_identity_bytes_present_v1(import->primary_context_identity_sha256) &&
+         all_identity_bytes_present_v1(backend_identity_v3::device_identity(*import)) &&
+         all_identity_bytes_present_v1(backend_identity_v3::owner_identity(*import)) &&
          all_identity_bytes_present_v1(import->run_stream_identity_sha256) &&
          all_identity_bytes_present_v1(import->metric_semantics_sha256) &&
          all_identity_bytes_present_v1(import->gene_schema_sha256) &&
          all_identity_bytes_present_v1(import->scenario_order_semantics_sha256) &&
-         all_identity_bytes_present_v1(import->cuda_build_manifest_sha256) &&
-         all_identity_bytes_present_v1(import->cuda_math_flags_sha256) &&
+         all_identity_bytes_present_v1(backend_identity_v3::build_identity(*import)) &&
+         all_identity_bytes_present_v1(backend_identity_v3::math_identity(*import)) &&
          all_identity_bytes_present_v1(import->resident_input_content_sha256) &&
          all_identity_bytes_present_v1(import->gene_content_sha256) &&
          all_identity_bytes_present_v1(import->metric_content_sha256) &&
@@ -153,10 +158,11 @@ bool validate_import_v1(const NeoResidentScoringNoveltyPopulationImportV1* impor
 }
 
 bool validate_plan_v1(const NeoResidentScoringNoveltyPlanV1* plan) {
-  if (plan == nullptr || plan->abi_version != NEO_RESIDENT_SCORING_NOVELTY_ABI_V1 ||
-      plan->scoring_version != NEO_RESIDENT_SCORING_VERSION_V1 ||
+  if (plan == nullptr || plan->abi_version != NEO_RESIDENT_SCORING_PLAN_ABI_V2 ||
+      plan->reserved != 0u || plan->reserved_extents != 0u ||
       (plan->scoring_objective != NEO_RESIDENT_SCORING_PROPFIRM_V4 &&
-       plan->scoring_objective != NEO_RESIDENT_SCORING_RISKY_GROWTH_V5) ||
+       plan->scoring_objective != NEO_RESIDENT_SCORING_RISKY_GROWTH_V5 &&
+       plan->scoring_objective != NEO_RESIDENT_SCORING_RISKY_GROWTH_GOAL_V6) ||
       plan->logical_population_count == 0 ||
       plan->logical_population_count > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
       plan->feature_count == 0 || plan->max_terms_per_gene == 0 ||
@@ -167,12 +173,31 @@ bool validate_plan_v1(const NeoResidentScoringNoveltyPlanV1* plan) {
       !all_identity_bytes_present_v1(plan->scenario_order_semantics_sha256) ||
       !all_identity_bytes_present_v1(plan->gene_schema_sha256) ||
       !all_identity_bytes_present_v1(plan->rank_semantics_sha256) ||
-      !all_identity_bytes_present_v1(plan->cuda_device_identity_sha256) ||
-      !all_identity_bytes_present_v1(plan->primary_context_identity_sha256) ||
+      !all_identity_bytes_present_v1(backend_identity_v3::device_identity(*plan)) ||
+      !all_identity_bytes_present_v1(backend_identity_v3::owner_identity(*plan)) ||
       !all_identity_bytes_present_v1(plan->run_stream_identity_sha256) ||
-      !all_identity_bytes_present_v1(plan->cuda_build_manifest_sha256) ||
-      !all_identity_bytes_present_v1(plan->cuda_math_flags_sha256) ||
+      !all_identity_bytes_present_v1(backend_identity_v3::build_identity(*plan)) ||
+      !all_identity_bytes_present_v1(backend_identity_v3::math_identity(*plan)) ||
       !all_identity_bytes_present_v1(plan->plan_identity_sha256)) {
+    return false;
+  }
+  if (plan->scoring_objective == NEO_RESIDENT_SCORING_RISKY_GROWTH_GOAL_V6) {
+    const double initial = f64_from_bits_v1(plan->initial_equity_bits);
+    const double span = f64_from_bits_v1(plan->span_days_bits);
+    const double start = f64_from_bits_v1(plan->goal_start_balance_bits);
+    const double target = f64_from_bits_v1(plan->goal_target_balance_bits);
+    const double horizon = f64_from_bits_v1(plan->goal_horizon_days_bits);
+    const double required_log_growth = std::log(target) - std::log(start);
+    if (plan->scoring_version != 6u || !std::isfinite(initial) || initial <= 0.0 ||
+        !std::isfinite(span) || span <= 0.0 || !std::isfinite(start) || start <= 0.0 ||
+        !std::isfinite(target) || target <= start || !std::isfinite(horizon) ||
+        horizon <= 0.0 || !std::isfinite(required_log_growth) || required_log_growth <= 0.0) {
+      return false;
+    }
+  } else if (plan->scoring_version != NEO_RESIDENT_SCORING_VERSION_V1 ||
+             plan->initial_equity_bits != 0ull || plan->span_days_bits != 0ull ||
+             plan->goal_start_balance_bits != 0ull || plan->goal_target_balance_bits != 0ull ||
+             plan->goal_horizon_days_bits != 0ull) {
     return false;
   }
   const double novelty_weight = f64_from_bits_v1(plan->novelty_weight_bits);
@@ -182,23 +207,23 @@ bool validate_plan_v1(const NeoResidentScoringNoveltyPlanV1* plan) {
 bool validate_scoring_admission_v2(const NeoResidentScoringAdmissionV2* admission,
                                    const NeoResidentScoringNoveltyPlanV1* plan) {
   if (admission == nullptr || !validate_plan_v1(plan) ||
-      admission->abi_version != 2u ||
-      admission->selected_cuda_ordinal ==
+      admission->abi_version != NEO_RESIDENT_SCORING_ADMISSION_ABI_V3 ||
+      backend_identity_v3::selected_device_ordinal(*admission) ==
           std::numeric_limits<std::uint32_t>::max() ||
       admission->admitted_run_stream == nullptr ||
       admission->scoring_novelty_ready_event == nullptr ||
       plan->novelty_weight_bits != 0ull ||
-      !identity_equal_v1(plan->cuda_math_flags_sha256,
-                         NEO_RESIDENT_CUDA_MATH_SEMANTICS_SHA256_V2) ||
-      !all_identity_bytes_present_v1(admission->cuda_device_identity_sha256) ||
-      !all_identity_bytes_present_v1(admission->primary_context_identity_sha256) ||
+      !identity_equal_v1(backend_identity_v3::math_identity(*plan),
+                         resident_backend_math_v3::expected_math_semantics_sha256_v3()) ||
+      !all_identity_bytes_present_v1(backend_identity_v3::device_identity(*admission)) ||
+      !all_identity_bytes_present_v1(backend_identity_v3::owner_identity(*admission)) ||
       !all_identity_bytes_present_v1(admission->run_stream_identity_sha256)) {
     return false;
   }
-  return identity_equal_v1(admission->cuda_device_identity_sha256,
-                           plan->cuda_device_identity_sha256) &&
-         identity_equal_v1(admission->primary_context_identity_sha256,
-                           plan->primary_context_identity_sha256) &&
+  return identity_equal_v1(backend_identity_v3::device_identity(*admission),
+                           backend_identity_v3::device_identity(*plan)) &&
+         identity_equal_v1(backend_identity_v3::owner_identity(*admission),
+                           backend_identity_v3::owner_identity(*plan)) &&
          identity_equal_v1(admission->run_stream_identity_sha256,
                            plan->run_stream_identity_sha256);
 }
@@ -223,19 +248,19 @@ std::int32_t query_cub_reduce_scratch_bytes_v1(
   std::size_t candidate = 0;
   std::size_t maximum = 0;
   cudaError_t status =
-      cub::DeviceReduce::Min(nullptr, candidate, input, output, count, stream);
+      neoethos_parallel_primitives_v1::DeviceReduce::Min(nullptr, candidate, input, output, count, stream);
   if (status != cudaSuccess) {
     return NEO_SCORING_STATUS_CUB_ERROR_V1;
   }
   maximum = candidate;
   candidate = 0;
-  status = cub::DeviceReduce::Max(nullptr, candidate, input, output, count, stream);
+  status = neoethos_parallel_primitives_v1::DeviceReduce::Max(nullptr, candidate, input, output, count, stream);
   if (status != cudaSuccess) {
     return NEO_SCORING_STATUS_CUB_ERROR_V1;
   }
   maximum = candidate > maximum ? candidate : maximum;
   candidate = 0;
-  status = cub::DeviceRadixSort::SortPairs(
+  status = neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(
       nullptr, candidate, rank_keys, rank_keys, rank_values, rank_values,
       count, 0, 64, stream);
   if (status != cudaSuccess) {
@@ -243,7 +268,7 @@ std::int32_t query_cub_reduce_scratch_bytes_v1(
   }
   maximum = candidate > maximum ? candidate : maximum;
   candidate = 0;
-  status = cub::DeviceRadixSort::SortPairs(
+  status = neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(
       nullptr, candidate, rank_keys, rank_keys, rank_values, rank_values,
       count, 0, 64, stream);
   if (status != cudaSuccess) {
@@ -251,7 +276,7 @@ std::int32_t query_cub_reduce_scratch_bytes_v1(
   }
   maximum = candidate > maximum ? candidate : maximum;
   candidate = 0;
-  status = cub::DeviceRadixSort::SortPairsDescending(
+  status = neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(
       nullptr, candidate, rank_keys, rank_keys, rank_values, rank_values,
       count, 0, 64, stream);
   if (status != cudaSuccess) {
@@ -398,14 +423,35 @@ __device__ double score_risky_ga_fitness_growth_v5(const double metrics[11]) {
   return growth * 10.0 + edge_gradient;
 }
 
-__device__ bool all_metric_values_finite_v1(
-    const NeoResidentScoringNoveltyMetricRowV1& row) {
-  for (std::uint32_t metric = 0; metric < 11; ++metric) {
-    if (!isfinite(row.values[metric])) {
-      return false;
-    }
+// Same arithmetic order as the shared CPU V6 contract. log1p preserves the
+// small-return behavior; log(1 + relative_net) is not an equivalent replacement.
+__device__ double score_risky_ga_fitness_goal_v6(
+    const double* metrics, const NeoResidentScoringNoveltyPlanV1& plan) {
+  const double initial = f64_from_bits_v1(plan.initial_equity_bits);
+  const double span = f64_from_bits_v1(plan.span_days_bits);
+  const double start = f64_from_bits_v1(plan.goal_start_balance_bits);
+  const double target = f64_from_bits_v1(plan.goal_target_balance_bits);
+  const double horizon = f64_from_bits_v1(plan.goal_horizon_days_bits);
+  // Checked metric/domain classification runs in the caller. This scalar keeps
+  // the exact CPU arithmetic; the caller distinguishes economic rejection from
+  // an arithmetic overflow producing the same scalar -infinity.
+  if (metrics[3] < 0.0 || metrics[3] >= 1.0 || metrics[8] < 0.0) {
+    return -INFINITY;
   }
-  return true;
+  const double relative_net = metrics[0] / initial;
+  if (!isfinite(relative_net) || relative_net <= -1.0) {
+    return -INFINITY;
+  }
+  if (metrics[8] < 1.0) {
+    return -100.0;
+  }
+  const double required_log_growth = log(target) - log(start);
+  const double relative_pace = log1p(relative_net) / required_log_growth * (horizon / span);
+  if (!isfinite(relative_pace)) {
+    return -INFINITY;
+  }
+  const double shortfall = fmax(1.0 - relative_pace, 0.0);
+  return 1.0 - shortfall * shortfall;
 }
 
 __global__ void build_checked_gene_set_bitmap_kernel_v1(
@@ -451,21 +497,52 @@ __global__ void score_canonical_metrics_kernel_v1(
     const NeoResidentScoringNoveltyMetricRowV1* metric_rows,
     double* fitness_scores,
     std::uint32_t* device_fault_word,
-    NeoResidentScoringNoveltyPlanV1 plan) {
+    NeoResidentScoringNoveltyPlanV1 plan,
+    bool checked_economic_rejection_v2) {
   const std::uint64_t candidate =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (candidate >= plan.logical_population_count) {
     return;
   }
   const auto& row = metric_rows[candidate];
-  if (!all_metric_values_finite_v1(row)) {
+  using neoethos::resident_scoring_novelty_v2_internal::ResidentMetricStatusV2;
+  using neoethos::resident_scoring_novelty_v2_internal::classify_resident_metrics_v2;
+  const auto metric_status = classify_resident_metrics_v2(row.values);
+  const bool goal = plan.scoring_objective == NEO_RESIDENT_SCORING_RISKY_GROWTH_GOAL_V6;
+  if (metric_status == ResidentMetricStatusV2::Fault ||
+      (goal && (row.values[3] < 0.0 || row.values[8] < 0.0))) {
     atomicExch(device_fault_word, 1u);
     fitness_scores[candidate] = -DBL_MAX;
     return;
   }
+  if (metric_status == ResidentMetricStatusV2::EconomicMonthlyEquityReject ||
+      (goal && row.values[3] >= 1.0)) {
+    if (!checked_economic_rejection_v2) {
+      atomicExch(device_fault_word, 1u);
+    }
+    fitness_scores[candidate] = -INFINITY;
+    return;
+  }
+  if (goal) {
+    const double relative_net = row.values[0] / f64_from_bits_v1(plan.initial_equity_bits);
+    if (!isfinite(relative_net)) {
+      atomicExch(device_fault_word, 1u);
+      fitness_scores[candidate] = -DBL_MAX;
+      return;
+    }
+    if (relative_net <= -1.0) {
+      if (!checked_economic_rejection_v2) {
+        atomicExch(device_fault_word, 1u);
+      }
+      fitness_scores[candidate] = -INFINITY;
+      return;
+    }
+  }
   const double score = plan.scoring_objective == NEO_RESIDENT_SCORING_PROPFIRM_V4
                            ? score_prop_firm_ga_fitness_v4(row.values)
-                           : score_risky_ga_fitness_growth_v5(row.values);
+                           : plan.scoring_objective == NEO_RESIDENT_SCORING_RISKY_GROWTH_V5
+                                 ? score_risky_ga_fitness_growth_v5(row.values)
+                                 : score_risky_ga_fitness_goal_v6(row.values, plan);
   if (!isfinite(score)) {
     atomicExch(device_fault_word, 1u);
     fitness_scores[candidate] = -DBL_MAX;
@@ -528,6 +605,9 @@ __device__ std::uint64_t ordered_f64_decision_key_v1(double value) {
 }
 
 __device__ std::uint64_t ordered_f64_decision_key_v2(double value) {
+  if (value == -INFINITY) {
+    return 1;
+  }
   if (!isfinite(value)) {
     return 0;
   }
@@ -547,7 +627,8 @@ __global__ void encode_finite_objective_keys_kernel_v2(
   if (candidate >= population) {
     return;
   }
-  if (*device_fault_word != 0u || !isfinite(fitness_scores[candidate])) {
+  if (*device_fault_word != 0u ||
+      (!isfinite(fitness_scores[candidate]) && fitness_scores[candidate] != -INFINITY)) {
     atomicExch(device_fault_word, 1u);
     decision_keys[candidate] = 0;
     return;
@@ -572,7 +653,7 @@ __global__ void fixture_rewrite_resident_metric_rows_kernel_v2(
     }
   } else if (mode == 2u && candidate == 0) {
     rows[0].values[0] = __longlong_as_double(0x7ff8000000000000ull);
-  } else if (mode == 3u) {
+  } else if (mode == 3u || mode == 4u) {
     const std::uint32_t levels[8] = {3u, 6u, 6u, 1u, 7u, 2u, 5u, 4u};
     const double level = static_cast<double>(levels[candidate % 8ull]);
     for (std::uint32_t metric = 0; metric < 11u; ++metric) {
@@ -587,6 +668,11 @@ __global__ void fixture_rewrite_resident_metric_rows_kernel_v2(
     rows[candidate].values[8] = 30.0;
     rows[candidate].values[9] = 0.5 + level * 0.03;
     rows[candidate].values[10] = (8.0 - level) * 0.002;
+    if (mode == 4u) {
+      // Scorer-only all-rejected V6 fixture: finite measured metrics, with the
+      // exact economic DD boundary. Separate tests exercise the real producer.
+      rows[candidate].values[3] = 1.0;
+    }
   }
   if (fault_enabled != 0u && candidate == 0 && fault_metric_slot < 11u) {
     rows[0].values[fault_metric_slot] =
@@ -681,17 +767,20 @@ __global__ void seal_scoring_novelty_content_kernel_v1(
         (static_cast<std::uint64_t>(plan.scoring_semantics_sha256[identity_index]) << 8) |
         (static_cast<std::uint64_t>(plan.novelty_semantics_sha256[identity_index]) << 16) |
         (static_cast<std::uint64_t>(plan.rank_semantics_sha256[identity_index]) << 24) |
-        (static_cast<std::uint64_t>(plan.cuda_build_manifest_sha256[identity_index]) << 32) |
-        (static_cast<std::uint64_t>(plan.cuda_math_flags_sha256[identity_index]) << 40);
+        (static_cast<std::uint64_t>(backend_identity_v3::build_identity(plan)[identity_index]) << 32) |
+        (static_cast<std::uint64_t>(backend_identity_v3::math_identity(plan)[identity_index]) << 40);
     const std::uint64_t execution_and_schema =
-        static_cast<std::uint64_t>(plan.cuda_device_identity_sha256[identity_index]) |
-        (static_cast<std::uint64_t>(plan.primary_context_identity_sha256[identity_index]) << 8) |
+        static_cast<std::uint64_t>(backend_identity_v3::device_identity(plan)[identity_index]) |
+        (static_cast<std::uint64_t>(backend_identity_v3::owner_identity(plan)[identity_index]) << 8) |
         (static_cast<std::uint64_t>(plan.run_stream_identity_sha256[identity_index]) << 16) |
         (static_cast<std::uint64_t>(plan.scenario_order_semantics_sha256[identity_index]) << 24) |
         (static_cast<std::uint64_t>(plan.gene_schema_sha256[identity_index]) << 32);
     for (std::uint32_t lane = 0; lane < 4; ++lane) {
       lanes[lane] = hash_mix_v1(lanes[lane], bound ^ lane);
       lanes[lane] = hash_mix_v1(lanes[lane], execution_and_schema ^ lane);
+      if (plan.scoring_objective == NEO_RESIDENT_SCORING_RISKY_GROWTH_GOAL_V6) {
+        lanes[lane] = hash_mix_v1(lanes[lane], plan.plan_identity_sha256[identity_index] ^ lane);
+      }
     }
   }
   for (std::uint32_t lane = 0; lane < 4; ++lane) {
@@ -752,16 +841,16 @@ __global__ void seal_finite_objective_content_kernel_v2(
         (static_cast<std::uint64_t>(plan.rank_semantics_sha256[identity_index])
          << 24) |
         (static_cast<std::uint64_t>(
-             plan.cuda_build_manifest_sha256[identity_index])
+             backend_identity_v3::build_identity(plan)[identity_index])
          << 32) |
         (static_cast<std::uint64_t>(
-             plan.cuda_math_flags_sha256[identity_index])
+             backend_identity_v3::math_identity(plan)[identity_index])
          << 40);
     const std::uint64_t execution_and_schema =
         static_cast<std::uint64_t>(
-            plan.cuda_device_identity_sha256[identity_index]) |
+            backend_identity_v3::device_identity(plan)[identity_index]) |
         (static_cast<std::uint64_t>(
-             plan.primary_context_identity_sha256[identity_index])
+             backend_identity_v3::owner_identity(plan)[identity_index])
          << 8) |
         (static_cast<std::uint64_t>(
              plan.run_stream_identity_sha256[identity_index])
@@ -774,6 +863,9 @@ __global__ void seal_finite_objective_content_kernel_v2(
     for (std::uint32_t lane = 0; lane < 4; ++lane) {
       lanes[lane] = hash_mix_v1(lanes[lane], bound ^ lane);
       lanes[lane] = hash_mix_v1(lanes[lane], execution_and_schema ^ lane);
+      if (plan.scoring_objective == NEO_RESIDENT_SCORING_RISKY_GROWTH_GOAL_V6) {
+        lanes[lane] = hash_mix_v1(lanes[lane], plan.plan_identity_sha256[identity_index] ^ lane);
+      }
     }
   }
   for (std::uint32_t lane = 0; lane < 4; ++lane) {
@@ -796,20 +888,6 @@ bool same_slice2_region_v2(
   return left.offset_bytes == right.offset_bytes &&
          left.size_bytes == right.size_bytes;
 }
-
-bool valid_slice2_region_v2(
-    const resident_archive_knn_v2::NeoResidentArchiveKnnArenaRegionV2& region,
-    std::uint64_t expected_offset, std::uint64_t expected_size,
-    std::uint64_t* next_offset) {
-  std::uint64_t end = 0;
-  return next_offset != nullptr && region.offset_bytes == expected_offset &&
-         region.offset_bytes % DEVICE_ALIGNMENT_V1 == 0 &&
-         region.size_bytes == expected_size && region.size_bytes != 0 &&
-         region.size_bytes % DEVICE_ALIGNMENT_V1 == 0 &&
-         checked_add_v1(region.offset_bytes, region.size_bytes, &end) &&
-         ((*next_offset = end), true);
-}
-
 bool all_slice2_device_uuid_bytes_present_v2(const std::uint8_t uuid[16]) {
   std::uint8_t aggregate = 0;
   for (std::size_t index = 0; index < 16; ++index) {
@@ -817,55 +895,30 @@ bool all_slice2_device_uuid_bytes_present_v2(const std::uint8_t uuid[16]) {
   }
   return aggregate != 0;
 }
-
-bool checked_slice2_region_bytes_v2(std::uint64_t item_count,
-                                    std::uint64_t elements_per_item,
-                                    std::size_t element_bytes,
-                                    std::uint64_t* aligned_bytes) {
-  if (aligned_bytes == nullptr || item_count == 0 || elements_per_item == 0 ||
-      item_count > static_cast<std::uint64_t>(
-                       std::numeric_limits<std::size_t>::max()) ||
-      elements_per_item > static_cast<std::uint64_t>(
-                                  std::numeric_limits<std::size_t>::max())) {
-    return false;
-  }
-  std::size_t element_count = 0;
-  std::size_t raw_bytes = 0;
-  std::size_t aligned = 0;
-  if (!checked_mul_v1(static_cast<std::size_t>(item_count),
-                      static_cast<std::size_t>(elements_per_item),
-                      &element_count) ||
-      !checked_mul_v1(element_count, element_bytes, &raw_bytes) ||
-      !align_device_bytes_v1(raw_bytes, &aligned)) {
-    return false;
-  }
-  *aligned_bytes = static_cast<std::uint64_t>(aligned);
-  return true;
-}
-
 bool validate_slice2_combined_binding_v2(
     const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding) {
   using namespace resident_archive_knn_v2;
   if (binding == nullptr ||
       binding->abi_version != NEO_RESIDENT_ARCHIVE_KNN_ABI_V2 ||
-      binding->reserved != 0u ||
+      !backend_identity_v3::archive_backend_valid(*binding) ||
       binding->population_count == 0 ||
       binding->population_count >
           NEO_RESIDENT_ARCHIVE_KNN_MAX_POPULATION_COUNT_V2 ||
       binding->archive_capacity == 0 ||
       binding->archive_capacity > NEO_RESIDENT_ARCHIVE_KNN_MAX_CAPACITY_V2 ||
-      binding->signature_word_count !=
+      binding->signature_word_count <
           NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 ||
-      binding->novelty_neighbor_count != NEO_RESIDENT_ARCHIVE_KNN_K_V2 ||
-      binding->max_terms_per_gene != NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 ||
+      binding->novelty_neighbor_count == 0u ||
+      binding->max_terms_per_gene == 0u ||
+      binding->max_terms_per_gene > NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 ||
       binding->reserved_extents != 0u || binding->total_device_bytes == 0ull ||
       binding->total_device_bytes >
           static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
       !all_slice2_device_uuid_bytes_present_v2(binding->device_uuid) ||
-      binding->primary_context_identity == 0ull ||
+      backend_identity_v3::archive_owner_identity(*binding) == 0ull ||
       binding->search_stream_identity == 0ull ||
       binding->active_pool_identity == 0ull ||
-      binding->cuda_build_identity == 0ull ||
+      backend_identity_v3::archive_build_identity(*binding) == 0ull ||
       binding->kernel_semantics_identity == 0ull ||
       binding->binary64_math_identity == 0ull ||
       binding->plan_identity == 0ull || binding->run_identity == 0ull ||
@@ -874,103 +927,9 @@ bool validate_slice2_combined_binding_v2(
     return false;
   }
 
-  std::uint64_t population_scalar_bytes = 0;
-  std::uint64_t archive_gene_scalar_bytes = 0;
-  std::uint64_t archive_term_index_bytes = 0;
-  std::uint64_t archive_term_weight_bytes = 0;
-  std::uint64_t archive_metric_row_bytes = 0;
-  std::uint64_t archive_signature_bytes = 0;
-  std::uint64_t archive_hash_bytes = 0;
-  std::uint64_t population_signature_bytes = 0;
-  std::uint64_t exact_top_k_bytes = 0;
-  std::uint64_t admission_flag_bytes = 0;
-  std::uint64_t admission_offset_bytes = 0;
-  if (!checked_slice2_region_bytes_v2(binding->population_count, 1,
-                                      sizeof(double),
-                                      &population_scalar_bytes) ||
-      !checked_slice2_region_bytes_v2(
-          binding->archive_capacity, 1,
-          sizeof(NeoResidentScoringNoveltyGeneScalarV1),
-          &archive_gene_scalar_bytes) ||
-      !checked_slice2_region_bytes_v2(binding->archive_capacity,
-                                      binding->max_terms_per_gene,
-                                      sizeof(std::uint64_t),
-                                      &archive_term_index_bytes) ||
-      !checked_slice2_region_bytes_v2(binding->archive_capacity,
-                                      binding->max_terms_per_gene,
-                                      sizeof(double),
-                                      &archive_term_weight_bytes) ||
-      !checked_slice2_region_bytes_v2(
-          binding->archive_capacity, 1,
-          sizeof(NeoResidentScoringNoveltyMetricRowV1),
-          &archive_metric_row_bytes) ||
-      !checked_slice2_region_bytes_v2(binding->archive_capacity,
-                                      binding->signature_word_count,
-                                      sizeof(std::uint64_t),
-                                      &archive_signature_bytes) ||
-      !checked_slice2_region_bytes_v2(binding->archive_capacity, 1,
-                                      sizeof(std::uint64_t),
-                                      &archive_hash_bytes) ||
-      !checked_slice2_region_bytes_v2(binding->population_count,
-                                      binding->signature_word_count,
-                                      sizeof(std::uint64_t),
-                                      &population_signature_bytes) ||
-      !checked_slice2_region_bytes_v2(binding->population_count,
-                                      binding->novelty_neighbor_count, 32,
-                                      &exact_top_k_bytes) ||
-      !checked_slice2_region_bytes_v2(binding->population_count, 1,
-                                      sizeof(std::uint32_t),
-                                      &admission_flag_bytes) ||
-      !checked_slice2_region_bytes_v2(binding->population_count, 1,
-                                      sizeof(std::uint64_t),
-                                      &admission_offset_bytes)) {
-    return false;
-  }
-
-  std::uint64_t cursor = 0;
-  if (!valid_slice2_region_v2(binding->fitness_scores, cursor,
-                              population_scalar_bytes,
-                              &cursor) ||
-      !valid_slice2_region_v2(binding->decision_keys, cursor,
-                              population_scalar_bytes,
-                              &cursor) ||
-      binding->cub_scratch.offset_bytes != cursor ||
-      binding->cub_scratch.size_bytes == 0ull ||
-      binding->cub_scratch.offset_bytes % DEVICE_ALIGNMENT_V1 != 0 ||
-      binding->cub_scratch.size_bytes % DEVICE_ALIGNMENT_V1 != 0 ||
-      !checked_add_v1(binding->cub_scratch.offset_bytes,
-                      binding->cub_scratch.size_bytes, &cursor) ||
-      !valid_slice2_region_v2(binding->archive_gene_scalars, cursor,
-                              archive_gene_scalar_bytes, &cursor) ||
-      !valid_slice2_region_v2(binding->archive_term_indices, cursor,
-                              archive_term_index_bytes, &cursor) ||
-      !valid_slice2_region_v2(binding->archive_term_weights, cursor,
-                              archive_term_weight_bytes, &cursor) ||
-      !valid_slice2_region_v2(binding->archive_metric_rows, cursor,
-                              archive_metric_row_bytes, &cursor) ||
-      !valid_slice2_region_v2(binding->archive_signatures, cursor,
-                              archive_signature_bytes, &cursor) ||
-      !valid_slice2_region_v2(binding->archive_hashes, cursor,
-                              archive_hash_bytes, &cursor) ||
-      !valid_slice2_region_v2(binding->current_population_signatures, cursor,
-                              population_signature_bytes, &cursor) ||
-      !valid_slice2_region_v2(binding->novelty_scores, cursor,
-                              population_scalar_bytes,
-                              &cursor) ||
-      !valid_slice2_region_v2(binding->exact_top_k_keys, cursor,
-                              exact_top_k_bytes,
-                              &cursor) ||
-      !valid_slice2_region_v2(binding->admission_flags, cursor,
-                              admission_flag_bytes,
-                              &cursor) ||
-      !valid_slice2_region_v2(binding->admission_offsets, cursor,
-                              admission_offset_bytes,
-                              &cursor) ||
-      !valid_slice2_region_v2(binding->archive_control_and_seal, cursor, 256,
-                              &cursor)) {
-    return false;
-  }
-  return cursor == binding->total_device_bytes;
+  return archive_layout_v3::validate_geometry_v3<
+      sizeof(NeoResidentScoringNoveltyGeneScalarV1),
+      sizeof(NeoResidentScoringNoveltyMetricRowV1), 32>(*binding);
 }
 
 bool same_slice2_binding_v2(
@@ -1000,7 +959,8 @@ bool same_slice2_binding_v2(
       same_slice2_region_v2(left.archive_control_and_seal,
                             right.archive_control_and_seal);
   return same_regions && left.abi_version == right.abi_version &&
-         left.reserved == right.reserved &&
+         backend_identity_v3::archive_backend_valid(left) &&
+         backend_identity_v3::archive_backend_valid(right) &&
          left.total_device_bytes == right.total_device_bytes &&
          left.population_count == right.population_count &&
          left.archive_capacity == right.archive_capacity &&
@@ -1009,10 +969,10 @@ bool same_slice2_binding_v2(
          left.max_terms_per_gene == right.max_terms_per_gene &&
          left.reserved_extents == right.reserved_extents &&
          std::memcmp(left.device_uuid, right.device_uuid, 16) == 0 &&
-         left.primary_context_identity == right.primary_context_identity &&
+         backend_identity_v3::archive_owner_identity(left) == backend_identity_v3::archive_owner_identity(right) &&
          left.search_stream_identity == right.search_stream_identity &&
          left.active_pool_identity == right.active_pool_identity &&
-         left.cuda_build_identity == right.cuda_build_identity &&
+         backend_identity_v3::archive_build_identity(left) == backend_identity_v3::archive_build_identity(right) &&
          left.kernel_semantics_identity == right.kernel_semantics_identity &&
          left.binary64_math_identity == right.binary64_math_identity &&
          left.plan_identity == right.plan_identity &&
@@ -1052,7 +1012,7 @@ struct NeoResidentScoringNoveltyRunV1 {
   std::uint64_t feature_word_count;
   std::uint64_t same_stream_enqueue_count;
   std::uint64_t next_event_id;
-  std::uint32_t selected_cuda_ordinal_v2;
+  std::uint32_t selected_device_ordinal_v3;
   bool sealed;
   bool bound_v2;
   bool slice2_combined_arena_v2;
@@ -1183,7 +1143,7 @@ bool validate_slice2_population_source_v2(
          population->abi_version == NEO_RESIDENT_SEARCH_GENERATION_ABI_V2 &&
          population->reserved == 0u && population->receipt_token != nullptr &&
          population->population_lifetime_owner != nullptr &&
-         population->selected_cuda_ordinal == run->selected_cuda_ordinal_v2 &&
+         backend_identity_v3::selected_device_ordinal(*population) == run->selected_device_ordinal_v3 &&
          population->admitted_run_stream == run->admitted_run_stream &&
          population->metrics_ready_event != nullptr &&
          population->scoring_ready_event == run->scoring_novelty_ready_event &&
@@ -1224,17 +1184,17 @@ extern "C" std::int32_t query_resident_scoring_novelty_allocation_v1(
   if (!validate_import_v1(import) || receipt == nullptr) {
     return NEO_SCORING_STATUS_INVALID_ARGUMENT_V1;
   }
-  if (plan == nullptr || plan->abi_version != NEO_RESIDENT_SCORING_NOVELTY_ABI_V1) {
+  if (plan == nullptr || plan->abi_version != NEO_RESIDENT_SCORING_PLAN_ABI_V2) {
     return NEO_SCORING_STATUS_ABI_MISMATCH_V1;
   }
   if (!validate_plan_v1(plan) ||
       import->logical_population_count != plan->logical_population_count ||
       import->feature_count != plan->feature_count ||
       import->max_terms_per_gene != plan->max_terms_per_gene ||
-      !identity_equal_v1(import->cuda_device_identity_sha256,
-                         plan->cuda_device_identity_sha256) ||
-      !identity_equal_v1(import->primary_context_identity_sha256,
-                         plan->primary_context_identity_sha256) ||
+      !identity_equal_v1(backend_identity_v3::device_identity(*import),
+                         backend_identity_v3::device_identity(*plan)) ||
+      !identity_equal_v1(backend_identity_v3::owner_identity(*import),
+                         backend_identity_v3::owner_identity(*plan)) ||
       !identity_equal_v1(import->run_stream_identity_sha256,
                          plan->run_stream_identity_sha256) ||
       !identity_equal_v1(import->metric_semantics_sha256,
@@ -1243,15 +1203,15 @@ extern "C" std::int32_t query_resident_scoring_novelty_allocation_v1(
                          plan->gene_schema_sha256) ||
       !identity_equal_v1(import->scenario_order_semantics_sha256,
                          plan->scenario_order_semantics_sha256) ||
-      !identity_equal_v1(import->cuda_build_manifest_sha256,
-                         plan->cuda_build_manifest_sha256) ||
-      !identity_equal_v1(import->cuda_math_flags_sha256,
-                         plan->cuda_math_flags_sha256)) {
+      !identity_equal_v1(backend_identity_v3::build_identity(*import),
+                         backend_identity_v3::build_identity(*plan)) ||
+      !identity_equal_v1(backend_identity_v3::math_identity(*import),
+                         backend_identity_v3::math_identity(*plan))) {
     return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
   }
   int current_device = -1;
   if (cudaGetDevice(&current_device) != cudaSuccess || current_device < 0 ||
-      static_cast<std::uint32_t>(current_device) != import->selected_cuda_ordinal) {
+      static_cast<std::uint32_t>(current_device) != backend_identity_v3::selected_device_ordinal(*import)) {
     return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
   }
   PhysicalLayoutV1 layout{};
@@ -1298,10 +1258,10 @@ extern "C" std::int32_t create_resident_scoring_novelty_run_v1(
       receipt->scoring_store_allocation_count != 1 ||
       receipt->logical_population_count != plan->logical_population_count ||
       receipt->full_discovery_reserve_bytes != import->full_discovery_reserve_bytes ||
-      !identity_equal_v1(import->cuda_device_identity_sha256,
-                         plan->cuda_device_identity_sha256) ||
-      !identity_equal_v1(import->primary_context_identity_sha256,
-                         plan->primary_context_identity_sha256) ||
+      !identity_equal_v1(backend_identity_v3::device_identity(*import),
+                         backend_identity_v3::device_identity(*plan)) ||
+      !identity_equal_v1(backend_identity_v3::owner_identity(*import),
+                         backend_identity_v3::owner_identity(*plan)) ||
       !identity_equal_v1(import->run_stream_identity_sha256,
                          plan->run_stream_identity_sha256) ||
       !identity_equal_v1(import->metric_semantics_sha256,
@@ -1310,10 +1270,10 @@ extern "C" std::int32_t create_resident_scoring_novelty_run_v1(
                          plan->gene_schema_sha256) ||
       !identity_equal_v1(import->scenario_order_semantics_sha256,
                          plan->scenario_order_semantics_sha256) ||
-      !identity_equal_v1(import->cuda_build_manifest_sha256,
-                         plan->cuda_build_manifest_sha256) ||
-      !identity_equal_v1(import->cuda_math_flags_sha256,
-                         plan->cuda_math_flags_sha256) ||
+      !identity_equal_v1(backend_identity_v3::build_identity(*import),
+                         backend_identity_v3::build_identity(*plan)) ||
+      !identity_equal_v1(backend_identity_v3::math_identity(*import),
+                         backend_identity_v3::math_identity(*plan)) ||
       !identity_equal_v1(receipt->allocation_plan_sha256, plan->plan_identity_sha256)) {
     return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
   }
@@ -1407,7 +1367,7 @@ extern "C" std::int32_t query_resident_scoring_admission_v2(
   int current_device = -1;
   if (cudaGetDevice(&current_device) != cudaSuccess || current_device < 0 ||
       static_cast<std::uint32_t>(current_device) !=
-          admission->selected_cuda_ordinal) {
+          backend_identity_v3::selected_device_ordinal(*admission)) {
     return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
   }
   std::size_t same_context_free_bytes = 0;
@@ -1431,7 +1391,7 @@ extern "C" std::int32_t calculate_resident_scoring_allocation_v2(
   if (plan == nullptr || receipt == nullptr || admitted_run_stream == nullptr) {
     return NEO_SCORING_STATUS_INVALID_ARGUMENT_V1;
   }
-  if (plan->abi_version != NEO_RESIDENT_SCORING_NOVELTY_ABI_V1) {
+  if (plan->abi_version != NEO_RESIDENT_SCORING_PLAN_ABI_V2) {
     return NEO_SCORING_STATUS_ABI_MISMATCH_V1;
   }
   if (!validate_plan_v1(plan)) {
@@ -1560,10 +1520,10 @@ extern "C" std::int32_t bind_and_seal_resident_scoring_v2(
           run->plan.logical_population_count ||
       population->feature_count != run->plan.feature_count ||
       population->max_terms_per_gene != run->plan.max_terms_per_gene ||
-      !identity_equal_v1(population->cuda_device_identity_sha256,
-                         run->plan.cuda_device_identity_sha256) ||
-      !identity_equal_v1(population->primary_context_identity_sha256,
-                         run->plan.primary_context_identity_sha256) ||
+      !identity_equal_v1(backend_identity_v3::device_identity(*population),
+                         backend_identity_v3::device_identity(run->plan)) ||
+      !identity_equal_v1(backend_identity_v3::owner_identity(*population),
+                         backend_identity_v3::owner_identity(run->plan)) ||
       !identity_equal_v1(population->run_stream_identity_sha256,
                          run->plan.run_stream_identity_sha256) ||
       !identity_equal_v1(population->metric_semantics_sha256,
@@ -1572,10 +1532,10 @@ extern "C" std::int32_t bind_and_seal_resident_scoring_v2(
                          run->plan.gene_schema_sha256) ||
       !identity_equal_v1(population->scenario_order_semantics_sha256,
                          run->plan.scenario_order_semantics_sha256) ||
-      !identity_equal_v1(population->cuda_build_manifest_sha256,
-                         run->plan.cuda_build_manifest_sha256) ||
-      !identity_equal_v1(population->cuda_math_flags_sha256,
-                         run->plan.cuda_math_flags_sha256)) {
+      !identity_equal_v1(backend_identity_v3::build_identity(*population),
+                         backend_identity_v3::build_identity(run->plan)) ||
+      !identity_equal_v1(backend_identity_v3::math_identity(*population),
+                         backend_identity_v3::math_identity(run->plan))) {
     return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
   }
   run->metrics_ready_event = population->metrics_ready_event;
@@ -1618,7 +1578,7 @@ extern "C" std::int32_t bind_and_seal_resident_scoring_v2(
   score_canonical_metrics_kernel_v1<<<grid, threads, 0,
                                       run->admitted_run_stream>>>(
       run->metric_rows_device, run->fitness_scores_device,
-      run->device_fault_word, run->plan);
+      run->device_fault_word, run->plan, true);
   ++run->same_stream_enqueue_count;
   std::int32_t status = launch_status_v1();
   if (status != NEO_SCORING_STATUS_OK_V1) {
@@ -1668,10 +1628,10 @@ extern "C" std::int32_t bind_and_seal_resident_scoring_v2(
                    run->plan.scenario_order_semantics_sha256);
   copy_identity_v1(output->rank_semantics_sha256,
                    run->plan.rank_semantics_sha256);
-  copy_identity_v1(output->cuda_build_manifest_sha256,
-                   run->plan.cuda_build_manifest_sha256);
-  copy_identity_v1(output->cuda_math_flags_sha256,
-                   run->plan.cuda_math_flags_sha256);
+  copy_identity_v1(backend_identity_v3::build_identity(*output),
+                   backend_identity_v3::build_identity(run->plan));
+  copy_identity_v1(backend_identity_v3::math_identity(*output),
+                   backend_identity_v3::math_identity(run->plan));
   return NEO_SCORING_STATUS_OK_V1;
 }
 
@@ -1703,7 +1663,7 @@ extern "C" std::int32_t enqueue_and_seal_resident_scoring_novelty_v1(
   }
   score_canonical_metrics_kernel_v1<<<grid, threads, 0, run->admitted_run_stream>>>(
       run->metric_rows_device, run->fitness_scores_device,
-      run->device_fault_word, run->plan);
+      run->device_fault_word, run->plan, false);
   ++run->same_stream_enqueue_count;
   status = launch_status_v1();
   if (status != NEO_SCORING_STATUS_OK_V1) {
@@ -1720,7 +1680,7 @@ extern "C" std::int32_t enqueue_and_seal_resident_scoring_novelty_v1(
   }
   const int count = static_cast<int>(run->plan.logical_population_count);
   std::size_t scratch = static_cast<std::size_t>(run->allocation.cub_scratch_bytes);
-  cuda_status = cub::DeviceReduce::Min(
+  cuda_status = neoethos_parallel_primitives_v1::DeviceReduce::Min(
       run->cub_scratch_device, scratch, run->fitness_scores_device,
       run->min_fitness_device, count, run->admitted_run_stream);
   ++run->same_stream_enqueue_count;
@@ -1728,7 +1688,7 @@ extern "C" std::int32_t enqueue_and_seal_resident_scoring_novelty_v1(
     return NEO_SCORING_STATUS_CUB_ERROR_V1;
   }
   scratch = static_cast<std::size_t>(run->allocation.cub_scratch_bytes);
-  cuda_status = cub::DeviceReduce::Max(
+  cuda_status = neoethos_parallel_primitives_v1::DeviceReduce::Max(
       run->cub_scratch_device, scratch, run->fitness_scores_device,
       run->max_fitness_device, count, run->admitted_run_stream);
   ++run->same_stream_enqueue_count;
@@ -1736,7 +1696,7 @@ extern "C" std::int32_t enqueue_and_seal_resident_scoring_novelty_v1(
     return NEO_SCORING_STATUS_CUB_ERROR_V1;
   }
   scratch = static_cast<std::size_t>(run->allocation.cub_scratch_bytes);
-  cuda_status = cub::DeviceReduce::Max(
+  cuda_status = neoethos_parallel_primitives_v1::DeviceReduce::Max(
       run->cub_scratch_device, scratch, run->novelty_scores_device,
       run->max_novelty_device, count, run->admitted_run_stream);
   ++run->same_stream_enqueue_count;
@@ -1789,10 +1749,10 @@ extern "C" std::int32_t enqueue_and_seal_resident_scoring_novelty_v1(
                    run->plan.scenario_order_semantics_sha256);
   copy_identity_v1(output->rank_semantics_sha256,
                    run->plan.rank_semantics_sha256);
-  copy_identity_v1(output->cuda_build_manifest_sha256,
-                   run->plan.cuda_build_manifest_sha256);
-  copy_identity_v1(output->cuda_math_flags_sha256,
-                   run->plan.cuda_math_flags_sha256);
+  copy_identity_v1(backend_identity_v3::build_identity(*output),
+                   backend_identity_v3::build_identity(run->plan));
+  copy_identity_v1(backend_identity_v3::math_identity(*output),
+                   backend_identity_v3::math_identity(run->plan));
   return NEO_SCORING_STATUS_OK_V1;
 }
 
@@ -1825,7 +1785,7 @@ extern "C" std::int32_t enqueue_resident_scoring_release_v2(
 extern "C" std::int32_t fixture_set_resident_scoring_metric_mode_v2(
     NeoResidentScoringNoveltyRunV1* run, std::uint32_t mode) {
   if (run == nullptr || run->sealed || run->bound_v2 ||
-      run->slice2_combined_arena_v2 || mode > 3u) {
+      run->slice2_combined_arena_v2 || mode > 4u) {
     return NEO_SCORING_STATUS_STATE_ERROR_V1;
   }
   run->fixture_metric_mode_v2 = mode;
@@ -1914,6 +1874,8 @@ std::int32_t query_slice2_combined_scoring_archive_run_v2(
       !validate_slice2_combined_binding_v2(binding) || receipt == nullptr ||
       binding->population_count != plan->logical_population_count ||
       binding->max_terms_per_gene != plan->max_terms_per_gene ||
+      binding->signature_word_count !=
+          resident_archive_knn_v2::signature_word_count_v2(plan->feature_count) ||
       binding->total_device_bytes > same_context_free_bytes ||
       admission->full_discovery_reserve_bytes > same_context_free_bytes ||
       binding->total_device_bytes >
@@ -1950,13 +1912,15 @@ std::int32_t create_slice2_combined_scoring_archive_run_v2(
       !validate_slice2_combined_binding_v2(binding) || run == nullptr ||
       *run != nullptr ||
       binding->population_count != plan->logical_population_count ||
-      binding->max_terms_per_gene != plan->max_terms_per_gene) {
+      binding->max_terms_per_gene != plan->max_terms_per_gene ||
+      binding->signature_word_count !=
+          resident_archive_knn_v2::signature_word_count_v2(plan->feature_count)) {
     return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
   }
   int current_device = -1;
   if (cudaGetDevice(&current_device) != cudaSuccess || current_device < 0 ||
       static_cast<std::uint32_t>(current_device) !=
-          admission->selected_cuda_ordinal) {
+          backend_identity_v3::selected_device_ordinal(*admission)) {
     return NEO_SCORING_STATUS_IDENTITY_MISMATCH_V1;
   }
 
@@ -1986,7 +1950,7 @@ std::int32_t create_slice2_combined_scoring_archive_run_v2(
   created->feature_word_count = 0;
   created->same_stream_enqueue_count = 0;
   created->next_event_id = 0;
-  created->selected_cuda_ordinal_v2 = admission->selected_cuda_ordinal;
+  created->selected_device_ordinal_v3 = backend_identity_v3::selected_device_ordinal(*admission);
   created->sealed = false;
   created->bound_v2 = false;
   created->poisoned_v2 = false;
@@ -2081,7 +2045,7 @@ std::int32_t enqueue_resident_scoring_finite_objective_v2(
   score_canonical_metrics_kernel_v1<<<grid, threads, 0,
                                       run->admitted_run_stream>>>(
       run->metric_rows_device, run->fitness_scores_device,
-      run->device_fault_word, run->plan);
+      run->device_fault_word, run->plan, true);
   ++run->same_stream_enqueue_count;
   std::int32_t status = launch_status_v1();
   if (status != NEO_SCORING_STATUS_OK_V1) {
@@ -2125,10 +2089,10 @@ std::int32_t enqueue_resident_scoring_finite_objective_v2(
                    run->plan.scenario_order_semantics_sha256);
   copy_identity_v1(rows->rank_semantics_sha256,
                    run->plan.rank_semantics_sha256);
-  copy_identity_v1(rows->cuda_build_manifest_sha256,
-                   run->plan.cuda_build_manifest_sha256);
-  copy_identity_v1(rows->cuda_math_flags_sha256,
-                   run->plan.cuda_math_flags_sha256);
+  copy_identity_v1(backend_identity_v3::build_identity(*rows),
+                   backend_identity_v3::build_identity(run->plan));
+  copy_identity_v1(backend_identity_v3::math_identity(*rows),
+                   backend_identity_v3::math_identity(run->plan));
   return NEO_SCORING_STATUS_OK_V1;
 }
 

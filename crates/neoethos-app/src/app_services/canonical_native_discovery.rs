@@ -354,7 +354,9 @@ fn spawn_native_worker_v1(
             overrides,
             &worker_cancellation,
             move |progress| {
-                let (stage, percent) = progress_snapshot_v1(&progress);
+                let Some((stage, percent)) = progress_snapshot_v1(&progress) else {
+                    return;
+                };
                 progress_tx.send_replace(CanonicalNativeResearchSnapshotV1::running(
                     lease_token,
                     stage,
@@ -389,8 +391,9 @@ fn spawn_native_worker_v1(
     }
 }
 
-fn progress_snapshot_v1(progress: &DiscoveryProgress) -> (&'static str, u16) {
-    match progress {
+fn progress_snapshot_v1(progress: &DiscoveryProgress) -> Option<(&'static str, u16)> {
+    Some(match progress {
+        DiscoveryProgress::CandidateCensusUpdated { .. } => return None,
         DiscoveryProgress::SearchStarted { .. } => ("generation_zero_started", 1_000),
         DiscoveryProgress::GenerationCompleted {
             generation,
@@ -410,7 +413,7 @@ fn progress_snapshot_v1(progress: &DiscoveryProgress) -> (&'static str, u16) {
         DiscoveryProgress::PortfolioSelected { .. } => ("portfolio_selected", 9_200),
         DiscoveryProgress::StageAdvanced { stage, .. } => (stage, 9_400),
         DiscoveryProgress::Completed { .. } => ("generation_zero_completed", 9_700),
-    }
+    })
 }
 
 fn bounded_detail_v1(detail: impl ToString) -> String {
@@ -439,6 +442,7 @@ fn stage_name_v1(stage: CanonicalNativeDiscoveryExecutionStageV1) -> &'static st
         Stage::ExactSourcePin => "exact_source_pin",
         Stage::NativePreflight => "native_preflight",
         Stage::NativeAdmission => "native_admission",
+        Stage::ResidentFeatureScreening => "resident_feature_screening",
         Stage::ResidentDataMaterialization => "resident_data_materialization",
         Stage::NativeReceiptBinding => "native_receipt_binding",
         Stage::GenerationZeroEvaluation => "generation_zero_evaluation",
@@ -473,3 +477,26 @@ fn code_name_v1(code: CanonicalNativeDiscoveryExecutionErrorCodeV1) -> &'static 
 #[cfg(test)]
 #[path = "canonical_native_discovery_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod census_progress_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_census_does_not_invent_a_native_phase_or_percentage() {
+        assert_eq!(
+            progress_snapshot_v1(&DiscoveryProgress::CandidateCensusUpdated {
+                census: Default::default()
+            }),
+            None
+        );
+        assert_eq!(
+            progress_snapshot_v1(&DiscoveryProgress::Completed {
+                candidate_count: 3,
+                filtered_count: 2,
+                portfolio_size: 1
+            }),
+            Some(("generation_zero_completed", 9700))
+        );
+    }
+}

@@ -169,7 +169,7 @@ fn anomaly_runtime_metadata(
         CapabilityState::Implemented,
         feature_columns,
         canonical_three_class_label_mapping(),
-        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0),
+        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0, 0),
     )
 }
 
@@ -219,12 +219,17 @@ fn validate_runtime_metadata(
             metadata.training_summary.dataset_rows
         );
     }
-    if metadata.training_summary.train_rows + metadata.training_summary.val_rows
-        != metadata.training_summary.dataset_rows
+    if metadata
+        .training_summary
+        .train_rows
+        .checked_add(metadata.training_summary.embargo_rows)
+        .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows))
+        != Some(metadata.training_summary.dataset_rows)
     {
         bail!(
-            "runtime metadata mismatch for isolation_forest: training rows {} + validation rows {} must equal dataset rows {}",
+            "runtime metadata mismatch for isolation_forest: training rows {} + embargo rows {} + validation rows {} must equal dataset rows {}",
             metadata.training_summary.train_rows,
+            metadata.training_summary.embargo_rows,
             metadata.training_summary.val_rows,
             metadata.training_summary.dataset_rows
         );
@@ -249,15 +254,7 @@ fn resolve_runtime_metadata_from_artifact(
                     )
                 })?;
             if let Some(embedded) = artifact.runtime_metadata.as_ref()
-                && (embedded.model_name != metadata.model_name
-                    || embedded.family != metadata.family
-                    || embedded.state != metadata.state
-                    || embedded.feature_columns != metadata.feature_columns
-                    || embedded.label_mapping != metadata.label_mapping
-                    || embedded.training_summary.dataset_rows
-                        != metadata.training_summary.dataset_rows
-                    || embedded.training_summary.train_rows != metadata.training_summary.train_rows
-                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows)
+                && embedded != &metadata
             {
                 bail!(
                     "runtime metadata sidecar mismatch with embedded isolation_forest metadata at {}",

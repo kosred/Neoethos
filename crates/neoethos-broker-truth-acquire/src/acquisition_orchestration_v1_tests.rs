@@ -1254,3 +1254,122 @@ fn public_entrypoint_is_concrete_and_runner_injection_remains_crate_private() {
     assert!(!library.contains("BrokerTruthCaptureRunnerV1"));
     assert!(!library.contains("execute_prepared_acquisition_with_runner_v1"));
 }
+
+fn finalist_input_with_config_identity(
+    search_config_hash: String,
+) -> (
+    TempDir,
+    crate::FinalistQuoteReplayAcquisitionInputV1,
+    PathBuf,
+) {
+    let Fixture {
+        _temp,
+        prepared,
+        store_root,
+        observations_path,
+        ..
+    } = Fixture::new();
+    let scope_path = observations_path
+        .parent()
+        .unwrap()
+        .join("canonical-search-artifact-scope.json");
+    let scope = CanonicalSearchArtifactScopeV2::from_json_bytes(&fs::read(scope_path).unwrap())
+        .expect("use the same exact scope as the real acquisition preflight");
+    let reviewed_replay_rule = prepared.authority_manifest().reviewed_synchronizations()[0]
+        .review_identity()
+        .clone();
+    let input = crate::FinalistQuoteReplayAcquisitionInputV1 {
+        prepared_acquisition: prepared,
+        canonical_search_input_receipt_sha256: scope.receipt_sha256().to_owned(),
+        holdout_scope_identity_sha256: scope.identity_sha256().unwrap(),
+        canonical_search_scope: scope,
+        canonical_signal_plan_sha256: digest(0x71),
+        portfolio_identity_sha256: digest(0x72),
+        search_config_hash,
+        locked_finalist_scope: neoethos_broker_truth::LockedFinalistOosReplayScopeV1::new(
+            window(),
+            0,
+            0,
+        )
+        .unwrap(),
+        reviewed_replay_rule,
+        max_entry_wait_ms: 1_000,
+        max_quote_staleness_ms: 1_000,
+        max_exit_wait_ms: 1_000,
+        latency_slippage: neoethos_broker_truth::VersionedLatencySlippagePolicyV1::new(
+            "test-only-config-identity-boundary",
+            0,
+            0,
+            0.0,
+            0.0001,
+        )
+        .unwrap(),
+    };
+    (_temp, input, store_root)
+}
+
+#[test]
+fn finalist_request_accepts_real_resolved_search_config_and_legacy_sha_without_capture() {
+    // Exercise the public Search stamp producer, not just a hand-written tag.
+    // The sizing-linked Search authority uses this same stable-JSON hash format.
+    let mut config = neoethos_search::DiscoveryConfig {
+        evaluation_symbol: "EURUSD".to_owned(),
+        timeframe_label: "M1".to_owned(),
+        // Explicit synthetic costs; unresolved production defaults are NaN.
+        evaluation_spread_pips: 1.0,
+        evaluation_commission_per_trade: 2.0,
+        ..neoethos_search::DiscoveryConfig::default()
+    };
+    config.target_profile.min_payoff_ratio = 0.0;
+    let inputs = neoethos_search::payoff_inputs_for_config(&config, 10.0);
+    let ceiling = neoethos_search::assert_payoff_floor_reachable(0.0, &inputs).unwrap();
+    let current = neoethos_search::stamp_resolved_config(&config, &inputs, ceiling, 10.0, false)
+        .unwrap()
+        .config_hash;
+    assert!(current.starts_with("fnv64:"));
+    for identity in [current, digest(0x73)] {
+        let (_temp, input, store_root) = finalist_input_with_config_identity(identity);
+        let _request = crate::FinalistQuoteReplayAcquisitionRequestV1::new(input)
+            .expect("Search identity must cross the finalist-acquisition boundary unchanged");
+        assert_eq!(fs::read_dir(store_root).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn finalist_request_rejects_invalid_config_and_never_accepts_fnv_as_an_artifact_digest() {
+    type Input = crate::FinalistQuoteReplayAcquisitionInputV1;
+    let cases: &[(&str, fn(&mut Input))] = &[
+        ("config sentinel", |input| {
+            input.search_config_hash = "fnv64:UNHASHABLE-test".to_owned();
+        }),
+        ("receipt", |input| {
+            input.canonical_search_input_receipt_sha256 = input.search_config_hash.clone();
+        }),
+        ("signal plan", |input| {
+            input.canonical_signal_plan_sha256 = input.search_config_hash.clone();
+        }),
+        ("portfolio", |input| {
+            input.portfolio_identity_sha256 = input.search_config_hash.clone();
+        }),
+        ("scope", |input| {
+            input.holdout_scope_identity_sha256 = input.search_config_hash.clone();
+        }),
+    ];
+    for (label, corrupt) in cases {
+        let (_temp, mut input, store_root) =
+            finalist_input_with_config_identity("fnv64:0123456789abcdef".to_owned());
+        corrupt(&mut input);
+        let error = crate::FinalistQuoteReplayAcquisitionRequestV1::new(input)
+            .err()
+            .unwrap_or_else(|| panic!("invalid {label} must fail before acquisition"));
+        assert!(
+            matches!(
+                error.code(),
+                crate::FinalistQuoteReplayAcquisitionErrorCodeV1::ArtifactDigestMismatch
+                    | crate::FinalistQuoteReplayAcquisitionErrorCodeV1::FinalistScopeMismatch
+            ),
+            "{label}: {error}"
+        );
+        assert_eq!(fs::read_dir(store_root).unwrap().count(), 0, "{label}");
+    }
+}

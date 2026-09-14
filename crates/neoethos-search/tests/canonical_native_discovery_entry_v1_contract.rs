@@ -95,6 +95,7 @@ fn public_failure_taxonomy_names_every_executor_boundary() {
         Stage::ExactSourcePin,
         Stage::NativePreflight,
         Stage::NativeAdmission,
+        Stage::ResidentFeatureScreening,
         Stage::ResidentDataMaterialization,
         Stage::NativeReceiptBinding,
         Stage::GenerationZeroEvaluation,
@@ -120,7 +121,7 @@ fn public_failure_taxonomy_names_every_executor_boundary() {
         Code::ResultSealingRejected,
         Code::PublicationRejected,
     ];
-    assert_eq!(stages.len(), 15);
+    assert_eq!(stages.len(), 16);
     assert_eq!(codes.len(), 17);
 }
 
@@ -163,11 +164,16 @@ fn source_contract_is_one_staged_native_pipeline_without_population_clone_or_reo
         "pin_exact_canonical_series_v1",
         "preflight_gpu_only_feature_workspace_v3",
         "prepare_gpu_only_feature_materialization_v3",
-        "preflight_canonical_native_generation_zero_result_v1",
-        "prepare_prepared_canonical_trendbar_research_run_input_capped_v5",
+        "acquire_discovery_run_device_admission_v1",
+        "prepare_resident_feature_screening_v2",
+        "seal_feature_screening_workspace_plan_v2",
+        "bind_feature_screening_gpu_workspace_plan_v2",
         "begin_prepared_gpu_only_feature_two_pass_v2",
         "stream_score_batches_v2",
         "seal_selected_map_v2",
+        "prepare_compact_selected_store_v2",
+        "preflight_canonical_native_generation_zero_result_v1",
+        "prepare_compact_selected_canonical_trendbar_research_run_input_capped_v6",
         "materialize_compact_selected_store_v2",
         "CanonicalGpuResidentSearchInputReceiptV3::from_resident_store",
         "run_prepared_canonical_trendbar_research_generation_zero_gated_typed_v5",
@@ -184,11 +190,16 @@ fn source_contract_is_one_staged_native_pipeline_without_population_clone_or_reo
         "pin_exact_canonical_series_v1",
         "preflight_gpu_only_feature_workspace_v3",
         "prepare_gpu_only_feature_materialization_v3",
+        "acquire_discovery_run_device_admission_v1",
+        "prepare_resident_feature_screening_v2",
+        "seal_feature_screening_workspace_plan_v2",
+        "bind_feature_screening_gpu_workspace_plan_v2",
         "begin_prepared_gpu_only_feature_two_pass_v2",
         "stream_score_batches_v2",
         "seal_selected_map_v2",
+        "prepare_compact_selected_store_v2",
         "preflight_canonical_native_generation_zero_result_v1",
-        "prepare_prepared_canonical_trendbar_research_run_input_capped_v5",
+        "prepare_compact_selected_canonical_trendbar_research_run_input_capped_v6",
         "materialize_compact_selected_store_v2",
         "run_prepared_canonical_trendbar_research_generation_zero_gated_typed_v5",
         "seal_canonical_native_generation_zero_research_result_v1",
@@ -203,36 +214,10 @@ fn source_contract_is_one_staged_native_pipeline_without_population_clone_or_reo
 
     let seal_position = pipeline.find("seal_selected_map_v2(").unwrap();
     let selected_map_binding = let_binding_for_call(pipeline, "seal_selected_map_v2(");
-    let selected_count_call = format!("{selected_map_binding}.selected_column_count()");
-    let selected_count_position = pipeline.find(&selected_count_call).unwrap_or_else(|| {
-        panic!("sealed receipt `{selected_map_binding}` never supplies its count")
-    });
-    let result_preflight_position = pipeline
-        .find("preflight_canonical_native_generation_zero_result_v1(")
-        .unwrap();
+    let compact_call = parenthesized_call(pipeline, "prepare_compact_selected_store_v2(");
     assert!(
-        seal_position < selected_count_position
-            && selected_count_position < result_preflight_position,
-        "selected-map seal and compact selected count must precede result preflight"
-    );
-
-    let result_preflight = parenthesized_call(
-        pipeline,
-        "preflight_canonical_native_generation_zero_result_v1(",
-    );
-    if !result_preflight.contains(&selected_count_call) {
-        let compact_count_binding = let_binding_for_call(pipeline, &selected_count_call);
-        assert!(
-            result_preflight.contains(compact_count_binding),
-            "result preflight must consume the compact selected count"
-        );
-    }
-
-    let compact_materialization =
-        parenthesized_call(pipeline, "materialize_compact_selected_store_v2(");
-    assert!(
-        compact_materialization.contains(selected_map_binding),
-        "compact materialization must consume the exact sealed selected-map receipt"
+        compact_call.contains(selected_map_binding),
+        "compact preparation must consume the exact sealed selected-map receipt"
     );
     for forbidden in [
         format!("&{selected_map_binding}"),
@@ -240,8 +225,72 @@ fn source_contract_is_one_staged_native_pipeline_without_population_clone_or_reo
         format!("Arc::clone(&{selected_map_binding})"),
     ] {
         assert!(
-            !compact_materialization.contains(&forbidden),
-            "Search must move the sealed selected-map receipt by value, not `{forbidden}`"
+            !compact_call.contains(&forbidden),
+            "compact preparation must move the selected-map receipt, not `{forbidden}`"
+        );
+    }
+    let compact_binding = let_binding_for_call(pipeline, "prepare_compact_selected_store_v2(");
+    let selected_count_call = format!("{compact_binding}.workspace_extent().column_count()");
+    let selected_count_position = pipeline.find(&selected_count_call).unwrap_or_else(|| {
+        panic!("compact receipt `{compact_binding}` never supplies its selected width")
+    });
+    let result_preflight_position = pipeline
+        .find("preflight_canonical_native_generation_zero_result_v1(")
+        .unwrap();
+    assert!(
+        seal_position < selected_count_position
+            && selected_count_position < result_preflight_position,
+        "selected-map seal, compact preparation and selected width must precede result preflight"
+    );
+
+    let result_preflight = parenthesized_call(
+        pipeline,
+        "preflight_canonical_native_generation_zero_result_v1(",
+    );
+    let selected_count_binding = let_binding_for_call(pipeline, &selected_count_call);
+    assert!(
+        result_preflight.contains(selected_count_binding),
+        "result preflight must consume the compact selected width"
+    );
+
+    let compact_finalizer = parenthesized_call(
+        pipeline,
+        "prepare_compact_selected_canonical_trendbar_research_run_input_capped_v6(",
+    );
+    assert!(
+        compact_finalizer.contains(compact_binding),
+        "population sizing must consume the exact compact replay recipe"
+    );
+    assert!(
+        compact_finalizer.contains("screening_scope"),
+        "population sizing must consume the exact selection/holdout scope resolved before the two-pass run"
+    );
+    assert!(
+        compact_finalizer.contains("materialize_compact_selected_store_v2(admitted)"),
+        "the admitted compact recipe must be the only final resident materializer"
+    );
+    for forbidden in [
+        format!("&{compact_binding}"),
+        format!("{compact_binding}.clone()"),
+        format!("Arc::clone(&{compact_binding})"),
+    ] {
+        assert!(
+            !compact_finalizer.contains(&forbidden),
+            "Search must move the compact replay recipe by value, not `{forbidden}`"
+        );
+    }
+
+    assert_eq!(
+        pipeline
+            .matches("acquire_discovery_run_device_admission_v1(")
+            .count(),
+        1,
+        "the production path must acquire exactly one CUDA admission"
+    );
+    for forbidden in ["runtime_available()", "device_count()"] {
+        assert!(
+            !pipeline.contains(forbidden),
+            "the one-shot CUDA path must not perform a second probe through `{forbidden}`"
         );
     }
 
@@ -266,6 +315,16 @@ fn source_contract_is_one_staged_native_pipeline_without_population_clone_or_reo
         !pipeline.contains("materialize_prepared_gpu_only_feature_store_for_data_population_v3"),
         "production native pipeline must not reopen the unfiltered resident-store materializer"
     );
+    for obsolete in [
+        "prepare_staged_canonical_trendbar_research_run_input_v5",
+        "prepare_prepared_canonical_trendbar_research_run_input_capped_v5",
+        "begin_gpu_resident_trim_prefilter_view_v1",
+    ] {
+        assert!(
+            !pipeline.contains(obsolete),
+            "superseded production path remains reachable through `{obsolete}`"
+        );
+    }
 
     assert!(pipeline.matches("probe_cancellation_v1(").count() >= 6);
     assert!(pipeline.contains("ExecutorCancellationMarkerV1"));

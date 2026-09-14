@@ -43,10 +43,14 @@ pub fn risk_constrained_kelly(
 ) -> f64 {
     let p = win_rate;
     let rr = reward_to_risk;
-    if !(p > 0.0 && p < 1.0)
-        || !(rr > 0.0 && rr.is_finite())
-        || !(dd_level > 0.0 && dd_level < 1.0)
-        || !(dd_prob > 0.0 && dd_prob < 1.0)
+    if !(p > 0.0
+        && p < 1.0
+        && rr > 0.0
+        && rr.is_finite()
+        && dd_level > 0.0
+        && dd_level < 1.0
+        && dd_prob > 0.0
+        && dd_prob < 1.0)
     {
         return 0.0;
     }
@@ -104,7 +108,7 @@ pub fn risk_constrained_kelly(
 /// Fail-safe zeros: fewer than 30 finite samples, non-positive mean edge, or
 /// NO observed loss (a tail we have never seen cannot be sized against).
 pub fn risk_constrained_kelly_empirical(r_sample: &[f64], dd_level: f64, dd_prob: f64) -> f64 {
-    if !(dd_level > 0.0 && dd_level < 1.0) || !(dd_prob > 0.0 && dd_prob < 1.0) {
+    if !(dd_level > 0.0 && dd_level < 1.0 && dd_prob > 0.0 && dd_prob < 1.0) {
         return 0.0;
     }
     let rs: Vec<f64> = r_sample.iter().copied().filter(|r| r.is_finite()).collect();
@@ -213,7 +217,7 @@ mod tests {
     fn sample(wins: usize, win_r: f64, losses: &[(usize, f64)]) -> Vec<f64> {
         let mut v = vec![win_r; wins];
         for &(count, loss_r) in losses {
-            v.extend(std::iter::repeat(loss_r).take(count));
+            v.extend(std::iter::repeat_n(loss_r, count));
         }
         v
     }

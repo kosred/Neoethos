@@ -95,20 +95,8 @@ pub(crate) const RETIRED_ENV_VARS: &[(&str, &str)] = &[
         "the per-lane device_override the scheduler passes (default device 0)",
     ),
     (
-        "NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE",
-        "the per-lane device_override the scheduler passes",
-    ),
-    (
-        "NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES",
-        "the scheduler's per-process device assignment",
-    ),
-    (
         "NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES",
         "the scheduler's per-process device assignment",
-    ),
-    (
-        "NEOETHOS_BOT_SEARCH_USE_IGPU",
-        "the hardware probe (an integrated GPU is detected, not declared)",
     ),
     (
         "NEOETHOS_GPU_FUSED_EVAL",
@@ -494,7 +482,6 @@ pub struct GpuLaneProfile {
     /// `cfg!(feature = "gpu")` — was any GPU lane compiled in at all?
     pub compiled_gpu: bool,
     pub compiled_gpu_cuda: bool,
-    pub compiled_gpu_vulkan: bool,
     /// Resolved evaluation backend policy (device / fallback / accelerator),
     /// from [`crate::backend::current_evaluation_backend`] — the exact value
     /// `evaluate_population_core_with_backend` dispatches on.
@@ -521,14 +508,10 @@ pub struct GpuLaneProfile {
     /// GPU windowing and can demote work to the CPU lane.
     pub host_budget_mb: Option<u64>,
     pub vram_budget_mb: Option<u64>,
-    pub gpu_buffer_mb: Option<usize>,
-    /// Raw device/budget env overrides as seen by this process. Recorded raw
+    /// Raw CUDA device/budget env overrides as seen by this process. Recorded raw
     /// because their resolvers live inside cfg-gated GPU code with
     /// per-call-site defaults; the raw value is what those resolvers see.
-    pub wgpu_device_env: Option<String>,
-    pub multi_wgpu_devices_env: Option<String>,
     pub multi_cuda_devices_env: Option<String>,
-    pub use_igpu_env: Option<String>,
     pub gpu_buffer_mb_env: Option<String>,
     pub vram_budget_mb_env: Option<String>,
     pub host_budget_mb_env: Option<String>,
@@ -611,7 +594,6 @@ impl ExecutionEnvironmentProfile {
             gpu: GpuLaneProfile {
                 compiled_gpu: cfg!(feature = "gpu"),
                 compiled_gpu_cuda: cfg!(feature = "gpu-cuda"),
-                compiled_gpu_vulkan: cfg!(feature = "gpu-vulkan"),
                 backend_device: format!("{:?}", backend.device),
                 backend_fallback: format!("{:?}", backend.fallback),
                 backend_accelerator: format!("{:?}", backend.accelerator_hint),
@@ -625,11 +607,7 @@ impl ExecutionEnvironmentProfile {
                 cuda_device_id: cuda_knobs().map(|k| k.5),
                 host_budget_mb: memory_budgets().map(|b| b.0),
                 vram_budget_mb: memory_budgets().map(|b| b.1),
-                gpu_buffer_mb: memory_budgets().map(|b| b.2),
-                wgpu_device_env: raw_env("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE"),
-                multi_wgpu_devices_env: raw_env("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES"),
                 multi_cuda_devices_env: raw_env("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICES"),
-                use_igpu_env: raw_env("NEOETHOS_BOT_SEARCH_USE_IGPU"),
                 gpu_buffer_mb_env: raw_env("NEOETHOS_BOT_SEARCH_GPU_BUFFER_MB"),
                 vram_budget_mb_env: raw_env("NEOETHOS_BOT_SEARCH_VRAM_BUDGET_MB"),
                 host_budget_mb_env: raw_env("NEOETHOS_BOT_SEARCH_HOST_BUDGET_MB"),
@@ -686,12 +664,12 @@ fn cuda_knobs() -> Option<(String, bool, bool, Option<u32>, Option<u32>, usize)>
 }
 
 #[cfg(feature = "gpu")]
-fn memory_budgets() -> Option<(u64, u64, usize)> {
+fn memory_budgets() -> Option<(u64, u64)> {
     crate::cubecl_eval::memory_budgets_for_profile()
 }
 
 #[cfg(not(feature = "gpu"))]
-fn memory_budgets() -> Option<(u64, u64, usize)> {
+fn memory_budgets() -> Option<(u64, u64)> {
     None
 }
 

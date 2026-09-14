@@ -62,7 +62,12 @@ async fn busy_native_lease_rejects_both_legacy_http_starts_before_settings_or_da
         .oneshot(
             Request::post("/engines/training/start")
                 .header("content-type", "application/json")
-                .body(Body::from("{}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "training_handoff": "a".repeat(64),
+                    }))
+                    .unwrap(),
+                ))
                 .expect("training request"),
         )
         .await
@@ -77,6 +82,20 @@ async fn busy_native_lease_rejects_both_legacy_http_starts_before_settings_or_da
     let released = try_acquire_process_execution_lease_v1(ProcessExecutionKindV1::Migration)
         .expect("Busy HTTP losers must not retain or replace the held authority");
     drop(released);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn training_without_a_discovery_handoff_is_rejected_before_work() {
+    let response = router(AppApiState::new())
+        .oneshot(
+            Request::post("/engines/training/start")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 fn function_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
@@ -102,7 +121,7 @@ fn legacy_http_routes_delegate_to_the_typed_lease_lane_and_keep_exact_selection(
         "TypedDiscoveryDatasetPolicyV1::Exact",
         "start_typed_discovery_execution_v1",
         "await_admission_v1().await",
-        "training_after_success: true",
+        "training_after_success: false",
         "detach_typed_legacy_execution_observer_v1",
     ] {
         assert!(
@@ -131,8 +150,10 @@ fn legacy_http_routes_delegate_to_the_typed_lease_lane_and_keep_exact_selection(
     assert!(training.contains("start_typed_training_execution_v1"));
     assert!(training.contains("await_admission_v1().await"));
     assert!(training.contains("detach_typed_legacy_execution_observer_v1"));
-    assert!(training.contains("TypedTrainingSelectionPolicyV1::Configured"));
-    assert!(training.contains("TypedTrainingSelectionPolicyV1::Exact"));
+    assert!(training.contains("TypedTrainingSelectionPolicyV1::DiscoveryHandoff"));
+    assert!(training.contains("identity_sha256: body.training_handoff"));
+    assert!(!training.contains("TypedTrainingSelectionPolicyV1::Configured"));
+    assert!(!training.contains("TypedTrainingSelectionPolicyV1::Exact"));
     for forbidden in [
         "Settings::from_yaml",
         "start_training_job",
@@ -153,11 +174,11 @@ fn legacy_http_routes_delegate_to_the_typed_lease_lane_and_keep_exact_selection(
         "Exact(SelectedDatasetGenerationV1)",
         "enum TypedTrainingSelectionPolicyV1",
         "enum TypedLegacyExecutionAdmissionV1",
-        "transition_discovery_to_training_v1()",
+        "let _lease = lease;",
     ] {
         assert!(
             typed.contains(required),
-            "missing typed exact/same-token seam: {required}"
+            "missing typed exact/owned-lease seam: {required}"
         );
     }
     let start = typed
@@ -171,20 +192,40 @@ fn legacy_http_routes_delegate_to_the_typed_lease_lane_and_keep_exact_selection(
         .find("spawn_discovery_worker_v1")
         .expect("leased worker spawn");
     let settings = tail
-        .find("Settings::from_yaml")
+        .find("DiscoverySettingsSource::load(&config_path)")
         .expect("leased Settings load");
     assert!(acquire < worker && worker < settings);
 
-    let transition = typed
-        .find("transition_discovery_to_training_v1()")
-        .expect("same-token transition");
-    let training_run = typed[transition..]
-        .find("run_training_intent_v1(")
-        .map(|offset| transition + offset)
-        .expect("training continuation");
-    let reacquire = typed[transition..training_run].find("try_acquire_process_execution_lease_v1");
-    assert!(
-        reacquire.is_none(),
-        "Discovery success must transition the owned lease without a release/reacquire gap",
+    let worker = function_body(
+        typed,
+        "fn spawn_discovery_worker_v1(",
+        "fn spawn_training_worker_v1(",
     );
+    assert!(worker.contains("let mut lease = lease;"));
+    assert!(worker.contains("let expected_series = request.pinned_input.receipt().clone();"));
+    assert!(worker.contains("if intent.training_after_success {"));
+    assert!(worker.contains("continue_discovery_training_v1("));
+    assert!(worker.contains("run_training_intent_v1("));
+    assert!(worker.contains("Some(expected_series)"));
+    assert!(!worker.contains("start_typed_training_execution_v1("));
+    assert!(!worker.contains("start_training_job("));
+    let continuation = function_body(
+        typed,
+        "async fn continue_discovery_training_v1<",
+        "async fn prepare_discovery_request_v1(",
+    );
+    assert!(continuation.contains("TypedTrainingSelectionPolicyV1::DiscoveryHandoff"));
+    assert!(!continuation.contains("TypedTrainingSelectionPolicyV1::Exact"));
+    assert!(!continuation.contains("try_acquire_process_execution_lease_v1"));
+    let transition = continuation
+        .find("transition_discovery_to_training_v1()")
+        .unwrap();
+    assert!(
+        continuation
+            .find("discovery_snapshot.state != JobState::Succeeded")
+            .unwrap()
+            < transition
+    );
+    assert!(continuation.find("handoff::handoff_path(").unwrap() < transition);
+    assert!(transition < continuation.find("run_training(intent).await").unwrap());
 }

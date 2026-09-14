@@ -52,6 +52,11 @@
 #include <cmath>
 #include <cstdint>
 
+// M_PI is not standard C++; preserve binary64 pi on MSVC as well.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846264338327950288
+#endif
+
 #define STS_STYLE_MEAN          0
 #define STS_STYLE_SMOOTH_MEDIAN 1
 #define STS_STYLE_MEDIAN        2

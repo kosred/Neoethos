@@ -10,24 +10,28 @@
 //! in one place keeps the route modules thin.
 
 use anyhow::{Context, Result, anyhow};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::app_services::broker_config::CTraderBrokerEnvironment;
-use crate::app_services::broker_deal_economics::BrokerSymbolVolumeScaleEvidenceV1;
+use crate::app_services::broker_deal_economics::{
+    BrokerSymbolVolumeScaleEvidenceV1, MAX_EXACT_BROKER_VOLUME, broker_lots_from_wire_volume_v1,
+};
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot, CTraderCashFlowBundle,
-    CTraderCtidProfileSnapshot, CTraderExpectedMarginBundle, CTraderOrderHistoryBundle,
-    CTraderServerVersionSnapshot, ensure_success_payload_type, load_account_runtime,
-    parse_cash_flow_history_response, parse_ctid_profile_response, parse_expected_margin_response,
-    parse_order_list_response, parse_reconcile_response, parse_trader_response,
-    parse_version_response,
+    CTraderCtidProfileSnapshot, CTraderDealListBundle, CTraderExpectedMarginBundle,
+    CTraderOrderHistoryBundle, CTraderServerVersionSnapshot, ensure_success_payload_type,
+    load_account_runtime, parse_cash_flow_history_response, parse_ctid_profile_response,
+    parse_deal_list_bundle_response, parse_expected_margin_response, parse_order_list_response,
+    parse_reconcile_response, parse_trader_response, parse_version_response,
+    reconcile_broker_unrealized_pnl,
 };
 use crate::app_services::ctrader_auth::CTraderTokenBundle;
 use crate::app_services::ctrader_data::{
     CTraderChartHistoryRequest, CTraderHistoricalBarsFetchResult, CTraderLightSymbolInfo,
     CTraderResolvedSymbol, CTraderSymbolLookupRequest, CTraderSymbolsListResult, HistoricalBar,
-    load_historical_bars_only, parse_asset_class_list_response,
+    load_historical_bars_only, parse_asset_class_list_response, parse_symbol_by_id_response,
     parse_symbol_category_list_response, parse_symbols_list_response, resolve_symbol,
 };
 use crate::app_services::ctrader_execution::{
@@ -42,17 +46,18 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_CASH_FLOW_HISTORY_LIST_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_CTID_PROFILE_BY_TOKEN_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_MARGIN_CALL_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE, CTraderMarginCallListSnapshot,
-    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
-    build_application_auth_request, build_asset_class_list_request,
-    build_cash_flow_history_list_request, build_expected_margin_request,
-    build_get_ctid_profile_by_token_request, build_get_position_unrealized_pnl_request,
-    build_margin_call_list_request, build_order_list_request, build_reconcile_request,
+    CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_VERSION_RESPONSE_PAYLOAD_TYPE,
+    CTraderDealListRequest, CTraderMarginCallListSnapshot, CTraderOpenApiTransport,
+    ProductionCTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
+    build_asset_class_list_request, build_cash_flow_history_list_request, build_deal_list_request,
+    build_expected_margin_request, build_get_ctid_profile_by_token_request,
+    build_get_position_unrealized_pnl_request, build_margin_call_list_request,
+    build_order_list_request, build_reconcile_request, build_symbol_by_id_request,
     build_symbol_category_list_request, build_symbols_list_request, build_trader_request,
     build_version_request, parse_get_position_unrealized_pnl_response,
     parse_margin_call_list_response,
@@ -63,6 +68,27 @@ use crate::app_services::ctrader_messages::{
     CTraderTradeSide,
 };
 use crate::app_services::secure_store::production_ctrader_token_store;
+
+/// cTrader's bounded recent-trendbar response ceiling. Callers that need more
+/// history must use the paged canonical-history capture path instead of
+/// pretending a one-page live snapshot is complete.
+pub(crate) const CTRADER_RECENT_TRENDBAR_LIMIT: usize = 5_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecentTrendbarPurpose {
+    DisplayOnly,
+    CanonicalEvidence,
+}
+
+impl RecentTrendbarPurpose {
+    fn validate_pagination(self, has_more: bool) -> Result<()> {
+        anyhow::ensure!(
+            !has_more || self == Self::DisplayOnly,
+            "cTrader reported hasMore; an incomplete page cannot become a canonical live-feature snapshot"
+        );
+        Ok(())
+    }
+}
 
 /// What `/broker/symbols` ultimately returns over the wire — kept here
 /// so the server module just shovels it to JSON.
@@ -118,6 +144,90 @@ pub struct HistoricalDownloadOutcome {
     pub dataset_identity: String,
     pub generation: String,
     pub durable_commit_id: String,
+}
+
+/// One exact, in-memory cTrader trendbar response together with the broker
+/// identity and request bounds needed to publish it through the canonical
+/// Vortex boundary. Unlike a bare `Vec<HistoricalBar>`, this cannot silently
+/// lose the environment/account/symbol/timeframe authority of its source.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RecentBrokerTrendbarSnapshot {
+    pub(crate) identity: neoethos_data::CanonicalDatasetIdentity,
+    pub(crate) requested_from_ms: i64,
+    pub(crate) requested_to_ms: i64,
+    pub(crate) retrieved_unix_ms: u64,
+    pub(crate) bars: Vec<HistoricalBar>,
+}
+
+impl RecentBrokerTrendbarSnapshot {
+    pub(crate) fn identity(&self) -> &neoethos_data::CanonicalDatasetIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn bars(&self) -> &[HistoricalBar] {
+        &self.bars
+    }
+
+    fn into_bars(self) -> Vec<HistoricalBar> {
+        self.bars
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_with_empty_policy(false)
+    }
+
+    fn validate_with_empty_policy(&self, allow_empty: bool) -> Result<()> {
+        anyhow::ensure!(
+            self.identity.is_broker_real(),
+            "recent trendbar snapshot is not bound to a broker identity"
+        );
+        anyhow::ensure!(
+            self.identity.bar_timestamp_convention()
+                == neoethos_data::BarTimestampConvention::BarOpen,
+            "recent trendbar snapshot does not use canonical bar-open timestamps"
+        );
+        anyhow::ensure!(
+            self.requested_from_ms < self.requested_to_ms,
+            "recent trendbar snapshot request range is empty or descending"
+        );
+        if self.bars.is_empty() {
+            anyhow::ensure!(
+                allow_empty,
+                "recent trendbar snapshot contains zero broker rows"
+            );
+            return Ok(());
+        }
+        validate_broker_bar_order(&self.bars, "recent cTrader trendbar snapshot")?;
+        for (row, bar) in self.bars.iter().enumerate() {
+            anyhow::ensure!(
+                bar.timestamp_ms >= self.requested_from_ms
+                    && bar.timestamp_ms < self.requested_to_ms,
+                "recent trendbar row {row} timestamp {} is outside request [{}, {})",
+                bar.timestamp_ms,
+                self.requested_from_ms,
+                self.requested_to_ms
+            );
+            anyhow::ensure!(
+                [bar.open, bar.high, bar.low, bar.close]
+                    .into_iter()
+                    .all(f64::is_finite),
+                "recent trendbar row {row} contains a non-finite OHLC price"
+            );
+            anyhow::ensure!(
+                bar.high >= bar.open
+                    && bar.high >= bar.close
+                    && bar.high >= bar.low
+                    && bar.low <= bar.open
+                    && bar.low <= bar.close,
+                "recent trendbar row {row} has incoherent OHLC bounds"
+            );
+            anyhow::ensure!(
+                bar.volume.is_none_or(|volume| volume >= 0),
+                "recent trendbar row {row} has negative tick volume"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Resolve broker credentials + token bundle into the four primitives
@@ -269,7 +379,7 @@ fn resolve_creds_expecting(expected_is_live: Option<bool>) -> Result<ResolvedCre
     if ct.client_id.is_empty() || ct.client_secret.is_empty() {
         return Err(anyhow!(
             "cTrader client_id / client_secret are empty in \
-             broker_credentials.toml; the wizard / --reauth must run first"
+             broker_credentials.toml. Save them in Broker Setup, then run Re-authenticate."
         ));
     }
     // Prefer the account explicitly marked for execution (mirrors the spot
@@ -579,12 +689,62 @@ pub fn fetch_recent_chart_bars_blocking(
     if limit == 0 {
         return Ok(Vec::new());
     }
+    let as_of_ms = current_unix_time_ms_i64()?;
+    Ok(fetch_recent_broker_trendbar_snapshot_at_inner(
+        symbol,
+        timeframe,
+        limit,
+        as_of_ms,
+        RecentTrendbarPurpose::DisplayOnly,
+    )?
+    .into_bars())
+}
+
+/// Fetch one recent broker snapshot and retain its exact cTrader identity and
+/// request bounds so live feature construction can publish verified canonical
+/// artifacts instead of fabricating an empty authority map.
+pub(crate) fn fetch_recent_broker_trendbar_snapshot_blocking(
+    symbol: &str,
+    timeframe: &str,
+    limit: usize,
+) -> Result<RecentBrokerTrendbarSnapshot> {
+    let as_of_ms = current_unix_time_ms_i64()?;
+    fetch_recent_broker_trendbar_snapshot_at_blocking(symbol, timeframe, limit, as_of_ms)
+}
+
+/// Same operation with a caller-owned inclusive cTrader `toTimestamp`. The
+/// parity harness uses one shared value for its long and short requests and
+/// then proves that the short response is the exact tail of the long response.
+pub(crate) fn fetch_recent_broker_trendbar_snapshot_at_blocking(
+    symbol: &str,
+    timeframe: &str,
+    limit: usize,
+    as_of_ms: i64,
+) -> Result<RecentBrokerTrendbarSnapshot> {
+    fetch_recent_broker_trendbar_snapshot_at_inner(
+        symbol,
+        timeframe,
+        limit,
+        as_of_ms,
+        RecentTrendbarPurpose::CanonicalEvidence,
+    )
+}
+
+fn fetch_recent_broker_trendbar_snapshot_at_inner(
+    symbol: &str,
+    timeframe: &str,
+    limit: usize,
+    as_of_ms: i64,
+    purpose: RecentTrendbarPurpose,
+) -> Result<RecentBrokerTrendbarSnapshot> {
+    anyhow::ensure!(limit > 0, "recent cTrader trendbar limit must be positive");
+    anyhow::ensure!(
+        limit <= CTRADER_RECENT_TRENDBAR_LIMIT,
+        "recent cTrader trendbar limit {limit} exceeds the one-page ceiling {CTRADER_RECENT_TRENDBAR_LIMIT}; use paged canonical history capture"
+    );
+    anyhow::ensure!(as_of_ms >= 0, "recent cTrader as-of timestamp is negative");
     let creds = resolve_creds()?;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let from_ms = chart_fetch_from_ms(timeframe, now_ms, limit)?;
+    let from_ms = chart_fetch_from_ms(timeframe, as_of_ms, limit)?;
     // Window wide enough to contain `limit` bars with generous headroom
     // for weekends / holidays / illiquid gaps (markets aren't open 24/7,
     // so a tight window would starve the requested count). cTrader caps a
@@ -599,23 +759,69 @@ pub fn fetch_recent_chart_bars_blocking(
         symbol_name: symbol.to_string(),
         timeframe: timeframe.to_string(),
         from_timestamp_ms: from_ms,
-        to_timestamp_ms: now_ms,
-        count: Some(limit as u32),
+        to_timestamp_ms: as_of_ms,
+        count: Some(u32::try_from(limit).context("recent cTrader trendbar limit exceeds u32")?),
     };
     let CTraderHistoricalBarsFetchResult {
-        mut bars, has_more, ..
+        symbol: resolved_symbol,
+        symbol_id,
+        timeframe: resolved_timeframe,
+        mut bars,
+        has_more,
     } = load_historical_bars_only(&request)?;
-    if has_more {
-        return Err(anyhow!(
-            "cTrader reported hasMore for the bounded recent-chart request"
-        ));
-    }
+    // `count` deliberately bounds a display page. hasMore is pagination, not
+    // corrupt OHLC data. Only the display caller may accept that page; the
+    // canonical-feature callers still require complete response evidence.
+    purpose.validate_pagination(has_more)?;
     validate_broker_bar_order(&bars, "recent cTrader chart response")?;
     // The broker may return a few more than requested — keep trailing N.
     if bars.len() > limit {
         bars.drain(0..bars.len() - limit);
     }
-    Ok(bars)
+    let requested_timeframe = parse_canonical_timeframe(timeframe)?;
+    anyhow::ensure!(
+        resolved_timeframe == requested_timeframe,
+        "recent cTrader trendbar response timeframe {resolved_timeframe} disagrees with request {requested_timeframe}"
+    );
+    let dataset_environment = match creds.environment {
+        CTraderEnvironment::Live => neoethos_data::CTraderEnvironment::Live,
+        CTraderEnvironment::Demo => neoethos_data::CTraderEnvironment::Demo,
+    };
+    let account_id = creds
+        .account_id_str
+        .parse::<i64>()
+        .context("configured cTrader account id is not a signed 64-bit integer")?;
+    let identity = neoethos_data::CanonicalDatasetIdentity::ctrader(
+        dataset_environment,
+        creds.environment.endpoint_host(),
+        account_id,
+        symbol_id,
+        resolved_symbol.symbol_name,
+        resolved_timeframe,
+        neoethos_data::BarTimestampConvention::BarOpen,
+    )
+    .map_err(|error| anyhow!(error.to_string()))?;
+    let requested_to_ms = as_of_ms
+        .checked_add(1)
+        .context("recent cTrader half-open upper bound overflows i64")?;
+    let snapshot = RecentBrokerTrendbarSnapshot {
+        identity,
+        requested_from_ms: from_ms,
+        requested_to_ms,
+        retrieved_unix_ms: u64::try_from(current_unix_time_ms_i64()?)
+            .context("recent cTrader retrieval timestamp is negative")?,
+        bars,
+    };
+    snapshot.validate_with_empty_policy(purpose == RecentTrendbarPurpose::DisplayOnly)?;
+    Ok(snapshot)
+}
+
+fn current_unix_time_ms_i64() -> Result<i64> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis();
+    i64::try_from(millis).context("Unix timestamp milliseconds exceed i64")
 }
 
 /// Fetch up to `limit` OHLCV bars ENDING strictly before `before_ms`,
@@ -641,44 +847,16 @@ pub fn fetch_chart_bars_before_blocking(
     if limit == 0 || before_ms <= 0 {
         return Ok(Vec::new());
     }
-    let creds = resolve_creds()?;
-    let from_ms = chart_fetch_from_ms(timeframe, before_ms, limit)?;
-    // Same generous headroom as the recent-bars path: markets aren't open
-    // 24/7, so the wall-clock window must be wider than `limit × step` to
-    // actually contain `limit` bars. `count` bounds the response so the
-    // wide window never over-fetches.
-    let request = CTraderChartHistoryRequest {
-        client_id: creds.client_id.clone(),
-        client_secret: creds.client_secret.clone(),
-        access_token: creds.access_token.clone(),
-        environment: creds.environment,
-        account_id: creds.account_id_str.clone(),
-        symbol_name: symbol.to_string(),
-        timeframe: timeframe.to_string(),
-        from_timestamp_ms: from_ms,
-        to_timestamp_ms: before_ms,
-        count: Some(limit as u32),
-    };
-    let CTraderHistoricalBarsFetchResult {
-        mut bars, has_more, ..
-    } = load_historical_bars_only(&request)?;
-    if has_more {
-        return Err(anyhow!(
-            "cTrader reported hasMore for the bounded historical-chart request"
-        ));
-    }
-    validate_broker_bar_order(&bars, "historical cTrader chart response")?;
-    if let Some(bar) = bars.iter().find(|bar| bar.timestamp_ms >= before_ms) {
-        return Err(anyhow!(
-            "cTrader returned chart bar {} at/after exclusive cursor {before_ms}",
-            bar.timestamp_ms
-        ));
-    }
-    if bars.len() > limit {
-        let cut = bars.len() - limit;
-        bars.drain(0..cut);
-    }
-    Ok(bars)
+    // Broker toTimestamp is inclusive; the UI cursor is exclusive. Reuse
+    // the same bounded fetch and OHLC/identity checks as the initial page.
+    Ok(fetch_recent_broker_trendbar_snapshot_at_inner(
+        symbol,
+        timeframe,
+        limit,
+        before_ms - 1,
+        RecentTrendbarPurpose::DisplayOnly,
+    )?
+    .into_bars())
 }
 
 /// Duration of a single bar for the canonical timeframe, in ms. Used to
@@ -768,6 +946,27 @@ struct PreparedNewOrder {
     volume_scale_evidence: BrokerSymbolVolumeScaleEvidenceV1,
     relative_stop_loss: Option<i64>,
     relative_take_profit: Option<i64>,
+    broker_allows_new_positions: bool,
+    broker_allows_short_selling: bool,
+}
+
+fn ensure_broker_allows_new_order(
+    symbol: &str,
+    side: OrderSide,
+    broker_allows_new_positions: bool,
+    broker_allows_short_selling: bool,
+) -> Result<()> {
+    if !broker_allows_new_positions {
+        return Err(anyhow!(
+            "broker full-symbol metadata does not report tradingMode=ENABLED for {symbol}; refusing to open a new position"
+        ));
+    }
+    if side == OrderSide::Sell && !broker_allows_short_selling {
+        return Err(anyhow!(
+            "broker full-symbol metadata forbids short selling for {symbol}; refusing the sell-to-open order"
+        ));
+    }
+    Ok(())
 }
 
 fn wire_volume_from_broker_lot_size(volume_lots: f64, lot_size_cents: i64) -> Result<i64> {
@@ -833,6 +1032,47 @@ fn relative_distance_from_broker_symbol(pips: f64, digits: i32, pip_position: i3
     Ok(snapped as i64)
 }
 
+// Preserve the existing entry/resting-amend halt; close/reduce routes do not use it.
+fn ensure_entry_margin_halt_clear() -> Result<()> {
+    crate::app_services::margin_call::ensure_spawned();
+    if let Some(halt) = crate::app_services::margin_call::active_halt() {
+        return Err(anyhow!(
+            "REFUSING to open a position: {}. No order is sent. Reduce exposure \
+             (closing positions and amending stops are still allowed) and restart \
+             the backend to clear the halt once the account is healthy.",
+            halt.describe()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_order_volume_and_brackets(
+    volume_lots: Option<f64>,
+    stop_loss_pips: Option<f64>,
+    take_profit_pips: Option<f64>,
+) -> Result<()> {
+    if let Some(volume_lots) = volume_lots {
+        if !(volume_lots.is_finite() && volume_lots > 0.0) {
+            return Err(anyhow!(
+                "volume_lots must be a finite positive number (got {volume_lots})"
+            ));
+        }
+    }
+    for (name, val) in [
+        ("stop_loss_pips", stop_loss_pips),
+        ("take_profit_pips", take_profit_pips),
+    ] {
+        if let Some(v) = val {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(anyhow!(
+                    "{name} must be a finite positive number when set (got {v})"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate inputs, resolve the symbol, convert lots→wire volume (bounds-checked)
 /// and derive tick-aligned relative SL/TP exclusively from the resolved
 /// `ProtoOASymbol` contract.
@@ -842,6 +1082,7 @@ fn prepare_new_order(
     stop_loss_pips: Option<f64>,
     take_profit_pips: Option<f64>,
     expected_is_live: Option<bool>,
+    expected_account_id: Option<i64>,
 ) -> Result<PreparedNewOrder> {
     // ── #238: the margin-call halt, applied at the single choke point ──────
     // Both order-OPENING paths (`submit_market_order_blocking` and
@@ -865,38 +1106,84 @@ fn prepare_new_order(
     // scope of this change. Starting it here guarantees that any process which
     // actually opens a position is being watched. Idempotent and cheap — one
     // relaxed atomic swap after the first call.
-    crate::app_services::margin_call::ensure_spawned();
-    if let Some(halt) = crate::app_services::margin_call::active_halt() {
-        return Err(anyhow!(
-            "REFUSING to open a position: {}. No order is sent. Reduce exposure \
-             (closing positions and amending stops are still allowed) and restart \
-             the backend to clear the halt once the account is healthy.",
-            halt.describe()
-        ));
-    }
+    ensure_entry_margin_halt_clear()?;
 
-    if !(volume_lots.is_finite() && volume_lots > 0.0) {
-        return Err(anyhow!(
-            "volume_lots must be a finite positive number (got {volume_lots})"
-        ));
-    }
-    for (name, val) in [
-        ("stop_loss_pips", stop_loss_pips),
-        ("take_profit_pips", take_profit_pips),
-    ] {
-        if let Some(v) = val {
-            if !v.is_finite() || v <= 0.0 {
-                return Err(anyhow!(
-                    "{name} must be a finite positive number when set (got {v})"
-                ));
-            }
-        }
-    }
+    validate_order_volume_and_brackets(Some(volume_lots), stop_loss_pips, take_profit_pips)?;
     // THE LAST READ BEFORE REAL MONEY. `creds.environment` — the environment
     // this order is actually sent to — comes out of the same
     // `broker_credentials.toml` read that validates `expected_is_live`, so a
     // Demo→Live flip cannot land between the check and the send.
     let creds = resolve_creds_expecting(expected_is_live)?;
+    prepare_new_order_from_resolved_creds(
+        creds,
+        symbol,
+        volume_lots,
+        stop_loss_pips,
+        take_profit_pips,
+        expected_account_id,
+        resolve_symbol,
+    )
+}
+
+// One captured credential/account identity for both entry and no-volume amendments.
+fn resolve_order_symbol_from_creds(
+    creds: &ResolvedCreds,
+    symbol: &str,
+    expected_account_id: Option<i64>,
+    resolve: impl FnOnce(&CTraderSymbolLookupRequest) -> Result<CTraderResolvedSymbol>,
+) -> Result<CTraderResolvedSymbol> {
+    let account_id = creds
+        .account_id_str
+        .parse::<i64>()
+        .context("configured cTrader account_id must be numeric")?;
+    anyhow::ensure!(
+        account_id > 0,
+        "configured cTrader account_id must be positive; no order is sent"
+    );
+    if let Some(expected) = expected_account_id {
+        anyhow::ensure!(
+            expected > 0 && account_id == expected,
+            "REFUSING to open a position: the resolved cTrader account does not match \
+             the admitted account. No symbol lookup or order is sent."
+        );
+    }
+    let resolved = resolve(&CTraderSymbolLookupRequest {
+        client_id: creds.client_id.clone(),
+        client_secret: creds.client_secret.clone(),
+        access_token: creds.access_token.clone(),
+        environment: creds.environment,
+        account_id: creds.account_id_str.clone(),
+        symbol_name: symbol.to_string(),
+    })?;
+    anyhow::ensure!(
+        resolved.account_id == account_id,
+        "REFUSING to prepare an order: resolved symbol metadata belongs to a different \
+         cTrader account than the checked credentials. No order is sent."
+    );
+    // No-volume amendments skip volume-scale evidence, not its symbol identity
+    // sanity checks. The resolver already binds the full/light/requested symbol.
+    anyhow::ensure!(
+        resolved.light_symbol.symbol_id > 0
+            && !resolved.light_symbol.symbol_name.trim().is_empty()
+            && resolved.light_symbol.symbol_name.trim() == resolved.light_symbol.symbol_name,
+        "broker returned incomplete or invalid symbol identity; no order is sent"
+    );
+    Ok(resolved)
+}
+
+/// Continue from the one immutable credential snapshot used for authentication
+/// and submission. Check the admitted account before the injected symbol lookup:
+/// switching accounts inside the same environment must not send an order either.
+fn prepare_new_order_from_resolved_creds(
+    creds: ResolvedCreds,
+    symbol: &str,
+    volume_lots: f64,
+    stop_loss_pips: Option<f64>,
+    take_profit_pips: Option<f64>,
+    expected_account_id: Option<i64>,
+    resolve: impl FnOnce(&CTraderSymbolLookupRequest) -> Result<CTraderResolvedSymbol>,
+) -> Result<PreparedNewOrder> {
+    let resolved = resolve_order_symbol_from_creds(&creds, symbol, expected_account_id, resolve)?;
 
     // Resolve the symbol so we know its id + lot_size for volume
     // conversion.
@@ -923,14 +1210,13 @@ fn prepare_new_order(
     // The conversion below consumes that exact broker field with checked
     // arithmetic. Missing/invalid lotSize, min/max, or stepVolume fails before
     // order submission; there is no built-in FX/XAU/CFD default.
-    let resolved: CTraderResolvedSymbol = resolve_symbol(&CTraderSymbolLookupRequest {
-        client_id: creds.client_id.clone(),
-        client_secret: creds.client_secret.clone(),
-        access_token: creds.access_token.clone(),
-        environment: creds.environment,
-        account_id: creds.account_id_str.clone(),
-        symbol_name: symbol.to_string(),
+    let financials = resolved.symbol.financials.as_ref().ok_or_else(|| {
+        anyhow!(
+            "broker omitted full financial/trading metadata for {symbol}; refusing to prepare an order"
+        )
     })?;
+    let broker_allows_new_positions = financials.can_open_new_position();
+    let broker_allows_short_selling = financials.short_selling_allowed();
     let lot_size = resolved.symbol.lot_size.ok_or_else(|| {
         anyhow!(
             "broker omitted lotSize for {symbol}; refusing to fall back \
@@ -951,35 +1237,62 @@ fn prepare_new_order(
         lot_size,
     )?;
     let volume_units = wire_volume_from_broker_lot_size(volume_lots, lot_size)?;
-    if let Some(min) = resolved.symbol.min_volume {
-        if volume_units < min {
-            return Err(anyhow!(
-                "volume {volume_units} is below broker min_volume {min} \
-                 for {symbol}"
-            ));
-        }
+    let min = resolved.symbol.min_volume.ok_or_else(|| {
+        anyhow!("broker omitted minVolume for {symbol}; refusing to prepare an order")
+    })?;
+    let max = resolved.symbol.max_volume.ok_or_else(|| {
+        anyhow!("broker omitted maxVolume for {symbol}; refusing to prepare an order")
+    })?;
+    let step = resolved.symbol.step_volume.ok_or_else(|| {
+        anyhow!("broker omitted stepVolume for {symbol}; refusing to prepare an order")
+    })?;
+    for (field, value) in [("minVolume", min), ("maxVolume", max), ("stepVolume", step)] {
+        anyhow::ensure!(
+            value > 0,
+            "broker returned invalid {field} {value} for {symbol}"
+        );
     }
-    if let Some(max) = resolved.symbol.max_volume {
-        if volume_units > max {
-            return Err(anyhow!(
-                "volume {volume_units} exceeds broker max_volume {max} \
-                 for {symbol}"
-            ));
-        }
+    anyhow::ensure!(
+        min <= max,
+        "broker returned inverted volume bounds minVolume={min}, maxVolume={max} for {symbol}"
+    );
+    if volume_units < min {
+        return Err(anyhow!(
+            "volume {volume_units} is below broker min_volume {min} for {symbol}"
+        ));
     }
-    if let Some(step) = resolved.symbol.step_volume {
-        if step <= 0 {
-            return Err(anyhow!(
-                "broker returned invalid stepVolume {step} for {symbol}"
-            ));
-        }
-        if volume_units % step != 0 {
-            return Err(anyhow!(
-                "volume {volume_units} is not aligned to broker stepVolume {step} for {symbol}"
-            ));
-        }
+    if volume_units > max {
+        return Err(anyhow!(
+            "volume {volume_units} exceeds broker max_volume {max} for {symbol}"
+        ));
+    }
+    if volume_units % step != 0 {
+        return Err(anyhow!(
+            "volume {volume_units} is not aligned to broker stepVolume {step} for {symbol}"
+        ));
     }
 
+    let (relative_stop_loss, relative_take_profit) =
+        relative_brackets_from_broker_symbol(&resolved, stop_loss_pips, take_profit_pips)?;
+
+    Ok(PreparedNewOrder {
+        creds,
+        account_id: resolved.account_id,
+        symbol_id: resolved.light_symbol.symbol_id,
+        volume_units,
+        volume_scale_evidence,
+        relative_stop_loss,
+        relative_take_profit,
+        broker_allows_new_positions,
+        broker_allows_short_selling,
+    })
+}
+
+fn relative_brackets_from_broker_symbol(
+    resolved: &CTraderResolvedSymbol,
+    stop_loss_pips: Option<f64>,
+    take_profit_pips: Option<f64>,
+) -> Result<(Option<i64>, Option<i64>)> {
     // cTrader `relativeStopLoss` / `relativeTakeProfit` is the price *distance*
     // expressed in 1/100000 of a price unit, and the broker REJECTS any value
     // that isn't aligned to the symbol's price precision (10^-digits) with
@@ -1006,16 +1319,7 @@ fn prepare_new_order(
             )
         })
         .transpose()?;
-
-    Ok(PreparedNewOrder {
-        creds,
-        account_id: resolved.account_id,
-        symbol_id: resolved.light_symbol.symbol_id,
-        volume_units,
-        volume_scale_evidence,
-        relative_stop_loss,
-        relative_take_profit,
-    })
+    Ok((relative_stop_loss, relative_take_profit))
 }
 
 ///
@@ -1023,6 +1327,8 @@ fn prepare_new_order(
 /// against. `Some(false)`/`Some(true)` refuses the order outright if the
 /// environment on disk has since changed; `None` means the caller has no
 /// admission decision to honour (the operator's manual Buy/Sell button).
+/// `expected_account_id` additionally pins the admitted account within that
+/// environment, before symbol lookup, using the same credentials as submission.
 #[allow(clippy::too_many_arguments)]
 pub fn submit_market_order_blocking(
     symbol: &str,
@@ -1032,6 +1338,7 @@ pub fn submit_market_order_blocking(
     take_profit_pips: Option<f64>,
     comment: Option<String>,
     expected_is_live: Option<bool>,
+    expected_account_id: Option<i64>,
 ) -> Result<CTraderExecutionOutcome> {
     let prep = prepare_new_order(
         symbol,
@@ -1039,8 +1346,28 @@ pub fn submit_market_order_blocking(
         stop_loss_pips,
         take_profit_pips,
         expected_is_live,
+        expected_account_id,
+    )?;
+    ensure_broker_allows_new_order(
+        symbol,
+        side,
+        prep.broker_allows_new_positions,
+        prep.broker_allows_short_selling,
     )?;
 
+    execute_prepared_market_order(prep, side, comment, None, |request| {
+        ProductionCTraderExecutionBackend::default().execute(request)
+    })
+}
+
+// One wire construction/execute path for manual and context-bound entries.
+fn execute_prepared_market_order(
+    prep: PreparedNewOrder,
+    side: OrderSide,
+    comment: Option<String>,
+    client_order_id: Option<String>,
+    execute: impl FnOnce(&CTraderExecutionRuntimeRequest) -> Result<CTraderExecutionOutcome>,
+) -> Result<CTraderExecutionOutcome> {
     let new_order = CTraderNewOrderRequest {
         account_id: prep.account_id,
         symbol_id: prep.symbol_id,
@@ -1062,7 +1389,7 @@ pub fn submit_market_order_blocking(
         slippage_in_points: None,
         label: Some("neoethos-ui".to_string()),
         position_id: None,
-        client_order_id: None,
+        client_order_id,
         relative_stop_loss: prep.relative_stop_loss,
         relative_take_profit: prep.relative_take_profit,
         guaranteed_stop_loss: None,
@@ -1070,7 +1397,6 @@ pub fn submit_market_order_blocking(
         stop_trigger_method: None,
     };
 
-    let backend = ProductionCTraderExecutionBackend::default();
     let runtime_request = CTraderExecutionRuntimeRequest {
         client_id: prep.creds.client_id,
         client_secret: prep.creds.client_secret,
@@ -1079,7 +1405,7 @@ pub fn submit_market_order_blocking(
         account_id: prep.creds.account_id_str,
         request: CTraderExecutionRequest::NewOrder(Box::new(new_order)),
     };
-    let mut outcome = backend.execute(&runtime_request)?;
+    let mut outcome = execute(&runtime_request)?;
     outcome.volume_scale_evidence = Some(prep.volume_scale_evidence);
     Ok(outcome)
 }
@@ -1129,6 +1455,13 @@ pub fn submit_pending_order_blocking(
         stop_loss_pips,
         take_profit_pips,
         expected_is_live,
+        None,
+    )?;
+    ensure_broker_allows_new_order(
+        symbol,
+        side,
+        prep.broker_allows_new_positions,
+        prep.broker_allows_short_selling,
     )?;
 
     // Limit orders carry `limit_price`; stop orders carry `stop_price`.
@@ -1188,20 +1521,42 @@ pub fn submit_pending_order_blocking(
 /// volume). Used by the Trade Watch screen's per-row close button.
 ///
 /// `expected_is_live` — see [`submit_market_order_blocking`]. An engine's
-/// weekend force-close and auto-cull flatten pass the environment they were
-/// admitted against, so they can never close a position on an account this
-/// engine was never admitted to; the Trade Watch button passes `None`.
+/// weekend force-close and auto-cull flatten also pass `expected_account_id`.
+/// Both expectations are checked against the same resolved credentials used
+/// to send the request, including an account switch inside one environment.
+/// The operator's manual Trade Watch button passes `None` for both.
 pub fn close_position_blocking(
     position_id: i64,
     volume: i64,
     expected_is_live: Option<bool>,
+    expected_account_id: Option<i64>,
 ) -> Result<CTraderExecutionOutcome> {
     let creds = resolve_creds_expecting(expected_is_live)?;
+    let runtime_request =
+        close_request_from_resolved_creds(creds, position_id, volume, expected_account_id)?;
+    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+}
+
+/// Build and validate from one immutable credential snapshot. This pure step
+/// cannot accidentally check one account and route with a second disk read.
+fn close_request_from_resolved_creds(
+    creds: ResolvedCreds,
+    position_id: i64,
+    volume: i64,
+    expected_account_id: Option<i64>,
+) -> Result<CTraderExecutionRuntimeRequest> {
     let account_id: i64 = creds
         .account_id_str
         .parse()
         .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
-    let runtime_request = CTraderExecutionRuntimeRequest {
+    if let Some(expected) = expected_account_id {
+        anyhow::ensure!(
+            expected > 0 && account_id == expected,
+            "REFUSING to close position {position_id}: cTrader account changed from admitted account \
+             {expected} to resolved account {account_id}. No close order is sent."
+        );
+    }
+    Ok(CTraderExecutionRuntimeRequest {
         client_id: creds.client_id,
         client_secret: creds.client_secret,
         access_token: creds.access_token,
@@ -1212,8 +1567,7 @@ pub fn close_position_blocking(
             position_id,
             volume,
         }),
-    };
-    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+    })
 }
 
 /// Load the live account runtime (balance, equity inputs, open positions,
@@ -1273,7 +1627,7 @@ pub fn cancel_order_blocking(order_id: i64) -> Result<CTraderExecutionOutcome> {
 /// `trigger_price` is written to `limit_price` or `stop_price` according to
 /// `order_type`, which must be the order's OWN type: cTrader rejects a limit
 /// price on a stop order. Volume is lots and SL/TP are pip DISTANCES, converted
-/// by the same [`prepare_new_order`] that the placement paths use, so an amend
+/// by the shared placement helpers (volume only when explicitly set), so an amend
 /// and a placement can never disagree about what "0.01 lots" or "20 pips" mean
 /// on this symbol.
 ///
@@ -1332,17 +1686,182 @@ pub fn amend_order_blocking(
         }
     }
 
-    // Volume conversion needs a lot size, and the SL/TP pip conversion needs a
-    // pip size, so the symbol is resolved even when only one of them is being
-    // amended. `1.0` is a placeholder that is only used when `volume_lots` is
-    // None, and its converted result is discarded below.
-    let prep = prepare_new_order(
+    // Keep the existing resting-order halt and the same one-snapshot environment
+    // check. Only an explicitly amended volume requires entry-volume evidence.
+    ensure_entry_margin_halt_clear()?;
+    validate_order_volume_and_brackets(volume_lots, stop_loss_pips, take_profit_pips)?;
+    let creds = resolve_creds_expecting(expected_is_live)?;
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    let runtime_request = prepare_amend_order_from_resolved_creds(
+        creds,
+        order_id,
         symbol,
-        volume_lots.unwrap_or(1.0),
+        order_type,
+        volume_lots,
+        trigger_price,
         stop_loss_pips,
         take_profit_pips,
-        expected_is_live,
+        expiry_unix_ms,
+        None,
+        |request| {
+            resolve_amend_order_symbol_with_transport(
+                &transport,
+                request,
+                order_id,
+                order_type,
+                resolve_symbol,
+            )
+        },
     )?;
+    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+}
+
+// Bind the requested amendment to the broker's own order before any pip or
+// lot conversion. This reuses the existing details parser and symbol resolver;
+// it does not create a second execution path or require historical fills.
+fn resolve_amend_order_symbol_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderSymbolLookupRequest,
+    order_id: i64,
+    order_type: CTraderOrderType,
+    resolve: impl FnOnce(&CTraderSymbolLookupRequest) -> Result<CTraderResolvedSymbol>,
+) -> Result<CTraderResolvedSymbol> {
+    let account_id = request
+        .account_id
+        .parse::<i64>()
+        .context("cTrader amendment account id must be numeric")?;
+    anyhow::ensure!(
+        account_id > 0,
+        "cTrader amendment account id must be positive"
+    );
+    anyhow::ensure!(order_id > 0, "cTrader amendment order id must be positive");
+    anyhow::ensure!(
+        matches!(order_type, CTraderOrderType::Limit | CTraderOrderType::Stop),
+        "cTrader amendment requires a Limit or Stop order"
+    );
+
+    // All authentication and lookup inputs originate in the one credential
+    // snapshot also carried by the eventual execution request.
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(
+            &request.client_id,
+            &request.client_secret,
+            "amend-details-app-auth",
+        ),
+        build_account_auth_request(
+            account_id,
+            &request.access_token,
+            "amend-details-account-auth",
+        ),
+        crate::app_services::ctrader_messages::build_order_details_request(
+            account_id,
+            order_id,
+            "amend-order-details",
+        ),
+    ])?;
+    // A broker error may end the sequence before three responses. Preserve its
+    // original code/description before reporting length or missing identity.
+    for (response, expected_type) in responses.iter().zip([
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+        CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+        crate::app_services::ctrader_messages::CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE,
+    ]) {
+        ensure_success_payload_type(response, expected_type)?;
+    }
+    anyhow::ensure!(
+        responses.len() == 3,
+        "expected 3 cTrader amendment order-details responses, received {}",
+        responses.len()
+    );
+    require_response_account(&responses[1], account_id, "amendment authentication")?;
+    require_response_account(&responses[2], account_id, "amendment order details")?;
+    let details =
+        crate::app_services::ctrader_account::parse_order_details_response(&responses[2])?;
+    anyhow::ensure!(
+        details.account_id == account_id && details.order.order_id == order_id,
+        "cTrader amendment order-details identity differs from requested account/order"
+    );
+    anyhow::ensure!(
+        details.order.symbol_id > 0,
+        "cTrader amendment order details contain an invalid symbol id"
+    );
+    anyhow::ensure!(
+        details.order.order_type == order_type.label(),
+        "cTrader amendment order type {} differs from requested {}",
+        details.order.order_type,
+        order_type.label()
+    );
+    // ProtoOAOrder.orderStatus is required. The reusable display snapshot does
+    // not retain it, so check the original envelope, not a caller/default value.
+    // Only ACCEPTED (1) is still pending; filled/cancelled/expired orders cannot
+    // be amended. A later fill can still race this read: the broker remains the
+    // authority at submission and its rejection is propagated unchanged.
+    let envelope = crate::app_services::ctrader_messages::parse_open_api_envelope(&responses[2])?;
+    anyhow::ensure!(
+        envelope.payload["order"]
+            .get("orderStatus")
+            .and_then(serde_json::Value::as_i64)
+            == Some(1),
+        "cTrader amendment order is not pending or omitted a valid orderStatus"
+    );
+
+    let resolved = resolve(request)?;
+    anyhow::ensure!(
+        resolved.account_id == details.account_id
+            && resolved.light_symbol.symbol_id == details.order.symbol_id
+            && resolved.symbol.symbol_id == details.order.symbol_id,
+        "cTrader amendment order symbol/account differs from requested symbol metadata"
+    );
+    Ok(resolved)
+}
+
+// Build the actual pending-order amendment after the wrapper's field/halt checks.
+// Symbol lookup is injected for tests; submission stays in the existing backend.
+#[allow(clippy::too_many_arguments)]
+fn prepare_amend_order_from_resolved_creds(
+    creds: ResolvedCreds,
+    order_id: i64,
+    symbol: &str,
+    order_type: CTraderOrderType,
+    volume_lots: Option<f64>,
+    trigger_price: Option<f64>,
+    stop_loss_pips: Option<f64>,
+    take_profit_pips: Option<f64>,
+    expiry_unix_ms: Option<i64>,
+    expected_account_id: Option<i64>,
+    resolve: impl FnOnce(&CTraderSymbolLookupRequest) -> Result<CTraderResolvedSymbol>,
+) -> Result<CTraderExecutionRuntimeRequest> {
+    let (creds, account_id, volume, relative_stop_loss, relative_take_profit) =
+        if let Some(volume_lots) = volume_lots {
+            let prep = prepare_new_order_from_resolved_creds(
+                creds,
+                symbol,
+                volume_lots,
+                stop_loss_pips,
+                take_profit_pips,
+                expected_account_id,
+                resolve,
+            )?;
+            (
+                prep.creds,
+                prep.account_id,
+                Some(prep.volume_units),
+                prep.relative_stop_loss,
+                prep.relative_take_profit,
+            )
+        } else {
+            let resolved =
+                resolve_order_symbol_from_creds(&creds, symbol, expected_account_id, resolve)?;
+            let (relative_stop_loss, relative_take_profit) =
+                relative_brackets_from_broker_symbol(&resolved, stop_loss_pips, take_profit_pips)?;
+            (
+                creds,
+                resolved.account_id,
+                None,
+                relative_stop_loss,
+                relative_take_profit,
+            )
+        };
 
     let (limit_price, stop_price) = match order_type {
         CTraderOrderType::Limit => (trigger_price, None),
@@ -1350,9 +1869,9 @@ pub fn amend_order_blocking(
     };
 
     let amend = CTraderAmendOrderRequest {
-        account_id: prep.account_id,
+        account_id,
         order_id,
-        volume: volume_lots.map(|_| prep.volume_units),
+        volume,
         limit_price,
         stop_price,
         expiration_timestamp_ms: expiry_unix_ms,
@@ -1362,22 +1881,21 @@ pub fn amend_order_blocking(
         stop_loss: None,
         take_profit: None,
         slippage_in_points: None,
-        relative_stop_loss: prep.relative_stop_loss,
-        relative_take_profit: prep.relative_take_profit,
+        relative_stop_loss,
+        relative_take_profit,
         guaranteed_stop_loss: None,
         trailing_stop_loss: None,
         stop_trigger_method: None,
     };
 
-    let runtime_request = CTraderExecutionRuntimeRequest {
-        client_id: prep.creds.client_id,
-        client_secret: prep.creds.client_secret,
-        access_token: prep.creds.access_token,
-        environment: prep.creds.environment,
-        account_id: prep.creds.account_id_str,
+    Ok(CTraderExecutionRuntimeRequest {
+        client_id: creds.client_id,
+        client_secret: creds.client_secret,
+        access_token: creds.access_token,
+        environment: creds.environment,
+        account_id: creds.account_id_str,
         request: CTraderExecutionRequest::AmendOrder(Box::new(amend)),
-    };
-    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+    })
 }
 
 /// Modify the stop-loss / take-profit of an ALREADY-OPEN position
@@ -1423,12 +1941,9 @@ pub fn amend_position_sltp_blocking(
 /// environment. `None` reproduces the old, unbound behaviour and is correct
 /// only for the operator's manual route.
 ///
-/// **This function logs its own failure at `error`.** The autopilot's trailing
-/// block in `live_trading::run` calls the amend as `let _ = …`, so a rejection
-/// — an environment flip, an expired token, a broker refusal — was dropped
-/// twice over: once by the missing check and once by the discarded `Result`.
-/// Logging here means the operator sees the refusal regardless of what the
-/// caller does with the return value.
+/// Logs failures independently of its caller. The autonomous loop additionally
+/// requires a matching broker replacement event before advancing its local
+/// confirmed stop. A transport error is not proof the broker left it unchanged.
 pub fn amend_position_sltp_expecting(
     position_id: i64,
     stop_loss: Option<f64>,
@@ -1436,12 +1951,33 @@ pub fn amend_position_sltp_expecting(
     trailing_stop_loss: Option<bool>,
     expected_is_live: Option<bool>,
 ) -> Result<CTraderExecutionOutcome> {
+    amend_position_sltp_expecting_account(
+        position_id,
+        stop_loss,
+        take_profit,
+        trailing_stop_loss,
+        expected_is_live,
+        None,
+    )
+}
+
+/// Protective amendment bound to the autonomous loop's exact account as well
+/// as environment. Does not impose entry/historical prerequisites on protection.
+pub fn amend_position_sltp_expecting_account(
+    position_id: i64,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    trailing_stop_loss: Option<bool>,
+    expected_is_live: Option<bool>,
+    expected_account_id: Option<i64>,
+) -> Result<CTraderExecutionOutcome> {
     let result = amend_position_sltp_inner(
         position_id,
         stop_loss,
         take_profit,
         trailing_stop_loss,
         expected_is_live,
+        expected_account_id,
     );
     match &result {
         Ok(outcome) => {
@@ -1461,10 +1997,11 @@ pub fn amend_position_sltp_expecting(
                 ?stop_loss,
                 ?take_profit,
                 ?expected_is_live,
+                ?expected_account_id,
                 error = %e,
-                "POSITION SL/TP AMEND FAILED — the stop on this open position was NOT \
-                 moved. If a trailing/break-even stop was expected, it is not where the \
-                 engine believes it is."
+                "POSITION SL/TP AMEND UNCONFIRMED — local confirmed protection was not \
+                 advanced. If sending had begun, a transport failure does not prove the \
+                 broker left the stop unchanged; reconcile the actual position."
             );
         }
     }
@@ -1477,6 +2014,7 @@ fn amend_position_sltp_inner(
     take_profit: Option<f64>,
     trailing_stop_loss: Option<bool>,
     expected_is_live: Option<bool>,
+    expected_account_id: Option<i64>,
 ) -> Result<CTraderExecutionOutcome> {
     if stop_loss.is_none() && take_profit.is_none() {
         return Err(anyhow!(
@@ -1484,11 +2022,36 @@ fn amend_position_sltp_inner(
         ));
     }
     let creds = resolve_creds_expecting(expected_is_live)?;
+    let runtime_request = amend_position_sltp_request_from_creds(
+        creds,
+        position_id,
+        stop_loss,
+        take_profit,
+        trailing_stop_loss,
+        expected_account_id,
+    )?;
+    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+}
+
+fn amend_position_sltp_request_from_creds(
+    creds: ResolvedCreds,
+    position_id: i64,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    trailing_stop_loss: Option<bool>,
+    expected_account_id: Option<i64>,
+) -> Result<CTraderExecutionRuntimeRequest> {
     let account_id: i64 = creds
         .account_id_str
         .parse()
         .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
-    let runtime_request = CTraderExecutionRuntimeRequest {
+    if let Some(expected) = expected_account_id {
+        anyhow::ensure!(
+            expected > 0 && account_id == expected,
+            "REFUSING position protection amendment: resolved cTrader account differs from the admitted account"
+        );
+    }
+    Ok(CTraderExecutionRuntimeRequest {
         client_id: creds.client_id,
         client_secret: creds.client_secret,
         access_token: creds.access_token,
@@ -1503,8 +2066,7 @@ fn amend_position_sltp_inner(
             trailing_stop_loss,
             stop_loss_trigger_method: None,
         }),
-    };
-    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+    })
 }
 
 // ─── #238: the margin-call feed finally has a reader ───────────────────────
@@ -1604,14 +2166,31 @@ pub fn broker_credentials_configured() -> bool {
 /// [`margin_call::MAX_CONSECUTIVE_POLL_FAILURES`]: crate::app_services::margin_call::MAX_CONSECUTIVE_POLL_FAILURES
 pub fn fetch_margin_status_blocking() -> Result<MarginStatus> {
     let creds = resolve_creds()?;
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    fetch_margin_status_with_transport(&transport, &creds)
+}
+
+#[path = "broker_api_entry.rs"]
+mod entry;
+pub(crate) use entry::{
+    LiveEntryContext, fetch_bound_broker_symbol_blocking, fetch_live_entry_context_blocking,
+    required_entry_conversion_symbol,
+};
+
+/// The same margin poll, with transport injected for wire-envelope regressions.
+/// No additional credential read or alternate monetary implementation.
+fn fetch_margin_status_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    creds: &ResolvedCreds,
+) -> Result<MarginStatus> {
     let account_id: i64 = creds
         .account_id_str
         .parse()
         .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
+    anyhow::ensure!(account_id > 0, "cTrader account id must be positive");
 
-    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
     let responses = crate::app_services::ctrader_messages::send_sequence_resilient(
-        &transport,
+        transport,
         &[
             build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
             build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
@@ -1628,6 +2207,20 @@ pub fn fetch_margin_status_blocking() -> Result<MarginStatus> {
         "cTrader margin-call status",
     )?;
 
+    Ok(parse_margin_status_responses(creds, &responses)?.0)
+}
+
+// Shared by the ordinary margin poll and the entry request's same-session
+// account/asset/symbol snapshot. Monetary and identity checks stay in one place.
+fn parse_margin_status_responses(
+    creds: &ResolvedCreds,
+    responses: &[String],
+) -> Result<(
+    MarginStatus,
+    crate::app_services::ctrader_account::CTraderTraderSnapshot,
+)> {
+    let account_id = creds.account_id_str.parse::<i64>()?;
+    anyhow::ensure!(account_id > 0, "cTrader account id must be positive");
     if responses.len() != 6 {
         return Err(anyhow!(
             "expected 6 cTrader margin-status responses, received {}",
@@ -1657,6 +2250,13 @@ pub fn fetch_margin_status_blocking() -> Result<MarginStatus> {
     let unreadable = |what: &str, e: anyhow::Error| {
         anyhow!("{MARGIN_STATUS_UNREADABLE_SENTINEL}: could not read the {what} — {e}")
     };
+    // Validate every account-scoped envelope before parsers discard identity,
+    // including empty position/PnL arrays. Broker-error/type precedence above
+    // remains unchanged; a foreign or missing identity is an unreadable reply.
+    for response in &responses[1..] {
+        require_response_account(response, account_id, "cTrader margin status")
+            .map_err(|error| unreadable("account-scoped response", error))?;
+    }
     let thresholds = parse_margin_call_list_response(&responses[2])
         .map_err(|e| unreadable("margin-call threshold list", e))?;
     let trader =
@@ -1666,7 +2266,12 @@ pub fn fetch_margin_status_blocking() -> Result<MarginStatus> {
     let pnl = parse_get_position_unrealized_pnl_response(&responses[5])
         .map_err(|e| unreadable("unrealised P&L snapshot", e))?;
 
-    let unrealized_pnl: f64 = pnl.positions.iter().map(|p| p.net_unrealized_pnl).sum();
+    let unrealized_pnl_by_position = reconcile_broker_unrealized_pnl(&reconcile, &pnl)
+        .map_err(|error| unreadable("position/PnL reconciliation", error))?;
+    let unrealized_pnl: f64 = unrealized_pnl_by_position
+        .values()
+        .map(|position| position.net_unrealized_pnl)
+        .sum();
     let equity = trader.balance + unrealized_pnl;
 
     let mut used_margin = 0.0_f64;
@@ -1689,19 +2294,22 @@ pub fn fetch_margin_status_blocking() -> Result<MarginStatus> {
         _ => None,
     };
 
-    Ok(MarginStatus {
-        account_id: trader.account_id,
-        environment_label: creds.env_label,
-        balance: trader.balance,
-        unrealized_pnl,
-        equity,
-        used_margin,
-        margin_level_pct,
-        thresholds,
-        breached_threshold_pct,
-        positions_missing_used_margin,
-        open_position_count: reconcile.positions.len(),
-    })
+    Ok((
+        MarginStatus {
+            account_id: trader.account_id,
+            environment_label: creds.env_label,
+            balance: trader.balance,
+            unrealized_pnl,
+            equity,
+            used_margin,
+            margin_level_pct,
+            thresholds,
+            breached_threshold_pct,
+            positions_missing_used_margin,
+            open_position_count: reconcile.positions.len(),
+        },
+        trader,
+    ))
 }
 
 /// Maximum cTrader history window for the order-list / cash-flow RPCs.
@@ -1726,6 +2334,83 @@ fn validate_history_window(from_ms: i64, to_ms: i64) -> Result<()> {
     Ok(())
 }
 
+fn require_response_account(response: &str, expected_account: i64, context: &str) -> Result<()> {
+    let envelope = crate::app_services::ctrader_messages::parse_open_api_envelope(response)?;
+    let actual = envelope
+        .payload
+        .get("ctidTraderAccountId")
+        .and_then(serde_json::Value::as_i64);
+    anyhow::ensure!(
+        actual == Some(expected_account),
+        "{context} response account {actual:?} differs from requested account {expected_account}"
+    );
+    Ok(())
+}
+
+/// Read current symbol lot sizes on the same credential/environment snapshot.
+/// This is a display conversion, not historical contract or trading authority.
+/// Batch repeated symbol IDs; never make one metadata request per order.
+fn fetch_current_broker_lot_sizes_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    creds: &ResolvedCreds,
+    account_id: i64,
+    symbol_ids: &BTreeSet<i64>,
+) -> Result<BTreeMap<i64, i64>> {
+    anyhow::ensure!(
+        symbol_ids.iter().all(|id| *id > 0),
+        "invalid broker symbol id for lotSize lookup"
+    );
+    let ids: Vec<i64> = symbol_ids.iter().copied().collect();
+    let mut lot_sizes = BTreeMap::new();
+    for chunk in ids.chunks(50) {
+        let responses = transport.send_sequence(&[
+            build_application_auth_request(
+                &creds.client_id,
+                &creds.client_secret,
+                "lot-size-app-auth",
+            ),
+            build_account_auth_request(account_id, &creds.access_token, "lot-size-account-auth"),
+            build_symbol_by_id_request(account_id, chunk, "lot-size-symbols"),
+        ])?;
+        anyhow::ensure!(
+            responses.len() == 3,
+            "expected 3 cTrader lotSize responses, received {}",
+            responses.len()
+        );
+        ensure_success_payload_type(
+            &responses[0],
+            CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+        )?;
+        ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+        ensure_success_payload_type(&responses[2], CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE)?;
+        require_response_account(&responses[1], account_id, "lotSize authentication")?;
+        require_response_account(&responses[2], account_id, "lotSize")?;
+        for symbol in parse_symbol_by_id_response(&responses[2])? {
+            anyhow::ensure!(
+                chunk.binary_search(&symbol.symbol_id).is_ok(),
+                "lotSize response contains unrequested symbol {}",
+                symbol.symbol_id
+            );
+            let lot_size = symbol
+                .lot_size
+                .ok_or_else(|| anyhow!("broker omitted lotSize for symbol {}", symbol.symbol_id))?;
+            broker_lots_from_wire_volume_v1(0, lot_size)?;
+            anyhow::ensure!(
+                lot_sizes.insert(symbol.symbol_id, lot_size).is_none(),
+                "duplicate lotSize row for symbol {}",
+                symbol.symbol_id
+            );
+        }
+        for id in chunk {
+            anyhow::ensure!(
+                lot_sizes.contains_key(id),
+                "broker has no current lotSize for symbol {id} (possibly archived)"
+            );
+        }
+    }
+    Ok(lot_sizes)
+}
+
 /// Account-wide historical orders over `[from_ms, to_ms]` (ms).
 /// `ProtoOAOrderListReq`. Blocking (sync WSS) — wrap in `spawn_blocking`.
 pub fn fetch_broker_order_history_blocking(
@@ -1734,11 +2419,21 @@ pub fn fetch_broker_order_history_blocking(
 ) -> Result<CTraderOrderHistoryBundle> {
     validate_history_window(from_ms, to_ms)?;
     let creds = resolve_creds()?;
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    fetch_broker_order_history_with_transport(&transport, &creds, from_ms, to_ms)
+}
+
+fn fetch_broker_order_history_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    creds: &ResolvedCreds,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<CTraderOrderHistoryBundle> {
+    validate_history_window(from_ms, to_ms)?;
     let account_id: i64 = creds
         .account_id_str
         .parse()
         .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
-    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
     let responses = transport.send_sequence(&[
         build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
         build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
@@ -1756,7 +2451,54 @@ pub fn fetch_broker_order_history_blocking(
     )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[2], CTRADER_OA_ORDER_LIST_RESPONSE_PAYLOAD_TYPE)?;
-    parse_order_list_response(&responses[2])
+    require_response_account(&responses[1], account_id, "order-history authentication")?;
+    let mut bundle = parse_order_list_response(&responses[2])?;
+    anyhow::ensure!(
+        bundle.account_id == account_id,
+        "order-history response belongs to account {}, expected {account_id}",
+        bundle.account_id
+    );
+    let symbol_ids = bundle.orders.iter().map(|order| order.symbol_id).collect();
+    let conversion = (|| -> Result<()> {
+        let lot_sizes = fetch_current_broker_lot_sizes_with_transport(
+            transport,
+            creds,
+            account_id,
+            &symbol_ids,
+        )?;
+        // Resolve every value before publishing any lots, so one failed join
+        // cannot leave a misleading partially converted history response.
+        let volumes = bundle
+            .orders
+            .iter()
+            .map(|order| -> Result<_> {
+                let lot_size = lot_sizes[&order.symbol_id];
+                Ok((
+                    broker_lots_from_wire_volume_v1(order.volume_raw_centi_units, lot_size)?,
+                    order
+                        .executed_volume_raw_centi_units
+                        .map(|raw| broker_lots_from_wire_volume_v1(raw, lot_size))
+                        .transpose()?,
+                    lot_size,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (order, (lots, executed_lots, lot_size)) in bundle.orders.iter_mut().zip(volumes) {
+            order.volume_lots = Some(lots);
+            order.executed_volume_lots = executed_lots;
+            order.lot_size_raw_centi_units = Some(lot_size);
+        }
+        if !bundle.orders.is_empty() {
+            bundle.lot_size_observed_at_unix_ms = Some(chrono::Utc::now().timestamp_millis());
+        }
+        Ok(())
+    })();
+    if let Err(error) = conversion {
+        bundle.lot_size_error = Some(format!(
+            "Current broker lotSize unavailable; volumes are shown in units: {error:#}"
+        ));
+    }
+    Ok(bundle)
 }
 
 /// Cash-flow history (deposits / withdrawals / swaps / fees) over
@@ -1795,14 +2537,19 @@ pub fn fetch_broker_cash_flow_history_blocking(
     parse_cash_flow_history_response(&responses[2])
 }
 
-/// Pre-trade margin estimate for each of `volumes` (0.01-unit wire volume) on
-/// `symbol_id`. `ProtoOAExpectedMarginReq`. Blocking.
-pub fn fetch_broker_expected_margin_blocking(
-    symbol_id: i64,
-    volumes: Vec<i64>,
-) -> Result<CTraderExpectedMarginBundle> {
-    if volumes.is_empty() {
-        return Err(anyhow!("expected-margin requires at least one volume"));
+/// Account-wide deal history over `[from_ms, to_ms]`, preserving the broker's
+/// `hasMore` truncation bit. Callers that need completeness or absence proof
+/// must use this instead of the bounded `recent_deals` runtime field.
+pub fn fetch_broker_deal_history_blocking(
+    from_ms: i64,
+    to_ms: i64,
+    max_rows: i32,
+) -> Result<CTraderDealListBundle> {
+    validate_history_window(from_ms, to_ms)?;
+    if max_rows <= 0 {
+        return Err(anyhow!(
+            "deal-history max_rows must be positive; got {max_rows}"
+        ));
     }
     let creds = resolve_creds()?;
     let account_id: i64 = creds
@@ -1813,7 +2560,88 @@ pub fn fetch_broker_expected_margin_blocking(
     let responses = transport.send_sequence(&[
         build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
         build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
-        build_expected_margin_request(account_id, symbol_id, &volumes, "exp-margin-1"),
+        build_deal_list_request(
+            &CTraderDealListRequest {
+                account_id,
+                from_timestamp_ms: Some(from_ms),
+                to_timestamp_ms: Some(to_ms),
+                max_rows: Some(max_rows),
+            },
+            "deal-history-1",
+        ),
+    ])?;
+    if responses.len() != 3 {
+        return Err(anyhow!(
+            "expected 3 cTrader deal-history responses, received {}",
+            responses.len()
+        ));
+    }
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[2], CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE)?;
+    let bundle = parse_deal_list_bundle_response(&responses[2])?;
+    if bundle.account_id != account_id {
+        return Err(anyhow!(
+            "deal-history response belongs to account {}, expected {}",
+            bundle.account_id,
+            account_id
+        ));
+    }
+    Ok(bundle)
+}
+
+/// Pre-trade margin estimate for each of `volumes` (0.01-unit wire volume) on
+/// `symbol_id`. `ProtoOAExpectedMarginReq`. Blocking.
+pub fn fetch_broker_expected_margin_blocking(
+    symbol_id: i64,
+    volumes: Vec<i64>,
+) -> Result<CTraderExpectedMarginBundle> {
+    validate_expected_margin_request(symbol_id, &volumes)?;
+    let creds = resolve_creds()?;
+    let transport = ProductionCTraderOpenApiTransport::new(creds.environment.endpoint_host());
+    fetch_broker_expected_margin_with_transport(&transport, &creds, symbol_id, &volumes)
+}
+
+fn validate_expected_margin_request(symbol_id: i64, volumes: &[i64]) -> Result<()> {
+    anyhow::ensure!(
+        symbol_id > 0,
+        "expected-margin requires a positive symbol id"
+    );
+    anyhow::ensure!(
+        !volumes.is_empty(),
+        "expected-margin requires at least one volume"
+    );
+    anyhow::ensure!(
+        volumes
+            .iter()
+            .all(|v| (1..=MAX_EXACT_BROKER_VOLUME).contains(v)),
+        "expected-margin requires positive, exactly representable centi-unit volumes"
+    );
+    anyhow::ensure!(
+        volumes.iter().collect::<BTreeSet<_>>().len() == volumes.len(),
+        "expected-margin request contains duplicate volumes"
+    );
+    Ok(())
+}
+
+fn fetch_broker_expected_margin_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    creds: &ResolvedCreds,
+    symbol_id: i64,
+    volumes: &[i64],
+) -> Result<CTraderExpectedMarginBundle> {
+    validate_expected_margin_request(symbol_id, volumes)?;
+    let account_id: i64 = creds
+        .account_id_str
+        .parse()
+        .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(&creds.client_id, &creds.client_secret, "app-auth-1"),
+        build_account_auth_request(account_id, &creds.access_token, "account-auth-1"),
+        build_expected_margin_request(account_id, symbol_id, volumes, "exp-margin-1"),
     ])?;
     if responses.len() != 3 {
         return Err(anyhow!(
@@ -1830,7 +2658,48 @@ pub fn fetch_broker_expected_margin_blocking(
         &responses[2],
         CTRADER_OA_EXPECTED_MARGIN_RESPONSE_PAYLOAD_TYPE,
     )?;
-    parse_expected_margin_response(&responses[2])
+    require_response_account(&responses[1], account_id, "expected-margin authentication")?;
+    let mut bundle = parse_expected_margin_response(&responses[2])?;
+    anyhow::ensure!(
+        bundle.account_id == account_id,
+        "expected-margin response belongs to account {}, expected {account_id}",
+        bundle.account_id
+    );
+    let requested: BTreeSet<i64> = volumes.iter().copied().collect();
+    let returned: BTreeSet<i64> = bundle
+        .entries
+        .iter()
+        .map(|entry| entry.volume_raw_centi_units)
+        .collect();
+    anyhow::ensure!(
+        returned == requested && returned.len() == bundle.entries.len(),
+        "expected-margin response volumes are missing, duplicated, or differ from the request"
+    );
+    bundle.symbol_id = Some(symbol_id);
+    match fetch_current_broker_lot_sizes_with_transport(
+        transport,
+        creds,
+        account_id,
+        &BTreeSet::from([symbol_id]),
+    ) {
+        Ok(lot_sizes) => {
+            let lot_size = lot_sizes[&symbol_id];
+            for entry in &mut bundle.entries {
+                entry.volume_lots = Some(broker_lots_from_wire_volume_v1(
+                    entry.volume_raw_centi_units,
+                    lot_size,
+                )?);
+                entry.lot_size_raw_centi_units = Some(lot_size);
+            }
+            bundle.lot_size_observed_at_unix_ms = Some(chrono::Utc::now().timestamp_millis());
+        }
+        Err(error) => {
+            bundle.lot_size_error = Some(format!(
+                "Current broker lotSize unavailable; volumes are shown in units: {error:#}"
+            ));
+        }
+    }
+    Ok(bundle)
 }
 
 /// The cTID profile (user id) behind the saved access token.
@@ -1883,12 +2752,159 @@ pub fn fetch_broker_version_blocking() -> Result<CTraderServerVersionSnapshot> {
 }
 
 #[cfg(test)]
+#[path = "broker_api_volume_tests.rs"]
+mod broker_volume_tests;
+
+#[cfg(test)]
+#[path = "broker_api_account_pin_tests.rs"]
+mod broker_account_pin_tests;
+
+#[cfg(test)]
 mod exact_broker_order_unit_tests {
     use super::{
-        HistoricalBar, chart_fetch_from_ms, relative_distance_from_broker_symbol,
+        HistoricalBar, OrderSide, RecentBrokerTrendbarSnapshot, chart_fetch_from_ms,
+        ensure_broker_allows_new_order, relative_distance_from_broker_symbol,
         validate_broker_bar_order, wire_volume_from_broker_lot_size,
     };
     use neoethos_core::CanonicalTimeframe;
+
+    #[test]
+    fn protection_request_binds_the_same_account_without_entry_prerequisites() {
+        let creds = |account_id: &str| super::ResolvedCreds {
+            client_id: "synthetic-client".into(),
+            client_secret: "synthetic-secret".into(),
+            access_token: "synthetic-token".into(),
+            account_id_str: account_id.into(),
+            environment: super::CTraderEnvironment::Demo,
+            env_label: "Demo",
+        };
+        let request = super::amend_position_sltp_request_from_creds(
+            creds("42"),
+            7,
+            Some(1.09),
+            None,
+            None,
+            Some(42),
+        )
+        .expect("matched protection account requires no historical fills or entry quote");
+        assert_eq!(request.account_id, "42");
+        let super::CTraderExecutionRequest::AmendPositionSltp(amend) = request.request else {
+            panic!("only protective amendment is built")
+        };
+        assert_eq!(
+            (amend.account_id, amend.position_id, amend.stop_loss),
+            (42, 7, Some(1.09))
+        );
+        for account in ["99", "0", "-1", "invalid"] {
+            assert!(
+                super::amend_position_sltp_request_from_creds(
+                    creds(account),
+                    7,
+                    Some(1.09),
+                    None,
+                    None,
+                    Some(42),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            super::amend_position_sltp_request_from_creds(
+                creds("42"),
+                7,
+                Some(1.09),
+                None,
+                None,
+                Some(0),
+            )
+            .is_err()
+        );
+        assert!(
+            super::amend_position_sltp_request_from_creds(
+                creds("99"),
+                7,
+                Some(1.09),
+                None,
+                None,
+                None,
+            )
+            .is_ok(),
+            "manual legacy wrapper remains deliberately unpinned"
+        );
+    }
+
+    #[test]
+    fn close_request_binds_the_account_from_the_same_resolved_credentials() {
+        let creds = |account_id: &str| super::ResolvedCreds {
+            client_id: "fixture-client".to_string(),
+            client_secret: "fixture-secret".to_string(),
+            access_token: "fixture-token".to_string(),
+            account_id_str: account_id.to_string(),
+            environment: super::CTraderEnvironment::Demo,
+            env_label: "Demo",
+        };
+        let request = super::close_request_from_resolved_creds(creds("42"), 7, 37_001, Some(42))
+            .expect("unchanged admitted account is allowed");
+        assert_eq!(request.account_id, "42");
+        let super::CTraderExecutionRequest::ClosePosition(close) = request.request else {
+            panic!("must build only a close request");
+        };
+        assert_eq!(
+            (close.account_id, close.position_id, close.volume),
+            (42, 7, 37_001)
+        );
+
+        let error = super::close_request_from_resolved_creds(creds("99"), 7, 37_001, Some(42))
+            .expect_err("same-environment foreign account must be refused before execution");
+        assert!(
+            error
+                .to_string()
+                .contains("admitted account 42 to resolved account 99")
+        );
+        assert!(super::close_request_from_resolved_creds(creds("42"), 7, 37_001, None).is_ok());
+        assert!(super::close_request_from_resolved_creds(creds("99"), 7, 37_001, None).is_ok());
+        assert!(
+            super::close_request_from_resolved_creds(creds("invalid"), 7, 37_001, Some(42))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_chart_pages_never_gain_canonical_feature_authority() {
+        use super::RecentTrendbarPurpose;
+        assert!(
+            RecentTrendbarPurpose::DisplayOnly
+                .validate_pagination(true)
+                .is_ok()
+        );
+        assert!(
+            RecentTrendbarPurpose::DisplayOnly
+                .validate_pagination(false)
+                .is_ok()
+        );
+        assert!(
+            RecentTrendbarPurpose::CanonicalEvidence
+                .validate_pagination(false)
+                .is_ok()
+        );
+        assert!(
+            RecentTrendbarPurpose::CanonicalEvidence
+                .validate_pagination(true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn chart_paging_rejects_oversized_pages_before_contacting_the_broker() {
+        let error = super::fetch_chart_bars_before_blocking(
+            "EURUSD",
+            "M5",
+            1_700_000_000_000,
+            super::CTRADER_RECENT_TRENDBAR_LIMIT + 1,
+        )
+        .expect_err("unbounded page must fail before credentials or network access");
+        assert!(error.to_string().contains("one-page ceiling"));
+    }
 
     #[test]
     fn wire_volume_uses_the_exact_broker_lot_size() {
@@ -1921,6 +2937,25 @@ mod exact_broker_order_unit_tests {
     }
 
     #[test]
+    fn new_orders_obey_full_broker_trading_permissions() {
+        assert!(ensure_broker_allows_new_order("EURUSD", OrderSide::Buy, true, true).is_ok());
+        assert!(ensure_broker_allows_new_order("EURUSD", OrderSide::Sell, true, true).is_ok());
+
+        let disabled = ensure_broker_allows_new_order("EURUSD", OrderSide::Buy, false, true)
+            .expect_err("close-only or disabled symbol must reject new positions");
+        assert!(disabled.to_string().contains("tradingMode=ENABLED"));
+
+        let short_disabled = ensure_broker_allows_new_order("EURUSD", OrderSide::Sell, true, false)
+            .expect_err("sell-to-open must obey broker short-selling permission");
+        assert!(short_disabled.to_string().contains("forbids short selling"));
+
+        assert!(
+            ensure_broker_allows_new_order("EURUSD", OrderSide::Buy, true, false).is_ok(),
+            "a long order does not require the short-selling permission"
+        );
+    }
+
+    #[test]
     fn every_official_timeframe_uses_the_shared_typed_contract() {
         const TO_MS: i64 = 1_700_000_040_000;
         for timeframe in CanonicalTimeframe::ALL {
@@ -1948,5 +2983,28 @@ mod exact_broker_order_unit_tests {
         assert!(validate_broker_bar_order(&[bar(1), bar(2)], "fixture").is_ok());
         assert!(validate_broker_bar_order(&[bar(1), bar(1)], "fixture").is_err());
         assert!(validate_broker_bar_order(&[bar(2), bar(1)], "fixture").is_err());
+    }
+
+    #[test]
+    fn empty_chart_response_is_valid_but_cannot_become_a_live_feature_snapshot() {
+        let identity = neoethos_data::CanonicalDatasetIdentity::ctrader(
+            neoethos_data::CTraderEnvironment::Demo,
+            "demo.ctraderapi.com",
+            42,
+            1,
+            "EURUSD",
+            CanonicalTimeframe::M1,
+            neoethos_data::BarTimestampConvention::BarOpen,
+        )
+        .expect("test cTrader identity");
+        let snapshot = RecentBrokerTrendbarSnapshot {
+            identity,
+            requested_from_ms: 1,
+            requested_to_ms: 2,
+            retrieved_unix_ms: 1,
+            bars: Vec::new(),
+        };
+        assert!(snapshot.validate_with_empty_policy(true).is_ok());
+        assert!(snapshot.validate().is_err());
     }
 }

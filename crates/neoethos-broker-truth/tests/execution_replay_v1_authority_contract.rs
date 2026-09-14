@@ -221,6 +221,151 @@ fn the_single_v1_decision_owns_every_trailing_threshold_causally() {
 }
 
 #[test]
+fn sequence_preflight_rejects_empty_unordered_or_malformed_deserialized_plans() {
+    let first = plan(vec![decision(
+        ResearchPositionDirectionV1::Long,
+        0.99,
+        1.01,
+    )])
+    .expect("valid first plan");
+    let later = QuoteValidatedResearchReplayPlanV1::new(
+        binding(),
+        policy(),
+        vec![
+            CanonicalBarSignalResearchDecisionV1::new(
+                SIGNAL_BAR_OPEN_MS + 1_000,
+                DECISION_AT_MS + 1_000,
+                ResearchPositionDirectionV1::Long,
+                0.99,
+                1.01,
+            )
+            .expect("later decision"),
+        ],
+        Vec::new(),
+    )
+    .expect("valid later plan");
+    QuoteValidatedResearchReplayPlanV1::validate_ordered_sequence(&[first.clone(), later.clone()])
+        .expect("one fixed chronological decision lane");
+    let mut wire = serde_json::to_value(&first).expect("serializable plan DTO");
+    wire["decisions"] = serde_json::json!([]);
+    let malformed: QuoteValidatedResearchReplayPlanV1 = serde_json::from_value(wire)
+        .expect("direct deserialization does not imply constructor validation");
+    for plans in [
+        Vec::new(),
+        vec![first.clone(), first.clone()],
+        vec![later, first.clone()],
+        vec![first, malformed],
+    ] {
+        let error = QuoteValidatedResearchReplayPlanV1::validate_ordered_sequence(&plans)
+            .expect_err("invalid sequences must refuse without indexing an invalid plan");
+        assert_eq!(
+            error.code(),
+            QuoteValidatedResearchReplayErrorCodeV1::InvalidDecision
+        );
+    }
+}
+
+#[test]
+fn sequence_preflight_refuses_binding_and_execution_policy_changes() {
+    let first = plan(vec![decision(
+        ResearchPositionDirectionV1::Long,
+        0.99,
+        1.01,
+    )])
+    .expect("first plan");
+    let later_decision = CanonicalBarSignalResearchDecisionV1::new(
+        SIGNAL_BAR_OPEN_MS + 1_000,
+        DECISION_AT_MS + 1_000,
+        ResearchPositionDirectionV1::Long,
+        0.99,
+        1.01,
+    )
+    .expect("later decision");
+    let foreign_binding = QuoteValidatedResearchReplayBindingV1::new(
+        SEARCH_RECEIPT_SHA256,
+        SIGNAL_PLAN_SHA256,
+        ACCOUNT_ID + 1,
+        SYMBOL_ID,
+        SYMBOL_NAME,
+        replay_scope(),
+        ReviewedQuoteReplayRuleIdentityV2::new(REVIEW_SHA256, PROTOCOL_SHA256, OBSERVATION_SHA256)
+            .expect("review identity"),
+        MANIFEST_SHA256,
+    )
+    .expect("internally valid different account binding");
+    let changed_policy = QuoteValidatedResearchReplayPolicyV1::new(
+        2_000,
+        1_000,
+        2_000,
+        VersionedLatencySlippagePolicyV1::new("different-cost-assumptions", 1, 0, 1.0, PIP_SIZE)
+            .expect("different valid assumptions"),
+        None,
+    )
+    .expect("internally valid different policy");
+    for (later, expected) in [
+        (
+            QuoteValidatedResearchReplayPlanV1::new(
+                foreign_binding,
+                policy(),
+                vec![later_decision.clone()],
+                Vec::new(),
+            )
+            .expect("foreign account plan"),
+            QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch,
+        ),
+        (
+            QuoteValidatedResearchReplayPlanV1::new(
+                binding(),
+                changed_policy,
+                vec![later_decision],
+                Vec::new(),
+            )
+            .expect("changed policy plan"),
+            QuoteValidatedResearchReplayErrorCodeV1::InvalidPolicy,
+        ),
+    ] {
+        let error =
+            QuoteValidatedResearchReplayPlanV1::validate_ordered_sequence(&[first.clone(), later])
+                .expect_err("a lane cannot change account or execution assumptions midway");
+        assert_eq!(error.code(), expected);
+    }
+}
+
+#[test]
+fn raw_deserialization_still_requires_quote_order_and_digest_validation() {
+    let original = caller_supplied_evidence(
+        vec![
+            quote(DECISION_AT_MS - 1, 1.0, 0),
+            quote(DECISION_AT_MS, 1.0001, 1),
+        ],
+        vec![quote(DECISION_AT_MS + 1, 1.0002, 0)],
+    );
+    for mutation in ["price", "order"] {
+        let mut wire = serde_json::to_value(&original).expect("raw quote DTO");
+        if mutation == "price" {
+            wire["bid"]["quote_records"][0]["price"] = serde_json::json!(1.00005);
+        } else {
+            wire["bid"]["quote_records"]
+                .as_array_mut()
+                .expect("quote array")
+                .swap(0, 1);
+        }
+        let untrusted: CompleteBidAskQuoteReplayEvidenceV1 =
+            serde_json::from_value(wire).expect("untrusted direct DTO deserialization");
+        replay_quote_validated_research_v1(
+            &plan(vec![decision(
+                ResearchPositionDirectionV1::Long,
+                0.99,
+                1.01,
+            )])
+            .expect("valid replay plan"),
+            untrusted,
+        )
+        .expect_err("borrowing sealed evidence must not weaken raw evidence validation");
+    }
+}
+
+#[test]
 fn crossed_synchronized_books_are_evidence_errors_for_long_and_short_entries() {
     for (direction, stop, target) in [
         (ResearchPositionDirectionV1::Long, 0.9900, 1.0100),
@@ -385,7 +530,7 @@ fn historical_authority_requires_the_reopened_link_bft2_and_semantic_ingress_sea
     >;
     type ReplaySealedEvidence = fn(
         &QuoteValidatedResearchReplayPlanV1,
-        SealedHistoricalBidAskQuoteReplayEvidenceV1,
+        &SealedHistoricalBidAskQuoteReplayEvidenceV1,
     ) -> Result<
         SealedHistoricalQuoteValidatedResearchLedgerV1,
         QuoteValidatedResearchReplayErrorV1,
@@ -393,6 +538,39 @@ fn historical_authority_requires_the_reopened_link_bft2_and_semantic_ingress_sea
 
     let _: OpenSealedEvidence = open_sealed_historical_bid_ask_quote_replay_evidence_v1;
     let _: ReplaySealedEvidence = replay_sealed_quote_validated_research_v1;
+}
+
+#[test]
+fn reviewed_run_authority_is_consumed_without_reopening_its_verified_quotes() {
+    let source = include_str!("../src/execution_replay_v1.rs");
+    let consumer = function_body(
+        source,
+        "pub fn into_sealed_historical_bid_ask_quote_replay_evidence_v2(",
+    );
+    for required in [
+        "authority: BrokerFinancialTruthAuthorityV2",
+        "expected_replay_binding.validate()",
+        "authority.into_verified_quote_replay_inputs()",
+        "validate_linked_replay_binding",
+        "quote_evidence_manifest_sha256",
+        "seal_structurally_verified_primary_replay",
+    ] {
+        assert!(
+            consumer.contains(required),
+            "missing reviewed replay binding: {required}"
+        );
+    }
+    for forbidden in [
+        ".open_link(",
+        ".open_exact_v2(",
+        "inspect_untrusted_",
+        "std::fs",
+    ] {
+        assert!(
+            !consumer.contains(forbidden),
+            "reviewed quotes are reopened through {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -430,6 +608,10 @@ fn source_keeps_historical_authority_behind_exact_reopen_and_never_mints_a_permi
     }
     let caller_supplied = function_body(source, "pub fn replay_quote_validated_research_v1(");
     assert!(
+        caller_supplied.contains("evidence.validate()?"),
+        "deserialized caller evidence still requires full row/digest validation"
+    );
+    assert!(
         caller_supplied
             .contains("QuoteValidatedResearchAuthorityV1::UnverifiedCallerSuppliedQuotes"),
         "caller-supplied quote vectors must be explicitly unverified"
@@ -439,6 +621,9 @@ fn source_keeps_historical_authority_behind_exact_reopen_and_never_mints_a_permi
         "caller-supplied quote vectors must not mint historical broker authority"
     );
     let sealed = function_body(source, "pub fn replay_sealed_quote_validated_research_v1(");
+    assert!(sealed.contains("evidence: &SealedHistoricalBidAskQuoteReplayEvidenceV1"));
+    assert!(!sealed.contains("evidence.evidence.clone()"));
+    assert!(!sealed.contains("evidence.validate()"));
     assert!(
         sealed.contains("QuoteValidatedResearchAuthorityV1::HistoricalBidAskQuotesOnly"),
         "only sealed replay may carry historical Bid/Ask authority"

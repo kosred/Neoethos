@@ -33,6 +33,30 @@ fn require_all(source: &str, required: &[&str]) {
     }
 }
 
+fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing function signature {signature:?}"));
+    let open = start
+        + source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("missing function body for {signature:?}"));
+    let mut depth = 0usize;
+    for (offset, byte) in source.as_bytes()[open..].iter().copied().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1).expect("unbalanced function body");
+                if depth == 0 {
+                    return &source[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated function body for {signature:?}");
+}
+
 #[test]
 fn preflight_owns_the_exact_pin_and_complete_census_without_decoding_values() {
     let source = read_or_empty("src/core/gpu_only_feature_workspace_preflight_v3.rs");
@@ -207,21 +231,20 @@ fn data_seals_its_current_census_before_any_one_shot_run_carrier_is_consumed() {
             "current_resident_producer_capabilities_v3()?",
         ],
     );
-    let materialize = section(
+    let prepare = function_body(
         &resident,
-        "pub fn materialize_gpu_only_feature_store_v3(",
-        "\n}",
+        "pub fn prepare_gpu_only_feature_materialization_v3(",
     );
-    let resolve = materialize
+    let resolve = prepare
         .find("CrateOwnedResidentProducerFactoryV3::resolve")
         .expect("Data must resolve the complete producer census");
-    let consume = materialize
-        .find("admitted_run.into_gpu_only_run_device_admission_v3()")
-        .expect("Data must consume the one-shot run carrier");
-    assert!(
-        resolve < consume,
-        "producer preflight must fail before the one-shot carrier is consumed"
+    assert!(resolve < prepare.len());
+    assert!(!prepare.contains("into_gpu_only_run_device_admission_v3"));
+    let materialize = function_body(
+        &resident,
+        "pub fn materialize_prepared_gpu_only_feature_store_v3(",
     );
+    assert!(materialize.contains("admitted_run.into_gpu_only_run_device_admission_v3()?"));
 }
 
 #[test]
@@ -262,7 +285,7 @@ fn completed_workspace_preflight_moves_directly_into_the_resident_materializer()
             "workspace_preflight: PreparedGpuOnlyFeatureWorkspacePreflightV3",
             "CrateOwnedResidentProducerFactoryV3::resolve(workspace_preflight)?",
             "preflight_resident_higher_timeframe_alignment_v3(",
-            "prepared_htf_append.append_to(&mut assembler)?",
+            "post_smc.htf_append.append_to(assembler)?",
             "seal_token.apply_resident_robust_normalization_v2(&mut assembler)?",
         ],
     );

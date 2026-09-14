@@ -15,10 +15,9 @@
 //!   45 of them, e.g. every `perplexity_*` knob but the enable flag, all four
 //!   `auto_rescore_*`, `smc_freshness_limit`, `vortex_memory_map`. Deleted.
 //! * **UNWIRED** — a consumer mechanism exists but nothing connects the config
-//!   to it. `challenge_phase` is the specimen: `PropFirmPhaseRiskDefaults::
-//!   for_preset(preset, phase)` takes exactly that string and only tests call
-//!   it. Kept, documented, and listed in [`NO_QUALIFIED_READER`] below —
-//!   because wiring them would change live sizing and must be a deliberate act.
+//!   to it. Such fields stay documented in [`NO_QUALIFIED_READER`] until a
+//!   deliberate integration or deletion resolves them. The former specimen,
+//!   `ModelsConfig::rl_population_size`, now feeds the NEAT model plan.
 //! * **STORED** — validated, persisted, displayed, then ignored. The purest
 //!   defect, because it is indistinguishable from working. `ui_locale` offered
 //!   an English/Ελληνικά picker in an app with no i18n layer;
@@ -120,6 +119,7 @@
 //!      the struct itself that something outside `config.rs` calls
 //!      (`settings.risk.session_spread_pips()`). An accessor with no caller is
 //!      not a recipient, it is more unwired code.
+//!
 //!    Strings and comments are stripped first, and an assignment target
 //!    (`settings.system.n_jobs = …`) is a write, not a read.
 //! 2. A read that only ever happens in `tests/`, `benches/` or `examples/` is
@@ -166,51 +166,10 @@ enum Inert {
 /// and an entry that has since acquired a qualified production reader fails as
 /// stale. Adding one is a code change in this file, reviewed like any other.
 const NO_QUALIFIED_READER: &[(&str, Inert, &str)] = &[
-    // ─────────────────── kept on purpose: real mechanism, unwired ───────────
-    (
-        "RiskConfig::challenge_phase",
-        Inert::Unwired,
-        "domain::prop_firm::PropFirmPhaseRiskDefaults::for_preset(preset, phase) takes this \
-         string; only its own #[cfg(test)] block calls it. OWNER: operator — wiring it changes \
-         live position sizing on a funded account.",
-    ),
-    (
-        "RiskConfig::recovery_mode_enabled",
-        Inert::Unwired,
-        "domain::risk::RiskManager::update_recovery_state flips recovery_mode from drawdown \
-         alone and consults no toggle; RiskManager has no production constructor at all. \
-         OWNER: operator — honouring the toggle changes drawdown behaviour mid-trade.",
-    ),
-    (
-        "ModelsConfig::rl_population_size",
-        Inert::Unwired,
-        "evolution::neat_impl::NeatTrainer::population_size is hardcoded (96 default / 24 \
-         floor); this field's default of 5 would collapse it 19-fold. OWNER: operator — \
-         wiring it silently would change every NEAT run.",
-    ),
     // ─── 2026-08-09: found the moment the scanner started resolving receivers.
     // Every one of these PASSED the old guard on a same-named field belonging to
     // some other struct. Each was checked by hand against the code before being
     // written down; the site that fooled the old scanner is named.
-    (
-        "RiskConfig::challenge_mode",
-        Inert::Unwired,
-        "the only `challenge_mode` reads are `domain::risk::RiskManager::challenge_mode` \
-         (risk.rs:506,509), a DIFFERENT struct whose value arrives as the second argument to \
-         `RiskManager::new` — and every `RiskManager::new` call in the workspace is inside a \
-         test module, so there is no live call site to pass the config value to. Same root \
-         cause as `recovery_mode_enabled` above. OWNER: operator — deciding challenge vs \
-         monthly-target gating changes when live trading stops.",
-    ),
-    (
-        "RiskConfig::high_quality_confidence",
-        Inert::Unwired,
-        "the consumer is `eval.rs:736 let hq = settings.high_quality_confidence`, but that \
-         `settings` is a `BacktestSettings`, whose field defaults to 0.65 at eval.rs:389 and is \
-         assigned nowhere outside #[cfg(test)]. The two 0.65s agree today, which is exactly why \
-         nobody noticed: changing the config moves nothing and looks like it worked. OWNER: \
-         operator — it scales position size per signal confidence.",
-    ),
     // ─── the four trailing shadows: DELETED 2026-08-10 (audit #206). ────────
     //
     // `RiskConfig::trailing_enabled` / `trailing_atr_multiplier` /
@@ -315,9 +274,9 @@ const REPORTING_ONLY: &[(&str, &str, &str)] = &[
         "crates/neoethos-search/src/discovery.rs",
         "log_gate_states",
         "prints every gate flag with its configured and default value at run start. Its \
-         `settings.risk.challenge_mode` read is accompanied, in the same call, by the text \
-         `UNWIRED: … this arms nothing today` — the reporter says out loud that it is not a \
-         recipient.",
+         `settings.risk.challenge_mode` read is reporting-only; the qualified production \
+         recipient is the account-wide risk authority, which constructs its sole manager with \
+         `RiskManager::from_settings` and is injected into every live portfolio.",
     ),
 ];
 
@@ -783,7 +742,7 @@ fn enclosing_open_brace(b: &[u8], pos: usize) -> Option<usize> {
 ///   `match <expr> { … Some(x) [if guard] => … }`
 ///   `[if|while] let …Some(x)… = <expr>`  — including inside a tuple pattern,
 ///   which is how `live_trading.rs:1427` binds the live trailing policy.
-fn scrutinee_text<'a>(code: &'a str, pat_start: usize, pat_end: usize) -> Option<&'a str> {
+fn scrutinee_text(code: &str, pat_start: usize, pat_end: usize) -> Option<&str> {
     let b = code.as_bytes();
     let mut k = pat_end;
     while k < b.len() && (b[k] as char).is_whitespace() {
@@ -818,10 +777,11 @@ fn scrutinee_text<'a>(code: &'a str, pat_start: usize, pat_end: usize) -> Option
     }
     let rhs = &code[j + 1..];
     let mut end = rhs.len();
-    for stop in [rhs.find(';'), rhs.find('{'), rhs.find(" else")] {
-        if let Some(s) = stop {
-            end = end.min(s);
-        }
+    for s in [rhs.find(';'), rhs.find('{'), rhs.find(" else")]
+        .into_iter()
+        .flatten()
+    {
+        end = end.min(s);
     }
     // Never slice mid-character; `get` returns None rather than panicking.
     let rhs = rhs.get(..end).map(str::trim)?;
@@ -1539,10 +1499,10 @@ fn scan_workspace(model: &ConfigModel) -> ReadIndex {
 
     let mut index = ReadIndex::default();
     for file in files {
-        if let (Some(skip), Ok(canon)) = (skip.as_ref(), std::fs::canonicalize(&file)) {
-            if &canon == skip {
-                continue;
-            }
+        if let (Some(skip), Ok(canon)) = (skip.as_ref(), std::fs::canonicalize(&file))
+            && &canon == skip
+        {
+            continue;
         }
         let Ok(raw) = std::fs::read_to_string(&file) else {
             continue;

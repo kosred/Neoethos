@@ -160,7 +160,7 @@ pub fn recent_log(limit: usize) -> Vec<SupervisorLogEntry> {
 // ── Action protocol (STRICT whitelist — serde-tagged, no free-form) ─────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SupervisorAction {
     /// Record an observation/diagnosis for the operator. Always allowed.
     Note {
@@ -168,13 +168,11 @@ pub enum SupervisorAction {
     },
     /// Kick a discovery run (same validated body as the UI button).
     StartDiscovery {
-        symbol: String,
-        base_tf: String,
+        dataset_selection: neoethos_data::SelectedDatasetGenerationV1,
     },
     StopDiscovery,
     StartTraining {
-        symbol: String,
-        base_tf: String,
+        training_handoff: String,
     },
     StopTraining,
     /// Start live engines for portfolio files. The demo-forward gate still
@@ -182,7 +180,8 @@ pub enum SupervisorAction {
     StartLive {
         portfolio_paths: Vec<String>,
     },
-    /// Stop ALL live engines (risk-reducing — always allowed).
+    /// Stop ALL live engines. This does not close broker positions and stops
+    /// their local strategy supervision; it is not a substitute for an exit.
     StopLive,
     /// Change settings THROUGH the same clamped/validated applier as the UI.
     /// Payload = the camelCase `POST /settings` body (subset).
@@ -216,40 +215,92 @@ pub enum SupervisorAction {
 
 // ── State bundle ────────────────────────────────────────────────────────────
 
-async fn gather_bundle(state: &AppApiState) -> serde_json::Value {
-    // Engines (discovery/training) — same DTO the UI polls.
-    let engines = serde_json::to_value(
-        crate::server::system_status::engines(State(state.clone()))
-            .await
-            .0,
-    )
-    .unwrap_or(serde_json::Value::Null);
+/// The same cached observation is available to the UI and to every AI cycle.
+/// It is monitoring context, never broker execution authority.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SupervisorObservation {
+    observed_at_unix_ms: i64,
+    account: Option<crate::server::account::AccountSnapshotDto>,
+    account_failure: Option<crate::server::state::AccountRefreshFailure>,
+    market: crate::server::live_spots::SpotsResponse,
+    live_engines: Vec<crate::app_services::live_trading::LiveTradingStatus>,
+    live_engine_error: Option<&'static str>,
+}
 
-    // Live autopilot overview.
-    let live: Vec<serde_json::Value> = {
-        match state.live_trading.lock() {
-            Ok(handles) => handles
+pub(crate) async fn observation(state: &AppApiState) -> SupervisorObservation {
+    observation_with_scope(
+        state,
+        crate::server::bridge::current_execution_account_scope,
+    )
+    .await
+}
+
+async fn observation_with_scope(
+    state: &AppApiState,
+    resolve_scope: impl FnOnce() -> Result<(
+        i64,
+        crate::app_services::ctrader_live_auth::CTraderEnvironment,
+    )> + Send
+    + 'static,
+) -> SupervisorObservation {
+    let (account, account_failure) =
+        crate::server::account::observation_with_scope(state, resolve_scope).await;
+    let live = state
+        .live_trading
+        .lock()
+        .map_err(|_| "Live engine registry is unavailable")
+        .and_then(|handles| {
+            handles
                 .iter()
-                .map(|h| serde_json::to_value(h.snapshot()).unwrap_or(serde_json::Value::Null))
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+                .map(|handle| {
+                    handle
+                        .status
+                        .lock()
+                        .map(|status| status.clone())
+                        .map_err(|_| "A live engine status is unavailable")
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+        });
+    let (live_engines, live_engine_error) = match live {
+        Ok(engines) => (engines, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    SupervisorObservation {
+        observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+        account: account.map(Into::into),
+        account_failure,
+        market: crate::server::live_spots::snapshot(),
+        live_engines,
+        live_engine_error,
+    }
+}
+
+async fn gather_bundle(state: &AppApiState) -> serde_json::Value {
+    let observation = observation(state).await;
+    // Engines (discovery/training) — same DTO the UI polls.
+    let engines = match crate::server::system_status::engines(State(state.clone())).await {
+        Ok(Json(dto)) => serde_json::to_value(dto).unwrap_or(serde_json::Value::Null),
+        Err(response) => inventory_context(response).await,
     };
 
     // Journal stats (last 7 days) + last closed trades.
-    let (stats, last_trades) = match data_dir() {
-        Some(dir) => {
+    let (stats, last_trades) = match (data_dir(), observation.account.as_ref()) {
+        (Some(dir), Some(account)) => {
             let now = chrono::Utc::now().timestamp_millis();
             let from = now - 7 * 24 * 3600 * 1000;
             let mut trades =
                 crate::app_services::journal_store::query_closed_trades(&dir, Some(from), None);
             let mut equity =
                 crate::app_services::journal_store::query_equity(&dir, Some(from), None);
-            // Scope to the ACTIVE account — same rule as the Journal screen.
-            if let Some(active) = crate::app_services::journal_store::active_account_id() {
-                trades.retain(|t| t.account_id.as_deref() == Some(active.as_str()));
-                equity.retain(|e| e.account_id.as_deref() == Some(active.as_str()));
-            }
+            // Use the verified observation scope. No account means unknown
+            // history, never all accounts; Demo/Live IDs are not interchangeable.
+            trades.retain(|t| {
+                journal_scope_matches(account, t.account_id.as_deref(), t.environment.as_deref())
+            });
+            equity.retain(|e| {
+                journal_scope_matches(account, e.account_id.as_deref(), e.environment.as_deref())
+            });
             let stats = serde_json::to_value(crate::app_services::journal_stats::compute_stats(
                 &trades, &equity,
             ))
@@ -267,20 +318,8 @@ async fn gather_bundle(state: &AppApiState) -> serde_json::Value {
                 .collect();
             (stats, serde_json::Value::Array(tail))
         }
-        None => (serde_json::Value::Null, serde_json::Value::Null),
+        _ => (serde_json::Value::Null, serde_json::Value::Null),
     };
-
-    // Account snapshot (cached — no broker roundtrip on the tick path).
-    let account = state
-        .account()
-        .await
-        .map(|a| {
-            serde_json::json!({
-                "balance": a.balance, "equity": a.equity, "currency": a.currency,
-                "openPositions": a.positions.len(),
-            })
-        })
-        .unwrap_or(serde_json::Value::Null);
 
     // Discovered portfolios + permanent blacklist.
     let portfolios = serde_json::to_value(
@@ -295,18 +334,52 @@ async fn gather_bundle(state: &AppApiState) -> serde_json::Value {
     // The agent's own recent memory (notes, fetched research, action results).
     let memory = serde_json::to_value(recent_log(20)).unwrap_or(serde_json::Value::Null);
 
+    // Reuse the UI inventories. The model must not invent a dataset generation
+    // or reopen training by symbol/timeframe from old artifacts.
+    let (data_inventory, intelligence) = tokio::join!(
+        crate::server::system_status::data_bootstrap(State(state.clone())),
+        crate::server::intelligence::intelligence(State(state.clone())),
+    );
+    let data_inventory = inventory_context(data_inventory).await;
+    let intelligence = inventory_context(intelligence).await;
+
     serde_json::json!({
         "nowUtc": chrono::Utc::now().to_rfc3339(),
         "engines": engines,
-        "liveEngines": live,
+        "dataInventory": data_inventory,
+        "intelligence": intelligence,
+        "observedAtUnixMs": observation.observed_at_unix_ms,
+        "market": observation.market,
+        "liveEngines": observation.live_engines,
+        "liveEngineError": observation.live_engine_error,
         "journalStats7d": stats,
         "recentClosedTrades": last_trades,
-        "account": account,
+        "account": observation.account,
+        "accountFailure": observation.account_failure,
         "portfolios": portfolios,
         "blacklist": blacklist,
         "liveExperienceCount": crate::app_services::experience_store::count(),
         "supervisorMemory": memory,
     })
+}
+
+fn journal_scope_matches(
+    account: &crate::server::account::AccountSnapshotDto,
+    account_id: Option<&str>,
+    environment: Option<&str>,
+) -> bool {
+    account_id == Some(account.source_account_id.as_str())
+        && environment == Some(account.source_environment)
+}
+
+async fn inventory_context(response: axum::response::Response) -> serde_json::Value {
+    let status = response.status().as_u16();
+    match axum::body::to_bytes(response.into_body(), 1024 * 1024).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::json!({"status": status, "error": "Inventory response is not valid JSON"})
+        }),
+        Err(_) => serde_json::json!({"status": status, "error": "Inventory unavailable or exceeds the supervisor context limit"}),
+    }
 }
 
 // ── Prompt ──────────────────────────────────────────────────────────────────
@@ -318,19 +391,30 @@ numbers.
 
 You receive a JSON state bundle: discovery/training engine status, live
 autopilot engines (with loss streaks), 7-day journal stats, recent closed
-trades, account, discovered portfolios (with blacklisted flags), the permanent
-blacklist, and your own recent action log (your memory).
+trades, the cached account with its full positions and fetchedAtUnixMs,
+market.spots with bid/ask and received/broker timestamps, discovered portfolios
+(with blacklisted flags), the permanent blacklist, and your own recent action
+log (your memory), dataInventory.datasets and intelligence.trainingHandoffs.
+Missing account, prices, timestamps or engine status mean
+UNKNOWN, never zero exposure or a healthy connection. accountFailure records
+the actual last refresh failure; any retained account snapshot is then stale.
+Do not recommend re-authentication when the failure is missing financial-truth
+capability rather than an authentication rejection. freshnessSeconds is the
+age of the last received event, not a guarantee that both quote sides are fresh.
+Inspect position IDs, stops, targets, account currency and engine protection
+errors before proposing position changes. Account pnlUsd is a legacy field name:
+its value is in account.currency, not necessarily USD.
 
 Reply with ONLY a JSON array (no prose, no markdown fences) of at most N
 actions (N given per request). Available actions:
 
   {"action":"note","text":"..."}                                  — record a finding/diagnosis for the operator (use freely)
-  {"action":"start_discovery","symbol":"EURUSD","base_tf":"M15"}  — kick a strategy search
+  {"action":"start_discovery","dataset_selection":{"schema":"neoethos.selected-dataset-generation.v1","version":1,"dataset_identity":"<datasetIdentity>","generation_id":"<generation>","manifest_binding_sha256":"<manifestBindingSha256>"}} — copy one exact dataInventory.datasets entry, never invent values
   {"action":"stop_discovery"}
-  {"action":"start_training","symbol":"EURUSD","base_tf":"M15"}
+  {"action":"start_training","training_handoff":"<identity from intelligence.trainingHandoffs>"}
   {"action":"stop_training"}
   {"action":"start_live","portfolio_paths":["..."]}               — start live engines (never blacklisted paths)
-  {"action":"stop_live"}                                          — stop ALL live engines (risk-reducing)
+  {"action":"stop_live"}                                          — stop ALL live engines, NOT their broker positions
   {"action":"update_settings","payload":{...}}                    — camelCase POST /settings subset, e.g. {"riskPerTrade":0.005}
   {"action":"propose_close","position_id":123,"reason":"..."}     — queues for HUMAN approval, never executes itself
   {"action":"fetch_url","url":"https://..."}                      — research; excerpt appears in your memory next tick
@@ -343,8 +427,16 @@ Judgement guidelines:
   a preemptive stop (auto-cull handles it).
 - If NO discovery/training is running and the machine is idle, consider
   starting discovery for a pair with data but few/stale strategies.
+- Discovery is ResearchOnly and does not auto-start training. Training must
+  explicitly select one published handoff. If either inventory is unavailable,
+  report its error; never replace exact selectors with symbol/timeframe guesses.
 - Never start a blacklisted portfolio. Never raise risk settings on a losing
   week. Keep any riskPerTrade suggestion ≤ 0.01 (1%).
+- Stopping engines also stops their local monitoring. It does not close open
+  positions or add protection. Never describe stop_live as a position exit.
+- The strategy engine and broker-confirmed protection manage entries/exits;
+  this periodic AI cycle is not a tick-by-tick protective stop. Never claim a
+  proposed close or a requested stop amendment has executed without a receipt.
 - If everything is healthy, a single note saying so is a perfect reply.
 Reply with [] if nothing is worth doing."#;
 
@@ -352,15 +444,17 @@ Reply with [] if nothing is worth doing."#;
 
 static TICK_RUNNING: AtomicBool = AtomicBool::new(false);
 
+pub(crate) fn cycle_running() -> bool {
+    TICK_RUNNING.load(Ordering::SeqCst)
+}
+
 /// One supervisor cycle: gather → ask the LLM → execute (whitelisted, capped).
 /// Returns a short human-readable summary. Guarded against overlap.
 pub async fn tick(state: AppApiState) -> Result<String> {
-    if TICK_RUNNING.swap(true, Ordering::SeqCst) {
-        anyhow::bail!("a supervisor tick is already running");
-    }
-    let result = run_cycle(state, None).await.map(|(_, summary)| summary);
-    TICK_RUNNING.store(false, Ordering::SeqCst);
-    result
+    run_exclusive_cycle(&TICK_RUNNING, async move {
+        run_cycle(state, None).await.map(|(_, summary)| summary)
+    })
+    .await
 }
 
 /// Operator ↔ supervisor CHAT: same state bundle, same whitelisted actions —
@@ -368,13 +462,28 @@ pub async fn tick(state: AppApiState) -> Result<String> {
 /// `(assistant_reply, actions_summary)`. The supervisor and the chat are ONE
 /// brain: what you tell it here it acts on (within the same tiered authority).
 pub async fn chat(state: AppApiState, message: String) -> Result<(String, String)> {
-    if TICK_RUNNING.swap(true, Ordering::SeqCst) {
+    run_exclusive_cycle(&TICK_RUNNING, async move {
+        log_entry("chat", format!("operator: {message}"), None, None);
+        run_cycle(state, Some(message)).await
+    })
+    .await
+}
+
+async fn run_exclusive_cycle<T>(
+    running: &AtomicBool,
+    cycle: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if running.swap(true, Ordering::SeqCst) {
         anyhow::bail!("a supervisor cycle is already running — try again in a moment");
     }
-    log_entry("chat", format!("operator: {message}"), None, None);
-    let result = run_cycle(state, Some(message)).await;
-    TICK_RUNNING.store(false, Ordering::SeqCst);
-    result
+    struct RunningGuard<'a>(&'a AtomicBool);
+    impl Drop for RunningGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = RunningGuard(running);
+    cycle.await
 }
 
 async fn run_cycle(
@@ -427,7 +536,7 @@ async fn run_cycle(
         .map(|c| c.message.content)
         .unwrap_or_default();
 
-    let actions = parse_actions(&reply);
+    let actions = parse_actions(&reply)?;
     log_entry(
         "tick",
         format!("cycle complete — {} action(s) proposed", actions.len()),
@@ -483,16 +592,16 @@ async fn run_cycle(
 
 /// Extract the first JSON array from the reply (models occasionally wrap the
 /// array in prose or code fences despite instructions).
-fn parse_actions(reply: &str) -> Vec<SupervisorAction> {
-    let start = match reply.find('[') {
-        Some(i) => i,
-        None => return Vec::new(),
-    };
-    let end = match reply.rfind(']') {
-        Some(i) if i > start => i,
-        _ => return Vec::new(),
-    };
-    serde_json::from_str::<Vec<SupervisorAction>>(&reply[start..=end]).unwrap_or_default()
+fn parse_actions(reply: &str) -> Result<Vec<SupervisorAction>> {
+    let start = reply
+        .find('[')
+        .context("Supervisor returned no action array; no actions were executed")?;
+    let end = reply
+        .rfind(']')
+        .filter(|end| *end > start)
+        .context("Supervisor returned an incomplete action array; no actions were executed")?;
+    serde_json::from_str::<Vec<SupervisorAction>>(&reply[start..=end])
+        .context("Supervisor returned invalid or unsupported actions; no actions were executed")
 }
 
 /// Local MCP sidecar base URL.
@@ -565,12 +674,17 @@ fn action_label(a: &SupervisorAction) -> String {
         }
         SupervisorAction::McpTools => "mcp_tools".into(),
         SupervisorAction::McpCall { server, tool, .. } => format!("mcp_call {server}/{tool}"),
-        SupervisorAction::StartDiscovery { symbol, base_tf } => {
-            format!("start_discovery {symbol} {base_tf}")
+        SupervisorAction::StartDiscovery { dataset_selection } => {
+            format!(
+                "start_discovery {} {} {}",
+                dataset_selection.identity().symbol_name(),
+                dataset_selection.identity().timeframe().as_str(),
+                dataset_selection.generation_id()
+            )
         }
         SupervisorAction::StopDiscovery => "stop_discovery".into(),
-        SupervisorAction::StartTraining { symbol, base_tf } => {
-            format!("start_training {symbol} {base_tf}")
+        SupervisorAction::StartTraining { training_handoff } => {
+            format!("start_training {training_handoff}")
         }
         SupervisorAction::StopTraining => "stop_training".into(),
         SupervisorAction::StartLive { portfolio_paths } => {
@@ -594,48 +708,37 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
     match action {
         SupervisorAction::Note { text } => Ok(format!("noted: {text}")),
 
-        SupervisorAction::StartDiscovery { symbol, base_tf } => {
-            let base_timeframe = base_tf
-                .trim()
-                .to_uppercase()
-                .parse::<neoethos_data::CanonicalTimeframe>()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            let handle = engines_control::start_typed_discovery_execution_v1(
-                state.clone(),
-                engines_control::TypedDiscoveryExecutionIntentV1 {
-                    symbol,
-                    base_timeframe,
-                    higher_timeframes: engines_control::TypedHigherTimeframePolicyV1::Configured,
-                    overrides: engines_control::TypedDiscoveryOverridesV1::default(),
-                    settings_gate: engines_control::TypedDiscoverySettingsGateV1::None,
-                    dataset_policy: engines_control::TypedDiscoveryDatasetPolicyV1::Current,
-                    training_after_success: true,
-                },
-            )?;
-            engines_control::detach_typed_legacy_execution_observer_v1(state.clone(), handle);
-            Ok("discovery start → accepted".to_owned())
+        SupervisorAction::StartDiscovery { dataset_selection } => {
+            let response = engines_control::discovery_start(
+                State(state.clone()),
+                Some(Json(engines_control::StartJobBody {
+                    dataset_selection: Some(dataset_selection),
+                    ..Default::default()
+                })),
+            )
+            .await;
+            Ok(format!(
+                "discovery start → {}",
+                action_response(response).await?
+            ))
         }
         SupervisorAction::StopDiscovery => {
             let _ = engines_control::discovery_stop(State(state.clone())).await;
             Ok("discovery stop requested".into())
         }
-        SupervisorAction::StartTraining { symbol, base_tf } => {
-            let base_timeframe = base_tf
-                .trim()
-                .to_uppercase()
-                .parse::<neoethos_data::CanonicalTimeframe>()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            let handle = engines_control::start_typed_training_execution_v1(
-                state.clone(),
-                engines_control::TypedTrainingExecutionIntentV1 {
-                    selection: engines_control::TypedTrainingSelectionPolicyV1::Exact {
-                        symbol,
-                        base_timeframe,
-                    },
-                },
-            )?;
-            engines_control::detach_typed_legacy_execution_observer_v1(state.clone(), handle);
-            Ok("training start → accepted".to_owned())
+        SupervisorAction::StartTraining { training_handoff } => {
+            let response = engines_control::training_start(
+                State(state.clone()),
+                Json(engines_control::TrainingStartBody {
+                    training_handoff,
+                    mode: crate::app_services::training::TrainingMode::TrainModels,
+                }),
+            )
+            .await;
+            Ok(format!(
+                "training start → {}",
+                action_response(response).await?
+            ))
         }
         SupervisorAction::StopTraining => {
             let _ = engines_control::training_stop(State(state.clone())).await;
@@ -646,18 +749,21 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
             let body: autonomous::StartLiveBody =
                 serde_json::from_value(serde_json::json!({ "portfolio_paths": portfolio_paths }))?;
             let resp = autonomous::start_live(State(state.clone()), Json(body)).await;
-            Ok(format!("live start → {}", response_status(&resp)))
+            Ok(format!("live start → {}", action_response(resp).await?))
         }
         SupervisorAction::StopLive => {
             let resp = autonomous::stop_live(State(state.clone())).await;
-            Ok(format!("live stop-all → {}", response_status(&resp)))
+            Ok(format!("live stop-all → {}", action_response(resp).await?))
         }
 
         SupervisorAction::UpdateSettings { payload } => {
             let dto: settings::SettingsUpdateDto = serde_json::from_value(payload)
                 .context("payload is not a valid settings update")?;
             let resp = settings::update_settings(State(state.clone()), Json(dto)).await;
-            Ok(format!("settings update → {}", response_status(&resp)))
+            Ok(format!(
+                "settings update → {}",
+                action_response(resp).await?
+            ))
         }
 
         SupervisorAction::ProposeClose {
@@ -773,13 +879,38 @@ async fn execute(state: &AppApiState, action: SupervisorAction) -> Result<String
     }
 }
 
-fn response_status(resp: &axum::response::Response) -> String {
-    let s = resp.status();
-    if s.is_success() {
-        format!("OK {s}")
-    } else {
-        format!("HTTP {s}")
+async fn action_response(resp: axum::response::Response) -> Result<String> {
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .context("Could not read the backend action result; verify the actual engine state")?;
+    let detail = String::from_utf8_lossy(&body);
+    if !status.is_success() {
+        anyhow::bail!(
+            "HTTP {status}: {}",
+            detail.chars().take(4000).collect::<String>()
+        );
     }
+    // Batch starts may return HTTP 200 after starting only SOME engines.
+    // Preserve that distinction: a partial execution is not full success.
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
+        && let Some(failed) = value.get("failed").and_then(serde_json::Value::as_array)
+        && !failed.is_empty()
+    {
+        let started = value
+            .get("started")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        anyhow::bail!(
+            "Partial execution: {started} engines started, {} failed; inspect running engines. {}",
+            failed.len(),
+            serde_json::to_string(failed)?
+                .chars()
+                .take(4000)
+                .collect::<String>()
+        );
+    }
+    Ok(format!("OK {status}"))
 }
 
 // ── Background loop ─────────────────────────────────────────────────────────
@@ -871,5 +1002,293 @@ mod s02_tests {
         // "getaway"/"reader" must NOT count as read-only via substring.
         assert!(!is_read_only_mcp_tool("getaway_launch"));
         assert!(!is_read_only_mcp_tool("listen_and_trade"));
+    }
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use super::*;
+    use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn cancelling_a_cycle_releases_its_running_state() {
+        let running = AtomicBool::new(false);
+        let mut cycle = Box::pin(run_exclusive_cycle(
+            &running,
+            std::future::pending::<Result<()>>(),
+        ));
+        assert!(futures::poll!(cycle.as_mut()).is_pending());
+        assert!(running.load(Ordering::SeqCst));
+        drop(cycle);
+        assert!(
+            !running.load(Ordering::SeqCst),
+            "a cancelled request must not permanently disable the supervisor"
+        );
+        assert!(
+            run_exclusive_cycle(&running, async { Ok(()) })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_actions_are_not_reported_as_no_work() {
+        for reply in [
+            "The service is unavailable.",
+            "[{\"action\":\"open_unchecked_trade\"}]",
+            "[{\"action\":\"note\"}]",
+            "[{\"action\":\"note\",\"text\":",
+        ] {
+            assert!(parse_actions(reply).is_err(), "silently accepted: {reply}");
+        }
+        assert!(parse_actions("[]").unwrap().is_empty());
+        assert_eq!(
+            parse_actions("```json\n[{\"action\":\"note\",\"text\":\"No change\"}]\n```")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn research_actions_require_exact_current_selectors_and_reject_old_fields() {
+        use neoethos_data::{
+            BarTimestampConvention, CanonicalDatasetIdentity, CanonicalTimeframe,
+            SelectedDatasetGenerationV1,
+        };
+        let selection = SelectedDatasetGenerationV1::new(
+            CanonicalDatasetIdentity::external(
+                "test",
+                "EURUSD",
+                CanonicalTimeframe::M5,
+                BarTimestampConvention::BarOpen,
+            )
+            .unwrap(),
+            format!("g1-{}.vortex", "1".repeat(64)),
+            "2".repeat(64),
+        )
+        .unwrap();
+        let discovery =
+            serde_json::json!({"action":"start_discovery", "dataset_selection": selection});
+        let training =
+            serde_json::json!({"action":"start_training", "training_handoff": "a".repeat(64)});
+        for valid in [discovery, training] {
+            assert!(serde_json::from_value::<SupervisorAction>(valid.clone()).is_ok());
+            for field in ["symbol", "base_tf", "training_after_success"] {
+                let mut ambiguous = valid.clone();
+                ambiguous[field] = serde_json::json!("old-selector");
+                assert!(serde_json::from_value::<SupervisorAction>(ambiguous).is_err());
+            }
+        }
+        for action in ["start_discovery", "start_training"] {
+            assert!(
+                serde_json::from_value::<SupervisorAction>(serde_json::json!({
+                    "action": action, "symbol":"EURUSD", "base_tf":"M5",
+                }))
+                .is_err()
+            );
+        }
+        assert!(SYSTEM_PROMPT.contains("intelligence.trainingHandoffs"));
+        assert!(SYSTEM_PROMPT.contains("dataInventory.datasets"));
+    }
+
+    #[tokio::test]
+    async fn inventory_failures_remain_visible_instead_of_becoming_empty_success() {
+        let failure = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"inventory denied"})),
+        )
+            .into_response();
+        assert_eq!(
+            inventory_context(failure).await["error"],
+            "inventory denied"
+        );
+        let malformed = inventory_context("not JSON".into_response()).await;
+        assert!(
+            malformed["error"]
+                .as_str()
+                .unwrap()
+                .contains("not valid JSON")
+        );
+        let oversized = inventory_context("x".repeat(1024 * 1024 + 1).into_response()).await;
+        assert!(
+            oversized["error"]
+                .as_str()
+                .unwrap()
+                .contains("context limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_rejections_are_failed_actions_with_the_actual_reason() {
+        let response = (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"position identity changed"})),
+        )
+            .into_response();
+        let error = action_response(response)
+            .await
+            .expect_err("a rejected backend action is not a completed action");
+        assert!(error.to_string().contains("position identity changed"));
+    }
+
+    #[tokio::test]
+    async fn partial_batch_start_is_not_full_success() {
+        let response = Json(serde_json::json!({
+            "started": ["one-portfolio"],
+            "failed": [{"portfolio":"another", "error":"missing execution authority"}],
+        }))
+        .into_response();
+        let error = action_response(response).await.unwrap_err().to_string();
+        assert!(error.contains("1 engines started, 1 failed"));
+        assert!(error.contains("missing execution authority"));
+        assert!(error.contains("inspect running engines"));
+
+        let success = Json(serde_json::json!({"started":["one"],"failed":[]})).into_response();
+        assert!(action_response(success).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_overlapping_request_cannot_clear_the_active_cycle() {
+        let running = AtomicBool::new(false);
+        let mut first = Box::pin(run_exclusive_cycle(
+            &running,
+            std::future::pending::<Result<()>>(),
+        ));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(
+            run_exclusive_cycle(&running, async { Ok(()) })
+                .await
+                .is_err()
+        );
+        assert!(running.load(Ordering::SeqCst));
+        drop(first);
+        assert!(!running.load(Ordering::SeqCst));
+        assert!(
+            run_exclusive_cycle(&running, async {
+                Err::<(), _>(anyhow::anyhow!("cycle failure"))
+            })
+            .await
+            .is_err()
+        );
+        assert!(!running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn observation_contains_positions_and_nullable_quote_evidence() {
+        use crate::app_services::live_spots;
+        use crate::server::state::{AccountSnapshotPayload, PositionPayload};
+
+        struct ClearQuotes;
+        impl Drop for ClearQuotes {
+            fn drop(&mut self) {
+                live_spots::clear();
+            }
+        }
+        let _quotes = ClearQuotes;
+        live_spots::clear();
+        // Synthetic cached data only: no streamer, broker call or order.
+        live_spots::update_tick(101, "EURUSD", Some(1.125), None, None);
+        let state = AppApiState::new();
+        state
+            .set_account(AccountSnapshotPayload {
+                source_account_id: 42,
+                source_environment:
+                    crate::app_services::ctrader_live_auth::CTraderEnvironment::Demo,
+                balance: 1000.0,
+                equity: 1012.5,
+                free_margin: 900.0,
+                used_margin: 112.5,
+                currency: "EUR".into(),
+                fetched_at_unix_ms: 123456,
+                positions: vec![PositionPayload {
+                    position_id: 42,
+                    volume_units: 100000,
+                    symbol: "EURUSD".into(),
+                    side: "BUY".into(),
+                    volume: 1000.0,
+                    open_timestamp_ms: Some(123000),
+                    pnl_pips: None,
+                    pnl_usd: 12.5,
+                    entry_price: Some(1.1),
+                    stop_loss: Some(1.09),
+                    take_profit: Some(1.15),
+                    volume_lots: Some(0.01),
+                }],
+            })
+            .await;
+        let value = serde_json::to_value(
+            observation_with_scope(&state, || Ok((42, CTraderEnvironment::Demo))).await,
+        )
+        .unwrap();
+        assert_eq!(value["account"]["sourceAccountId"], "42");
+        assert_eq!(value["account"]["sourceEnvironment"], "Demo");
+        assert_eq!(value["account"]["positions"][0]["positionId"], 42);
+        assert_eq!(value["account"]["positions"][0]["stopLoss"], 1.09);
+        assert_eq!(value["account"]["positions"][0]["takeProfit"], 1.15);
+        assert_eq!(value["account"]["positions"][0]["pnlUsd"], 12.5);
+        assert_eq!(value["account"]["currency"], "EUR");
+        assert_eq!(value["account"]["fetchedAtUnixMs"], 123456);
+        assert_eq!(value["market"]["spots"][0]["bid"], 1.125);
+        assert!(value["market"]["spots"][0]["ask"].is_null());
+        assert!(value["market"]["spots"][0]["brokerTimestampMs"].is_null());
+        assert!(
+            value["market"]["spots"][0]["receivedAtUnixMs"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
+        assert!(value["liveEngineError"].is_null());
+        assert!(value["accountFailure"].is_null());
+        let account =
+            crate::server::account::AccountSnapshotDto::from(state.account().await.unwrap());
+        assert!(journal_scope_matches(&account, Some("42"), Some("Demo")));
+        for (id, env) in [
+            (Some("42"), Some("Live")),
+            (Some("99"), Some("Demo")),
+            (None, Some("Demo")),
+            (Some("42"), None),
+        ] {
+            assert!(!journal_scope_matches(&account, id, env));
+        }
+        state
+            .set_account_failure(&anyhow::anyhow!("broker snapshot rejected"))
+            .await;
+        let stale = serde_json::to_value(
+            observation_with_scope(&state, || Ok((42, CTraderEnvironment::Demo))).await,
+        )
+        .unwrap();
+        assert_eq!(stale["accountFailure"]["code"], "account_refresh_failed");
+        assert_eq!(
+            stale["accountFailure"]["detail"],
+            "broker snapshot rejected"
+        );
+        assert_eq!(stale["account"]["positions"][0]["positionId"], 42);
+
+        let switched = serde_json::to_value(
+            observation_with_scope(&state, || Ok((42, CTraderEnvironment::Live))).await,
+        )
+        .unwrap();
+        assert!(
+            switched["account"].is_null(),
+            "old Demo positions must not enter a Live observation"
+        );
+        let missing = serde_json::to_value(
+            observation_with_scope(&AppApiState::new(), || {
+                anyhow::bail!("No selected execution account")
+            })
+            .await,
+        )
+        .unwrap();
+        assert!(
+            missing["account"].is_null(),
+            "no account must remain unknown, not zero exposure"
+        );
+        assert_eq!(
+            missing["accountFailure"]["code"],
+            "account_scope_unavailable"
+        );
     }
 }

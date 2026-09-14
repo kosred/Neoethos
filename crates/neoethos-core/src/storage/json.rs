@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,23 @@ pub fn write_json_atomic<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &
     write_bytes_atomic(path, &json)
 }
 
+/// Stream the same JSON values without pretty whitespace or a whole-document
+/// buffer. The existing pretty writer remains unchanged for its callers.
+pub fn write_json_atomic_compact<T: Serialize + ?Sized>(
+    path: impl AsRef<Path>,
+    value: &T,
+) -> Result<()> {
+    write_atomic(path.as_ref(), |file| {
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+        serde_json::to_writer(&mut writer, value).context("serialize compact artifact")?;
+        writer
+            .write_all(b"\n")
+            .context("terminate compact artifact")?;
+        // Drop ignores flush errors; publication must require a successful flush.
+        writer.flush().context("flush compact artifact")
+    })
+}
+
 /// Atomically write raw bytes to `path` (audit M07): serialize into a UNIQUE
 /// hidden temp file in the SAME directory, fsync it, then atomically rename
 /// it over the target. A crash at any point leaves either the previous file
@@ -26,7 +43,12 @@ pub fn write_json_atomic<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &
 /// other's staging file. Use for any canonical on-disk state (config.yaml,
 /// symbol metadata, …) where a half-written file would be corruption.
 pub fn write_bytes_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
-    let path = path.as_ref();
+    write_atomic(path.as_ref(), |file| {
+        file.write_all(bytes).context("write artifact bytes")
+    })
+}
+
+fn write_atomic(path: &Path, writer: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
     // M07 writer lock: serialize same-target writers within this process so
     // two threads saving the same file can't interleave their temp-write +
     // rename sequences (each write stays all-or-nothing regardless, but
@@ -49,21 +71,41 @@ pub fn write_bytes_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(parent)
         .with_context(|| format!("create artifact directory {}", parent.display()))?;
     let tmp_path = temporary_path(path);
-    {
-        let mut tmp = File::create(&tmp_path)
-            .with_context(|| format!("create temp artifact {}", tmp_path.display()))?;
-        tmp.write_all(bytes)
-            .with_context(|| format!("write temp artifact {}", tmp_path.display()))?;
-        tmp.sync_all()
-            .with_context(|| format!("fsync temp artifact {}", tmp_path.display()))?;
+    // Only a file created by this attempt may be removed on failure. A stale
+    // same-name file (for example after PID reuse) is never overwritten/deleted.
+    let mut tmp = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .with_context(|| format!("create temp artifact {}", tmp_path.display()))?;
+    let written = writer(&mut tmp)
+        .with_context(|| format!("write temp artifact {}", tmp_path.display()))
+        .and_then(|()| {
+            tmp.sync_all()
+                .with_context(|| format!("fsync temp artifact {}", tmp_path.display()))
+        });
+    // Close before either rename or cleanup, including on Windows.
+    drop(tmp);
+    let published = written.and_then(|()| {
+        rename_with_windows_retry(&tmp_path, path).with_context(|| {
+            format!(
+                "atomically rename {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })
+    });
+    if let Err(error) = published {
+        if let Err(cleanup_error) = fs::remove_file(&tmp_path)
+            && cleanup_error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.context(format!(
+                "also failed to remove owned temp {}: {cleanup_error}",
+                tmp_path.display()
+            )));
+        }
+        return Err(error);
     }
-    rename_with_windows_retry(&tmp_path, path).with_context(|| {
-        format!(
-            "atomically rename {} to {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
     if let Ok(dir) = File::open(parent) {
         // Directory fsync is best-effort: some filesystems (tmpfs, NFS, FAT)
         // legitimately return EINVAL. The atomic rename above is what
@@ -196,16 +238,16 @@ pub fn write_json_with_backup<T: Serialize + ?Sized>(
                     "failed to restore backup after write failure"
                 );
             }
-        } else if temp_path.exists() {
-            if let Err(rb_err) = fs::remove_file(&temp_path) {
-                tracing::warn!(
-                    target: "neoethos_core::storage::json",
-                    artifact = config.artifact_label,
-                    temp = %temp_path.display(),
-                    error = %rb_err,
-                    "failed to remove staged temp file after write failure"
-                );
-            }
+        } else if temp_path.exists()
+            && let Err(rb_err) = fs::remove_file(&temp_path)
+        {
+            tracing::warn!(
+                target: "neoethos_core::storage::json",
+                artifact = config.artifact_label,
+                temp = %temp_path.display(),
+                error = %rb_err,
+                "failed to remove staged temp file after write failure"
+            );
         }
         anyhow::bail!(
             "write {} to {} failed: {}",
@@ -323,18 +365,18 @@ where
 
     // Step 8: rename staged → target. On failure, attempt backup restore.
     if let Err(error) = fs::rename(&staged_path, path) {
-        if backup_path.exists() {
-            if let Err(restore_err) = fs::rename(&backup_path, path) {
-                tracing::error!(
-                    target: "neoethos_core::storage::dir",
-                    artifact = config.artifact_label,
-                    backup = %backup_path.display(),
-                    target = %path.display(),
-                    error = %restore_err,
-                    "failed to restore backup after staged-rename failure; \
-                     artifact directory may be in an inconsistent state"
-                );
-            }
+        if backup_path.exists()
+            && let Err(restore_err) = fs::rename(&backup_path, path)
+        {
+            tracing::error!(
+                target: "neoethos_core::storage::dir",
+                artifact = config.artifact_label,
+                backup = %backup_path.display(),
+                target = %path.display(),
+                error = %restore_err,
+                "failed to restore backup after staged-rename failure; \
+                 artifact directory may be in an inconsistent state"
+            );
         }
         anyhow::bail!(
             "rename staged {} into {} failed: {}",
@@ -462,6 +504,113 @@ mod tests {
                 .starts_with(".artifact.json.tmp-")
         );
         std::fs::remove_dir_all(&dir).expect("cleanup atomic json dir");
+    }
+
+    #[test]
+    fn compact_atomic_json_matches_pretty_values_hash_and_replacement() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Payload {
+            note: String,
+            bytes: Vec<u8>,
+            values: Vec<f64>,
+        }
+        let dir = unique_test_dir("compact_parity");
+        let pretty_path = dir.join("pretty.json");
+        let compact_path = dir.join("compact.json");
+        // Cross several writer buffers; byte arrays model the recorded plan.
+        let mut payload = Payload {
+            note: "escaped \"text\"\nwith \\ and λ".to_owned(),
+            bytes: (0..131_073).map(|index| (index % 256) as u8).collect(),
+            values: vec![-0.0, -12.5, 0.125, f64::MIN_POSITIVE],
+        };
+        for revision in 0..2 {
+            payload.bytes[0] = revision;
+            write_json_atomic(&pretty_path, &payload).unwrap();
+            write_json_atomic_compact(&compact_path, &payload).unwrap();
+            let pretty_bytes = fs::read(&pretty_path).unwrap();
+            let compact_bytes = fs::read(&compact_path).unwrap();
+            let mut expected_pretty = serde_json::to_vec_pretty(&payload).unwrap();
+            expected_pretty.push(b'\n');
+            let mut expected_compact = serde_json::to_vec(&payload).unwrap();
+            expected_compact.push(b'\n');
+            assert_eq!(pretty_bytes, expected_pretty, "existing format changed");
+            assert_eq!(compact_bytes, expected_compact);
+            assert!(compact_bytes.len() < pretty_bytes.len());
+            let pretty: Payload = read_json(&pretty_path, "pretty").unwrap();
+            let compact: Payload = read_json(&compact_path, "compact").unwrap();
+            assert_eq!(pretty, payload);
+            assert_eq!(compact, payload);
+            assert_eq!(
+                stable_json_hash(&pretty).unwrap(),
+                stable_json_hash(&compact).unwrap()
+            );
+            assert_eq!(
+                stable_json_hash(&compact).unwrap(),
+                stable_json_hash(&payload).unwrap()
+            );
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "orphan temp");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compact_atomic_json_serialization_failure_preserves_destination_and_cleans_temp() {
+        struct FailingSerialize;
+        impl Serialize for FailingSerialize {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut sequence = serializer.serialize_seq(Some(100_001))?;
+                // Fail after enough output to have reached the actual temp file.
+                for _ in 0..100_000 {
+                    sequence.serialize_element(&255u8)?;
+                }
+                Err(serde::ser::Error::custom(
+                    "deliberate serialization failure",
+                ))
+            }
+        }
+        let dir = unique_test_dir("compact_failure");
+        let path = dir.join("artifact.json");
+        for prior_exists in [false, true] {
+            if prior_exists {
+                write_bytes_atomic(&path, b"previous destination\n").unwrap();
+            }
+            let error = write_json_atomic_compact(&path, &FailingSerialize).unwrap_err();
+            assert!(format!("{error:#}").contains("deliberate serialization failure"));
+            if prior_exists {
+                assert_eq!(fs::read(&path).unwrap(), b"previous destination\n");
+            } else {
+                assert!(!path.exists());
+            }
+            assert_eq!(
+                fs::read_dir(&dir).unwrap().count(),
+                usize::from(prior_exists),
+                "orphan temp"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_writer_io_failure_preserves_destination_and_cleans_temp() {
+        let dir = unique_test_dir("atomic_io_failure");
+        let path = dir.join("artifact.json");
+        write_bytes_atomic(&path, b"previous destination\n").unwrap();
+        let error = write_atomic(&path, |file| {
+            file.write_all(b"partial replacement")?;
+            Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "injected write failure").into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WriteZero
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"previous destination\n");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "orphan temp");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

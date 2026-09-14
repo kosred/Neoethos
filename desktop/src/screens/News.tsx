@@ -3,11 +3,14 @@ import { newsFeed } from "../api";
 import { usePoll } from "../hooks";
 
 export default function News() {
-  const [force, setForce] = useState(false);
-  const { data, error, loading, reload } = usePoll(() => newsFeed(force), 0, [force]);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const { data, error, loading } = usePoll(
+    () => newsFeed(refreshVersion > 0),
+    0,
+    refreshVersion,
+  );
 
-  // Shape: { items: [{title, source, url, summary, published_at}], aiSummary, aiAvailable, notice }
-  const items: any[] = data?.items ?? data?.headlines ?? (Array.isArray(data) ? data : []);
+  const items = data?.items ?? [];
   const briefing: string | undefined = data?.aiSummary || undefined;
   const notice: string | undefined = data?.notice || undefined;
 
@@ -15,9 +18,14 @@ export default function News() {
     <div className="screen">
       <h1>News</h1>
       <p className="sub">Market headlines + AI briefing</p>
+      <p className="muted small">
+        Opening or refreshing this page may fetch public feeds and request an AI briefing using
+        your existing ChatGPT login. Results may be reused for up to 10 minutes. Broker settings
+        do not control these requests.
+      </p>
 
       <div className="btn-row">
-        <button disabled={loading} onClick={() => { setForce(true); reload(); }}>Refresh</button>
+        <button disabled={loading} onClick={() => setRefreshVersion((version) => version + 1)}>Refresh headlines &amp; briefing</button>
       </div>
       {error && <div className="banner warn">{error}</div>}
       {notice && <div className="banner warn">{notice}</div>}
@@ -30,16 +38,18 @@ export default function News() {
       )}
 
       {items.length === 0 ? (
-        <p className="muted">{loading ? "Loading…" : "No headlines available."}</p>
+        <p className="muted">{error ? "Headlines could not be loaded." : loading ? "Loading…" : "No headlines available."}</p>
       ) : (
         <div className="news-list">
-          {items.slice(0, 60).map((it, i) => (
-            <div className="news-item" key={i}>
-              <div className="news-title">{it.title ?? "(untitled)"}</div>
-              <div className="muted small">
-                {it.source ?? ""}{it.publishedMs ? ` · ${new Date(it.publishedMs).toLocaleString()}` : ""}
+          {items.slice(0, 60).map((item) => (
+            <div className="news-item" key={`${item.link}-${item.publishedMs ?? 0}`}>
+              <div className="news-title">
+                {item.link ? <a href={item.link} target="_blank" rel="noreferrer">{item.title || "(untitled)"}</a> : (item.title || "(untitled)")}
               </div>
-              {it.blurb && <div className="news-summary">{it.blurb}</div>}
+              <div className="muted small">
+                {item.source}{item.publishedMs ? ` · ${new Date(item.publishedMs).toLocaleString()}` : ""}
+              </div>
+              {item.blurb && <div className="news-summary">{item.blurb}</div>}
             </div>
           ))}
         </div>

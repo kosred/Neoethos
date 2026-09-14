@@ -81,7 +81,7 @@ fn unrecorded_label_geometry() -> String {
     "unrecorded".to_string()
 }
 
-fn validate_training_runtime_profile(profile: &TrainingRuntimeProfile) -> Result<()> {
+pub(crate) fn validate_training_runtime_profile(profile: &TrainingRuntimeProfile) -> Result<()> {
     if profile.model_name.trim().is_empty() {
         anyhow::bail!("training runtime profile model_name must not be empty");
     }
@@ -237,10 +237,10 @@ pub fn write_model_runtime_artifact<T: Serialize>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn sample_profile() -> TrainingRuntimeProfile {
+    pub(crate) fn sample_profile() -> TrainingRuntimeProfile {
         TrainingRuntimeProfile {
             model_name: "lightgbm".to_string(),
             capability_family: ModelFamily::Tree,

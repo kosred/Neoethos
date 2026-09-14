@@ -16,6 +16,11 @@ fn discovery_ledger_is_versioned_and_receipt_bound() {
         "#[serde(deny_unknown_fields)]",
         "expected_receipt: &CanonicalSearchInputReceiptV2",
         "expected_config_hash: &str",
+        "expected_resolved_config_hash: &str",
+        "search_authority: &PopulationAutoSearchAuthorityV1",
+        "stamp.validate()",
+        "stamp.config_hash == expected_resolved_config_hash",
+        "let expected_config_hash = search_authority.search_config_hash()",
         "Result<Option<DiscoverySearchLedger>>",
         "legacy unbound discovery ledger",
         "embedded trial-returns manifest does not match",
@@ -71,6 +76,8 @@ fn discovery_passes_one_receipt_and_config_identity_to_all_state_edges() {
         "search_input_receipt,\n            &search_state_config_hash",
         "search_input_receipt,\n                search_state_config_hash,",
         "search_input_receipt,\n            &search_state_config_hash,",
+        "&search_authority.resolved_config_stamp().config_hash",
+        "search_input_receipt,\n            &search_authority,\n            &result,",
     ] {
         assert!(
             source.contains(required),

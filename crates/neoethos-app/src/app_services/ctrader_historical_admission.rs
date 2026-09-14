@@ -2263,15 +2263,61 @@ mod tests {
         let connection = source
             .split("pub(crate) fn connect_session")
             .nth(1)
-            .and_then(|tail| tail.split("pub fn build_application_auth_json").next())
+            .and_then(|tail| tail.split("pub(crate) fn connect_ctrader_socket").next())
             .expect("session connection source");
         let socket = connection
-            .find("establish_ctrader_socket_with_connector")
-            .expect("socket connection");
+            .find("connect_ctrader_socket(&self.endpoint_host, cancellation)?")
+            .expect("successful shared socket connection with the same cancellation token");
         let admission = connection
             .find("ConnectionHistoricalAdmission::new")
             .expect("connection-local admission construction");
         assert!(socket < admission);
+        assert_eq!(connection.matches("connect_ctrader_socket(").count(), 1);
+        assert_eq!(
+            connection
+                .matches("ConnectionHistoricalAdmission::new")
+                .count(),
+            1
+        );
+
+        // The connector is now shared with execution. Follow that call rather
+        // than comparing the helper definition's file position with admission.
+        let shared_socket = source
+            .split("pub(crate) fn connect_ctrader_socket")
+            .nth(1)
+            .and_then(|tail| tail.split("fn ctrader_deadline_io_mut").next())
+            .expect("shared bounded socket connector source");
+        let budget = shared_socket
+            .find("CTraderOperationBudget::new")
+            .expect("one connection operation budget");
+        let establish = shared_socket
+            .find("establish_ctrader_socket_with_connector(&mut connector, &budget)")
+            .expect("all connection stages receive the same budget");
+        assert!(budget < establish);
+        assert_eq!(
+            shared_socket.matches("CTraderOperationBudget::new").count(),
+            1
+        );
+        assert!(shared_socket.contains("CTRADER_CONNECT_TIMEOUT"));
+        assert!(shared_socket.contains("cancellation.cloned()"));
+        assert!(shared_socket.contains("ProductionCTraderSocketConnector::new"));
+
+        let connector = source
+            .split("impl CTraderSocketConnector<SystemCTraderMonotonicClock> for ProductionCTraderSocketConnector")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(crate) enum CTraderOpenApiSessionResponse").next())
+            .expect("production DNS/TCP/TLS-WebSocket connector implementation");
+        for stage in [
+            "resolve_ctrader_endpoint(&self.endpoint_host, budget)",
+            "connect_ctrader_tcp(resolved, budget)",
+            "handshake_ctrader_websocket(stream, &self.url, budget)",
+        ] {
+            assert_eq!(
+                connector.matches(stage).count(),
+                1,
+                "unbounded stage: {stage}"
+            );
+        }
 
         let session = source
             .split("impl ProductionCTraderOpenApiSession")

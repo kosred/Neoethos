@@ -311,6 +311,75 @@ fn bounded_output(command: &mut Command, parent_deadline: Instant, context: &str
     }
 }
 
+fn bounded_output_with_input(
+    command: &mut Command,
+    input: Vec<u8>,
+    parent_deadline: Instant,
+    context: &str,
+) -> Output {
+    assert_before_deadline(parent_deadline, context);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("launch {context}: {error}"));
+    let mut stdin = child.stdin.take().expect("bounded command stdin is piped");
+    let mut stdout = child
+        .stdout
+        .take()
+        .expect("bounded command stdout is piped");
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("bounded command stderr is piped");
+    let stdin_writer = std::thread::spawn(move || stdin.write_all(&input));
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .read_to_end(&mut bytes)
+            .expect("read bounded command stdout");
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .expect("read bounded command stderr");
+        bytes
+    });
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("poll {context}: {error}"))
+        {
+            break status;
+        }
+        if Instant::now() >= parent_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdin_writer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            panic!(
+                "{context} exhausted the single {:?} Bayesian R5 parent ceiling",
+                PARENT_WALL_CEILING
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    stdin_writer
+        .join()
+        .expect("join bounded stdin writer")
+        .unwrap_or_else(|error| panic!("write bounded command stdin for {context}: {error}"));
+    Output {
+        status,
+        stdout: stdout_reader.join().expect("join bounded stdout reader"),
+        stderr: stderr_reader.join().expect("join bounded stderr reader"),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn native_thread_id() -> u64 {
     #[link(name = "kernel32")]
@@ -1703,6 +1772,107 @@ fn git_stdout(
     output.stdout
 }
 
+fn canonical_git_blob_ledger(
+    workspace: &Path,
+    tracked: &BTreeSet<String>,
+    parent_deadline: Instant,
+) -> (Vec<u8>, u64) {
+    let mut input = Vec::new();
+    for relative in tracked {
+        assert!(
+            !relative.contains(['\n', '\r']),
+            "vendor path cannot be represented by the Git batch protocol: {relative:?}"
+        );
+        writeln!(&mut input, ":{relative}").expect("write Git batch object request");
+    }
+
+    let mut command = Command::new("git");
+    command.current_dir(workspace).args(["cat-file", "--batch"]);
+    let output = bounded_output_with_input(
+        &mut command,
+        input,
+        parent_deadline,
+        "read canonical tracked vendor blobs",
+    );
+    assert!(
+        output.status.success(),
+        "read canonical tracked vendor blobs failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut reader = BufReader::new(output.stdout.as_slice());
+    let mut ledger = Vec::new();
+    let mut total_bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    for (index, relative) in tracked.iter().enumerate() {
+        if index % 128 == 0 {
+            assert_before_deadline(parent_deadline, "canonical vendor blob verification");
+        }
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .unwrap_or_else(|error| panic!("read Git blob header for {relative}: {error}"));
+        let mut fields = header.trim_end_matches(['\r', '\n']).split_whitespace();
+        let object_id = fields.next().expect("Git batch object id");
+        let object_type = fields.next().expect("Git batch object type");
+        let byte_count = fields
+            .next()
+            .expect("Git batch blob byte count")
+            .parse::<u64>()
+            .expect("Git batch blob byte count must be u64");
+        assert!(
+            fields.next().is_none(),
+            "unexpected Git batch header: {header:?}"
+        );
+        assert!(
+            object_id.len() >= 40 && object_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid Git object id for {relative}: {object_id}"
+        );
+        assert_eq!(
+            object_type, "blob",
+            "vendor input {relative} must be a blob"
+        );
+
+        let mut hasher = Sha256::new();
+        let mut remaining = byte_count;
+        while remaining > 0 {
+            let chunk = remaining.min(buffer.len() as u64) as usize;
+            reader
+                .read_exact(&mut buffer[..chunk])
+                .unwrap_or_else(|error| panic!("read canonical Git blob {relative}: {error}"));
+            hasher.update(&buffer[..chunk]);
+            remaining -= chunk as u64;
+        }
+        let mut delimiter = [0u8; 1];
+        reader
+            .read_exact(&mut delimiter)
+            .unwrap_or_else(|error| panic!("read Git batch delimiter for {relative}: {error}"));
+        assert_eq!(
+            delimiter,
+            [b'\n'],
+            "invalid Git batch delimiter for {relative}"
+        );
+
+        let sha256 = format!("{:x}", hasher.finalize());
+        writeln!(&mut ledger, "{sha256}\t{byte_count}\t{relative}")
+            .expect("append canonical vendor ledger row");
+        total_bytes = total_bytes
+            .checked_add(byte_count)
+            .expect("vendor byte total overflow");
+    }
+    let mut trailing = Vec::new();
+    reader
+        .read_to_end(&mut trailing)
+        .expect("read trailing Git batch output");
+    assert!(
+        trailing.is_empty(),
+        "unexpected trailing Git batch output: {:?}",
+        String::from_utf8_lossy(&trailing)
+    );
+    (ledger, total_bytes)
+}
+
 fn tested_git_identity(workspace: &Path, parent_deadline: Instant) -> GitIdentity {
     let commit = git_stdout(
         workspace,
@@ -1925,59 +2095,15 @@ fn verified_vendor_closure(workspace: &Path, run_root: &Path, parent_deadline: I
                 .to_string()
         })
         .collect::<BTreeSet<_>>();
-    let ledger_path = workspace.join("audit/bayesian-full-gpu-r5-red/vendor-closure.sha256");
-    let ledger_bytes = fs::read(&ledger_path).expect("read tracked vendor closure ledger");
-    let ledger = std::str::from_utf8(&ledger_bytes).expect("vendor ledger must be UTF-8");
-    let mut ledger_paths = BTreeSet::new();
-    let mut total_bytes = 0u64;
-    for (index, line) in ledger.lines().enumerate() {
-        if index % 128 == 0 {
-            assert_before_deadline(parent_deadline, "vendor closure verification");
-        }
-        let mut fields = line.splitn(3, '\t');
-        let expected_hash = fields.next().expect("vendor row hash");
-        let expected_bytes = fields
-            .next()
-            .expect("vendor row byte count")
-            .parse::<u64>()
-            .expect("vendor byte count must be u64");
-        let relative = fields.next().expect("vendor row path");
-        assert!(
-            relative.starts_with("vendor/"),
-            "vendor ledger path escaped vendor/: {relative}"
-        );
-        assert!(
-            ledger_paths.insert(relative.to_string()),
-            "duplicate vendor ledger path {relative}"
-        );
-        let path = workspace.join(relative);
-        assert_eq!(
-            fs::metadata(&path)
-                .unwrap_or_else(|error| panic!("stat vendor input {relative}: {error}"))
-                .len(),
-            expected_bytes,
-            "vendor byte drift for {relative}"
-        );
-        assert_eq!(
-            file_sha256(&path),
-            expected_hash,
-            "vendor content drift for {relative}"
-        );
-        total_bytes = total_bytes
-            .checked_add(expected_bytes)
-            .expect("vendor byte total overflow");
-    }
-    assert_eq!(
-        ledger_paths, tracked,
-        "tracked vendor inputs must exactly equal the per-file closure ledger"
-    );
-    let copied_ledger = run_root.join("vendor-closure.sha256");
-    fs::write(&copied_ledger, &ledger_bytes).expect("persist exact tested vendor ledger");
+    let (ledger_bytes, total_bytes) =
+        canonical_git_blob_ledger(workspace, &tracked, parent_deadline);
+    let ledger_path = run_root.join("vendor-closure.sha256");
+    fs::write(&ledger_path, &ledger_bytes).expect("persist exact tested vendor ledger");
     json!({
-        "source_path": ledger_path,
-        "evidence_path": copied_ledger,
+        "source": "canonical stage-0 Git blobs from git cat-file --batch",
+        "evidence_path": ledger_path,
         "sha256": format!("{:x}", Sha256::digest(&ledger_bytes)),
-        "file_count": ledger_paths.len(),
+        "file_count": tracked.len(),
         "total_bytes": total_bytes,
         "ignored_untracked_count": 0,
         "ordinary_untracked_count": 0,
@@ -2297,6 +2423,41 @@ fn oracle_parity_verdict(cpu_role: &Value, gpu_role: &Value) -> Result<Value, Ve
     } else {
         Err(errors)
     }
+}
+
+#[test]
+fn canonical_vendor_blob_ledger_matches_stage_zero_git_content() {
+    let workspace = workspace_root();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let tracked = BTreeSet::from([
+        "vendor/catboost-rust-0.3.8-patched/.gitignore".to_string(),
+        "vendor/vector-ta-0.2.9-patched/kernels/cuda/zscore_kernel.cu".to_string(),
+    ]);
+    let (actual_ledger, actual_total_bytes) =
+        canonical_git_blob_ledger(&workspace, &tracked, deadline);
+
+    let mut expected_ledger = Vec::new();
+    let mut expected_total_bytes = 0u64;
+    for relative in &tracked {
+        let object = format!(":{relative}");
+        let bytes = git_stdout(
+            &workspace,
+            deadline,
+            &["cat-file", "blob", &object],
+            "read independent canonical vendor blob",
+        );
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        writeln!(
+            &mut expected_ledger,
+            "{sha256}\t{}\t{relative}",
+            bytes.len()
+        )
+        .expect("append expected canonical vendor ledger row");
+        expected_total_bytes += bytes.len() as u64;
+    }
+
+    assert_eq!(actual_ledger, expected_ledger);
+    assert_eq!(actual_total_bytes, expected_total_bytes);
 }
 
 #[test]

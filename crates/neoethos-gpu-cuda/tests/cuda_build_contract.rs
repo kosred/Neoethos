@@ -193,6 +193,8 @@ fn nvcc_argv_is_exact_and_precision_preserving() {
         "out/smoke.o",
         false,
         NativePlatform::Unix,
+        "gnu",
+        "",
     );
 
     assert_eq!(
@@ -230,9 +232,14 @@ fn windows_nvcc_argv_and_archive_are_native_not_unix_hard_coded() {
         r"out\smoke.obj",
         false,
         NativePlatform::Windows,
+        "msvc",
+        "",
     );
 
     assert!(!args.iter().any(|arg| arg.contains("fPIC")));
+    assert!(args.iter().any(|arg| arg == "-Xcompiler=/Zc:preprocessor"));
+    assert!(args.iter().any(|arg| arg == "-Xcompiler=/MD"));
+    assert!(!args.iter().any(|arg| arg.contains("CCCL_IGNORE")));
     assert_eq!(NativePlatform::Windows.object_extension(), "obj");
     assert_eq!(
         NativePlatform::Windows.device_archive_name(),
@@ -258,6 +265,66 @@ fn windows_nvcc_argv_and_archive_are_native_not_unix_hard_coded() {
             r"out\population.obj",
         ]
     );
+}
+
+#[test]
+fn windows_msvc_crt_follows_exact_target_feature_not_debug_information() {
+    let plan = CudaArchitecturePlan::host_auto_from_tool_output(
+        "12.0\n",
+        NVCC_ARCHS_WITH_BLACKWELL,
+        NVCC_CODE_WITH_BLACKWELL,
+    )
+    .unwrap();
+    for (features, expected) in [
+        ("", "-Xcompiler=/MD"),
+        ("sse2,avx", "-Xcompiler=/MD"),
+        ("crt-static", "-Xcompiler=/MT"),
+        ("sse2,crt-static,avx", "-Xcompiler=/MT"),
+        ("not-crt-static,crt-static-extra", "-Xcompiler=/MD"),
+    ] {
+        for debug in [false, true] {
+            let args = build_nvcc_argv(
+                &plan,
+                "native/smoke.cu",
+                r"out\smoke.obj",
+                debug,
+                NativePlatform::Windows,
+                "msvc",
+                features,
+            );
+            let crt = args
+                .iter()
+                .filter(|arg| arg.starts_with("-Xcompiler=/M"))
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            assert_eq!(crt, vec![expected], "features={features:?}, debug={debug}");
+            assert!(
+                args.iter()
+                    .any(|arg| arg == if debug { "-lineinfo" } else { "-O3" })
+            );
+            assert!(!args.iter().any(|arg| arg.contains("NODEFAULTLIB")));
+        }
+    }
+    for (platform, target_env) in [
+        (NativePlatform::Unix, "gnu"),
+        (NativePlatform::Windows, "gnu"),
+    ] {
+        let args = build_nvcc_argv(
+            &plan,
+            "native/smoke.cu",
+            "out/smoke.o",
+            true,
+            platform,
+            target_env,
+            "crt-static",
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with("-Xcompiler=/M")));
+    }
+    let source = include_str!("../build.rs");
+    assert!(source.contains("env::var(\"CARGO_CFG_TARGET_ENV\")"));
+    assert!(source.contains("read_optional_env(\"CARGO_CFG_TARGET_FEATURE\")?"));
+    assert!(source.contains("&cuda_build.target_env,"));
+    assert!(source.contains("&cuda_build.target_features,"));
 }
 
 #[test]
@@ -400,6 +467,63 @@ fn artifact_inspection_proves_exact_sass_set_and_rejects_any_ptx() {
     )
     .unwrap_err();
     assert!(ptx.contains("PTX"), "{ptx}");
+}
+
+#[test]
+fn windows_absolute_archive_members_preserve_strict_no_ptx_evidence() {
+    let plan = CudaArchitecturePlan::cross_release_from_tool_output(
+        "86;89;120",
+        NVCC_ARCHS_WITH_BLACKWELL,
+        NVCC_CODE_WITH_BLACKWELL,
+    )
+    .unwrap();
+    let elf = "ELF file 1: smoke.sm_86.cubin\nELF file 2: smoke.sm_89.cubin\nELF file 3: smoke.sm_120.cubin\n";
+    // Actual CUDA 13.3 Windows --lib/--list-ptx shape: the archive and its
+    // object both have drive letters. The directory includes spaces as well.
+    let archive = r"C:\cuda out\neoethos_gpu_cuda_native.lib";
+    let diagnostic = format!(
+        "cuobjdump info : No PTX file found to extract from '{archive}'. You may try with -all option.\n"
+    );
+    let members = format!(
+        "member {archive}:C:\\cuda out\\smoke.obj:\n\nmember {archive}:C:\\cuda out\\prototype_b.obj:\n"
+    );
+    for listing in [
+        format!("{members}{diagnostic}"),
+        format!("{diagnostic}{members}"),
+    ] {
+        let images = inspect_artifact_images(&plan, elf, &listing)
+            .expect("exact absolute sibling object names are canonical Windows archive output");
+        assert_eq!(images.sass_targets(), &["sm_86", "sm_89", "sm_120"]);
+        assert!(images.ptx_targets().is_empty());
+    }
+    for invalid_members in [
+        format!("member C:\\other\\native.lib:C:\\cuda out\\smoke.obj:\n"),
+        format!("member {archive}:D:\\cuda out\\smoke.obj:\n"),
+        format!("member {archive}:C:\\other\\smoke.obj:\n"),
+        format!("member {archive}:C:\\cuda out\\..\\smoke.obj:\n"),
+        format!("member {archive}:C:\\cuda out\\subdir\\smoke.obj:\n"),
+        format!("member {archive}:C:\\cuda outside\\smoke.obj:\n"),
+        format!("{members}member {archive}:smoke.obj:\n"),
+        format!("{members}unknown inspector output\n"),
+        format!("{members}PTX file 1: smoke.ptx\n"),
+    ] {
+        let error = inspect_artifact_images(&plan, elf, &format!("{invalid_members}{diagnostic}"))
+            .expect_err("unknown paths, mismatched archives, duplicate members and unknown output remain refused");
+        assert!(error.contains("unrecognized"), "{error}");
+    }
+    assert!(
+        inspect_artifact_images(&plan, elf, &members).is_err(),
+        "member paths alone are not no-PTX evidence"
+    );
+    assert!(
+        inspect_artifact_images(
+            &plan,
+            elf,
+            &format!("{members}{diagnostic}PTX file 1: smoke.compute_120.ptx\n")
+        )
+        .is_err(),
+        "an actual PTX target is never accepted"
+    );
 }
 
 #[test]

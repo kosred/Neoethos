@@ -1,9 +1,11 @@
-//! Safe Rust ownership wrapper around the persistent Prototype B CUDA session.
+//! Safe Rust ownership wrapper around the persistent Prototype B native session.
+//! HIP parents enter only through the separately owned HIP physical-store guard.
 //!
 //! Every argument is validated on the host before it crosses the C ABI, so an
 //! invalid shape is a typed Rust error rather than undefined behaviour on the
-//! device. A session owns exactly one native session; `Drop` destroys it on
-//! every path, including error paths and unwinds.
+//! device. A session owns exactly one native session. Proven idle owners are
+//! destroyed; uncertain in-flight owners are deliberately retained, never freed
+//! while their allocations may still be reachable by device work.
 
 use super::{
     DatasetHeader, GeneDescriptor, NeoPopulationCounters, NeoPopulationEvent,
@@ -18,6 +20,12 @@ use std::sync::Arc;
 #[cfg(feature = "cuda-device-fixtures")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
+
+// This diagnostic child uses the real HIP lease and native evaluator. It is
+// deliberately not a production Data admission or a CUDA identity adapter.
+#[cfg(all(test, feature = "hip-device-fixtures"))]
+#[path = "hip_population_v1.rs"]
+mod hip_population_v1;
 
 pub const STATUS_OK: i32 = 0;
 pub const STATUS_UNSUPPORTED: i32 = -1;
@@ -58,7 +66,7 @@ pub const MAX_TRADES_PER_CANDIDATE: u64 = 8192;
 const POPULATION_METRIC_ROW_BYTES_V1: u64 = 104;
 const POPULATION_SCENARIO_DEVICE_BYTES_V1: u64 = 56;
 const POPULATION_F64_BYTES_V1: u64 = 8;
-pub const RESIDENT_ADAPTIVE_BASE_SEMANTIC_V1: &str = "neoethos.population.resident-adaptive-base.semantic-v1;view-local-full-or-contiguous;safe-log-floor=1e-12;safe-log=neoethos.quant.log.semantic-v3;sun-fdlibm-openlibm-e_log;positive-finite-binary64;commit=82e90aef0657289192efe77be89791c07dea0775;source-sha256=8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD;rounding=rn-no-fma;cpu-cuda-bit-tolerance=zero;real-log-accuracy=bounded-faithful-max-1ulp-reviewed-wide-domain;parkinson-window=50;horizon=5;tail-window=100;tail-alpha=0.975;q-index=2;tail-grid=view-origin;global-finite-median-replacement;degenerate=fail;zero-adaptive-h2d";
+pub const RESIDENT_ADAPTIVE_BASE_SEMANTIC_V1: &str = "neoethos.population.resident-adaptive-base.semantic-v2;view-local-full-contiguous-or-exact-ordered;safe-log-floor=1e-12;safe-log=neoethos.quant.log.semantic-v3;sun-fdlibm-openlibm-e_log;positive-finite-binary64;commit=82e90aef0657289192efe77be89791c07dea0775;source-sha256=8996B789A4CBBCEF7CF7D568C1BE558CE9110900A40CA6C46FB4ED46C343CAFD;rounding=rn-no-fma;cpu-cuda-bit-tolerance=zero;real-log-accuracy=bounded-faithful-max-1ulp-reviewed-wide-domain;parkinson-window=50;horizon=5;tail-window=100;tail-alpha=0.975;q-index=2;tail-grid=view-origin;causal-unavailable-qnan=0x7ff8000000000000;ready-stop-bits=cpu-exact;no-median-or-minimum-clamp;all-unavailable=fail;normalized-arithmetic=whole-view-refusal-stricter-than-cpu-row-omission;four-resident-phases;zero-adaptive-h2d";
 
 pub fn population_status_message(status: i32) -> &'static str {
     match status {
@@ -192,6 +200,12 @@ pub struct PopulationDatasetView<'a> {
     pub adaptive_base_pips: Option<&'a [f64]>,
 }
 
+// CPU adaptive producers use this exact quiet NaN for causal unavailability.
+// Other NaN encodings and infinities are not canonical unavailable markers.
+fn valid_host_adaptive_cell_v1(value: f64) -> bool {
+    value.is_finite() || value.to_bits() == 0x7ff8_0000_0000_0000
+}
+
 impl PopulationDatasetView<'_> {
     fn validate(&self) -> Result<usize, CudaPopulationError> {
         let bars = self.close.len();
@@ -238,6 +252,14 @@ impl PopulationDatasetView<'_> {
                 "adaptive base length {} does not match {bars} bars",
                 self.adaptive_base_pips.map_or(0, <[f64]>::len)
             )));
+        }
+        if self.adaptive_base_pips.is_some_and(|base| {
+            base.iter()
+                .any(|value| !valid_host_adaptive_cell_v1(*value))
+        }) {
+            return Err(invalid(
+                "adaptive dataset series contains an invalid non-finite value",
+            ));
         }
         for (field, values) in [
             ("close", self.close),
@@ -479,10 +501,13 @@ impl PopulationEvaluationViewV1 {
             |indices| indices.len(),
         );
         if adaptive_base_pips.as_ref().is_some_and(|values| {
-            values.len() != row_count || values.iter().any(|value| !value.is_finite())
+            values.len() != row_count
+                || values
+                    .iter()
+                    .any(|value| !valid_host_adaptive_cell_v1(*value))
         }) {
             return Err(invalid(
-                "adaptive population series must be finite and cover the exact view",
+                "adaptive population series must contain finite values or canonical unavailable markers and cover the exact view",
             ));
         }
         Ok(Self {
@@ -530,9 +555,10 @@ impl PopulationEvaluationViewV1 {
 ///
 /// The recipe is intentionally narrow: current production Search uses the
 /// open-independent Parkinson estimator with a 50-bar volatility window and a
-/// 100-return expected-shortfall tail. Full and contiguous Stage-1 views are
-/// supported; ordered views fail closed until their view-local sequence has a
-/// separately reviewed resident mapping contract.
+/// 100-return expected-shortfall tail. Full, contiguous and exact ordered views
+/// recompute the base on their own sequence, including adjacent gathered close
+/// returns. Unavailable cells forbid entry. Normalization overflow/underflow
+/// remains an explicit whole-view refusal, stricter than CPU per-row omission.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ResidentAdaptiveBaseRequestV1 {
@@ -574,11 +600,6 @@ impl ResidentAdaptiveBaseRequestV1 {
                 "resident adaptive producer refuses a host adaptive-base slice",
             ));
         }
-        if matches!(view.kind(), PopulationViewKindV1::OrderedIndices) {
-            return Err(invalid(
-                "resident adaptive producer V1 supports only full/contiguous views",
-            ));
-        }
         let view_row_count = view.row_count();
         if view_row_count < Self::MIN_VIEW_ROWS_V1 {
             return Err(invalid(format!(
@@ -609,11 +630,7 @@ impl ResidentAdaptiveBaseRequestV1 {
                     .ok_or_else(|| invalid("resident adaptive range lost its exact start"))?
                     .start,
             ),
-            PopulationViewKindV1::OrderedIndices => {
-                return Err(invalid(
-                    "resident adaptive producer V1 supports only full/contiguous views",
-                ));
-            }
+            PopulationViewKindV1::OrderedIndices => (2, 0),
         };
         Ok(Self {
             abi_version: ABI_VERSION,
@@ -1080,15 +1097,15 @@ impl PopulationMetricsOnlyPlanV1 {
     }
 }
 
-/// Checked allocation plan for the immutable parent owned by a strict V1
-/// population session.
+/// Checked allocation plan for the immutable parent and the exact retained view
+/// capacities owned by a strict V1 population session.
 ///
-/// This is allocation memory, not upload traffic. In addition to the copied
-/// parent arrays, the native session always reserves one full-parent
-/// `view_indices`, `adaptive_base_pips`, and `gap_flags` array. Keeping those
-/// three arrays in this plan prevents a caller from reproducing the older
-/// `(8 * features + 68) * rows` undercharge; the exact native allocation is
-/// `(8 * features + 76) * rows` bytes.
+/// This is allocation memory, not upload traffic. The immutable parent always
+/// owns its copied arrays and one full-parent `gap_flags` array. Ordered indices
+/// and adaptive base pips are optional, independently retained buffers: native
+/// code grows each one lazily to the largest active view seen by the session.
+/// Charging them by parent rows would unnecessarily shrink every full/range or
+/// fixed-stop search; omitting them would understate an ordered/adaptive search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PopulationParentDevicePlanV1 {
     parent_rows: u64,
@@ -1101,17 +1118,40 @@ pub struct PopulationParentDevicePlanV1 {
 }
 
 impl PopulationParentDevicePlanV1 {
+    /// Plan only the immutable parent. Call
+    /// [`Self::checked_from_parent_and_view_extents_v1`] when a retained view is
+    /// part of the same admission.
     pub fn checked_from_parent_extents_v1(
         parent_rows: usize,
         feature_count: usize,
+    ) -> Result<Self, CudaPopulationError> {
+        Self::checked_from_parent_and_view_extents_v1(parent_rows, feature_count, 0, 0)
+    }
+
+    /// Plan the immutable parent plus exact maximum active view capacities.
+    /// Both optional buffers are retained independently and may coexist.
+    pub fn checked_from_parent_and_view_extents_v1(
+        parent_rows: usize,
+        feature_count: usize,
+        ordered_index_capacity: usize,
+        adaptive_row_capacity: usize,
     ) -> Result<Self, CudaPopulationError> {
         let parent_rows = u64::try_from(parent_rows)
             .map_err(|_| invalid("parent rows do not fit the strict device plan"))?;
         let feature_count = u64::try_from(feature_count)
             .map_err(|_| invalid("feature count does not fit the strict device plan"))?;
+        let ordered_index_capacity = u64::try_from(ordered_index_capacity)
+            .map_err(|_| invalid("ordered-index capacity does not fit the strict device plan"))?;
+        let adaptive_row_capacity = u64::try_from(adaptive_row_capacity)
+            .map_err(|_| invalid("adaptive-row capacity does not fit the strict device plan"))?;
         if parent_rows == 0 || feature_count == 0 {
             return Err(invalid(
                 "strict parent device plan requires non-zero rows and features",
+            ));
+        }
+        if ordered_index_capacity > parent_rows || adaptive_row_capacity > parent_rows {
+            return Err(invalid(
+                "strict retained view capacities cannot exceed parent rows",
             ));
         }
 
@@ -1131,16 +1171,16 @@ impl PopulationParentDevicePlanV1 {
                     .ok_or_else(|| invalid("strict parent copied bytes overflow u64"))?,
             )
             .ok_or_else(|| invalid("strict parent copied bytes overflow u64"))?;
-        let view_indices_bytes = parent_rows
+        let ordered_index_capacity_bytes = ordered_index_capacity
             .checked_mul(8)
             .ok_or_else(|| invalid("strict parent view-index bytes overflow u64"))?;
-        let adaptive_base_pips_bytes = parent_rows
+        let adaptive_capacity_bytes = adaptive_row_capacity
             .checked_mul(POPULATION_F64_BYTES_V1)
             .ok_or_else(|| invalid("strict parent adaptive bytes overflow u64"))?;
         let gap_flags_bytes = parent_rows;
         let total_device_bytes = copied_parent_bytes
-            .checked_add(view_indices_bytes)
-            .and_then(|total| total.checked_add(adaptive_base_pips_bytes))
+            .checked_add(ordered_index_capacity_bytes)
+            .and_then(|total| total.checked_add(adaptive_capacity_bytes))
             .and_then(|total| total.checked_add(gap_flags_bytes))
             .ok_or_else(|| invalid("strict parent total device bytes overflow u64"))?;
 
@@ -1148,8 +1188,8 @@ impl PopulationParentDevicePlanV1 {
             parent_rows,
             feature_count,
             copied_parent_bytes,
-            view_indices_bytes,
-            adaptive_base_pips_bytes,
+            view_indices_bytes: ordered_index_capacity_bytes,
+            adaptive_base_pips_bytes: adaptive_capacity_bytes,
             gap_flags_bytes,
             total_device_bytes,
         })
@@ -1376,7 +1416,10 @@ struct RawResidentPopulationMetricsHandleV1 {
 #[derive(Clone, Copy)]
 pub(crate) struct RawResidentScoringPopulationSourceV2 {
     abi_version: u32,
+    #[cfg(not(feature = "hip-native-kernels"))]
     selected_cuda_ordinal: u32,
+    #[cfg(feature = "hip-native-kernels")]
+    selected_hip_ordinal: u32,
     admitted_run_stream: *mut c_void,
     metrics_ready_event: *mut c_void,
     scoring_ready_event: *mut c_void,
@@ -1395,7 +1438,10 @@ impl Default for RawResidentScoringPopulationSourceV2 {
     fn default() -> Self {
         Self {
             abi_version: 0,
+            #[cfg(not(feature = "hip-native-kernels"))]
             selected_cuda_ordinal: 0,
+            #[cfg(feature = "hip-native-kernels")]
+            selected_hip_ordinal: 0,
             admitted_run_stream: std::ptr::null_mut(),
             metrics_ready_event: std::ptr::null_mut(),
             scoring_ready_event: std::ptr::null_mut(),
@@ -1584,7 +1630,7 @@ fn hash_resident_adaptive_base_request_v1(request: ResidentAdaptiveBaseRequestV1
     hasher.finalize().into()
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 fn hash_resident_adaptive_view_token_v1(
     resident_session_identity_sha256: [u8; 32],
     view_identity_sha256: [u8; 32],
@@ -1598,7 +1644,7 @@ fn hash_resident_adaptive_view_token_v1(
     hasher.finalize().into()
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 fn hash_resident_adaptive_population_view_identity_v1(
     base_view_identity_sha256: [u8; 32],
     request_identity_sha256: [u8; 32],
@@ -1681,7 +1727,7 @@ fn hash_population_scenario_batch_identity_v1(scenarios: &[ScenarioDescriptor]) 
     hasher.finalize().into()
 }
 
-fn hash_population_settings_identity_v1(settings: &NeoPopulationSettings) -> [u8; 32] {
+pub(crate) fn hash_population_settings_identity_v1(settings: &NeoPopulationSettings) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"neoethos.population.settings.v1");
     for value in [
@@ -1738,7 +1784,10 @@ fn validate_terminal_compact_result_v1(
         && raw.scenario_count == 1
         && raw.metric_row.candidate_id == expected_candidate_id
         && raw.metric_row.scenario_id == expected_scenario_id
-        && raw.metric_row.values.iter().all(|value| value.is_finite())
+        && neoethos_gpu_contracts::resident_search_scoring_v2::classify_resident_metrics_v2(
+            &raw.metric_row.values,
+        )
+        .is_ok()
         && raw.terminal_synchronization_count == 1
         && raw.terminal_readback_count == 1
         && raw.terminal_readback_rows == 1
@@ -1812,10 +1861,13 @@ fn validate_host_population_metrics_result_v1(
     }
     for (index, (row, expected)) in rows.iter().zip(expected_identities).enumerate() {
         if (row.candidate_id, row.scenario_id) != *expected
-            || row.values.iter().any(|value| !value.is_finite())
+            || neoethos_gpu_contracts::resident_search_scoring_v2::classify_resident_metrics_v2(
+                &row.values,
+            )
+            .is_err()
         {
             return Err(invalid(format!(
-                "host metric row {index} violated uploaded scenario order/identity or finiteness: \
+                "host metric row {index} violated uploaded scenario order/identity or metric classification: \
                  got=({}, {}), expected={expected:?}",
                 row.candidate_id, row.scenario_id
             )));
@@ -1874,7 +1926,31 @@ fn strict_enqueue_failure_is_known_prelaunch_v1(status: i32) -> bool {
     )
 }
 
+/// Private HIP wire input. Only the physical-store owner may bind these keys;
+/// neither this DTO nor the shared session is a canonical Data admission.
+#[cfg(feature = "hip-native-kernels")]
+#[repr(C)]
+pub(crate) struct RawHipResidentFeatureStoreBindV1 {
+    pub(crate) abi_version: u32,
+    pub(crate) backend_kind: u32,
+    pub(crate) lease_id: u64,
+    pub(crate) row_count: u64,
+    pub(crate) feature_count: u32,
+    pub(crate) smc_slots: u32,
+    pub(crate) buffer_keys: [u64; 9],
+    pub(crate) allocator_reserve_bytes: u64,
+    pub(crate) admission_identity_sha256: [u8; 32],
+    pub(crate) canonical_content_merkle: [u8; 32],
+    pub(crate) run_stream_process_token: [u8; 32],
+}
+
 unsafe extern "C" {
+    #[cfg(feature = "hip-native-kernels")]
+    fn neoethos_hip_population_bind_resident_feature_store_v1(
+        parent: *const RawHipResidentFeatureStoreBindV1,
+        status: *mut i32,
+    ) -> *mut c_void;
+    #[cfg(not(feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_create(
         abi_version: u32,
         device: i32,
@@ -1898,7 +1974,7 @@ unsafe extern "C" {
         session: *mut c_void,
         view: *const RawEvaluationViewV1,
     ) -> i32;
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_bind_resident_adaptive_view_v1(
         session: *mut c_void,
         view: *const RawEvaluationViewV1,
@@ -1915,6 +1991,7 @@ unsafe extern "C" {
         session: *mut c_void,
         counters: *mut PopulationResidencyCountersV1,
     ) -> i32;
+    #[cfg(not(feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_read_device_identity_v1(
         session: *mut c_void,
         identity: *mut CudaPopulationDeviceIdentityV1,
@@ -1927,13 +2004,20 @@ unsafe extern "C" {
         session: *mut c_void,
         scenarios: *const RawScenarioView,
     ) -> i32;
-    #[allow(dead_code)] // Reached by the crate-private resident Search owner.
+    #[cfg(feature = "cuda")]
     fn neoethos_gpu_cuda_population_upload_resident_scenarios_v2(
         session: *mut c_void,
         scenarios: *const RawScenarioView,
         planned_population: u64,
     ) -> i32;
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+    fn neoethos_gpu_cuda_population_upload_resident_base_scenarios_v3(
+        session: *mut c_void,
+        scenarios: *const RawScenarioView,
+        planned_population: u64,
+        retained_capacity: u64,
+    ) -> i32;
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_enqueue_resident_gene_metrics_v2(
         session: *mut c_void,
         genes: *const crate::resident_search_v2::RawResidentGenerationGeneViewV2,
@@ -1941,7 +2025,7 @@ unsafe extern "C" {
         resident_metrics: *mut RawResidentPopulationMetricsHandleV1,
         counters: *mut NeoPopulationCounters,
     ) -> i32;
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_export_resident_scoring_source_v2(
         session: *mut c_void,
         resident_metrics: *const RawResidentPopulationMetricsHandleV1,
@@ -1950,7 +2034,7 @@ unsafe extern "C" {
         expected_max_terms: u32,
         source: *mut RawResidentScoringPopulationSourceV2,
     ) -> i32;
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_finish_resident_scoring_source_v2(
         session: *mut c_void,
         resident_metrics: *const RawResidentPopulationMetricsHandleV1,
@@ -1993,7 +2077,7 @@ unsafe extern "C" {
     ) -> i32;
     #[allow(dead_code)] // Compatibility ABI remains covered by the signature test below.
     fn neoethos_gpu_cuda_population_destroy(session: *mut c_void);
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     fn neoethos_gpu_cuda_population_destroy_terminal_checked_v2(session: *mut c_void) -> i32;
 }
 
@@ -2004,7 +2088,7 @@ enum StrictResidentSessionStateV1 {
     Poisoned,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PopulationSessionDropPolicyV3 {
     DestroyWhenIdle,
@@ -2019,7 +2103,8 @@ pub(crate) fn terminal_search_session_destroy_count_fixture_v2() -> u64 {
     TERMINAL_SEARCH_SESSION_DESTROY_COUNT_V2.load(Ordering::SeqCst)
 }
 
-/// Owns exactly one native CUDA population session.
+/// Owns exactly one native population session. Production HIP ownership stays
+/// enclosed by its lifetime-bound physical-parent guard, never a CUDA identity.
 #[derive(Debug)]
 pub struct PopulationSession {
     handle: *mut c_void,
@@ -2041,7 +2126,7 @@ pub struct PopulationSession {
     pending_event: Option<u64>,
     metrics_ready: bool,
     strict_resident_state: StrictResidentSessionStateV1,
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     drop_policy_v3: PopulationSessionDropPolicyV3,
     parent_source_v1: Option<PopulationParentDatasetV1>,
     resident_parent_shape_v3: Option<(usize, usize)>,
@@ -2220,7 +2305,7 @@ pub struct ResidentPopulationMetricsV1<'session> {
 /// Move-only population receipt retained across the asynchronous Search
 /// completion boundary. Unlike the borrowed metrics facade, this owner carries
 /// the complete session and cannot make it reusable before terminal proof.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 pub(crate) struct ResidentSearchPopulationCompletionLeaseV2 {
     session: Option<PopulationSession>,
     receipt: Box<RawResidentPopulationMetricsHandleV1>,
@@ -2230,26 +2315,26 @@ pub(crate) struct ResidentSearchPopulationCompletionLeaseV2 {
     consumed: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 pub(crate) struct ResidentSearchPopulationEnqueueRejectedV2 {
     error: CudaPopulationError,
     session: PopulationSession,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 impl ResidentSearchPopulationEnqueueRejectedV2 {
     pub(crate) fn into_parts_v2(self) -> (CudaPopulationError, PopulationSession) {
         (self.error, self.session)
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 pub(crate) struct ResidentSearchPopulationFinishRejectedV2 {
     error: CudaPopulationError,
     lease: ResidentSearchPopulationCompletionLeaseV2,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 impl ResidentSearchPopulationFinishRejectedV2 {
     pub(crate) fn into_parts_v2(
         self,
@@ -2261,7 +2346,7 @@ impl ResidentSearchPopulationFinishRejectedV2 {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 impl ResidentSearchPopulationCompletionLeaseV2 {
     pub(crate) const fn raw_source_v2(&self) -> &RawResidentScoringPopulationSourceV2 {
         &self.raw
@@ -2328,7 +2413,7 @@ impl ResidentSearchPopulationCompletionLeaseV2 {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 impl Drop for ResidentSearchPopulationCompletionLeaseV2 {
     fn drop(&mut self) {
         if !self.consumed {
@@ -2573,7 +2658,200 @@ impl Drop for ResidentPopulationMetricsV1<'_> {
     }
 }
 
+/// Validate the entire immutable base work list before admitting its bounded
+/// physical descriptor workspace. No scenario controls may disappear in chunks.
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels", test))]
+fn validate_resident_base_scenarios_v3(
+    scenarios: &[ScenarioDescriptor],
+    planned_population: u64,
+    retained_capacity: u64,
+    bars: usize,
+) -> Result<(usize, usize), CudaPopulationError> {
+    let population = usize::try_from(planned_population)
+        .map_err(|_| invalid("resident population does not fit host usize"))?;
+    let capacity = usize::try_from(retained_capacity)
+        .map_err(|_| invalid("resident evaluation capacity does not fit host usize"))?;
+    if population == 0
+        || population > i32::MAX as usize
+        || capacity == 0
+        || capacity > population
+        || scenarios.len() != population
+        || bars == 0
+        || bars > i32::MAX as usize
+    {
+        return Err(invalid(
+            "resident base scenarios require all P descriptors, 0 < C <= P and one bound view",
+        ));
+    }
+    for (ordinal, scenario) in scenarios.iter().enumerate() {
+        let expected = ScenarioDescriptor {
+            base_candidate_id: ordinal as u64,
+            scenario_id: ordinal as u64,
+            window_len: bars as u32,
+            ..ScenarioDescriptor::default()
+        };
+        if *scenario != expected {
+            return Err(invalid(format!(
+                "resident base scenario {ordinal} changes identity, view, costs or perturbations"
+            )));
+        }
+    }
+    Ok((population, capacity))
+}
+
 impl PopulationSession {
+    /// Bind already checked HIP-owned storage without materializing a host parent.
+    ///
+    /// # Safety
+    /// The caller must retain the actual HIP lease and all nine buffer owners
+    /// until checked close, quarantine the lease after an ambiguous failure,
+    /// and never expose this bare session outside that owner guard.
+    #[cfg(feature = "hip-native-kernels")]
+    pub(crate) unsafe fn bind_hip_physical_parent_v1(
+        resident: &RawHipResidentFeatureStoreBindV1,
+        device_ordinal: u32,
+        native_build_identity_sha256: [u8; 32],
+    ) -> Result<Self, CudaPopulationError> {
+        let mut status = STATUS_OK;
+        // SAFETY: caller retains the checked owners; native independently checks
+        // the registered lease and pins exact initialized same-lease allocations.
+        let handle = unsafe {
+            neoethos_hip_population_bind_resident_feature_store_v1(resident, &mut status)
+        };
+        if handle.is_null() || status != STATUS_OK {
+            // No retry: native may retain a partially constructed tombstone.
+            return Err(CudaPopulationError::native(
+                "bind_hip_physical_parent_v1",
+                if status == STATUS_OK {
+                    STATUS_ABI_MISMATCH
+                } else {
+                    status
+                },
+            ));
+        }
+        let mut session = Self::detached_resident_v3();
+        session.handle = handle;
+        session.device = device_ordinal as i32;
+        session.feature_count = resident.feature_count as usize;
+        session.dataset_uploaded = true;
+        session.resident_parent_shape_v3 =
+            Some((resident.row_count as usize, session.feature_count));
+        session.strict_resident_state = StrictResidentSessionStateV1::StrictIdle;
+        session.resident_session_identity_sha256 = Some(resident.admission_identity_sha256);
+        session.native_build_identity_sha256 = Some(native_build_identity_sha256);
+        Ok(session)
+    }
+
+    /// Shared strict evaluator, including its actual CSR, scenario, boxed-token,
+    /// workspace and terminal metric checks. This adds no alternate kernel path.
+    #[cfg(feature = "hip-native-kernels")]
+    pub(crate) fn evaluate_hip_physical_parent_v1(
+        &mut self,
+        view: PopulationEvaluationViewV1,
+        genes: PopulationGeneView<'_>,
+        scenarios: &[ScenarioDescriptor],
+        settings: &NeoPopulationSettings,
+    ) -> Result<HostPopulationMetricsReceiptV1, CudaPopulationError> {
+        self.require_strict_idle_v1("evaluate_hip_physical_parent_v1")?;
+        let (rows, features) = self
+            .resident_parent_shape_v3
+            .ok_or_else(|| invalid("HIP physical parent is missing"))?;
+        if self.handle.is_null()
+            || view.parent_row_count != rows
+            || view.adaptive_base_pips.is_some()
+        {
+            return Err(invalid(
+                "exact HIP parent view required; host adaptive base is forbidden",
+            ));
+        }
+        let population = genes.validate(features)?;
+        if scenarios.is_empty()
+            || scenarios
+                .iter()
+                .any(|s| s.base_candidate_id >= population as u64)
+        {
+            return Err(invalid("scenario must name an uploaded gene"));
+        }
+        if settings.month_capacity == 0 || settings.month_capacity > i32::MAX as u32 {
+            return Err(invalid(
+                "month_capacity must be non-zero and fit the native signed extent",
+            ));
+        }
+        PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(
+            scenarios.len(),
+            settings.month_capacity,
+        )?;
+        // Everything above is a host refusal and leaves the previous authority
+        // untouched. Once a view/upload starts, any failure may follow accepted
+        // stream work or replaced storage and must not permit reuse.
+        let result = (|| {
+            self.bind_evaluation_view_v1(view)?;
+            self.upload_genes(genes)?;
+            self.upload_scenarios(scenarios)?;
+            self.enqueue_metrics_only_v1(settings)?
+                .consume_host_metrics_v1()
+        })();
+        if result.is_err() {
+            self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+        }
+        result
+    }
+
+    #[cfg(feature = "hip-native-kernels")]
+    pub(crate) fn matches_hip_physical_parent_v1(
+        &self,
+        handle: usize,
+        rows: usize,
+        features: usize,
+        ordinal: u32,
+        binding: [u8; 32],
+        build: [u8; 32],
+    ) -> bool {
+        self.handle as usize == handle
+            && handle != 0
+            && self.resident_parent_shape_v3 == Some((rows, features))
+            && self.device == ordinal as i32
+            && self.dataset_uploaded
+            && self.resident_session_identity_sha256 == Some(binding)
+            && self.native_build_identity_sha256 == Some(build)
+            && self.strict_resident_state == StrictResidentSessionStateV1::StrictIdle
+    }
+
+    #[cfg(feature = "hip-native-kernels")]
+    pub(crate) fn hip_physical_parent_is_poisoned_v1(&self) -> bool {
+        self.strict_resident_state != StrictResidentSessionStateV1::StrictIdle
+    }
+
+    /// Disarm before checked deletion so neither Drop nor a caller retries an
+    /// ambiguous destroy. Native retains borrower pins if completion is unknown.
+    #[cfg(feature = "hip-native-kernels")]
+    pub(crate) fn close_hip_physical_parent_v1(
+        &mut self,
+        lease_active: bool,
+    ) -> Result<(), CudaPopulationError> {
+        let handle = std::mem::replace(&mut self.handle, std::ptr::null_mut());
+        if handle.is_null() {
+            return Ok(());
+        }
+        if !lease_active {
+            // Another same-lease producer may have quarantined the owner. Never
+            // probe or destroy its potentially stale stream through this child.
+            self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+        }
+        self.require_strict_idle_v1("close_hip_physical_parent_v1")?;
+        // SAFETY: the unique guard retained every source owner. The native HIP
+        // branch validates its borrower, synchronizes, checks frees, then unpins.
+        let status = unsafe { neoethos_gpu_cuda_population_destroy_terminal_checked_v2(handle) };
+        if status != STATUS_OK {
+            self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            return Err(CudaPopulationError::native(
+                "close_hip_physical_parent_v1",
+                status,
+            ));
+        }
+        Ok(())
+    }
+
     fn require_strict_idle_v1(&self, operation: &'static str) -> Result<(), CudaPopulationError> {
         match self.strict_resident_state {
             StrictResidentSessionStateV1::StrictIdle => Ok(()),
@@ -2588,14 +2866,16 @@ impl PopulationSession {
         }
     }
 
-    #[allow(dead_code)] // First bounded Search ownership seam; no public raw handle.
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     pub(crate) fn admit_resident_search_owner_v2(
         &mut self,
         expected_feature_count: usize,
     ) -> Result<*mut c_void, CudaPopulationError> {
         self.require_strict_idle_v1("begin_resident_search_v2")?;
         if self.handle.is_null() {
-            return Err(invalid("resident Search V2 requires one live CUDA session"));
+            return Err(invalid(
+                "resident Search V2 requires one live native session",
+            ));
         }
         if !self.dataset_uploaded || self.feature_count != expected_feature_count {
             return Err(invalid(
@@ -2610,12 +2890,12 @@ impl PopulationSession {
         Ok(self.handle)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     pub(crate) const fn resident_search_native_handle_v2(&self) -> *mut c_void {
         self.handle
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     pub(crate) fn poison_resident_search_owner_v2(&mut self) {
         self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
     }
@@ -2627,45 +2907,55 @@ impl PopulationSession {
         if device < 0 {
             return Err(invalid("device index must be non-negative"));
         }
-        let mut status = STATUS_OK;
-        // SAFETY: `status` is a valid out-parameter; the native side either
-        // returns a live session or a null pointer plus a typed status.
-        let handle = unsafe {
-            neoethos_gpu_cuda_population_create(ABI_VERSION, device, max_events, &mut status)
-        };
-        if handle.is_null() {
-            return Err(CudaPopulationError::native("create", status));
+        // HIP has no legacy CUDA constructor: only an owned HIP buffer bind
+        // may create its native population child. Do not link an absent CUDA
+        // symbol or reinterpret the AMD runtime as CUDA.
+        #[cfg(feature = "hip-native-kernels")]
+        {
+            Err(CudaPopulationError::RuntimeUnavailable)
         }
-        Ok(Self {
-            handle,
-            device,
-            max_events,
-            bars: 0,
-            feature_count: 0,
-            population: 0,
-            scenario_count: 0,
-            emitted_events: 0,
-            dataset_uploaded: false,
-            genes_uploaded: false,
-            scenarios_uploaded: false,
-            pending_event: None,
-            metrics_ready: false,
-            strict_resident_state: StrictResidentSessionStateV1::StrictIdle,
-            #[cfg(feature = "cuda")]
-            drop_policy_v3: PopulationSessionDropPolicyV3::DestroyWhenIdle,
-            parent_source_v1: None,
-            resident_parent_shape_v3: None,
-            bound_view_source_v1: None,
-            resident_session_identity_sha256: None,
-            native_build_identity_sha256: None,
-            view_identity_sha256: None,
-            resident_adaptive_base_view_token_v1: None,
-            gene_batch_identity_sha256: None,
-            scenario_batch_identity_sha256: None,
-            uploaded_candidate_ids: Vec::new(),
-            expected_scenario_identities: Arc::from([]),
-            terminal_scenario_identity: None,
-        })
+        #[cfg(not(feature = "hip-native-kernels"))]
+        {
+            let mut status = STATUS_OK;
+            // SAFETY: `status` is a valid out-parameter; the native side either
+            // returns a live session or a null pointer plus a typed status.
+            let handle = unsafe {
+                neoethos_gpu_cuda_population_create(ABI_VERSION, device, max_events, &mut status)
+            };
+            if handle.is_null() {
+                return Err(CudaPopulationError::native("create", status));
+            }
+            Ok(Self {
+                handle,
+                device,
+                max_events,
+                bars: 0,
+                feature_count: 0,
+                population: 0,
+                scenario_count: 0,
+                emitted_events: 0,
+                dataset_uploaded: false,
+                genes_uploaded: false,
+                scenarios_uploaded: false,
+                pending_event: None,
+                metrics_ready: false,
+                strict_resident_state: StrictResidentSessionStateV1::StrictIdle,
+                #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+                drop_policy_v3: PopulationSessionDropPolicyV3::DestroyWhenIdle,
+                parent_source_v1: None,
+                resident_parent_shape_v3: None,
+                bound_view_source_v1: None,
+                resident_session_identity_sha256: None,
+                native_build_identity_sha256: None,
+                view_identity_sha256: None,
+                resident_adaptive_base_view_token_v1: None,
+                gene_batch_identity_sha256: None,
+                scenario_batch_identity_sha256: None,
+                uploaded_candidate_ids: Vec::new(),
+                expected_scenario_identities: Arc::from([]),
+                terminal_scenario_identity: None,
+            })
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -2733,17 +3023,17 @@ impl PopulationSession {
         })
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     pub(crate) fn arm_resident_session_leak_only_v3(&mut self) {
         self.drop_policy_v3 = PopulationSessionDropPolicyV3::LeakUntilResidentConsumerEvent;
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     pub(crate) fn authorize_resident_session_destroy_v3(&mut self) {
         self.drop_policy_v3 = PopulationSessionDropPolicyV3::DestroyWhenIdle;
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     pub(crate) fn destroy_terminal_proven_resident_search_v2(
         mut self,
     ) -> Result<(), CudaPopulationError> {
@@ -2781,8 +3071,8 @@ impl PopulationSession {
         std::mem::replace(self, Self::detached_resident_v3())
     }
 
-    #[cfg(feature = "cuda")]
-    fn detached_resident_v3() -> Self {
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+    pub(crate) fn detached_resident_v3() -> Self {
         Self {
             handle: std::ptr::null_mut(),
             device: -1,
@@ -2798,6 +3088,7 @@ impl PopulationSession {
             pending_event: None,
             metrics_ready: false,
             strict_resident_state: StrictResidentSessionStateV1::Poisoned,
+            #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
             drop_policy_v3: PopulationSessionDropPolicyV3::LeakUntilResidentConsumerEvent,
             parent_source_v1: None,
             resident_parent_shape_v3: None,
@@ -3007,13 +3298,17 @@ impl PopulationSession {
                 .map_or(std::ptr::null(), <[f64]>::as_ptr),
             adaptive_base_pips_len: view.adaptive_base_pips.as_deref().map_or(0, <[f64]>::len),
         };
-        // SAFETY: every pointer comes from a validated Arc retained below until
-        // the next bind, which native code refuses while work is incomplete.
+        // SAFETY: every pointer comes from a validated Arc alive during this
+        // call. Native code owns and stream-retires both asynchronous sources;
+        // retaining the view below additionally preserves its exact identity.
         let status = unsafe { neoethos_gpu_cuda_population_bind_view_v1(self.handle, &raw) };
         if status != STATUS_OK {
             // See the parent upload above: an error may follow accepted async
             // copies, so retain this view's host buffers until session teardown.
             self.bound_view_source_v1 = Some(view);
+            // Device buffers may already differ from the previous authority.
+            // An ignored error must not allow the old scenarios to run on them.
+            self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
             return Err(CudaPopulationError::native(
                 "bind_evaluation_view_v1",
                 status,
@@ -3033,7 +3328,7 @@ impl PopulationSession {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     pub(crate) fn bind_evaluation_view_with_resident_adaptive_base_v1(
         &mut self,
         view: PopulationEvaluationViewV1,
@@ -3081,11 +3376,7 @@ impl PopulationSession {
                 })?;
                 (1, start)
             }
-            PopulationViewKindV1::OrderedIndices => {
-                return Err(invalid(
-                    "resident adaptive producer V1 refuses ordered views",
-                ));
-            }
+            PopulationViewKindV1::OrderedIndices => (2, 0),
         };
         let raw = RawEvaluationViewV1 {
             abi_version: ABI_VERSION,
@@ -3093,8 +3384,10 @@ impl PopulationSession {
             parent_row_count,
             range_start,
             row_count,
-            ordered_indices: std::ptr::null(),
-            ordered_index_count: 0,
+            ordered_indices: view
+                .ordered_index_values()
+                .map_or(std::ptr::null(), <[u64]>::as_ptr),
+            ordered_index_count: view.ordered_index_values().map_or(0, <[u64]>::len),
             timestamp_mode: match view.timestamp_mode {
                 PopulationTimestampModeV1::Canonical => 0,
                 PopulationTimestampModeV1::DisabledIndexDelta => 1,
@@ -3112,9 +3405,11 @@ impl PopulationSession {
             request_identity_sha256,
         );
 
-        // SAFETY: this descriptor carries no host price/base pointer. Native
-        // code reads the resident parent and writes its retained adaptive output
-        // on the already-admitted stream; `view` only contributes scalar bounds.
+        // SAFETY: this descriptor carries no host price/base pointer. Its exact
+        // ordered map, if present, lives in `view` for this call. Native code
+        // copies that map into owned staging and retires it on the same stream,
+        // including error paths, before releasing its host source. Kernels read
+        // the resident parent and write the retained adaptive output.
         let status = unsafe {
             neoethos_gpu_cuda_population_bind_resident_adaptive_view_v1(self.handle, &raw, &request)
         };
@@ -3248,20 +3543,27 @@ impl PopulationSession {
     pub fn read_device_identity_v1(
         &self,
     ) -> Result<CudaPopulationDeviceIdentityV1, CudaPopulationError> {
-        self.require_strict_idle_v1("read_device_identity_v1")?;
-        let mut identity = CudaPopulationDeviceIdentityV1::default();
-        // SAFETY: `identity` is a live repr(C) out-parameter and the session is
-        // immutably borrowed for the duration of the read.
-        let status = unsafe {
-            neoethos_gpu_cuda_population_read_device_identity_v1(self.handle, &mut identity)
-        };
-        if status != STATUS_OK {
-            return Err(CudaPopulationError::native(
-                "read_device_identity_v1",
-                status,
-            ));
+        #[cfg(feature = "hip-native-kernels")]
+        {
+            Err(CudaPopulationError::RuntimeUnavailable)
         }
-        Ok(identity)
+        #[cfg(not(feature = "hip-native-kernels"))]
+        {
+            self.require_strict_idle_v1("read_device_identity_v1")?;
+            let mut identity = CudaPopulationDeviceIdentityV1::default();
+            // SAFETY: `identity` is a live repr(C) out-parameter and the session is
+            // immutably borrowed for the duration of the read.
+            let status = unsafe {
+                neoethos_gpu_cuda_population_read_device_identity_v1(self.handle, &mut identity)
+            };
+            if status != STATUS_OK {
+                return Err(CudaPopulationError::native(
+                    "read_device_identity_v1",
+                    status,
+                ));
+            }
+            Ok(identity)
+        }
     }
 
     pub fn upload_genes(
@@ -3388,7 +3690,7 @@ impl PopulationSession {
         Ok(())
     }
 
-    #[allow(dead_code)] // Reached by the crate-private resident Search owner.
+    #[cfg(feature = "cuda")]
     pub(crate) fn upload_resident_scenarios_v2(
         &mut self,
         scenarios: &[ScenarioDescriptor],
@@ -3463,6 +3765,82 @@ impl PopulationSession {
         }
         self.population = population;
         self.scenario_count = scenarios.len();
+        self.scenarios_uploaded = true;
+        self.gene_batch_identity_sha256 = Some(gene_batch_identity_sha256);
+        self.scenario_batch_identity_sha256 = Some(scenario_batch_identity_sha256);
+        self.uploaded_candidate_ids = uploaded_candidate_ids;
+        self.expected_scenario_identities = expected_scenario_identities;
+        self.terminal_scenario_identity = terminal_scenario_identity;
+        self.metrics_ready = false;
+        self.pending_event = None;
+        Ok(())
+    }
+
+    /// Upload one canonical work list while retaining only C scenario slots on
+    /// the device. Native evaluates every P member, stages all P metric rows in
+    /// its admitted generation arena and exposes one population-wide score input.
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+    pub(crate) fn upload_resident_base_scenarios_v3(
+        &mut self,
+        scenarios: &[ScenarioDescriptor],
+        planned_population: u64,
+        retained_capacity: u64,
+        generation_index: u64,
+        gene_batch_identity_sha256: [u8; 32],
+    ) -> Result<(), CudaPopulationError> {
+        self.require_strict_idle_v1("upload_resident_base_scenarios_v3")?;
+        if self.genes_uploaded || self.scenarios_uploaded || generation_index > u32::MAX as u64 {
+            return Err(invalid(
+                "resident base scenario admission requires one fresh generation-owned session",
+            ));
+        }
+        let (population, capacity) = validate_resident_base_scenarios_v3(
+            scenarios,
+            planned_population,
+            retained_capacity,
+            self.bars,
+        )?;
+        let identity_prefix = generation_index << 32;
+        let uploaded_candidate_ids = (0..population)
+            .map(|candidate| identity_prefix ^ candidate as u64)
+            .collect::<Vec<_>>();
+        let expected_scenario_identities = scenarios
+            .iter()
+            .map(|scenario| {
+                (
+                    uploaded_candidate_ids[scenario.base_candidate_id as usize],
+                    scenario.scenario_id,
+                )
+            })
+            .collect::<Arc<[(u64, u64)]>>();
+        let terminal_scenario_identity = (population == 1).then(|| expected_scenario_identities[0]);
+        let scenario_batch_identity_sha256 = hash_population_scenario_batch_identity_v1(scenarios);
+        let raw = RawScenarioView {
+            descriptors: scenarios.as_ptr(),
+            count: scenarios.len(),
+        };
+        // SAFETY: native validates all P descriptors and the actual run's P/C,
+        // then copies the first C into retained staging exactly once. Queued
+        // copies never retain this caller's temporary descriptor slice.
+        let status = unsafe {
+            neoethos_gpu_cuda_population_upload_resident_base_scenarios_v3(
+                self.handle,
+                &raw,
+                planned_population,
+                retained_capacity,
+            )
+        };
+        if status != STATUS_OK {
+            if !strict_enqueue_failure_is_known_prelaunch_v1(status) {
+                self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;
+            }
+            return Err(CudaPopulationError::native(
+                "upload_resident_base_scenarios_v3",
+                status,
+            ));
+        }
+        self.population = population;
+        self.scenario_count = capacity;
         self.scenarios_uploaded = true;
         self.gene_batch_identity_sha256 = Some(gene_batch_identity_sha256);
         self.scenario_batch_identity_sha256 = Some(scenario_batch_identity_sha256);
@@ -3648,7 +4026,7 @@ impl PopulationSession {
         })
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     #[allow(dead_code)] // Consumed by the move-only resident Search pending owner.
     pub(crate) fn enqueue_resident_gene_metrics_owned_v2(
         mut self,
@@ -3670,14 +4048,16 @@ impl PopulationSession {
         if !self.scenarios_uploaded
             || self.gene_batch_identity_sha256.is_none()
             || logical_population_count == 0
-            || retained_evaluation_capacity != logical_population_count
-            || self.scenario_count as u64 != logical_population_count
+            || retained_evaluation_capacity == 0
+            || retained_evaluation_capacity > logical_population_count
+            || self.scenario_count as u64 != retained_evaluation_capacity
             || self.population as u64 != logical_population_count
+            || self.expected_scenario_identities.len() as u64 != logical_population_count
             || expected_full_discovery_reserve_bytes == 0
         {
             return Err(ResidentSearchPopulationEnqueueRejectedV2 {
                 error: invalid(
-                    "owned resident scoring requires one immutable full-population chunk",
+                    "owned resident scoring requires all P identities and exact admitted capacity 0 < C <= P",
                 ),
                 session: self,
             });
@@ -3973,10 +4353,10 @@ impl PopulationSession {
 
 impl Drop for PopulationSession {
     fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
         let resident_drop_requires_leak =
             self.drop_policy_v3 == PopulationSessionDropPolicyV3::LeakUntilResidentConsumerEvent;
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "hip-native-kernels")))]
         let resident_drop_requires_leak = false;
         if resident_drop_requires_leak
             || matches!(
@@ -4011,6 +4391,92 @@ impl Drop for PopulationSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "hip-native-kernels")]
+    #[test]
+    fn hip_physical_parent_host_refusal_does_not_replace_or_poison_authority() {
+        // A sentinel never crosses FFI: every case must stop during host checks.
+        // ManuallyDrop prevents a failing assertion from invoking native cleanup
+        // on this deliberately non-device test state.
+        let mut session = std::mem::ManuallyDrop::new(PopulationSession::detached_resident_v3());
+        session.handle = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        session.strict_resident_state = StrictResidentSessionStateV1::StrictIdle;
+        session.resident_parent_shape_v3 = Some((10, 1));
+        session.resident_session_identity_sha256 = Some([9; 32]);
+        let descriptors = [GeneDescriptor::default()];
+        let smc_weights = [0.0; SMC_SLOTS];
+        let genes = PopulationGeneView {
+            descriptors: &descriptors,
+            offsets: &[0, 1],
+            indices: &[0],
+            weights: &[1.0],
+            stop_pips: &[10.0],
+            target_pips: &[20.0],
+            stop_vol_multipliers: &[0.0],
+            smc_flags: &[0; SMC_SLOTS],
+            smc_weights: &smc_weights,
+            gate_threshold: 0.0,
+            smc_gate_disabled: true,
+        };
+        for case in 0..5 {
+            let view = PopulationEvaluationViewV1::full(
+                if case == 0 { 9 } else { 10 },
+                PopulationTimestampModeV1::Canonical,
+                (case == 1).then(|| Arc::from([1.0; 10])),
+            )
+            .unwrap();
+            let genes = if case == 2 {
+                PopulationGeneView {
+                    indices: &[1],
+                    ..genes
+                }
+            } else {
+                genes
+            };
+            let scenarios = [ScenarioDescriptor {
+                base_candidate_id: u64::from(case == 3),
+                ..ScenarioDescriptor::default()
+            }];
+            let settings = NeoPopulationSettings {
+                month_capacity: if case == 4 { 0 } else { 1 },
+                ..NeoPopulationSettings::default()
+            };
+            assert!(matches!(
+                session.evaluate_hip_physical_parent_v1(view, genes, &scenarios, &settings),
+                Err(CudaPopulationError::InvalidInput(_))
+            ));
+            assert_eq!(
+                session.strict_resident_state,
+                StrictResidentSessionStateV1::StrictIdle
+            );
+            assert_eq!(session.resident_session_identity_sha256, Some([9; 32]));
+            assert!(session.bound_view_source_v1.is_none());
+            assert!(!session.genes_uploaded && !session.scenarios_uploaded);
+        }
+    }
+
+    #[cfg(feature = "hip-native-kernels")]
+    #[test]
+    fn hip_physical_parent_quarantined_close_disarms_before_native_cleanup() {
+        // Host-only negative control: neither an inactive lease nor a poisoned
+        // session may pass this sentinel into a runtime API, even during Drop.
+        for (active, state) in [
+            (false, StrictResidentSessionStateV1::StrictIdle),
+            (true, StrictResidentSessionStateV1::Poisoned),
+        ] {
+            let mut session =
+                std::mem::ManuallyDrop::new(PopulationSession::detached_resident_v3());
+            session.handle = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+            session.strict_resident_state = state;
+            assert!(session.close_hip_physical_parent_v1(active).is_err());
+            assert!(session.handle.is_null());
+            assert_eq!(
+                session.strict_resident_state,
+                StrictResidentSessionStateV1::Poisoned
+            );
+            assert!(session.close_hip_physical_parent_v1(false).is_ok());
+        }
+    }
 
     fn normalize_source(source: &str) -> String {
         source.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -4276,6 +4742,7 @@ mod tests {
             *mut crate::CudaFirstHitResult,
             usize,
         ) -> i32 = crate::neoethos_gpu_cuda_warp_first_hit;
+        #[cfg(not(feature = "hip-native-kernels"))]
         let _: unsafe extern "C" fn(u32, i32, usize, *mut i32) -> *mut c_void =
             neoethos_gpu_cuda_population_create;
         let _: unsafe extern "C" fn(*mut c_void, *const RawDatasetView) -> i32 =
@@ -4297,12 +4764,18 @@ mod tests {
         ) -> i32 = neoethos_gpu_cuda_population_bind_resident_adaptive_view_v1;
         let _: unsafe extern "C" fn(*mut c_void, *mut PopulationResidencyCountersV1) -> i32 =
             neoethos_gpu_cuda_population_read_residency_counters_v1;
-        let _: unsafe extern "C" fn(*mut c_void, *mut CudaPopulationDeviceIdentityV1) -> i32 =
-            neoethos_gpu_cuda_population_read_device_identity_v1;
+        #[cfg(not(feature = "hip-native-kernels"))]
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *mut CudaPopulationDeviceIdentityV1,
+        ) -> i32 = neoethos_gpu_cuda_population_read_device_identity_v1;
         let _: unsafe extern "C" fn(*mut c_void, *const RawGeneView) -> i32 =
             neoethos_gpu_cuda_population_upload_genes;
         let _: unsafe extern "C" fn(*mut c_void, *const RawScenarioView) -> i32 =
             neoethos_gpu_cuda_population_upload_scenarios;
+        #[cfg(feature = "cuda")]
+        let _: unsafe extern "C" fn(*mut c_void, *const RawScenarioView, u64, u64) -> i32 =
+            neoethos_gpu_cuda_population_upload_resident_base_scenarios_v3;
         let _: unsafe extern "C" fn(
             *mut c_void,
             *const NeoPopulationSettings,
@@ -4516,7 +4989,10 @@ mod tests {
             "const double* weights;",
             "__shared__ double tile[kTransposeTile][kTransposeTile + 1];",
             "double combined = 0.0;",
-            "const double weight = genes.weights[term] * perturb_factor(",
+            "const double weight = plan.resident_mode_v2 != 0",
+            ": genes.weights[term];",
+            "const double base_weight = plan.resident_mode_v2 != 0",
+            "const double weight = base_weight * perturb_factor(",
             "double* indicators_bar_major = nullptr;",
             "double* gene_weights = nullptr;",
             "features * bars * sizeof(double)",
@@ -4597,7 +5073,10 @@ mod tests {
             "double active_sum;",
             "double gate;",
             "double active_sum = 0.0;",
-            "plan.gate = fmin(genes.gate_threshold, active_sum);",
+            "const double gate_threshold = plan.resident_mode_v2 != 0",
+            "f64_from_raw_bits_v2(genes.resident_control_v2->gate_threshold_bits)",
+            ": genes.gate_threshold;",
+            "plan.gate = fmin(gate_threshold, active_sum);",
             "double score = 0.0;",
             "double* smc_weights = nullptr;",
             "double gate_threshold = 0.0;",
@@ -4637,6 +5116,200 @@ mod tests {
     }
 
     #[test]
+    fn resident_adaptive_ordered_request_preserves_exact_view_identity() {
+        let indices = (0..120).map(|row| row * 2).collect::<Vec<u64>>();
+        let make_view = |indices: Vec<u64>, timestamp_mode| {
+            PopulationEvaluationViewV1::ordered_indices(
+                256,
+                Arc::from(indices),
+                timestamp_mode,
+                None,
+            )
+            .unwrap()
+        };
+        let view = make_view(indices.clone(), PopulationTimestampModeV1::Canonical);
+        let request =
+            ResidentAdaptiveBaseRequestV1::checked_canonical_v1(&view, 0.0001, 7, 120).unwrap();
+        assert_eq!(core::mem::size_of::<ResidentAdaptiveBaseRequestV1>(), 96);
+        assert_eq!(core::mem::size_of::<RawEvaluationViewV1>(), 72);
+        assert_eq!(request.view_kind, 2);
+        assert_eq!(request.view_start(), 0);
+        assert_eq!(request.view_row_count(), 120);
+        assert_eq!(view.ordered_index_values(), Some(indices.as_slice()));
+        let mut changed_indices = indices.clone();
+        changed_indices[119] += 1;
+        let changed = make_view(changed_indices, PopulationTimestampModeV1::Canonical);
+        let changed_request =
+            ResidentAdaptiveBaseRequestV1::checked_canonical_v1(&changed, 0.0001, 7, 120).unwrap();
+        // The recipe has the same shape; the separate view identity must bind
+        // every actual map value, not just this descriptor's row count.
+        assert_eq!(request.identity_sha256(), changed_request.identity_sha256());
+        let view_hash = hash_population_view_identity_v1(&view);
+        let changed_hash = hash_population_view_identity_v1(&changed);
+        assert_ne!(view_hash, changed_hash);
+        let disabled = make_view(indices, PopulationTimestampModeV1::DisabledIndexDelta);
+        assert_ne!(view_hash, hash_population_view_identity_v1(&disabled));
+        #[cfg(feature = "cuda")]
+        {
+            let bound = hash_resident_adaptive_population_view_identity_v1(
+                view_hash,
+                request.identity_sha256(),
+            );
+            let rebound = hash_resident_adaptive_population_view_identity_v1(
+                changed_hash,
+                changed_request.identity_sha256(),
+            );
+            assert_ne!(bound, rebound);
+            let token =
+                hash_resident_adaptive_view_token_v1([1; 32], bound, request.identity_sha256());
+            assert_ne!(
+                token,
+                hash_resident_adaptive_view_token_v1([1; 32], rebound, request.identity_sha256())
+            );
+            assert_ne!(
+                token,
+                hash_resident_adaptive_view_token_v1([2; 32], bound, request.identity_sha256())
+            );
+        }
+    }
+
+    #[test]
+    fn resident_adaptive_ordered_request_refuses_invalid_map_recipe_and_host_base() {
+        for indices in [vec![], vec![0, 0], vec![2, 1], vec![0, 256]] {
+            assert!(
+                PopulationEvaluationViewV1::ordered_indices(
+                    256,
+                    Arc::from(indices),
+                    PopulationTimestampModeV1::Canonical,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        let make_view = |rows, base| {
+            PopulationEvaluationViewV1::ordered_indices(
+                256,
+                Arc::from((0..rows).map(|row| row * 2).collect::<Vec<u64>>()),
+                PopulationTimestampModeV1::Canonical,
+                base,
+            )
+            .unwrap()
+        };
+        let view = make_view(120, None);
+        for (pip, step, cap) in [
+            (0.0, 1, 120),
+            (-1.0, 1, 120),
+            (f64::NAN, 1, 120),
+            (f64::INFINITY, 1, 120),
+            (0.0001, 0, 120),
+            (0.0001, 1, 119),
+        ] {
+            assert!(
+                ResidentAdaptiveBaseRequestV1::checked_canonical_v1(&view, pip, step, cap).is_err()
+            );
+        }
+        assert!(
+            ResidentAdaptiveBaseRequestV1::checked_canonical_v1(
+                &make_view(100, None),
+                0.0001,
+                1,
+                120
+            )
+            .is_err()
+        );
+        let host = make_view(120, Some(Arc::from(vec![1.0; 120])));
+        assert!(
+            ResidentAdaptiveBaseRequestV1::checked_canonical_v1(&host, 0.0001, 1, 120).is_err()
+        );
+        let unavailable = make_view(
+            120,
+            Some(Arc::from(vec![f64::from_bits(0x7ff8_0000_0000_0000); 120])),
+        );
+        assert!(
+            ResidentAdaptiveBaseRequestV1::checked_canonical_v1(&unavailable, 0.0001, 1, 120)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resident_adaptive_host_views_accept_only_canonical_unavailable_nonfinite_cells() {
+        let unavailable = f64::from_bits(0x7ff8_0000_0000_0000);
+        let values = [unavailable, 0.0, -2.0, 1.25];
+        let build = |values: &[f64]| {
+            PopulationEvaluationViewV1::full(
+                4,
+                PopulationTimestampModeV1::Canonical,
+                Some(Arc::from(values)),
+            )
+        };
+        let valid = build(&values).unwrap();
+        assert_eq!(
+            valid.adaptive_base_pips().unwrap()[0].to_bits(),
+            unavailable.to_bits()
+        );
+        let mut changed = values;
+        changed[3] = 2.5;
+        assert_ne!(
+            hash_population_view_identity_v1(&valid),
+            hash_population_view_identity_v1(&build(&changed).unwrap())
+        );
+        assert!(build(&values[..3]).is_err());
+        for invalid in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            f64::from_bits(0xfff8_0000_0000_0000),
+            f64::from_bits(0x7ff0_0000_0000_0001),
+        ] {
+            let mut changed = values;
+            changed[0] = invalid;
+            assert!(
+                build(&changed).is_err(),
+                "invalid bits {:x}",
+                invalid.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn resident_adaptive_host_datasets_use_the_same_unavailable_cell_policy() {
+        let (prices, indicators, calendar, smc) = dataset_slices();
+        let validate = |base: &[f64]| {
+            PopulationDatasetView {
+                close: &prices,
+                high: &prices,
+                low: &prices,
+                indicators: &indicators,
+                feature_count: 2,
+                months: &calendar,
+                days: &calendar,
+                timestamps: &calendar,
+                smc_rows: &smc,
+                adaptive_base_pips: Some(base),
+            }
+            .validate()
+        };
+        let values = [f64::from_bits(0x7ff8_0000_0000_0000), 0.0, -2.0, 1.25];
+        assert_eq!(validate(&values).unwrap(), 4);
+        assert!(validate(&values[..3]).is_err());
+        for invalid in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            f64::from_bits(0xfff8_0000_0000_0000),
+            f64::from_bits(0x7ff0_0000_0000_0001),
+        ] {
+            let mut changed = values;
+            changed[0] = invalid;
+            assert!(
+                validate(&changed).is_err(),
+                "invalid bits {:x}",
+                invalid.to_bits()
+            );
+        }
+    }
+
+    #[test]
     fn zero_capacity_and_negative_device_are_rejected_before_ffi() {
         assert!(matches!(
             PopulationSession::create(0, 0),
@@ -4659,6 +5332,266 @@ mod tests {
         assert_eq!(plan.total_device_bytes(), 4_000);
         assert_eq!(plan.outcome_bytes(), 0);
         assert_eq!(plan.accepted_trade_total_bytes(), 0);
+    }
+
+    #[test]
+    fn metrics_only_readers_preserve_economic_rejections_and_reject_every_nonfinite_fault() {
+        // Transport-validator fixtures only, not a substitute for a native
+        // producer or device evidence. Both consumers read the same kernel rows.
+        let plan = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(1, 240).unwrap();
+        let host = RawHostPopulationMetricsResultV1 {
+            abi_version: ABI_VERSION,
+            event_id: 19,
+            scenario_count: 1,
+            terminal_synchronization_count: 1,
+            terminal_readback_count: 1,
+            terminal_readback_rows: 1,
+            terminal_readback_bytes: 104,
+            ..Default::default()
+        };
+        let compact = RawTerminalCompactPopulationResultV1 {
+            abi_version: ABI_VERSION,
+            event_id: 19,
+            scenario_count: 1,
+            terminal_synchronization_count: 1,
+            terminal_readback_count: 1,
+            terminal_readback_rows: 1,
+            terminal_readback_bytes: 104,
+            ..Default::default()
+        };
+        let check = |values: [f64; 11], accepted: bool| {
+            let row = NeoPopulationMetricRow {
+                candidate_id: 7,
+                scenario_id: 11,
+                values,
+            };
+            assert_eq!(
+                validate_host_population_metrics_result_v1(&host, 1, &[row], 19, plan, &[(7, 11)])
+                    .is_ok(),
+                accepted,
+                "host metrics {values:?}"
+            );
+            assert_eq!(
+                validate_terminal_compact_result_v1(
+                    &RawTerminalCompactPopulationResultV1 {
+                        metric_row: row,
+                        ..compact
+                    },
+                    19,
+                    7,
+                    11,
+                )
+                .is_ok(),
+                accepted,
+                "compact metrics {values:?}"
+            );
+        };
+        let mut values = [0.0; 11];
+        values[0] = -1000.0;
+        values[3] = 1.0;
+        values[8] = 12.0;
+        check(values, true);
+        values[1] = f64::NEG_INFINITY;
+        check(values, true);
+        let mut inconsistent = values;
+        inconsistent[3] = 0.999;
+        check(inconsistent, false);
+        for slot in 0..11 {
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut fault = values;
+                fault[slot] = invalid;
+                check(fault, slot == 1 && invalid == f64::NEG_INFINITY);
+            }
+        }
+        assert_eq!(values[1].to_bits(), f64::NEG_INFINITY.to_bits());
+    }
+
+    #[test]
+    fn metrics_only_economic_marker_never_weakens_identity_or_transfer_checks() {
+        let plan = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(1, 240).unwrap();
+        let mut row = NeoPopulationMetricRow {
+            candidate_id: 7,
+            scenario_id: 11,
+            values: [0.0; 11],
+        };
+        row.values[1] = f64::NEG_INFINITY;
+        row.values[3] = 1.0;
+        let host = RawHostPopulationMetricsResultV1 {
+            abi_version: ABI_VERSION,
+            event_id: 19,
+            scenario_count: 1,
+            terminal_synchronization_count: 1,
+            terminal_readback_count: 1,
+            terminal_readback_rows: 1,
+            terminal_readback_bytes: 104,
+            ..Default::default()
+        };
+        let compact = RawTerminalCompactPopulationResultV1 {
+            abi_version: ABI_VERSION,
+            event_id: 19,
+            scenario_count: 1,
+            metric_row: row,
+            terminal_synchronization_count: 1,
+            terminal_readback_count: 1,
+            terminal_readback_rows: 1,
+            terminal_readback_bytes: 104,
+            ..Default::default()
+        };
+        for invalid in [
+            RawHostPopulationMetricsResultV1 {
+                abi_version: 0,
+                ..host
+            },
+            RawHostPopulationMetricsResultV1 {
+                reserved: 1,
+                ..host
+            },
+            RawHostPopulationMetricsResultV1 {
+                event_id: 20,
+                ..host
+            },
+            RawHostPopulationMetricsResultV1 {
+                scenario_count: 2,
+                ..host
+            },
+            RawHostPopulationMetricsResultV1 {
+                terminal_synchronization_count: 0,
+                ..host
+            },
+            RawHostPopulationMetricsResultV1 {
+                terminal_readback_count: 2,
+                ..host
+            },
+            RawHostPopulationMetricsResultV1 {
+                terminal_readback_rows: 2,
+                ..host
+            },
+            RawHostPopulationMetricsResultV1 {
+                terminal_readback_bytes: 208,
+                ..host
+            },
+        ] {
+            assert!(
+                validate_host_population_metrics_result_v1(
+                    &invalid,
+                    1,
+                    &[row],
+                    19,
+                    plan,
+                    &[(7, 11)]
+                )
+                .is_err()
+            );
+        }
+        for invalid in [
+            RawTerminalCompactPopulationResultV1 {
+                abi_version: 0,
+                ..compact
+            },
+            RawTerminalCompactPopulationResultV1 {
+                reserved: 1,
+                ..compact
+            },
+            RawTerminalCompactPopulationResultV1 {
+                event_id: 20,
+                ..compact
+            },
+            RawTerminalCompactPopulationResultV1 {
+                scenario_count: 2,
+                ..compact
+            },
+            RawTerminalCompactPopulationResultV1 {
+                terminal_synchronization_count: 0,
+                ..compact
+            },
+            RawTerminalCompactPopulationResultV1 {
+                terminal_readback_count: 2,
+                ..compact
+            },
+            RawTerminalCompactPopulationResultV1 {
+                terminal_readback_rows: 2,
+                ..compact
+            },
+            RawTerminalCompactPopulationResultV1 {
+                terminal_readback_bytes: 208,
+                ..compact
+            },
+        ] {
+            assert!(validate_terminal_compact_result_v1(&invalid, 19, 7, 11).is_err());
+        }
+        assert!(
+            validate_host_population_metrics_result_v1(&host, 0, &[row], 19, plan, &[(7, 11)])
+                .is_err()
+        );
+        assert!(
+            validate_host_population_metrics_result_v1(&host, 1, &[], 19, plan, &[(7, 11)])
+                .is_err()
+        );
+        for identities in [&[][..], &[(7, 12)][..], &[(8, 11)][..]] {
+            assert!(
+                validate_host_population_metrics_result_v1(&host, 1, &[row], 19, plan, identities)
+                    .is_err()
+            );
+        }
+        assert!(validate_terminal_compact_result_v1(&compact, 19, 8, 11).is_err());
+        assert!(validate_terminal_compact_result_v1(&compact, 19, 7, 12).is_err());
+    }
+
+    #[test]
+    fn resident_base_chunks_validate_every_descriptor_without_reducing_population() {
+        let scenarios = (0..12)
+            .map(|ordinal| ScenarioDescriptor {
+                base_candidate_id: ordinal,
+                scenario_id: ordinal,
+                window_len: 240,
+                ..ScenarioDescriptor::default()
+            })
+            .collect::<Vec<_>>();
+        for capacity in [1, 5, 12] {
+            assert_eq!(
+                validate_resident_base_scenarios_v3(&scenarios, 12, capacity, 240).unwrap(),
+                (12, capacity as usize)
+            );
+            let physical = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(
+                capacity as usize,
+                240,
+            )
+            .unwrap();
+            assert_eq!(physical.total_device_bytes(), 4000 * capacity);
+        }
+        for (population, capacity, bars) in [
+            (0, 1, 240),
+            (12, 0, 240),
+            (12, 13, 240),
+            (11, 5, 240),
+            (12, 5, 0),
+            (12, 5, 239),
+        ] {
+            assert!(
+                validate_resident_base_scenarios_v3(&scenarios, population, capacity, bars)
+                    .is_err()
+            );
+        }
+        let mutations: &[fn(&mut ScenarioDescriptor)] = &[
+            |s| s.base_candidate_id = 0,
+            |s| s.scenario_id = 0,
+            |s| s.rng_counter = 1,
+            |s| s.window_offset = 1,
+            |s| s.window_len = 0,
+            |s| s.scenario_type = 1,
+            |s| s.spread_ticks = 0,
+            |s| s.slippage_ticks = 1,
+            |s| s.commission_micros = 0,
+            |s| s.perturbation_offset = 1,
+            |s| s.perturbation_count = 1,
+            |s| s.reserved = 1,
+        ];
+        for mutate in mutations {
+            let mut changed = scenarios.clone();
+            // The final partial chunk must be checked, not just uploaded C=5.
+            mutate(&mut changed[11]);
+            assert!(validate_resident_base_scenarios_v3(&changed, 12, 5, 240).is_err());
+        }
     }
 
     #[test]
@@ -4834,6 +5767,30 @@ mod tests {
         assert!(
             matches!(broken.validate(8), Err(CudaPopulationError::InvalidInput(detail)) if detail.contains("CSR"))
         );
+    }
+
+    #[cfg(feature = "hip-native-kernels")]
+    #[test]
+    fn hip_native_build_does_not_offer_cuda_construction_or_identity() {
+        assert!(matches!(
+            PopulationSession::create(-1, 1),
+            Err(CudaPopulationError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            PopulationSession::create(0, 0),
+            Err(CudaPopulationError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            PopulationSession::create(0, 1),
+            Err(CudaPopulationError::RuntimeUnavailable)
+        ));
+        // Null/poisoned is a detached host state, not a fabricated HIP owner.
+        // The CUDA identity method must refuse without any native call.
+        let detached = PopulationSession::detached_resident_v3();
+        assert!(matches!(
+            detached.read_device_identity_v1(),
+            Err(CudaPopulationError::RuntimeUnavailable)
+        ));
     }
 
     #[cfg(not(feature = "cuda"))]

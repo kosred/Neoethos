@@ -55,42 +55,7 @@ pub struct Position {
 /// (`live_trading.rs:1479-1493`) and the evaluator also move the stop once a
 /// trade reaches `+be_trigger_r × R`. A replay that does not model the exit a
 /// strategy was scored under is not measuring that strategy.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TrailingPolicy {
-    pub be_trigger_r: f64,
-    pub stop_multiplier: f64,
-    pub min_lock_pips: f64,
-    pub pip_size: f64,
-}
-
-impl TrailingPolicy {
-    /// `Some` only when every number can actually move a stop. A non-finite or
-    /// non-positive trigger / multiplier / pip size, or a negative lock, would
-    /// place the stop at a nonsense level, so those yield `None` and the caller
-    /// reports the trail as UNARMED instead of running a trail nobody can read.
-    pub fn new(
-        be_trigger_r: f64,
-        stop_multiplier: f64,
-        min_lock_pips: f64,
-        pip_size: f64,
-    ) -> Option<Self> {
-        let finite_positive = |v: f64| v.is_finite() && v > 0.0;
-        if !finite_positive(be_trigger_r)
-            || !finite_positive(stop_multiplier)
-            || !finite_positive(pip_size)
-            || !min_lock_pips.is_finite()
-            || min_lock_pips < 0.0
-        {
-            return None;
-        }
-        Some(Self {
-            be_trigger_r,
-            stop_multiplier,
-            min_lock_pips,
-            pip_size,
-        })
-    }
-}
+pub use neoethos_core::domain::trailing::TrailingPolicy;
 
 impl Position {
     /// Unrealised P&L as `points × volume` (sign-aware). Pip value + contract
@@ -178,40 +143,18 @@ impl Position {
         let Some(sl) = self.sl else {
             return false;
         };
-        let stop_dist = (self.entry_price - sl).abs();
-        if !stop_dist.is_finite() || stop_dist <= 0.0 {
-            return false;
-        }
-        let trigger = policy.be_trigger_r * stop_dist;
-        let lock = policy.min_lock_pips * policy.pip_size;
-        let candidate = match self.dir {
-            Direction::Long => {
-                if (bar.h - self.entry_price) < trigger {
-                    return false;
-                }
-                (bar.h - policy.stop_multiplier * stop_dist).max(self.entry_price + lock)
-            }
-            Direction::Short => {
-                if (self.entry_price - bar.l) < trigger {
-                    return false;
-                }
-                (bar.l + policy.stop_multiplier * stop_dist).min(self.entry_price - lock)
-            }
-            Direction::Flat => return false,
+        let direction = match self.dir {
+            Direction::Long => 1,
+            Direction::Short => -1,
+            Direction::Flat => 0,
         };
-        if !candidate.is_finite() {
+        let Some(candidate) =
+            policy.next_stop_price(self.entry_price, sl, direction, bar.h, bar.l, self.trail_px)
+        else {
             return false;
-        }
-        let better = match (self.trail_px, self.dir) {
-            (None, _) => true,
-            (Some(prev), Direction::Long) => candidate > prev,
-            (Some(prev), Direction::Short) => candidate < prev,
-            (Some(_), Direction::Flat) => false,
         };
-        if better {
-            self.trail_px = Some(candidate);
-        }
-        better
+        self.trail_px = Some(candidate);
+        true
     }
 }
 

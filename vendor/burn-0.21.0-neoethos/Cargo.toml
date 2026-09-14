@@ -1,0 +1,43 @@
+[package]
+name = "burn"
+version = "0.21.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+description = "NeoEthos narrow Burn facade without the retired WGPU/Vulkan backend family."
+documentation = "https://docs.rs/burn"
+repository = "https://github.com/tracel-ai/burn"
+resolver = "2"
+
+[features]
+default = [
+    "std",
+    "burn-core/default",
+    "burn-autodiff?/default",
+    "burn-nn/default",
+    "burn-optim/default",
+]
+autodiff = ["dep:burn-autodiff"]
+std = [
+    "burn-core/std",
+    "burn-autodiff?/std",
+    "burn-nn/std",
+    "burn-optim/std",
+]
+tracing = [
+    "burn-core/tracing",
+    "burn-autodiff?/tracing",
+    "burn-nn/tracing",
+    "burn-optim/tracing",
+]
+
+[dependencies]
+burn-autodiff = { version = "0.21.0", optional = true, default-features = false }
+burn-core = { version = "0.21.0", default-features = false }
+burn-nn = { version = "0.21.0", default-features = false }
+burn-optim = { version = "0.21.0", default-features = false }
+burn-std = { version = "0.21.0", default-features = false }
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+invalid_html_tags = "deny"

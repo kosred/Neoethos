@@ -23,12 +23,10 @@ class Stage1WorkflowContractTests(unittest.TestCase):
         cls.compact = " ".join(cls.source.replace("\\\n", " ").split())
         cls.cuda_source = CUDA_WORKFLOW.read_text(encoding="utf-8")
 
-    def test_direct_probe_step_runs_the_complete_gpu_native_suite(self) -> None:
-        self.assertIn(
-            "cargo test -p neoethos-search --features gpu-vulkan "
-            "gpu_native:: -- --nocapture",
-            self.compact,
-        )
+    def test_stage1_workflow_does_not_restore_retired_gpu_backends(self) -> None:
+        self.assertNotIn("gpu-vulkan", self.source)
+        self.assertNotIn("gpu-wgpu", self.source)
+        self.assertNotIn("gpu-rocm", self.source)
 
     def test_workflow_does_not_hide_backend_failures_by_log_substring(self) -> None:
         self.assertNotIn("requested_backends: Backends", self.source)

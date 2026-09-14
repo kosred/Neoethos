@@ -10,10 +10,12 @@ use super::regime_detection::{
 };
 use crate::Ohlcv;
 use neoethos_gpu_cuda::resident_feature_store_v3::{
-    ResidentFeatureColumnBindingV3, ResidentFeatureStoreAssemblerV3,
+    ResidentFeatureColumnBindingV3, ResidentFeatureScreeningErrorV2,
+    ResidentFeatureScreeningPassV2, ResidentFeatureStoreAssemblerV3,
     ResidentFeatureStoreCudaErrorV3,
 };
 use neoethos_gpu_cuda::resident_regime_v3::ResidentRegimeRuntimeReceiptV3;
+use neoethos_gpu_cuda::resident_robust_normalization_v2::ResidentRobustNormalizationPlanV2;
 use sha2::{Digest, Sha256};
 
 const RESIDENT_REGIME_INPUT_AUTHORITY_V3: &str =
@@ -57,6 +59,16 @@ impl PreparedResidentRegimeInputV3 {
     ) -> Result<ResidentRegimeRuntimeReceiptV3, ResidentFeatureStoreCudaErrorV3> {
         let (_row_count, scale_anchor, _input_identity_sha256) = self.consume();
         assembler.append_resident_regime_v3(bindings, scale_anchor)
+    }
+
+    pub(crate) fn score_to_screening_v2(
+        self,
+        screening: &mut ResidentFeatureScreeningPassV2,
+        bindings: Vec<ResidentFeatureColumnBindingV3>,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> Result<ResidentRegimeRuntimeReceiptV3, ResidentFeatureScreeningErrorV2> {
+        let (_row_count, scale_anchor, _input_identity_sha256) = self.consume();
+        screening.score_resident_regime_v3(bindings, scale_anchor, normalization_template)
     }
 }
 

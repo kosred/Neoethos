@@ -80,7 +80,7 @@ fn sealed_store_is_consumed_once_only_after_exact_identity_validation() {
         &validation_and_bind,
         &[
             "sealed_store: SealedGpuResidentFeatureStoreV3",
-            "CanonicalSearchArtifactScopeV2",
+            "CanonicalGpuResidentSearchArtifactScopeV3",
             "admission_identity",
             "feature_plan",
             "normalization",
@@ -137,7 +137,7 @@ fn data_seal_owns_the_only_transition_to_an_admitted_stream_import() {
     let consume = section(
         &data,
         "pub fn into_resident_feature_store_import_v3(",
-        "\n}",
+        "\n    }",
     );
     require_all(
         consume,
@@ -288,7 +288,12 @@ fn standalone_native_run_owns_session_and_shape_without_a_host_v1_parent() {
     let evidence = read_or_empty("src/population_execution_evidence_v1.rs");
     let run = section(
         &search,
-        "pub(crate) struct StrictResidentPopulationExecutionRunV3 {",
+        "pub struct StrictResidentPopulationExecutionRunV3 {",
+        "\n}",
+    );
+    let host_v1_run = section(
+        &evidence,
+        "pub(crate) struct ExactPopulationExecutionRunV1<'a> {",
         "\n}",
     );
 
@@ -301,7 +306,7 @@ fn standalone_native_run_owns_session_and_shape_without_a_host_v1_parent() {
         ],
     );
     require_none(
-        &evidence,
+        host_v1_run,
         &[
             "resident_feature_store_session_v3",
             "parent_row_count",

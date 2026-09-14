@@ -57,6 +57,11 @@
 #include <cfloat>
 #include <cstdint>
 
+// M_PI is not standard C++; preserve binary64 pi on MSVC as well.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846264338327950288
+#endif
+
 #define PR_MODE_RSX      0
 #define PR_MODE_REGULAR  1
 #define PR_MODE_SLOW     2

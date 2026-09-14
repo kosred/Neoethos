@@ -143,8 +143,9 @@ pub(crate) struct ExactResidentDatasetAuthorityDeriveRequestV1<'a> {
 /// resident accelerator session is allowed to consume.
 ///
 /// There is intentionally no deserializer and no public constructor. Search
-/// seals this value from the already-validated CanonicalSearch V2 scope and
-/// concrete arrays; callers cannot promote a scalar cache key or supplied hash
+/// seals this value from a validated CPU scope and concrete arrays, or from
+/// the distinct V3 resident scope and its genuine immutable owner. The two
+/// parent hash domains cannot alias. Callers cannot promote supplied hashes
 /// into residency authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ExactResidentDatasetAuthorityV1 {
@@ -287,6 +288,7 @@ fn hash_optional_session_spread(hasher: &mut ExactHasherV1, profile: Option<Sess
 
 fn hash_settings(hasher: &mut ExactHasherV1, settings: &BacktestSettings) {
     let BacktestSettings {
+        initial_equity_override: _,
         sl_pips,
         tp_pips,
         max_hold_bars,
@@ -315,6 +317,9 @@ fn hash_settings(hasher: &mut ExactHasherV1, settings: &BacktestSettings) {
         adaptive_rr,
     } = settings;
 
+    // Bind the effective account money, not merely the optional override tag.
+    // Search installs a per-run value; standalone defaults are resolved here.
+    hasher.f64(settings.initial_equity());
     hasher.f64(*sl_pips);
     hasher.f64(*tp_pips);
     hasher.u64(*max_hold_bars as u64);
@@ -620,4 +625,232 @@ pub(crate) fn derive_exact_resident_dataset_authority_v1(
         feature_count: request.parent.feature_count,
         view,
     })
+}
+
+/// The original Data owner, not a supplied parent hash or a fabricated CPU
+/// receipt. This seal is constructed once and checked cheaply at every view.
+#[cfg(all(feature = "gpu-cuda", any(test, target_os = "linux")))]
+pub(crate) struct SealedExactResidentCompactParentV3 {
+    parent: SealedExactResidentDatasetParentV1,
+    owner: ResidentCompactOwnerIdentityV3,
+}
+
+#[cfg(all(feature = "gpu-cuda", any(test, target_os = "linux")))]
+#[derive(PartialEq, Eq)]
+struct ResidentCompactOwnerIdentityV3 {
+    rows: usize,
+    columns: usize,
+    admission: [u8; 32],
+    content: [u8; 32],
+    context: [u8; 32],
+    retirement: [u8; 32],
+    workspace: [u8; 32],
+    ordinal: u32,
+}
+
+#[cfg(all(feature = "gpu-cuda", any(test, target_os = "linux")))]
+impl ResidentCompactOwnerIdentityV3 {
+    fn capture(
+        session: &neoethos_gpu_cuda::resident_feature_store_v3::ResidentPopulationSessionV3,
+    ) -> anyhow::Result<Self> {
+        let limits = session
+            .data_population_limits()
+            .ok_or_else(|| anyhow::anyhow!("retained compact parent has no workspace authority"))?;
+        let owner = Self {
+            rows: session.rows(),
+            columns: session.columns(),
+            admission: session.admission_identity_sha256(),
+            content: session.canonical_content_merkle(),
+            context: session.device_identity().primary_context_process_token(),
+            retirement: session.data_transient_retirement_process_token(),
+            workspace: limits.workspace_plan_identity_sha256(),
+            ordinal: session.device_identity().ordinal(),
+        };
+        anyhow::ensure!(
+            owner.rows > 0
+                && owner.columns > 0
+                && [
+                    owner.admission,
+                    owner.content,
+                    owner.context,
+                    owner.retirement,
+                    owner.workspace
+                ]
+                .iter()
+                .all(|value| *value != [0; 32]),
+            "retained compact parent has incomplete immutable owner identity"
+        );
+        anyhow::ensure!(
+            u64::try_from(owner.rows)? == limits.parent_row_count()
+                && u64::try_from(owner.columns)? == limits.feature_count(),
+            "retained compact parent differs from its admitted workspace shape"
+        );
+        Ok(owner)
+    }
+}
+
+#[cfg(all(feature = "gpu-cuda", any(test, target_os = "linux")))]
+pub(crate) fn seal_exact_resident_compact_parent_v3(
+    scope: &crate::data_selection::CanonicalGpuResidentSearchArtifactScopeV3,
+    session: &neoethos_gpu_cuda::resident_feature_store_v3::ResidentPopulationSessionV3,
+) -> anyhow::Result<SealedExactResidentCompactParentV3> {
+    scope.validate()?;
+    let owner = ResidentCompactOwnerIdentityV3::capture(session)?;
+    let receipt = scope.receipt();
+    anyhow::ensure!(
+        receipt.row_count() == u64::try_from(owner.rows)?
+            && receipt.column_count() == u64::try_from(owner.columns)?
+            && receipt.feature_content_merkle_sha256() == hex_lower(&owner.content),
+        "retained compact Data owner differs from the actual native Search receipt"
+    );
+    let scope_identity = scope.identity_sha256()?;
+    let mut hash = ExactHasherV1::new(b"neoethos.search.retained-compact-parent.v3\0");
+    hash.string(&scope_identity);
+    hash.string(&receipt.identity_sha256()?);
+    hash.u64(u64::try_from(owner.rows)?);
+    hash.u64(u64::try_from(owner.columns)?);
+    hash.u64(u64::from(owner.ordinal));
+    for value in [
+        owner.admission,
+        owner.content,
+        owner.context,
+        owner.retirement,
+        owner.workspace,
+    ] {
+        hash.bytes(&value);
+    }
+    Ok(SealedExactResidentCompactParentV3 {
+        parent: SealedExactResidentDatasetParentV1 {
+            canonical_scope_identity_sha256: scope_identity,
+            parent_dataset_identity_sha256: hash.finish(),
+            parent_row_count: owner.rows,
+            feature_count: owner.columns,
+        },
+        owner,
+    })
+}
+
+#[cfg(all(feature = "gpu-cuda", any(test, target_os = "linux")))]
+impl SealedExactResidentCompactParentV3 {
+    pub(crate) fn validate_session_v3(
+        &self,
+        session: &neoethos_gpu_cuda::resident_feature_store_v3::ResidentPopulationSessionV3,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            ResidentCompactOwnerIdentityV3::capture(session)? == self.owner,
+            "retained compact evaluation names a different or stale Data owner"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn parent_v3(&self) -> &SealedExactResidentDatasetParentV1 {
+        &self.parent
+    }
+}
+
+#[cfg(all(feature = "gpu-cuda", any(test, target_os = "linux")))]
+pub(crate) fn bind_resident_adaptive_evaluation_v3(
+    authority: ExactResidentDatasetAuthorityV1,
+    request: &neoethos_gpu_cuda::ResidentAdaptiveBaseRequestV1,
+    token: &neoethos_gpu_cuda::ResidentAdaptiveBaseViewTokenV1,
+) -> anyhow::Result<ExactResidentDatasetAuthorityV1> {
+    anyhow::ensure!(
+        request.identity_sha256() == token.request_identity_sha256()
+            && token.resident_session_identity_sha256() != [0; 32]
+            && token.view_identity_sha256() != [0; 32]
+            && token.token_identity_sha256() != [0; 32],
+        "resident adaptive evaluation requires its genuine matching owner token"
+    );
+    Ok(bind_adaptive_identity_v3(
+        authority,
+        request.identity_sha256(),
+        token.token_identity_sha256(),
+    ))
+}
+
+#[cfg(any(test, all(feature = "gpu-cuda", target_os = "linux")))]
+fn bind_adaptive_identity_v3(
+    mut authority: ExactResidentDatasetAuthorityV1,
+    recipe: [u8; 32],
+    token: [u8; 32],
+) -> ExactResidentDatasetAuthorityV1 {
+    let mut evaluation = ExactHasherV1::new(b"neoethos.search.resident-adaptive-evaluation.v3\0");
+    evaluation.string(&authority.evaluation_binding_sha256);
+    evaluation.bytes(&recipe);
+    evaluation.bytes(&token);
+    authority.evaluation_binding_sha256 = evaluation.finish();
+    let mut identity = ExactHasherV1::new(AUTHORITY_HASH_DOMAIN_V1);
+    identity.u64(u64::from(authority.schema_version));
+    identity.string(&authority.canonical_scope_identity_sha256);
+    identity.string(&authority.parent_dataset_identity_sha256);
+    identity.string(&authority.view_identity_sha256);
+    identity.string(&authority.evaluation_binding_sha256);
+    authority.identity_sha256 = identity.finish();
+    authority
+}
+
+#[cfg(test)]
+mod account_equity_binding_tests {
+    use super::*;
+
+    fn policy_hash(settings: &BacktestSettings) -> String {
+        let mut hasher = ExactHasherV1::new(EVALUATION_HASH_DOMAIN_V1);
+        hash_settings(&mut hasher, settings);
+        hasher.finish()
+    }
+
+    #[test]
+    fn evaluation_identity_binds_the_effective_run_balance() {
+        let mut first = BacktestSettings::default();
+        first.initial_equity_override = Some(10_000.0);
+        let mut second = first.clone();
+        second.initial_equity_override = Some(25_000.0);
+        assert_ne!(policy_hash(&first), policy_hash(&second));
+        let implicit = BacktestSettings::default();
+        let mut explicit = implicit.clone();
+        explicit.initial_equity_override = Some(implicit.initial_equity());
+        assert_eq!(
+            policy_hash(&implicit),
+            policy_hash(&explicit),
+            "equal effective policies must not differ only by the optional-default tag"
+        );
+    }
+
+    #[test]
+    fn resident_adaptive_recipe_and_owner_token_change_the_evaluation_authority() {
+        // Pure identity regression; these test hashes are not an owner/token
+        // constructor and cannot authorize device execution.
+        let parent = SealedExactResidentDatasetParentV1 {
+            canonical_scope_identity_sha256: "scope".into(),
+            parent_dataset_identity_sha256: "parent".into(),
+            parent_row_count: 200,
+            feature_count: 2,
+        };
+        let settings = BacktestSettings::default();
+        let fixed = derive_exact_resident_dataset_authority_v1(
+            ExactResidentDatasetAuthorityDeriveRequestV1 {
+                parent: &parent,
+                settings: &settings,
+                view: ExactResidentDatasetViewRequestV1::ContiguousRange {
+                    start: 10,
+                    end: 180,
+                },
+            },
+        )
+        .unwrap();
+        let adaptive = bind_adaptive_identity_v3(fixed.clone(), [1; 32], [2; 32]);
+        let other_recipe = bind_adaptive_identity_v3(fixed.clone(), [3; 32], [2; 32]);
+        let other_owner = bind_adaptive_identity_v3(fixed.clone(), [1; 32], [4; 32]);
+        assert_ne!(
+            fixed.evaluation_binding_sha256(),
+            adaptive.evaluation_binding_sha256()
+        );
+        assert_ne!(fixed.identity_sha256(), adaptive.identity_sha256());
+        assert_ne!(adaptive.identity_sha256(), other_recipe.identity_sha256());
+        assert_ne!(adaptive.identity_sha256(), other_owner.identity_sha256());
+        assert_eq!(
+            fixed.view_identity_sha256(),
+            adaptive.view_identity_sha256()
+        );
+    }
 }

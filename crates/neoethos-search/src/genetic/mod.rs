@@ -56,8 +56,6 @@ pub use search_engine::{
     random_search, set_search_cancel, signals_and_confidence_for_gene_full,
     signals_and_confidence_for_gene_full_with_smc, signals_and_confidence_for_gene_with_config,
     signals_for_gene, signals_for_gene_full, signals_for_gene_full_with_smc,
-    validation_genes_population, validation_genes_population_gathered,
-    validation_genes_population_window,
 };
 pub(crate) use search_engine::{
     adaptive_pip_size, calendar_day_key_ms, evolve_search_with_progress_and_limits_exact,

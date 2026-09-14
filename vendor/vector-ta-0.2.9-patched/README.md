@@ -87,8 +87,10 @@ vector-ta = {version = "0.2.9", features = ["cuda-build-native"]}
 ```
 
 Notes:
-- `CUDA_ARCHS=120,89` builds exact `sm_120` and `sm_89` cubins. Without that
-  setting, every visible GPU architecture is detected and built.
+- `NEOETHOS_CUDA_BUILD_MODE=cross_release_explicit` together with
+  `NEOETHOS_CUDA_ARCHS=120,89` builds exact `sm_120` and `sm_89` cubins.
+  Without those settings, `host_auto` detects and builds every visible GPU
+  architecture.
 - A CUDA build requires both `nvcc` and `cuobjdump`. Every cubin is inspected
   before the generated registry is emitted, and runtime loading accepts only
   the current device's exact architecture.

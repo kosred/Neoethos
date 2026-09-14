@@ -41,6 +41,9 @@ fn htf_v3_device_availability_uses_a_device_safe_saturating_bound() {
         helper.contains("INT64_MAX - segment.fixed_period_ms"),
         "fixed availability must retain its explicit saturating int64 bound"
     );
+    assert!(cuda.contains("__device__ __forceinline__ bool nonnegative_difference_v3"));
+    assert!(cuda.contains("available_at_ms, segment.parent_open_ms[parent_row]"));
+    assert!(cuda.contains("age_ms > effective_max_age_ms"));
 }
 
 #[test]
@@ -303,7 +306,7 @@ fn htf_v3_native_abi_is_variable_width_and_owns_direct_parent_carriers() {
         "kStaleV3 = 4U",
         "canonical_nan_v3",
         "available_at_ms <= base_timestamp_ms",
-        "age_ms > segment.max_age_ms",
+        "age_ms > effective_max_age_ms",
         "source_validity <= kAlignmentMissingV3",
         "source_validity == kValidV3",
         "parent_open_ms[parent_row + 1U]",
@@ -375,7 +378,7 @@ fn htf_v3_launch_binds_shape_route_order_identity_and_exact_allocation_receipts(
         "producer_ready_event_count",
         "availability_rule",
         "fixed_open_plus_period_v1",
-        "next_direct_bar_open_v1",
+        "next_direct_bar_open_observed_span_expiry_v1",
         "forward_fill",
         "canonical_qnan_bits: 0x7ff8_0000_0000_0000",
     ] {
@@ -434,6 +437,7 @@ fn htf_v3_real_device_gate_covers_cross_parent_values_and_all_validity_codes() {
         "max_age_ms: 10",
         "fixed_period_ms: 0",
         "max_age_ms: -1",
+        "semantic_version: 4",
         "2_002.0_f64.to_bits()",
         "3_002.0_f64.to_bits()",
         "stream.synchronize()?",

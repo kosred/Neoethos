@@ -13,10 +13,17 @@ use super::errors::actionable_error;
 use super::state::AppApiState;
 use crate::app_services::supervisor;
 
-pub async fn status(State(_state): State<AppApiState>) -> Response {
+pub async fn status(State(state): State<AppApiState>) -> Response {
     let cfg = supervisor::load_config();
     let log = supervisor::recent_log(50);
-    Json(serde_json::json!({ "config": cfg, "log": log })).into_response()
+    let observation = supervisor::observation(&state).await;
+    Json(serde_json::json!({
+        "config": cfg,
+        "log": log,
+        "cycleRunning": supervisor::cycle_running(),
+        "observation": observation,
+    }))
+    .into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]

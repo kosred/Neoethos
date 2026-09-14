@@ -71,8 +71,8 @@ fn parse_open_api_envelope_tolerates_heartbeat_without_client_msg_id() {
     // neither `clientMsgId` nor `payload` populated. Before the
     // `#[serde(default)]` annotations on `CTraderOpenApiJsonMessage`
     // those frames blew up the WSS read loop with the generic
-    // "failed to parse cTrader JSON envelope" error and the wizard's
-    // account-discovery leg aborted on the first heartbeat that
+    // "failed to parse cTrader JSON envelope" error and account discovery
+    // aborted on the first heartbeat that
     // raced the application-auth response.
     let heartbeat = r#"{"payloadType":51}"#;
     let envelope = parse_open_api_envelope(heartbeat).expect("heartbeat must parse");
@@ -85,7 +85,7 @@ fn parse_open_api_envelope_tolerates_heartbeat_without_client_msg_id() {
 fn parse_open_api_envelope_error_includes_response_head_for_diagnosis() {
     // v0.4.13 — the error context now includes a 200-char head of
     // the offending body so a future schema drift is debuggable from
-    // the wizard's status surface alone (no extra logs required).
+    // the Broker Setup status surface alone (no extra logs required).
     let malformed = "this is not JSON at all";
     let err = parse_open_api_envelope(malformed).unwrap_err().to_string();
     assert!(err.contains("len=23"), "len missing from error: {err}");

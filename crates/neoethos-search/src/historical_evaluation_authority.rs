@@ -15,7 +15,9 @@ pub(crate) enum HistoricalEvaluationAuthorityV1 {
 pub(crate) fn require_historical_evaluation_authority_v1() -> Result<HistoricalEvaluationAuthorityV1>
 {
     if let Some(contract) = active_canonical_trendbar_research_execution_v3() {
-        contract.validate()?;
+        // Installation validates this owned, immutable snapshot before publishing
+        // it. Parallel workers only clone that Arc; re-decoding its full receipt
+        // here repeats identical work for every candidate and split.
         return Ok(HistoricalEvaluationAuthorityV1::CanonicalTrendbarResearch(
             contract,
         ));

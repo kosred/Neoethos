@@ -59,7 +59,7 @@ impl ComboShape {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdmissionPolicy {
     /// Fraction of a card's VRAM the planner may fill (headroom for the
-    /// wgpu/CUDA context, kernel scratch, and fragmentation).
+    /// CUDA context, kernel scratch, and fragmentation).
     pub vram_usable_fraction: f64,
     /// Fraction of available host RAM the planner may fill across **all**
     /// concurrent combos.
@@ -149,22 +149,11 @@ pub fn genes_per_card(device_vram_gb: f64, shape: ComboShape, policy: &Admission
     (usable / per_gene).floor().max(0.0) as usize
 }
 
-/// Conservative VRAM (GB) assumed for a GPU that exists but doesn't report its
-/// memory (common on consumer Vulkan/wgpu adapters, which surface 0). The
-/// worker's bounded pool + gene-chunking path can stream oversized populations,
-/// so the scheduler still needs the card COUNT to dispatch one combo per card.
-/// The assumed value is used only to expose that chunking is required; it must
-/// not be treated as measured dedicated VRAM.
-const ASSUMED_VRAM_GB: f64 = 8.0;
-
 /// Per-GPU usable VRAM in GB, one entry per detected card.
 ///
-/// Prefer real reported VRAM (NVIDIA via nvidia-smi). When NO card reports its
-/// VRAM (consumer wgpu/Vulkan adapters surface 0) but GPUs DO exist, fall back
-/// to counting the devices with [`ASSUMED_VRAM_GB`] each — otherwise a consumer
-/// multi-GPU box would be seen as "0 cards" and run everything sequentially.
-/// The worker-side bounded pool and chunking keep the actual allocation bounded;
-/// this fallback is not a claim about dedicated memory capacity.
+/// Only devices with measured positive VRAM are admitted. A CUDA device whose
+/// memory probe failed cannot receive a defensible allocation budget and is
+/// therefore unavailable to this scheduler until the probe succeeds.
 fn gpu_device_vrams(hw: &HardwareProfile) -> Vec<f64> {
     let from_list: Vec<f64> = hw.gpu_mem_gb.iter().copied().filter(|m| *m > 0.0).collect();
     if !from_list.is_empty() {
@@ -179,10 +168,7 @@ fn gpu_device_vrams(hw: &HardwareProfile) -> Vec<f64> {
     if !from_accel.is_empty() {
         return from_accel;
     }
-    // No card reports VRAM. Count the devices that exist (by accelerator list or
-    // num_gpus) and assume a conservative size — never-OOM handles the fitting.
-    let device_count = hw.accelerator_devices.len().max(hw.num_gpus);
-    vec![ASSUMED_VRAM_GB; device_count]
+    Vec::new()
 }
 
 fn cpu_threads_per_worker(cores: usize, active_workers: usize) -> usize {
@@ -303,7 +289,7 @@ pub fn plan_combo(
 // A pure, hardware-free state machine that the CLI `schedule` command drives.
 // It owns the queue + a logical device pool + RAM accounting + the heavy-vs-
 // light dispatch policy; the CLI maps logical card slots to real device ids
-// (NEOETHOS_BOT_SEARCH_EVAL_{WGPU,CUDA}_DEVICE) and does the actual
+// (`NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE`) and does the actual
 // `Command::spawn`. Keeping the policy here makes it unit-testable with no GPU.
 //
 // Logical card slots are `0..usable_card_count`. The CLI builds the list of
@@ -354,9 +340,9 @@ struct RunningItem {
 ///
 /// Multi-card scaling is **combo-level**: each combo runs on ONE card and many
 /// combos run concurrently, one per card, bounded by free cards + usable RAM.
-/// Intra-combo GPU sharding is disabled because CubeCL WGPU cannot safely drive
-/// the project's multiple device contexts concurrently in one process. The
-/// admission plan and dispatch contract therefore both assign one card.
+/// Intra-combo GPU sharding is disabled because the production worker contract
+/// pins one CUDA device per child process. The admission plan and dispatch
+/// contract therefore both assign one card.
 /// On a many-card, big-RAM box this fills every card with a different combo.
 ///
 /// Invariants:
@@ -481,26 +467,6 @@ impl WorkScheduler {
             self.free_cards.extend(done.card_ids);
             self.free_cards.sort_unstable();
             self.committed_ram_gb = (self.committed_ram_gb - done.ram_gb).max(0.0);
-        }
-    }
-
-    /// A dispatched combo failed (crash / GPU OOM). Free its resources and
-    /// requeue it for the **CPU lane** (no cards) at the back of the queue —
-    /// the belt-and-suspenders fallback behind the never-OOM math.
-    pub fn fail_and_requeue_cpu(&mut self, id: &str) {
-        if let Some(pos) = self.running.iter().position(|r| r.item.id == id) {
-            let done = self.running.remove(pos);
-            self.free_cards.extend(done.card_ids);
-            self.free_cards.sort_unstable();
-            self.committed_ram_gb = (self.committed_ram_gb - done.ram_gb).max(0.0);
-            let mut item = done.item;
-            item.plan.cards_per_combo = 0;
-            item.plan.genes_per_card = 0;
-            item.plan.fits_on_gpu = false;
-            item.plan
-                .notes
-                .push("requeued to CPU lane after GPU failure/OOM".to_string());
-            self.pending.push_back(item);
         }
     }
 }
@@ -674,11 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn consumer_wgpu_zero_vram_box_counts_cards_not_serialize() {
-        // Consumer Vulkan/wgpu adapters report 0 VRAM but the GPUs exist
-        // (num_gpus). never-OOM makes every combo fit any card, so the scheduler
-        // must COUNT them — otherwise a 2-GPU consumer box would run everything
-        // on "0 cards" sequentially (the bug this fixes).
+    fn zero_vram_devices_are_not_admitted_to_the_cuda_pool() {
         let combos = vec![
             mk_item("A", ComboClass::Light, 1, 1.0),
             mk_item("B", ComboClass::Light, 1, 1.0),
@@ -690,14 +652,14 @@ mod tests {
         );
         assert_eq!(
             sched.total_cards(),
-            2,
-            "two 0-VRAM GPUs must count as 2 cards"
+            0,
+            "devices without a measured VRAM budget must not be scheduled"
         );
         let started = sched.poll();
         assert_eq!(
             started.len(),
             2,
-            "both combos dispatched across the 2 cards"
+            "CPU-capable combos remain schedulable without inventing GPU capacity"
         );
         assert_eq!(sched.free_cards(), 0);
     }
@@ -776,28 +738,5 @@ mod tests {
         assert_eq!(started.len(), 1);
         assert!(started[0].card_ids.is_empty(), "CPU lane => no cards");
         assert_eq!(started[0].cpu_threads, 96);
-    }
-
-    #[test]
-    fn oom_requeue_moves_combo_to_cpu_lane() {
-        let combos = vec![mk_item("G", ComboClass::Light, 2, 10.0)];
-        let mut sched = WorkScheduler::new(
-            combos,
-            &hw(32, 128.0, &[48.0; 4]),
-            &AdmissionPolicy::default(),
-        );
-        let started = sched.poll();
-        assert_eq!(started.len(), 1);
-        assert_eq!(started[0].card_ids.len(), 1, "one card per combo");
-        // Simulate a GPU failure: requeue to the CPU lane (plan cards -> 0).
-        sched.fail_and_requeue_cpu("G");
-        assert_eq!(sched.free_cards(), 4, "card freed after failure");
-        let retry = sched.poll();
-        assert_eq!(retry.len(), 1);
-        assert!(
-            retry[0].card_ids.is_empty(),
-            "retried on CPU lane, no cards"
-        );
-        assert_eq!(sched.pending_len(), 0);
     }
 }

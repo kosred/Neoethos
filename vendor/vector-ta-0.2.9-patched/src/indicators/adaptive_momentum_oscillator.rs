@@ -283,18 +283,17 @@ fn prepare_input<'a>(
         return Err(AdaptiveMomentumOscillatorError::EmptyInputData);
     }
 
-    if data.iter().all(|value| value.is_nan()) {
-        return Err(AdaptiveMomentumOscillatorError::AllValuesNaN);
-    }
+    let first_valid = data
+        .iter()
+        .position(|value| !value.is_nan())
+        .ok_or(AdaptiveMomentumOscillatorError::AllValuesNaN)?;
 
     let length = input.get_length();
     let smoothing_length = input.get_smoothing_length();
     validate_params(length, smoothing_length)?;
 
-    // The creator's raw momentum begins with the history available on each
-    // bar. Only the linear-regression window controls the output warmup.
-    let valid = data.len();
-    let needed = smoothing_length;
+    let valid = data.len() - first_valid;
+    let needed = length + smoothing_length;
     if valid < needed {
         return Err(AdaptiveMomentumOscillatorError::NotEnoughValidData { needed, valid });
     }
@@ -312,6 +311,7 @@ struct AmoRawState {
     length: usize,
     ring: Vec<f64>,
     head: usize,
+    count: usize,
 }
 
 impl AmoRawState {
@@ -321,6 +321,7 @@ impl AmoRawState {
             length,
             ring: vec![f64::NAN; length],
             head: 0,
+            count: 0,
         }
     }
 
@@ -337,31 +338,40 @@ impl AmoRawState {
         if self.head == self.length {
             self.head = 0;
         }
+        if self.count < self.length {
+            self.count += 1;
+        }
     }
 
     #[inline(always)]
     fn update(&mut self, value: f64) -> f64 {
-        // Creator Pine initializes both locals to zero on every bar. A missing
-        // historical value turns `math.max` into `na`; all following equality
-        // tests are false, but the delta selected before that hole is retained.
-        let mut max_momentum: f64 = 0.0;
-        let mut selected_delta = 0.0;
-        for lag in 1..=self.length {
-            let past = self.history_value(lag);
-            let delta = value - past;
-            let absolute_momentum = delta.abs();
-            max_momentum = if max_momentum.is_nan() || absolute_momentum.is_nan() {
-                f64::NAN
-            } else {
-                max_momentum.max(absolute_momentum)
-            };
-            if max_momentum == absolute_momentum {
-                selected_delta = delta;
+        let out = if value.is_finite() && self.count >= self.length {
+            let mut best_abs = -1.0;
+            let mut best_delta = f64::NAN;
+            let mut valid = true;
+            for lag in 1..=self.length {
+                let past = self.history_value(lag);
+                if !past.is_finite() {
+                    valid = false;
+                    break;
+                }
+                let delta = value - past;
+                let abs_delta = delta.abs();
+                if abs_delta >= best_abs {
+                    best_abs = abs_delta;
+                    best_delta = delta;
+                }
             }
-        }
-
+            if valid {
+                best_delta
+            } else {
+                f64::NAN
+            }
+        } else {
+            f64::NAN
+        };
         self.push(value);
-        selected_delta
+        out
     }
 }
 
@@ -394,19 +404,15 @@ impl AdaptiveAverageState {
 
     #[inline(always)]
     fn push_change(&mut self, change: f64) {
-        // Pine `math.sum` ignores `na` observations and waits until it owns the
-        // requested number of non-na observations.
-        if change.is_nan() {
-            return;
-        }
+        let normalized = if change.is_finite() { change } else { 0.0 };
         if self.count < self.length {
-            self.change_ring[self.head] = change;
-            self.change_sum += change;
+            self.change_ring[self.head] = normalized;
+            self.change_sum += normalized;
             self.count += 1;
         } else {
             let old = self.change_ring[self.head];
-            self.change_ring[self.head] = change;
-            self.change_sum += change - old;
+            self.change_ring[self.head] = normalized;
+            self.change_sum += normalized - old;
         }
         self.head += 1;
         if self.head == self.length {
@@ -415,29 +421,29 @@ impl AdaptiveAverageState {
     }
 
     #[inline(always)]
-    fn update(&mut self, input: f64) -> f64 {
-        let change = if self.have_prev {
+    fn update(&mut self, input: f64) -> Option<f64> {
+        let change = if self.have_prev && input.is_finite() && self.prev.is_finite() {
             (input - self.prev).abs()
         } else {
-            f64::NAN
+            0.0
         };
         self.push_change(change);
-
-        let rolling_sum = if self.count == self.length {
-            self.change_sum
-        } else {
-            f64::NAN
-        };
-        let efficiency_ratio = input.abs() / rolling_sum;
-        let delta = efficiency_ratio * (input - self.value);
-        if !delta.is_nan() {
-            self.value += delta;
+        if input.is_finite() && self.change_sum > 0.0 {
+            let efficiency_ratio = input.abs() / self.change_sum;
+            let delta = efficiency_ratio * (input - self.value);
+            if delta.is_finite() {
+                self.value += delta;
+            }
         }
 
         self.prev = input;
         self.have_prev = true;
 
-        self.value
+        if input.is_finite() {
+            Some(self.value)
+        } else {
+            None
+        }
     }
 }
 
@@ -469,11 +475,15 @@ impl AdaptiveMomentumOscillatorCore {
     }
 
     #[inline(always)]
-    fn update(&mut self, value: f64) -> (f64, f64) {
+    fn update(&mut self, value: f64) -> Option<(f64, f64)> {
         let raw = self.raw.update(value);
         let amo = self.smoothing.update(raw).unwrap_or(f64::NAN);
         let ama = self.average.update(amo);
-        (amo, ama)
+        if amo.is_finite() {
+            Some((amo, ama.unwrap_or(f64::NAN)))
+        } else {
+            None
+        }
     }
 }
 
@@ -504,9 +514,10 @@ fn compute_into_slices(
     })?;
 
     for idx in 0..prepared.len {
-        let (amo, ama) = core.update(prepared.data[idx]);
-        amo_out[idx] = amo;
-        ama_out[idx] = ama;
+        if let Some((amo, ama)) = core.update(prepared.data[idx]) {
+            amo_out[idx] = amo;
+            ama_out[idx] = ama;
+        }
     }
 
     Ok(())
@@ -527,11 +538,12 @@ fn compute_output_into_slice(
     })?;
 
     for idx in 0..prepared.len {
-        let (amo, ama) = core.update(prepared.data[idx]);
-        out[idx] = match field {
-            AdaptiveMomentumOscillatorOutputField::Amo => amo,
-            AdaptiveMomentumOscillatorOutputField::Ama => ama,
-        };
+        if let Some((amo, ama)) = core.update(prepared.data[idx]) {
+            out[idx] = match field {
+                AdaptiveMomentumOscillatorOutputField::Amo => amo,
+                AdaptiveMomentumOscillatorOutputField::Ama => ama,
+            };
+        }
     }
 
     Ok(())
@@ -604,7 +616,7 @@ impl AdaptiveMomentumOscillatorStream {
 
     #[inline(always)]
     pub fn update(&mut self, value: f64) -> Option<(f64, f64)> {
-        Some(self.core.update(value))
+        self.core.update(value)
     }
 
     pub fn reset(&mut self) {
@@ -1032,27 +1044,27 @@ mod tests {
         let mut amo = vec![f64::NAN; data.len()];
         let mut ama = vec![f64::NAN; data.len()];
 
-        let mut raw = vec![0.0; data.len()];
+        let mut raw = vec![f64::NAN; data.len()];
         for idx in 0..data.len() {
             let value = data[idx];
-            let mut max_momentum: f64 = 0.0;
-            let mut selected_delta = 0.0;
-            for lag in 1..=length {
-                let past = idx
-                    .checked_sub(lag)
-                    .map_or(f64::NAN, |history| data[history]);
-                let delta = value - past;
-                let absolute_momentum = delta.abs();
-                max_momentum = if max_momentum.is_nan() || absolute_momentum.is_nan() {
-                    f64::NAN
-                } else {
-                    max_momentum.max(absolute_momentum)
-                };
-                if max_momentum == absolute_momentum {
-                    selected_delta = delta;
+            if value.is_finite() && idx >= length {
+                let mut best_abs = -1.0;
+                let mut best_delta = f64::NAN;
+                for lag in 1..=length {
+                    let past = data[idx - lag];
+                    if !past.is_finite() {
+                        best_delta = f64::NAN;
+                        break;
+                    }
+                    let delta = value - past;
+                    let absolute_momentum = delta.abs();
+                    if absolute_momentum >= best_abs {
+                        best_abs = absolute_momentum;
+                        best_delta = delta;
+                    }
                 }
+                raw[idx] = best_delta;
             }
-            raw[idx] = selected_delta;
         }
 
         if smoothing_length > 0 {
@@ -1093,36 +1105,33 @@ mod tests {
 
         for idx in 0..data.len() {
             let current = amo[idx];
-            let change = if have_prev {
+            let change = if have_prev && current.is_finite() && prev.is_finite() {
                 (current - prev).abs()
             } else {
-                f64::NAN
+                0.0
             };
 
-            if !change.is_nan() {
-                if count < length {
-                    change_ring[head] = change;
-                    change_sum += change;
-                    count += 1;
-                } else {
-                    let old = change_ring[head];
-                    change_ring[head] = change;
-                    change_sum += change - old;
-                }
-                head = (head + 1) % length;
-            }
-
-            let rolling_sum = if count == length {
-                change_sum
+            if count < length {
+                change_ring[head] = change;
+                change_sum += change;
+                count += 1;
             } else {
-                f64::NAN
-            };
-            let efficiency_ratio = current.abs() / rolling_sum;
-            let delta = efficiency_ratio * (current - ama_state);
-            if !delta.is_nan() {
-                ama_state += delta;
+                let old = change_ring[head];
+                change_ring[head] = change;
+                change_sum += change - old;
             }
-            ama[idx] = ama_state;
+            head = (head + 1) % length;
+
+            if current.is_finite() && change_sum > 0.0 {
+                let efficiency_ratio = current.abs() / change_sum;
+                let delta = efficiency_ratio * (current - ama_state);
+                if delta.is_finite() {
+                    ama_state += delta;
+                }
+            }
+            if current.is_finite() {
+                ama[idx] = ama_state;
+            }
 
             prev = current;
             have_prev = true;
@@ -1215,12 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn creator_pine_available_history_and_interior_na_are_exact() -> Result<(), Box<dyn StdError>> {
-        // Creator Pine, source lines 40-53 and 81-82:
-        // - raw momentum starts from 0 and keeps the best delta selected before a
-        //   missing historical lag poisons `math.max`;
-        // - `ta.linreg(raw, 2, 0)` therefore emits at row 1, not row length+1;
-        // - `math.sum` waits for three non-na changes, so AMA remains its 0 seed.
+    fn complete_finite_history_and_interior_gap_are_explicit() -> Result<(), Box<dyn StdError>> {
         let data = [
             1.0,
             2.0,
@@ -1241,33 +1245,37 @@ mod tests {
             },
         ))?;
 
-        assert!(output.amo[0].is_nan(), "ta.linreg needs two raw values");
-        for (row, expected) in [
-            (1, 1.0f64),
-            (2, 3.0),
-            (3, 7.0),
-            (4, 0.0),
-            (5, 0.0),
-            (6, 32.0),
-            (7, 96.0),
-        ] {
-            assert_eq!(
-                output.amo[row].to_bits(),
-                expected.to_bits(),
-                "creator Pine AMO mismatch at row {row}"
-            );
-        }
-        for row in 0..=5 {
-            assert_eq!(
-                output.ama[row].to_bits(),
-                0.0f64.to_bits(),
-                "creator Pine AMA must retain its zero seed at row {row}"
-            );
-        }
+        assert!(output.amo[..9].iter().all(|value| value.is_nan()));
         assert_eq!(
-            output.ama[6].to_bits(),
-            (1024.0f64 / 39.0).to_bits(),
-            "creator Pine AMA must use the first complete three-change math.sum window"
+            output.amo[9].to_bits(),
+            448.0f64.to_bits(),
+            "AMO must resume only after a complete finite raw and smoothing window"
+        );
+        assert!(output.ama[..9].iter().all(|value| value.is_nan()));
+        assert_eq!(output.ama[9].to_bits(), 0.0f64.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn flat_input_never_emits_infinity() -> Result<(), Box<dyn StdError>> {
+        let data = vec![1.0; 64];
+        let output = adaptive_momentum_oscillator(&AdaptiveMomentumOscillatorInput::from_slice(
+            &data,
+            AdaptiveMomentumOscillatorParams::default(),
+        ))?;
+        assert!(
+            output
+                .amo
+                .iter()
+                .chain(&output.ama)
+                .all(|value| !value.is_infinite())
+        );
+        assert!(
+            output
+                .ama
+                .iter()
+                .filter(|value| value.is_finite())
+                .all(|value| *value == 0.0)
         );
         Ok(())
     }

@@ -101,14 +101,33 @@ fn has_f64_resident_output_route(indicator_id: &str, output_id: &str) -> bool {
         .is_some_and(|output| output.id == output_id)
 }
 
+// Follow the public frozen-plan wrapper to the execution authority. Checking
+// only the wrapper would miss both a disconnected executor and allocations or
+// fallback introduced around the delegate after cancellation was factored out.
+fn controlled_classic_execution_body(hpc: &str) -> &str {
+    let wrapper = function_body(
+        hpc,
+        "pub fn compute_classic_ta_columns_sized_report_with_run_plan(",
+    );
+    let compact: String = wrapper.split_whitespace().collect();
+    assert_eq!(
+        compact,
+        "compute_classic_ta_columns_sized_report_with_control(ohlcv,run_plan,\
+         &FeatureBuildControl::default(),)",
+        "the public frozen-plan wrapper must return exactly one controlled execution \
+         of the same frame and plan, without re-admission, allocation or fallback"
+    );
+    function_body(
+        hpc,
+        "fn compute_classic_ta_columns_sized_report_with_control(",
+    )
+}
+
 #[test]
 fn gpu_only_enters_one_exact_cuda_executor_instead_of_the_cpu_body() {
     let hpc = source("src/core/hpc_ta.rs");
     let wrapper = function_body(&hpc, "pub fn compute_classic_ta_columns_sized_report(");
-    let entry = function_body(
-        &hpc,
-        "pub fn compute_classic_ta_columns_sized_report_with_run_plan(",
-    );
+    let entry = controlled_classic_execution_body(&hpc);
 
     assert!(
         wrapper.contains("prepare_classic_ta_run_plan")
@@ -121,19 +140,57 @@ fn gpu_only_enters_one_exact_cuda_executor_instead_of_the_cpu_body() {
         !entry.contains("GpuOnly preflight rejected before any CPU or CUDA work"),
         "the current unconditional rejection is not a production CUDA route"
     );
+    let gpu_branch = function_body(
+        entry,
+        "#[cfg(feature = \"gpu-cuda\")]\n    if policy == IndicatorComputePolicy::GpuOnly",
+    );
+    assert!(
+        gpu_branch
+            .contains("return crate::core::classic_cuda_plan::execute_gpu_only_classic_plan("),
+        "GpuOnly must return the exact executor's result, including failures, before CPU work"
+    );
+    assert_eq!(
+        entry.matches("execute_gpu_only_classic_plan(").count(),
+        1,
+        "one frame must enter exactly one strict CUDA executor"
+    );
+    for forbidden in [
+        "Candles::new",
+        "dispatch_indicator_outputs",
+        "compute_multi_period_columns",
+        "Kernel::Auto",
+        "IndicatorComputePolicy::CpuOnly",
+        ".or_else(",
+        ".unwrap_or",
+    ] {
+        assert!(
+            !gpu_branch.contains(forbidden),
+            "the GpuOnly branch contains a CPU/fallback escape `{forbidden}`"
+        );
+    }
 }
 
 #[test]
 fn one_admission_decision_precedes_both_cuda_and_cpu_allocation() {
     let hpc = source("src/core/hpc_ta.rs");
     let prepare = function_body(&hpc, "pub fn prepare_classic_ta_run_plan(");
-    let wrapper = function_body(&hpc, "pub fn compute_classic_ta_columns_sized_report(");
-    let entry = function_body(
+    let prepare_with_working_set = function_body(
         &hpc,
-        "pub fn compute_classic_ta_columns_sized_report_with_run_plan(",
+        "pub(crate) fn prepare_classic_ta_run_plan_with_working_set(",
+    );
+    let wrapper = function_body(&hpc, "pub fn compute_classic_ta_columns_sized_report(");
+    let entry = controlled_classic_execution_body(&hpc);
+    assert_eq!(
+        prepare
+            .matches("prepare_classic_ta_run_plan_with_working_set")
+            .count(),
+        1,
+        "the public planner must delegate exactly once to the working-set-aware authority"
     );
     assert_eq!(
-        prepare.matches("build_classic_ta_admission_plan").count(),
+        prepare_with_working_set
+            .matches("build_classic_ta_admission_plan")
+            .count(),
         1,
         "production must probe RAM/admit the vocabulary exactly once"
     );
@@ -146,28 +203,42 @@ fn one_admission_decision_precedes_both_cuda_and_cpu_allocation() {
         !entry.contains("build_classic_ta_admission_plan"),
         "execution through a frozen run plan must not probe/admit again"
     );
-    let admission = prepare
+    let admission = prepare_with_working_set
         .find("build_classic_ta_admission_plan")
         .expect("missing shared admission decision");
-    let cuda_preflight = prepare
+    let cuda_preflight = prepare_with_working_set
         .find("build_exact_classic_cuda_plan")
         .expect("missing exact CUDA preflight plan");
     assert!(
         admission < cuda_preflight,
         "admission must be finalized before exact CUDA preflight"
     );
+    let frame_bound = entry
+        .find("n <= run_plan.admission.budget_rows")
+        .expect("execution did not enforce the frozen frame admission bound");
     let frozen_admission = entry
         .find("let admission = run_plan.admission.clone()")
         .expect("execution did not consume the frozen admission");
     let cuda = entry
         .find("build_exact_classic_cuda_plan")
         .expect("missing exact CUDA execution plan");
+    let cuda_return = entry
+        .find("return crate::core::classic_cuda_plan::execute_gpu_only_classic_plan(")
+        .expect("missing strict CUDA return before the CPU lane");
+    let cpu_copy = entry
+        .find("let timestamps = ohlcv.timestamp.clone()")
+        .expect("missing first CPU input-copy boundary");
     let cpu_allocation = entry
         .find("Candles::new")
         .expect("missing CPU Candles boundary");
     assert!(
-        frozen_admission < cuda && frozen_admission < cpu_allocation,
-        "admission must be finalized before either execution lane allocates"
+        frame_bound < frozen_admission
+            && frozen_admission < cuda
+            && cuda < cuda_return
+            && cuda_return < cpu_copy
+            && cpu_copy < cpu_allocation,
+        "the frozen bound/admission must precede CUDA planning; GpuOnly must return \
+         before even the CPU input copies or Candles allocation"
     );
 }
 

@@ -67,7 +67,7 @@ Notes from real-world experience:
   `rust-toolchain.toml` selects the pinned nightly automatically. On Windows use
   the **MSVC** host (`x86_64-pc-windows-msvc`), not GNU.
 - **Node.js 20+** (Node 20.19+ or 22.12+ — required by Vite 8) and npm. [nodejs.org](https://nodejs.org/) or nvm.
-- **CMake 3.28+** and a **C/C++ compiler** — several native crates (e.g. `lightgbm3-sys`, `polars`) build C/C++ at compile time.
+- **CMake 3.28+** and a **C/C++ compiler** — several native crates (e.g. `lightgbm3-sys`, `xgboost_lib-sys`) build C/C++ at compile time.
 - **Git**.
 
 ### Platform-specific system dependencies

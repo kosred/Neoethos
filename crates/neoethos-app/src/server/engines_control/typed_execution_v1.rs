@@ -9,24 +9,32 @@ use std::sync::Arc;
 
 use neoethos_core::Settings;
 use neoethos_data::{
-    CanonicalTimeframe, ExactDatasetGenerationConflict, SelectedDatasetGenerationV1,
+    CanonicalDatasetSeriesReceiptV1, CanonicalTimeframe, ExactDatasetGenerationConflict,
+    SelectedDatasetGenerationV1,
 };
+#[cfg(test)]
+use neoethos_search::DiscoveryConfig;
 use neoethos_search::{
-    DiscoveryConfig, ProcessExecutionBusyV1, ProcessExecutionKindV1, ProcessExecutionLeaseV1,
-    PropFirmRiskRules, try_acquire_process_execution_lease_v1,
+    ProcessExecutionBusyV1, ProcessExecutionKindV1, ProcessExecutionLeaseV1, PropFirmRiskRules,
+    try_acquire_process_execution_lease_v1,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::app_services::ServiceEvent;
 use crate::app_services::discovery::{
-    DirectTimeframeAcquisitionRequired, DiscoveryRequest, pin_current_discovery_input,
-    pin_discovery_input, resolve_unique_background_dataset_identity, start_discovery_job,
+    DirectTimeframeAcquisitionRequired, DiscoveryRequest, DiscoverySettingsSource,
+    pin_current_discovery_input, pin_discovery_input, resolve_unique_background_dataset_identity,
+    start_discovery_job,
 };
-use crate::app_services::jobs::{CancellationFlag, JobKind, JobReport, JobSnapshot, JobState};
-use crate::app_services::training::{TrainingRequest, start_training_job};
+use crate::app_services::jobs::{CancellationFlag, JobKind, JobSnapshot, JobState};
+use crate::app_services::training::{
+    TrainingRequest, handoff, start_discovery_training_job, start_strategy_research_job,
+    start_training_job,
+};
 use crate::server::state::AppApiState;
 
+#[cfg(test)]
 use super::EngineRunState;
 
 const MAX_TYPED_EXECUTION_DETAIL_BYTES_V1: usize = 1_024;
@@ -34,108 +42,74 @@ const MAX_TYPED_EXECUTION_DETAIL_BYTES_V1: usize = 1_024;
 type TypedLegacyAdmissionSenderV1 =
     oneshot::Sender<Result<TypedLegacyExecutionAdmissionV1, TypedLegacyExecutionAdmissionErrorV1>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TypedDiscoveryGenerationOverrideV1 {
-    Exact(usize),
-    Floor(usize),
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TypedDiscoveryOverridesV1 {
-    population: Option<usize>,
-    generation_policy: Option<TypedDiscoveryGenerationOverrideV1>,
-    max_indicators: Option<usize>,
-    max_rows: Option<usize>,
-    target_candidates: Option<usize>,
-    portfolio_size: Option<usize>,
-}
-
-impl TypedDiscoveryOverridesV1 {
-    pub(crate) fn checked_new(
-        population: Option<usize>,
-        generation_policy: Option<TypedDiscoveryGenerationOverrideV1>,
-        max_indicators: Option<usize>,
-        max_rows: Option<usize>,
-        target_candidates: Option<usize>,
-        portfolio_size: Option<usize>,
-    ) -> Result<Self, &'static str> {
-        let values = [
-            population,
-            max_indicators,
-            max_rows,
-            target_candidates,
-            portfolio_size,
-        ];
-        if values.into_iter().flatten().any(|value| value == 0) {
-            return Err("typed Discovery overrides must be nonzero when supplied");
-        }
-        if generation_policy.is_some_and(|policy| match policy {
-            TypedDiscoveryGenerationOverrideV1::Exact(value)
-            | TypedDiscoveryGenerationOverrideV1::Floor(value) => value == 0,
-        }) {
-            return Err("typed Discovery generation override must be nonzero");
-        }
-        Ok(Self {
-            population,
-            generation_policy,
-            max_indicators,
-            max_rows,
-            target_candidates,
-            portfolio_size,
-        })
-    }
-
-    pub(crate) fn exact_generations(generations: usize) -> Result<Self, &'static str> {
-        Self::checked_new(
-            None,
-            Some(TypedDiscoveryGenerationOverrideV1::Exact(generations)),
-            None,
-            None,
-            None,
-            None,
-        )
-    }
-
-    pub(crate) fn minimum_generations(generations: usize) -> Result<Self, &'static str> {
-        Self::checked_new(
-            None,
-            Some(TypedDiscoveryGenerationOverrideV1::Floor(generations)),
-            None,
-            None,
-            None,
-            None,
-        )
-    }
-
-    fn apply(&self, config: &mut DiscoveryConfig) {
-        if let Some(population) = self.population {
-            config.population = population;
-        }
-        if let Some(policy) = self.generation_policy {
-            config.generations = match policy {
-                TypedDiscoveryGenerationOverrideV1::Exact(value) => value,
-                TypedDiscoveryGenerationOverrideV1::Floor(value) => config.generations.max(value),
-            };
-        }
-        if let Some(max_indicators) = self.max_indicators {
-            config.max_indicators = max_indicators;
-        }
-        if let Some(max_rows) = self.max_rows {
-            config.max_rows = max_rows;
-        }
-        if let Some(target_candidates) = self.target_candidates {
-            config.candidate_count = target_candidates;
-        }
-        if let Some(portfolio_size) = self.portfolio_size {
-            config.portfolio_size = portfolio_size;
-        }
-    }
-}
+pub(crate) use crate::app_services::discovery::{
+    TypedDiscoveryGenerationOverrideV1, TypedDiscoveryOverridesV1,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TypedHigherTimeframePolicyV1 {
     Configured,
     Exact(Vec<CanonicalTimeframe>),
+}
+
+impl TypedHigherTimeframePolicyV1 {
+    fn resolve_for_discovery(
+        &self,
+        settings: &Settings,
+        base: CanonicalTimeframe,
+    ) -> Result<Vec<String>, TypedLegacyExecutionAdmissionErrorV1> {
+        let configured = matches!(self, Self::Configured);
+        let timeframes = match self {
+            TypedHigherTimeframePolicyV1::Configured => {
+                let system = &settings.system;
+                let active = if system.multi_resolution_enabled
+                    && !system.multi_resolution_timeframes.is_empty()
+                {
+                    &system.multi_resolution_timeframes
+                } else {
+                    &system.higher_timeframes
+                };
+                active
+                    .iter()
+                    .map(|raw| raw.trim().to_uppercase())
+                    .filter(|label| !label.is_empty())
+                    .map(|label| {
+                        label.parse::<CanonicalTimeframe>().map_err(|error| {
+                            TypedLegacyExecutionAdmissionErrorV1::BadRequest(format!(
+                                "invalid configured Discovery timeframe {label:?}: {error}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            Self::Exact(timeframes) => timeframes.clone(),
+        };
+        let mut higher = Vec::with_capacity(timeframes.len());
+        for timeframe in timeframes {
+            if timeframe <= base {
+                if configured {
+                    // The shared model-context resolver deliberately retains lower
+                    // resolutions. Discovery pins a strictly top-down input ladder;
+                    // do not change model context or silently rewrite exact API intent.
+                    tracing::info!(%base, %timeframe, "excluded non-higher configured timeframe from Discovery top-down context");
+                    continue;
+                }
+                return Err(TypedLegacyExecutionAdmissionErrorV1::BadRequest(format!(
+                    "higher timeframe {timeframe} must be strictly above base {base}"
+                )));
+            }
+            if higher.contains(&timeframe) {
+                return Err(TypedLegacyExecutionAdmissionErrorV1::BadRequest(format!(
+                    "duplicate higher timeframe {timeframe}"
+                )));
+            }
+            higher.push(timeframe);
+        }
+        Ok(higher
+            .into_iter()
+            .map(|timeframe| timeframe.as_str().to_owned())
+            .collect())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,7 +137,12 @@ pub(crate) struct TypedDiscoveryExecutionIntentV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TypedTrainingSelectionPolicyV1 {
-    Configured,
+    DiscoveryHandoff {
+        identity_sha256: String,
+    },
+    StrategyResearchHandoff {
+        identity_sha256: String,
+    },
     Exact {
         symbol: String,
         base_timeframe: CanonicalTimeframe,
@@ -237,24 +216,8 @@ impl TypedLegacyExecutionSnapshotV1 {
         }
     }
 
-    pub(crate) const fn lease_token(&self) -> u64 {
-        self.lease_token
-    }
-
-    pub(crate) const fn lease_kind(&self) -> ProcessExecutionKindV1 {
-        self.lease_kind
-    }
-
-    pub(crate) fn job_snapshot(&self) -> &JobSnapshot {
-        &self.job_snapshot
-    }
-
     pub(crate) const fn state(&self) -> JobState {
         self.job_snapshot.state
-    }
-
-    pub(crate) fn report(&self) -> &JobReport {
-        &self.job_snapshot.report
     }
 }
 
@@ -276,6 +239,7 @@ pub(crate) enum TypedLegacyExecutionTerminalV1 {
     },
     WorkerPanicked {
         lease_token: u64,
+        job_kind: JobKind,
         detail: String,
     },
 }
@@ -316,6 +280,10 @@ impl TypedLegacyExecutionJobHandleV1 {
         self.cancel.request();
     }
 
+    pub(crate) fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
     pub(crate) fn snapshot_receiver_mut(
         &mut self,
     ) -> &mut watch::Receiver<TypedLegacyExecutionSnapshotV1> {
@@ -337,19 +305,23 @@ impl TypedLegacyExecutionJobHandleV1 {
             lease_token,
             initial_kind: _,
             cancel: _,
-            snapshots: _,
+            snapshots,
             admission: _,
             terminal,
             worker,
         } = self;
         let signalled = terminal.await.ok();
-        match worker.await {
+        let joined = worker.await;
+        let job_kind = snapshots.borrow().job_snapshot.kind;
+        match joined {
             Ok(()) => signalled.unwrap_or(TypedLegacyExecutionTerminalV1::WorkerPanicked {
                 lease_token,
+                job_kind,
                 detail: "typed engine worker exited without terminal evidence".to_owned(),
             }),
             Err(error) => TypedLegacyExecutionTerminalV1::WorkerPanicked {
                 lease_token,
+                job_kind,
                 detail: bounded_detail_v1(error),
             },
         }
@@ -387,7 +359,7 @@ fn require_runtime_v1() -> Result<(), TypedLegacyExecutionStartErrorV1> {
 fn spawn_discovery_worker_v1(
     state: AppApiState,
     intent: TypedDiscoveryExecutionIntentV1,
-    mut lease: ProcessExecutionLeaseV1,
+    lease: ProcessExecutionLeaseV1,
 ) -> TypedLegacyExecutionJobHandleV1 {
     let lease_token = lease.token();
     let cancel = CancellationFlag::new();
@@ -401,13 +373,17 @@ fn spawn_discovery_worker_v1(
     let (admission_tx, admission) = oneshot::channel();
     let worker_cancel = cancel.clone();
     let worker = tokio::spawn(async move {
+        // One owner retains the same token through Discovery and its exact
+        // candidate Training continuation. Never reacquire between phases.
+        let mut lease = lease;
         state
-            .install_engine(JobKind::Discovery, worker_cancel.clone())
+            .install_engine(JobKind::Discovery, worker_cancel.clone(), lease_token)
             .await;
         let discovery = prepare_discovery_request_v1(&state, &intent, &worker_cancel).await;
         let final_result = match discovery {
             Ok((request, receipt)) => {
-                run_discovery_job_v1(
+                let expected_series = request.pinned_input.receipt().clone();
+                let discovery_result = run_discovery_job_v1(
                     &state,
                     request,
                     &worker_cancel,
@@ -416,7 +392,34 @@ fn spawn_discovery_worker_v1(
                     admission_tx,
                     receipt,
                 )
-                .await
+                .await;
+                if intent.training_after_success {
+                    match discovery_result {
+                        Ok(snapshot) => {
+                            continue_discovery_training_v1(
+                                snapshot,
+                                &worker_cancel,
+                                &mut lease,
+                                &snapshot_tx,
+                                |training_intent| {
+                                    run_training_intent_v1(
+                                        &state,
+                                        training_intent,
+                                        &worker_cancel,
+                                        &snapshot_tx,
+                                        lease_token,
+                                        None,
+                                        Some(expected_series),
+                                    )
+                                },
+                            )
+                            .await
+                        }
+                        Err(snapshot) => Err(snapshot),
+                    }
+                } else {
+                    discovery_result
+                }
             }
             Err(error) => {
                 let _ = admission_tx.send(Err(error.clone()));
@@ -427,55 +430,12 @@ fn spawn_discovery_worker_v1(
                 ))
             }
         };
-        let terminal_value = match final_result {
-            Ok(discovery_final)
-                if discovery_final.state == JobState::Succeeded
-                    && intent.training_after_success
-                    && !worker_cancel.is_requested() =>
-            {
-                match lease.transition_discovery_to_training_v1() {
-                    Ok(()) => {
-                        let training_intent = TypedTrainingExecutionIntentV1 {
-                            selection: TypedTrainingSelectionPolicyV1::Exact {
-                                symbol: intent.symbol,
-                                base_timeframe: intent.base_timeframe,
-                            },
-                        };
-                        match run_training_intent_v1(
-                            &state,
-                            training_intent,
-                            &worker_cancel,
-                            &snapshot_tx,
-                            lease_token,
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(training_final) => terminal_from_snapshot_v1(
-                                training_final,
-                                lease_token,
-                                JobKind::Training,
-                            ),
-                            Err(failed) => {
-                                terminal_from_snapshot_v1(failed, lease_token, JobKind::Training)
-                            }
-                        }
-                    }
-                    Err(error) => TypedLegacyExecutionTerminalV1::Failed {
-                        final_snapshot: failed_snapshot_v1(JobKind::Discovery, &error),
-                        lease_token,
-                        detail: bounded_detail_v1(error),
-                    },
-                }
-            }
-            Ok(final_snapshot) => {
-                terminal_from_snapshot_v1(final_snapshot, lease_token, JobKind::Discovery)
-            }
-            Err(final_snapshot) => {
-                terminal_from_snapshot_v1(final_snapshot, lease_token, JobKind::Discovery)
-            }
+        let final_snapshot = match final_result {
+            Ok(snapshot) | Err(snapshot) => snapshot,
         };
-        persist_terminal_state_v1(&state, &terminal_value, JobKind::Discovery).await;
+        let completed_kind = final_snapshot.kind;
+        let terminal_value = terminal_from_snapshot_v1(final_snapshot, lease_token, completed_kind);
+        persist_terminal_state_v1(&state, &terminal_value, JobKind::Discovery, lease_token).await;
         let _ = terminal_tx.send(terminal_value);
     });
     TypedLegacyExecutionJobHandleV1 {
@@ -514,6 +474,7 @@ fn spawn_training_worker_v1(
             &snapshot_tx,
             lease_token,
             Some(admission_tx),
+            None,
         )
         .await
         {
@@ -521,7 +482,7 @@ fn spawn_training_worker_v1(
         };
         let terminal_value =
             terminal_from_snapshot_v1(final_snapshot, lease_token, JobKind::Training);
-        persist_terminal_state_v1(&state, &terminal_value, JobKind::Training).await;
+        persist_terminal_state_v1(&state, &terminal_value, JobKind::Training, lease_token).await;
         let _ = terminal_tx.send(terminal_value);
     });
     TypedLegacyExecutionJobHandleV1 {
@@ -533,6 +494,89 @@ fn spawn_training_worker_v1(
         terminal,
         worker,
     }
+}
+
+async fn continue_discovery_training_v1<F, Fut>(
+    discovery_snapshot: JobSnapshot,
+    cancel: &CancellationFlag,
+    lease: &mut ProcessExecutionLeaseV1,
+    snapshot_tx: &watch::Sender<TypedLegacyExecutionSnapshotV1>,
+    run_training: F,
+) -> Result<JobSnapshot, JobSnapshot>
+where
+    F: FnOnce(TypedTrainingExecutionIntentV1) -> Fut,
+    Fut: std::future::Future<Output = Result<JobSnapshot, JobSnapshot>>,
+{
+    if discovery_snapshot.kind != JobKind::Discovery {
+        return Err(failed_snapshot_v1(
+            JobKind::Discovery,
+            "automatic candidate Training requires a Discovery terminal snapshot",
+        ));
+    }
+    if discovery_snapshot.state != JobState::Succeeded {
+        return Err(discovery_snapshot);
+    }
+    if cancel.is_requested() {
+        return Err(cancelled_snapshot_v1(JobKind::Discovery));
+    }
+    if let Some((_, published)) = discovery_snapshot
+        .report
+        .counters
+        .iter()
+        .find(|(key, _)| key == "working_set_training_handoffs")
+        && *published > 1
+    {
+        let detail = format!(
+            "Discovery published {published} batch handoffs. Automatic Training currently accepts one exact result; select a published result in Training. No result was selected automatically."
+        );
+        // The requested continuation failed, not the already completed research.
+        // Keep its evidence and counters visible instead of replacing the report.
+        let mut snapshot = discovery_snapshot;
+        snapshot.state = JobState::Failed;
+        snapshot.report.summary = detail;
+        return Err(snapshot);
+    }
+    let mut handoffs = discovery_snapshot
+        .report
+        .highlights
+        .iter()
+        .filter(|(key, _)| key == "training_handoff");
+    let Some((_, identity_sha256)) = handoffs.next() else {
+        return Err(failed_snapshot_v1(
+            JobKind::Discovery,
+            "successful Discovery did not publish a training_handoff identity",
+        ));
+    };
+    if handoffs.next().is_some() {
+        return Err(failed_snapshot_v1(
+            JobKind::Discovery,
+            "successful Discovery published ambiguous training_handoff identities",
+        ));
+    }
+    // Reuse the same canonical identity validation as the durable loader; this
+    // only builds a path and performs no filesystem access.
+    if let Err(error) = handoff::handoff_path(std::path::Path::new(""), identity_sha256) {
+        return Err(failed_snapshot_v1(JobKind::Discovery, error));
+    }
+    let intent = TypedTrainingExecutionIntentV1 {
+        selection: TypedTrainingSelectionPolicyV1::DiscoveryHandoff {
+            identity_sha256: identity_sha256.clone(),
+        },
+    };
+    if cancel.is_requested() {
+        return Err(cancelled_snapshot_v1(JobKind::Discovery));
+    }
+    if let Err(error) = lease.transition_discovery_to_training_v1() {
+        return Err(failed_snapshot_v1(JobKind::Discovery, error));
+    }
+    // Publish the new phase before invoking its worker, including preparation.
+    // A panic now belongs to Training, not to the initial Discovery phase.
+    snapshot_tx.send_replace(TypedLegacyExecutionSnapshotV1::new(
+        lease.token(),
+        ProcessExecutionKindV1::Training,
+        queued_snapshot_v1(JobKind::Training),
+    ));
+    run_training(intent).await
 }
 
 async fn prepare_discovery_request_v1(
@@ -547,12 +591,17 @@ async fn prepare_discovery_request_v1(
         ));
     }
     let config_path = state.config_path().to_path_buf();
-    let settings = tokio::task::spawn_blocking(move || Settings::from_yaml(&config_path))
-        .await
-        .map_err(|error| TypedLegacyExecutionAdmissionErrorV1::Internal(bounded_detail_v1(error)))?
-        .map_err(|error| {
-            TypedLegacyExecutionAdmissionErrorV1::ServiceUnavailable(bounded_detail_v1(error))
-        })?;
+    let settings_source =
+        tokio::task::spawn_blocking(move || DiscoverySettingsSource::load(&config_path))
+            .await
+            .map_err(|error| {
+                TypedLegacyExecutionAdmissionErrorV1::Internal(bounded_detail_v1(error))
+            })?
+            .map_err(|error| {
+                TypedLegacyExecutionAdmissionErrorV1::ServiceUnavailable(bounded_detail_v1(error))
+            })?;
+    let settings_source = Arc::new(settings_source);
+    let settings = settings_source.settings();
     if intent.settings_gate == TypedDiscoverySettingsGateV1::RequireAutoRediscoveryEnabled
         && !settings.system.auto_rediscover_on_cull
     {
@@ -568,15 +617,9 @@ async fn prepare_discovery_request_v1(
     let data_root = settings.system.data_dir.clone();
     let symbol = intent.symbol.trim().to_uppercase();
     let base_tf = intent.base_timeframe.as_str().to_owned();
-    let higher = match &intent.higher_timeframes {
-        TypedHigherTimeframePolicyV1::Configured => {
-            settings.system.resolve_higher_timeframes(&base_tf)
-        }
-        TypedHigherTimeframePolicyV1::Exact(timeframes) => timeframes
-            .iter()
-            .map(|timeframe| timeframe.as_str().to_owned())
-            .collect(),
-    };
+    let higher = intent
+        .higher_timeframes
+        .resolve_for_discovery(settings, intent.base_timeframe)?;
     let pin_root = data_root.clone();
     let pin_higher = higher.clone();
     let pinned_input = match &intent.dataset_policy {
@@ -643,18 +686,16 @@ async fn prepare_discovery_request_v1(
             .map_err(classify_discovery_pin_error_v1)?
         }
     };
-    let mut config = DiscoveryConfig::try_from_settings(&settings).map_err(|error| {
-        TypedLegacyExecutionAdmissionErrorV1::ServiceUnavailable(bounded_detail_v1(error))
-    })?;
-    config.evaluation_symbol = symbol;
-    intent.overrides.apply(&mut config);
-    config = config.apply_mode_overrides();
+    // Admission owns intent and exact source selection only. The actual worker
+    // resolves financial configuration after its real feature receipt exists.
     let selected_generation = pinned_input.receipt().anchor().clone();
     let request = DiscoveryRequest {
         data_root,
+        settings_source,
         pinned_input: Arc::new(pinned_input),
         higher_tfs: higher,
-        config,
+        config: None,
+        overrides: intent.overrides.clone(),
         prop_firm_rules: PropFirmRiskRules::default(),
     };
     Ok((
@@ -697,8 +738,16 @@ async fn run_discovery_job_v1(
         )));
         return Err(cancelled_snapshot_v1(JobKind::Discovery));
     }
+    let Some(execution) = state.execution_state() else {
+        let error = TypedLegacyExecutionAdmissionErrorV1::ServiceUnavailable(
+            "Discovery requires the installed application CPU execution budget".to_owned(),
+        );
+        let snapshot = failed_snapshot_v1(JobKind::Discovery, &error);
+        let _ = admission_tx.send(Err(error));
+        return Err(snapshot);
+    };
     let (tx, mut rx) = mpsc::channel::<ServiceEvent>(1_000);
-    let child = match start_discovery_job(request, tx) {
+    let child = match start_discovery_job(request, execution, tx) {
         Ok(child) => child,
         Err(error) => {
             let error = TypedLegacyExecutionAdmissionErrorV1::BadRequest(bounded_detail_v1(error));
@@ -728,7 +777,12 @@ async fn run_training_intent_v1(
     snapshot_tx: &watch::Sender<TypedLegacyExecutionSnapshotV1>,
     lease_token: u64,
     admission_tx: Option<TypedLegacyAdmissionSenderV1>,
+    expected_series: Option<CanonicalDatasetSeriesReceiptV1>,
 ) -> Result<JobSnapshot, JobSnapshot> {
+    // Admission starts a new Training census even when cancellation precedes IO.
+    state
+        .install_engine(JobKind::Training, cancel.clone(), lease_token)
+        .await;
     if cancel.is_requested() {
         if let Some(admission_tx) = admission_tx {
             let _ = admission_tx.send(Err(TypedLegacyExecutionAdmissionErrorV1::Cancelled(
@@ -737,24 +791,38 @@ async fn run_training_intent_v1(
         }
         return Err(cancelled_snapshot_v1(JobKind::Training));
     }
-    state
-        .install_engine(JobKind::Training, cancel.clone())
-        .await;
-    let (request, admission) = match prepare_training_request_v1(state, intent, cancel).await {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            if let Some(admission_tx) = admission_tx {
-                let _ = admission_tx.send(Err(error.clone()));
-            }
-            return Err(preparation_error_snapshot_v1(
-                JobKind::Training,
-                cancel,
-                error,
-            ));
+    let strategy_only = matches!(
+        &intent.selection,
+        TypedTrainingSelectionPolicyV1::StrategyResearchHandoff { .. }
+    );
+    let handoff_identity = match &intent.selection {
+        TypedTrainingSelectionPolicyV1::DiscoveryHandoff { identity_sha256 }
+        | TypedTrainingSelectionPolicyV1::StrategyResearchHandoff { identity_sha256 } => {
+            Some(identity_sha256.clone())
         }
+        _ => None,
     };
+    let (request, admission) =
+        match prepare_training_request_v1(state, intent, cancel, expected_series).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(admission_tx) = admission_tx {
+                    let _ = admission_tx.send(Err(error.clone()));
+                }
+                return Err(preparation_error_snapshot_v1(
+                    JobKind::Training,
+                    cancel,
+                    error,
+                ));
+            }
+        };
     let (tx, mut rx) = mpsc::channel::<ServiceEvent>(1_000);
-    let child = match start_training_job(request, tx) {
+    let start = match handoff_identity {
+        Some(identity) if strategy_only => start_strategy_research_job(request, identity, tx),
+        Some(identity) => start_discovery_training_job(request, identity, tx),
+        None => start_training_job(request, tx),
+    };
+    let child = match start {
         Ok(child) => child,
         Err(error) => {
             let error = TypedLegacyExecutionAdmissionErrorV1::BadRequest(bounded_detail_v1(error));
@@ -785,33 +853,57 @@ async fn prepare_training_request_v1(
     state: &AppApiState,
     intent: TypedTrainingExecutionIntentV1,
     cancel: &CancellationFlag,
+    expected_series: Option<CanonicalDatasetSeriesReceiptV1>,
 ) -> Result<(TrainingRequest, TypedLegacyExecutionAdmissionV1), TypedLegacyExecutionAdmissionErrorV1>
 {
+    let strategy_only = matches!(
+        &intent.selection,
+        TypedTrainingSelectionPolicyV1::StrategyResearchHandoff { .. }
+    );
     let (symbol, base_timeframe) = match intent.selection {
-        TypedTrainingSelectionPolicyV1::Configured => {
+        TypedTrainingSelectionPolicyV1::DiscoveryHandoff { identity_sha256 }
+        | TypedTrainingSelectionPolicyV1::StrategyResearchHandoff { identity_sha256 } => {
             let config_path = state.config_path().to_path_buf();
-            let settings = tokio::task::spawn_blocking(move || Settings::from_yaml(&config_path))
-                .await
-                .map_err(|error| {
-                    TypedLegacyExecutionAdmissionErrorV1::Internal(bounded_detail_v1(error))
-                })?
-                .map_err(|error| {
-                    TypedLegacyExecutionAdmissionErrorV1::BadRequest(bounded_detail_v1(error))
-                })?;
-            let symbol = settings.system.resolve_symbol().trim().to_uppercase();
-            let base_timeframe = settings
-                .system
-                .resolve_base_timeframe()
-                .parse::<CanonicalTimeframe>()
-                .map_err(|error| {
-                    TypedLegacyExecutionAdmissionErrorV1::BadRequest(bounded_detail_v1(error))
-                })?;
-            (symbol, base_timeframe)
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let settings = Settings::from_yaml(&config_path)?;
+                let selected = handoff::load(&settings.system.data_dir, &identity_sha256)?;
+                validate_follow_on_series_v1(
+                    expected_series.as_ref(),
+                    selected.canonical_series(),
+                )?;
+                let settings = handoff::settings_for_series(&settings, selected.canonical_series());
+                if !strategy_only {
+                    selected.validate_against_settings_v1(&settings)?;
+                }
+                Ok((
+                    selected
+                        .canonical_series()
+                        .anchor()
+                        .identity()
+                        .symbol_name()
+                        .to_owned(),
+                    selected.base_timeframe(),
+                ))
+            })
+            .await
+            .map_err(|error| {
+                TypedLegacyExecutionAdmissionErrorV1::Internal(bounded_detail_v1(error))
+            })?
+            .map_err(|error| {
+                TypedLegacyExecutionAdmissionErrorV1::BadRequest(bounded_detail_v1(error))
+            })?
         }
         TypedTrainingSelectionPolicyV1::Exact {
             symbol,
             base_timeframe,
-        } => (symbol.trim().to_uppercase(), base_timeframe),
+        } => {
+            if expected_series.is_some() {
+                return Err(TypedLegacyExecutionAdmissionErrorV1::BadRequest(
+                    "automatic candidate Training cannot use a symbol-only selection".to_owned(),
+                ));
+            }
+            (symbol.trim().to_uppercase(), base_timeframe)
+        }
     };
     if symbol.is_empty() {
         return Err(TypedLegacyExecutionAdmissionErrorV1::BadRequest(
@@ -836,6 +928,19 @@ async fn prepare_training_request_v1(
             base_timeframe,
         },
     ))
+}
+
+fn validate_follow_on_series_v1(
+    expected: Option<&CanonicalDatasetSeriesReceiptV1>,
+    actual: &CanonicalDatasetSeriesReceiptV1,
+) -> anyhow::Result<()> {
+    if let Some(expected) = expected {
+        anyhow::ensure!(
+            actual == expected,
+            "automatic candidate Training handoff differs from the completed Discovery canonical series"
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -865,20 +970,9 @@ async fn drain_job_events_v1(
             | (JobKind::Training, ServiceEvent::TrainingUpdated(snapshot)) => snapshot,
             _ => continue,
         };
-        let run_state = EngineRunState::from(snapshot.state);
         state
-            .update_engine(kind, run_state, snapshot.report.summary.clone())
+            .update_engine_snapshot(kind, &snapshot, lease_token)
             .await;
-        if run_state == EngineRunState::Running {
-            state
-                .set_engine_progress(
-                    kind,
-                    snapshot.progress.stage.clone(),
-                    f64::from(snapshot.progress.percent.unwrap_or(0.0)),
-                    snapshot.report.counters.clone(),
-                )
-                .await;
-        }
         snapshot_tx.send_replace(TypedLegacyExecutionSnapshotV1::new(
             lease_token,
             lease_kind,
@@ -892,11 +986,14 @@ async fn drain_job_events_v1(
             };
         }
     }
-    state.finalize_engine_if_running(kind).await;
-    Err(failed_snapshot_v1(
+    let failure = failed_snapshot_v1(
         kind,
         format!("{kind:?} event channel closed without terminal evidence"),
-    ))
+    );
+    state
+        .update_engine_snapshot(kind, &failure, lease_token)
+        .await;
+    Err(failure)
 }
 
 pub(crate) fn detach_typed_legacy_execution_observer_v1(
@@ -905,6 +1002,7 @@ pub(crate) fn detach_typed_legacy_execution_observer_v1(
 ) {
     tokio::spawn(async move {
         let initial_kind = handle.initial_kind;
+        let lease_token = handle.lease_token;
         loop {
             if handle.snapshot_receiver_mut().changed().await.is_err() {
                 break;
@@ -920,15 +1018,11 @@ pub(crate) fn detach_typed_legacy_execution_observer_v1(
         let (kind, snapshot) = terminal_kind_and_snapshot_v1(&terminal, initial_kind);
         if let Some(snapshot) = snapshot {
             state
-                .update_engine(
-                    kind,
-                    EngineRunState::from(snapshot.state),
-                    snapshot.report.summary.clone(),
-                )
+                .update_engine_snapshot(kind, snapshot, lease_token)
                 .await;
         } else if let TypedLegacyExecutionTerminalV1::WorkerPanicked { detail, .. } = terminal {
             state
-                .update_engine(kind, EngineRunState::Failed, detail)
+                .update_engine_snapshot(kind, &failed_snapshot_v1(kind, detail), lease_token)
                 .await;
         }
     });
@@ -989,7 +1083,7 @@ fn terminal_from_snapshot_v1(
 
 fn terminal_kind_and_snapshot_v1(
     terminal: &TypedLegacyExecutionTerminalV1,
-    fallback_kind: JobKind,
+    _fallback_kind: JobKind,
 ) -> (JobKind, Option<&JobSnapshot>) {
     match terminal {
         TypedLegacyExecutionTerminalV1::Succeeded {
@@ -1001,7 +1095,7 @@ fn terminal_kind_and_snapshot_v1(
         | TypedLegacyExecutionTerminalV1::Cancelled { final_snapshot, .. } => {
             (final_snapshot.kind, Some(final_snapshot))
         }
-        TypedLegacyExecutionTerminalV1::WorkerPanicked { .. } => (fallback_kind, None),
+        TypedLegacyExecutionTerminalV1::WorkerPanicked { job_kind, .. } => (*job_kind, None),
     }
 }
 
@@ -1009,15 +1103,12 @@ async fn persist_terminal_state_v1(
     state: &AppApiState,
     terminal: &TypedLegacyExecutionTerminalV1,
     fallback_kind: JobKind,
+    lease_token: u64,
 ) {
     let (kind, snapshot) = terminal_kind_and_snapshot_v1(terminal, fallback_kind);
     if let Some(snapshot) = snapshot {
         state
-            .update_engine(
-                kind,
-                EngineRunState::from(snapshot.state),
-                snapshot.report.summary.clone(),
-            )
+            .update_engine_snapshot(kind, snapshot, lease_token)
             .await;
     }
 }

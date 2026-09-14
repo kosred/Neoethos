@@ -49,6 +49,30 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     &tail[..end]
 }
 
+fn braced_item<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing source item `{signature}`"));
+    let open = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("missing opening brace for `{signature}`"));
+    let mut depth = 0_u32;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("missing closing brace for `{signature}`");
+}
+
 #[test]
 fn parent_dataset_is_immutable_exact_and_excludes_view_local_adaptive_state() {
     let parent = parent(8, 3);
@@ -213,16 +237,8 @@ fn native_abi_has_separate_parent_bind_and_counter_functions_in_cuda_and_stub() 
 
 #[test]
 fn parent_and_view_hot_paths_have_no_intermediate_stream_synchronization() {
-    let parent_upload = source_between(
-        CUDA,
-        "neoethos_gpu_cuda_population_upload_parent_v1(",
-        "neoethos_gpu_cuda_population_bind_view_v1(",
-    );
-    let bind = source_between(
-        CUDA,
-        "neoethos_gpu_cuda_population_bind_view_v1(",
-        "neoethos_gpu_cuda_population_upload_genes(",
-    );
+    let parent_upload = braced_item(CUDA, "neoethos_gpu_cuda_population_upload_parent_v1(");
+    let bind = braced_item(CUDA, "neoethos_gpu_cuda_population_bind_view_v1(");
 
     for source in [parent_upload, bind] {
         assert!(!source.contains("cudaStreamSynchronize"));

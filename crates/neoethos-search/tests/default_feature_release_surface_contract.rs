@@ -106,17 +106,17 @@ fn native_probe_and_retry_internals_follow_their_real_feature_callers() {
         "pub(crate) enum StrictDiscoveryDeviceRouteErrorCodeV1 {",
         "\n}",
     );
-    for native_only_error in [
-        "MissingCudaBuildManifest,",
-        "DeviceIdentityMismatch,",
-        "WrongDeviceRoute,",
-    ] {
+    for native_only_error in ["MissingCudaBuildManifest,", "DeviceIdentityMismatch,"] {
         require_cfg_immediately_before(
             route_errors,
             native_only_error,
             "#[cfg(feature = \"gpu-b-native\")]",
         );
     }
+    assert!(
+        route_errors.contains("WrongDeviceRoute,"),
+        "the default explicit-CPU research route still needs a typed wrong-route refusal"
+    );
 
     let no_native_probe = section(
         &route,
@@ -150,20 +150,22 @@ fn default_release_has_no_fake_sealed_route_constructor_or_dead_code_suppression
         "\n}",
     );
     assert!(sealed_route.contains("_sealed: ()"));
-    require_cfg_immediately_before(
-        sealed_route,
-        "kind: SealedStrictDiscoveryDeviceRouteKindV1",
-        "#[cfg(feature = \"gpu-b-native\")]",
-    );
-    require_cfg_immediately_before(
-        &route,
-        "enum SealedStrictDiscoveryDeviceRouteKindV1",
-        "#[cfg(feature = \"gpu-b-native\")]",
-    );
+    assert!(sealed_route.contains("kind: SealedStrictDiscoveryDeviceRouteKindV1"));
     let route_kind = section(
         &route,
         "enum SealedStrictDiscoveryDeviceRouteKindV1 {",
         "\n}",
+    );
+    assert!(route_kind.contains("ExplicitCpuResearch("));
+    require_cfg_immediately_before(
+        route_kind,
+        "NativeCuda(",
+        "#[cfg(feature = \"gpu-b-native\")]",
+    );
+    require_cfg_immediately_before(
+        route_kind,
+        "CpuNoCompatibleGpu(",
+        "#[cfg(feature = \"gpu-b-native\")]",
     );
     assert!(route_kind.contains("NativeCuda("));
     assert!(route_kind.contains("CpuNoCompatibleGpu("));

@@ -15,7 +15,7 @@ fn public_discovery_preflights_the_strict_native_population_stage_not_a_fake_ful
     let body = section(
         source,
         "fn run_discovery_cycle_with_holdout_and_progress_authorized",
-        "outer OOS holdout: discovery sees only",
+        "let mut result = if let Some(strict_device_admission)",
     );
 
     assert!(

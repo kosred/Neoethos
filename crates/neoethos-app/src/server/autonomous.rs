@@ -256,7 +256,7 @@ pub async fn start_live(
             cull_min_win_rate_pct: body.cull_min_win_rate_pct,
             cull_window_trades: body.cull_window_trades,
         };
-        match crate::app_services::live_trading::start(req) {
+        match crate::app_services::live_trading::start(req, state.account_risk.clone()) {
             Ok(handle) => {
                 started.push(path);
                 slot.push(handle);
@@ -427,7 +427,7 @@ pub struct GateQuery {
 
 /// `GET /autonomous/gate?portfolio=...` — demo forward-test eligibility for a
 /// portfolio, so the UI can show WHY live is (not) yet allowed BEFORE the
-/// operator clicks Start. `enforced` is true only on a Live (real-money) env;
+/// operator clicks Start. `enforced` is true only when enabled on a Live env;
 /// on Demo the gate is informational (eligibility still tracked, never blocks).
 pub async fn gate(Query(q): Query<GateQuery>) -> Response {
     let portfolio = q.portfolio;
@@ -439,7 +439,7 @@ pub async fn gate(Query(q): Query<GateQuery>) -> Response {
     match result {
         Ok(Ok(decision)) => Json(serde_json::json!({
             "envIsLive": env_is_live,
-            "enforced": env_is_live,
+            "enforced": env_is_live && decision.enabled,
             "eligible": decision.eligible,
             "summary": decision.summary,
             "criteria": decision.criteria,
@@ -447,8 +447,8 @@ pub async fn gate(Query(q): Query<GateQuery>) -> Response {
         .into_response(),
         Ok(Err(e)) => actionable_error(
             StatusCode::BAD_REQUEST,
-            "Couldn't evaluate the demo forward-test gate — make sure the portfolio path \
-             and its sibling *.quality.json exist.",
+            "Couldn't evaluate the optional demo check — verify settings, the validated \
+             portfolio and, when enabled, broker access and the demo journal.",
             &e,
         ),
         Err(join_err) => actionable_error(

@@ -113,28 +113,6 @@ jobs:
           set -o pipefail
           cargo check -p neoethos-cli 2>&1 | tee /tmp/stage1-diagnostics/cli-check.log
 
-      - name: Check search GPU feature
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo check -p neoethos-search --features gpu-vulkan \
-            2>&1 | tee /tmp/stage1-diagnostics/search-gpu-check.log
-
-      - name: Check CLI GPU feature
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo check -p neoethos-cli --features gpu-vulkan \
-            2>&1 | tee /tmp/stage1-diagnostics/cli-gpu-check.log
-
-      - name: Direct WGPU correctness probes
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test -p neoethos-search --features gpu-vulkan \
-            gpu_native:: -- --nocapture \
-            2>&1 | tee /tmp/stage1-diagnostics/gpu-native-direct.log
-
       - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4

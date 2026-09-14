@@ -1,40 +1,14 @@
-//! Live data bridge between the broker integration and the HTTP server.
-//!
-//! Phase-1 implementation of task #87: a tokio task that polls the
-//! cTrader account-runtime endpoint every `REFRESH_INTERVAL` seconds
-//! and writes the latest snapshot into [`AppApiState`]. The axum
-//! route layer reads from the same `AppApiState`, so the HTTP surface
-//! always serves the **most-recent broker-fed numbers** without
-//! holding any locks across an outgoing HTTP request.
-//!
-//! ## Why polling and not push
-//!
-//! cTrader's Open API supports a streaming `ProtoOAGetAccountInfoRes`
-//! event, but wiring that into our existing
-//! `ProductionCTraderOpenApiTransport` is a separate piece of work
-//! (it shares the same websocket as quote streaming, which lands in
-//! Session 2). A 5-second poll is acceptable for the dashboard's
-//! balance/equity numbers — those fields move on every trade close,
-//! not every tick.
-//!
-//! ## Credential resolution
-//!
-//! 1. `broker_persistence::load_broker_settings()` — TOML + embedded
-//!    fallback. Source of `client_id`, `client_secret`, account-id,
-//!    and `CTraderEnvironment` (demo vs. live).
-//! 2. `secure_store::production_ctrader_token_store().load_token_bundle()`
-//!    — keyring-stored `access_token`. Empty / missing means the
-//!    operator hasn't OAuthed yet; the bridge logs a warning and
-//!    keeps retrying (the operator might OAuth at any moment).
-//!
-//! If either lookup fails the bridge waits one full interval and
-//! tries again — no point spamming the cTrader API with calls that
-//! will all 401.
+//! Polls verified cTrader account-runtime responses every five seconds and on
+//! explicit refresh triggers. Cache publication and reads recheck the selected
+//! account/environment; unavailable or failed observations remain explicit.
+//! Snapshot identities come from the verified response and its request endpoint.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use crate::app_services::broker_api::fetch_broker_symbols_blocking;
+use crate::app_services::broker_api::{
+    broker_credentials_configured, fetch_broker_symbols_blocking,
+};
 use crate::app_services::broker_config::BrokerSettingsState;
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::ctrader_account::{
@@ -52,41 +26,22 @@ use super::state::{AccountSnapshotPayload, AppApiState, PositionPayload};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Number of consecutive refresh failures before the cached account
-/// snapshot is wiped (= `STALE_THRESHOLD * REFRESH_INTERVAL` of
-/// continuous broker silence — 15s with the current 3 × 5s tuning).
-/// Lower → faster "broker not ready" surface but more flapping on a
-/// flaky network; higher → dashboard lies for longer when the token
-/// has actually expired. The v0.4.20 symptom that motivated the cache
-/// invalidation is documented in `run()` below.
-#[allow(dead_code)] // referenced inside the cTrader-gated run() loop.
-const STALE_THRESHOLD: usize = 3;
-
 /// Auto-sync `system.account_currency` in config.yaml to the broker's real
 /// deposit currency (known 3-letter codes only — never the UNKNOWN sentinel).
 ///
-/// Cheap on the hot path: a process-level memo of the last currency we synced
-/// means config.yaml is only READ/WRITTEN when the broker currency actually
-/// changes (first snapshot of the process, or an account switch) — not on
-/// every 5s refresh. Best-effort: failures log and never affect the snapshot.
-fn sync_account_currency_to_config(broker_ccy: &str) {
-    static LAST_SYNCED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
+/// Only accepted snapshots initiate this best-effort write. Recheck selection
+/// inside the blocking task. This is not transactional with other config or
+/// selection writers. Read config each time so failed saves and later operator
+/// edits are reconsidered; there is no process-lifetime currency memo.
+fn sync_account_currency_to_config(broker_ccy: &str, scope: (i64, CTraderEnvironment)) {
     let ccy = broker_ccy.trim().to_ascii_uppercase();
     if ccy.len() != 3 || ccy == "UNK" {
         return; // UNKNOWN sentinel or malformed — never write a guess to config
     }
-    {
-        let Ok(mut last) = LAST_SYNCED.lock() else {
-            return;
-        };
-        if last.as_deref() == Some(ccy.as_str()) {
-            return; // already synced this currency in this process
-        }
-        *last = Some(ccy.clone());
-    }
-
     tokio::task::spawn_blocking(move || {
+        if current_execution_account_scope().ok() != Some(scope) {
+            return;
+        }
         let path = crate::server::state::current_config_path();
         let mut settings = match neoethos_core::Settings::from_yaml(&path) {
             Ok(s) => s,
@@ -100,17 +55,22 @@ fn sync_account_currency_to_config(broker_ccy: &str) {
             }
         };
         let current = settings.system.account_currency.trim().to_ascii_uppercase();
+        // Loading config may have blocked while a different account was selected.
+        if current_execution_account_scope().ok() != Some(scope) {
+            return;
+        }
         if current == ccy {
             return; // config already correct
         }
         settings.system.account_currency = ccy.clone();
         match settings.save(&path) {
-            Ok(()) => tracing::info!(
-                target: "neoethos_app::bridge",
-                from = %current, to = %ccy,
-                "account-currency synced from broker → config.yaml (discovery \
-                 cost model + money views now use the real deposit currency)"
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    target: "neoethos_app::bridge",
+                    from = %current, to = %ccy,
+                    "account-currency synced from broker → config.yaml"
+                );
+            }
             Err(e) => tracing::warn!(
                 target: "neoethos_app::bridge",
                 error = %e,
@@ -133,7 +93,7 @@ async fn run(state: AppApiState) {
     let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
     // **2026-05-25 — uniform-push doctrine**: alongside the 5 s safety
     // timer, listen on the account-refresh trigger channel. Senders
-    // (force-refresh endpoint + future `OAExecutionEvent` handler)
+    // (force-refresh endpoint and broker-operation refresh triggers)
     // ping the channel to demand an immediate refresh — no waiting
     // for the next 5 s tick.
     // Graceful degradation: if a future regression spawns a second
@@ -153,16 +113,6 @@ async fn run(state: AppApiState) {
     // Run an immediate first refresh so the dashboard isn't blank for
     // the first 5 seconds after server start.
     ticker.tick().await;
-    // Consecutive-failure counter. After 3 failed refreshes (= 15s of
-    // continuous error), wipe the cached snapshot so /account/snapshot
-    // returns 503 instead of last-known-good numbers. Without this the
-    // dashboard would silently lie for hours — the v0.4.20 user-visible
-    // symptom was "balance shows €1000 forever even though token is
-    // CH_ACCESS_TOKEN_INVALID since 30 minutes ago". One transient blip
-    // (1-2 missed ticks) does NOT clear the cache; only sustained failure.
-    // The threshold itself lives at module scope (#148) as STALE_THRESHOLD.
-    let mut failures: usize = 0;
-
     // **F-201/F-202 closure (2026-05-25 — operator directive
     // "periodic refresh 24h")**: the symbol-catalog cache used to be
     // lazy-loaded only on first position with `sym#<id>` and then
@@ -176,133 +126,133 @@ async fn run(state: AppApiState) {
 
     loop {
         // **F-231/F-501/F-630 closure (2026-05-25)**: Risky Mode
-        // auto re-arm check. Each tick of the polling loop (every 5s)
+        // kill-switch expiry check. Each tick of the polling loop (every 5s)
         // we ask the persistence layer "has the 24h cooldown elapsed
-        // since the last kill-switch trip?" — when yes, it flips
-        // `armed = true` on disk and clears the kill timestamp. Cheap
+        // since the last kill-switch trip?" — when yes, it clears the persisted
+        // kill timestamp. Cheap
         // (single file read; only writes on the rare day-cadence
-        // re-arm event), and the 5s granularity is way faster than the
-        // human-visible "operator notices kill switch came back".
+        // expiry event), and the 5s granularity is more than sufficient for a
+        // 24-hour safety window.
         match tokio::task::spawn_blocking(
-            crate::app_services::risky_mode_persistence::auto_re_arm_if_ready,
+            crate::app_services::risky_mode_persistence::clear_expired_kill_switch,
         )
         .await
         {
             Ok(Ok(true)) => {
                 tracing::info!(
                     target: "neoethos_app::server::bridge",
-                    "Risky Mode auto re-armed (24h cooldown elapsed)"
+                    "Risky Mode kill-switch cooldown expired and was cleared"
                 );
             }
             Ok(Ok(false)) => {
                 // No state file, or cooldown still in progress, or
-                // already armed — all benign. No log.
+                // already cleared — all benign. No log.
             }
             Ok(Err(err)) => {
                 tracing::warn!(
                     target: "neoethos_app::server::bridge",
                     error = %err,
-                    "Risky Mode auto re-arm check failed; will retry next cycle"
+                    "Risky Mode kill-switch expiry check failed; will retry next cycle"
                 );
             }
             Err(join_err) => {
                 tracing::warn!(
                     target: "neoethos_app::server::bridge",
                     error = %join_err,
-                    "Risky Mode auto re-arm blocking task panicked"
+                    "Risky Mode kill-switch expiry task panicked"
                 );
             }
         }
 
-        // **F-201/F-202**: 24h periodic symbol-catalog refresh.
-        // Independent of the account-snapshot refresh because broker
-        // catalogs change on a different timescale (rarely vs.
-        // every 5s).
-        let needs_symbol_refresh = match last_symbol_refresh {
-            None => true,
-            Some(t) => t.elapsed() >= SYMBOL_REFRESH_INTERVAL,
-        };
-        if needs_symbol_refresh {
-            match tokio::task::spawn_blocking(fetch_broker_symbols_blocking).await {
-                Ok(Ok(bundle)) => {
-                    let catalog: HashMap<i64, String> = bundle
-                        .symbols
-                        .into_iter()
-                        .map(|s| (s.symbol_id, s.symbol_name))
-                        .collect();
-                    let count = catalog.len();
-                    state.set_symbol_catalog(catalog).await;
-                    last_symbol_refresh = Some(std::time::Instant::now());
-                    tracing::info!(
-                        target: "neoethos_app::server::bridge",
-                        symbol_count = count,
-                        "periodic symbol-catalog refresh complete (24h cadence)"
-                    );
-                }
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        target: "neoethos_app::server::bridge",
-                        error = %err,
-                        "periodic symbol-catalog refresh failed; will retry next cycle"
-                    );
-                }
-                Err(join_err) => {
-                    tracing::warn!(
-                        target: "neoethos_app::server::bridge",
-                        error = %join_err,
-                        "periodic symbol-catalog blocking task panicked; will retry"
-                    );
-                }
-            }
-        }
-
-        // **2026-05-25 — drain any pending push-triggers** before the
-        // refresh so a burst of `OAExecutionEvent`s collapses into a
-        // single refresh per polling iteration (idempotent — the
-        // refresh reads broker-of-record state, not deltas).
+        // Coalesce refresh triggers even when no broker is configured. The
+        // normal wait below still runs, and configuration is checked again on
+        // the next tick/push; setup never requires restarting the bridge.
         if let Some(rx) = refresh_rx.as_mut() {
-            while let Ok(()) = rx.try_recv() {
-                // Drain only; the refresh below covers them all.
-            }
+            while let Ok(()) = rx.try_recv() {}
         }
 
-        match refresh_once(&state).await {
-            Ok(payload) => {
-                state.set_account(payload).await;
-                failures = 0;
-                tracing::debug!(
-                    target: "neoethos_app::server::bridge",
-                    "/account/snapshot refreshed from cTrader"
-                );
-            }
-            Err(err) => {
-                failures = failures.saturating_add(1);
-                tracing::warn!(
-                    target: "neoethos_app::server::bridge",
-                    error = %err,
-                    consecutive_failures = failures,
-                    "cTrader account refresh failed — Flutter dashboard \
-                     will keep showing the previous snapshot until the \
-                     next interval. Common causes: OAuth token expired, \
-                     broker session not yet established, or no network."
-                );
-                if failures >= STALE_THRESHOLD && state.account().await.is_some() {
-                    tracing::warn!(
-                        target: "neoethos_app::server::bridge",
-                        consecutive_failures = failures,
-                        "clearing cached account snapshot — dashboard \
-                         will now show 'broker not ready' instead of \
-                         stale balance/equity numbers. Re-authenticate \
-                         (Broker Setup → Re-authenticate) or correct \
-                         the account_id (Settings) to restore the feed."
-                    );
-                    state.clear_account().await;
+        if broker_refresh_configured(&state, broker_credentials_configured).await {
+            // **F-201/F-202**: 24h periodic symbol-catalog refresh.
+            // Independent of the account-snapshot refresh because broker
+            // catalogs change on a different timescale (rarely vs.
+            // every 5s).
+            let needs_symbol_refresh = match last_symbol_refresh {
+                None => true,
+                Some(t) => t.elapsed() >= SYMBOL_REFRESH_INTERVAL,
+            };
+            if needs_symbol_refresh {
+                match tokio::task::spawn_blocking(fetch_broker_symbols_blocking).await {
+                    Ok(Ok(bundle)) => {
+                        let catalog: HashMap<i64, String> = bundle
+                            .symbols
+                            .into_iter()
+                            .map(|s| (s.symbol_id, s.symbol_name))
+                            .collect();
+                        let count = catalog.len();
+                        state.set_symbol_catalog(catalog).await;
+                        last_symbol_refresh = Some(std::time::Instant::now());
+                        tracing::info!(
+                            target: "neoethos_app::server::bridge",
+                            symbol_count = count,
+                            "periodic symbol-catalog refresh complete (24h cadence)"
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            target: "neoethos_app::server::bridge",
+                            error = %err,
+                            "periodic symbol-catalog refresh failed; will retry next cycle"
+                        );
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            target: "neoethos_app::server::bridge",
+                            error = %join_err,
+                            "periodic symbol-catalog blocking task panicked; will retry"
+                        );
+                    }
                 }
             }
+
+            let mut request_scope = None;
+            let result = refresh_once(&state, &mut request_scope).await;
+            let currency = result.as_ref().ok().map(|payload| payload.currency.clone());
+            let publisher = state.clone();
+            let completion = tokio::task::spawn_blocking(move || {
+                publisher.complete_account_refresh(
+                    request_scope,
+                    result,
+                    current_execution_account_scope,
+                )
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("account completion task panicked: {error}"))
+            .and_then(|result| result);
+            match completion {
+                Ok(true) => {
+                    if let (Some(currency), Some(scope)) = (currency, request_scope) {
+                        sync_account_currency_to_config(&currency, scope);
+                        tracing::debug!(target: "neoethos_app::server::bridge", "/account/snapshot refreshed from cTrader");
+                    }
+                }
+                Ok(false) => tracing::debug!(
+                    target: "neoethos_app::server::bridge",
+                    "discarded account refresh from a superseded or unresolved execution scope"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "neoethos_app::server::bridge",
+                    error = %error,
+                    "Account refresh completion could not be confirmed."
+                ),
+            }
+        } else {
+            // A later configured profile must refresh its catalog immediately,
+            // not inherit the previous profile's 24-hour timestamp.
+            last_symbol_refresh = None;
         }
         // **2026-05-25 — push-trigger or timer, whichever fires first**.
         // The 5 s ticker is the safety floor; `refresh_rx.recv()` lets
-        // a force-refresh button or a future `OAExecutionEvent` push
+        // a force-refresh button or a broker-operation refresh trigger
         // skip the wait. `tokio::select!` ensures both wakeups are
         // honoured without spinning. The drain-loop at the top of the
         // outer loop body collapses any burst of triggers into a
@@ -322,6 +272,39 @@ async fn run(state: AppApiState) {
             None => {
                 ticker.tick().await;
             }
+        }
+    }
+}
+
+/// A local setup check only, not account, token or trading authorization. Keep
+/// all configured-account validation inside the existing refresh path.
+async fn broker_refresh_configured(
+    state: &AppApiState,
+    configured: impl FnOnce() -> bool + Send + 'static,
+) -> bool {
+    let observer = state.clone();
+    match tokio::task::spawn_blocking(move || {
+        let configured = configured();
+        if !configured {
+            // A removed/unconfigured broker cannot keep displaying a previously
+            // confirmed account. Reuse the same scope-invalidation boundary as
+            // account reads; no broker/keyring/transport operation is needed.
+            let _ = observer.current_account_observation(|| {
+                Err(anyhow::anyhow!("broker credentials are not configured"))
+            });
+        }
+        configured
+    })
+    .await
+    {
+        Ok(configured) => configured,
+        Err(error) => {
+            tracing::warn!(
+                target: "neoethos_app::server::bridge",
+                error = %error,
+                "broker configuration check failed; skipping refresh this cycle"
+            );
+            false
         }
     }
 }
@@ -414,16 +397,31 @@ fn refresh_ctrader_token_if_needed(
 /// `sym#<id>` placeholder. If the catalog is empty (Markets tab never
 /// opened), this triggers a one-time lazy fetch so the dashboard
 /// shows correct names from the very first refresh.
-async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayload> {
-    neoethos_core::current_broker_financial_truth_capability_v1()
-        .require(neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl)
-        .map_err(anyhow::Error::new)?;
-
+async fn refresh_once(
+    state: &AppApiState,
+    request_scope: &mut Option<(i64, CTraderEnvironment)>,
+) -> anyhow::Result<AccountSnapshotPayload> {
+    // Current account figures come from the authenticated trader/reconcile/PnL
+    // responses below. Historical quote-replay certification is not a
+    // prerequisite for reading the broker's current balance and position PnL.
     // Step 1: resolve credentials. `load_broker_settings` and the
     // secure store are both sync filesystem / keyring ops; we run
     // them on a blocking task so the tokio reactor stays free.
-    let (settings, token_bundle) = tokio::task::spawn_blocking(|| {
-        let s = load_broker_settings();
+    let settings = tokio::task::spawn_blocking(load_broker_settings)
+        .await
+        .map_err(|error| anyhow::anyhow!("blocking settings task panicked: {error}"))?;
+    let account_id = execution_account_id(&settings)?;
+    let environment = match settings.ctrader.environment {
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Demo => {
+            CTraderEnvironment::Demo
+        }
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Live => {
+            CTraderEnvironment::Live
+        }
+    };
+    // Qualify failures too, before keyring/token refresh or broker work starts.
+    *request_scope = Some((account_id.parse::<i64>()?, environment));
+    let (settings, token_bundle) = tokio::task::spawn_blocking(move || {
         let t = production_ctrader_token_store()
             .load_token_bundle_with_legacy_fallback()
             .map_err(|e| anyhow::anyhow!("load_token_bundle failed: {e}"))?;
@@ -432,8 +430,8 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         // the legacy TradingSession heartbeat — which used to drive token
         // refresh — was removed in v0.4.36. Non-fatal: on any failure the
         // existing token is kept, so this never regresses the refresh path.
-        let t = t.map(|bundle| refresh_ctrader_token_if_needed(&s, bundle));
-        Ok::<_, anyhow::Error>((s, t))
+        let t = t.map(|bundle| refresh_ctrader_token_if_needed(&settings, bundle));
+        Ok::<_, anyhow::Error>((settings, t))
     })
     .await
     .map_err(|e| anyhow::anyhow!("blocking creds task panicked: {e}"))??;
@@ -448,30 +446,12 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     if ctrader.client_id.is_empty() || ctrader.client_secret.is_empty() {
         anyhow::bail!("broker_credentials.toml has no cTrader client_id / client_secret");
     }
-    let account_target = ctrader
-        .accounts
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("broker_credentials.toml has no cTrader account picked"))?
-        .clone();
-
-    let environment = match ctrader.environment {
-        // The on-disk enum mirrors the live-auth one but they're
-        // independent types so we can't blanket-cast. Explicit
-        // match keeps a compile error if either gains a variant.
-        crate::app_services::broker_config::CTraderBrokerEnvironment::Demo => {
-            CTraderEnvironment::Demo
-        }
-        crate::app_services::broker_config::CTraderBrokerEnvironment::Live => {
-            CTraderEnvironment::Live
-        }
-    };
-
     let request = CTraderAccountRuntimeRequest {
         client_id: ctrader.client_id.clone(),
         client_secret: ctrader.client_secret.clone(),
         access_token,
         environment,
-        account_id: account_target.account_id,
+        account_id,
         // Pending protection orders not needed for the dashboard's
         // balance/equity summary — saves an extra round-trip.
         return_protection_orders: false,
@@ -584,13 +564,6 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     // authoritative monetary PnL in the correct account currency.
     let account_currency = snapshot.deposit_asset_name.clone();
 
-    // Auto-sync `system.account_currency` in config.yaml to the broker's REAL
-    // deposit currency. Live sizing already reads the broker value, but the
-    // DISCOVERY cost model + €/£ views read config — a stale value (USD while
-    // the account is GBP) makes discovery optimize with wrong costs. Fire-and-
-    // forget on the blocking pool; never delays this snapshot.
-    sync_account_currency_to_config(&account_currency);
-
     let mut positions = Vec::with_capacity(snapshot.reconcile.positions.len());
     for p in &snapshot.reconcile.positions {
         let resolved_name = state.resolve_symbol_name(p.symbol_id).await;
@@ -598,6 +571,8 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     }
 
     Ok(AccountSnapshotPayload {
+        source_account_id: snapshot.trader.account_id,
+        source_environment: snapshot.environment,
         balance,
         equity,
         free_margin,
@@ -613,40 +588,58 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     })
 }
 
+/// Read only the actual persisted execution selection. No credentials healing,
+/// embedded fallback, keyring access or authentication occurs at this boundary.
+/// Call on the blocking pool; file writers are not serialized with cache locks.
+pub(crate) fn current_execution_account_scope() -> anyhow::Result<(i64, CTraderEnvironment)> {
+    let path = neoethos_core::broker_config::credentials_file_path()?;
+    let settings = neoethos_core::broker_config::load_from_disk(&path)
+        // A TOML error chain may echo credential source lines. Keep only its
+        // safe outer file/category context when returning an error to the UI.
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .ok_or_else(|| anyhow::anyhow!("no persisted cTrader account selection is available"))?;
+    let account_id = execution_account_id(&settings)?.parse::<i64>()?;
+    let environment = match settings.ctrader.environment {
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Demo => {
+            CTraderEnvironment::Demo
+        }
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Live => {
+            CTraderEnvironment::Live
+        }
+    };
+    Ok((account_id, environment))
+}
+
+/// The dashboard must describe the account that execution uses, not whichever
+/// account happened to be first in the saved OAuth list.
+pub(super) fn execution_account_id(settings: &BrokerSettingsState) -> anyhow::Result<String> {
+    let mut enabled = settings
+        .ctrader
+        .accounts
+        .iter()
+        .filter(|a| a.enabled_for_execution);
+    let selected = enabled
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no cTrader account enabled for execution"))?;
+    anyhow::ensure!(
+        enabled.next().is_none(),
+        "more than one cTrader account enabled for execution"
+    );
+    anyhow::ensure!(
+        selected.account_id.parse::<i64>().is_ok_and(|id| id > 0),
+        "selected cTrader account id is not a positive integer"
+    );
+    Ok(selected.account_id.clone())
+}
+
 fn position_to_payload(
     p: &CTraderPositionSnapshot,
     resolved_name: Option<String>,
     pnl_by_position: &BTreeMap<i64, CTraderPositionUnrealizedPnL>,
 ) -> anyhow::Result<PositionPayload> {
-    // **2026-05-26 fix v2 (Κωνσταντίνος)**: corrected unit conversion
-    // for the Close-Position endpoint. Empirical chain from live trace
-    // against cTrader Demo account 47367144, position 262647379:
-    //
-    //   * cTrader proto wire field `tradeData.volume` is in CENTS of
-    //     base currency (1 lot EURUSD = 100,000 EUR × 100 = 10,000,000
-    //     wire units).
-    //   * `volume_to_units(wire) = wire / 100.0` in
-    //     `ctrader_account.rs:885`, so `p.volume` stored in the
-    //     snapshot is base-currency UNITS — not cents and not lots.
-    //     For a 1.0 standard lot EURUSD: p.volume = 100,000.
-    //   * The Close-Position endpoint (`ProtoOAClosePositionReq.volume`)
-    //     wants the same unit as `tradeData.volume`, i.e. CENTS.
-    //   * Therefore: `volume_units = p.volume * 100`.
-    //
-    // History:
-    //   v1 (this session, earlier): assumed `p.volume` was already in
-    //   cents — passed through → still 100× too small.
-    //   pre-v1 (the dev's original): assumed `p.volume` was in lots —
-    //   computed `lots * 100_000 * 100 = 10^7` → 10^7× too large.
-    //   v2 (here): `p.volume * 100` produces the correct wire volume.
-    //
-    // Verified against the broker's TRADING_BAD_VOLUME error trace:
-    //   "Order closeVolume 10000000000 is bigger than position
-    //    volume 100000" — broker displays in `wire / 100` units, so a
-    //   1.0-lot position shows 100,000 there too. To close it, the
-    //   close request must send wire volume = 10,000,000, which is
-    //   `snapshot.volume (100_000) * 100`.
-    let volume_units = (p.volume * 100.0).round() as i64;
+    // The close endpoint takes the original broker centi-units. The separate
+    // display value is base units and can lose integer precision through f64.
+    let volume_units = p.volume_raw_centi_units;
 
     // Broker-authoritative net unrealized PnL in the deposit currency. Missing
     // rows are an integrity failure, not zero profit.
@@ -696,6 +689,70 @@ fn position_to_payload(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn unconfigured_cycles_skip_refresh_clear_stale_account_and_resume_after_setup() {
+        let scope = (22, CTraderEnvironment::Demo);
+        let state = AppApiState::new().with_seed_account(AccountSnapshotPayload {
+            source_account_id: scope.0,
+            source_environment: scope.1,
+            balance: 100.0,
+            equity: 100.0,
+            free_margin: 100.0,
+            used_margin: 0.0,
+            currency: "USD".into(),
+            fetched_at_unix_ms: 123_456,
+            positions: Vec::new(),
+        });
+        state
+            .set_account_failure(&anyhow::anyhow!("previous configured refresh failed"))
+            .await;
+        let mut refresh_calls = 0;
+        for configured in [false, false, false, true] {
+            if broker_refresh_configured(&state, move || configured).await {
+                refresh_calls += 1;
+            }
+            if !configured {
+                let (account, failure) = state.account_observation().await;
+                assert!(account.is_none());
+                assert!(failure.is_none());
+                assert_eq!(refresh_calls, 0);
+            }
+        }
+        assert_eq!(
+            refresh_calls, 1,
+            "setup re-enables the existing refresh path"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_check_preserves_the_current_account_observation() {
+        let state = AppApiState::new();
+        state
+            .set_account_failure(&anyhow::anyhow!("configured account is unreachable"))
+            .await;
+        assert!(broker_refresh_configured(&state, || true).await);
+        assert!(state.account_observation().await.1.is_some());
+    }
+
+    #[test]
+    fn account_snapshot_follows_the_execution_selection_not_list_order() {
+        let mut settings = BrokerSettingsState::default();
+        let disabled = neoethos_core::broker_config::BrokerAccountTarget {
+            account_id: "11".into(),
+            label: "unselected".into(),
+            enabled_for_execution: false,
+        };
+        let mut selected = disabled.clone();
+        selected.account_id = "22".into();
+        selected.enabled_for_execution = true;
+        settings.ctrader.accounts = vec![disabled, selected];
+        assert_eq!(execution_account_id(&settings).unwrap(), "22");
+        settings.ctrader.accounts[0].enabled_for_execution = true;
+        assert!(execution_account_id(&settings).is_err());
+        settings.ctrader.accounts.clear();
+        assert!(execution_account_id(&settings).is_err());
+    }
+
     fn sample_position() -> CTraderPositionSnapshot {
         CTraderPositionSnapshot {
             position_id: 42,
@@ -709,6 +766,7 @@ mod tests {
             // `pnl / (pip_value_quote × volume)` happened to produce the
             // right number when `volume` was passed as lots. Now the
             // fixture is wire-shape-accurate.
+            volume_raw_centi_units: 1_000_000,
             volume: 10_000.0,
             price: Some(1.0840),
             stop_loss: None,
@@ -743,6 +801,25 @@ mod tests {
             payload.pnl_pips, None,
             "pips stay unavailable until exact ProtoOASymbol/conversion provenance is wired"
         );
+    }
+
+    #[test]
+    fn position_to_payload_preserves_exact_raw_close_volume() {
+        let mut position = sample_position();
+        position.volume_raw_centi_units = 9_007_199_254_740_993;
+        position.volume = position.volume_raw_centi_units as f64 / 100.0;
+        let pnl = BTreeMap::from([(
+            position.position_id,
+            CTraderPositionUnrealizedPnL {
+                position_id: position.position_id,
+                gross_unrealized_pnl: 0.0,
+                net_unrealized_pnl: 0.0,
+            },
+        )]);
+        let payload = position_to_payload(&position, Some("EURUSD".to_string()), &pnl)
+            .expect("broker position payload");
+        assert_eq!(payload.volume_units, 9_007_199_254_740_993);
+        assert_eq!(payload.volume, position.volume);
     }
 
     #[test]

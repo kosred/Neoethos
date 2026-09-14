@@ -96,6 +96,20 @@ tempfile = "3.27"
 # `CUDA_FAST_MATH` must remain unset or `0` for parity.
 # The default feature set remains CPU-only and never resolves `cust`.
 [features]
+# One genuine HIP producer using the shared Session-v2 native kernel. This does
+# not enable CUDA, vector-ta's CUDA loader, or whole-store/Search HIP admission.
+gpu-hip-session = [
+    "dep:neoethos-gpu-contracts",
+    "dep:neoethos-gpu-cuda",
+    "neoethos-gpu-cuda/hip-session-kernels",
+]
+# SMC reuses the existing native family and one shared OHLCV upload. This is
+# still raw producer output, not complete feature-store or Search admission.
+gpu-hip-smc = [
+    "dep:neoethos-gpu-contracts",
+    "dep:neoethos-gpu-cuda",
+    "neoethos-gpu-cuda/hip-native-kernels",
+]
 gpu-cuda = [
     "dep:cust",
     "dep:neoethos-gpu-contracts",
@@ -107,3 +121,13 @@ gpu-cuda-device-fixtures = [
     "gpu-cuda",
     "neoethos-gpu-cuda/cuda-device-fixtures",
 ]
+
+[[example]]
+name = "hip_session_smoke"
+path = "examples/hip_session_smoke.rs"
+required-features = ["gpu-hip-session"]
+
+[[example]]
+name = "hip_shared_producers_smoke"
+path = "examples/hip_shared_producers_smoke.rs"
+required-features = ["gpu-hip-session", "gpu-hip-smc"]

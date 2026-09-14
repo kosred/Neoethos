@@ -1,6 +1,6 @@
 #include "resident_trim_prefilter_v1_abi.cuh"
 
-#include <cub/cub.cuh>
+#include "resident_parallel_primitives_v1.cuh"
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -109,6 +109,32 @@ bool finite_fraction_v1(double value) {
   return std::isfinite(value) && value >= 0.0 && value <= 1.0;
 }
 
+// The caller has validated finite 0 < fraction <= 1 and exact f64 row counts.
+// Keep the complete first-passage horizon inside the configured fit prefix.
+__host__ __device__ std::uint64_t label_safe_prefix_fit_rows_v1(
+    std::uint64_t selection_rows, double insample_fraction,
+    std::uint64_t max_hold_bars) {
+  const std::uint64_t requested_end = static_cast<std::uint64_t>(
+      floor(insample_fraction * static_cast<double>(selection_rows)));
+  const std::uint64_t fit_end =
+      requested_end < selection_rows ? requested_end : selection_rows;
+  const std::uint64_t horizon = max_hold_bars > 0U ? max_hold_bars : 1U;
+  return fit_end > horizon ? fit_end - horizon : 0U;
+}
+
+bool prefilter_active_v1(const NeoResidentTrimPrefilterPlanV1* plan) {
+  // Explicit legacy CPCV callers retain their existing low-level capability.
+  // Ordinary Discovery sends a single prefix fit, never pre-GA CPCV folds.
+  const bool explicit_cpcv = plan->cpcv_split_count >= 2U &&
+      plan->cpcv_test_group_count > 0U &&
+      plan->cpcv_test_group_count < plan->cpcv_split_count;
+  return plan->resolved_top_k > 0U &&
+      plan->parent_column_count > plan->resolved_top_k &&
+      (explicit_cpcv || label_safe_prefix_fit_rows_v1(
+          plan->selection_row_end - plan->selection_row_start,
+          plan->insample_fraction, plan->max_hold_bars) >= 3U);
+}
+
 struct AbsoluteViewRangesV1 {
   std::uint64_t outer_split_at;
   std::uint64_t selection_row_start;
@@ -150,7 +176,8 @@ bool resolve_absolute_view_ranges_v1(std::uint64_t parent_row_count,
 bool validate_import_and_plan_v1(const NeoResidentTrimPrefilterImportV1* import,
                                  const NeoResidentTrimPrefilterPlanV1* plan) {
   if (import == nullptr || plan == nullptr ||
-      import->abi_version != NEO_RESIDENT_TRIM_PREFILTER_ABI_V1 ||
+      (import->abi_version != NEO_RESIDENT_TRIM_PREFILTER_ABI_V1 &&
+       import->abi_version != NEO_RESIDENT_TRIM_PREFILTER_IMPORT_ABI_V2) ||
       plan->abi_version != NEO_RESIDENT_TRIM_PREFILTER_ABI_V1 ||
       import->admitted_run_stream == nullptr ||
       import->parent_ready_event == nullptr ||
@@ -178,7 +205,7 @@ bool validate_import_and_plan_v1(const NeoResidentTrimPrefilterImportV1* import,
           MINIMUM_DECIDED_FIRST_PASSAGE_LABELS_V1 ||
       plan->maximum_refit_folds != MAXIMUM_REFIT_FOLDS_V1 ||
       !finite_positive_v1(plan->insample_fraction) ||
-      plan->insample_fraction >= 1.0 ||
+      plan->insample_fraction > 1.0 ||
       !finite_positive_v1(plan->stop_atr_multiplier) ||
       !finite_positive_v1(plan->reward_risk_ratio) ||
       !std::isfinite(plan->round_trip_cost_price) ||
@@ -194,7 +221,10 @@ bool validate_import_and_plan_v1(const NeoResidentTrimPrefilterImportV1* import,
     return false;
   }
   const std::uint64_t packed = cells / 2U + cells % 2U;
-  if (import->packed_validity_bytes < packed ||
+  if ((import->abi_version == NEO_RESIDENT_TRIM_PREFILTER_ABI_V1 &&
+       import->packed_validity_bytes < packed) ||
+      (import->abi_version == NEO_RESIDENT_TRIM_PREFILTER_IMPORT_ABI_V2 &&
+       import->packed_validity_bytes < sizeof(unsigned int)) ||
       import->schema_metadata_bytes == 0U ||
       import->trim_prefilter_reserved_bytes < plan->charged_peak_device_bytes ||
       import->full_discovery_reserve_bytes !=
@@ -536,6 +566,7 @@ __device__ std::uint64_t ceil_fraction_rows_v1(std::uint64_t rows,
 
 __global__ void exact_fold_descriptors_kernel_v1(
     std::uint64_t selection_rows, double insample_fraction,
+    std::uint64_t max_hold_bars,
     std::uint64_t split_count, std::uint64_t test_group_count,
     double embargo_fraction, double purge_fraction,
     std::uint64_t cpcv_max_rows,
@@ -616,15 +647,8 @@ __global__ void exact_fold_descriptors_kernel_v1(
     }
   }
   if (!emitted_cpcv) {
-    std::uint64_t prefix_train_end = static_cast<std::uint64_t>(
-        floor(insample_fraction * static_cast<double>(selection_rows)));
-    if (prefix_train_end < 2U) {
-      prefix_train_end = 2U;
-    }
-    if (prefix_train_end > selection_rows - 1U) {
-      prefix_train_end = selection_rows - 1U;
-    }
-    const std::uint64_t prefix_exclusive_end = prefix_train_end - 1U;
+    const std::uint64_t prefix_exclusive_end = label_safe_prefix_fit_rows_v1(
+        selection_rows, insample_fraction, max_hold_bars);
     descriptors[0].capped_rows = selection_rows;
     descriptors[0].prefix_exclusive_end = prefix_exclusive_end;
     descriptors[0].use_cpcv = 0U;
@@ -834,6 +858,238 @@ __global__ void pairwise_two_pass_correlation_kernel_v1(
   column_scores[column] = worst;
   column_instability[column] = best - worst;
   column_rankability[column] = 1U;
+}
+
+struct ResidentTrimPrefilterScoreBatchAddressV2 {
+  std::uint64_t local_offset;
+  std::uint32_t global_parent_ordinal;
+};
+
+__host__ __device__ bool checked_resident_trim_prefilter_score_batch_address_v2(
+    const NeoResidentTrimPrefilterScoreBatchV2* batch, std::uint64_t row,
+    std::uint64_t local_column,
+    ResidentTrimPrefilterScoreBatchAddressV2* output) {
+  if (batch == nullptr || output == nullptr ||
+      row >= batch->batch_row_count ||
+      local_column >= batch->batch_column_count ||
+      batch->local_batch_stride < batch->batch_column_count ||
+      batch->global_parent_ordinals_device == nullptr ||
+      row > (U64_MAX_V1 - local_column) /
+                batch->local_batch_stride) {
+    return false;
+  }
+  output->local_offset = row * batch->local_batch_stride + local_column;
+  output->global_parent_ordinal =
+      batch->global_parent_ordinals_device[local_column];
+  return true;
+}
+
+__device__ bool load_resident_trim_prefilter_score_batch_cell_v2(
+    const NeoResidentTrimPrefilterScoreBatchV2* batch, std::uint64_t row,
+    std::uint64_t local_column, std::uint64_t parent_column_count,
+    double* value, unsigned char* validity) {
+  ResidentTrimPrefilterScoreBatchAddressV2 address{};
+  if (!checked_resident_trim_prefilter_score_batch_address_v2(
+          batch, row, local_column, &address) ||
+      address.global_parent_ordinal >= parent_column_count) {
+    return false;
+  }
+  *value = batch->batch_values_bar_major[address.local_offset];
+  *validity =
+      validity_code_v1(batch->batch_validity_u4, address.local_offset);
+  return true;
+}
+
+__device__ CorrelationOutcomeV1 pairwise_two_pass_one_direction_batch_v2(
+    const NeoResidentTrimPrefilterScoreBatchV2* batch, const double* labels,
+    std::uint64_t parent_column_count, std::uint64_t selection_row_start,
+    std::uint64_t selection_rows, std::uint64_t local_column,
+    const NeoResidentTrimPrefilterFoldDescriptorV1& descriptor,
+    NeoResidentTrimPrefilterDeviceSealV1* device_seal) {
+  std::uint64_t used = 0U;
+  std::uint64_t skipped = 0U;
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+  for (std::uint64_t row = 0U; row < selection_rows; ++row) {
+    if (!row_in_fold_train_v1(row, descriptor)) {
+      continue;
+    }
+    double x = 0.0;
+    unsigned char validity = 0U;
+    const std::uint64_t parent_row = selection_row_start + row;
+    if (!load_resident_trim_prefilter_score_batch_cell_v2(
+            batch, parent_row, local_column, parent_column_count, &x,
+            &validity)) {
+      atomicCAS(&device_seal->device_fault_word,
+                NEO_TRIM_PREFILTER_FAULT_NONE_V1,
+                NEO_TRIM_PREFILTER_FAULT_SELECTED_MAP_OVERFLOW_V1);
+      device_seal->valid = 0U;
+      return {0.0, used, skipped, false};
+    }
+    if (validity > 9U) {
+      atomicCAS(&device_seal->device_fault_word,
+                NEO_TRIM_PREFILTER_FAULT_NONE_V1,
+                NEO_TRIM_PREFILTER_FAULT_INVALID_VALIDITY_V1);
+      device_seal->valid = 0U;
+      ++skipped;
+      continue;
+    }
+    const double y = labels[row];
+    if (validity == 0U && isfinite(x) && isfinite(y)) {
+      ++used;
+      sum_x += x;
+      sum_y += y;
+    } else {
+      ++skipped;
+    }
+  }
+  if (used < MINIMUM_PAIRWISE_SAMPLES_V1) {
+    return {0.0, used, skipped, false};
+  }
+  const double mean_x = sum_x / static_cast<double>(used);
+  const double mean_y = sum_y / static_cast<double>(used);
+  double sxx = 0.0;
+  double syy = 0.0;
+  double sxy = 0.0;
+  for (std::uint64_t row = 0U; row < selection_rows; ++row) {
+    if (!row_in_fold_train_v1(row, descriptor)) {
+      continue;
+    }
+    double x = 0.0;
+    unsigned char validity = 0U;
+    const std::uint64_t parent_row = selection_row_start + row;
+    if (!load_resident_trim_prefilter_score_batch_cell_v2(
+            batch, parent_row, local_column, parent_column_count, &x,
+            &validity)) {
+      atomicCAS(&device_seal->device_fault_word,
+                NEO_TRIM_PREFILTER_FAULT_NONE_V1,
+                NEO_TRIM_PREFILTER_FAULT_SELECTED_MAP_OVERFLOW_V1);
+      device_seal->valid = 0U;
+      return {0.0, used, skipped, false};
+    }
+    const double y = labels[row];
+    if (validity != 0U || !isfinite(x) || !isfinite(y)) {
+      continue;
+    }
+    const double dx = x - mean_x;
+    const double dy = y - mean_y;
+    sxx += dx * dx;
+    syy += dy * dy;
+    sxy += dx * dy;
+  }
+  const double denominator = sqrt(sxx * syy);
+  if (!isfinite(denominator) || denominator <= 0.0) {
+    return {0.0, used, skipped, false};
+  }
+  double correlation = sxy / denominator;
+  if (!isfinite(correlation)) {
+    atomicCAS(&device_seal->device_fault_word,
+              NEO_TRIM_PREFILTER_FAULT_NONE_V1,
+              NEO_TRIM_PREFILTER_FAULT_NONFINITE_DECISION_V1);
+    device_seal->valid = 0U;
+    return {0.0, used, skipped, false};
+  }
+  correlation = fmax(-1.0, fmin(1.0, correlation));
+  return {fabs(correlation), used, skipped, true};
+}
+
+__global__ void resident_trim_prefilter_score_batch_kernel_v2(
+    NeoResidentTrimPrefilterScoreBatchV2 batch_value,
+    const unsigned char* column_class_flags_device, const double* long_labels,
+    const double* short_labels,
+    const NeoResidentTrimPrefilterFoldDescriptorV1* descriptors,
+    std::uint64_t parent_column_count, std::uint64_t selection_row_start,
+    std::uint64_t selection_rows, double* column_scores,
+    double* column_instability, unsigned char* column_rankability,
+    NeoResidentTrimPrefilterDeviceSealV1* device_seal) {
+  const NeoResidentTrimPrefilterScoreBatchV2* batch = &batch_value;
+  const std::uint64_t local_column = blockIdx.x;
+  if (local_column >= batch->batch_column_count || threadIdx.x != 0U) {
+    return;
+  }
+  ResidentTrimPrefilterScoreBatchAddressV2 address{};
+  if (!checked_resident_trim_prefilter_score_batch_address_v2(
+          batch, 0U, local_column, &address) ||
+      address.global_parent_ordinal >= parent_column_count) {
+    atomicCAS(&device_seal->device_fault_word,
+              NEO_TRIM_PREFILTER_FAULT_NONE_V1,
+              NEO_TRIM_PREFILTER_FAULT_SELECTED_MAP_OVERFLOW_V1);
+    device_seal->valid = 0U;
+    return;
+  }
+  const double first_value =
+      batch->batch_values_bar_major[address.local_offset];
+  const unsigned char first_validity =
+      validity_code_v1(batch->batch_validity_u4, address.local_offset);
+  (void)first_value;
+  (void)first_validity;
+  if ((column_class_flags_device[address.global_parent_ordinal] &
+       NEO_COLUMN_CLASS_STATE_V1) != 0U) {
+    column_scores[address.global_parent_ordinal] = F64_INFINITY_V1;
+    column_instability[address.global_parent_ordinal] = 0.0;
+    column_rankability[address.global_parent_ordinal] = 1U;
+    return;
+  }
+  double worst = F64_INFINITY_V1;
+  double best = 0.0;
+  bool rankable_in_all = true;
+  bool saw_fold = false;
+  for (std::uint64_t fold = 0U; fold < MAXIMUM_REFIT_FOLDS_V1; ++fold) {
+    if (descriptors[fold].valid == 0U) {
+      continue;
+    }
+    saw_fold = true;
+    const CorrelationOutcomeV1 long_outcome =
+        pairwise_two_pass_one_direction_batch_v2(
+            batch, long_labels, parent_column_count, selection_row_start,
+            selection_rows, local_column, descriptors[fold], device_seal);
+    const CorrelationOutcomeV1 short_outcome =
+        pairwise_two_pass_one_direction_batch_v2(
+            batch, short_labels, parent_column_count, selection_row_start,
+            selection_rows, local_column, descriptors[fold], device_seal);
+    if (!long_outcome.rankable && !short_outcome.rankable) {
+      rankable_in_all = false;
+      break;
+    }
+    double direction_score = long_outcome.rankable
+                                 ? long_outcome.absolute_correlation
+                                 : short_outcome.absolute_correlation;
+    if (short_outcome.rankable) {
+      direction_score = fmax(direction_score, short_outcome.absolute_correlation);
+    }
+    if (!isfinite(direction_score)) {
+      atomicCAS(&device_seal->device_fault_word,
+                NEO_TRIM_PREFILTER_FAULT_NONE_V1,
+                NEO_TRIM_PREFILTER_FAULT_NONFINITE_DECISION_V1);
+      device_seal->valid = 0U;
+      rankable_in_all = false;
+      break;
+    }
+    worst = fmin(worst, direction_score);
+    best = fmax(best, direction_score);
+  }
+  if (!saw_fold || !rankable_in_all || !isfinite(worst)) {
+    column_scores[address.global_parent_ordinal] = -F64_INFINITY_V1;
+    column_instability[address.global_parent_ordinal] = 0.0;
+    column_rankability[address.global_parent_ordinal] = 0U;
+    return;
+  }
+  column_scores[address.global_parent_ordinal] = worst;
+  column_instability[address.global_parent_ordinal] = best - worst;
+  column_rankability[address.global_parent_ordinal] = 1U;
+}
+
+__global__ void validate_streamed_score_coverage_kernel_v2(
+    const unsigned char* column_rankability, std::uint64_t parent_column_count,
+    NeoResidentTrimPrefilterDeviceSealV1* device_seal) {
+  const std::uint64_t column =
+      static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (column < parent_column_count && column_rankability[column] == 0xffU) {
+    atomicCAS(&device_seal->device_fault_word,
+              NEO_TRIM_PREFILTER_FAULT_NONE_V1,
+              NEO_TRIM_PREFILTER_FAULT_SELECTED_MAP_OVERFLOW_V1);
+    device_seal->valid = 0U;
+  }
 }
 
 __device__ std::uint64_t monotone_nonnegative_f64_key_v1(double value) {
@@ -1231,6 +1487,8 @@ struct NeoResidentTrimPrefilterRunV1 {
   void* cub_select_scratch;
   void* cub_radix_sort_scratch;
   std::uint64_t same_stream_enqueue_count;
+  std::uint64_t v2_scored_column_count;
+  bool v2_selected_map_sealed;
 };
 
 namespace {
@@ -1315,14 +1573,14 @@ bool query_cub_scratch_v1(std::uint64_t parent_column_count,
     return false;
   }
   std::size_t selected = 0U;
-  const cudaError_t select_status = cub::DeviceSelect::Flagged(
+  const cudaError_t select_status = neoethos_parallel_primitives_v1::DeviceSelect::Flagged(
       nullptr, selected, static_cast<const std::uint32_t*>(nullptr),
       static_cast<const unsigned char*>(nullptr),
       static_cast<std::uint32_t*>(nullptr),
       static_cast<std::uint64_t*>(nullptr),
       static_cast<int>(parent_column_count), stream);
   std::size_t sorted = 0U;
-  const cudaError_t sort_status = cub::DeviceRadixSort::SortPairsDescending(
+  const cudaError_t sort_status = neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(
       nullptr, sorted, static_cast<const std::uint64_t*>(nullptr),
       static_cast<std::uint64_t*>(nullptr),
       static_cast<const std::uint32_t*>(nullptr),
@@ -1343,9 +1601,7 @@ bool fill_allocation_receipt_v1(
   if (!validate_import_and_plan_v1(import, plan) || receipt == nullptr) {
     return false;
   }
-  const bool prefilter_active =
-      plan->resolved_top_k > 0U &&
-      plan->parent_column_count > plan->resolved_top_k;
+  const bool prefilter_active = prefilter_active_v1(plan);
   const std::uint64_t selection_rows =
       plan->selection_row_end - plan->selection_row_start;
   std::uint64_t long_labels_bytes = 0U;
@@ -1602,7 +1858,7 @@ cudaError_t initialize_run_buffers_v1(NeoResidentTrimPrefilterRunV1* run) {
         run->admitted_run_stream);
   }
   if (run->prefilter_active && status == cudaSuccess) {
-    status = cudaMemsetAsync(run->column_rankability_and_keep_flags, 0,
+    status = cudaMemsetAsync(run->column_rankability_and_keep_flags, 0xff,
                              run->plan.parent_column_count,
                              run->admitted_run_stream);
   }
@@ -1681,9 +1937,9 @@ extern "C" std::int32_t create_resident_trim_prefilter_run_v1(
   run->schema_ready_event = import->schema_ready_event;
   run->trim_prefilter_ready_event = import->trim_prefilter_ready_event;
   run->next_stage = STAGE_LABELS_V1;
-  run->prefilter_active =
-      plan->resolved_top_k > 0U &&
-      plan->parent_column_count > plan->resolved_top_k;
+  run->prefilter_active = prefilter_active_v1(plan);
+  run->v2_scored_column_count = 0U;
+  run->v2_selected_map_sealed = false;
   cudaError_t status = allocate_run_buffers_v1(run);
   if (status == cudaSuccess) {
     status = initialize_run_buffers_v1(run);
@@ -1701,6 +1957,8 @@ extern "C" std::int32_t create_resident_trim_prefilter_run_v1(
 extern "C" std::int32_t enqueue_resident_trim_prefilter_stage_v1(
     NeoResidentTrimPrefilterRunV1* run, std::uint32_t stage) {
   if (run == nullptr || stage != run->next_stage ||
+      (stage == STAGE_CORRELATIONS_V1 &&
+       run->import.abi_version == NEO_RESIDENT_TRIM_PREFILTER_IMPORT_ABI_V2) ||
       stage < STAGE_LABELS_V1 || stage > STAGE_DEVICE_SEAL_V1) {
     return NEO_TRIM_PREFILTER_STATUS_STATE_ERROR_V1;
   }
@@ -1739,7 +1997,7 @@ extern "C" std::int32_t enqueue_resident_trim_prefilter_stage_v1(
     status = cudaPeekAtLastError();
   } else if (stage == STAGE_FOLDS_V1 && run->prefilter_active) {
     exact_fold_descriptors_kernel_v1<<<1, 1, 0, run->admitted_run_stream>>>(
-        selection_rows, run->plan.insample_fraction,
+        selection_rows, run->plan.insample_fraction, run->plan.max_hold_bars,
         run->plan.cpcv_split_count, run->plan.cpcv_test_group_count,
         run->plan.cpcv_embargo_fraction, run->plan.cpcv_purge_fraction,
         run->plan.cpcv_max_rows, run->fold_descriptors, run->device_seal);
@@ -1765,7 +2023,7 @@ extern "C" std::int32_t enqueue_resident_trim_prefilter_stage_v1(
     if (status == cudaSuccess) {
       std::size_t scratch =
           static_cast<std::size_t>(run->receipt.cub_radix_sort_scratch_bytes);
-      status = cub::DeviceRadixSort::SortPairsDescending(
+      status = neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(
           run->cub_radix_sort_scratch, scratch, run->radix_keys_input,
           run->radix_keys_output, run->radix_indices_input,
           run->radix_indices_output, static_cast<int>(columns), 0, 64,
@@ -1798,7 +2056,7 @@ extern "C" std::int32_t enqueue_resident_trim_prefilter_stage_v1(
       if (status == cudaSuccess) {
         std::size_t scratch =
             static_cast<std::size_t>(run->receipt.cub_select_scratch_bytes);
-        status = cub::DeviceSelect::Flagged(
+        status = neoethos_parallel_primitives_v1::DeviceSelect::Flagged(
             run->cub_select_scratch, scratch, run->radix_indices_input,
             run->column_rankability_and_keep_flags,
             run->selected_compact_to_parent_columns_device,
@@ -1823,6 +2081,171 @@ extern "C" std::int32_t enqueue_resident_trim_prefilter_stage_v1(
   ++run->same_stream_enqueue_count;
   ++run->next_stage;
   return NEO_TRIM_PREFILTER_STATUS_OK_V1;
+}
+
+extern "C" std::int32_t enqueue_resident_trim_prefilter_score_batch_v2(
+    NeoResidentTrimPrefilterRunV1* run,
+    const NeoResidentTrimPrefilterScoreBatchV2* batch) {
+  if (run == nullptr || batch == nullptr ||
+      batch->abi_version != NEO_RESIDENT_TRIM_PREFILTER_SCORE_BATCH_ABI_V2 ||
+      batch->reserved != 0U ||
+      run->import.abi_version != NEO_RESIDENT_TRIM_PREFILTER_IMPORT_ABI_V2 ||
+      run->next_stage != STAGE_CORRELATIONS_V1 ||
+      run->v2_selected_map_sealed ||
+      batch->batch_values_bar_major == nullptr ||
+      batch->batch_validity_u4 == nullptr ||
+      batch->global_parent_ordinals_device == nullptr ||
+      batch->batch_ready_event == nullptr || batch->batch_row_count == 0U ||
+      batch->batch_row_count != run->plan.parent_row_count ||
+      batch->batch_column_count == 0U ||
+      batch->batch_column_count > MAX_GRID_X_V1 ||
+      batch->local_batch_stride < batch->batch_column_count ||
+      batch->global_parent_column_start != run->v2_scored_column_count) {
+    return NEO_TRIM_PREFILTER_STATUS_INVALID_ARGUMENT_V1;
+  }
+  std::uint64_t next_scored_column_count = 0U;
+  std::uint64_t batch_cell_extent = 0U;
+  if (!checked_add_v1(batch->global_parent_column_start,
+                      batch->batch_column_count,
+                      &next_scored_column_count) ||
+      next_scored_column_count > run->plan.parent_column_count ||
+      !checked_mul_v1(batch->batch_row_count, batch->local_batch_stride,
+                      &batch_cell_extent) ||
+      batch_cell_extent == 0U) {
+    return NEO_TRIM_PREFILTER_STATUS_INVALID_ARGUMENT_V1;
+  }
+  cudaError_t status = cudaStreamWaitEvent(
+      run->admitted_run_stream, batch->batch_ready_event, 0U);
+  if (status == cudaSuccess && run->prefilter_active) {
+    const std::uint64_t selection_rows =
+        run->plan.selection_row_end - run->plan.selection_row_start;
+    resident_trim_prefilter_score_batch_kernel_v2<<<
+        static_cast<std::uint32_t>(batch->batch_column_count), 32, 0,
+        run->admitted_run_stream>>>(
+        *batch, run->import.column_class_flags_device, run->long_labels,
+        run->short_labels, run->fold_descriptors,
+        run->plan.parent_column_count, run->plan.selection_row_start,
+        selection_rows, run->column_scores, run->column_instability,
+        run->column_rankability_and_keep_flags, run->device_seal);
+    status = cudaPeekAtLastError();
+  }
+  if (status != cudaSuccess) {
+    return NEO_TRIM_PREFILTER_STATUS_CUDA_ERROR_V1;
+  }
+  run->v2_scored_column_count = next_scored_column_count;
+  ++run->same_stream_enqueue_count;
+  return NEO_TRIM_PREFILTER_STATUS_OK_V1;
+}
+
+extern "C" std::int32_t seal_resident_trim_prefilter_selected_map_v2(
+    NeoResidentTrimPrefilterRunV1* run) {
+  if (run == nullptr || run->v2_selected_map_sealed ||
+      run->next_stage != STAGE_CORRELATIONS_V1) {
+    return NEO_TRIM_PREFILTER_STATUS_STATE_ERROR_V1;
+  }
+  if (run->v2_scored_column_count != run->plan.parent_column_count) {
+    return NEO_TRIM_PREFILTER_STATUS_STATE_ERROR_V1;
+  }
+  if (run->prefilter_active) {
+    constexpr std::uint32_t threads = 256U;
+    const std::uint32_t blocks = static_cast<std::uint32_t>(
+        divide_round_up_v1(run->plan.parent_column_count, threads));
+    validate_streamed_score_coverage_kernel_v2<<<
+        blocks, threads, 0, run->admitted_run_stream>>>(
+        run->column_rankability_and_keep_flags,
+        run->plan.parent_column_count, run->device_seal);
+    if (cudaPeekAtLastError() != cudaSuccess) {
+      return NEO_TRIM_PREFILTER_STATUS_CUDA_ERROR_V1;
+    }
+    ++run->same_stream_enqueue_count;
+  }
+  // Streaming batches have already covered every parent column, even when
+  // keep-all required no correlation kernels. Do not re-enter the V1 stage.
+  run->next_stage = STAGE_RANK_V1;
+  while (run->next_stage <= STAGE_DEVICE_SEAL_V1) {
+    const std::int32_t status = enqueue_resident_trim_prefilter_stage_v1(
+        run, run->next_stage);
+    if (status != NEO_TRIM_PREFILTER_STATUS_OK_V1) {
+      return status;
+    }
+  }
+  if (cudaEventRecord(run->trim_prefilter_ready_event,
+                      run->admitted_run_stream) != cudaSuccess) {
+    return NEO_TRIM_PREFILTER_STATUS_CUDA_ERROR_V1;
+  }
+  ++run->same_stream_enqueue_count;
+  run->v2_selected_map_sealed = true;
+  return NEO_TRIM_PREFILTER_STATUS_OK_V1;
+}
+
+extern "C" std::int32_t read_resident_trim_prefilter_selected_map_v2(
+    NeoResidentTrimPrefilterRunV1* run,
+    NeoResidentTrimPrefilterSelectedMapReadV2* read) {
+  if (run == nullptr || read == nullptr ||
+      read->abi_version != NEO_RESIDENT_TRIM_PREFILTER_SELECTED_MAP_READ_ABI_V2 ||
+      read->reserved != 0U || !run->v2_selected_map_sealed ||
+      run->next_stage != STAGE_DEVICE_SEAL_V1 + 1U ||
+      read->selected_capacity == 0U ||
+      read->selected_global_parent_ordinals_host == nullptr ||
+      read->selected_map_readback_ready_event == nullptr ||
+      read->selected_map_readback_ready_event !=
+          run->trim_prefilter_ready_event ||
+      run->selected_compact_to_parent_columns_device == nullptr ||
+      run->selected_column_count_device == nullptr) {
+    return NEO_TRIM_PREFILTER_STATUS_INVALID_ARGUMENT_V1;
+  }
+  cudaError_t status =
+      cudaEventSynchronize(run->trim_prefilter_ready_event);
+  NeoResidentTrimPrefilterDeviceSealV1 bounded_device_seal{};
+  if (status == cudaSuccess) {
+    status = cudaMemcpy(&bounded_device_seal, run->device_seal,
+                        sizeof(NeoResidentTrimPrefilterDeviceSealV1),
+                        cudaMemcpyDeviceToHost);
+  }
+  if (status == cudaSuccess) {
+    status = cudaMemcpy(
+        &read->selected_count, run->selected_column_count_device,
+        sizeof(std::uint64_t), cudaMemcpyDeviceToHost);
+  }
+  if (status != cudaSuccess) {
+    return NEO_TRIM_PREFILTER_STATUS_CUDA_ERROR_V1;
+  }
+  if (bounded_device_seal.abi_version != NEO_RESIDENT_TRIM_PREFILTER_ABI_V1 ||
+      bounded_device_seal.valid != 1U ||
+      bounded_device_seal.device_fault_word !=
+          NEO_TRIM_PREFILTER_FAULT_NONE_V1 ||
+      bounded_device_seal.selected_count != read->selected_count ||
+      bounded_device_seal.selection_row_start !=
+          run->plan.selection_row_start ||
+      bounded_device_seal.selection_row_end != run->plan.selection_row_end ||
+      bounded_device_seal.holdout_row_start != run->plan.holdout_row_start ||
+      bounded_device_seal.holdout_row_end != run->plan.holdout_row_end ||
+      read->selected_count > read->selected_capacity ||
+      read->selected_count > run->plan.parent_column_count) {
+    return NEO_TRIM_PREFILTER_STATUS_STATE_ERROR_V1;
+  }
+  std::uint64_t selected_map_readback_bytes = 0U;
+  if (!checked_mul_v1(read->selected_count, sizeof(std::uint32_t),
+                      &selected_map_readback_bytes)) {
+    return NEO_TRIM_PREFILTER_STATUS_INVALID_ARGUMENT_V1;
+  }
+  read->selected_map_readback_bytes = selected_map_readback_bytes;
+  if (selected_map_readback_bytes > 0U) {
+    status = cudaMemcpyAsync(
+        read->selected_global_parent_ordinals_host,
+        run->selected_compact_to_parent_columns_device,
+        static_cast<std::size_t>(selected_map_readback_bytes),
+        cudaMemcpyDeviceToHost, run->admitted_run_stream);
+  }
+  if (status == cudaSuccess) {
+    status = cudaEventRecord(read->selected_map_readback_ready_event,
+                             run->admitted_run_stream);
+  }
+  if (status == cudaSuccess) {
+    status = cudaEventSynchronize(read->selected_map_readback_ready_event);
+  }
+  return status == cudaSuccess ? NEO_TRIM_PREFILTER_STATUS_OK_V1
+                               : NEO_TRIM_PREFILTER_STATUS_CUDA_ERROR_V1;
 }
 
 extern "C" std::int32_t seal_resident_trim_prefilter_views_v1(

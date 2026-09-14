@@ -93,12 +93,13 @@ pub fn compare_metric_matrices(
 
     if !report.is_within_tolerance() && semantics.is_canonical() {
         bail!(
-            "canonical parity mismatch between {} and {}: {} cells exceeded tolerance {} (max delta {})",
+            "canonical parity mismatch between {} and {}: {} cells exceeded tolerance {} (max delta {}; first mismatch {:?})",
             report.reference_backend,
             report.candidate_backend,
             report.mismatches.len(),
             report.tolerance,
-            report.max_abs_delta
+            report.max_abs_delta,
+            report.mismatches.first()
         );
     }
 
@@ -108,7 +109,7 @@ pub fn compare_metric_matrices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{BacktestSettings, fast_evaluate_strategy_core};
+    use crate::eval::{BacktestSettings, SessionSpreadProfile, fast_evaluate_strategy_core};
     use crate::genetic::search_engine::evaluate_genes_test_oracle;
     use crate::genetic::{
         EvaluationConfig, Gene, month_day_indices, signals_and_confidence_for_gene_with_config,
@@ -201,6 +202,13 @@ mod tests {
             spread_pips: 0.0,
             commission_per_trade: 0.0,
             pip_value_per_lot: 10.0,
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
+            session_spread_pips: Some([0.2, 0.4, 0.6]),
+            risk_per_trade_min: 0.01,
+            risk_per_trade_max: 0.02,
+            high_quality_confidence: 0.5,
             smc_gate_threshold: 0.0,
             ..EvaluationConfig::default()
         }
@@ -217,6 +225,20 @@ mod tests {
             spread_pips: config.spread_pips,
             commission_per_trade: config.commission_per_trade,
             pip_value_per_lot: config.pip_value_per_lot,
+            kill_zones_enabled: config.kill_zones_enabled,
+            session_spread_profile: config.session_spread_pips.map(
+                |[asian_pips, overlap_pips, late_ny_pips]| SessionSpreadProfile {
+                    asian_pips,
+                    overlap_pips,
+                    late_ny_pips,
+                },
+            ),
+            swap_long_pips_per_day: config.swap_long_pips_per_day,
+            swap_short_pips_per_day: config.swap_short_pips_per_day,
+            pnl_conversion_fee_rate: config.pnl_conversion_fee_rate,
+            risk_per_trade_min: config.risk_per_trade_min,
+            risk_per_trade_max: config.risk_per_trade_max,
+            high_quality_confidence: config.high_quality_confidence,
             ..BacktestSettings::default()
         }
     }
@@ -230,12 +252,25 @@ mod tests {
         let candidate = evaluate_genes_test_oracle(&frame, &ohlcv, &genes, &config)
             .expect("population evaluator should score fixture genes");
 
-        let (_months, days) = month_day_indices(&frame.timestamps);
-        let months = vec![0_i64; frame.timestamps.len()];
+        let (months, days) = month_day_indices(&frame.timestamps);
         let settings = backtest_settings(&config);
+        let indicators = frame
+            .to_dense_samples_major()
+            .expect("dense parity fixture")
+            .values
+            .reversed_axes();
+        let offsets = [0_i32, 2, 4];
+        let indices = [0_i32, 1, 0, 1];
+        let weights = [0.8_f64, -0.4, -0.3, 0.9];
+        let long_thresholds = [0.35_f64, 0.25];
+        let short_thresholds = [-0.35_f64, -0.25];
+        let smc_rows = vec![[0_i8; 11]; frame.n_samples()];
+        let smc_flags = vec![[0_i8; 11]; genes.len()];
+        let smc_weights = [0.0_f64; 11];
         let reference: Vec<[f64; 11]> = genes
             .iter()
-            .map(|gene| {
+            .enumerate()
+            .map(|(gene_index, gene)| {
                 // Match the population evaluator's risk-based sizing: it now
                 // synthesizes per-bar confidence and sizes accordingly. The
                 // scalar reference must thread the SAME confidence (computed
@@ -244,6 +279,29 @@ mod tests {
                 let (signals, confidences) =
                     signals_and_confidence_for_gene_with_config(&frame, gene, &config)
                         .expect("valid parity signal inputs");
+                let (population_signals, population_confidences) =
+                    crate::eval::synthesize_signals_and_confidence_cpu(
+                        indicators.view(),
+                        &offsets,
+                        &indices,
+                        &weights,
+                        &long_thresholds,
+                        &short_thresholds,
+                        &smc_rows,
+                        &smc_flags,
+                        config.smc_gate_threshold,
+                        &smc_weights,
+                        gene_index,
+                        frame.n_samples(),
+                    );
+                assert_eq!(
+                    population_signals, signals,
+                    "population and scalar signal synthesis diverged for gene {gene_index}"
+                );
+                assert_eq!(
+                    population_confidences, confidences,
+                    "population and scalar confidence synthesis diverged for gene {gene_index}"
+                );
                 fast_evaluate_strategy_core(
                     &ohlcv.close,
                     &ohlcv.high,
@@ -273,6 +331,22 @@ mod tests {
         .expect("canonical fixture should match exactly");
         assert!(report.is_within_tolerance());
         assert_eq!(report.max_abs_delta, 0.0);
+    }
+
+    #[test]
+    fn population_evaluator_rejects_non_finite_financial_inputs_before_scoring() {
+        let frame = fixture_frame();
+        let ohlcv = fixture_ohlcv(&frame);
+        let genes = fixture_genes();
+        let mut config = eval_config();
+        config.swap_long_pips_per_day = f64::NAN;
+
+        let error = evaluate_genes_test_oracle(&frame, &ohlcv, &genes, &config)
+            .expect_err("non-finite broker financials must stop evaluation");
+        assert!(
+            error.to_string().contains("swap inputs must be finite"),
+            "unexpected rejection: {error:#}"
+        );
     }
 
     #[test]

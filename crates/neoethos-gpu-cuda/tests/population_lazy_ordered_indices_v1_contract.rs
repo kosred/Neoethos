@@ -1,6 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use neoethos_gpu_cuda::{
+    PopulationGeneStorePlanV1, PopulationMetricsOnlyPlanV1, PopulationParentDevicePlanV1,
+};
+
 fn manifest_dir() -> PathBuf {
     std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
@@ -13,13 +17,28 @@ fn read(relative: &str) -> String {
         .unwrap_or_else(|error| panic!("read required source {}: {error}", path.display()))
 }
 
-fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    let (_, tail) = source
-        .split_once(start)
-        .unwrap_or_else(|| panic!("missing source boundary {start:?}"));
-    tail.split_once(end)
-        .unwrap_or_else(|| panic!("missing source boundary {end:?} after {start:?}"))
-        .0
+fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing function signature {signature:?}"));
+    let open = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("missing function body for {signature:?}"));
+    let mut depth = 0usize;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated function body for {signature:?}")
 }
 
 fn require_all(source: &str, required: &[&str]) {
@@ -34,11 +53,7 @@ fn require_all(source: &str, required: &[&str]) {
 #[test]
 fn immutable_parent_upload_does_not_allocate_optional_view_buffers() {
     let cuda = read("native/prototype_b_population.cu");
-    let upload = section(
-        &cuda,
-        "neoethos_gpu_cuda_population_upload_parent_v1(",
-        "\n}\n\nextern \"C\" std::int32_t neoethos_gpu_cuda_population_bind_view_v1(",
-    );
+    let upload = function_body(&cuda, "neoethos_gpu_cuda_population_upload_parent_v1(");
     for forbidden in [
         "device_alloc(&session->view_indices",
         "device_alloc(&session->adaptive_base_pips",
@@ -53,24 +68,20 @@ fn immutable_parent_upload_does_not_allocate_optional_view_buffers() {
 #[test]
 fn full_and_range_views_need_no_device_index_map() {
     let cuda = read("native/prototype_b_population.cu");
-    let bind = section(
-        &cuda,
-        "neoethos_gpu_cuda_population_bind_view_v1(",
-        "\n}\n\nextern \"C\" std::int32_t neoethos_gpu_cuda_population_read_residency_counters_v1(",
-    );
+    let bind = function_body(&cuda, "neoethos_gpu_cuda_population_bind_view_v1(");
     require_all(
         bind,
         &[
             "NEO_POPULATION_VIEW_FULL",
             "NEO_POPULATION_VIEW_CONTIGUOUS_RANGE",
             "NEO_POPULATION_VIEW_ORDERED_INDICES",
-            "ordered_index_required_capacity",
+            "ensure_device_capacity_v3(&session->view_indices",
         ],
     );
     assert!(
         bind.find("NEO_POPULATION_VIEW_ORDERED_INDICES").unwrap()
             < bind
-                .find("grow_device_buffer(&session->view_indices")
+                .find("ensure_device_capacity_v3(&session->view_indices")
                 .unwrap(),
         "index-map allocation must be guarded by the ordered-index view"
     );
@@ -83,10 +94,10 @@ fn ordered_index_map_grows_to_required_capacity_and_reuses_larger_storage() {
         &cuda,
         &[
             "std::size_t view_indices_capacity = 0;",
-            "rows > session->view_indices_capacity",
-            "grow_device_buffer(&session->view_indices",
+            "required <= *capacity",
+            "ensure_device_capacity_v3(&session->view_indices",
             "&session->view_indices_capacity",
-            "ordered_index_capacity_bytes",
+            "view_indices_capacity",
         ],
     );
     assert!(
@@ -98,25 +109,21 @@ fn ordered_index_map_grows_to_required_capacity_and_reuses_larger_storage() {
 #[test]
 fn adaptive_base_buffer_is_lazy_and_grows_only_for_a_present_view_series() {
     let cuda = read("native/prototype_b_population.cu");
-    let bind = section(
-        &cuda,
-        "neoethos_gpu_cuda_population_bind_view_v1(",
-        "\n}\n\nextern \"C\" std::int32_t neoethos_gpu_cuda_population_read_residency_counters_v1(",
-    );
+    let bind = function_body(&cuda, "neoethos_gpu_cuda_population_bind_view_v1(");
     require_all(
         &cuda,
         &[
             "std::size_t adaptive_base_pips_capacity = 0;",
-            "rows > session->adaptive_base_pips_capacity",
+            "ensure_device_capacity_v3(&session->adaptive_base_pips",
             "&session->adaptive_base_pips_capacity",
-            "adaptive_capacity_bytes",
+            "adaptive_base_pips_capacity",
         ],
     );
     let presence = bind
         .find("view->adaptive_base_pips != nullptr")
         .expect("adaptive presence guard");
     let growth = bind
-        .find("grow_device_buffer(&session->adaptive_base_pips")
+        .find("ensure_device_capacity_v3(&session->adaptive_base_pips")
         .expect("adaptive lazy growth");
     assert!(
         presence < growth,
@@ -131,53 +138,60 @@ fn adaptive_base_buffer_is_lazy_and_grows_only_for_a_present_view_series() {
 #[test]
 fn host_budget_charges_one_parent_matrix_plus_exact_active_view_capacities() {
     let adapter = read("../neoethos-search/src/gpu_native/prototype_b_population_eval.rs");
-    let dataset = section(
-        &adapter,
-        "fn prototype_b_dataset_peak_bytes(",
-        "\n}\n\nfn candidates_for_free_memory(",
-    );
-    assert_eq!(
-        dataset.matches("indicator_bytes").count(),
-        2,
-        "one declaration and one addition must charge exactly one resident indicator matrix"
-    );
-    for stale in [
-        "charged twice",
-        "21.6 GB at the transpose peak",
-        "the CPU lane is the honest answer",
-    ] {
-        assert!(
-            !adapter.contains(stale),
-            "VRAM authority retains stale claim {stale:?}"
-        );
-    }
     require_all(
         &adapter,
         &[
-            "ordered_index_capacity_bytes",
-            "adaptive_capacity_bytes",
+            "checked_from_parent_and_view_extents_v1",
+            "ordered_index_capacity",
+            "adaptive_row_capacity",
+            "evidence.ordered_index_capacity_v1()",
+            "evidence.adaptive_row_capacity_v1()",
             "checked_add",
-            "StrictGpuMinimumBatchNotResident",
         ],
+    );
+
+    let immutable = PopulationParentDevicePlanV1::checked_from_parent_extents_v1(10_000, 257)
+        .expect("checked immutable parent");
+    let exact = PopulationParentDevicePlanV1::checked_from_parent_and_view_extents_v1(
+        10_000, 257, 2_500, 4_000,
+    )
+    .expect("checked exact active view capacities");
+    assert_eq!(exact.copied_parent_bytes(), immutable.copied_parent_bytes());
+    assert_eq!(exact.gap_flags_bytes(), immutable.gap_flags_bytes());
+    assert_eq!(exact.view_indices_bytes(), 2_500 * 8);
+    assert_eq!(exact.adaptive_base_pips_bytes(), 4_000 * 8);
+    assert_eq!(
+        exact.total_device_bytes(),
+        immutable.total_device_bytes() + (2_500 + 4_000) * 8
     );
 }
 
 #[test]
 fn worked_large_parent_budget_refuses_twelve_gib_but_fits_sixteen_gib() {
-    let adapter = read("../neoethos-search/src/gpu_native/prototype_b_population_eval.rs");
-    require_all(
-        &adapter,
-        &[
-            "12 * 1024 * 1024 * 1024",
-            "16 * 1024 * 1024 * 1024",
-            "5_270_000",
-            "257",
-            "Sizing::NoRoom",
-            "Sizing::Fits",
-        ],
-    );
-    assert!(
-        !adapter.contains("if fits < 16 {\n        return Sizing::NoRoom"),
-        "a small positive native fit still routes toward CPU instead of strict same-card batches"
-    );
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const PARENT_ROWS: usize = 5_270_000;
+    const STAGE1_ROWS: usize = 1_317_500;
+    const FEATURES: usize = 257;
+
+    let parent = PopulationParentDevicePlanV1::checked_from_parent_and_view_extents_v1(
+        PARENT_ROWS,
+        FEATURES,
+        0,
+        STAGE1_ROWS,
+    )
+    .expect("worked M1 parent and adaptive Stage-1 view");
+    let genes = PopulationGeneStorePlanV1::checked_from_gene_extents_v1(200, 3_200)
+        .expect("worked 200-gene store");
+    let scenarios = PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(16_384, 240)
+        .expect("worked strict scenario workspace");
+    let required = parent
+        .total_device_bytes()
+        .checked_add(genes.total_device_bytes())
+        .and_then(|bytes| bytes.checked_add(scenarios.total_device_bytes()))
+        .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
+        .expect("worked budget fits u64");
+    let twelve_gib_budget = (12 * GIB / 10) * 7;
+    let sixteen_gib_budget = (16 * GIB / 10) * 7;
+    assert!(required > twelve_gib_budget);
+    assert!(required <= sixteen_gib_budget);
 }

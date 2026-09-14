@@ -113,7 +113,9 @@ fn discovery_start_contract_rejects_a_noncanonical_dataset_identity() {
     .expect_err("noncanonical discovery identity must fail during request decoding");
 
     assert!(
-        error.to_string().contains("canonical dataset identity"),
+        error
+            .to_string()
+            .contains("dataset path contains a non-base32hex-lower character"),
         "unexpected decode error: {error}"
     );
 }

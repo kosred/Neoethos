@@ -59,6 +59,11 @@
 #include <cfloat>
 #include <cstdint>
 
+// M_PI is not standard C++; preserve binary64 pi on MSVC as well.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846264338327950288
+#endif
+
 #define GZ_MODE_NONE        0
 #define GZ_MODE_HP_SMOOTH   1
 #define GZ_MODE_ZL_SMOOTH   2

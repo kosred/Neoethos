@@ -7,6 +7,7 @@ use crate::runtime::capabilities::{
     CapabilityState, ModelFamily, append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason,
 };
 use crate::runtime::prediction::RuntimePrediction;
+use crate::statistical::common::temporal_train_validation_split;
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 use neoethos_core::storage::json::{
@@ -200,20 +201,6 @@ impl GeneticStrategyExpert {
         }
     }
 
-    fn split_label_train_val_indices(row_count: usize) -> (Vec<usize>, Vec<usize>) {
-        if row_count <= 4 {
-            return ((0..row_count).collect(), Vec::new());
-        }
-
-        let val_rows = ((row_count as f32) * 0.2).round() as usize;
-        let val_rows = val_rows.clamp(1, row_count.saturating_sub(1));
-        let train_rows = row_count - val_rows;
-
-        let train = (0..train_rows).collect::<Vec<_>>();
-        let val = (train_rows..row_count).collect::<Vec<_>>();
-        (train, val)
-    }
-
     fn slice_feature_frame(features: &FeatureFrame, indices: &[usize]) -> Result<FeatureFrame> {
         features
             .select_rows(indices)
@@ -313,18 +300,21 @@ impl GeneticStrategyExpert {
         if n_indicators == 0 {
             bail!("genetic label-search requires at least one feature column");
         }
-        let (train_indices, val_indices) = Self::split_label_train_val_indices(labels.len());
-        let train_features = Self::slice_feature_frame(features, &train_indices)?;
-        let train_labels = Self::slice_labels(labels, &train_indices)?;
-        let val_features = if val_indices.is_empty() {
+        let split = temporal_train_validation_split(labels.len());
+        let train_features = Self::slice_feature_frame(features, &split.train_indices)?;
+        let train_labels = Self::slice_labels(labels, &split.train_indices)?;
+        let val_features = if split.validation_indices.is_empty() {
             None
         } else {
-            Some(Self::slice_feature_frame(features, &val_indices)?)
+            Some(Self::slice_feature_frame(
+                features,
+                &split.validation_indices,
+            )?)
         };
-        let val_labels = if val_indices.is_empty() {
+        let val_labels = if split.validation_indices.is_empty() {
             None
         } else {
-            Some(Self::slice_labels(labels, &val_indices)?)
+            Some(Self::slice_labels(labels, &split.validation_indices)?)
         };
 
         let smc_cfg = SmcSearchConfig::current();
@@ -759,8 +749,13 @@ impl GeneticStrategyExpert {
 
     fn training_summary(&self, features: &FeatureFrame) -> TrainingSummaryMetadata {
         let dataset_rows = features.n_samples();
-        let (train_indices, val_indices) = Self::split_label_train_val_indices(dataset_rows);
-        TrainingSummaryMetadata::new(dataset_rows, train_indices.len(), val_indices.len())
+        let split = temporal_train_validation_split(dataset_rows);
+        TrainingSummaryMetadata::new(
+            dataset_rows,
+            split.train_indices.len(),
+            split.embargo_rows,
+            split.validation_indices.len(),
+        )
     }
 
     fn build_runtime_metadata(
@@ -820,12 +815,16 @@ impl GeneticStrategyExpert {
         if metadata.training_summary.train_rows == 0 {
             bail!("runtime metadata mismatch for {MODEL_NAME}: train_rows must be positive");
         }
-        if metadata.training_summary.train_rows + metadata.training_summary.val_rows
-            != metadata.training_summary.dataset_rows
-        {
+        let accounted_rows = metadata
+            .training_summary
+            .train_rows
+            .checked_add(metadata.training_summary.embargo_rows)
+            .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows));
+        if accounted_rows != Some(metadata.training_summary.dataset_rows) {
             bail!(
-                "runtime metadata mismatch for {MODEL_NAME}: training rows {} + validation rows {} must equal dataset rows {}",
+                "runtime metadata mismatch for {MODEL_NAME}: training rows {} + embargo rows {} + validation rows {} must equal dataset rows {}",
                 metadata.training_summary.train_rows,
+                metadata.training_summary.embargo_rows,
                 metadata.training_summary.val_rows,
                 metadata.training_summary.dataset_rows
             );
@@ -1308,7 +1307,7 @@ mod tests {
     fn sample_runtime_metadata(feature_columns: Vec<String>) -> RuntimeArtifactMetadata {
         GeneticStrategyExpert::build_runtime_metadata(
             feature_columns,
-            TrainingSummaryMetadata::new(24, 24, 0),
+            TrainingSummaryMetadata::new(24, 24, 0, 0),
         )
         .expect("build metadata")
     }
@@ -1497,6 +1496,7 @@ mod tests {
             .context("genetic runtime metadata should be present after fit")?;
         assert_eq!(metadata.training_summary.dataset_rows, 20);
         assert_eq!(metadata.training_summary.train_rows, 16);
+        assert_eq!(metadata.training_summary.embargo_rows, 0);
         assert_eq!(metadata.training_summary.val_rows, 4);
         Ok(())
     }

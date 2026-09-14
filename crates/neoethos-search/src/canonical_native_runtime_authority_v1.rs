@@ -382,11 +382,6 @@ fn backend_tag(backend: crate::EvaluationBackend) -> String {
     let accelerator = match backend.accelerator_hint {
         crate::AcceleratorHint::Any => "any",
         crate::AcceleratorHint::Cuda => "cuda",
-        crate::AcceleratorHint::Wgpu => "wgpu",
-        crate::AcceleratorHint::Vulkan => "vulkan",
-        crate::AcceleratorHint::Rocm => "rocm",
-        crate::AcceleratorHint::Metal => "metal",
-        crate::AcceleratorHint::Dx12 => "dx12",
     };
     format!("{device}:forbid_cpu:{accelerator}")
 }

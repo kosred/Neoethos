@@ -1,374 +1,349 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useMemo, useState } from "react";
 import {
   dataBootstrap,
-  dataImport,
+  discoveryStart,
+  discoveryStop,
   enginesStatus,
-  pickDataFile,
-  riskInfo,
-  settings,
-  updateSettings,
 } from "../api";
-import { usePoll } from "../hooks";
-import { TimeframeSelect } from "../components/Select";
-import { HelpPanel, HelpStep, Tip } from "../components/Help";
 import {
-  dataImportIdentityKey,
-  dataOperationErrorText,
-  expectedGenerationFor,
-  recordDatasetGeneration,
-  type CanonicalDatasetIdentity,
-  type DataImportBody,
-  type DataImportSourceFormat,
+  discoveryStartBody,
+  sameDiscoveryDatasetGeneration,
+  toggleDiscoveryDatasetSelection,
   type DatasetInventoryEntry,
-  type DatasetGenerationReceipts,
 } from "../apiContracts";
-import {
-  subscribe,
-  getSnapshot,
-  setQueue,
-  startQueue,
-  stopQueue,
-  clearQueue,
-  drive,
-  labelFor,
-  type QItem,
-} from "../discoveryQueue";
+import { DiscoveryParameters } from "../components/DiscoveryParameters";
+import { tfRank } from "../components/filterUtils";
+import { discoveryInventoryPage } from "../discoveryInventory";
+import { discoveryCounterRows, discoveryGenerationProgress, researchEngineStatus } from "../runtimeStatus";
+import { HelpPanel, HelpStep } from "../components/Help";
+import { usePoll } from "../hooks";
 import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
 
-// Fast-first TF order so the cheap, high-yield timeframes run before the
-// dense ones (M5/M3 take hours) — you get strategies quickly and the slow
-// units land last. Lower index = runs earlier.
-const TF_SPEED: string[] = [...CANONICAL_BROKER_TIMEFRAMES].reverse();
-const tfRank = (t: string) => {
-  const i = TF_SPEED.indexOf(t);
-  return i < 0 ? 99 : i;
-};
-
-const num = (s: string) => (s.trim() === "" ? undefined : Number(s));
-const statusIcon: Record<QItem["status"], string> = {
-  pending: "⏳",
-  running: "▶",
-  done: "✓",
-  failed: "✗",
-};
+const stateClass = (state: string) =>
+  state === "Running" || state === "Queued"
+    ? "live"
+    : state === "Succeeded" || state === "Published"
+      ? "demo"
+      : "";
 
 export default function Discovery() {
-  const { data: st, error } = usePoll(enginesStatus, 2000);
-  const { data: cfg, reload: reloadCfg } = usePoll(settings, 0);
-  const {
-    data: inventory,
-    error: inventoryError,
-    reload: reloadInventory,
-  } = usePoll(dataBootstrap, 5_000);
-  const q = useSyncExternalStore(subscribe, getSnapshot);
-  const [selectedDatasetIds, setSelectedDatasetIds] =
-    useState<CanonicalDatasetIdentity[]>([]);
-  const [riskPct, setRiskPct] = useState<number | null>(null);
-  const [adv, setAdv] = useState(false);
-  const [population, setPopulation] = useState("");
-  const [generations, setGenerations] = useState("");
-  const [targets, setTargets] = useState("");
-  const [portfolio, setPortfolio] = useState("");
-  const [msg, setMsg] = useState("");
+  const { data: engines, error: engineError } = usePoll(enginesStatus, 2_000);
+  const { data: inventory, error: inventoryError, reload: reloadInventory } =
+    usePoll(dataBootstrap, 5_000);
+  const [selectedEntries, setSelectedEntries] = useState<DatasetInventoryEntry[]>([]);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [parametersReady, setParametersReady] = useState(false);
+  const [inventoryQuery, setInventoryQuery] = useState("");
+  const [inventoryTimeframe, setInventoryTimeframe] = useState("");
+  const [inventoryPage, setInventoryPage] = useState(0);
 
-  // Import data file (lives here because data is only for search + training).
-  const [impSrc, setImpSrc] = useState("");
-  const [impFormat, setImpFormat] = useState<DataImportSourceFormat>("csv");
-  const [impNamespace, setImpNamespace] = useState("operator-upload");
-  const [impSym, setImpSym] = useState("EURUSD");
-  const [impTf, setImpTf] = useState("H1");
-  const [impTimestampConvention, setImpTimestampConvention] =
-    useState<DataImportBody["barTimestampConvention"]>("bar_open");
-  const [impMsg, setImpMsg] = useState("");
-  const [impBusy, setImpBusy] = useState(false);
-  const [importReceipts, setImportReceipts] = useState<DatasetGenerationReceipts>({});
+  const inventoryEntries = useMemo(() => inventory?.datasets ?? [], [inventory]);
+  const visibleInventory = useMemo(
+    () => discoveryInventoryPage(inventoryEntries, inventoryQuery, inventoryTimeframe, inventoryPage),
+    [inventoryEntries, inventoryQuery, inventoryTimeframe, inventoryPage],
+  );
+  const selectedDatasets = useMemo(
+    () => selectedEntries
+      .slice()
+      .sort((left, right) => {
+        const symbolOrder = (left.symbol ?? "").localeCompare(right.symbol ?? "");
+        if (symbolOrder !== 0) return symbolOrder;
+        return tfRank(left.timeframe ?? "") - tfRank(right.timeframe ?? "");
+      }),
+    [selectedEntries],
+  );
+  const unavailableDatasets = useMemo(
+    () => selectedDatasets.filter((selected) =>
+      !inventoryEntries.some((entry) => sameDiscoveryDatasetGeneration(selected, entry)),
+    ),
+    [inventoryEntries, selectedDatasets],
+  );
 
-  const browse = async () => {
-    try {
-      const p = await pickDataFile();
-      if (p) setImpSrc(p);
-    } catch (e) {
-      setImpMsg(String(e));
-    }
-  };
-  const doImport = async () => {
-    if (!impSrc) { setImpMsg("Choose a file first (Browse…)."); return; }
-    if (!impNamespace.trim()) { setImpMsg("Source namespace must be non-empty."); return; }
-    const sourceNamespace = impNamespace.trim();
-    const symbol = impSym.trim();
-    const requestIdentity = dataImportIdentityKey(
-      sourceNamespace,
-      symbol,
-      impTf,
-      impTimestampConvention,
-    );
-    setImpBusy(true);
-    setImpMsg("Importing…");
-    try {
-      const outcome = await dataImport(
-        impSrc,
-        impFormat,
-        sourceNamespace,
-        symbol,
-        impTf,
-        impTimestampConvention,
-        expectedGenerationFor(importReceipts, requestIdentity),
-      );
-      setImportReceipts((current) =>
-        recordDatasetGeneration(current, requestIdentity, outcome),
-      );
-      await reloadInventory();
-      setImpMsg(
-        `✓ Imported ${outcome.rowCount} rows as ${outcome.datasetIdentity} @ ${outcome.generation} → ${outcome.writtenPath}`,
-      );
-    } catch (e) {
-      setImpMsg(`Import failed: ${dataOperationErrorText(e)}`);
-    } finally {
-      setImpBusy(false);
-    }
-  };
-
-  const state = st?.discovery ?? "…";
-  const running = state === "Running";
-  const stage = st?.discoveryStage ?? st?.discovery_stage ?? "";
-  const percent = st?.discoveryPercent ?? st?.discovery_percent ?? 0;
-  const summary = st?.discoverySummary ?? st?.discovery_summary ?? "";
-  const counters = st?.discoveryCounters ?? st?.discovery_counters ?? [];
-
-  // RAM / disk readout (operator visibility).
-  const ramTotal = st?.ramTotalGb ?? 0;
-  const ramAvail = st?.ramAvailableGb ?? 0;
-  const ramUsedPct = ramTotal > 0 ? ((ramTotal - ramAvail) / ramTotal) * 100 : 0;
-  const diskMb = st?.featureStoreMb ?? 0;
-
-  // Drive the queue forward on every poll tick.
-  useEffect(() => {
-    if (st) void drive(st.discovery, summary);
-  }, [st]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Pre-flight risk visibility is independent from the exact data selector.
-  useEffect(() => {
-    let live = true;
-    riskInfo().then((r) => { if (live) setRiskPct(r.riskPerTrade); }).catch(() => {});
-    return () => { live = false; };
-  }, []);
-
-  const applyMode = async (m: "risky" | "prop_firm") => {
-    try {
-      await updateSettings({ tradingMode: m });
-      reloadCfg?.();
-    } catch { /* ignore */ }
-  };
-  const applyRisk = async (pctStr: string) => {
-    const pct = Number(pctStr);
-    if (!Number.isFinite(pct) || pct <= 0) return;
-    try {
-      await updateSettings({ riskPerTrade: pct / 100 });
-      const r = await riskInfo();
-      setRiskPct(r.riskPerTrade);
-    } catch { /* ignore */ }
-  };
-
-  const inventoryEntries = inventory ? inventory.datasets : [];
-  const selectedDatasets = inventoryEntries
-    .filter((entry) => selectedDatasetIds.includes(entry.datasetIdentity))
-    .slice()
-    .sort((left, right) => {
-      const symbolOrder = (left.symbol ?? "").localeCompare(right.symbol ?? "");
-      if (symbolOrder !== 0) return symbolOrder;
-      const timeframeOrder = tfRank(left.timeframe ?? "") - tfRank(right.timeframe ?? "");
-      return timeframeOrder || left.datasetIdentity.localeCompare(right.datasetIdentity);
-    });
+  const discoveryState = engines?.discovery ?? "Unknown";
+  const discoveryStatus = researchEngineStatus(discoveryState);
+  const discoveryRunning = discoveryState === "Running";
+  const researchRoute = engines?.discoveryStartMode === "ResearchOnly";
+  const discoveryAvailable = researchRoute && engines?.discoveryStartAvailable === true;
+  const discoveryPercent = typeof engines?.discoveryPercent === "number"
+    && Number.isFinite(engines.discoveryPercent)
+    ? Math.max(0, Math.min(100, engines.discoveryPercent))
+    : undefined;
+  const native = engines?.canonicalNativeResearch;
+  const generationProgress = discoveryGenerationProgress(engines?.discoveryCounters);
+  const counterRows = discoveryCounterRows(engines?.discoveryCounters);
+  const workingSetBatch = counterRows.find((counter) => counter.name === "working_set_batch");
+  const progressLabel = workingSetBatch ? "Current batch progress" : "Overall progress";
+  const nativeRunning = native?.state === "Running" || native?.state === "Queued";
+  const ramTotal = engines?.ramTotalGb ?? 0;
+  const ramAvailable = engines?.ramAvailableGb ?? 0;
+  const ramUsedPercent = ramTotal > 0
+    ? Math.max(0, Math.min(100, ((ramTotal - ramAvailable) / ramTotal) * 100))
+    : 0;
 
   const toggleDataset = (entry: DatasetInventoryEntry) => {
-    setSelectedDatasetIds((current) =>
-      current.includes(entry.datasetIdentity)
-        ? current.filter((identity) => identity !== entry.datasetIdentity)
-        : [...current, entry.datasetIdentity],
-    );
+    setSelectedEntries((current) => toggleDiscoveryDatasetSelection(current, entry));
   };
 
-  const queued = q.items.length;
-  const done = q.items.filter((i) => i.status === "done").length;
-  const failed = q.items.filter((i) => i.status === "failed").length;
-
-  const launch = () => {
-    if (selectedDatasets.length === 0) {
-      setMsg("Select at least one exact canonical dataset generation from Data.");
-      return;
+  const startResearchRun = async () => {
+    const selected = selectedDatasets[0];
+    if (!selected || selectedDatasets.length !== 1 || unavailableDatasets.length > 0 || busy || discoveryRunning || !discoveryAvailable || !parametersReady || engineError || inventoryError) return;
+    setBusy(true);
+    setMessage(`Requesting exact ${selected.symbol} ${selected.timeframe} run…`);
+    try {
+      await discoveryStart(discoveryStartBody(selected, {}));
+      setMessage("Research request accepted for the exact dataset generation. Input preparation and search progress appear above; this does not authorize trading.");
+    } catch (error) {
+      setMessage(`Search start failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
     }
-    setQueue(selectedDatasets, {
-      population: num(population),
-      generations: num(generations),
-      target_candidates: num(targets),
-      portfolio_size: num(portfolio),
-    });
-    startQueue();
-    setMsg(
-      `Queued ${selectedDatasets.length} exact dataset run${selectedDatasets.length === 1 ? "" : "s"}.`,
-    );
   };
 
-  const stop = async () => {
-    await stopQueue();
-    setMsg("Stopped — current run cancelled, queue cleared.");
+  const stopCurrentRun = async () => {
+    setBusy(true);
+    try {
+      const result = await discoveryStop();
+      setMessage(result.running
+        ? "Cancellation requested. The worker remains active until it has stopped safely."
+        : "No active research run remains to stop.");
+    } catch (error) {
+      setMessage(`Stop failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
     <div className="screen">
-      <h1>
-        Discovery{" "}
-        {cfg?.tradingMode && (
-          <span className={`badge ${cfg.tradingMode === "risky" ? "live" : "demo"}`}>
-            {cfg.tradingMode === "risky" ? "🚀 RISKY MODE" : "🛡 PROP-FIRM MODE"}
-          </span>
-        )}
-      </h1>
+      <h1>Strategy search</h1>
       <p className="sub">
-        Genetic strategy search · queue many pairs · <b>mode + tuning in Settings</b>
+        Indicator + SMC search · exact data · separate execution validation
       </p>
 
       <HelpPanel id="discovery">
         <p>
-          Discovery is the <b>strategy factory</b>. Select one or more exact canonical datasets from
-          the authoritative Data inventory, press <b>Start queue</b>, and it runs each identity in turn.
+          Search combines indicators and SMC using the saved objectives and risk settings.
+          Select an exact dataset generation, then start the research run.
         </p>
-        <HelpStep n={1}>
-          Select the exact <b>identity + current generation</b>. Symbol and timeframe labels are shown
-          only as consistency assertions; they never choose a file.
-        </HelpStep>
-        <HelpStep n={2}>
-          Every timeframe must be downloaded from the broker or imported directly at that same
-          timeframe. Missing higher-timeframe data stops that run and reports the backend error.
-        </HelpStep>
-        <HelpStep n={3}>
-          The <b>RAM / disk</b> strip shows what the run is consuming: cubes that fit in RAM use no
-          disk; large ones stream to disk and are freed as each timeframe finishes. Results appear in{" "}
-          <b>Strategy Lab</b> / <b>Autopilot</b>.
-        </HelpStep>
-        <p className="muted small">
-          The engine runs in-process, so keep the app open while a queue runs. Leaving this screen is
-          fine — the queue resumes when you return.
-        </p>
+        <HelpStep n={1}>Select exact canonical generations, not a symbol/timeframe filename guess.</HelpStep>
+        <HelpStep n={2}>Discovery prepares inputs, searches candidates and screens the calibration window using research cost assumptions. The reserved final window is evaluated separately from the selected handoff. ResearchOnly means the result is not approved for live trading.</HelpStep>
+        <HelpStep n={3}>Exact bid/ask fills and historical execution costs need their own validation. The CUDA Generation-0 lane below is a separate kernel-research path, not the complete strategy search.</HelpStep>
       </HelpPanel>
 
-      {/* ── Live machine-resource strip ── */}
-      <div className="res-strip">
+      <DiscoveryParameters onReadinessChange={setParametersReady} />
+
+      <div className="res-strip" aria-label="Current machine resources">
         <div className="res-item">
-          <div className="res-label">
-            RAM {ramAvail.toFixed(1)} GB free of {ramTotal.toFixed(0)} GB
-          </div>
-          <div className="res-bar">
-            <div className="res-fill" style={{ width: `${Math.min(100, ramUsedPct)}%` }} />
-          </div>
+          <div className="res-label">{engines ? `RAM ${ramAvailable.toFixed(1)} GB free of ${ramTotal.toFixed(1)} GB` : "RAM availability unknown"}</div>
+          <div className="res-bar"><div className="res-fill" style={{ width: `${ramUsedPercent}%` }} /></div>
         </div>
         <div className="res-item res-disk">
-          <div className="res-label">Discovery disk</div>
-          <div className="res-value">
-            {diskMb > 0 ? `${(diskMb / 1024).toFixed(2)} GB` : "0 (all in RAM)"}
-          </div>
+          <div className="res-label">Active Vortex scratch</div>
+          <div className="res-value">{engines ? `${((engines.featureStoreMb ?? 0) / 1024).toFixed(2)} GiB` : "—"}</div>
         </div>
       </div>
 
-      {/* ── Currently running ── */}
-      <div className="engine-status">
-        <span className={`badge ${running ? "live" : "demo"}`}>
-          {running ? "RUNNING" : state.toUpperCase()}
-        </span>
-        {stage && <span className="muted">{stage}</span>}
-        {running && (
-          <div className="progress">
-            <div className="progress-bar" style={{ width: `${Math.min(100, percent)}%` }} />
-            <span className="progress-label">{percent.toFixed(0)}%</span>
-          </div>
-        )}
-      </div>
-      {summary && <div className="banner info">{summary}</div>}
-      {error && <div className="banner warn">{error}</div>}
-      {inventoryError && <div className="banner warn">{inventoryError}</div>}
-
-      {counters.length > 0 && (
-        <div
-          className="cards"
-          style={{ gridTemplateColumns: `repeat(${Math.min(4, counters.length)}, 1fr)` }}
-        >
-          {counters.map((c) => (
-            <div className="card" key={c.name}>
-              <div className="card-label">{c.name.toUpperCase()}</div>
-              <div className="card-value">{c.value.toLocaleString()}</div>
+      <h2>Execution lanes</h2>
+      <div className="engine-lanes">
+        <section className="ticket engine-lane" aria-labelledby="native-research-lane">
+          <div className="engine-lane-head">
+            <div>
+              <h3 id="native-research-lane">Canonical CUDA · ResearchOnly</h3>
+              <p className="muted small">Sealed contract → device Generation 0 → evidence receipt</p>
             </div>
-          ))}
+            <span className={`badge ${stateClass(native?.state ?? "Unknown")}`}>{native?.state ?? "Unknown"}</span>
+          </div>
+          <p className={native?.available ? "buy" : "muted"}>
+            {native?.availabilityDetail ?? "Reading native runtime capability…"}
+          </p>
+          {native?.stage && <p><b>Stage:</b> {native.stage} · {native.percent.toFixed(1)}%</p>}
+          {nativeRunning && <progress max={100} value={native?.percent ?? 0}>{native?.percent ?? 0}%</progress>}
+          {native?.failureDetail && (
+            <div className="banner warn" role="alert">
+              {native.failureStage ?? "native research"} · {native.failureCode ?? "failed"}: {native.failureDetail}
+            </div>
+          )}
+          {native?.published && (
+            <div className="banner info">
+              Published <code>{native.published.relativePath}</code><br />
+              <span className="small">engine {native.published.engine} · population {native.published.resolvedPopulation.toLocaleString()} · device {native.published.selectedDeviceOrdinal}</span>
+            </div>
+          )}
+          <p className="muted small">
+            Dataset rows on this screen are not yet wired to the sealed-contract builder, so the UI
+            does not fabricate a native start request from incomplete inputs.
+          </p>
+        </section>
+
+        <section className="ticket engine-lane" aria-labelledby="strategy-discovery-lane">
+          <div className="engine-lane-head">
+            <div>
+              <h3 id="strategy-discovery-lane">Strategy discovery · ResearchOnly</h3>
+              <p className="muted small">Input preparation → indicator + SMC search → calibration screening</p>
+            </div>
+            <span className={`badge ${discoveryStatus.badgeClass}`}>{discoveryStatus.label}</span>
+          </div>
+          <p className={discoveryAvailable ? "buy" : "muted"}>
+            {discoveryRunning
+              ? "Research is running. Input preparation and search progress appear below."
+              : discoveryAvailable
+                ? "Research requests are available. Selected data and cost sources are checked at start."
+                : engines ? "New research requests are currently unavailable." : "Waiting for backend status."}
+          </p>
+          {engines && !researchRoute && (
+            <div className="banner warn" role="alert">This backend does not advertise the ResearchOnly start contract. Restart with the matching application build before starting.</div>
+          )}
+          {!discoveryRunning && !discoveryAvailable && engines?.discoveryStartUnavailableReason && (
+            <div className="banner warn" role="alert">
+              {engines.discoveryStartUnavailableReason}
+            </div>
+          )}
+          {(discoveryStatus.notice || engines?.discoverySummary) && (
+            <div className={`banner ${discoveryStatus.warning ? "warn" : "info"}`} role={discoveryStatus.warning ? "alert" : "status"}>
+              {discoveryStatus.notice && <p>{discoveryStatus.notice}</p>}
+              <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{engines?.discoverySummary}</div>
+            </div>
+          )}
+          {discoveryRunning && (
+            <>
+              <p><b>{progressLabel}:</b> {discoveryPercent === undefined ? "Progress not yet measurable" : `${discoveryPercent.toFixed(1)}%`} · <b>Stage:</b> {engines?.discoveryStage || "running"}</p>
+              <progress aria-label={progressLabel} max={100} value={discoveryPercent}>{discoveryPercent === undefined ? "Indeterminate" : `${discoveryPercent}%`}</progress>
+              {engines?.discoveryStage === "search_generations" && generationProgress && (
+                <p className="small"><b>Generations:</b> {generationProgress.completed.toLocaleString()} / {generationProgress.total.toLocaleString()} · {generationProgress.percent.toFixed(1)}% of generations</p>
+              )}
+              <button type="button" className="danger" disabled={busy} onClick={stopCurrentRun}>Stop current run</button>
+            </>
+          )}
+          {counterRows.length > 0 && (
+            <details open>
+              <summary>Search counts · {discoveryRunning ? "current run" : "last reported run"}</summary>
+              {workingSetBatch && (
+                <p className="muted small">
+                  Batch {workingSetBatch.value === null ? "unknown" : workingSetBatch.value.toLocaleString()}.
+                  Population, generation and validation counts refer to this batch; batch totals refer to the whole run.
+                  Completed batches include empty results. Saved reports are not trading approval.
+                </p>
+              )}
+              <p className="muted small">Planned evaluations, unique candidates and validation tests are different counts. Capped or not-tested candidates did not fail OOS. Unreported stages remain unknown.</p>
+              <table className="tbl" aria-label="Discovery candidate and validation counts">
+                <thead><tr><th scope="col">Observation</th><th scope="col">Count</th></tr></thead>
+                <tbody>
+                  {counterRows.map((counter) => (
+                    <tr key={counter.name}>
+                      <th scope="row">{counter.label}</th>
+                      <td>{counter.value === null ? "Unavailable" : counter.value.toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </details>
+          )}
+          <details>
+            <summary>Historical execution validation</summary>
+            <p className="muted small">The Discovery start button does not yet run the reviewed bid/ask replay or its execution-cost ledger. Completing research is not proof of validated fills, profit, or readiness for live trading.</p>
+            <p className="small">{engines?.historicalEvaluationAvailable === true ? "Historical financial capability is available separately." : "Historical financial capability is not available for this process."}</p>
+            {engines?.historicalEvaluationUnavailableReason && <p className="muted small break-anywhere">{engines.historicalEvaluationUnavailableReason}</p>}
+          </details>
+        </section>
+      </div>
+
+      {engineError && <div className="banner warn" role="alert">{engineError}</div>}
+      {inventoryError && <div className="banner warn" role="alert">{inventoryError}</div>}
+
+      <div className="section-heading-row">
+        <div>
+          <h2>Research dataset plan</h2>
+          <p className="muted small">{selectedDatasets.length} exact generation{selectedDatasets.length === 1 ? "" : "s"} selected</p>
+        </div>
+        <div className="btn-row">
+          <button type="button" onClick={() => void reloadInventory()}>Refresh inventory</button>
+          <button type="button" onClick={() => setSelectedEntries([])}>Clear</button>
+        </div>
+      </div>
+
+      {unavailableDatasets.length > 0 && (
+        <div className="banner warn" role="alert">
+          <b>Selected data changed or is no longer available.</b>
+          <p>Start is blocked. Select the current row again, or clear the unavailable selections below. Your selected versions are not replaced automatically.</p>
+          <ul>
+            {unavailableDatasets.map((entry) => (
+              <li key={entry.datasetIdentity}>
+                {entry.symbol} {entry.timeframe} · <code className="break-anywhere">{entry.generation}</code>
+                <details>
+                  <summary>Selected identity and manifest binding</summary>
+                  <code className="break-anywhere">{entry.datasetIdentity}</code><br />
+                  <code className="break-anywhere">{entry.manifestBindingSha256}</code>
+                </details>
+              </li>
+            ))}
+          </ul>
+          <button type="button" onClick={() => setSelectedEntries((current) =>
+            current.filter((selected) => inventoryEntries.some((entry) => sameDiscoveryDatasetGeneration(selected, entry))),
+          )}>Clear unavailable selections</button>
         </div>
       )}
 
-      {/* ── Queue ── */}
-      {queued > 0 && (
-        <>
-          <h2>
-            Queue{" "}
-            <span className="muted">
-              — {done} done · {queued - done - failed} left
-              {failed ? ` · ${failed} failed` : ""}
-            </span>
-          </h2>
-          <div className="queue-list">
-            {q.items.map((it) => (
-              <div className={`q-item q-${it.status}`} key={it.id}>
-                <span className="q-icon">{statusIcon[it.status]}</span>
-                <span className="q-name">{labelFor(it.symbol ?? "?", it.timeframe ?? "?", it.generation)}</span>
-                {it.status === "running" && (
-                  <span className="q-prog">
-                    <span className="q-bar">
-                      <span className="q-fill" style={{ width: `${Math.min(100, percent)}%` }} />
-                    </span>
-                    {stage || "running"} · {percent.toFixed(0)}%
-                  </span>
-                )}
-                {it.note && it.status !== "running" && (
-                  <span className="q-note muted">{it.note}</span>
-                )}
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-
-      {/* ── Build a queue ── */}
-      <h2>Build a queue</h2>
-      <div className="ticket">
-        <label className="picker-label">
-          Exact canonical datasets <span className="muted">({selectedDatasets.length} selected)</span>
-          <div className="picker-actions">
-            <button
-              type="button"
-              className="link"
-              onClick={() => setSelectedDatasetIds(
-                inventoryEntries
-                  .filter((entry) => entry.symbol !== null && entry.timeframe !== null)
-                  .map((entry) => entry.datasetIdentity),
-              )}
-            >all</button>
-            <button type="button" className="link" onClick={() => setSelectedDatasetIds([])}>none</button>
-          </div>
-        </label>
-        {inventoryEntries.length === 0 ? (
-          <div className="banner warn">
-            No canonical dataset generation is available. Download or import each exact timeframe in Data.
-          </div>
+      <div className="ticket research-admission">
+        {!parametersReady && <p className="banner warn">Search parameters must be loaded and saved before starting. Unsaved edits are not used by the engine.</p>}
+        {selectedDatasets.length > 1 ? (
+          <div className="banner warn">The backend has no parallel batch admission for these {selectedDatasets.length} exact generations. Select one generation to start.</div>
+        ) : selectedDatasets.length === 1 ? (
+          <p className="muted small">Start uses the saved search settings and the exact selected generation; it does not start training or trading.</p>
         ) : (
+          <p className="muted small">Select one generation below to start research.</p>
+        )}
+        {selectedDatasets.map((entry) => (
+          <div key={entry.datasetIdentity}>
+            <b>{entry.symbol} · {entry.timeframe}</b> · {entry.sourceKind}
+            <details><summary>Selected generation</summary><code className="break-anywhere">{entry.generation}</code></details>
+            <button type="button" onClick={() => toggleDataset(entry)}>Remove {entry.symbol} {entry.timeframe}</button>
+          </div>
+        ))}
+        <button
+          type="button"
+          className="primary"
+          disabled={busy || discoveryRunning || !discoveryAvailable || !parametersReady || !!engineError || !!inventoryError || selectedDatasets.length !== 1 || unavailableDatasets.length > 0}
+          onClick={startResearchRun}
+        >
+          {discoveryAvailable ? "Start strategy research" : "Research start unavailable"}
+        </button>
+        {message && <div className="banner info" role="status">{message}</div>}
+      </div>
+
+      <div className="btn-row" role="search" aria-label="Filter research datasets">
+        <label>Find dataset
+          <input type="search" value={inventoryQuery} placeholder="Symbol, source or exact identity"
+            onChange={(event) => { setInventoryQuery(event.target.value); setInventoryPage(0); }} />
+        </label>
+        <label>Timeframe
+          <select value={inventoryTimeframe} onChange={(event) => { setInventoryTimeframe(event.target.value); setInventoryPage(0); }}>
+            <option value="">All timeframes</option>
+            {CANONICAL_BROKER_TIMEFRAMES.map((tf) => <option key={tf} value={tf}>{tf}</option>)}
+          </select>
+        </label>
+        <span className="muted small" role="status">{visibleInventory.matched} of {inventoryEntries.length} datasets · selections stay pinned when filtered</span>
+      </div>
+
+      {inventoryEntries.length === 0 ? (
+        <div className="banner warn">{inventory && !inventoryError ? "No verified canonical datasets are available. Use Data to download or import them." : "Dataset inventory is not confirmed. Waiting for a successful backend response."}</div>
+      ) : visibleInventory.matched === 0 ? (
+        <div className="banner info">No datasets match these filters. Existing selections are unchanged.</div>
+      ) : (
+        <div className="table-scroll" tabIndex={0} aria-label="Canonical research dataset inventory">
           <table className="tbl">
             <thead>
-              <tr><th>Select</th><th>Symbol</th><th>TF</th><th>Current generation</th><th>Exact identity</th><th>Verification</th></tr>
+              <tr><th>Select</th><th>Symbol</th><th>TF</th><th>Source</th><th>Exact generation details</th><th>Verification</th></tr>
             </thead>
             <tbody>
-              {inventoryEntries.map((entry) => {
+              {visibleInventory.entries.map((entry) => {
                 const assertionMetadataMissing = entry.symbol === null || entry.timeframe === null;
                 return (
                   <tr key={entry.datasetIdentity}>
                     <td>
                       <input
                         type="checkbox"
-                        checked={selectedDatasetIds.includes(entry.datasetIdentity)}
+                        checked={selectedDatasets.some((selected) => sameDiscoveryDatasetGeneration(selected, entry))}
                         disabled={assertionMetadataMissing}
                         onChange={() => toggleDataset(entry)}
                         aria-label={`Select exact dataset ${entry.datasetIdentity}`}
@@ -376,165 +351,44 @@ export default function Discovery() {
                     </td>
                     <td>{entry.symbol ?? "missing"}</td>
                     <td>{entry.timeframe ?? "missing"}</td>
-                    <td><code>{entry.generation}</code></td>
-                    <td><code style={{ overflowWrap: "anywhere" }}>{entry.datasetIdentity}</code></td>
+                    <td>{entry.sourceKind}</td>
+                    <td>
+                      <details>
+                        <summary>Identity, generation and binding</summary>
+                        <code className="break-anywhere">{entry.datasetIdentity}</code><br />
+                        <code className="break-anywhere">{entry.generation}</code><br />
+                        <code className="break-anywhere">{entry.manifestBindingSha256}</code>
+                      </details>
+                    </td>
                     <td>{assertionMetadataMissing ? "missing assertion metadata" : entry.verification}</td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
-        )}
-
-        {(inventory?.skipped.length ?? 0) > 0 && (
-          <div className="banner warn">
-            <b>Import/download required or rejected data:</b>
-            <ul>
-              {inventory!.skipped.map((item) => (
-                <li key={`${item.path}:${item.category}:${item.detail}`}>
-                  <code>{item.path}</code> — {item.category}: {item.detail}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        <label style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 12 }}>
-          <input type="checkbox" checked={adv} onChange={(e) => setAdv(e.target.checked)} /> Advanced knobs
-        </label>
-        {adv && (
-          <div className="ticket-row" style={{ marginTop: 8 }}>
-            <label>Population<input type="number" min="0" step="50" value={population} placeholder="default" onChange={(e) => setPopulation(e.target.value)} /></label>
-            <label>Generations<input type="number" min="0" step="10" value={generations} placeholder="default" onChange={(e) => setGenerations(e.target.value)} /></label>
-            <label>Target candidates<input type="number" min="0" step="10" value={targets} placeholder="default" onChange={(e) => setTargets(e.target.value)} /></label>
-            <label>Portfolio size<input type="number" min="0" step="1" value={portfolio} placeholder="default" onChange={(e) => setPortfolio(e.target.value)} /></label>
-          </div>
-        )}
-
-        {/* ── Pre-flight: choose mode/risk + see EXACTLY what will run ── */}
-        <h2 style={{ marginTop: 12 }}>Before you start — what THIS search will use</h2>
-        <div className="ticket-row" style={{ alignItems: "flex-end" }}>
-          <label>
-            Mode <Tip text="Applies to THIS search (saved to config as system.trading_mode). Risky = aggressive account-multiplication, drawdown-agnostic, ranks by fastest compounding. Prop-firm = robust FTMO-style rules (low drawdown / daily-loss limits)." />
-            <select value={cfg?.tradingMode ?? "risky"} onChange={(e) => applyMode(e.target.value as "risky" | "prop_firm")}>
-              <option value="risky">🚀 Risky</option>
-              <option value="prop_firm">🛡 Prop-firm</option>
-            </select>
-            {/* models.discovery_mode can override this switch and reach a mode
-                (`strict`) it cannot express. The backend resolves and ships the
-                effective value; showing only the switch would let this
-                pre-flight promise one regime and run another. */}
-            {cfg?.tradingModeDivergent && (
-              <span className="sell small">
-                ⚠ overridden — this search will run as <b>{String(cfg.effectiveDiscoveryMode)}</b>{" "}
-                (models.discovery_mode = {String(cfg.discoveryMode)})
-              </span>
-            )}
-          </label>
-          {/* 💰 The old tooltip promised "this search + live sizing". It sets
-              neither. `grep '\.risk_per_trade\b' crates/neoethos-search` →
-              zero hits: the search samples from the risk BANDS
-              (discovery.rs:813-821). And risky-mode live sizing substitutes
-              its own ladder (live_trading.rs:1664-1680). It binds live sizing
-              in prop-firm mode, and nothing else. */}
-          <label>
-            Risk %/trade{" "}
-            <Tip
-              text={
-                cfg?.tradingMode === "risky"
-                  ? "Does NOT apply to this search, and does NOT apply to live sizing while the mode is Risky. The search samples the configured risk bands, not this field; risky live sizing uses the engine's 30–50% ladder capped by Max portfolio risk. Saved to config.yaml, where it will bind if you switch to Prop-firm."
-                  : "Live position sizing in Prop-firm mode: fraction of the account risked per trade, clamped to the account's max risk. It does NOT change what THIS search explores — the search samples the configured risk bands, not this field."
-              }
-            />
-            <input
-              type="number"
-              step="0.1"
-              min="0"
-              style={{ width: 80 }}
-              key={riskPct ?? "risk"}
-              defaultValue={riskPct != null ? (riskPct * 100).toFixed(1) : ""}
-              onBlur={(e) => applyRisk(e.target.value)}
-            />
-          </label>
-          <div className="muted small" style={{ paddingBottom: 6 }}>
-            <b>{selectedDatasets.length} exact run{selectedDatasets.length === 1 ? "" : "s"}</b>
-            {cfg?.searchGenerations != null && (
-              <> · <b>gen</b> {cfg.searchGenerations} · <b>pop</b> {cfg.searchPopulation} · <b>prefilter</b> {cfg.prefilterTopK}</>
-            )}
-          </div>
         </div>
-        {selectedDatasets.length > 0 && (
-          <table className="tbl">
-            <thead><tr><th>Pair</th><th>TF</th><th>Current generation</th><th>Exact identity</th></tr></thead>
-            <tbody>
-              {selectedDatasets.map((entry) => (
-                  <tr key={entry.datasetIdentity}>
-                    <td><b>{entry.symbol}</b></td>
-                    <td>{entry.timeframe}</td>
-                    <td><code>{entry.generation}</code></td>
-                    <td><code style={{ overflowWrap: "anywhere" }}>{entry.datasetIdentity}</code></td>
-                  </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-        <p className="muted small">
-          The queue uses these exact opaque identities. Required higher timeframes are separate direct broker downloads/imports; missing ones fail visibly.
-        </p>
+      )}
 
-        <div className="btn-row">
-          <button className="primary" disabled={q.active || selectedDatasets.length === 0} onClick={launch}>
-            {q.active ? "Queue running…" : "Start queue"}
-          </button>
-          <button className="danger" disabled={!q.active && !running} onClick={stop}>
-            Stop
-          </button>
-          {queued > 0 && !q.active && (
-            <button className="ghost" onClick={() => { clearQueue(); setMsg(""); }}>Clear</button>
-          )}
+      {visibleInventory.pageCount > 1 && (
+        <div className="btn-row" aria-label="Research dataset pages">
+          <button type="button" disabled={visibleInventory.page === 0} onClick={() => setInventoryPage(visibleInventory.page - 1)}>Previous page</button>
+          <span>Page {visibleInventory.page + 1} of {visibleInventory.pageCount}</span>
+          <button type="button" disabled={visibleInventory.page + 1 >= visibleInventory.pageCount} onClick={() => setInventoryPage(visibleInventory.page + 1)}>Next page</button>
         </div>
-        {msg && <div className="banner info">{msg}</div>}
-      </div>
+      )}
 
-      {/* ── Import data file (data is only for search + training) ── */}
-      <h2>Import data file</h2>
-      <div className="ticket">
-        <p className="muted small">Bring in CSV, TSV, JSON, Parquet, Arrow IPC, or Vortex data. Choose Format explicitly; the filename extension never changes it automatically. A successful import publishes a verified canonical Vortex generation; runtime never opens the source format.</p>
-        <div className="ticket-row">
-          <button onClick={browse} disabled={impBusy}>Browse…</button>
-          <label style={{ flex: 1 }}>
-            File
-            <input value={impSrc} onChange={(e) => setImpSrc(e.target.value)} placeholder="(choose a file with Browse…)" style={{ width: "100%" }} />
-          </label>
-          <label>
-            Format
-            <select value={impFormat} onChange={(e) => setImpFormat(e.target.value as DataImportSourceFormat)}>
-              <option value="csv">CSV</option>
-              <option value="tsv">TSV</option>
-              <option value="json-array">JSON array</option>
-              <option value="json-lines">JSON lines</option>
-              <option value="parquet">Parquet</option>
-              <option value="arrow-ipc-file">Arrow IPC file</option>
-              <option value="arrow-ipc-stream">Arrow IPC stream</option>
-              <option value="vortex">Vortex</option>
-            </select>
-          </label>
-          <label>Source namespace<input value={impNamespace} onChange={(e) => setImpNamespace(e.target.value)} style={{ width: 130 }} placeholder="operator-upload" /></label>
-          <label>Symbol<input value={impSym} onChange={(e) => setImpSym(e.target.value)} style={{ width: 90 }} placeholder="EURUSD" /></label>
-          <label>TF<TimeframeSelect value={impTf} onChange={setImpTf} style={{ width: 80 }} /></label>
-          <label>
-            Timestamp meaning
-            <select value={impTimestampConvention} onChange={(e) => setImpTimestampConvention(e.target.value as DataImportBody["barTimestampConvention"])}>
-              <option value="bar_open">Bar open</option>
-              <option value="bar_close">Bar close (rejected)</option>
-              <option value="bar_end">Bar end (rejected)</option>
-              <option value="unknown">Unknown (rejected)</option>
-            </select>
-          </label>
-          <button className="primary" disabled={impBusy || !impSrc} onClick={doImport}>Import</button>
-        </div>
-        {impMsg && <div className="banner info">{impMsg}</div>}
-      </div>
+      {(inventory?.skipped.length ?? 0) > 0 && (
+        <details className="banner warn">
+          <summary>Rejected or non-canonical entries ({inventory?.skipped.length})</summary>
+          <ul>
+            {inventory?.skipped.map((item) => (
+              <li key={`${item.path}:${item.category}:${item.detail}`}>
+                <code>{item.path}</code> — {item.category}: {item.detail}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   );
 }

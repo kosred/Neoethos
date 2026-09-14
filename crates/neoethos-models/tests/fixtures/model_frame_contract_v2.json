@@ -35,12 +35,13 @@
     [1051426530, 1051444493, 1051245585]
   ],
   "expected_metadata": {
-    "schema_version": 1,
+    "schema_version": 2,
     "model_name": "logistic",
     "family": "Meta",
     "state": "Implemented",
     "dataset_rows": 9,
     "train_rows": 7,
+    "embargo_rows": 0,
     "val_rows": 2
   }
 }

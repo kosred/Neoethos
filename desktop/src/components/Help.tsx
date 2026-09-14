@@ -1,9 +1,8 @@
-import { useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 
 /**
  * Collapsible "what this screen does + how to use it" panel. Shown expanded the
- * first time; the user's open/closed choice is remembered per-screen so power
- * users can hide it for good.
+ * only on request; the user's choice is remembered per screen.
  */
 export function HelpPanel({
   id,
@@ -15,7 +14,7 @@ export function HelpPanel({
   children: ReactNode;
 }) {
   const key = `help.${id}.open`;
-  const [open, setOpen] = useState(() => localStorage.getItem(key) !== "0");
+  const [open, setOpen] = useState(() => localStorage.getItem(key) === "1");
   const toggle = () => {
     const next = !open;
     setOpen(next);
@@ -37,10 +36,17 @@ export function HelpPanel({
  *  Use next to any control the user chooses, so guidance is right where the
  *  decision is made (not only in the panel at the top). */
 export function Tip({ text }: { text: ReactNode }) {
+  const descriptionId = useId();
   return (
-    <span className="tip" tabIndex={0} role="note">
+    <span
+      className="tip"
+      tabIndex={0}
+      role="button"
+      aria-label="More information"
+      aria-describedby={descriptionId}
+    >
       ⓘ
-      <span className="tip-balloon">{text}</span>
+      <span id={descriptionId} role="tooltip" className="tip-balloon">{text}</span>
     </span>
   );
 }

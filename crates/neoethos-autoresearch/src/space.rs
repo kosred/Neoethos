@@ -241,6 +241,7 @@ pub const MONEY_PATH_FIELDS: &[&str] = &[
     "initial_balance",
     "risk_per_trade_min",
     "risk_per_trade_max",
+    "high_quality_confidence",
     "risky_risk_band",
     "prop_firm_risk_band",
     "risky_start_balance",
@@ -294,6 +295,7 @@ pub const FROZEN_FIELDS: &[&str] = &[
     "initial_balance",
     "risk_per_trade_min",
     "risk_per_trade_max",
+    "high_quality_confidence",
     "risky_risk_band",
     "prop_firm_risk_band",
     "risky_start_balance",
@@ -422,6 +424,11 @@ pub fn money_path_audit(
         "risk_per_trade_max",
         reference.risk_per_trade_max,
         proposed.risk_per_trade_max
+    );
+    cmpf!(
+        "high_quality_confidence",
+        reference.high_quality_confidence,
+        proposed.high_quality_confidence
     );
     cmp!(
         "risky_risk_band",

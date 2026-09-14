@@ -2,7 +2,7 @@ use crate::resident_generation_v1::{
     GeneticOperatorIdentityV1, checked_philox_counter_mapping_v1,
     checked_philox_rejection_draw_index_v1, philox4x32_10_reference_v1,
 };
-use crate::resident_scoring_v2::ResidentScoringObjectiveV2;
+use crate::resident_scoring_v2::{ResidentScoringGoalContextV2, ResidentScoringObjectiveV2};
 use crate::resident_search_v2::{
     ResidentSearchAdvancePendingV2, ResidentSearchFixtureGeneV2, ResidentSearchFixturePlanV2,
     ResidentSearchGenerationFixtureSnapshotV2, ResidentSearchRunV2, ResidentSearchStateV2,
@@ -13,7 +13,8 @@ use crate::{
 };
 use neoethos_gpu_contracts::ABI_VERSION;
 use neoethos_gpu_contracts::resident_search_scoring_v2::{
-    score_prop_firm_ga_fitness_v4, score_risky_ga_fitness_growth_v5,
+    ResidentScoringOutcomeV2, RiskyGrowthGoal, checked_resident_goal_score_v6,
+    checked_resident_growth_score_v5, checked_resident_prop_firm_score_v4,
 };
 
 const BARS: usize = 96;
@@ -57,6 +58,12 @@ struct CpuGenerationV2 {
 }
 
 fn fixture_session() -> Result<PopulationSession, Box<dyn std::error::Error>> {
+    fixture_session_with_bankruptcy(false)
+}
+
+fn fixture_session_with_bankruptcy(
+    bankruptcy: bool,
+) -> Result<PopulationSession, Box<dyn std::error::Error>> {
     let close = (0..BARS)
         .map(|bar| 1.08 + bar as f64 * 0.000_01 + (bar % 5) as f64 * 0.000_003)
         .collect::<Vec<_>>();
@@ -86,6 +93,33 @@ fn fixture_session() -> Result<PopulationSession, Box<dyn std::error::Error>> {
         .map(|bar| 1_704_067_200_000_i64 + bar as i64 * 300_000)
         .collect::<Vec<_>>();
     let smc_rows = vec![0_i8; BARS * SMC_SLOTS];
+    let (close, high, low, indicators, months) = if bankruptcy {
+        // Deliberately insolvent, synthetic formula input, not market evidence:
+        // constant prices imply zero gross PnL; each fixed-lot exit costs 200.
+        // Rotate strong finite signals so the actual gene producer can trade
+        // in each of three completed-month partitions without metric rewriting.
+        (
+            vec![1.0; BARS],
+            vec![1.0; BARS],
+            vec![1.0; BARS],
+            (0..FEATURES * BARS)
+                .map(|index| {
+                    let feature = index / BARS;
+                    let bar = index % BARS;
+                    if feature == (bar / 2) % FEATURES {
+                        10.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>(),
+            (0..BARS)
+                .map(|bar| 202_401_i64 + (bar / 32) as i64)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (close, high, low, indicators, months)
+    };
     let mut session = PopulationSession::create(0, 1)?;
     session.upload_dataset(PopulationDatasetView {
         close: &close,
@@ -129,6 +163,14 @@ fn begin_run(
     objective: ResidentScoringObjectiveV2,
     novelty_weight: f64,
 ) -> Result<ResidentSearchRunV2, ResidentSearchV2Error> {
+    begin_run_with_goal(objective, novelty_weight, None)
+}
+
+fn begin_run_with_goal(
+    objective: ResidentScoringObjectiveV2,
+    novelty_weight: f64,
+    goal_context: Option<ResidentScoringGoalContextV2>,
+) -> Result<ResidentSearchRunV2, ResidentSearchV2Error> {
     let session = fixture_session().map_err(|_| {
         ResidentSearchV2Error::InvalidPlan("failed to construct CUDA fixture session")
     })?;
@@ -141,6 +183,7 @@ fn begin_run(
         true,
         objective,
         novelty_weight,
+        goal_context,
     )
 }
 
@@ -160,6 +203,9 @@ fn upload_full_population_scenarios(
 }
 
 fn ordered_f64_score(value: f64) -> u64 {
+    if value == f64::NEG_INFINITY {
+        return 1;
+    }
     assert!(value.is_finite());
     let canonical = if value == 0.0 { 0.0 } else { value };
     let bits = canonical.to_bits();
@@ -385,19 +431,42 @@ fn rank_from_weighted_draw(draw: u64) -> usize {
     usize::try_from(low.min(POPULATION as u64 - 1)).expect("rank fits usize")
 }
 
-fn cpu_generation(scores: &[f64]) -> CpuGenerationV2 {
-    let initial_genes = (0..POPULATION).map(initialize_gene).collect::<Vec<_>>();
-    let mut ranked_population_ordinals = (0..POPULATION as u64).collect::<Vec<_>>();
+fn ranked_ordinals_for_scores(scores: &[f64], identities: &[u64]) -> Vec<u64> {
+    assert_eq!(scores.len(), identities.len());
+    let mut ranked_population_ordinals = (0..scores.len() as u64).collect::<Vec<_>>();
     ranked_population_ordinals.sort_by(|left, right| {
         ordered_f64_score(scores[*right as usize])
             .cmp(&ordered_f64_score(scores[*left as usize]))
-            .then_with(|| {
-                initial_genes[*left as usize]
-                    .gene_identity
-                    .cmp(&initial_genes[*right as usize].gene_identity)
-            })
+            .then_with(|| identities[*left as usize].cmp(&identities[*right as usize]))
             .then_with(|| left.cmp(right))
     });
+    ranked_population_ordinals
+}
+
+fn assert_rank_matches_cpu_scores(
+    actual: &[u64],
+    cpu_scores: &[f64],
+    identities: &[u64],
+    device_scores: &[f64],
+) {
+    // Numerical score tolerance cannot authorize a different discrete rank.
+    // The device-conditioned order is diagnostic only, never the expected result.
+    assert_eq!(
+        actual,
+        ranked_ordinals_for_scores(cpu_scores, identities),
+        "CPU-score rank changed; device-score-conditioned order={:?}",
+        ranked_ordinals_for_scores(device_scores, identities),
+    );
+}
+
+fn cpu_generation(scores: &[f64]) -> CpuGenerationV2 {
+    assert_eq!(scores.len(), POPULATION);
+    let initial_genes = (0..POPULATION).map(initialize_gene).collect::<Vec<_>>();
+    let identities = initial_genes
+        .iter()
+        .map(|gene| gene.gene_identity)
+        .collect::<Vec<_>>();
+    let ranked_population_ordinals = ranked_ordinals_for_scores(scores, &identities);
 
     let rank_weight_total = POPULATION as u64 * (POPULATION as u64 + 1) / 2;
     let mut parent_a = vec![0; POPULATION];
@@ -608,18 +677,62 @@ fn assert_gene_exact(actual: &ResidentSearchFixtureGeneV2, expected: &CpuGeneV2)
     );
 }
 
+fn cpu_score_oracle(
+    snapshot: &ResidentSearchGenerationFixtureSnapshotV2,
+    objective: ResidentScoringObjectiveV2,
+    goal_context: Option<ResidentScoringGoalContextV2>,
+) -> Vec<f64> {
+    assert_eq!(snapshot.scoring_objective, objective as u32);
+    assert_eq!(snapshot.metric_rows.len(), POPULATION);
+    assert_eq!(snapshot.fitness_scores.len(), POPULATION);
+    assert_eq!(snapshot.decision_keys.len(), POPULATION);
+    snapshot
+        .metric_rows
+        .iter()
+        .map(|row| {
+            // Recompute fitness on the CPU from the same metric inputs. This proves
+            // scorer-to-selection parity, not independence of the backtest metrics.
+            let outcome = match objective {
+                ResidentScoringObjectiveV2::PropFirmV4 => {
+                    checked_resident_prop_firm_score_v4(&row.values)
+                }
+                ResidentScoringObjectiveV2::RiskyGrowthV5 => {
+                    checked_resident_growth_score_v5(&row.values)
+                }
+                ResidentScoringObjectiveV2::RiskyGrowthGoalV6 => {
+                    let context = goal_context.expect("V6 oracle needs exact measured context");
+                    checked_resident_goal_score_v6(
+                        &row.values,
+                        context.initial_equity,
+                        context.span_days,
+                        context.goal,
+                    )
+                }
+            };
+            match outcome {
+                ResidentScoringOutcomeV2::Finite(score) => score,
+                ResidentScoringOutcomeV2::EconomicReject(_) => f64::NEG_INFINITY,
+                ResidentScoringOutcomeV2::Fault(fault) => {
+                    panic!("CPU scorer rejected committed metrics: {fault:?}")
+                }
+            }
+        })
+        .collect()
+}
+
 fn assert_score_oracle(
     snapshot: &ResidentSearchGenerationFixtureSnapshotV2,
     objective: ResidentScoringObjectiveV2,
-) {
-    for (row, device_score) in snapshot.metric_rows.iter().zip(&snapshot.fitness_scores) {
+    goal_context: Option<ResidentScoringGoalContextV2>,
+) -> Vec<f64> {
+    let cpu_scores = cpu_score_oracle(snapshot, objective, goal_context);
+    for ((row, device_score), cpu_score) in snapshot
+        .metric_rows
+        .iter()
+        .zip(&snapshot.fitness_scores)
+        .zip(&cpu_scores)
+    {
         assert!(row.values.iter().all(|value| value.is_finite()));
-        let cpu_score = match objective {
-            ResidentScoringObjectiveV2::PropFirmV4 => score_prop_firm_ga_fitness_v4(&row.values),
-            ResidentScoringObjectiveV2::RiskyGrowthV5 => {
-                score_risky_ga_fitness_growth_v5(&row.values)
-            }
-        };
         let scale = cpu_score.abs().max(device_score.abs()).max(1.0);
         assert!(
             (cpu_score - device_score).abs() <= SCORING_CPU_ORACLE_TOLERANCE_V2 * scale,
@@ -630,10 +743,25 @@ fn assert_score_oracle(
     for (score, key) in snapshot.fitness_scores.iter().zip(&snapshot.decision_keys) {
         assert_eq!(*key, ordered_f64_score(*score));
     }
+    cpu_scores
 }
 
-fn assert_full_generation_oracle(snapshot: &ResidentSearchGenerationFixtureSnapshotV2) {
-    let cpu = cpu_generation(&snapshot.fitness_scores);
+fn assert_full_generation_oracle(
+    snapshot: &ResidentSearchGenerationFixtureSnapshotV2,
+    cpu_scores: &[f64],
+) {
+    let cpu = cpu_generation(cpu_scores);
+    let identities = cpu
+        .initial_genes
+        .iter()
+        .map(|gene| gene.gene_identity)
+        .collect::<Vec<_>>();
+    assert_rank_matches_cpu_scores(
+        &snapshot.ranked_population_ordinals,
+        cpu_scores,
+        &identities,
+        &snapshot.fitness_scores,
+    );
     assert_eq!(
         snapshot.ranked_population_ordinals,
         cpu.ranked_population_ordinals
@@ -690,6 +818,43 @@ fn assert_clean_advance(snapshot: &ResidentSearchGenerationFixtureSnapshotV2) {
     assert!(snapshot.terminal_synchronization_count > 0);
     assert!(snapshot.terminal_readback_count > 0);
     assert!(snapshot.terminal_readback_bytes > 0);
+}
+
+#[test]
+fn cpu_score_rank_rejects_subtolerance_device_order_reversal() {
+    let identities = [0, 1];
+    let cpu_scores: [f64; 2] = [1.0, 1.0 + 1.0e-12];
+    let device_scores: [f64; 2] = [1.0 + 2.0e-12, 1.0];
+    for (cpu, device) in cpu_scores.iter().zip(device_scores) {
+        assert!((cpu - device).abs() < SCORING_CPU_ORACLE_TOLERANCE_V2);
+    }
+    let expected = ranked_ordinals_for_scores(&cpu_scores, &identities);
+    let device_order = ranked_ordinals_for_scores(&device_scores, &identities);
+    assert_eq!(expected, vec![1, 0]);
+    assert_eq!(device_order, vec![0, 1]);
+    assert_rank_matches_cpu_scores(&expected, &cpu_scores, &identities, &device_scores);
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_rank_matches_cpu_scores(&device_order, &cpu_scores, &identities, &device_scores);
+        })
+        .is_err(),
+        "the actual fixture assertion must reject a tolerated score perturbation that changes rank"
+    );
+}
+
+#[test]
+fn cpu_score_rank_retains_identity_ordinal_and_economic_rejection_ties() {
+    let identities = [50, 10, 10, 0];
+    let scores = [0.0, -0.0, 0.0, f64::NEG_INFINITY];
+    assert_eq!(
+        ranked_ordinals_for_scores(&scores, &identities),
+        vec![1, 2, 0, 3]
+    );
+    let rejected = [f64::NEG_INFINITY; 4];
+    assert_eq!(
+        ranked_ordinals_for_scores(&rejected, &identities),
+        vec![3, 1, 2, 0]
+    );
 }
 
 #[test]
@@ -771,8 +936,8 @@ fn resident_search_scores_and_advances_exactly_one_generation_on_real_cuda()
             snapshot.population_counters.full_readback_bytes,
         );
         assert_eq!(snapshot.scoring_objective, objective as u32);
-        assert_score_oracle(&snapshot, objective);
-        assert_full_generation_oracle(&snapshot);
+        let cpu_scores = assert_score_oracle(&snapshot, objective, None);
+        assert_full_generation_oracle(&snapshot, &cpu_scores);
         assert_clean_advance(&snapshot);
         let second = run.advance_one_full_population_generation_v2(&settings());
         assert!(matches!(
@@ -791,14 +956,15 @@ fn resident_search_scores_and_advances_exactly_one_generation_on_real_cuda()
     let pending = reordered.advance_one_full_population_generation_v2(&settings())?;
     let mut reordered = complete_pending(pending)?;
     let snapshot = reordered.terminal_fixture_snapshot_v2()?;
-    let mut expected = (0..POPULATION as u64).collect::<Vec<_>>();
-    expected.sort_by(|left, right| {
-        ordered_f64_score(snapshot.fitness_scores[*right as usize])
-            .cmp(&ordered_f64_score(snapshot.fitness_scores[*left as usize]))
-            .then_with(|| identities[*left as usize].cmp(&identities[*right as usize]))
-            .then_with(|| left.cmp(right))
-    });
+    let cpu_scores = assert_score_oracle(&snapshot, ResidentScoringObjectiveV2::PropFirmV4, None);
+    let expected = ranked_ordinals_for_scores(&cpu_scores, &identities);
     assert_ne!(expected, (0..POPULATION as u64).collect::<Vec<_>>());
+    assert_rank_matches_cpu_scores(
+        &snapshot.ranked_population_ordinals,
+        &cpu_scores,
+        &identities,
+        &snapshot.fitness_scores,
+    );
     assert_eq!(snapshot.ranked_population_ordinals, expected);
     drop(reordered.close_fixture_v2()?);
 
@@ -882,5 +1048,303 @@ fn resident_search_scores_and_advances_exactly_one_generation_on_real_cuda()
 
     // Archive/kNN novelty, persistent evolution and final promotion remain out
     // of scope; all five production readiness bits stay fail-closed.
+    Ok(())
+}
+
+#[test]
+fn resident_search_goal_v6_scores_contexts_and_faults_on_real_cuda()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(
+        std::env::var("NEOETHOS_REQUIRE_GPU").ok().as_deref(),
+        Some("1"),
+        "NEOETHOS_REQUIRE_GPU=1 is mandatory; there is no host fallback"
+    );
+    let base = ResidentScoringGoalContextV2 {
+        initial_equity: 100_000.0,
+        span_days: 180.0,
+        goal: RiskyGrowthGoal {
+            start_balance: 100.0,
+            target_balance: 50_000.0,
+            horizon_days: 180.0,
+        },
+    };
+    let contexts = [
+        base,
+        ResidentScoringGoalContextV2 {
+            initial_equity: 10_000.0,
+            ..base
+        },
+        ResidentScoringGoalContextV2 {
+            span_days: 90.0,
+            ..base
+        },
+        ResidentScoringGoalContextV2 {
+            goal: RiskyGrowthGoal {
+                target_balance: 1_000_000.0,
+                ..base.goal
+            },
+            ..base
+        },
+        ResidentScoringGoalContextV2 {
+            goal: RiskyGrowthGoal {
+                horizon_days: 90.0,
+                ..base.goal
+            },
+            ..base
+        },
+    ];
+    let mut scores = Vec::new();
+    let mut metric_bits = None;
+    for context in contexts {
+        let mut run = begin_run_with_goal(
+            ResidentScoringObjectiveV2::RiskyGrowthGoalV6,
+            0.0,
+            Some(context),
+        )?;
+        // Real native scorer, with identical finite synthetic metrics for each
+        // independently sealed context. This isolates scoring from backtest variation.
+        run.set_scoring_metric_mode_fixture_v2(3)?;
+        upload_full_population_scenarios(&mut run)?;
+        let mut evaluation = settings();
+        evaluation.initial_equity = context.initial_equity;
+        let pending = run.advance_one_full_population_generation_v2(&evaluation)?;
+        let mut run = complete_pending(pending)?;
+        let snapshot = run.terminal_fixture_snapshot_v2()?;
+        assert_eq!(
+            snapshot.scoring_objective,
+            ResidentScoringObjectiveV2::RiskyGrowthGoalV6 as u32
+        );
+        let cpu_scores = assert_score_oracle(
+            &snapshot,
+            ResidentScoringObjectiveV2::RiskyGrowthGoalV6,
+            Some(context),
+        );
+        assert_full_generation_oracle(&snapshot, &cpu_scores);
+        assert_clean_advance(&snapshot);
+        let current_bits = snapshot
+            .metric_rows
+            .iter()
+            .map(|row| row.values.map(f64::to_bits))
+            .collect::<Vec<_>>();
+        if let Some(expected) = &metric_bits {
+            assert_eq!(&current_bits, expected);
+        } else {
+            metric_bits = Some(current_bits);
+        }
+        // Positive and negative realized returns remain distinct; equal metrics
+        // retain the deterministic gene-identity/population-ordinal tie order.
+        assert!(snapshot.fitness_scores[1] > 0.0);
+        assert!(snapshot.fitness_scores[0] < 0.0);
+        assert_eq!(
+            snapshot.fitness_scores[1].to_bits(),
+            snapshot.fitness_scores[2].to_bits()
+        );
+        eprintln!(
+            "resident-goal-v6 context={context:?} scores={:?}",
+            snapshot.fitness_scores
+        );
+        scores.push(snapshot.fitness_scores);
+        drop(run.close_fixture_v2()?);
+    }
+    assert!(
+        scores[1][1] > scores[0][1],
+        "smaller actual capital increases measured pace"
+    );
+    assert!(
+        scores[2][1] > scores[0][1],
+        "shorter observed span increases measured pace"
+    );
+    assert!(
+        scores[3][1] < scores[0][1],
+        "larger goal increases the shortfall"
+    );
+    assert!(
+        scores[4][1] < scores[0][1],
+        "shorter deadline increases the shortfall"
+    );
+
+    // V6 does not weaken the existing all-eleven-finite transaction guard,
+    // including expectancy, which is not an ingredient of the goal formula.
+    let mut run = begin_run_with_goal(
+        ResidentScoringObjectiveV2::RiskyGrowthGoalV6,
+        0.0,
+        Some(base),
+    )?;
+    run.set_scoring_metric_fault_fixture_v2(6, f64::NAN)?;
+    upload_full_population_scenarios(&mut run)?;
+    let pending = run.advance_one_full_population_generation_v2(&settings())?;
+    match complete_pending(pending) {
+        Err(ResidentSearchV2Error::DeviceTerminalFault(receipt)) => {
+            assert_ne!(receipt.scoring_device_fault(), 0);
+            assert_eq!(receipt.generation_index(), 0);
+            assert_eq!(receipt.current_store_index(), 0);
+        }
+        _ => panic!("goal V6 must not commit a nonfinite metric transaction"),
+    }
+    Ok(())
+}
+
+#[test]
+fn resident_search_economic_rejections_and_arithmetic_faults_on_real_cuda()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(
+        std::env::var("NEOETHOS_REQUIRE_GPU").ok().as_deref(),
+        Some("1"),
+        "real CUDA is mandatory; these are not host acceptance tests"
+    );
+    let context = ResidentScoringGoalContextV2 {
+        initial_equity: 100.0,
+        span_days: 1.0,
+        goal: RiskyGrowthGoal {
+            start_balance: 1.0,
+            target_balance: 2.0,
+            horizon_days: 1.0,
+        },
+    };
+    let evaluation = NeoPopulationSettings {
+        initial_equity: 100.0,
+        max_hold_bars: 1,
+        min_hold_bars: 1,
+        max_trades_per_day: 0,
+        gap_threshold_ms: 0,
+        flags: 0,
+        spread_pips: 0.0,
+        spread_pips_asian: 0.0,
+        spread_pips_overlap: 0.0,
+        spread_pips_late_ny: 0.0,
+        commission_per_trade: 200.0,
+        swap_long_pips_per_day: 0.0,
+        swap_short_pips_per_day: 0.0,
+        pnl_conversion_fee_rate: 0.0,
+        ..settings()
+    };
+    for objective in [
+        ResidentScoringObjectiveV2::PropFirmV4,
+        ResidentScoringObjectiveV2::RiskyGrowthV5,
+        ResidentScoringObjectiveV2::RiskyGrowthGoalV6,
+    ] {
+        let session = fixture_session_with_bankruptcy(true)?;
+        let plan = ResidentSearchFixturePlanV2::new_with_scoring_objective_v2(
+            POPULATION, FEATURES, objective,
+        )?;
+        let mut run = session.begin_resident_search_scoring_fixture_v2(
+            plan,
+            [1.0; SMC_SLOTS],
+            true,
+            objective,
+            0.0,
+            (objective == ResidentScoringObjectiveV2::RiskyGrowthGoalV6).then_some(context),
+        )?;
+        upload_full_population_scenarios(&mut run)?;
+        let mut run =
+            complete_pending(run.advance_one_full_population_generation_v2(&evaluation)?)?;
+        let snapshot = run.terminal_fixture_snapshot_v2()?;
+        let mut bankrupt = 0;
+        for ((row, score), key) in snapshot
+            .metric_rows
+            .iter()
+            .zip(&snapshot.fitness_scores)
+            .zip(&snapshot.decision_keys)
+        {
+            assert!(
+                row.values
+                    .iter()
+                    .enumerate()
+                    .all(|(slot, value)| slot == 1 || value.is_finite())
+            );
+            // Independent cash arithmetic: constant price, zero spread/carry,
+            // one lot, exactly one 200-unit commission per completed trade.
+            assert_eq!(row.values[0], -200.0 * row.values[8]);
+            if row.values[1] == f64::NEG_INFINITY {
+                bankrupt += 1;
+                assert!(row.values[3] >= 1.0);
+                assert!(row.values[8] >= 2.0);
+                assert_eq!(*score, f64::NEG_INFINITY);
+                assert_eq!(*key, 1);
+            }
+        }
+        assert!(
+            bankrupt > 0,
+            "real producer must exercise nonpositive completed-month equity"
+        );
+        assert_clean_advance(&snapshot);
+        let cpu_scores = cpu_score_oracle(
+            &snapshot,
+            objective,
+            (objective == ResidentScoringObjectiveV2::RiskyGrowthGoalV6).then_some(context),
+        );
+        assert_full_generation_oracle(&snapshot, &cpu_scores);
+        drop(run.close_fixture_v2()?);
+    }
+
+    // Scorer-only controls: retain all candidates, including an all-rejected
+    // cohort. Mode 3 supplies mixed finite/wiped-out metrics, mode 4 supplies
+    // finite DD==1 for all rows. Neither is claimed as real producer evidence.
+    for mode in [3, 4] {
+        let mut run = begin_run_with_goal(
+            ResidentScoringObjectiveV2::RiskyGrowthGoalV6,
+            0.0,
+            Some(context),
+        )?;
+        run.set_scoring_metric_mode_fixture_v2(mode)?;
+        upload_full_population_scenarios(&mut run)?;
+        let mut run =
+            complete_pending(run.advance_one_full_population_generation_v2(&evaluation)?)?;
+        let snapshot = run.terminal_fixture_snapshot_v2()?;
+        let rejected = snapshot
+            .fitness_scores
+            .iter()
+            .filter(|score| **score == f64::NEG_INFINITY)
+            .count();
+        assert!(rejected > 0);
+        assert_eq!(rejected == POPULATION, mode == 4);
+        assert_clean_advance(&snapshot);
+        let cpu_scores = cpu_score_oracle(
+            &snapshot,
+            ResidentScoringObjectiveV2::RiskyGrowthGoalV6,
+            Some(context),
+        );
+        assert_full_generation_oracle(&snapshot, &cpu_scores);
+        for (score, key) in snapshot.fitness_scores.iter().zip(&snapshot.decision_keys) {
+            assert_eq!(*key, ordered_f64_score(*score));
+        }
+        drop(run.close_fixture_v2()?);
+    }
+
+    // A finite, nonbankrupt loss whose squared pace shortfall overflows must
+    // fault. Accepting every computed -infinity would incorrectly pass this.
+    let overflow_context = ResidentScoringGoalContextV2 {
+        initial_equity: 100_000.0,
+        goal: RiskyGrowthGoal {
+            horizon_days: 1.0e200,
+            ..context.goal
+        },
+        ..context
+    };
+    let mut run = begin_run_with_goal(
+        ResidentScoringObjectiveV2::RiskyGrowthGoalV6,
+        0.0,
+        Some(overflow_context),
+    )?;
+    run.set_scoring_metric_mode_fixture_v2(3)?;
+    upload_full_population_scenarios(&mut run)?;
+    assert!(matches!(
+        complete_pending(run.advance_one_full_population_generation_v2(&settings())?),
+        Err(ResidentSearchV2Error::DeviceTerminalFault(_))
+    ));
+
+    // Corrupt metrics dominate otherwise legitimate economic rejection.
+    let mut run = begin_run_with_goal(
+        ResidentScoringObjectiveV2::RiskyGrowthGoalV6,
+        0.0,
+        Some(context),
+    )?;
+    run.set_scoring_metric_mode_fixture_v2(4)?;
+    run.set_scoring_metric_fault_fixture_v2(6, f64::NAN)?;
+    upload_full_population_scenarios(&mut run)?;
+    assert!(matches!(
+        complete_pending(run.advance_one_full_population_generation_v2(&evaluation)?),
+        Err(ResidentSearchV2Error::DeviceTerminalFault(_))
+    ));
     Ok(())
 }

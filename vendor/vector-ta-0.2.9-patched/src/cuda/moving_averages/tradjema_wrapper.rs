@@ -214,8 +214,20 @@ impl CudaTradjema {
     }
 
     #[inline]
-    fn smem_bytes_for_len(length: usize) -> usize {
-        length * (2 * std::mem::size_of::<f64>() + 2 * std::mem::size_of::<i32>())
+    fn smem_bytes_for_len(length: usize) -> Result<usize, CudaTradjemaError> {
+        let capacity = length
+            .checked_add(1)
+            .ok_or_else(|| CudaTradjemaError::InvalidInput("deque capacity overflow".into()))?;
+        if capacity > i32::MAX as usize {
+            return Err(CudaTradjemaError::InvalidInput(
+                "deque capacity exceeds kernel i32 bounds".into(),
+            ));
+        }
+        // Both kernels need a spare ring slot. This is exact for the f64
+        // many-series deque and conservatively covers the f32 batch layout.
+        capacity
+            .checked_mul(2 * std::mem::size_of::<f64>() + 2 * std::mem::size_of::<i32>())
+            .ok_or_else(|| CudaTradjemaError::InvalidInput("shared-memory size overflow".into()))
     }
 
     #[inline]
@@ -377,6 +389,7 @@ impl CudaTradjema {
             max_length = max_length.max(length);
         }
 
+        Self::smem_bytes_for_len(max_length)?;
         Ok((combos, first_valid, series_len, max_length))
     }
 
@@ -463,7 +476,7 @@ impl CudaTradjema {
                 name: "tradjema_batch_f32",
             })?;
 
-        let shared_bytes = Self::smem_bytes_for_len(max_length);
+        let shared_bytes = Self::smem_bytes_for_len(max_length)?;
         let dev = Device::get_device(self.device_id).map_err(CudaTradjemaError::Cuda)?;
         let max_optin = dev
             .get_attribute(DeviceAttribute::MaxSharedMemoryPerBlock)
@@ -754,6 +767,7 @@ impl CudaTradjema {
             )));
         }
 
+        Self::smem_bytes_for_len(length)?;
         let mut first_valids = vec![0i32; cols];
         for series in 0..cols {
             let mut fv = None;
@@ -800,7 +814,7 @@ impl CudaTradjema {
                 name: "tradjema_many_series_one_param_time_major_f32",
             })?;
 
-        let shared_bytes = Self::smem_bytes_for_len(length);
+        let shared_bytes = Self::smem_bytes_for_len(length)?;
         let dev = Device::get_device(self.device_id).map_err(CudaTradjemaError::Cuda)?;
         let max_optin = dev
             .get_attribute(DeviceAttribute::MaxSharedMemoryPerBlock)
@@ -1020,6 +1034,37 @@ impl CudaTradjema {
             mult,
         )?;
         arr.buf.copy_to(out_tm).map_err(CudaTradjemaError::Cuda)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tradjema_shared_memory_includes_spare_deque_slot() {
+        for length in [2usize, 3, 512] {
+            let capacity = length + 1;
+            let bytes = CudaTradjema::smem_bytes_for_len(length).unwrap();
+            let f64_layout =
+                capacity * (2 * std::mem::size_of::<f64>() + 2 * std::mem::size_of::<i32>());
+            let f32_layout =
+                capacity * (2 * std::mem::size_of::<f32>() + 2 * std::mem::size_of::<i32>());
+            assert_eq!(bytes, f64_layout);
+            assert!(bytes >= f32_layout);
+        }
+        assert_eq!(CudaTradjema::smem_bytes_for_len(2).unwrap(), 72);
+        assert_eq!(CudaTradjema::smem_bytes_for_len(512).unwrap(), 12_312);
+    }
+
+    #[test]
+    fn tradjema_shared_memory_rejects_unrepresentable_deque_capacity() {
+        for length in [i32::MAX as usize, usize::MAX] {
+            assert!(matches!(
+                CudaTradjema::smem_bytes_for_len(length),
+                Err(CudaTradjemaError::InvalidInput(_))
+            ));
+        }
     }
 }
 

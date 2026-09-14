@@ -2,9 +2,8 @@
 //!
 //! v3 (this file): every parameter is a real editable form field.
 //! Up/Down navigates fields; Enter on a field opens edit mode (type to
-//! modify, Esc to cancel, Enter to commit); when the focus marker is
-//! on the LAUNCH row, Enter spawns the subprocess. Mouse: click any
-//! field to focus it, click "[ Launch ]" to spawn.
+//! modify, Esc to cancel, Enter to commit); L launches the subprocess.
+//! Mouse: click any field to focus it, click "[ Launch ]" to spawn.
 
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
@@ -14,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget};
 
 use crate::tui::app::{AppShared, Hit, HitAction};
+use crate::tui::form::FormState;
 use crate::tui::jobs::JobStatus;
 use crate::tui::theme;
 
@@ -36,7 +36,7 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::BORDER))
         .title(Span::styled(
-            " PARAMETERS — ↑↓ field · Enter edit/launch · Esc cancel ",
+            " PARAMETERS — ↑↓ field · Enter edit · Esc cancel · L launch ",
             theme::caption_style().add_modifier(Modifier::BOLD),
         ))
         .style(theme::panel_block_style())
@@ -44,7 +44,6 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let n_fields = shared.discover_form.fields.len();
     let focused = shared.discover_form.focused;
     let editing = shared.discover_form.editing;
 
@@ -58,7 +57,11 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         let is_focused = idx == focused;
         let is_editing = is_focused && editing;
         let marker = if is_focused { ">" } else { " " };
-        let value_render = if field.value.is_empty() {
+        let value_render = if is_editing {
+            field.value.clone()
+        } else if field.value.is_empty() && field.default_value.is_empty() {
+            "(blank)".to_string()
+        } else if field.value.is_empty() {
             format!("({})", field.default_value)
         } else {
             field.value.clone()
@@ -146,8 +149,6 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
             );
         }
         y += 3; // 1 value + 1 hint + 1 blank
-        let _ = idx;
-        let _ = n_fields;
     }
 
     // Validation / status message.
@@ -188,7 +189,7 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
             )
         } else {
             (
-                "  [ Launch batch-discover ]   Enter / click  ".to_string(),
+                "  [ Launch batch-discover ]   L / click  ".to_string(),
                 theme::APP_BG,
                 theme::ACCENT,
             )
@@ -275,11 +276,11 @@ fn render_status(area: Rect, buf: &mut Buffer, shared: &AppShared) {
         vec![
             Line::raw(""),
             Line::styled(
-                "  Edit fields on the left, then press Enter on the",
+                "  Edit fields on the left, then press L or click",
                 theme::muted_style(),
             ),
             Line::styled(
-                "  [ Launch ] row — log streams here in real time.",
+                "  [ Launch ] — log streams here in real time.",
                 theme::muted_style(),
             ),
         ]
@@ -384,12 +385,7 @@ fn append_population_auto_override(args: &mut Vec<String>, raw: &str) -> Result<
     }
 }
 
-pub fn launch_now(shared: &mut AppShared) {
-    if shared.jobs.has_running(JOB_LABEL_PREFIX) {
-        shared.status = "discovery already running".to_string();
-        return;
-    }
-    let form = &shared.discover_form;
+fn build_launch_args(form: &FormState) -> Result<Vec<String>, String> {
     let symbols = form.value_for("Symbols").unwrap_or("").to_string();
     let timeframes = form
         .value_for("Timeframes")
@@ -414,9 +410,8 @@ pub fn launch_now(shared: &mut AppShared) {
         args.push("--symbols".to_string());
         args.push(symbols);
     }
-    // Forward the numeric form fields as explicit overrides so they actually
-    // take effect (parity fix: these were silently dropped before, making the
-    // form fields dead). Each is passed only when the user entered a value.
+    // Blank inherits the backend's configured/adaptive budget. Invalid input
+    // must be reported here, not silently dropped in favor of a different run.
     for (field, flag) in [
         ("Population", "--population"),
         ("Generations", "--generations"),
@@ -424,20 +419,35 @@ pub fn launch_now(shared: &mut AppShared) {
     ] {
         if let Some(v) = form.value_for(field) {
             let v = v.trim();
-            if !v.is_empty() && v.parse::<usize>().is_ok() {
-                args.push(flag.to_string());
-                args.push(v.to_string());
+            if v.is_empty() {
+                continue;
             }
+            v.parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| format!("{field} must be a positive integer or blank; got `{v}`"))?;
+            args.push(flag.to_string());
+            args.push(v.to_string());
         }
     }
-    if let Err(message) =
-        append_population_auto_override(&mut args, form.value_for("Population auto").unwrap_or(""))
-    {
-        shared.discover_form.message = Some(message.clone());
-        shared.status = message;
+    append_population_auto_override(&mut args, form.value_for("Population auto").unwrap_or(""))?;
+    Ok(args)
+}
+
+pub fn launch_now(shared: &mut AppShared) {
+    if shared.jobs.has_running(JOB_LABEL_PREFIX) {
+        shared.status = "discovery already running".to_string();
         return;
     }
-
+    let args = match build_launch_args(&shared.discover_form) {
+        Ok(args) => args,
+        Err(message) => {
+            shared.discover_form.message = Some(message.clone());
+            shared.status = message;
+            return;
+        }
+    };
+    shared.discover_form.message = None;
     shared.jobs.spawn("discover", args);
     shared.status = "Spawned batch-discover".to_string();
 }
@@ -469,7 +479,56 @@ fn strip_ansi(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_population_auto_override, strip_ansi};
+    use super::{append_population_auto_override, build_launch_args, strip_ansi};
+    use crate::tui::form::make_discover_form;
+
+    #[test]
+    fn launch_inherits_budget_and_forwards_only_explicit_numeric_overrides() {
+        let mut form = make_discover_form("C:/canonical data");
+        let args = build_launch_args(&form).expect("inherited settings");
+        for flag in [
+            "--population",
+            "--population-auto",
+            "--generations",
+            "--portfolio-size",
+        ] {
+            assert!(!args.iter().any(|arg| arg == flag), "{flag}");
+        }
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--root", "C:/canonical data"])
+        );
+        for (field, flag, value) in [
+            ("Population", "--population", "2000"),
+            ("Generations", "--generations", "1000"),
+            ("Portfolio size", "--portfolio-size", "200"),
+            ("Population auto", "--population-auto", "true"),
+        ] {
+            form.fields
+                .iter_mut()
+                .find(|f| f.label == field)
+                .unwrap()
+                .value = format!(" {value} ");
+            let args = build_launch_args(&form).expect("explicit override");
+            assert!(args.windows(2).any(|pair| pair == [flag, value]), "{field}");
+        }
+    }
+
+    #[test]
+    fn malformed_numeric_overrides_fail_before_spawning_a_different_search() {
+        for label in ["Population", "Generations", "Portfolio size"] {
+            for bad in ["0", "-1", "2.5", "many", "999999999999999999999999999999"] {
+                let mut form = make_discover_form("data");
+                form.fields
+                    .iter_mut()
+                    .find(|f| f.label == label)
+                    .unwrap()
+                    .value = bad.to_string();
+                let error = build_launch_args(&form).unwrap_err();
+                assert!(error.contains(label) && error.contains(bad), "{error}");
+            }
+        }
+    }
 
     #[test]
     fn population_auto_launch_override_is_tri_state_and_typed() {

@@ -153,14 +153,8 @@ pub fn submit(
     portfolio_json: &str,
     trades_json: Option<&str>,
 ) -> Result<String> {
-    let v: serde_json::Value =
-        serde_json::from_str(portfolio_json).context("portfolio payload is not valid JSON")?;
-    let genes = v
-        .get("genes")
-        .or_else(|| v.get("full_genes"))
-        .and_then(|g| g.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
+    let artifact = validate_submission_portfolio(symbol, base_tf, portfolio_json)?;
+    let genes = artifact.genes.len();
     if genes == 0 {
         anyhow::bail!("submitted portfolio has no genes — rejected");
     }
@@ -191,7 +185,8 @@ pub fn submit(
     }
     let stem = format!("fed_{sym}_{tf}_{ts}");
     let pf_path = inbox.join(format!("{stem}.live_portfolio.json"));
-    std::fs::write(&pf_path, portfolio_json).context("write submitted portfolio")?;
+    neoethos_core::storage::json::write_bytes_atomic(&pf_path, portfolio_json.as_bytes())
+        .context("write submitted portfolio")?;
     if let Some(t) = trades_json {
         if serde_json::from_str::<serde_json::Value>(t).is_ok() {
             let _ = std::fs::write(inbox.join(format!("{stem}.trades.json")), t);
@@ -222,6 +217,23 @@ pub fn submit(
         %worker, genes, %saved, "federation: portfolio received into the inbox"
     );
     Ok(saved)
+}
+
+fn validate_submission_portfolio(
+    symbol: &str,
+    base_tf: &str,
+    portfolio_json: &str,
+) -> Result<neoethos_search::LivePortfolioArtifact> {
+    let artifact = neoethos_search::LivePortfolioArtifact::from_persisted_json_bytes(
+        portfolio_json.as_bytes(),
+    )
+    .context("submitted portfolio failed its exact artifact validation")?;
+    anyhow::ensure!(
+        artifact.symbol.eq_ignore_ascii_case(symbol.trim())
+            && artifact.base_tf.eq_ignore_ascii_case(base_tf.trim()),
+        "submitted symbol/baseTf differ from the portfolio's recorded dataset"
+    );
+    Ok(artifact)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -492,10 +504,26 @@ pub fn worker_start(
 
 /// Artifacts under `root` matching the combo and newer than `since_ms`.
 fn find_new_artifacts(root: &PathBuf, symbol: &str, base_tf: &str, since_ms: i64) -> Vec<PathBuf> {
+    find_new_artifacts_with_loader(root, symbol, base_tf, since_ms, |path| {
+        let portfolio = neoethos_search::live_portfolio::load_live_portfolio_json(path)?;
+        Ok((portfolio.symbol, portfolio.base_tf))
+    })
+}
+
+// Filenames are transport identifiers, not symbol/timeframe authority. Discovery
+// uses evidence hashes; the typed loader validates legacy and shared-receipt
+// portfolios before their metadata can select a federation job.
+fn find_new_artifacts_with_loader(
+    root: &PathBuf,
+    symbol: &str,
+    base_tf: &str,
+    since_ms: i64,
+    mut load_identity: impl FnMut(&std::path::Path) -> Result<(String, String)>,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.clone()];
-    let sym = symbol.to_uppercase();
-    let tf = base_tf.to_uppercase();
+    let sym = symbol.trim();
+    let tf = base_tf.trim();
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -519,8 +547,7 @@ fn find_new_artifacts(root: &PathBuf, symbol: &str, base_tf: &str, since_ms: i64
                 .file_name()
                 .map(|f| f.to_string_lossy().to_uppercase())
                 .unwrap_or_default();
-            if !name.ends_with("LIVE_PORTFOLIO.JSON") || !name.contains(&sym) || !name.contains(&tf)
-            {
+            if !name.ends_with("LIVE_PORTFOLIO.JSON") {
                 continue;
             }
             let modified_ms = std::fs::metadata(&p)
@@ -529,7 +556,19 @@ fn find_new_artifacts(root: &PathBuf, symbol: &str, base_tf: &str, since_ms: i64
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            if modified_ms >= since_ms {
+            if modified_ms < since_ms {
+                continue;
+            }
+            let (artifact_symbol, artifact_tf) = match load_identity(&p) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    tracing::warn!(path = %p.display(), %error, "invalid portfolio skipped by federation");
+                    continue;
+                }
+            };
+            if artifact_symbol.trim().eq_ignore_ascii_case(sym)
+                && artifact_tf.trim().eq_ignore_ascii_case(tf)
+            {
                 out.push(p);
             }
         }
@@ -540,6 +579,51 @@ fn find_new_artifacts(root: &PathBuf, symbol: &str, base_tf: &str, since_ms: i64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_scan_uses_validated_identity_not_filename_and_never_resubmits_inbox() {
+        let root = std::env::temp_dir().join(format!(
+            "neoethos-fed-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let inbox = root.join("federation_inbox");
+        std::fs::create_dir(&inbox).unwrap();
+        let hashed = root.join("0123456789abcdef.research.live_portfolio.json");
+        let misleading = root.join("EURUSD_M5.live_portfolio.json");
+        let invalid = root.join("invalid.live_portfolio.json");
+        let unrelated = root.join("not-a-portfolio.json");
+        let received = inbox.join("received.live_portfolio.json");
+        for path in [&hashed, &misleading, &invalid, &unrelated, &received] {
+            std::fs::write(path, b"fixture identity supplied by test loader").unwrap();
+        }
+        let mut loaded = Vec::new();
+        let found = find_new_artifacts_with_loader(&root, " eurusd ", " m5 ", 0, |path| {
+            loaded.push(path.to_path_buf());
+            if path == hashed {
+                Ok(("EURUSD".to_owned(), "M5".to_owned()))
+            } else if path == misleading {
+                Ok(("GBPUSD".to_owned(), "H1".to_owned()))
+            } else {
+                anyhow::bail!("deliberately malformed portfolio")
+            }
+        });
+        assert_eq!(found, vec![hashed]);
+        assert_eq!(loaded.len(), 3);
+        assert!(!loaded.contains(&unrelated));
+        assert!(!loaded.contains(&received));
+        assert!(
+            find_new_artifacts_with_loader(&root, "EURUSD", "M5", i64::MAX, |_| {
+                panic!("old file must be filtered before decoding")
+            })
+            .is_empty()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn queue_lease_and_submit_close_the_loop() {

@@ -1,3 +1,17 @@
+mod combined;
+mod final_holdout;
+pub mod handoff;
+
+pub(crate) use final_holdout::{
+    CombinedResearchReportsDto, load_saved_final_research_context,
+    read_saved_combined_research_reports, read_saved_final_research_reports_with_context,
+};
+#[cfg(test)]
+pub(crate) use final_holdout::{
+    install_saved_research_test_fixture, install_saved_strategy_research_test_fixture,
+    read_saved_final_research_reports,
+};
+
 use crate::app_services::{
     ServiceEvent,
     jobs::{
@@ -8,14 +22,12 @@ use crate::app_services::{
 use anyhow::{Context, Result};
 use neoethos_core::{
     Settings,
-    execution_budget::CpuLease,
     logging::{canonical_log_path, write_subsystem_record},
     sectioned_log::{SectionedRunRecord, SubsystemSection},
 };
 use neoethos_models::{
-    ModelTrainingProgress, PromotionCandidateTrainingHandoffV1,
-    PromotionCandidateTrainingTerminalV1, TrainingOrchestrator, TrainingRunSummary,
-    train_and_deploy_promotion_candidate_v1,
+    ModelTrainingProgress, PromotionCandidateTrainingTerminalV1, TrainingOrchestrator,
+    TrainingRunSummary, train_and_deploy_promotion_candidate_v1,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -28,6 +40,14 @@ pub struct TrainingRequest {
     pub models_dir: PathBuf,
     pub symbol: String,
     pub base_tf: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingMode {
+    #[default]
+    TrainModels,
+    StrategyOnly,
 }
 
 impl TrainingRequest {
@@ -46,29 +66,6 @@ impl TrainingRequest {
         }
         Ok(())
     }
-}
-
-/// Run exact promotion-candidate training without entering the legacy
-/// ambient/current dataset path or translating a typed refusal into Degraded.
-pub fn run_promotion_candidate_training_v1<R>(
-    settings: &Settings,
-    handoff: PromotionCandidateTrainingHandoffV1,
-    candidate_root: &Path,
-    data_root: &Path,
-    lease: &CpuLease,
-    progress_fn: R,
-) -> PromotionCandidateTrainingTerminalV1
-where
-    R: Fn(ModelTrainingProgress) + Send + Sync + Clone + 'static,
-{
-    train_and_deploy_promotion_candidate_v1(
-        settings,
-        handoff,
-        candidate_root,
-        data_root,
-        lease,
-        progress_fn,
-    )
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +133,22 @@ fn backend_progress_percent(
     let done = (completed_models + failed_models) as f32;
     let total = total_models as f32;
     Some((0.7 + 0.15 * (done / total)).clamp(0.7, 0.85))
+}
+
+fn combined_progress_percent(stage: &str, completed: usize, total: usize) -> Option<f32> {
+    let (start, end) = match stage {
+        "search_features" => (0.85, 0.88),
+        "model_features" => (0.88, 0.91),
+        "causal_model_inference" => (0.91, 0.97),
+        "account_replay" => (0.97, 0.99),
+        _ => return None,
+    };
+    let fraction = if total == 0 {
+        0.0
+    } else {
+        completed.min(total) as f32 / total as f32
+    };
+    Some(start + (end - start) * fraction)
 }
 
 fn apply_backend_progress_event(snapshot: &mut JobSnapshot, event: &ModelTrainingProgress) {
@@ -329,6 +342,7 @@ fn completed_snapshot_from(
     } else {
         JobState::Degraded
     };
+    snapshot.progress.percent = Some(1.0);
     let mut warnings = Vec::new();
     if !failed_models.is_empty() {
         warnings.push(format!(
@@ -395,7 +409,7 @@ pub fn failed_snapshot(err: anyhow::Error) -> JobSnapshot {
 }
 
 fn failed_snapshot_from(mut snapshot: JobSnapshot, err: anyhow::Error) -> JobSnapshot {
-    let message = err.to_string();
+    let message = format!("{err:#}");
     snapshot.state = JobState::Failed;
     snapshot.report = JobReport {
         errors: vec![message.clone()],
@@ -434,6 +448,33 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
 
 pub fn start_training_job(
     request: TrainingRequest,
+    tx: mpsc::Sender<ServiceEvent>,
+) -> Result<TrainingJobHandle> {
+    start_training_job_impl(request, None, TrainingMode::TrainModels, tx)
+}
+
+pub fn start_discovery_training_job(
+    request: TrainingRequest,
+    identity: String,
+    tx: mpsc::Sender<ServiceEvent>,
+) -> Result<TrainingJobHandle> {
+    handoff::handoff_path(Path::new("data"), &identity)?;
+    start_training_job_impl(request, Some(identity), TrainingMode::TrainModels, tx)
+}
+
+pub(crate) fn start_strategy_research_job(
+    request: TrainingRequest,
+    identity: String,
+    tx: mpsc::Sender<ServiceEvent>,
+) -> Result<TrainingJobHandle> {
+    handoff::handoff_path(Path::new("data"), &identity)?;
+    start_training_job_impl(request, Some(identity), TrainingMode::StrategyOnly, tx)
+}
+
+fn start_training_job_impl(
+    request: TrainingRequest,
+    handoff_identity: Option<String>,
+    mode: TrainingMode,
     tx: mpsc::Sender<ServiceEvent>,
 ) -> Result<TrainingJobHandle> {
     request.validate()?;
@@ -477,7 +518,7 @@ pub fn start_training_job(
                 snapshot,
                 "operator cancelled training before settings load",
             );
-            send_event(&tx, ServiceEvent::TrainingUpdated(cancelled.clone()));
+            send_terminal_snapshot(&tx, &cancelled).await;
             log_training_event(
                 "ui_training_job",
                 "CANCELLED",
@@ -488,16 +529,38 @@ pub fn start_training_job(
 
         let settings_request = request.clone();
         let settings_and_models = match tokio::task::spawn_blocking(move || {
-            let settings = Settings::from_yaml(&settings_request.config_path)?;
-            let planned_models = settings.models.ml_models.clone();
-            Ok::<_, anyhow::Error>((settings, planned_models))
+            let mut settings = Settings::from_yaml(&settings_request.config_path)?;
+            let selected = handoff_identity
+                .as_deref()
+                .map(|identity| handoff::load(&settings.system.data_dir, identity))
+                .transpose()?;
+            let planned_models = if let Some(selected) = &selected {
+                settings = handoff::settings_for_series(&settings, selected.canonical_series());
+                anyhow::ensure!(
+                    settings_request.symbol == settings.system.symbol
+                        && settings_request.base_tf == selected.base_timeframe().as_str(),
+                    "Training request labels differ from the selected handoff"
+                );
+                if mode == TrainingMode::TrainModels {
+                    selected.validate_against_settings_v1(&settings)?;
+                    selected.training_config().planned_models().to_vec()
+                } else {
+                    // load() already validated the complete sealed handoff.
+                    // Strategy-only research uses its archived policy/recipe,
+                    // not ambient model settings or a new model hardware plan.
+                    Vec::new()
+                }
+            } else {
+                settings.models.ml_models.clone()
+            };
+            Ok::<_, anyhow::Error>((settings, planned_models, selected))
         })
         .await
         {
             Ok(Ok(parts)) => parts,
             Ok(Err(err)) => {
                 let failed = failed_snapshot_from(snapshot, err);
-                send_event(&tx, ServiceEvent::TrainingUpdated(failed.clone()));
+                send_terminal_snapshot(&tx, &failed).await;
                 log_training_event("ui_training_job", "FAILED", failed.report.summary.clone());
                 return;
             }
@@ -506,13 +569,36 @@ pub fn start_training_job(
                     snapshot,
                     anyhow::anyhow!("training settings join error: {err}"),
                 );
-                send_event(&tx, ServiceEvent::TrainingUpdated(failed.clone()));
+                send_terminal_snapshot(&tx, &failed).await;
                 log_training_event("ui_training_job", "FAILED", failed.report.summary.clone());
                 return;
             }
         };
 
-        let (settings, planned_models) = settings_and_models;
+        let (settings, planned_models, selected_handoff) = settings_and_models;
+
+        if mode == TrainingMode::StrategyOnly {
+            let Some(selected) = selected_handoff else {
+                let failed = failed_snapshot_from(
+                    snapshot,
+                    anyhow::anyhow!(
+                        "strategy-only final research requires an exact Discovery handoff"
+                    ),
+                );
+                send_terminal_snapshot(&tx, &failed).await;
+                return;
+            };
+            run_strategy_research_job(
+                settings,
+                request.models_dir.join("candidates"),
+                selected,
+                cancel,
+                snapshot,
+                tx,
+            )
+            .await;
+            return;
+        }
 
         snapshot.progress = JobProgress {
             percent: Some(0.35),
@@ -553,7 +639,7 @@ pub fn start_training_job(
                 snapshot,
                 "operator cancelled training before backend execution",
             );
-            send_event(&tx, ServiceEvent::TrainingUpdated(cancelled.clone()));
+            send_terminal_snapshot(&tx, &cancelled).await;
             log_training_event(
                 "ui_training_job",
                 "CANCELLED",
@@ -602,32 +688,126 @@ pub fn start_training_job(
         // Install the cancel flag the training loop polls between models so Stop
         // halts training mid-run (single-instance → a process-global is safe).
         neoethos_models::set_training_cancel(Some(cancel.cancel_arc()));
+        let combined_cancel = cancel.clone();
+        let combined_snapshot = Arc::clone(&live_snapshot);
+        let combined_tx = tx.clone();
         let train_result = tokio::task::spawn_blocking(move || {
             let installed = neoethos_core::execution_budget::installed_process_budget()
                 .context("training requires the immutable process CPU budget")?;
             let width = installed.resolved().effective_worker_limit;
             let lease = installed
                 .broker()
-                .acquire(neoethos_core::execution_budget::CpuPermitRequest::local(
-                    width,
-                ))
+                .acquire_cancellable(
+                    neoethos_core::execution_budget::CpuPermitRequest::local(width),
+                    combined_cancel.cpu_budget_token(),
+                )
                 .context("acquire process CPU budget for model training")?;
-            let orchestrator =
-                TrainingOrchestrator::new(settings, train_request.models_dir.clone());
-            orchestrator.train_symbol_with_progress(
-                &train_request.symbol,
-                &train_request.base_tf,
-                &lease,
-                move |event| {
-                    if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
-                        apply_backend_progress_event(&mut snapshot, &event);
-                        send_event(
-                            &tx_progress,
-                            ServiceEvent::TrainingUpdated(snapshot.clone()),
-                        );
+            let progress = move |event| {
+                if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
+                    apply_backend_progress_event(&mut snapshot, &event);
+                    send_event(
+                        &tx_progress,
+                        ServiceEvent::TrainingUpdated(snapshot.clone()),
+                    );
+                }
+            };
+            if let Some(handoff) = selected_handoff {
+                let identity = handoff.identity_sha256()?;
+                let candidate_root = train_request.models_dir.join("candidates");
+                let terminal = train_and_deploy_promotion_candidate_v1(
+                    &settings,
+                    handoff,
+                    &candidate_root,
+                    &settings.system.data_dir,
+                    &lease,
+                    progress,
+                );
+                let manifest = match terminal {
+                    PromotionCandidateTrainingTerminalV1::Installed(manifest)
+                    | PromotionCandidateTrainingTerminalV1::ExistingIdentical(manifest) => manifest,
+                    PromotionCandidateTrainingTerminalV1::Refused(error) => {
+                        return Err(error.into());
                     }
-                },
-            )
+                };
+                let model_names = manifest
+                    .model_artifacts()
+                    .iter()
+                    .map(|model| model.model_name().to_owned())
+                    .collect::<Vec<_>>();
+                let installed_path = candidate_root.join(manifest.candidate_relative_dir());
+                neoethos_core::storage::json::write_json_atomic(
+                    candidate_root.join(format!("{identity}.manifest.json")),
+                    &manifest,
+                )?;
+                // Training output and the inference consumer must meet here:
+                // never call a saved candidate usable while the loader still
+                // reads an unrelated legacy models/<symbol>/<tf> directory.
+                // Keep the manifest if loading fails so the actual trained
+                // output remains identifiable and the failure is diagnosable.
+                let ensemble = neoethos_models::ensemble_inference::bootstrap::build_ensemble_for_candidate(
+                    &candidate_root,
+                    &manifest,
+                    &settings,
+                )
+                .with_context(|| format!(
+                    "candidate models were saved at {}, but their ensemble could not load; combined validation and deployment remain unavailable",
+                    installed_path.display()
+                ))?;
+                tracing::info!(
+                    candidate = %identity,
+                    models = model_names.len(),
+                    voters = ensemble.voting_expert_count(),
+                    "exact candidate models reloaded through inference adapters; combined OOS validation is still required"
+                );
+                // The training lease cannot remain reserved while the next
+                // phase acquires/splits the same process CPU capacity.
+                drop(lease);
+                let report_path = combined::evaluate_candidate(
+                    &settings,
+                    &candidate_root,
+                    &manifest,
+                    &ensemble,
+                    &combined_cancel,
+                    &|stage, completed, total| {
+                        if let Ok(mut snapshot) = combined_snapshot.lock() {
+                            let Some(percent) = combined_progress_percent(stage, completed, total) else {
+                                return;
+                            };
+                            let stage = format!("combined_{stage}");
+                            if snapshot.progress.percent.is_some_and(|old| old > percent)
+                            {
+                                return;
+                            }
+                            snapshot.progress = JobProgress {
+                                stage,
+                                percent: Some(percent),
+                                message: format!("combined strategy/model bar research: {completed}/{total}"),
+                            };
+                            send_event(&combined_tx, ServiceEvent::TrainingUpdated(snapshot.clone()));
+                        }
+                    },
+                ).with_context(|| format!(
+                    "candidate models remain saved at {}, but combined bar research failed; no combined result or promotion is claimed",
+                    installed_path.display()
+                ))?;
+                Ok((
+                    TrainingRunSummary {
+                        planned_models: model_names.clone(),
+                        completed_models: model_names,
+                        failed_models: Vec::new(),
+                    },
+                    Some((installed_path, report_path)),
+                ))
+            } else {
+                TrainingOrchestrator::new(settings, train_request.models_dir.clone())
+                    .train_symbol_with_progress(
+                        &train_request.symbol,
+                        &train_request.base_tf,
+                        &lease,
+                        progress,
+                    )
+                    .map(|summary| (summary, None))
+            }
         })
         .await;
         // Clear the training cancel flag now the blocking run has returned.
@@ -644,7 +824,7 @@ pub fn start_training_job(
                 base_snapshot,
                 "operator cancelled training during model training",
             );
-            send_event(&tx, ServiceEvent::TrainingUpdated(cancelled.clone()));
+            send_terminal_snapshot(&tx, &cancelled).await;
             log_training_event(
                 "ui_training_job",
                 "CANCELLED",
@@ -654,13 +834,24 @@ pub fn start_training_job(
         }
 
         match train_result {
-            Ok(Ok(summary)) => {
+            Ok(Ok((summary, installed_path))) => {
                 let base_snapshot = live_snapshot
                     .lock()
                     .map(|snapshot| snapshot.clone())
                     .unwrap_or(snapshot);
-                let completed = completed_snapshot_from_run_summary(base_snapshot, summary);
-                send_event(&tx, ServiceEvent::TrainingUpdated(completed.clone()));
+                let mut completed = completed_snapshot_from_run_summary(base_snapshot, summary);
+                if let Some((path, report_path)) = installed_path {
+                    completed
+                        .report
+                        .highlights
+                        .push(("candidate_models".to_owned(), path.display().to_string()));
+                    completed.report.highlights.push((
+                        "combined_bar_research".to_owned(),
+                        report_path.display().to_string(),
+                    ));
+                    completed.report.summary.push_str(&format!("; candidate models installed at {}; gene-only and combined model bar research saved at {} (reserved final window, not broker/live admission)", path.display(), report_path.display()));
+                }
+                send_terminal_snapshot(&tx, &completed).await;
                 log_training_event(
                     "ui_training_job",
                     "SUCCESS",
@@ -673,7 +864,7 @@ pub fn start_training_job(
                     .map(|snapshot| snapshot.clone())
                     .unwrap_or(snapshot);
                 let failed = failed_snapshot_from(base_snapshot, err);
-                send_event(&tx, ServiceEvent::TrainingUpdated(failed.clone()));
+                send_terminal_snapshot(&tx, &failed).await;
                 log_training_event("ui_training_job", "FAILED", failed.report.summary.clone());
             }
             Err(err) => {
@@ -685,13 +876,132 @@ pub fn start_training_job(
                     base_snapshot,
                     anyhow::anyhow!("training join error: {err}"),
                 );
-                send_event(&tx, ServiceEvent::TrainingUpdated(failed.clone()));
+                send_terminal_snapshot(&tx, &failed).await;
                 log_training_event("ui_training_job", "FAILED", failed.report.summary.clone());
             }
         }
     });
 
     Ok(handle)
+}
+
+async fn run_strategy_research_job(
+    settings: Settings,
+    candidate_root: PathBuf,
+    handoff: neoethos_models::PromotionCandidateTrainingHandoffV1,
+    cancel: CancellationFlag,
+    mut snapshot: JobSnapshot,
+    tx: mpsc::Sender<ServiceEvent>,
+) {
+    snapshot.progress = JobProgress {
+        percent: Some(0.35),
+        stage: "strategy_search_features".to_owned(),
+        message: "reconstructing saved strategy features for the reserved final window".to_owned(),
+    };
+    snapshot
+        .report
+        .highlights
+        .push(("evaluation_mode".to_owned(), "strategy_only".to_owned()));
+    snapshot.report.summary =
+        "evaluating locked strategies without model training or inference".to_owned();
+    send_event(&tx, ServiceEvent::TrainingUpdated(snapshot.clone()));
+    let observed = Arc::new(Mutex::new(snapshot.clone()));
+    let progress_snapshot = Arc::clone(&observed);
+    let progress_tx = tx.clone();
+    let worker_cancel = cancel.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        combined::evaluate_strategies(
+            &settings,
+            &candidate_root,
+            &handoff,
+            &worker_cancel,
+            &|stage, completed, total| {
+                let Some(percent) = strategy_progress_percent(stage, completed, total) else {
+                    return;
+                };
+                if let Ok(mut current) = progress_snapshot.lock() {
+                    if current.progress.percent.is_some_and(|old| old > percent) {
+                        return;
+                    }
+                    current.progress = JobProgress {
+                        percent: Some(percent),
+                        stage: format!("strategy_{stage}"),
+                        message: format!(
+                            "strategy-only final research: {stage} {completed}/{total}"
+                        ),
+                    };
+                    send_event(&progress_tx, ServiceEvent::TrainingUpdated(current.clone()));
+                }
+            },
+        )
+    })
+    .await;
+    let snapshot = observed
+        .lock()
+        .map(|current| current.clone())
+        .unwrap_or(snapshot);
+    let terminal = if cancel.is_requested() {
+        cancelled_snapshot_from(snapshot, "operator cancelled strategy-only final research")
+    } else {
+        match result {
+            Ok(Ok(path)) => {
+                let mut completed = snapshot;
+                completed.state = JobState::Succeeded;
+                completed.progress = JobProgress {
+                    percent: Some(1.0),
+                    stage: "strategy_research_completed".to_owned(),
+                    message: "strategy-only final research saved; no promotion or live admission"
+                        .to_owned(),
+                };
+                completed.report.highlights.push((
+                    "strategy_bar_research".to_owned(),
+                    path.display().to_string(),
+                ));
+                completed.report.summary = format!(
+                    "locked strategies evaluated on the reserved final window; report saved at {} (research only; no models trained or trading permission)",
+                    path.display()
+                );
+                completed
+            }
+            Ok(Err(error)) => failed_snapshot_from(
+                snapshot,
+                error.context("strategy-only final research failed"),
+            ),
+            Err(error) => failed_snapshot_from(
+                snapshot,
+                anyhow::anyhow!("strategy-only final research worker failed: {error}"),
+            ),
+        }
+    };
+    send_terminal_snapshot(&tx, &terminal).await;
+    log_training_event(
+        "ui_strategy_research",
+        &format!("{:?}", terminal.state),
+        terminal.report.summary.clone(),
+    );
+}
+
+fn strategy_progress_percent(stage: &str, completed: usize, total: usize) -> Option<f32> {
+    let (start, end) = match stage {
+        "search_features" => (0.35, 0.9),
+        "account_replay" => (0.9, 0.99),
+        _ => return None,
+    };
+    let fraction = if total == 0 {
+        0.0
+    } else {
+        completed.min(total) as f32 / total as f32
+    };
+    Some(start + (end - start) * fraction)
+}
+
+async fn send_terminal_snapshot(tx: &mpsc::Sender<ServiceEvent>, snapshot: &JobSnapshot) {
+    if let Err(error) = tx
+        .send(ServiceEvent::TrainingUpdated(snapshot.clone()))
+        .await
+    {
+        tracing::error!(%error, "Training terminal receiver is closed");
+    }
 }
 
 fn send_event(tx: &mpsc::Sender<ServiceEvent>, event: ServiceEvent) {
@@ -792,6 +1102,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn training_terminal_waits_for_capacity_and_survives_progress_backpressure() {
+        for terminal in [
+            cancelled_snapshot("operator stop"),
+            failed_snapshot(anyhow::anyhow!("model failure")),
+            completed_snapshot(vec!["xgboost".to_owned()], Vec::new()),
+        ] {
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(ServiceEvent::TrainingUpdated(JobSnapshot::new(
+                JobKind::Training,
+            )))
+            .await
+            .unwrap();
+            let expected = terminal.clone();
+            let delivery = tokio::spawn(async move {
+                send_terminal_snapshot(&tx, &terminal).await;
+            });
+            tokio::task::yield_now().await;
+            assert!(!delivery.is_finished());
+            rx.recv().await.unwrap();
+            let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let ServiceEvent::TrainingUpdated(delivered) = delivered else {
+                panic!("wrong event")
+            };
+            assert_eq!(delivered, expected);
+            delivery.await.unwrap();
+        }
+    }
+
     #[test]
     fn completed_training_snapshot_keeps_completed_and_failed_models() {
         let snapshot = completed_snapshot(
@@ -849,6 +1191,88 @@ mod tests {
         );
         assert!(snapshot.report.summary.contains("xgboost"));
         assert!(snapshot.report.summary.contains("mlp"));
+    }
+
+    #[test]
+    fn combined_progress_occupies_ordered_final_phases_without_restarting_or_finishing_early() {
+        let mut previous = backend_progress_percent(3, 0, 3).unwrap();
+        for stage in [
+            "search_features",
+            "model_features",
+            "causal_model_inference",
+            "account_replay",
+        ] {
+            for done in [0, 1, 2] {
+                let current = combined_progress_percent(stage, done, 2).unwrap();
+                assert!(
+                    current >= previous && current < 1.0,
+                    "{stage}: {previous} -> {current}"
+                );
+                previous = current;
+            }
+        }
+        assert_eq!(previous, 0.99);
+        assert_eq!(
+            combined_progress_percent("search_features", 99, 2),
+            Some(0.88)
+        );
+        assert_eq!(
+            combined_progress_percent("model_features", 0, 0),
+            Some(0.88)
+        );
+        assert_eq!(combined_progress_percent("unknown", 1, 1), None);
+        assert_eq!(
+            completed_snapshot(vec!["xgboost".into()], vec![])
+                .progress
+                .percent,
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn strategy_progress_tracks_features_and_replay_without_a_model_phase() {
+        let mut previous = 0.35;
+        for stage in ["search_features", "account_replay"] {
+            for done in [0, 1, 2] {
+                let current = strategy_progress_percent(stage, done, 2).unwrap();
+                assert!(current >= previous && current < 1.0, "{stage}: {current}");
+                previous = current;
+            }
+        }
+        assert_eq!(previous, 0.99);
+        assert_eq!(
+            strategy_progress_percent("search_features", 99, 2),
+            Some(0.9)
+        );
+        assert_eq!(strategy_progress_percent("account_replay", 0, 0), Some(0.9));
+        for unentered in ["model_features", "causal_model_inference", "unknown"] {
+            assert_eq!(strategy_progress_percent(unentered, 1, 1), None);
+        }
+    }
+
+    #[test]
+    fn training_failure_keeps_the_causal_error_chain_in_the_ui_report() {
+        let error = anyhow::anyhow!("fitted column bits differ")
+            .context("validate expert input")
+            .context("candidate saved but combined research failed");
+        let snapshot = failed_snapshot(error);
+        for detail in [
+            "candidate saved",
+            "validate expert input",
+            "fitted column bits differ",
+        ] {
+            assert!(snapshot.report.summary.contains(detail));
+            assert!(snapshot.report.errors[0].contains(detail));
+            assert!(
+                snapshot
+                    .report
+                    .events
+                    .last()
+                    .unwrap()
+                    .message
+                    .contains(detail)
+            );
+        }
     }
 
     #[tokio::test]

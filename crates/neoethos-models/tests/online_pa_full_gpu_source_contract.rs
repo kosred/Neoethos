@@ -1,14 +1,17 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const ADAPTIVE_IMPL: &str = include_str!("../src/streaming/adaptive_impl.rs");
 const REGISTRY: &str = include_str!("../src/registry.rs");
 const LIFECYCLE: &str = include_str!("online_pa_full_gpu_lifecycle.rs");
 
 fn repo_file(path: impl AsRef<Path>) -> String {
-    let path = std::env::current_dir()
-        .expect("current repository directory")
-        .join(path);
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("models crate lives directly below the repository crates directory")
+        .to_path_buf();
+    let path = repository_root.join(path);
     fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 }
@@ -229,9 +232,11 @@ fn superseded_host_update_wrapper_and_cpu_weight_helper_are_test_only() {
         );
     }
     assert!(
-        ADAPTIVE_IMPL
-            .contains("#[cfg(test)]\npub(super) fn clamped_balanced_class_slack_weights_v1"),
-        "CPU class-weight helper must not compile into the production GPU lane"
+        ADAPTIVE_IMPL.contains(concat!(
+            "#[cfg(all(test, any(feature = \"adaptive-models\", feature = \"statistical-gpu\")))]\n",
+            "pub(super) fn clamped_balanced_class_slack_weights_v1"
+        )),
+        "CPU class-weight helper must compile only with a test module that uses it"
     );
 }
 

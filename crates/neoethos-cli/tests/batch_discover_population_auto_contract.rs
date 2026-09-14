@@ -49,6 +49,9 @@ fn tui_forwards_the_population_auto_field_to_batch_discover() {
 
     assert!(form.contains("\"Population auto\""));
     assert!(override_helper.contains("\"--population-auto\""));
-    assert!(launch_body.contains("\"Population auto\""));
-    assert!(launch_body.contains("append_population_auto_override"));
+    let arguments = section(launch, "fn build_launch_args(", "pub fn launch_now");
+    assert!(arguments.contains("\"Population auto\""));
+    assert!(arguments.contains("append_population_auto_override"));
+    assert!(launch_body.contains("build_launch_args(&shared.discover_form)"));
+    assert!(launch_body.contains("shared.jobs.spawn(\"discover\", args)"));
 }

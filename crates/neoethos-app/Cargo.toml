@@ -23,7 +23,7 @@ default = []
 # crate enables it while the shared transport is moved out of the app tree.
 broker-history-service = []
 
-# #205 GPU backends — pick ONE per build.
+# CUDA GPU backend.
 #
 # Pulls cubecl/burn/lightgbm/candle/ort into the appropriate GPU
 # code path. Picking the wrong vendor for the host makes the LINK
@@ -48,20 +48,6 @@ gpu-nvidia-full = [
     "gpu-nvidia",
     "neoethos-models/burn-cuda-backend",
 ]
-gpu-vulkan = [
-    "neoethos-models/gpu-vulkan",
-    "neoethos-search/gpu-vulkan",
-]
-gpu-rocm = [
-    "neoethos-models/gpu-rocm",
-    "neoethos-search/gpu-rocm",
-]
-# `gpu-apple` previously light up llama-cpp(metal) for the Gemma
-# path. With Gemma gone, the AI Helper runs entirely against the
-# ChatGPT subscription API (HTTP), so there is no Metal-accelerated
-# work on Apple Silicon to wire in. Kept as an alias for parity in
-# build matrices; behaves as gpu-vulkan via MoltenVK.
-gpu-apple = ["gpu-vulkan"]
 # REMOVED 2026-08-03: `native-tree-models = ["neoethos-models/tree-models"]`.
 # It had zero `cfg` sites and, more to the point, was a NO-OP: the dependency at
 # line 175 already sets `features = ["pure-rust-ml", "tree-models"]`
@@ -74,6 +60,7 @@ tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
 tracing = "0.1.42"  # aligned with workspace.dependencies (2026-05-26)
 anyhow = "1.0.100"
 chrono = "0.4"
+chrono-tz = "0.10.4"
 # keyring 3.6.3 — backend is OPT-IN per platform feature flag. Without these
 # features the crate falls back to an in-memory MockCredential that does not
 # persist anything (verified 2026-05-20 via --api-test on Windows: tokens

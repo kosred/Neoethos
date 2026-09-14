@@ -1,7 +1,8 @@
 use crate::population_auto_sizing_receipt_v1::{
-    PopulationAutoCpuAuthorityV1, PopulationAutoSizingErrorCodeV1, PopulationAutoSizingRequestV1,
-    PopulationAutoSizingRouteV1, quality_screen_candidate_chunk_v1,
-    recompute_population_auto_receipt_identity_for_test_v1, seal_population_auto_sizing_receipt_v1,
+    CpuPopulationAutoCalibrationV1, PopulationAutoCpuAuthorityV1, PopulationAutoSizingErrorCodeV1,
+    PopulationAutoSizingRequestV1, PopulationAutoSizingRouteV1, population_auto_term_cap_v1,
+    quality_screen_candidate_chunk_v1, recompute_population_auto_receipt_identity_for_test_v1,
+    seal_cpu_population_auto_plan_v1, seal_population_auto_sizing_receipt_v1,
     seal_population_auto_stage1_window_v1,
 };
 
@@ -35,7 +36,29 @@ fn gpu_request() -> PopulationAutoSizingRequestV1 {
             cuda_build_manifest_sha256: sha('5'),
             probe_receipt_identity_sha256: sha('6'),
         },
+        cpu_plan: None,
     }
+}
+
+fn attach_cpu_plan(request: &mut PopulationAutoSizingRequestV1) {
+    let term_cap =
+        population_auto_term_cap_v1(request.feature_count, request.requested_max_indicators)
+            .expect("term cap");
+    request.cpu_plan = Some(
+        seal_cpu_population_auto_plan_v1(
+            CpuPopulationAutoCalibrationV1 {
+                worker_count: 10,
+                calibration_candidates: 40,
+                calibration_elapsed_ns: 1_000_000_000,
+                available_memory_bytes: 64 * 1024 * 1024 * 1024,
+                total_memory_bytes: 64 * 1024 * 1024 * 1024,
+            },
+            request.evaluation_rows,
+            request.month_capacity,
+            term_cap,
+        )
+        .expect("CPU calibration plan"),
+    );
 }
 
 #[test]
@@ -53,7 +76,7 @@ fn native_auto_binds_full_parent_and_stage1_time_extent_without_shrinking() {
 }
 
 #[test]
-fn auto_off_and_cpu_routes_are_typed_and_never_resize() {
+fn auto_off_and_cpu_routes_are_typed_and_exact_cpu_calibration_resizes() {
     let mut request = gpu_request();
     request.population_auto = false;
     let disabled = seal_population_auto_sizing_receipt_v1(request).expect("disabled receipt");
@@ -67,9 +90,10 @@ fn auto_off_and_cpu_routes_are_typed_and_never_resize() {
             inventory_identity_sha256: sha('7'),
         },
     };
+    attach_cpu_plan(&mut request);
     let cpu = seal_population_auto_sizing_receipt_v1(request).expect("CPU receipt");
-    assert_eq!(cpu.resolved_population(), 200);
-    assert_eq!(cpu.resolution_reason(), "cpu_no_compatible_gpu");
+    assert!(cpu.resolved_population() > 200);
+    assert_eq!(cpu.resolution_reason(), "cpu_exact_timeframe_auto_grew");
 
     let mut request = gpu_request();
     request.route = PopulationAutoSizingRouteV1::CpuNoCompatibleGpu {
@@ -77,11 +101,39 @@ fn auto_off_and_cpu_routes_are_typed_and_never_resize() {
             probe_receipt_identity_sha256: sha('8'),
         },
     };
+    attach_cpu_plan(&mut request);
     let legacy = seal_population_auto_sizing_receipt_v1(request).expect("legacy CPU receipt");
     let encoded = serde_json::to_vec(&legacy).expect("serialize legacy CPU receipt");
     let decoded: crate::population_auto_sizing_receipt_v1::PopulationAutoSizingReceiptV1 =
         serde_json::from_slice(&encoded).expect("deserialize legacy CPU receipt");
     decoded.validate().expect("legacy CPU receipt validates");
+
+    let mut request = gpu_request();
+    request.route = PopulationAutoSizingRouteV1::CpuExplicitResearch {
+        contract_identity_sha256: sha('9'),
+        input_receipt_sha256: sha('a'),
+    };
+    attach_cpu_plan(&mut request);
+    let explicit = seal_population_auto_sizing_receipt_v1(request)
+        .expect("explicit canonical CPU research receipt");
+    assert!(explicit.resolved_population() > 200);
+    assert_eq!(
+        explicit.resolution_reason(),
+        "cpu_exact_timeframe_auto_grew"
+    );
+    explicit.validate().expect("explicit CPU receipt validates");
+
+    let mut invalid = gpu_request();
+    invalid.route = PopulationAutoSizingRouteV1::CpuExplicitResearch {
+        contract_identity_sha256: "0".repeat(64),
+        input_receipt_sha256: sha('a'),
+    };
+    attach_cpu_plan(&mut invalid);
+    let error = seal_population_auto_sizing_receipt_v1(invalid).unwrap_err();
+    assert_eq!(
+        error.code(),
+        PopulationAutoSizingErrorCodeV1::InvalidReceipt
+    );
 }
 
 #[test]

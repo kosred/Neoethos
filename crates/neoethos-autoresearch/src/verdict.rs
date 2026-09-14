@@ -169,6 +169,63 @@ impl UnreachableCheck {
     }
 }
 
+/// U2, separated so its two no-champion cases remain directly testable.
+///
+/// No champion can mean either that a genuinely searched space produced no
+/// passing result, or that work never ran / could not be judged. Only the first
+/// is evidence. `judged_live_searches` therefore counts executed live searches
+/// with a real `Passed` or `Failed` verdict; it excludes refusals, infrastructure
+/// errors, controls and `Unavailable` screens.
+fn u2_condition(
+    best: Option<f64>,
+    q95: Option<f64>,
+    null_observations: usize,
+    judged_live_searches: usize,
+) -> UnreachableCondition {
+    match (best, q95) {
+        (Some(b), Some(q)) => UnreachableCondition {
+            id: "U2".to_string(),
+            satisfied: b <= q,
+            detail: format!(
+                "best live E_screen_pess {b:+.4} pips vs Q_0.95(shuffle null) {q:+.4} pips"
+            ),
+        },
+        (None, Some(q)) => {
+            let required = crate::K_MIN * crate::SWEEP_SEARCHES;
+            let enough_evidence = judged_live_searches >= required;
+            UnreachableCondition {
+                id: "U2".to_string(),
+                satisfied: enough_evidence,
+                detail: if enough_evidence {
+                    format!(
+                        "{judged_live_searches} live searches ran and were judged, and NOT ONE \
+                         produced a champion; Q_0.95(shuffle null) = {q:+.4} pips. Silence after \
+                         the required {required} judged searches is evidence about the searched \
+                         space."
+                    )
+                } else {
+                    format!(
+                        "no live sweep produced a screened E_screen_pess, but only \
+                         {judged_live_searches} executed live search(es) received a real verdict; \
+                         {required} are required before silence can mean anything. Q_0.95 = \
+                         {q:+.4}. Refused, errored, control and unavailable screens are not \
+                         evidence about the searched market space."
+                    )
+                },
+            }
+        }
+        (_, None) => UnreachableCondition {
+            id: "U2".to_string(),
+            satisfied: false,
+            detail: format!(
+                "the shuffle null holds {null_observations} observation(s) and needs {}, so \
+                 'never beat its own noise' is not yet a statement that can be made.",
+                crate::MIN_NULL_OBS
+            ),
+        },
+    }
+}
+
 /// Evaluate U1–U4, each checkable, each with its numbers.
 ///
 /// **Every condition is evaluated even after one fails.** A short-circuit would
@@ -198,34 +255,12 @@ pub fn check_unreachable(session: &Session, _th: &JudgeThresholds) -> Unreachabl
     // an unsupported claim is not a refutation.
     let null = ShuffleNull::from_session(session);
     let best = session.best_ever.as_ref().map(|b| b.e_screen_pess);
-    conditions.push(match (best, null.quantile_95()) {
-        (Some(b), Some(q)) => UnreachableCondition {
-            id: "U2".to_string(),
-            satisfied: b <= q,
-            detail: format!(
-                "best live E_screen_pess {b:+.4} pips vs Q_0.95(shuffle null) {q:+.4} pips"
-            ),
-        },
-        (None, Some(q)) => UnreachableCondition {
-            id: "U2".to_string(),
-            satisfied: false,
-            detail: format!(
-                "no sweep ever produced a screened E_screen_pess, so there is nothing to compare \
-                 against Q_0.95 = {q:+.4}. That is a wiring or data finding, NOT evidence that \
-                 the space holds no edge."
-            ),
-        },
-        (_, None) => UnreachableCondition {
-            id: "U2".to_string(),
-            satisfied: false,
-            detail: format!(
-                "the shuffle null holds {} observation(s) and needs {}, so 'never beat its own \
-                 noise' is not yet a statement that can be made.",
-                null.len(),
-                crate::MIN_NULL_OBS
-            ),
-        },
-    });
+    conditions.push(u2_condition(
+        best,
+        null.quantile_95(),
+        null.len(),
+        session.live_searches_judged(),
+    ));
 
     // U3 — the blocks were mostly indistinguishable from their controls.
     let blocks = session.blocks.len();
@@ -960,6 +995,26 @@ mod tests {
                 .unwrap()
                 .satisfied
         );
+    }
+
+    #[test]
+    fn no_champion_is_a_refutation_only_after_enough_live_searches_were_judged() {
+        let required = crate::K_MIN * crate::SWEEP_SEARCHES;
+
+        let enough = u2_condition(None, Some(0.5), crate::MIN_NULL_OBS, required);
+        assert!(enough.satisfied, "{}", enough.detail);
+
+        let too_few = u2_condition(
+            None,
+            Some(0.5),
+            crate::MIN_NULL_OBS,
+            required.saturating_sub(1),
+        );
+        assert!(!too_few.satisfied, "{}", too_few.detail);
+        assert!(too_few.detail.contains("are not evidence"));
+
+        let no_null = u2_condition(None, None, 0, required * 2);
+        assert!(!no_null.satisfied, "{}", no_null.detail);
     }
 
     #[test]

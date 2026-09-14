@@ -1584,24 +1584,13 @@ extern "C" __global__ void neoethos_vwma_batch_f64(
 
 // ============================================================================
 // NATR — reference: natr.rs::natr_scalar
-//   warm = first_valid + period - 1
-//   NOT "atr divided by close": the seed differs from `atr`'s and so does the
-//   NaN behaviour of its true range. natr seeds with
-//   `sum_tr = high[first] - low[first]`, adds true ranges over (first, warm],
-//   divides by period once, and then smooths with a SINGLE FUSED operation:
-//   `atr = (tr - atr).mul_add(inv_p, atr)` (natr.rs:344/354/364/374 in the
-//   4x-unrolled body and natr.rs:392 in the tail) -> `fma(tr - atr, inv_p, atr)`.
-//   NOT `(atr * (period - 1) + tr) / period`, which is algebraically equal and
-//   three roundings instead of one. Inside a recursion that difference does not
-//   stay at 1 ULP; it compounds over every bar of the series. Same trap as
-//   `atr` twelve hundred lines up, different indicator.
-//   The true range uses Rust's `.max()` chain, i.e. `f64::max`, which returns
-//   the NON-NaN operand — so `fmax` is correct here. `atr.rs` instead uses
-//   explicit `if (x > tr)` comparisons, where a NaN comparison is false and the
-//   earlier value survives. Same numbers on clean data, different numbers on a
-//   NaN bar, and carrying one convention into the other is invisible until a
-//   gap appears in live data.
-//   A zero or non-finite close yields NaN, not an infinity.
+//   TA-Lib lookback is exactly `period`: the seed consumes TR[first+1..=
+//   first+period], because every True Range needs the preceding close.
+//   True Range starts from high-low and conditionally replaces it with the two
+//   previous-close distances in that order. Wilder smoothing is three separate
+//   operations (multiply, add, divide); `-fmad=false` prevents contraction.
+//   Period one emits raw True Range. For larger periods an exact zero close
+//   emits 0.0, while every nonzero close — however small — is a real divisor.
 // ============================================================================
 extern "C" __global__ void neoethos_natr_batch_f64(
     const double* __restrict__ high,
@@ -1620,34 +1609,45 @@ extern "C" __global__ void neoethos_natr_batch_f64(
     double* row = out + (size_t)r * (size_t)n;
     if (period <= 0 || first_valid < 0 || first_valid >= n) { neo_fill_warmup(row, n, n); return; }
 
-    const int warm_end = first_valid + period - 1;
+    const int warm_end = first_valid + period;
     neo_fill_warmup(row, n, warm_end);
     if (warm_end >= n) return;
 
-    const double inv_p = 1.0 / (double)period;
-
-    double sum_tr = high[first_valid] - low[first_valid];
+    double sum_tr = 0.0;
     for (int i = first_valid + 1; i <= warm_end; ++i) {
         const double hi = high[i];
         const double lo = low[i];
         const double pc = close[i - 1];
-        const double tr = fmax(fmax(hi - lo, fabs(hi - pc)), fabs(lo - pc));
-        sum_tr += tr;
+        double greatest = hi - lo;
+        const double high_distance = fabs(pc - hi);
+        if (high_distance > greatest) greatest = high_distance;
+        const double low_distance = fabs(pc - lo);
+        if (low_distance > greatest) greatest = low_distance;
+        sum_tr += greatest;
     }
 
-    double atr = sum_tr * inv_p;
+    double atr = sum_tr / (double)period;
     const double c_we = close[warm_end];
-    row[warm_end] = (neo_is_finite(c_we) && c_we != 0.0) ? ((atr / c_we) * 100.0) : neo_qnan();
+    if (period <= 1) row[warm_end] = atr;
+    else if (c_we == 0.0) row[warm_end] = 0.0;
+    else row[warm_end] = (atr / c_we) * 100.0;
 
     for (int i = warm_end + 1; i < n; ++i) {
         const double hi = high[i];
         const double lo = low[i];
         const double pc = close[i - 1];
-        const double tr = fmax(fmax(hi - lo, fabs(hi - pc)), fabs(lo - pc));
-        // natr.rs:392 `atr = (tr - atr).mul_add(inv_p, atr)` — ONE rounding.
-        atr = fma(tr - atr, inv_p, atr);
+        double greatest = hi - lo;
+        const double high_distance = fabs(pc - hi);
+        if (high_distance > greatest) greatest = high_distance;
+        const double low_distance = fabs(pc - lo);
+        if (low_distance > greatest) greatest = low_distance;
+        atr *= (double)(period - 1);
+        atr += greatest;
+        atr /= (double)period;
         const double c = close[i];
-        row[i] = (neo_is_finite(c) && c != 0.0) ? ((atr / c) * 100.0) : neo_qnan();
+        if (period <= 1) row[i] = atr;
+        else if (c == 0.0) row[i] = 0.0;
+        else row[i] = (atr / c) * 100.0;
     }
 }
 

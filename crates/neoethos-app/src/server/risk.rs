@@ -325,24 +325,11 @@ pub async fn update_preset(
 
     settings.risk.daily_drawdown_limit = next_daily;
     settings.risk.total_drawdown_limit = next_total;
-    // #294 — `monthly_profit_target_pct` is WrittenNeverRead: this line assigns
-    // it and the only readers (`domain::risk::PropFirmRules` /
-    // `RiskManager::monthly_profit_target_pct`) build from `PropFirmConstraints`
-    // directly, never from `Settings`. DECISION TAKEN 2026-08-09: **keep the
-    // write, do not wire a reader here.** Reasons, in order:
-    //   1. The value is a firm-published constraint, not an operator preference,
-    //      so seeding it from the preset matches `config.rs:531` exactly — the
-    //      loader and this writer agree, which is the property #213 lost.
-    //   2. The only candidate reader is `RiskManager` (`domain/risk.rs:332`),
-    //      which has **no production constructor at all** (#137) and is under an
-    //      explicit operator hold: wiring it changes live position sizing on a
-    //      funded account. Giving this field a reader means wiring that, and
-    //      that is not a code-tidying decision.
-    // Consequence to be honest about: setting a monthly profit target from the
-    // UI still changes nothing at runtime, and a preset switch still overwrites
-    // whatever was there. The ledger entry in
-    // `crates/neoethos-core/tests/config_has_recipient.rs:200-207` remains
-    // accurate (`Inert::WrittenNeverRead`, OWNER: operator) and needs no edit.
+    // #294 RESOLVED 2026-08-30 — preset changes seed the published monthly
+    // target here, and the live account-risk authority validates and consumes
+    // it through its sole `RiskManager`. In challenge mode the phase target applies;
+    // outside challenge mode this is the closed-balance monthly stop. A custom
+    // value may still be entered after selecting the preset.
     settings.risk.monthly_profit_target_pct = constraints.monthly_profit_target();
 
     if let Err(err) = settings.save(config_path()) {

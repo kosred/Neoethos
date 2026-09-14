@@ -37,6 +37,81 @@ fn require_all(source: &str, required: &[&str]) {
     }
 }
 
+fn compact(source: &str) -> String {
+    source.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn assert_live_feature_metadata_binding(source: &str) {
+    let validator = compact(section(
+        source,
+        "pub(crate) fn validate_strict_resident_feature_store_v3(",
+        "\n}",
+    ));
+    assert!(validator.contains(
+        "scope.receipt().validate_against_store(&anchor,sealed_store).context(\"bindexactcanonicalplanandfittedstatetothesealedDatastore\")?;"
+    ));
+    let sealed_bind = compact(section(
+        source,
+        "pub(crate) fn bind_strict_resident_feature_store_v3_run_input(",
+        "\n}",
+    ));
+    let validate_at = sealed_bind
+        .find("validate_strict_resident_feature_store_v3(&sealed_store,scope)?;")
+        .expect("checked exact Data-store validation");
+    let import_at = sealed_bind
+        .find(".into_resident_feature_store_import_v3()")
+        .expect("consuming Data import");
+    assert!(validate_at < import_at);
+
+    let raw_bind = compact(section(
+        source,
+        "pub(crate) fn bind_resident_feature_store_v3(",
+        "\n}",
+    ));
+    let guard_at = raw_bind
+        .find("ifscope.receipt().feature_plan_canonical_bytes().is_none(){bail!(\"residentV3importrequiresaretainedcanonicalfeatureplan\");}")
+        .expect("legacy opaque metadata must not authorize a native run");
+    let consume_at = raw_bind
+        .find(".consume_into_population_session_v3()")
+        .expect("native population consumption");
+    assert!(guard_at < consume_at);
+}
+
+#[test]
+fn exact_portable_metadata_is_checked_before_data_and_population_consumption() {
+    assert_live_feature_metadata_binding(&read("src/strict_resident_feature_store_v3.rs"));
+}
+
+#[test]
+fn portable_metadata_guard_removal_or_legacy_wildcard_is_detected() {
+    let source = read("src/strict_resident_feature_store_v3.rs");
+    for (from, to) in [
+        (
+            ".validate_against_store(&anchor, sealed_store)",
+            ".validate_without_store(&anchor, sealed_store)",
+        ),
+        (
+            ".context(\"bind exact canonical plan and fitted state to the sealed Data store\")?;",
+            ".context(\"bind exact canonical plan and fitted state to the sealed Data store\");",
+        ),
+        (
+            "validate_strict_resident_feature_store_v3(&sealed_store, scope)?;",
+            "validate_strict_resident_feature_store_v3(&sealed_store, scope);",
+        ),
+        (
+            "feature_plan_canonical_bytes().is_none()",
+            "feature_plan_canonical_bytes().is_some()",
+        ),
+    ] {
+        assert!(source.contains(from), "missing negative-control mutation");
+        let changed = source.replacen(from, to, 1);
+        assert!(
+            std::panic::catch_unwind(|| assert_live_feature_metadata_binding(&changed)).is_err(),
+            "portable metadata contract missed {from:?}"
+        );
+    }
+}
+
 #[test]
 fn strict_gpu_run_consumes_the_opaque_v3_import_through_gpu_cuda_owned_binding() {
     let bind = read("src/strict_resident_feature_store_v3.rs");
@@ -162,7 +237,12 @@ fn run_owns_the_bound_session_until_exact_consumer_completion_is_recorded() {
     let evidence = read("src/population_execution_evidence_v1.rs");
     let run = section(
         &bind,
-        "pub(crate) struct StrictResidentPopulationExecutionRunV3 {",
+        "pub struct StrictResidentPopulationExecutionRunV3 {",
+        "\n}",
+    );
+    let host_v1_run = section(
+        &evidence,
+        "pub(crate) struct ExactPopulationExecutionRunV1<'a> {",
         "\n}",
     );
 
@@ -187,9 +267,9 @@ fn run_owns_the_bound_session_until_exact_consumer_completion_is_recorded() {
         "a default native run could detach residency from the sealed route"
     );
     assert!(
-        !evidence.contains("resident_feature_store_session_v3")
-            && !evidence.contains("parent_row_count")
-            && !evidence.contains("parent_feature_count"),
+        !host_v1_run.contains("resident_feature_store_session_v3")
+            && !host_v1_run.contains("parent_row_count")
+            && !host_v1_run.contains("parent_feature_count"),
         "the host V1 execution run must not retain native V3 residency state"
     );
 }
@@ -202,8 +282,9 @@ fn strict_bind_checks_exact_scope_shape_and_route_identity_before_native_reads()
         "pub(crate) fn bind_resident_feature_store_v3(",
         "\n}",
     );
+    let function = compact(function);
     require_all(
-        function,
+        &function,
         &[
             "scope.evaluated_window()",
             "resident_import.rows()",
@@ -248,8 +329,17 @@ fn gpu_cuda_owned_wrapper_retains_population_session_import_and_completion_lease
         &[
             "self",
             "Result<ResidentPopulationSessionV3",
-            "bind_resident_feature_store_v3",
+            "bind_population_after_data_transient_retirement_v1",
         ],
+    );
+    let bind_after_retirement = section(
+        &resident,
+        "fn bind_population_after_data_transient_retirement_v1(",
+        "\n}",
+    );
+    require_all(
+        bind_after_retirement,
+        &["PopulationSession::bind_resident_feature_store_v3"],
     );
     assert!(
         !consume.contains("&self"),

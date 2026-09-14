@@ -141,6 +141,7 @@ fn runtime(
             position_id: 77,
             symbol_id: 7,
             trade_side: "BUY".to_string(),
+            volume_raw_centi_units: 1_000_000,
             volume: 10_000.0,
             open_timestamp_ms: Some(1_799_999_000_000),
             price: Some(1.1000),

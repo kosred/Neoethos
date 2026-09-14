@@ -7,8 +7,15 @@ use neoethos_gpu_contracts::device::{
 };
 use thiserror::Error;
 
+#[cfg(feature = "hip-runtime")]
+pub mod hip_runtime_v1;
+
 #[cfg(feature = "cuda")]
 pub mod data_population_workspace_plan_v1;
+#[cfg(feature = "cuda")]
+pub mod feature_screening_workspace_plan_v2;
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+pub mod resident_archive_output_v3;
 #[cfg(feature = "cuda")]
 pub mod resident_classic_ta_v3;
 #[cfg(feature = "cuda")]
@@ -17,11 +24,17 @@ pub mod resident_feature_store_v3;
 pub mod resident_feature_store_v3_device_fixture;
 #[cfg(feature = "cuda")]
 pub mod resident_footprint_v2;
-#[cfg(feature = "cuda")]
-// The pre-existing V1 generation owner was source-contract-only. Root it
-// privately for the first V3 -> Search consumer without widening its API.
-#[allow(dead_code)]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 mod resident_generation_v1;
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+pub use resident_generation_v1::{
+    ParentSelectionPolicyV1, ResidentAdaptiveCheckpointV3, ResidentAdaptiveGenerationInputsV3,
+    ResidentGenerationDeviceErrorV1, ResidentGenerationPlanAuthorityInputV1,
+    ResidentGenerationTemplateV3, SealedResidentGenerationPlanV1, SurvivorSelectionPolicyV1,
+    discovery_adaptive_generation_semantics_sha256_v3, discovery_generation_semantics_sha256_v1,
+    resident_metric_semantics_sha256_v2, seal_adaptive_resident_generation_plan_v3,
+    seal_resident_generation_plan_v1,
+};
 #[cfg(feature = "cuda")]
 pub mod resident_higher_timeframe_alignment_v3;
 #[cfg(feature = "cuda-device-fixtures")]
@@ -32,21 +45,18 @@ pub mod resident_quant_v3;
 pub mod resident_regime_v3;
 #[cfg(feature = "cuda")]
 pub mod resident_robust_normalization_v2;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 mod resident_scoring_v2;
-#[cfg(any(
-    feature = "cuda",
-    feature = "resident-search-slice2-compile-contract",
-    all(test, feature = "resident-search-slice2-host-contract")
-))]
-#[cfg_attr(
-    not(all(test, feature = "resident-search-slice2-host-contract")),
-    allow(dead_code)
-)]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+pub use resident_scoring_v2::{
+    ResidentScoringObjectiveV2, novelty_disabled_semantics_sha256_v2, rank_semantics_sha256_v2,
+    scoring_semantics_sha256_v2,
+};
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 mod resident_search_slice2_admission_v2;
-#[cfg(any(feature = "cuda", feature = "resident-search-slice2-compile-contract"))]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 pub mod resident_search_slice2_v3;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 pub mod resident_search_v2;
 #[cfg(feature = "cuda")]
 pub mod resident_session_v2;
@@ -77,6 +87,14 @@ pub use data_population_workspace_plan_v1::{
     SealedDataPopulationExecutionLimitsV1, SealedDataPopulationGpuWorkspacePlanV1,
     SealedNativeCudaDataPopulationPreflightFactsV1, bind_data_population_gpu_workspace_plan_v1,
     native_cuda_data_population_preflight_facts_v1, seal_data_population_gpu_workspace_plan_v1,
+    upgrade_feature_screening_run_to_data_population_v2,
+};
+#[cfg(feature = "cuda")]
+pub use feature_screening_workspace_plan_v2::{
+    AdmittedNativeCudaFeatureScreeningRunV2, FeatureScreeningWorkspacePlanErrorCodeV2,
+    FeatureScreeningWorkspacePlanErrorV2, FeatureScreeningWorkspacePreflightRequestV2,
+    SealedFeatureScreeningGpuWorkspacePlanV2, bind_feature_screening_gpu_workspace_plan_v2,
+    seal_feature_screening_gpu_workspace_plan_v2,
 };
 pub use full_discovery_workspace_plan_v1::{
     AdmittedFullDiscoveryGpuRunV1, FullDiscoveryGpuRunReceiptV1,
@@ -171,6 +189,9 @@ pub enum CudaDeviceEnumerationErrorV1 {
 }
 
 pub fn probe_cuda_device_count_v1() -> Result<u32, CudaDeviceEnumerationErrorV1> {
+    if !cfg!(feature = "cuda") {
+        return Err(CudaDeviceEnumerationErrorV1::NativeAdapterUnavailable);
+    }
     let mut count = u32::MAX;
     // SAFETY: `count` is a valid exclusive output pointer for the duration of
     // the call. The native contract writes it only after CUDA success.
@@ -226,7 +247,9 @@ pub fn validate_abi() -> Result<(), CudaSmokeError> {
 
 pub fn runtime_available() -> bool {
     // SAFETY: no arguments, no memory access, stable C ABI.
-    unsafe { neoethos_gpu_cuda_runtime_available() == 1 }
+    // The HIP native archive reuses internal algorithm symbols, never CUDA
+    // capability authority. A HIP card must not become a visible CUDA device.
+    cfg!(feature = "cuda") && unsafe { neoethos_gpu_cuda_runtime_available() == 1 }
 }
 
 /// Number of visible CUDA devices.
@@ -235,6 +258,9 @@ pub fn runtime_available() -> bool {
 /// depending on `tch`, which would drag a multi-gigabyte libtorch install onto
 /// every machine that only wants to run a GPU benchmark.
 pub fn device_count() -> usize {
+    if !cfg!(feature = "cuda") {
+        return 0;
+    }
     // SAFETY: no arguments, no memory access, stable C ABI.
     let count = unsafe { neoethos_gpu_cuda_device_count() };
     count.max(0) as usize
@@ -430,6 +456,11 @@ mod tests {
     #[test]
     fn default_build_reports_runtime_unavailable_without_fabricating_success() {
         assert!(!runtime_available());
+        assert_eq!(device_count(), 0);
+        assert_eq!(
+            probe_cuda_device_count_v1(),
+            Err(CudaDeviceEnumerationErrorV1::NativeAdapterUnavailable)
+        );
         assert_eq!(
             smoke_add_one(&[1, 2, 3]),
             Err(CudaSmokeError::RuntimeUnavailable)

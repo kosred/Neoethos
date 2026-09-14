@@ -303,7 +303,7 @@ fn public_discovery_boundary_and_result_cannot_drop_the_exact_receipt() {
 }
 
 #[test]
-fn live_portfolio_is_a_strict_v3_artifact_bound_to_receipt_and_config() {
+fn live_portfolio_is_a_strict_v6_artifact_with_separate_calibration_and_final_scope() {
     let source = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
@@ -312,10 +312,24 @@ fn live_portfolio_is_a_strict_v3_artifact_bound_to_receipt_and_config() {
     .expect("read live portfolio source");
 
     for required in [
-        "pub const LIVE_PORTFOLIO_SCHEMA_VERSION: u32 = 3;",
+        "pub const LIVE_PORTFOLIO_SCHEMA_VERSION: u32 = 6;",
         "#[serde(deny_unknown_fields)]",
         "pub search_scope: CanonicalSearchArtifactScopeV2",
+        "pub final_holdout_scope: CanonicalSearchArtifactScopeV2",
+        "final_holdout_scope: CanonicalSearchArtifactScopeRefV1",
+        "result.calibration_scope.as_ref()",
+        "held_out.role() == CanonicalSearchWindowRoleV1::SelectionValidation",
+        "held_out.row_end() == final_window.row_start()",
+        "final_window.row_end() == last.row_end()",
         "pub search_config_hash: String",
+        "pub live_trading_policy: LiveTradingPolicyV1",
+        "pub struct LiveTradingPolicyV1",
+        "pub struct LiveSizingEvidenceV1",
+        "pub sizing_evidence: Vec<LiveSizingEvidenceV1>",
+        "pub fn portfolio_half_kelly_risk_fraction(&self)",
+        "pub(crate) fn from_search_authority(",
+        "self.live_trading_policy.validate()?;",
+        "self.live_trading_policy.source_search_config_hash == self.search_config_hash",
         "pub fn validate(&self) -> anyhow::Result<()>",
         "artifact.validate()?;",
     ] {
@@ -327,6 +341,14 @@ fn live_portfolio_is_a_strict_v3_artifact_bound_to_receipt_and_config() {
     assert!(
         !source.contains("#[serde(default)]\n    pub cost_band"),
         "live portfolio still silently accepts the receipt-free legacy schema"
+    );
+    assert!(
+        !source.contains("#[serde(default)]\n    pub live_trading_policy"),
+        "live portfolio silently accepts artifacts without their validated trading policy"
+    );
+    assert!(
+        !source.contains("#[serde(default)]\n    pub final_holdout_scope"),
+        "old two-way portfolios cannot silently mint reserved final-test authority"
     );
 }
 

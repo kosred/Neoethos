@@ -75,7 +75,8 @@ pub(super) fn native_receipt_value_v1(
         "feature_provenance_identity": "e".repeat(64),
         "content_merkle_algorithm": "neoethos.canonical-feature-content.merkle.v3",
         "feature_content_merkle_sha256": "f".repeat(64),
-        "normalization_fit_sha256": "1".repeat(64),
+        // Explicit raw legacy metadata, never a normalized execution fixture.
+        "normalization_fit_sha256": hex_lower_v1(&neoethos_gpu_cuda::resident_robust_normalization_v2::resident_robust_normalization_disabled_fit_sha256_v2()),
         "row_count": row_count,
         "column_count": 5,
         "feature_execution": {

@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget};
 
 use crate::tui::app::{AppShared, Hit, HitAction};
+use crate::tui::form::FormState;
 use crate::tui::jobs::JobStatus;
 use crate::tui::theme;
 
@@ -130,6 +131,21 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
             );
         }
         y += 3;
+    }
+
+    if let Some(message) = &shared.train_form.message {
+        if y < inner.y + inner.height {
+            Paragraph::new(Line::styled(message.clone(), theme::sell_style())).render(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+                buf,
+            );
+            y += 2;
+        }
     }
 
     if y < inner.y + inner.height {
@@ -381,13 +397,13 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
     }
 }
 
-pub fn launch_now(shared: &mut AppShared) {
-    if shared.jobs.has_running(JOB_LABEL_PREFIX) {
-        shared.status = "training already running".to_string();
-        return;
+fn build_launch_args(form: &FormState) -> Result<Vec<String>, String> {
+    let symbol = form.value_for("Symbol").unwrap_or("").trim().to_string();
+    if symbol.is_empty() {
+        return Err(
+            "Symbol is required; select an available dataset on the Symbols page.".to_string(),
+        );
     }
-    let form = &shared.train_form;
-    let symbol = form.value_for("Symbol").unwrap_or("EURUSD").to_string();
     let base = form.value_for("Base TF").unwrap_or("M30").to_string();
     let root = form.value_for("Data root").unwrap_or("data").to_string();
     let models_dir = form
@@ -395,7 +411,7 @@ pub fn launch_now(shared: &mut AppShared) {
         .unwrap_or("cache/models")
         .to_string();
 
-    let args = vec![
+    Ok(vec![
         "train".to_string(),
         "--symbol".to_string(),
         symbol,
@@ -405,7 +421,44 @@ pub fn launch_now(shared: &mut AppShared) {
         models_dir,
         "--root".to_string(),
         root,
-    ];
+    ])
+}
+
+pub fn launch_now(shared: &mut AppShared) {
+    if shared.jobs.has_running(JOB_LABEL_PREFIX) {
+        shared.status = "training already running".to_string();
+        return;
+    }
+    let args = match build_launch_args(&shared.train_form) {
+        Ok(args) => args,
+        Err(message) => {
+            shared.train_form.message = Some(message.clone());
+            shared.status = message;
+            return;
+        }
+    };
+    shared.train_form.message = None;
     shared.jobs.spawn("train", args);
     shared.status = "Spawned train".to_string();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_launch_args;
+    use crate::tui::form::make_train_form;
+
+    #[test]
+    fn train_requires_an_explicit_symbol_before_launch() {
+        let mut form = make_train_form("data");
+        assert!(
+            build_launch_args(&form)
+                .unwrap_err()
+                .contains("Symbol is required")
+        );
+        form.fields[0].value = "   ".to_string();
+        assert!(build_launch_args(&form).is_err());
+        form.fields[0].value = " EURUSD.c ".to_string();
+        let args = build_launch_args(&form).expect("explicit broker symbol");
+        assert!(args.windows(2).any(|pair| pair == ["--symbol", "EURUSD.c"]));
+    }
 }

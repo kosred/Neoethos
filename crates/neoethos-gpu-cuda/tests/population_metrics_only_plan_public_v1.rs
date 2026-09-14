@@ -30,10 +30,22 @@ fn strict_parent_and_gene_plans_match_the_native_allocations() {
         .expect("M15 parent extents must have a checked plan");
     assert_eq!(
         parent.total_device_bytes(),
-        (8 * 1_800 + 76) * 262_290,
-        "the always-allocated view index must not disappear from parent sizing"
+        (8 * 1_800 + 60) * 262_290,
+        "the immutable parent must include its exact copied arrays and gap flags"
     );
-    assert_eq!(parent.view_indices_bytes(), 8 * 262_290);
+    assert_eq!(parent.view_indices_bytes(), 0);
+    assert_eq!(parent.adaptive_base_pips_bytes(), 0);
+
+    let with_view = PopulationParentDevicePlanV1::checked_from_parent_and_view_extents_v1(
+        262_290, 1_800, 65_572, 262_290,
+    )
+    .expect("ordered and adaptive capacities fit inside the M15 parent");
+    assert_eq!(with_view.view_indices_bytes(), 8 * 65_572);
+    assert_eq!(with_view.adaptive_base_pips_bytes(), 8 * 262_290);
+    assert_eq!(
+        with_view.total_device_bytes(),
+        parent.total_device_bytes() + 8 * (65_572 + 262_290)
+    );
 
     let genes = PopulationGeneStorePlanV1::checked_from_gene_extents_v1(200, 3_200)
         .expect("200 genes with sixteen terms each must have a checked plan");

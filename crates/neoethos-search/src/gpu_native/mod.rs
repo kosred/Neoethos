@@ -9,7 +9,7 @@ pub mod instrumentation;
 pub mod parity_hierarchy;
 pub mod population_fixture;
 pub mod prototype_a;
-#[cfg(feature = "gpu")]
+#[cfg(feature = "gpu-cuda")]
 mod prototype_a_engine;
 pub mod prototype_b_engine;
 pub mod prototype_b_mirror;

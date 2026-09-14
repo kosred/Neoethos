@@ -17,21 +17,24 @@ import {
   type ParityReport,
   type TailRiskReport,
   type ChallengeReport,
+  type LiveEngineStatus,
+  type ReplayStats,
 } from "../api";
 import { usePoll } from "../hooks";
 import { HelpPanel, HelpStep, Tip } from "../components/Help";
-import { FilterChips, ago, stamp, tfRank, toggleIn } from "../components/filters";
+import { FilterChips } from "../components/FilterChips";
+import { ago, stamp, tfRank, toggleIn } from "../components/filterUtils";
 
-function StatGrid({ data }: { data: any }) {
+function StatGrid({ data }: { data: unknown }) {
   if (!data || typeof data !== "object") return null;
-  const rows = Object.entries(data).filter(([, v]) => typeof v !== "object" || v === null);
+  const rows = Object.entries(data as Record<string, unknown>).filter(([, v]) => typeof v !== "object" || v === null);
   return (
     <table className="tbl">
       <tbody>
         {rows.map(([k, v]) => (
           <tr key={k}>
             <td style={{ color: "#9ca3af" }}>{k.replace(/_/g, " ")}</td>
-            <td>{typeof v === "number" ? (Number.isInteger(v) ? (v as number).toLocaleString() : (v as number).toFixed(4)) : String(v)}</td>
+            <td>{typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(4)) : String(v)}</td>
           </tr>
         ))}
       </tbody>
@@ -45,19 +48,19 @@ function GatePanel({ gate }: { gate: GateVerdict | null }) {
   return (
     <div className="ticket" style={{ marginTop: 12, borderColor: blocked ? "#b91c1c" : gate.eligible ? "#15803d" : "#a16207" }}>
       <h2 style={{ marginTop: 0 }}>
-        Demo forward-test gate{" "}
+        Optional demo check{" "}
         <span className={`badge ${gate.enforced ? "live" : "demo"}`}>
-          {gate.enforced ? "LIVE — enforced" : "DEMO — informational"}
+          {gate.enforced ? "LIVE — enforced" : "NOT REQUIRED"}
         </span>{" "}
         <span className={`badge ${gate.eligible ? "demo" : ""}`} style={{ background: gate.eligible ? "#15803d" : "#a16207" }}>
-          {gate.eligible ? "ELIGIBLE" : "NOT YET"}
+          {gate.criteria.length === 0 ? "OFF" : gate.eligible ? "PASSED" : "NOT YET"}
         </span>
       </h2>
       <p className="muted small">{gate.summary}</p>
       {!gate.enforced && (
         <p className="muted small">
-          Active account is a <b>Demo</b> environment — running here builds the demo track record. The gate only
-          blocks <b>real-money</b> (Live) accounts.
+          Demo history is an optional integration check, not proof of profit or identical live fills.
+          Validated strategies, broker checks and position-risk limits are still required to trade.
         </p>
       )}
       {gate.criteria.length > 0 && (
@@ -82,39 +85,51 @@ function GatePanel({ gate }: { gate: GateVerdict | null }) {
 
 const fileTail = (p: string) => p.split(/[\\/]/).pop() ?? p;
 
+const readableState = (value: string | null | undefined) =>
+  value ? value.replace(/_/g, " ") : "policy loading";
+
+const compactPrice = (value: number | null | undefined) =>
+  typeof value === "number" && Number.isFinite(value) ? value.toFixed(5) : "—";
+
 export default function Autopilot() {
   const { data: list, error, reload } = usePoll(portfoliosList, 0);
-  const { data: status, reload: reloadStatus } = usePoll(autonomousStatus, 3000);
+  const { data: status, error: statusError, reload: reloadStatus } = usePoll(autonomousStatus, 3000);
   const [selected, setSelected] = useState<string[]>([]);
   const [focus, setFocus] = useState<PortfolioEntry | null>(null);
-  const [gate, setGate] = useState<GateVerdict | null>(null);
-  const [replay, setReplay] = useState<any>(null);
-  const [parity, setParity] = useState<ParityReport | null>(null);
-  const [risk, setRisk] = useState<TailRiskReport | null>(null);
-  const [chal, setChal] = useState<ChallengeReport | null>(null);
+  const [gateResult, setGateResult] = useState<{ path: string; value: GateVerdict | null } | null>(null);
+  const [replayResult, setReplay] = useState<{ path: string; value: ReplayStats } | null>(null);
+  const [parityResult, setParity] = useState<{ path: string; value: ParityReport } | null>(null);
+  const [riskResult, setRisk] = useState<{ path: string; value: TailRiskReport } | null>(null);
+  const [challengeResult, setChal] = useState<{ path: string; value: ChallengeReport } | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   // Filters — same set as Strategy Report (operator request 2026-07-21), sharing
   // the chip/format helpers so the two screens can never drift apart.
   const [modeFilter, setModeFilter] = useState<"all" | "risky" | "prop">("all");
-  const [onlyValidated, setOnlyValidated] = useState(false);
-  const [validatedKeys, setValidatedKeys] = useState<Set<string>>(new Set());
+  const [onlyResearchScreened, setOnlyResearchScreened] = useState(false);
+  const [researchScreenedKeys, setResearchScreenedKeys] = useState<Set<string>>(new Set());
   const [symFilter, setSymFilter] = useState<string[]>([]);
   const [tfFilter, setTfFilter] = useState<string[]>([]);
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState<"discovered" | "symbol" | "genes">("discovered");
+  const gate = focus?.path && gateResult?.path === focus.path ? gateResult.value : null;
+  const replay = focus && replayResult?.path === focus.path ? replayResult.value : null;
+  const parity = focus && parityResult?.path === focus.path ? parityResult.value : null;
+  const risk = focus && riskResult?.path === focus.path ? riskResult.value : null;
+  const chal = focus && challengeResult?.path === focus.path ? challengeResult.value : null;
   // Auto-cull: retire a strategy after this many consecutive losing trades.
-  const [cullLosses, setCullLosses] = useState(6);
+  const [cullLosses, setCullLosses] = useState(0);
   // Auto-cull, rolling window: min win-rate % over the last N closed trades.
-  const [cullMinWr, setCullMinWr] = useState(57);
+  const [cullMinWr, setCullMinWr] = useState(0);
   const [cullWindow, setCullWindow] = useState(10);
 
   const { data: blacklist } = usePoll(strategyBlacklist, 0);
   const retired = Array.isArray(blacklist) ? blacklist : [];
 
-  const engines: any[] = status?.engines ?? [];
+  const engines: LiveEngineStatus[] = status?.engines ?? [];
   const running = !!status?.running;
-  const runningPaths = new Set(engines.map((e) => e.portfolioPath));
+  const runningPaths = new Set(engines.filter((e) => e.running).map((e) => e.portfolioPath));
+  const runningCount = engines.filter((e) => e.running).length;
   const allPortfolios = list?.portfolios ?? [];
   const selectable = allPortfolios.filter((p) => !p.blacklisted); // retired are never selectable
   const symbolOpts = Array.from(new Set(selectable.map((p) => p.symbol ?? "?"))).sort();
@@ -127,7 +142,7 @@ export default function Autopilot() {
       const isProp = p.path.toLowerCase().includes("propfirm");
       if (modeFilter === "risky" && isProp) return false;
       if (modeFilter === "prop" && !isProp) return false;
-      if (onlyValidated && !validatedKeys.has(`${p.symbol ?? ""}|${p.baseTf ?? ""}`)) return false;
+      if (onlyResearchScreened && !researchScreenedKeys.has(`${p.symbol ?? ""}|${p.baseTf ?? ""}`)) return false;
       if (symFilter.length && !symFilter.includes(p.symbol ?? "?")) return false;
       if (tfFilter.length && !tfFilter.includes(p.baseTf ?? "?")) return false;
       if (q && !`${p.symbol ?? ""} ${p.baseTf ?? ""} ${p.fileName}`.toUpperCase().includes(q)) return false;
@@ -156,13 +171,13 @@ export default function Autopilot() {
     null,
   );
   const filtersOn =
-    symFilter.length > 0 || tfFilter.length > 0 || modeFilter !== "all" || onlyValidated || q !== "";
+    symFilter.length > 0 || tfFilter.length > 0 || modeFilter !== "all" || onlyResearchScreened || q !== "";
   const clearFilters = () => {
-    setSymFilter([]); setTfFilter([]); setModeFilter("all"); setOnlyValidated(false); setSearch("");
+    setSymFilter([]); setTfFilter([]); setModeFilter("all"); setOnlyResearchScreened(false); setSearch("");
   };
 
-  // Validated set (passed CPCV + Walkforward) keyed by symbol|timeframe, from the
-  // strategy report — powers the "only validated" filter.
+  // Research-screened set (passed in-sample CPCV + walk-forward) keyed by symbol|timeframe.
+  // These stored checks are not independent OOS or promotion approval.
   useEffect(() => {
     let live = true;
     strategyList()
@@ -172,7 +187,7 @@ export default function Autopilot() {
         for (const s of r.strategies) {
           if (s.cpcvPassed && s.walkforwardPassed) keys.add(`${s.symbol}|${s.timeframe}`);
         }
-        setValidatedKeys(keys);
+        setResearchScreenedKeys(keys);
       })
       .catch(() => {});
     return () => { live = false; };
@@ -180,12 +195,12 @@ export default function Autopilot() {
 
   // Demo forward-test verdict for the focused strategy.
   useEffect(() => {
-    setGate(null);
     if (!focus?.path) return;
+    const path = focus.path;
     let live = true;
-    autonomousGate(focus.path)
-      .then((v) => { if (live) setGate(v); })
-      .catch(() => { if (live) setGate(null); });
+    autonomousGate(path)
+      .then((value) => { if (live) setGateResult({ path, value }); })
+      .catch(() => { if (live) setGateResult({ path, value: null }); });
     return () => { live = false; };
   }, [focus?.path]);
 
@@ -197,18 +212,18 @@ export default function Autopilot() {
     setBusy(true);
     setMsg(`Starting ${selected.length} engine${selected.length === 1 ? "" : "s"}…`);
     try {
-      const r: any = await autonomousStart({
+      const r = await autonomousStart({
         portfolio_paths: selected,
         cull_after_consecutive_losses: cullLosses,
         cull_min_win_rate_pct: cullMinWr,
         cull_window_trades: cullWindow,
       });
-      const s = r?.started?.length ?? 0;
-      const sk = r?.skipped?.length ?? 0;
-      const bl = r?.blacklisted?.length ?? 0;
-      const f = r?.failed ?? [];
-      let m = `✓ Started ${s}${sk ? `, ${sk} already running` : ""}${bl ? `, ${bl} retired (skipped)` : ""}${f.length ? `, ${f.length} blocked/failed` : ""}.`;
-      if (f.length) m += " — " + f.map((x: any) => `${fileTail(x.portfolio)}: ${x.error}`).join("; ");
+      const s = r.started.length;
+      const sk = r.skipped.length;
+      const bl = r.blacklisted.length;
+      const f = r.failed;
+      let m = `Started ${s}${sk ? `, ${sk} already running` : ""}${bl ? `, ${bl} retired (skipped)` : ""}${f.length ? `, ${f.length} blocked/failed` : ""}.`;
+      if (f.length) m += " — " + f.map((failure) => `${fileTail(failure.portfolio)}: ${failure.error}`).join("; ");
       setMsg(m);
       await reloadStatus();
     } catch (e) {
@@ -223,7 +238,7 @@ export default function Autopilot() {
     setMsg("Stopping all engines…");
     try {
       await autonomousStop();
-      setMsg("✓ All engines stopped.");
+      setMsg("Engine stop requested. Broker positions were NOT closed; local engine monitoring stops. Check positions and broker-side stops in Trading.");
       await reloadStatus();
     } catch (e) {
       setMsg(`Stop failed: ${e}`);
@@ -235,6 +250,7 @@ export default function Autopilot() {
   const doReplay = async () => {
     if (!focus) { setMsg("Click a strategy name to focus it, then Replay."); return; }
     setBusy(true);
+    setReplay(null);
     setMsg(`Replaying ${focus.symbol ?? ""} ${focus.baseTf ?? ""}…`);
     try {
       // Pass the focused strategy's OWN artifact (audit #225). Without
@@ -248,8 +264,8 @@ export default function Autopilot() {
         base_tf: focus.baseTf ?? undefined,
         portfolio_path: focus.path,
       });
-      setReplay(r);
-      setMsg("✓ Replay done.");
+      setReplay({ path: focus.path, value: r });
+      setMsg(`Replay completed for ${fileTail(focus.path)}.`);
     } catch (e) {
       setMsg(`Replay failed: ${e}`);
     } finally {
@@ -264,7 +280,7 @@ export default function Autopilot() {
     setMsg(`Monte-Carlo tail risk for ${focus.symbol ?? ""}… (2000 reshuffles)`);
     try {
       const r = await tailRisk(focus.path);
-      setRisk(r);
+      setRisk({ path: focus.path, value: r });
       setMsg(r.ruinProbabilityPct >= 1 ? "⚠ Tail risk: DANGER — see the report." : "✓ Tail risk computed.");
     } catch (e) {
       setMsg(`Tail risk failed: ${e}`);
@@ -280,7 +296,7 @@ export default function Autopilot() {
     setMsg(`Challenge first-passage Monte Carlo for ${focus.symbol ?? ""}… (2000 paths × 6 sizes × 2 phases)`);
     try {
       const r = await challengeSim(focus.path);
-      setChal(r);
+      setChal({ path: focus.path, value: r });
       setMsg(r.bestFundedPct < 5 ? "⚠ Challenge sim: this edge barely clears prop-firm barriers." : "✓ Challenge sim computed.");
     } catch (e) {
       setMsg(`Challenge sim failed: ${e}`);
@@ -296,7 +312,7 @@ export default function Autopilot() {
     setMsg(`Checking live↔backtest parity for ${focus.symbol ?? ""}… (fetches broker bars, ~10-30s)`);
     try {
       const r = await parityCheck(focus.path);
-      setParity(r);
+      setParity({ path: focus.path, value: r });
       setMsg(r.verdict === "PASS" ? "✓ Parity PASS — live signals are window-invariant." : "✗ Parity FAIL — see the report below.");
     } catch (e) {
       setMsg(`Parity check failed: ${e}`);
@@ -310,18 +326,18 @@ export default function Autopilot() {
       <h1>
         Autopilot{" "}
         <span className={`badge ${running ? "live" : "demo"}`}>
-          {running ? `LIVE · ${engines.length} engine${engines.length === 1 ? "" : "s"}` : "STOPPED"}
+          {statusError || !status ? "STATE UNCONFIRMED" : running ? `ACTIVE · ${runningCount} engine${runningCount === 1 ? "" : "s"}` : "STOPPED"}
         </span>
       </h1>
       <p className="sub">Run one or MANY discovered strategies at once — each is internally multi-timeframe and trades concurrently</p>
 
       <HelpPanel id="autopilot">
-        <p>Autopilot runs your discovered strategies <b>for you</b>. Each strategy already reads every higher timeframe internally; running several together is like a trader watching multiple setups at once.</p>
+        <p>Autopilot requests execution of selected deployed portfolios. The backend remains authoritative for account environment, exact artifact eligibility, broker-truth checks and every order acknowledgement.</p>
         <HelpStep n={1}>Tick the strategies you want to run (use <b>Select all</b> to deploy your whole library). Click a name to <b>focus</b> it for Replay + the demo-gate detail.</HelpStep>
         <HelpStep n={2}><b>Replay (dry-run)</b> tests the focused strategy on stored history with zero broker calls.</HelpStep>
-        <HelpStep n={3}><b>Start selected (live)</b> launches one concurrent engine per ticked strategy. On a <b>Demo</b> account they always run (building the track record); on a <b>Live</b> account each is blocked until its demo gate passes — blocked ones are reported, the rest still start.</HelpStep>
-        <HelpStep n={4}><b>Stop all</b> halts every running engine.</HelpStep>
-        <HelpStep n={5}><b>Auto-cull</b>: set a consecutive-loss limit. When a running strategy hits it, the engine stops itself and the strategy is <b>permanently retired</b> — blacklisted so it can never be selected or re-discovered again (kept as a record, never deleted). Retired ones appear at the bottom.</HelpStep>
+        <HelpStep n={3}><b>Request selected engines</b> asks the backend to start them. A row is shown as active only after the server reports it; any missing evidence or broker authority fails closed and is reported.</HelpStep>
+        <HelpStep n={4}><b>Stop engines</b> requests that local engines stop. It does not close broker positions and stops local protection monitoring; inspect positions and broker stops separately.</HelpStep>
+        <HelpStep n={5}><b>Auto-cull is off by default.</b> A loss streak or raw win rate alone does not prove negative expectancy: payoff, costs and sample uncertainty matter. Enable permanent retirement only as an explicit operator rule; the risk manager still protects account-level loss limits.</HelpStep>
       </HelpPanel>
 
       <div className="btn-row" style={{ flexWrap: "wrap", alignItems: "center" }}>
@@ -332,7 +348,7 @@ export default function Autopilot() {
         </label>
         <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
           Mode
-          <select value={modeFilter} onChange={(e) => setModeFilter(e.target.value as any)}>
+          <select value={modeFilter} onChange={(e) => setModeFilter(e.target.value as typeof modeFilter)}>
             <option value="all">All</option>
             <option value="risky">🚀 Risky</option>
             <option value="prop">🛡 Prop-firm</option>
@@ -346,16 +362,16 @@ export default function Autopilot() {
             <option value="symbol">Symbol · TF</option>
           </select>
         </label>
-        <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }} title="Only strategies whose backtest passed CPCV + Walkforward out-of-sample">
-          <input type="checkbox" checked={onlyValidated} onChange={(e) => setOnlyValidated(e.target.checked)} /> Only validated (passed OOS)
+        <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }} title="Passed stored in-sample CPCV / walk-forward checks; not independent OOS or promotion approval.">
+          <input type="checkbox" checked={onlyResearchScreened} onChange={(e) => setOnlyResearchScreened(e.target.checked)} /> Research-screened only
         </label>
         {filtersOn && <button className="link" onClick={clearFilters}>clear filters</button>}
         <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-          Auto-cull after <Tip text="After this many CONSECUTIVE losing trades, the engine stops itself and permanently retires the strategy (blacklist) — it can never be selected or re-discovered again. 0 = off." />
+          Auto-cull after <Tip text="Optional permanent retirement after a raw loss streak. This can reject a profitable low-win-rate/high-payoff strategy, so 0/off is the default." />
           <input type="number" min={0} max={50} value={cullLosses} onChange={(e) => setCullLosses(Math.max(0, Number(e.target.value)))} style={{ width: 56 }} /> losses
         </label>
         <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-          or WR &lt; <Tip text="Rolling-window cull: once the last N closed trades are in, the win rate must stay at or above this percent or the strategy retires. Catches chronic losers (e.g. 40% WR) that never streak. 0 = off." />
+          or WR &lt; <Tip text="Optional raw win-rate retirement. Break-even win rate depends on reward:risk and costs; use only deliberately. 0 = off." />
           <input type="number" min={0} max={100} value={cullMinWr} onChange={(e) => setCullMinWr(Math.min(100, Math.max(0, Number(e.target.value))))} style={{ width: 56 }} />% per last
           <input type="number" min={4} max={100} value={cullWindow} onChange={(e) => setCullWindow(Math.max(4, Number(e.target.value)))} style={{ width: 52 }} /> trades
         </label>
@@ -365,23 +381,24 @@ export default function Autopilot() {
           {newest ? ` · newest ${stamp(newest)}` : ""}
         </span>
       </div>
-      <FilterChips label="Pairs" opts={symbolOpts} sel={symFilter} onToggle={toggleIn(setSymFilter)} />
-      <FilterChips label="Timeframes" opts={tfOpts} sel={tfFilter} onToggle={toggleIn(setTfFilter)} />
+      <FilterChips label="Pairs" options={symbolOpts} selected={symFilter} onToggle={toggleIn(setSymFilter)} />
+      <FilterChips label="Timeframes" options={tfOpts} selected={tfFilter} onToggle={toggleIn(setTfFilter)} />
       {byTf.length > 1 && (
         <div className="cards" style={{ gridTemplateColumns: `repeat(${Math.min(6, byTf.length)}, 1fr)` }}>
           {byTf.map(([tf, e]) => (
             <div className="card" key={tf} title={`${e.n} strategies on ${tf}${e.live ? `, ${e.live} running live` : ""}`}>
               <div className="card-label">{tf}</div>
               <div className="card-value">{e.n}</div>
-              {e.live > 0 && <div className="muted small">{e.live} live</div>}
+              {e.live > 0 && <div className="muted small">{e.live} active</div>}
             </div>
           ))}
         </div>
       )}
       {error && <div className="banner warn">{error}</div>}
+      {statusError && <div className="banner warn" role="alert">Engine status could not be refreshed; retained rows may be stale. {statusError}</div>}
 
       {portfolios.length === 0 ? (
-        <p className="muted">{allPortfolios.length === 0 ? "No discovered strategies yet — run Discovery, then promote in Strategy Lab." : "No strategies match the current filters."}</p>
+        <p className="muted">{!list || error ? "Portfolio inventory is not confirmed." : allPortfolios.length === 0 ? "No deployed portfolios are exposed by the backend." : "No strategies match the current filters."}</p>
       ) : (
         <>
           <div className="btn-row" style={{ marginBottom: 6 }}>
@@ -401,7 +418,7 @@ export default function Autopilot() {
                     </td>
                     <td>
                       <button className="link" onClick={() => setFocus(p)} style={{ fontWeight: 700 }}>{p.symbol ?? "?"}</button>
-                      {live && <span className="badge live" style={{ marginLeft: 6, fontSize: 9 }}>LIVE</span>}
+                      {live && <span className="badge live" style={{ marginLeft: 6, fontSize: 9 }}>ACTIVE</span>}
                     </td>
                     <td>{p.baseTf ?? "?"}</td>
                     <td>{p.geneCount ?? "—"}</td>
@@ -421,10 +438,10 @@ export default function Autopilot() {
           <button disabled={busy || !focus} onClick={doParity} title="Does the live bar-window produce the SAME signals as the full history? FAIL = live won't match the validated backtest.">Check parity</button>
           <button disabled={busy || !focus} onClick={doTailRisk} title="Monte-Carlo the trade sequence: worst-case drawdown distribution + probability of losing half the account at YOUR current risk %. The pre-Start number.">Tail risk</button>
           <button disabled={busy || !focus} onClick={doChallenge} title="First-passage Monte Carlo of a prop-firm challenge (FTMO-style +10% target vs −10% max / −5% daily loss): pass & funded probability per risk size, and the challenge-optimal size.">Challenge sim</button>
-          <button className="primary" disabled={busy || selected.length === 0} onClick={startSelected}>
-            Start selected (live) · {selected.length}
+          <button className="primary" disabled={busy || !status || !!statusError || !!error || selected.length === 0} onClick={startSelected}>
+            Request selected engines · {selected.length}
           </button>
-          <button className="danger" disabled={busy || !running} onClick={stopAll}>Stop all</button>
+          <button className="danger" disabled={busy || (!running && !statusError)} onClick={stopAll}>Stop engines (keep positions)</button>
         </div>
         {focus && <p className="muted small" style={{ marginTop: 8 }}>Focused: {focus.symbol} {focus.baseTf} — {focus.path}</p>}
         {msg && <div className="banner info">{msg}</div>}
@@ -530,23 +547,32 @@ export default function Autopilot() {
 
       {engines.length > 0 && (
         <>
-          <h2>Running engines <span className="muted">({engines.length})</span></h2>
+          <h2>Engine records <span className="muted">({runningCount} running / {engines.length} total)</span></h2>
           <table className="tbl">
-            <thead><tr><th>Symbol</th><th>Base TF</th><th>Genes</th><th>Bars eval</th><th>Last signal</th><th>Open pos</th><th>Loss streak</th><th>Window WR</th></tr></thead>
+            <thead><tr><th>Symbol</th><th>Base TF</th><th>Genes</th><th>Bars eval</th><th>Last signal</th><th>Open pos</th><th>Profit protection</th><th>Last exit</th><th>Loss streak</th><th>Window WR</th></tr></thead>
             <tbody>
               {engines.map((e, i) => {
                 const losses = Number(e.consecutiveLosses ?? 0);
                 const wr = typeof e.windowWinRatePct === "number" ? e.windowWinRatePct : null;
-                const wrDanger = wr != null && Number(e.windowTrades ?? 0) >= cullWindow - 2 && wr < cullMinWr + 5;
+                const wrDanger = cullMinWr > 0 && wr != null && Number(e.windowTrades ?? 0) >= cullWindow - 2 && wr < cullMinWr + 5;
+                const mfe = typeof e.favorableMoveR === "number" ? e.favorableMoveR : null;
+                const protectionPending = e.protectionState === "trigger_reached_pending_broker" || !!e.lastProtectionError;
                 return (
                   <tr key={e.portfolioPath ?? i}>
-                    <td><b>{e.symbol ?? "?"}</b>{e.retired && <span className="badge" style={{ marginLeft: 6, background: "#7f1d1d", fontSize: 9 }}>RETIRED</span>}</td>
+                    <td><b>{e.symbol ?? "?"}</b><div className="muted small">{e.running ? "Running" : "Stopped"}</div>{e.retired && <span className="badge" style={{ marginLeft: 6, background: "#7f1d1d", fontSize: 9 }}>RETIRED</span>}</td>
                     <td>{e.baseTf ?? "?"}</td>
                     <td>{e.genes ?? "—"}</td>
                     <td>{typeof e.barsEvaluated === "number" ? e.barsEvaluated.toLocaleString() : "—"}</td>
                     <td>{e.lastSignal ?? "—"}</td>
                     <td>{e.openPositionId ?? "—"}</td>
-                    <td className={losses >= Math.max(1, cullLosses - 1) ? "sell" : ""}>{losses > 0 ? `${losses} in a row` : "—"}</td>
+                    <td className={protectionPending ? "sell" : e.protectionState === "broker_confirmed" ? "buy" : ""} title={`${e.lastProtectionError ?? ""}${e.protectionPolicyIdentity ? `\nPolicy ${e.protectionPolicyIdentity}` : ""}`}>
+                      <div>{readableState(e.protectionState)}</div>
+                      <div className="muted small">
+                        {e.trailingEnabled === false ? "artifact policy: trailing off" : `MFE ${mfe != null ? `${mfe.toFixed(2)}R` : "—"} · stop ${compactPrice(e.confirmedStopPrice)}`}
+                      </div>
+                    </td>
+                    <td className="muted small">{e.lastExitReason ? readableState(e.lastExitReason) : "—"}</td>
+                    <td className={cullLosses > 0 && losses >= Math.max(1, cullLosses - 1) ? "sell" : ""}>{losses > 0 ? `${losses} in a row` : "—"}</td>
                     <td className={wrDanger ? "sell" : ""}>{wr != null ? `${wr.toFixed(0)}% (${e.windowTrades}/${cullWindow})` : "—"}</td>
                   </tr>
                 );

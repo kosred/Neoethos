@@ -1,3 +1,5 @@
+#[path = "../../cuda_build_arch.rs"]
+mod cuda_build_arch;
 #[path = "../build_support/native_cuda_build.rs"]
 mod native_cuda_build;
 #[path = "../src/native_sass.rs"]
@@ -5,8 +7,8 @@ mod native_sass;
 
 use native_cuda_build::{
     ArtifactCompiler, ArtifactVerifier, KernelJob, NativeCompileOptions, NativePrecision,
-    discover_native_architectures, expand_native_artifact_jobs, inspect_native_cubin,
-    native_nvcc_args, order_kernel_jobs_longest_first, reject_free_form_nvcc_args,
+    expand_native_artifact_jobs, inspect_native_cubin, native_nvcc_args,
+    order_kernel_jobs_longest_first, preserve_nvcc_output, reject_free_form_nvcc_args,
     run_native_artifact_jobs, run_native_artifact_verifications, validate_unique_kernel_jobs,
 };
 use serde_json::{Value, json};
@@ -22,6 +24,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const EXPECTED_KERNEL_COUNT: usize = 340;
 const FAKE_CUBIN: &[u8] = b"\x7fELFneoethos-fake-native-cubin\n";
 const MEASURED_TAIL_SOURCE: &str = "kernels/cuda/market_meanness_index_kernel.cu";
+const DIAGNOSTIC_STDOUT: &[u8] = b"ordinary_warning_kernel.cu\r\ncl : warning C4996: host diagnostic\r\ninformation with error and warning words\nunterminated non-UTF8: \xff";
+const DIAGNOSTIC_STDERR: &[u8] = b"kernel.cu(12): warning #20013-D: device diagnostic\n    diagnostic continuation\nptxas info : ordinary compiler information\n";
+const DIAGNOSTIC_FAILURE: &[u8] = b"nvcc fatal   : injected compiler failure\n";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory {
@@ -149,12 +154,23 @@ fn fake_nvcc(args: &[OsString]) -> i32 {
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    if display_args == ["--list-gpu-arch"] {
-        println!("compute_80\ncompute_86\ncompute_89\ncompute_90\ncompute_120");
-        return 0;
-    }
     if display_args == ["--version"] {
         println!("fake nvcc release 13.0");
+        return 0;
+    }
+    if display_args == ["--diagnostic-success"] || display_args == ["--diagnostic-failure"] {
+        std::io::stdout()
+            .write_all(DIAGNOSTIC_STDOUT)
+            .expect("emit raw compiler stdout");
+        std::io::stderr()
+            .write_all(DIAGNOSTIC_STDERR)
+            .expect("emit raw compiler stderr");
+        if display_args == ["--diagnostic-failure"] {
+            std::io::stderr()
+                .write_all(DIAGNOSTIC_FAILURE)
+                .expect("emit compiler failure");
+            return 17;
+        }
         return 0;
     }
 
@@ -233,22 +249,6 @@ fn fake_cuobjdump(args: &[OsString]) -> i32 {
             3
         }
     }
-}
-
-fn fake_nvidia_smi(args: &[OsString]) -> i32 {
-    let args = args
-        .iter()
-        .map(|arg| arg.to_string_lossy())
-        .collect::<Vec<_>>();
-    if !args
-        .iter()
-        .any(|arg| arg.contains("--query-gpu=compute_cap"))
-    {
-        eprintln!("unexpected fake nvidia-smi arguments: {args:?}");
-        return 2;
-    }
-    println!("8.9\n8.6\n8.9");
-    0
 }
 
 fn copy_self_as(directory: &Path, name: &str) -> PathBuf {
@@ -425,20 +425,52 @@ fn run_tool(path: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|error| panic!("run fake tool {}: {error}", path.display()))
 }
 
-fn assert_arch_discovery_and_cubin_inspection_contract() {
+fn assert_architecture_authority_and_cubin_inspection_contract() {
+    let _production_resolver = cuda_build_arch::resolve_exact_cuda_architectures;
     let directory = TestDirectory::new("tools");
-    let nvcc = copy_self_as(&directory.path, "fake-nvcc");
     let cuobjdump = copy_self_as(&directory.path, "fake-cuobjdump");
-    let nvidia_smi = copy_self_as(&directory.path, "fake-nvidia-smi");
 
-    let automatic = discover_native_architectures(&nvcc, &nvidia_smi, None)
-        .expect("discover every visible supported architecture");
-    assert_eq!(automatic.architectures, vec![86, 89]);
-    assert_eq!(automatic.source.as_str(), "auto-detected-visible-gpus");
-    let explicit = discover_native_architectures(&nvcc, &nvidia_smi, Some("sm_120, 12.0"))
-        .expect("canonicalize an explicit exact architecture");
-    assert_eq!(explicit.architectures, vec![120]);
-    assert_eq!(explicit.source.as_str(), "explicit-cuda-archs");
+    let automatic = cuda_build_arch::resolve_exact_cuda_architectures_from_inputs(
+        cuda_build_arch::ExactCudaArchitectureInputs {
+            build_mode: None,
+            explicit_architectures: None,
+            legacy_cuda_archs: None,
+            legacy_cudaarchs: None,
+            legacy_cmake_cuda_architectures: None,
+            visible_compute_capabilities: Some("8.9\n8.6\n8.9\n"),
+            nvcc_real_architectures: "sm_80\nsm_86\nsm_89\nsm_90\nsm_120\n",
+        },
+    )
+    .expect("resolve every visible supported architecture through the shared authority");
+    assert_eq!(automatic.numeric, "86;89");
+    assert_eq!(automatic.resolution_mode, "host_auto");
+    let automatic_plan = native_sass::NativeArchPlan {
+        source: native_sass::ArchRequestSource::DetectedVisibleDevices,
+        architectures: vec![86, 89],
+    };
+    assert_eq!(automatic_plan.source.as_str(), "auto-detected-visible-gpus");
+    assert_eq!(automatic_plan.architectures, vec![86, 89]);
+    let explicit = cuda_build_arch::resolve_exact_cuda_architectures_from_inputs(
+        cuda_build_arch::ExactCudaArchitectureInputs {
+            build_mode: Some("cross_release_explicit"),
+            explicit_architectures: Some("sm_120"),
+            legacy_cuda_archs: None,
+            legacy_cudaarchs: None,
+            legacy_cmake_cuda_architectures: None,
+            visible_compute_capabilities: None,
+            nvcc_real_architectures: "sm_80\nsm_86\nsm_89\nsm_90\nsm_120\n",
+        },
+    )
+    .expect("resolve one typed explicit architecture through the shared authority");
+    assert_eq!(explicit.numeric, "120");
+    assert_eq!(explicit.native_only, "120-real");
+    assert_eq!(explicit.resolution_mode, "cross_release_explicit");
+    let explicit_plan = native_sass::NativeArchPlan {
+        source: native_sass::ArchRequestSource::ExplicitList,
+        architectures: vec![120],
+    };
+    assert_eq!(explicit_plan.source.as_str(), "explicit-cuda-archs");
+    assert_eq!(explicit_plan.architectures, vec![120]);
 
     let cubin = directory.path.join("probe_sm120.cubin");
     std::fs::write(&cubin, FAKE_CUBIN).expect("write exact cubin inspection fixture");
@@ -606,6 +638,131 @@ fn assert_duplicate_architecture_expansion_fails_closed() {
     );
 }
 
+fn assert_nvcc_output_preservation_contract() {
+    let directory = TestDirectory::new("compiler-output");
+    let fake_nvcc = copy_self_as(&directory.path, "fake-nvcc");
+    let jobs = expand_native_artifact_jobs(
+        &production_kernel_jobs()[..1],
+        &[86, 89, 120],
+        &directory.path,
+    )
+    .expect("three independent architecture log coordinates");
+    for (job, mode, code) in [
+        (&jobs[0], "--diagnostic-success", 0),
+        (&jobs[1], "--diagnostic-failure", 17),
+    ] {
+        let output = run_tool(&fake_nvcc, &[mode]);
+        assert_eq!(output.status.code(), Some(code));
+        let mut expected_stderr = DIAGNOSTIC_STDERR.to_vec();
+        if code != 0 {
+            expected_stderr.extend_from_slice(DIAGNOSTIC_FAILURE);
+        }
+        assert_eq!(output.stdout, DIAGNOSTIC_STDOUT);
+        assert_eq!(output.stderr, expected_stderr);
+        let mut emitted = Vec::new();
+        preserve_nvcc_output(job, &output, |line| emitted.push(line.to_owned()))
+            .expect("preserve both complete raw streams for either compiler exit");
+        for (stream, expected) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            let path = directory.path.join("native-build-logs").join(format!(
+                "{}.{}.log",
+                job.output_path.file_name().unwrap().to_str().unwrap(),
+                stream
+            ));
+            assert_eq!(std::fs::read(path).unwrap(), *expected);
+        }
+        let diagnostics = emitted
+            .iter()
+            .filter(|line| line.starts_with("cargo:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|line| line.starts_with("cargo:warning="))
+                .count(),
+            2
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|line| line.starts_with("cargo:error="))
+                .count(),
+            usize::from(code != 0)
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|line| !line.contains("ordinary_warning_kernel.cu")
+                    && !line.contains("information with")
+                    && !line.contains("ptxas info"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| line.contains("warning C4996"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| line.contains("warning #20013-D"))
+        );
+        assert!(
+            !job.output_path.exists(),
+            "logging must not fabricate a CUDA artifact"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(directory.path.join("native-build-logs"))
+            .unwrap()
+            .count(),
+        4
+    );
+
+    // Failure to save one stream still attempts the other and fails closed.
+    let job = &jobs[2];
+    let stderr_path = directory.path.join("native-build-logs").join(format!(
+        "{}.stderr.log",
+        job.output_path.file_name().unwrap().to_str().unwrap()
+    ));
+    std::fs::create_dir(&stderr_path).unwrap();
+    let mut output = run_tool(&fake_nvcc, &["--diagnostic-success"]);
+    let error = preserve_nvcc_output(job, &output, |_| {})
+        .expect_err("incomplete logs must refuse success");
+    assert!(error.contains("cannot preserve complete NVCC output") && error.contains("stderr.log"));
+    let stdout_path = stderr_path.with_file_name(format!(
+        "{}.stdout.log",
+        job.output_path.file_name().unwrap().to_str().unwrap()
+    ));
+    assert_eq!(std::fs::read(stdout_path).unwrap(), DIAGNOSTIC_STDOUT);
+
+    // Do not manufacture a failed compiler exit from contradictory text.
+    output.stderr = DIAGNOSTIC_FAILURE.to_vec();
+    let mut emitted = Vec::new();
+    preserve_nvcc_output(&jobs[0], &output, |line| emitted.push(line.to_owned())).unwrap();
+    assert!(
+        emitted
+            .iter()
+            .any(|line| line.contains("nvcc exited successfully but reported:"))
+    );
+    assert!(!emitted.iter().any(|line| line.starts_with("cargo:error=")));
+
+    let build =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs")).unwrap();
+    let finish = build
+        .split("impl ArtifactCompiler for NativeNvccCompiler")
+        .nth(1)
+        .unwrap()
+        .split("struct NativeCubinVerifier")
+        .next()
+        .unwrap()
+        .split("fn finish(")
+        .nth(1)
+        .unwrap();
+    assert!(
+        finish.find("preserve_nvcc_output(job, &output,").unwrap()
+            < finish.find("if !output.status.success()").unwrap()
+    );
+}
+
 fn assert_nvcc_telemetry_excludes_post_child_verification_work() {
     let directory = TestDirectory::new("nvcc-child-telemetry");
     let fake_nvcc = copy_self_as(&directory.path, "fake-nvcc");
@@ -705,6 +862,11 @@ fn duplicate_architecture_expansion_fails_closed() {
 }
 
 #[test]
+fn nvcc_output_preserves_complete_success_and_failure_streams() {
+    assert_nvcc_output_preservation_contract();
+}
+
+#[test]
 fn nvcc_telemetry_excludes_post_child_verification_work() {
     assert_nvcc_telemetry_excludes_post_child_verification_work();
 }
@@ -716,11 +878,12 @@ fn sqwma_grid_binds_block_width_to_outputs_per_thread() {
 
 fn run_parity_contracts() {
     assert_native_inventory_and_command_contract();
-    assert_arch_discovery_and_cubin_inspection_contract();
+    assert_architecture_authority_and_cubin_inspection_contract();
     assert_jobserver_parallel_cancel_and_telemetry_contract();
     assert_duplicate_architecture_expansion_fails_closed();
     assert_nvcc_telemetry_excludes_post_child_verification_work();
     assert_sqwma_grid_binds_block_width_to_outputs_per_thread();
+    assert_nvcc_output_preservation_contract();
     println!(
         "{}",
         json!({
@@ -744,13 +907,14 @@ fn main() {
         Some(fake_nvcc(&args))
     } else if stem.starts_with("fake-cuobjdump") {
         Some(fake_cuobjdump(&args))
-    } else if stem.starts_with("fake-nvidia-smi") {
-        Some(fake_nvidia_smi(&args))
     } else if args.first().and_then(|arg| arg.to_str()) == Some("--check-duplicate-architecture") {
         assert_duplicate_architecture_expansion_fails_closed();
         None
     } else if args.first().and_then(|arg| arg.to_str()) == Some("--check-nvcc-telemetry") {
         assert_nvcc_telemetry_excludes_post_child_verification_work();
+        None
+    } else if args.first().and_then(|arg| arg.to_str()) == Some("--check-nvcc-output") {
+        assert_nvcc_output_preservation_contract();
         None
     } else {
         run_parity_contracts();

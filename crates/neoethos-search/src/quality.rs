@@ -117,6 +117,8 @@ pub struct StrategyMetrics {
     pub total_trades: usize,
     pub win_rate: f64,
     pub profit_factor: f64,
+    /// Canonical completed-month return Sharpe when evaluation metrics are supplied;
+    /// a trade-return diagnostic otherwise.
     pub sharpe_ratio: f64,
     pub sortino_ratio: f64,
     pub calmar_ratio: f64,
@@ -139,6 +141,8 @@ pub struct StrategyMetrics {
     pub in_market_pct: f64,
     pub largest_win_pct: f64,
     pub largest_loss_pct: f64,
+    /// Canonical intrabar mark-to-market drawdown when evaluation metrics are
+    /// supplied; closed-trade balance drawdown for trade-only diagnostics.
     pub max_drawdown_pct: f64,
     pub avg_drawdown_pct: f64,
     pub longest_losing_streak: usize,
@@ -201,6 +205,8 @@ pub struct StrategyMetrics {
     pub net_profit: f64,
     #[serde(default)]
     pub final_balance: f64,
+    /// Closed-trade balance drawdown in account currency. This is not the
+    /// canonical intrabar money drawdown (which the evaluator does not return).
     #[serde(default)]
     pub max_drawdown_money: f64,
     #[serde(default)]
@@ -273,14 +279,111 @@ impl Default for StrategyQualityAnalyzer {
 }
 
 impl StrategyQualityAnalyzer {
+    /// Trade-only diagnostics for callers without the evaluated bar interval.
+    /// Frequency, period and exposure describe the observed trades only; these
+    /// are not full-span account metrics. Discovery must use
+    /// [`Self::analyze_strategy_with_evaluation`] instead.
     pub fn analyze_strategy(
         &self,
         strategy_id: &str,
         trades: &[Trade],
         initial_balance: f64,
     ) -> StrategyMetrics {
+        self.analyze_strategy_inner(strategy_id, trades, initial_balance, None)
+    }
+
+    /// Analyze the ledger and canonical metrics returned by the SAME account
+    /// replay. The interval is the first through last evaluated bar timestamp,
+    /// not the first entry through last exit. Frequency counts every weekday in
+    /// those inclusive UTC dates, including dates with no trades, using the
+    /// configured trading-days-per-month convention. Calendar exposure uses the
+    /// elapsed milliseconds between the supplied endpoints.
+    #[allow(clippy::too_many_arguments)]
+    pub fn analyze_strategy_with_evaluation(
+        &self,
+        strategy_id: &str,
+        trades: &[Trade],
+        initial_balance: f64,
+        evaluation_start_ms: i64,
+        evaluation_end_ms: i64,
+        canonical_metrics: &[f64; 11],
+    ) -> anyhow::Result<StrategyMetrics> {
+        anyhow::ensure!(
+            initial_balance.is_finite() && initial_balance > 0.0,
+            "quality evaluation initial balance must be finite and positive"
+        );
+        let weekdays = evaluation_weekdays(evaluation_start_ms, evaluation_end_ms)?;
+        anyhow::ensure!(
+            trades.is_empty() || weekdays > 0,
+            "quality evaluation with trades requires a weekday in its supplied interval"
+        );
+        anyhow::ensure!(
+            canonical_metrics[0].is_finite()
+                && (canonical_metrics[1].is_finite()
+                    || canonical_metrics[1] == crate::eval::INVALID_MONTHLY_RETURN_SHARPE_V1)
+                && canonical_metrics[3].is_finite()
+                && canonical_metrics[3] >= 0.0
+                && canonical_metrics[8] == trades.len() as f64,
+            "quality evaluation requires canonical PnL, Sharpe, nonnegative drawdown and matching trade count"
+        );
+        let mut net = 0.0;
+        let mut absolute_pnl = 0.0;
+        for trade in trades {
+            anyhow::ensure!(
+                trade.pnl.is_finite()
+                    && trade.entry_time >= evaluation_start_ms
+                    && trade.exit_time.is_some_and(|exit| {
+                        exit >= trade.entry_time && exit <= evaluation_end_ms
+                    }),
+                "quality evaluation ledger contains non-finite PnL or a trade outside its supplied interval"
+            );
+            net += trade.pnl;
+            absolute_pnl += trade.pnl.abs();
+        }
+        // The ledger sums PnL from zero; the core updates initial balance and
+        // subtracts it at the end. Permit their floating-point summation error,
+        // not a financial tolerance or a different ledger.
+        let rounding_bound =
+            f64::EPSILON * (trades.len() as f64 + 2.0) * (initial_balance + absolute_pnl) * 4.0;
+        anyhow::ensure!(
+            net.is_finite()
+                && rounding_bound.is_finite()
+                && (net - canonical_metrics[0]).abs() <= rounding_bound,
+            "quality evaluation canonical PnL differs from its supplied ledger"
+        );
+        Ok(self.analyze_strategy_inner(
+            strategy_id,
+            trades,
+            initial_balance,
+            Some((
+                evaluation_start_ms,
+                evaluation_end_ms,
+                weekdays,
+                canonical_metrics,
+            )),
+        ))
+    }
+
+    fn analyze_strategy_inner(
+        &self,
+        strategy_id: &str,
+        trades: &[Trade],
+        initial_balance: f64,
+        evaluation: Option<(i64, i64, u64, &[f64; 11])>,
+    ) -> StrategyMetrics {
         if trades.is_empty() {
-            return empty_metrics(strategy_id);
+            let mut metrics = empty_metrics(strategy_id);
+            if let Some((start, end, _, canonical)) = evaluation {
+                metrics.initial_capital = initial_balance;
+                metrics.final_balance = initial_balance;
+                metrics.period_start_ms = start;
+                metrics.period_end_ms = end;
+                metrics.period_days = (end - start) as f64 / 86_400_000.0;
+                metrics.sharpe_ratio = canonical[1];
+                metrics.max_drawdown_pct = canonical[3];
+                metrics.equity_curve.push(initial_balance);
+            }
+            return metrics;
         }
 
         let mut pnls = Vec::with_capacity(trades.len());
@@ -363,16 +466,29 @@ impl StrategyQualityAnalyzer {
             }
             equity_curve.push(equity);
         }
-        let max_dd = drawdowns.iter().cloned().fold(0.0, f64::max);
+        let max_dd = evaluation.map_or_else(
+            || drawdowns.iter().cloned().fold(0.0, f64::max),
+            |(_, _, _, canonical)| canonical[3],
+        );
         let avg_dd = if !drawdowns.is_empty() {
             mean(&drawdowns)
         } else {
             0.0
         };
 
-        let trades_per_month_raw = calculate_trade_frequency(trades);
+        let trades_per_month_raw = evaluation.map_or_else(
+            || calculate_trade_frequency(trades),
+            |(_, _, weekdays, _)| {
+                trades.len() as f64
+                    * current_quality_runtime_overrides().resolved_trading_days_per_month()
+                    / weekdays as f64
+            },
+        );
         let trades_per_year = (trades_per_month_raw * 12.0).max(1.0);
-        let sharpe = calculate_sharpe(&returns, trades_per_year);
+        let sharpe = evaluation.map_or_else(
+            || calculate_sharpe(&returns, trades_per_year),
+            |(_, _, _, canonical)| canonical[1],
+        );
         let sortino = calculate_sortino(&returns, trades_per_year);
         if !sortino.is_finite() {
             let mut invalid = empty_metrics(strategy_id);
@@ -463,47 +579,14 @@ impl StrategyQualityAnalyzer {
             }
         }
         let day_blocks: Vec<Vec<f64>> = daily_pnl_blocks.into_values().collect();
-        // Fallback to trade-level if fewer than 5 distinct days
-        let use_blocks = day_blocks.len() >= 5;
-
         for _ in 0..mc_iterations {
-            // Sample WITH replacement: draw the same number of blocks (resp.
-            // trades) as the original, choosing each uniformly at random so
-            // blocks can repeat or be omitted — the defining property of a
-            // bootstrap that makes the resampled equity actually vary.
-            let shuffled_pnls: Vec<f64> = if use_blocks {
-                let n = day_blocks.len();
-                let mut out = Vec::with_capacity(pnls.len());
-                for _ in 0..n {
-                    let b = &day_blocks[rng.random_range(0..n)];
-                    out.extend_from_slice(b);
-                }
-                out
-            } else if pnls.is_empty() {
-                Vec::new()
-            } else {
-                let n = pnls.len();
-                (0..n).map(|_| pnls[rng.random_range(0..n)]).collect()
-            };
-
-            let mut eq = initial_balance;
-            let mut pk = initial_balance;
-            let mut max_mc_dd = 0.0_f64;
-            let mut ruined = false;
-
-            for p in shuffled_pnls {
-                eq += p;
-                if eq < ruin_threshold {
-                    ruined = true;
-                }
-                if eq > pk {
-                    pk = eq;
-                }
-                let dd = if pk > 0.0 { (pk - eq) / pk } else { 0.0 };
-                if dd > max_mc_dd {
-                    max_mc_dd = dd;
-                }
-            }
+            let (max_mc_dd, ruined) = bootstrap_draw_risk(
+                &day_blocks,
+                &pnls,
+                initial_balance,
+                ruin_threshold,
+                &mut rng,
+            );
             worst_dds.push(max_mc_dd);
             if ruined {
                 ruined_count += 1;
@@ -525,17 +608,23 @@ impl StrategyQualityAnalyzer {
         } else {
             0.0
         };
-        let period_start_ms = trades
-            .iter()
-            .map(|t| t.entry_time)
-            .filter(|&t| t > 0)
-            .min()
-            .unwrap_or(0);
-        let period_end_ms = trades
-            .iter()
-            .filter_map(|t| t.exit_time)
-            .max()
-            .unwrap_or(period_start_ms);
+        let (period_start_ms, period_end_ms) = evaluation.map_or_else(
+            || {
+                let start = trades
+                    .iter()
+                    .map(|t| t.entry_time)
+                    .filter(|&t| t > 0)
+                    .min()
+                    .unwrap_or(0);
+                let end = trades
+                    .iter()
+                    .filter_map(|t| t.exit_time)
+                    .max()
+                    .unwrap_or(start);
+                (start, end)
+            },
+            |(start, end, _, _)| (start, end),
+        );
         let period_days = if period_end_ms > period_start_ms {
             (period_end_ms - period_start_ms) as f64 / 86_400_000.0
         } else {
@@ -603,7 +692,18 @@ impl StrategyQualityAnalyzer {
             } else {
                 0.0
             },
-            in_market_pct: time_in_market(trades),
+            in_market_pct: evaluation.map_or_else(
+                || time_in_market(trades),
+                |(start, end, _, _)| {
+                    trades
+                        .iter()
+                        .filter_map(|trade| {
+                            trade.exit_time.map(|exit| (exit - trade.entry_time) as f64)
+                        })
+                        .sum::<f64>()
+                        / (end - start) as f64
+                },
+            ),
             largest_win_pct: returns.iter().cloned().fold(0.0, f64::max),
             largest_loss_pct: returns.iter().cloned().fold(0.0, f64::min),
             max_drawdown_pct: max_dd,
@@ -643,8 +743,86 @@ impl StrategyQualityAnalyzer {
         };
 
         score_strategy(self, &mut metrics);
+        if sharpe == crate::eval::INVALID_MONTHLY_RETURN_SHARPE_V1 {
+            // Preserve the core's candidate rejection, not a run-level error or
+            // an apparently acceptable score based on other finite metrics.
+            metrics.quality_score = f64::NEG_INFINITY;
+            metrics.has_edge = false;
+            metrics.recommendation = "INVALID_COMPLETED_MONTH_RETURN".to_string();
+        }
         metrics
     }
+}
+
+/// Inclusive UTC calendar dates; O(1) weeks plus at most six remainder days.
+/// Endpoint validation also bounds every later elapsed-time subtraction.
+fn evaluation_weekdays(start_ms: i64, end_ms: i64) -> anyhow::Result<u64> {
+    anyhow::ensure!(
+        start_ms >= 0 && end_ms > start_ms,
+        "quality evaluation interval must have ordered nonnegative endpoints"
+    );
+    let start = Utc
+        .timestamp_millis_opt(start_ms)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("quality evaluation start is outside the UTC calendar"))?;
+    let end = Utc
+        .timestamp_millis_opt(end_ms)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("quality evaluation end is outside the UTC calendar"))?;
+    let days = (end.date_naive() - start.date_naive()).num_days() as u64 + 1;
+    let first_weekday = u64::from(start.weekday().num_days_from_monday());
+    Ok((days / 7) * 5
+        + (0..days % 7)
+            .filter(|offset| (first_weekday + offset) % 7 < 5)
+            .count() as u64)
+}
+
+/// Visit the same with-replacement draws in the same P&L order without storing
+/// the resampled tape. Uneven day blocks can otherwise repeat into a temporary
+/// vector much larger than the original trade history. Interleaving the equity
+/// updates with sampling does not consume additional RNG draws or regroup sums.
+fn bootstrap_draw_risk(
+    day_blocks: &[Vec<f64>],
+    pnls: &[f64],
+    initial_balance: f64,
+    ruin_threshold: f64,
+    rng: &mut StdRng,
+) -> (f64, bool) {
+    let mut eq = initial_balance;
+    let mut pk = initial_balance;
+    let mut max_mc_dd = 0.0_f64;
+    let mut ruined = false;
+    let mut apply_pnl = |p: f64| {
+        eq += p;
+        if eq < ruin_threshold {
+            ruined = true;
+        }
+        if eq > pk {
+            pk = eq;
+        }
+        let dd = if pk > 0.0 { (pk - eq) / pk } else { 0.0 };
+        if dd > max_mc_dd {
+            max_mc_dd = dd;
+        }
+    };
+
+    // Fallback to trade-level if fewer than 5 distinct days. The number and
+    // order of uniform index draws match the former materialized implementation.
+    if day_blocks.len() >= 5 {
+        let n = day_blocks.len();
+        for _ in 0..n {
+            let block = &day_blocks[rng.random_range(0..n)];
+            for &p in block {
+                apply_pnl(p);
+            }
+        }
+    } else if !pnls.is_empty() {
+        let n = pnls.len();
+        for _ in 0..n {
+            apply_pnl(pnls[rng.random_range(0..n)]);
+        }
+    }
+    (max_mc_dd, ruined)
 }
 
 #[derive(Debug, Clone)]
@@ -763,8 +941,8 @@ fn calculate_trade_frequency(trades: &[Trade]) -> f64 {
     trades.len() as f64 / months
 }
 
-// QA-1: Annualize using actual trade frequency, not daily assumption.
-// √trades_per_year is the correct annualization factor for per-trade returns.
+// Trade-return diagnostic scaling. It is not the canonical fixed-calendar
+// return Sharpe, and square-root scaling alone does not prove independence.
 fn calculate_sharpe(returns: &[f64], trades_per_year: f64) -> f64 {
     if returns.len() < 2 {
         return 0.0;
@@ -1110,6 +1288,356 @@ impl StrategyRanker {
 #[cfg(test)]
 mod overrides_tests {
     use super::*;
+
+    fn quality_timestamp(year: i32, month: u32, day: u32) -> i64 {
+        Utc.with_ymd_and_hms(year, month, day, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn evaluation_quality_frequency_includes_inactive_weekdays_and_leap_day() {
+        assert_eq!(
+            evaluation_weekdays(
+                quality_timestamp(2024, 2, 28),
+                quality_timestamp(2024, 3, 4)
+            )
+            .unwrap(),
+            4, // Wednesday, leap-day Thursday, Friday and Monday.
+        );
+        assert_eq!(
+            evaluation_weekdays(quality_timestamp(2024, 3, 2), quality_timestamp(2024, 3, 3))
+                .unwrap(),
+            0,
+        );
+        let start = quality_timestamp(2024, 1, 1);
+        let end = quality_timestamp(2024, 12, 31);
+        assert_eq!(evaluation_weekdays(start, end).unwrap(), 262);
+        let trades = vec![
+            Trade {
+                entry_time: start,
+                exit_time: Some(start + 3_600_000),
+                pnl: 10.0,
+                ..Trade::default()
+            },
+            Trade {
+                entry_time: start + 86_400_000,
+                exit_time: Some(start + 90_000_000),
+                pnl: -2.0,
+                ..Trade::default()
+            },
+        ];
+        let canonical = [8.0, 0.5, 1010.0, 0.02, 0.5, 5.0, 4.0, 0.0, 2.0, 0.0, 0.02];
+        let analyzer = StrategyQualityAnalyzer::default();
+        let full = analyzer
+            .analyze_strategy_with_evaluation("idle", &trades, 1000.0, start, end, &canonical)
+            .unwrap();
+        let short_end = quality_timestamp(2024, 1, 2) + 3_600_000;
+        let short = analyzer
+            .analyze_strategy_with_evaluation("idle", &trades, 1000.0, start, short_end, &canonical)
+            .unwrap();
+        let expected =
+            2.0 * current_quality_runtime_overrides().resolved_trading_days_per_month() / 262.0;
+        assert_eq!(full.trades_per_month.to_bits(), expected.to_bits());
+        assert!(full.trades_per_month < short.trades_per_month);
+        assert!(full.sortino_ratio < short.sortino_ratio);
+        assert!(full.in_market_pct < short.in_market_pct);
+        assert_eq!(full.period_start_ms, start);
+        assert_eq!(full.period_end_ms, end);
+        assert_eq!(full.period_days, 365.0);
+        assert_eq!(full.sharpe_ratio.to_bits(), canonical[1].to_bits());
+        assert_eq!(full.equity_curve, short.equity_curve);
+    }
+
+    #[test]
+    fn evaluation_quality_uses_same_replay_canonical_sharpe_and_intrabar_drawdown() {
+        // Synthetic account replay, not profitability evidence. One trade has
+        // open-position excursions before its target; another reaches its stop.
+        let start = quality_timestamp(2024, 1, 1);
+        let timestamps: Vec<_> = (0..400).map(|day| start + day * 86_400_000).collect();
+        let close = vec![100.0; timestamps.len()];
+        let mut high = vec![100.5; timestamps.len()];
+        let mut low = vec![99.5; timestamps.len()];
+        high[2] = 105.0;
+        low[2] = 99.0;
+        high[3] = 111.0;
+        low[102] = 97.0;
+        let mut signals = vec![0; timestamps.len()];
+        signals[0] = 1;
+        signals[100] = 1;
+        let settings = crate::eval::BacktestSettings {
+            initial_equity_override: Some(10_000.0),
+            pip_value: 1.0,
+            pip_value_per_lot: 1.0,
+            spread_pips: 0.0,
+            commission_per_trade: 0.0,
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
+            sl_pips: 2.0,
+            tp_pips: 10.0,
+            risk_based_sizing: false,
+            ..crate::eval::BacktestSettings::default()
+        };
+        let (months, days) = crate::genetic::search_engine::month_day_indices(&timestamps);
+        let (canonical, trades) = crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &[],
+            &months,
+            &days,
+            &timestamps,
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(
+            trades.iter().map(|trade| trade.pnl).collect::<Vec<_>>(),
+            vec![10.0, -2.0]
+        );
+        let analyzer = StrategyQualityAnalyzer::default();
+        let diagnostic = analyzer.analyze_strategy("canonical", &trades, 10_000.0);
+        let actual = analyzer
+            .analyze_strategy_with_evaluation(
+                "canonical",
+                &trades,
+                10_000.0,
+                start,
+                *timestamps.last().unwrap(),
+                &canonical,
+            )
+            .unwrap();
+        assert_eq!(actual.sharpe_ratio.to_bits(), canonical[1].to_bits());
+        assert_eq!(actual.max_drawdown_pct.to_bits(), canonical[3].to_bits());
+        assert!(actual.max_drawdown_pct > diagnostic.max_drawdown_pct);
+        assert_ne!(
+            actual.sharpe_ratio.to_bits(),
+            diagnostic.sharpe_ratio.to_bits()
+        );
+        assert_eq!(
+            actual.calmar_ratio,
+            (actual.total_return_pct / canonical[3]).clamp(-1000.0, 1000.0)
+        );
+        assert_eq!(actual.max_drawdown_money, diagnostic.max_drawdown_money);
+        assert_eq!(actual.equity_curve, diagnostic.equity_curve);
+        assert_eq!(actual.net_profit, canonical[0]);
+        let mut rescored = actual.clone();
+        score_strategy(&analyzer, &mut rescored);
+        assert_eq!(
+            actual.quality_score.to_bits(),
+            rescored.quality_score.to_bits()
+        );
+        assert_eq!(actual.has_edge, rescored.has_edge);
+    }
+
+    #[test]
+    fn evaluation_quality_rejects_mismatched_ledger_and_preserves_invalid_sharpe() {
+        let start = quality_timestamp(2024, 1, 1);
+        let end = quality_timestamp(2024, 2, 1);
+        let trades = vec![Trade {
+            entry_time: start,
+            exit_time: Some(start + 3_600_000),
+            pnl: 1.0,
+            ..Trade::default()
+        }];
+        let canonical = [1.0, 0.0, 1001.0, 0.01, 1.0, 10.0, 1.0, 0.0, 1.0, 0.0, 0.01];
+        let analyzer = StrategyQualityAnalyzer::default();
+        for (bad_start, bad_end) in [(start, start), (end, start), (-1, end), (start, i64::MAX)] {
+            assert!(
+                analyzer
+                    .analyze_strategy_with_evaluation(
+                        "bad", &trades, 1000.0, bad_start, bad_end, &canonical
+                    )
+                    .is_err()
+            );
+        }
+        for (slot, value) in [
+            (0, 2.0),
+            (8, 2.0),
+            (1, f64::NAN),
+            (3, -0.1),
+            (3, f64::INFINITY),
+        ] {
+            let mut bad = canonical;
+            bad[slot] = value;
+            assert!(
+                analyzer
+                    .analyze_strategy_with_evaluation("bad", &trades, 1000.0, start, end, &bad)
+                    .is_err()
+            );
+        }
+        let mut invalid = canonical;
+        invalid[1] = crate::eval::INVALID_MONTHLY_RETURN_SHARPE_V1;
+        let rejected = analyzer
+            .analyze_strategy_with_evaluation("invalid", &trades, 1000.0, start, end, &invalid)
+            .unwrap();
+        assert_eq!(rejected.sharpe_ratio, f64::NEG_INFINITY);
+        assert_eq!(rejected.quality_score, f64::NEG_INFINITY);
+        assert!(!rejected.has_edge);
+        assert_eq!(rejected.recommendation, "INVALID_COMPLETED_MONTH_RETURN");
+        let mut outside = trades;
+        outside[0].exit_time = Some(end + 1);
+        assert!(
+            analyzer
+                .analyze_strategy_with_evaluation("bad", &outside, 1000.0, start, end, &canonical)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn evaluation_quality_empty_ledger_retains_explicit_span_without_edge_claim() {
+        let start = quality_timestamp(2024, 3, 2);
+        let end = quality_timestamp(2024, 3, 3);
+        let actual = StrategyQualityAnalyzer::default()
+            .analyze_strategy_with_evaluation("empty", &[], 1000.0, start, end, &[0.0; 11])
+            .unwrap();
+        assert_eq!(actual.period_start_ms, start);
+        assert_eq!(actual.period_end_ms, end);
+        assert_eq!(actual.period_days, 1.0);
+        assert_eq!(actual.equity_curve, vec![1000.0]);
+        assert_eq!(actual.trades_per_month, 0.0);
+        assert_eq!(actual.quality_score, 0.0);
+        assert!(!actual.has_edge);
+    }
+
+    // Independent reference: preserve the pre-streaming allocation and update
+    // order so a changed draw count, block order or floating-point sum is caught.
+    fn materialized_bootstrap_draw_risk(
+        day_blocks: &[Vec<f64>],
+        pnls: &[f64],
+        initial_balance: f64,
+        ruin_threshold: f64,
+        rng: &mut StdRng,
+    ) -> (f64, bool, usize) {
+        let shuffled_pnls: Vec<f64> = if day_blocks.len() >= 5 {
+            let n = day_blocks.len();
+            let mut out = Vec::with_capacity(pnls.len());
+            for _ in 0..n {
+                let b = &day_blocks[rng.random_range(0..n)];
+                out.extend_from_slice(b);
+            }
+            out
+        } else if pnls.is_empty() {
+            Vec::new()
+        } else {
+            let n = pnls.len();
+            (0..n).map(|_| pnls[rng.random_range(0..n)]).collect()
+        };
+        let sampled_len = shuffled_pnls.len();
+        let mut eq = initial_balance;
+        let mut pk = initial_balance;
+        let mut max_mc_dd = 0.0_f64;
+        let mut ruined = false;
+        for p in shuffled_pnls {
+            eq += p;
+            if eq < ruin_threshold {
+                ruined = true;
+            }
+            if eq > pk {
+                pk = eq;
+            }
+            let dd = if pk > 0.0 { (pk - eq) / pk } else { 0.0 };
+            if dd > max_mc_dd {
+                max_mc_dd = dd;
+            }
+        }
+        (max_mc_dd, ruined, sampled_len)
+    }
+
+    fn assert_streaming_bootstrap_matches_materialized(
+        day_blocks: &[Vec<f64>],
+        pnls: &[f64],
+        initial_balance: f64,
+    ) -> usize {
+        let mut longest_tape = 0;
+        for seed in [0, 1, 7, 0x9E37_79B9_7F4A_7C15] {
+            let mut old_rng = StdRng::seed_from_u64(seed);
+            let mut new_rng = StdRng::seed_from_u64(seed);
+            for draw in 0..1000 {
+                let expected = materialized_bootstrap_draw_risk(
+                    day_blocks,
+                    pnls,
+                    initial_balance,
+                    initial_balance * 0.50,
+                    &mut old_rng,
+                );
+                let actual = bootstrap_draw_risk(
+                    day_blocks,
+                    pnls,
+                    initial_balance,
+                    initial_balance * 0.50,
+                    &mut new_rng,
+                );
+                assert_eq!(
+                    actual.0.to_bits(),
+                    expected.0.to_bits(),
+                    "seed={seed} draw={draw}"
+                );
+                assert_eq!(actual.1, expected.1, "seed={seed} draw={draw}");
+                longest_tape = longest_tape.max(expected.2);
+            }
+            assert_eq!(
+                old_rng.random::<u64>(),
+                new_rng.random::<u64>(),
+                "RNG state drift for seed {seed}"
+            );
+        }
+        longest_tape
+    }
+
+    #[test]
+    fn streaming_bootstrap_matches_uneven_repeated_day_blocks_bit_for_bit() {
+        let day_blocks = vec![
+            vec![1.0e8, 0.1, -1.0e8, -4.5],
+            vec![-70.0],
+            vec![0.125; 97],
+            vec![25.0, -0.25],
+            vec![-1.5; 11],
+        ];
+        let pnls: Vec<f64> = day_blocks.iter().flatten().copied().collect();
+        let longest_tape =
+            assert_streaming_bootstrap_matches_materialized(&day_blocks, &pnls, 100.0);
+        assert!(
+            longest_tape > pnls.len(),
+            "fixture must exercise expansion beyond input trades"
+        );
+    }
+
+    #[test]
+    fn streaming_bootstrap_matches_negative_pnl_and_ruin_bit_for_bit() {
+        let day_blocks = vec![
+            vec![-60.0],
+            vec![-15.0, -30.0],
+            vec![-30.0],
+            vec![-40.0],
+            vec![-20.0],
+        ];
+        let pnls: Vec<f64> = day_blocks.iter().flatten().copied().collect();
+        assert_streaming_bootstrap_matches_materialized(&day_blocks, &pnls, 100.0);
+        let mut rng = StdRng::seed_from_u64(1);
+        let (_, ruined) = bootstrap_draw_risk(&day_blocks, &pnls, 100.0, 50.0, &mut rng);
+        assert!(ruined);
+    }
+
+    #[test]
+    fn streaming_bootstrap_matches_trade_level_fallback_and_empty_input() {
+        let pnls = [100.0, -300.0, 0.1, 60.0, -0.125, 1.0e-8];
+        // Fewer than five day blocks must draw from the complete P&L history,
+        // including values without a usable day, not from the partial blocks.
+        let partial_day_blocks = vec![vec![999.0]; 4];
+        assert_streaming_bootstrap_matches_materialized(&partial_day_blocks, &pnls, 100.0);
+        assert_eq!(
+            assert_streaming_bootstrap_matches_materialized(&[], &[], 100.0),
+            0
+        );
+        let mut rng = StdRng::seed_from_u64(7);
+        assert_eq!(
+            bootstrap_draw_risk(&[], &[], 100.0, 50.0, &mut rng),
+            (0.0, false)
+        );
+    }
 
     #[test]
     fn money_view_and_equity_curve_are_correct() {

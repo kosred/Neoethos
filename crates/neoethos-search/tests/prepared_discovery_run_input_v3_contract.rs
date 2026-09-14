@@ -79,20 +79,35 @@ fn owned_cpu_input_constructor_revalidates_receipt_frame_and_runtime_math_author
     let data_selection = read_or_empty("src/data_selection.rs");
     let constructor = section(
         &data_selection,
-        "pub fn from_prepared_canonical_frame(",
+        "pub fn from_prepared_canonical_frame_with_control(",
         "\n    }",
     );
     require_all(
         constructor,
         &[
             "CanonicalFeatureExecutionReceiptV1::from_runtime_authority",
-            "CanonicalSearchInputReceiptV2::from_feature_frame_with_execution",
-            "CanonicalSearchRunInputV2::new",
+            "canonical_feature_execution_authority_for_policy_v1",
+            "control.resolved_indicator_compute_policy()",
+            "CanonicalSearchRunInputV2::from_fresh_feature_frame_with_execution",
             "base_frame.artifact().identity()",
         ],
     );
+    require_none(constructor, &["resolved_canonical_feature_execution_authority_v1()"]);
+    let fresh_bind = section(
+        &data_selection,
+        "fn from_fresh_feature_frame_with_execution(",
+        "\n    }",
+    );
+    require_all(
+        fresh_bind,
+        &[
+            "CanonicalSearchInputReceiptV2::from_feature_frame_with_execution",
+            "Self::validate_values",
+            "Self::bind_base_frame",
+        ],
+    );
     require_none(
-        constructor,
+        &format!("{constructor}\n{fresh_bind}"),
         &["unsafe", "unwrap", "from_env", "caller_feature_execution"],
     );
 }
@@ -243,6 +258,30 @@ fn prepared_cpu_run_consumes_the_physical_absence_authority_without_a_second_pro
 }
 
 #[test]
+fn prepared_cpu_run_revalidates_its_carried_receipt_before_search() {
+    let source = read_or_empty("src/prepared_discovery_run_input_v3.rs");
+    let cpu_runner = section(
+        &source,
+        "fn run_cpu_prepared_discovery_v3_with_input",
+        "\n}\n",
+    );
+    let compact = normalized(cpu_runner);
+    require_all(
+        &compact,
+        &[
+            "CanonicalSearchRunInputV2::new(prepared.receipt,prepared.input.features(),prepared.input.base_frame(),)",
+            "run_discovery_cycle_with_prepared_cpu_admission_v3(&input,",
+        ],
+    );
+    require_none(cpu_runner, &[".as_run_input()", "from_fresh_feature_frame"]);
+    assert!(
+        compact.find("CanonicalSearchRunInputV2::new(")
+            < compact.find("run_discovery_cycle_with_prepared_cpu_admission_v3("),
+        "prepared values must match the carried receipt before Search can consume them"
+    );
+}
+
+#[test]
 fn native_factory_receives_only_the_moved_admitted_full_workspace_run() {
     let source = read_or_empty("src/prepared_discovery_run_input_v3.rs");
     let prepare = section(
@@ -255,7 +294,7 @@ fn native_factory_receives_only_the_moved_admitted_full_workspace_run() {
         &[
             "NativeFactory:FnOnce(",
             "AdmittedNativeCudaFullDiscoveryRunV1",
-            "CanonicalSearchInputReceiptV2",
+            "CanonicalGpuResidentSearchInputReceiptV3",
             "SealedGpuResidentFeatureStoreV3",
             "PreparedNativeCudaCanonicalDiscoveryRunInputV3",
         ],
@@ -310,30 +349,25 @@ fn prepared_runner_keeps_cpu_and_native_execution_bodies_disjoint() {
     require_all(
         native_arm,
         &[
-            "bind_strict_resident_feature_store_v3_run_input",
+            "consume_strict_resident_population_execution_run_v3",
             "seal_gpu_native_trim_prefilter_view_identity_v3",
-            "record_resident_feature_store_consumer_completion_v3",
+            "retain_resident_completion_until_ready_v1",
+            "drop(consumer_completion_lease)",
         ],
     );
     let compact_native_arm = normalized(native_arm);
-    require_all(
-        &compact_native_arm,
-        &[
-            "letexpected_completion_shape=(run.row_count(),run.column_count());",
-            "letconsumer_completion_lease=record_resident_feature_store_consumer_completion_v3(run).context(",
-            "consumer_completion_lease.rows()==expected_completion_shape.0",
-            "consumer_completion_lease.columns()==expected_completion_shape.1",
-        ],
-    );
     let completion = compact_native_arm
-        .find("letconsumer_completion_lease=record_resident_feature_store_consumer_completion_v3")
-        .expect("native run must retain its move-only completion lease");
+        .find("retain_resident_completion_until_ready_v1(consumer_completion_lease)")
+        .expect("native run must await its move-only completion lease");
+    let release = compact_native_arm
+        .find("drop(consumer_completion_lease)")
+        .expect("native run must release only its completed consumer lease");
     let return_outcome = compact_native_arm
         .rfind("outcome")
         .expect("native run must return its recorded execution outcome");
     assert!(
-        completion < return_outcome,
-        "the resident consumer lease must remain in scope through the native outcome return"
+        completion < release && release < return_outcome,
+        "the resident consumer lease must complete before release and native outcome return"
     );
     require_none(
         native_arm,
@@ -365,7 +399,7 @@ fn strict_v3_binder_owns_a_native_run_instead_of_attaching_to_the_host_v1_run() 
     require_all(
         &source,
         &[
-            "pub(crate) struct StrictResidentPopulationExecutionRunV3",
+            "pub struct StrictResidentPopulationExecutionRunV3",
             "pub(crate) fn bind_strict_resident_feature_store_v3_run_input",
             "Result<StrictResidentPopulationExecutionRunV3",
             "pub(crate) fn record_resident_feature_store_consumer_completion_v3",
@@ -392,25 +426,37 @@ fn strict_v3_binder_owns_a_native_run_instead_of_attaching_to_the_host_v1_run() 
 #[test]
 fn data_materialization_remains_fail_before_carrier_consumption_when_producers_are_missing() {
     let data = read_sibling_or_empty("neoethos-data", "src/core/gpu_resident_feature_store_v3.rs");
-    let materialize = section(
+    let prepare = section(
         &data,
-        "pub fn materialize_gpu_only_feature_store_v3",
+        "pub fn prepare_gpu_only_feature_materialization_v3",
         "\n}\n",
     );
-    let compact = normalized(materialize);
-    let resolve = compact
+    let compact_prepare = normalized(prepare);
+    let resolve = compact_prepare
         .find("CrateOwnedResidentProducerFactoryV3::resolve")
         .expect("Data must resolve the complete producer census");
-    let preflight = compact
+    let preflight = compact_prepare
         .find("preflight_gpu_only_feature_recipe_v3")
-        .expect("Data must preflight before consuming the run");
-    let consume = compact
-        .find("into_gpu_only_run_device_admission_v3")
-        .expect("Data must consume exactly one admitted full run");
+        .expect("Data must preflight the complete recipe");
     assert!(
-        resolve < preflight && preflight < consume,
-        "missing producers must fail before the one-shot device carrier is consumed"
+        resolve < preflight,
+        "missing producers must fail while preparing the recipe"
     );
+    let compatibility = section(&data, "pub fn materialize_gpu_only_feature_store_v3", "\n}");
+    let compact_compatibility = normalized(compatibility);
+    let prepare_at = compact_compatibility
+        .find("prepare_gpu_only_feature_materialization_v3")
+        .expect("compatibility entrypoint must prepare before binding");
+    let materialize_at = compact_compatibility
+        .find("materialize_prepared_gpu_only_feature_store_v3")
+        .expect("compatibility entrypoint must consume only a prepared recipe");
+    assert!(prepare_at < materialize_at);
+    let materialize = section(
+        &data,
+        "pub fn materialize_prepared_gpu_only_feature_store_v3",
+        "\n}",
+    );
+    require_all(materialize, &["into_gpu_only_run_device_admission_v3"]);
 }
 
 #[test]
@@ -419,12 +465,9 @@ fn app_cli_and_autoresearch_switch_the_real_entrypoints_to_the_prepared_typestat
         (
             read_sibling_or_empty("neoethos-app", "src/app_services/discovery.rs"),
             "prepare_canonical_discovery_run_input_v3",
-            "run_prepared_canonical_discovery_with_holdout_and_progress_v3",
-        ),
-        (
-            read_sibling_or_empty("neoethos-cli", "src/canonical_full_run.rs"),
-            "prepare_canonical_discovery_run_input_v3",
-            "run_prepared_canonical_trendbar_research_with_cpu_training_handoff_v3",
+            // The UI uses the explicit trendbar-research boundary, not the
+            // quote-validated financial execution entrypoint used by CLI.
+            "run_prepared_canonical_trendbar_research_with_holdout_and_progress_v3",
         ),
         (
             read_sibling_or_empty("neoethos-cli", "src/main.rs"),
@@ -449,7 +492,6 @@ fn app_cli_and_autoresearch_switch_the_real_entrypoints_to_the_prepared_typestat
 #[test]
 fn real_prepared_callers_do_not_build_host_features_before_the_one_shot_dispatch() {
     let app = read_sibling_or_empty("neoethos-app", "src/app_services/discovery.rs");
-    let cli = read_sibling_or_empty("neoethos-cli", "src/canonical_full_run.rs");
     let cli_main = read_sibling_or_empty("neoethos-cli", "src/main.rs");
     let autoresearch = read_sibling_or_empty("neoethos-autoresearch", "src/runner/streaming.rs");
     let compact_cli_main = normalized(&cli_main);
@@ -483,11 +525,19 @@ fn real_prepared_callers_do_not_build_host_features_before_the_one_shot_dispatch
         "the CLI must pin its immutable series before acquiring the prepared run admission"
     );
     for (label, caller, dispatcher) in [
-        ("app", app, "prepare_canonical_discovery_run_input_v3"),
-        ("cli", cli, "prepare_canonical_discovery_run_input_v3"),
+        (
+            "app",
+            app.as_str(),
+            "prepare_canonical_discovery_run_input_v3",
+        ),
+        (
+            "cli",
+            discover_command,
+            "prepare_canonical_discovery_run_input_v3",
+        ),
         (
             "autoresearch",
-            autoresearch,
+            autoresearch.as_str(),
             "run_prepared_streaming_working_set_v3",
         ),
     ] {
@@ -508,34 +558,30 @@ fn real_prepared_callers_do_not_build_host_features_before_the_one_shot_dispatch
 }
 
 #[test]
-fn combined_canonical_run_carries_the_cpu_training_input_and_refuses_a_native_host_rebuild() {
-    let prepared = read_or_empty("src/prepared_discovery_run_input_v3.rs");
+fn receipt_bound_training_reopens_the_exact_series_without_discovery_output_reconstruction() {
     let cli = read_sibling_or_empty("neoethos-cli", "src/canonical_full_run.rs");
-    require_all(
-        &prepared,
-        &[
-            "pub struct PreparedCpuCanonicalTrendbarResearchRunV3",
-            "run_prepared_canonical_trendbar_research_with_cpu_training_handoff_v3",
-            "CanonicalSearchInput",
-            "into_parts",
-            "GPU-resident training handoff",
-        ],
+    let training = section(
+        &cli,
+        "pub fn train_receipt_bound(args: &[String], settings: &neoethos_core::Settings)",
+        "#[cfg(not(feature = \"gpu-nvidia-full\"))]",
     );
     require_all(
-        &cli,
+        training,
         &[
-            "run_prepared_canonical_trendbar_research_with_cpu_training_handoff_v3",
-            "let (research, training_input) = prepared_research.into_parts();",
-            "train_canonical_series_with_progress",
-            "training_input",
+            "CanonicalSearchInputReceiptV2::from_json_bytes",
+            "validate_input_receipt_against_series",
+            "CanonicalTrendbarResearchExecutionContractV3::new",
+            "train_canonical_series_receipt_with_progress",
+            "&input_receipt",
+            "&contract",
         ],
     );
     require_none(
-        &cli,
+        training,
         &[
-            "drop(run_input)",
-            "search_input,\n        &contract",
-            "CanonicalSearchInput::from_exact_series_receipt(\n        &data_root",
+            "run_prepared_canonical_trendbar_research_with_cpu_training_handoff_v3",
+            "CanonicalSearchInput::from_exact_series_receipt",
+            "prepare_multitimeframe_features(",
         ],
     );
 }

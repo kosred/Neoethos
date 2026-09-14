@@ -185,3 +185,11 @@ pub fn try_acquire_process_execution_lease_v1(
         discovery_to_training_transitioned: false,
     })
 }
+
+/// Read-only readiness for frontends. This does not acquire a lease, allocate
+/// a token, or authorize evaluation. The start path still admits atomically.
+pub fn active_process_execution_kind_v1() -> Option<ProcessExecutionKindV1> {
+    lock_process_execution_coordinator_v1()
+        .active
+        .map(|active| active.kind)
+}

@@ -18,12 +18,12 @@ use serde_json::Value;
 use vortex_array::dtype::{DType, Nullability, PType, StructFields};
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
-use vortex_array::stream::ArrayStreamExt;
 use vortex_array::{ArrayRef, ToCanonical};
 use vortex_file::OpenOptionsSessionExt;
 use vortex_io::runtime::BlockingRuntime;
 use vortex_io::runtime::current::CurrentThreadRuntime;
 use vortex_io::session::{RuntimeSession, RuntimeSessionExt};
+use vortex_layout::scan::split_by::SplitBy;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
@@ -49,6 +49,9 @@ const CTRADER_RECONCILE_RESPONSE: u32 = 2125;
 const CTRADER_DEAL_RESPONSE: u32 = 2134;
 const CTRADER_UNREALIZED_PNL_RESPONSE: u32 = 2188;
 const MAX_MONEY_DIGITS_V2: u32 = 10;
+// I/O/decode scratch only, never a limit on history or search breadth. Raw
+// envelopes contain a page of ticks/deals each, so decode those one at a time.
+const DECODED_TICK_BATCH_ROWS_V2: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrokerFinancialTruthSemanticIngressErrorCodeV2 {
@@ -58,6 +61,7 @@ pub enum BrokerFinancialTruthSemanticIngressErrorCodeV2 {
     VortexSchemaMismatch,
     InvalidRawEnvelope,
     RawDecodedMismatch,
+    AllocationRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,7 +204,7 @@ pub fn inspect_untrusted_broker_financial_truth_bundle_v2(
     validate_close_deal_reconciliation(manifest.close_deal_reconciliation(), &tables)?;
 
     let artifact_count = artifacts.len();
-    let primary_quote_replay = structurally_verified_primary_quote_replay(manifest, &tables)?;
+    let primary_quote_replay = structurally_verified_primary_quote_replay(manifest, &mut tables)?;
     drop(artifacts);
     Ok(UntrustedBrokerFinancialTruthIngressV2 {
         verified_bundle,
@@ -211,7 +215,7 @@ pub fn inspect_untrusted_broker_financial_truth_bundle_v2(
 
 fn structurally_verified_primary_quote_replay(
     manifest: &BrokerFinancialTruthBundleManifestV2,
-    tables: &BTreeMap<String, ArtifactTableV2>,
+    tables: &mut BTreeMap<String, ArtifactTableV2>,
 ) -> Result<
     StructurallyVerifiedPrimaryBidAskQuoteReplayV2,
     BrokerFinancialTruthSemanticIngressErrorV2,
@@ -234,10 +238,17 @@ fn structurally_verified_primary_quote_replay(
 fn structurally_verified_quote_side_replay(
     quote: &ExactQuoteSideEvidenceV2,
     account_id: i64,
-    tables: &BTreeMap<String, ArtifactTableV2>,
+    tables: &mut BTreeMap<String, ArtifactTableV2>,
 ) -> Result<StructurallyVerifiedQuoteSideReplayV2, BrokerFinancialTruthSemanticIngressErrorV2> {
-    let quote_records = decoded_tick_rows(tables, quote.decoded_ticks())?
-        .iter()
+    // Consume the already validated table. Do not retain a second full decoded
+    // copy while constructing the one replay snapshot shared by all lanes.
+    let Some(ArtifactTableV2::DecodedTicks(rows)) =
+        tables.remove(quote.decoded_ticks().relative_path())
+    else {
+        return Err(table_kind_error(quote.decoded_ticks(), "decoded ticks"));
+    };
+    let quote_records = rows
+        .into_iter()
         .map(|row| StructurallyVerifiedQuoteReplayRowV2 {
             request_chunk_index: row.chunk_sequence,
             response_page_index: row.page_sequence_in_chunk,
@@ -297,9 +308,7 @@ fn read_and_decode_artifact(
     }
 
     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        reader
-            .read_array(&path)
-            .and_then(|array| decode_artifact_table(artifact, &array))
+        reader.read_table(&path, artifact)
     }));
     let table = match decoded {
         Ok(result) => result?,
@@ -347,10 +356,11 @@ impl VortexIngressReaderV2 {
         Self { runtime, session }
     }
 
-    fn read_array(
+    fn read_table(
         &self,
         path: &Path,
-    ) -> Result<ArrayRef, BrokerFinancialTruthSemanticIngressErrorV2> {
+        artifact: &ImmutableVortexArtifactV1,
+    ) -> Result<ArtifactTableV2, BrokerFinancialTruthSemanticIngressErrorV2> {
         let file = self
             .runtime
             .block_on(self.session.open_options().open_path(path))
@@ -361,7 +371,17 @@ impl VortexIngressReaderV2 {
                     format!("cannot open Vortex footer/layout: {error}"),
                 )
             })?;
-        let stream = file
+        if file.row_count() != artifact.row_count() {
+            return Err(row_count_error(artifact, file.row_count()));
+        }
+        let expected_rows = reconstructed_len(artifact.row_count())?;
+        let mut table = ArtifactTableV2::empty(artifact)?;
+        table.reserve_exact(expected_rows, artifact)?;
+        let batch_rows = match artifact.schema() {
+            BrokerFinancialTruthVortexSchemaV1::CTraderTicksDecodedV2 => DECODED_TICK_BATCH_ROWS_V2,
+            _ => 1,
+        };
+        let batches = file
             .scan()
             .map_err(|error| {
                 ingress_error(
@@ -370,22 +390,54 @@ impl VortexIngressReaderV2 {
                     format!("cannot scan Vortex layout: {error}"),
                 )
             })?
-            .into_array_stream()
+            .with_ordered(true)
+            .with_split_by(SplitBy::RowCount(batch_rows))
+            .into_array_iter(&self.runtime)
             .map_err(|error| {
                 ingress_error(
                     BrokerFinancialTruthSemanticIngressErrorCodeV2::VortexReadFailed,
                     path.file_name().and_then(|name| name.to_str()),
-                    format!("cannot construct Vortex array stream: {error}"),
+                    format!("cannot construct Vortex batch iterator: {error}"),
                 )
             })?;
-        self.runtime.block_on(stream.read_all()).map_err(|error| {
-            ingress_error(
-                BrokerFinancialTruthSemanticIngressErrorCodeV2::VortexReadFailed,
-                path.file_name().and_then(|name| name.to_str()),
-                format!("cannot materialize Vortex array: {error}"),
-            )
-        })
+        let mut decoded_rows = 0_usize;
+        for batch in batches {
+            let batch = batch.map_err(|error| {
+                ingress_error(
+                    BrokerFinancialTruthSemanticIngressErrorCodeV2::VortexReadFailed,
+                    Some(artifact.relative_path()),
+                    format!("cannot decode Vortex batch: {error}"),
+                )
+            })?;
+            let next_rows = decoded_rows
+                .checked_add(batch.len())
+                .filter(|rows| *rows <= expected_rows)
+                .ok_or_else(|| row_count_error(artifact, u64::MAX))?;
+            table.append(
+                decode_artifact_batch(artifact, &batch, decoded_rows)?,
+                artifact,
+            )?;
+            decoded_rows = next_rows;
+        }
+        if decoded_rows != expected_rows {
+            return Err(row_count_error(artifact, decoded_rows as u64));
+        }
+        Ok(table)
     }
+}
+
+fn row_count_error(
+    artifact: &ImmutableVortexArtifactV1,
+    actual_rows: u64,
+) -> BrokerFinancialTruthSemanticIngressErrorV2 {
+    ingress_error(
+        BrokerFinancialTruthSemanticIngressErrorCodeV2::ArtifactRowCountMismatch,
+        Some(artifact.relative_path()),
+        format!(
+            "manifest rows={} Vortex rows={actual_rows}",
+            artifact.row_count()
+        ),
+    )
 }
 
 enum ArtifactTableV2 {
@@ -393,6 +445,61 @@ enum ArtifactTableV2 {
     DecodedTicks(Vec<DecodedTickRowV2>),
     Evidence(Vec<EvidenceRowV2>),
     RawDealPages(Vec<RawDealPageRowV2>),
+}
+
+impl ArtifactTableV2 {
+    fn empty(
+        artifact: &ImmutableVortexArtifactV1,
+    ) -> Result<Self, BrokerFinancialTruthSemanticIngressErrorV2> {
+        match artifact.schema() {
+            BrokerFinancialTruthVortexSchemaV1::CTraderTickRequestPagesRawV2 => {
+                Ok(Self::RawTickPages(Vec::new()))
+            }
+            BrokerFinancialTruthVortexSchemaV1::CTraderTicksDecodedV2 => {
+                Ok(Self::DecodedTicks(Vec::new()))
+            }
+            BrokerFinancialTruthVortexSchemaV1::CTraderDealPagesRawV2 => {
+                Ok(Self::RawDealPages(Vec::new()))
+            }
+            schema if is_v2_evidence_schema(schema) => Ok(Self::Evidence(Vec::new())),
+            _ => Err(table_kind_error(artifact, "supported V2")),
+        }
+    }
+
+    fn reserve_exact(
+        &mut self,
+        rows: usize,
+        artifact: &ImmutableVortexArtifactV1,
+    ) -> Result<(), BrokerFinancialTruthSemanticIngressErrorV2> {
+        let result = match self {
+            Self::RawTickPages(values) => values.try_reserve_exact(rows),
+            Self::DecodedTicks(values) => values.try_reserve_exact(rows),
+            Self::Evidence(values) => values.try_reserve_exact(rows),
+            Self::RawDealPages(values) => values.try_reserve_exact(rows),
+        };
+        result.map_err(|error| {
+            ingress_error(
+                BrokerFinancialTruthSemanticIngressErrorCodeV2::AllocationRefused,
+                Some(artifact.relative_path()),
+                format!("cannot reserve decoded table for {rows} rows: {error}"),
+            )
+        })
+    }
+
+    fn append(
+        &mut self,
+        batch: Self,
+        artifact: &ImmutableVortexArtifactV1,
+    ) -> Result<(), BrokerFinancialTruthSemanticIngressErrorV2> {
+        match (self, batch) {
+            (Self::RawTickPages(rows), Self::RawTickPages(batch)) => rows.extend(batch),
+            (Self::DecodedTicks(rows), Self::DecodedTicks(batch)) => rows.extend(batch),
+            (Self::Evidence(rows), Self::Evidence(batch)) => rows.extend(batch),
+            (Self::RawDealPages(rows), Self::RawDealPages(batch)) => rows.extend(batch),
+            _ => return Err(table_kind_error(artifact, "consistent V2 batches")),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -543,21 +650,11 @@ const RAW_DEAL_FIELDS: [(&str, ColumnTypeV2); 15] = [
     ("raw_response_json", ColumnTypeV2::Utf8),
 ];
 
-fn decode_artifact_table(
+fn decode_artifact_batch(
     artifact: &ImmutableVortexArtifactV1,
     array: &ArrayRef,
+    row_offset: usize,
 ) -> Result<ArtifactTableV2, BrokerFinancialTruthSemanticIngressErrorV2> {
-    if array.len() as u64 != artifact.row_count() {
-        return Err(ingress_error(
-            BrokerFinancialTruthSemanticIngressErrorCodeV2::ArtifactRowCountMismatch,
-            Some(artifact.relative_path()),
-            format!(
-                "manifest rows={} Vortex rows={}",
-                artifact.row_count(),
-                array.len()
-            ),
-        ));
-    }
     match artifact.schema() {
         BrokerFinancialTruthVortexSchemaV1::CTraderTickRequestPagesRawV2 => {
             validate_dtype(artifact, array, &RAW_TICK_FIELDS)?;
@@ -580,7 +677,7 @@ fn decode_artifact_table(
         schema if is_v2_evidence_schema(schema) => {
             validate_dtype(artifact, array, &EVIDENCE_FIELDS)?;
             Ok(ArtifactTableV2::Evidence(decode_evidence_rows(
-                artifact, array,
+                artifact, array, row_offset,
             )?))
         }
         _ => Err(ingress_error(
@@ -772,6 +869,7 @@ fn decode_tick_rows(
 fn decode_evidence_rows(
     artifact: &ImmutableVortexArtifactV1,
     array: &ArrayRef,
+    row_offset: usize,
 ) -> Result<Vec<EvidenceRowV2>, BrokerFinancialTruthSemanticIngressErrorV2> {
     let sequence = u64_column(artifact, array, "sequence")?;
     let account_id = i64_column(artifact, array, "account_id")?;
@@ -788,7 +886,7 @@ fn decode_evidence_rows(
     let payload_json = utf8_column(artifact, array, "payload_json")?;
     let mut rows = Vec::with_capacity(array.len());
     for index in 0..array.len() {
-        if sequence[index] != index as u64
+        if sequence[index] != (row_offset + index) as u64
             || account_id[index] <= 0
             || evidence_kind[index] > 13
             || has_symbol_id[index] > 1
@@ -1461,14 +1559,16 @@ fn validate_quote_side(
     let pages = quote
         .request_chunks_newest_first()
         .iter()
-        .flat_map(|chunk| chunk.pages_newest_first())
-        .collect::<Vec<_>>();
-    if raw_rows.len() != pages.len() {
+        .flat_map(|chunk| chunk.pages_newest_first());
+    if raw_rows.len() != pages.clone().count() {
         return Err(raw_decoded_error(
             "raw quote-page rows do not equal exact manifest pages",
         ));
     }
-    let mut consumed_decoded = 0_usize;
+    // Manifest pages are newest-first; the decoded table is oldest-first.
+    // Consume one disjoint suffix per page, checking every row's exact source
+    // ordinal below. The old full-table filter per page was O(pages * ticks).
+    let mut remaining_decoded = decoded_rows.len();
     for (raw, page) in raw_rows.iter().zip(pages) {
         if raw.chunk_sequence != page.chunk_sequence()
             || raw.page_sequence_in_chunk != page.page_sequence_in_chunk()
@@ -1513,22 +1613,18 @@ fn validate_quote_side(
                 "raw cTrader tick envelope differs from retained page metadata",
             ));
         }
-        let page_decoded = decoded_rows
-            .iter()
-            .filter(|row| {
-                row.chunk_sequence == raw.chunk_sequence
-                    && row.page_sequence_in_chunk == raw.page_sequence_in_chunk
-            })
-            .collect::<Vec<_>>();
-        if page_decoded.len() != reconstructed.len() {
-            return Err(raw_decoded_error(
-                "decoded tick table count differs from re-decoded raw tick page",
-            ));
-        }
+        let page_start = remaining_decoded
+            .checked_sub(reconstructed.len())
+            .ok_or_else(|| {
+                raw_decoded_error("decoded tick table is shorter than its exact raw pages")
+            })?;
+        let page_decoded = &decoded_rows[page_start..remaining_decoded];
         for (row_index, (decoded, (timestamp, price))) in
-            page_decoded.into_iter().zip(reconstructed).enumerate()
+            page_decoded.iter().zip(reconstructed).enumerate()
         {
-            if decoded.row_sequence_in_page != row_index as u64
+            if decoded.chunk_sequence != raw.chunk_sequence
+                || decoded.page_sequence_in_chunk != raw.page_sequence_in_chunk
+                || decoded.row_sequence_in_page != row_index as u64
                 || decoded.account_id != account_id
                 || decoded.symbol_id != quote.symbol_id()
                 || decoded.quote_side != expected_side
@@ -1540,9 +1636,9 @@ fn validate_quote_side(
                 ));
             }
         }
-        consumed_decoded += reconstructed_len(raw.decoded_count)?;
+        remaining_decoded = page_start;
     }
-    if consumed_decoded != decoded_rows.len()
+    if remaining_decoded != 0
         || decoded_rows
             .windows(2)
             .any(|pair| pair[1].timestamp_ms <= pair[0].timestamp_ms)

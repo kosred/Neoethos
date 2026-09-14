@@ -336,195 +336,7 @@ pub fn cpu_threads_hint_for(_model_name: &str) -> usize {
     threads_per_model(cpu_threads_hint(), TRAINING_CONCURRENCY.current())
 }
 
-pub fn gpu_count() -> usize {
-    // The libtorch (`tch`) probe that used to sit here was removed 2026-08-09
-    // (batch D4) with the `tch` feature itself — no build ever enabled it, so
-    // this function has always fallen straight through to the env / nvidia-smi
-    // probe below. Nothing about the returned count changes.
-    fn parse_visible_devices(devices: &str) -> Option<usize> {
-        let trimmed = devices.trim();
-        if trimmed.is_empty() || trimmed == "-1" || trimmed.eq_ignore_ascii_case("void") {
-            return Some(0);
-        }
-        let count = trimmed
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != "-1")
-            .count();
-        (count > 0).then_some(count)
-    }
-
-    fn env_gpu_count(keys: &[&str]) -> Option<usize> {
-        for key in keys {
-            let Ok(devices) = env::var(key) else {
-                continue;
-            };
-            if let Some(count) = parse_visible_devices(&devices) {
-                return Some(count);
-            }
-        }
-        None
-    }
-
-    fn parse_nvidia_smi_output(stdout: &str) -> Option<usize> {
-        let count = stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .count();
-        Some(count)
-    }
-
-    /// GROUP H remediation (operator directive 2026-05-25): subprocess
-    /// timeout so a broken-NVML or zombie-rocm-smi cannot hang the
-    /// startup GPU probe forever. Spawns the subprocess on a separate
-    /// thread and waits up to `timeout`. If the subprocess hangs, the
-    /// main thread continues with `None` and the GPU probe falls back
-    /// to env-var detection or 0. The subprocess MAY continue running
-    /// in the background but the process is not blocked.
-    fn run_subprocess_with_timeout(
-        mut cmd: std::process::Command,
-        timeout: std::time::Duration,
-    ) -> Option<std::process::Output> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(cmd.output());
-        });
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(output)) => Some(output),
-            Ok(Err(err)) => {
-                tracing::debug!(
-                    target: "neoethos_models::tree_config",
-                    error = %err,
-                    "GPU-detect subprocess failed to spawn"
-                );
-                None
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "neoethos_models::tree_config",
-                    timeout_ms = timeout.as_millis() as u64,
-                    "GPU-detect subprocess timed out; treating as no-GPU"
-                );
-                None
-            }
-        }
-    }
-
-    /// Maximum time we wait for an external GPU-probe subprocess
-    /// (`nvidia-smi`, `rocminfo`, `rocm-smi`) before assuming the host
-    /// has no working accelerator. 2 seconds is generous — healthy
-    /// hosts answer in <100 ms.
-    const GPU_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-    fn nvidia_smi_gpu_count() -> Option<usize> {
-        let mut cmd = Command::new("nvidia-smi");
-        cmd.args(["--query-gpu=name", "--format=csv,noheader"]);
-        let output = run_subprocess_with_timeout(cmd, GPU_PROBE_TIMEOUT)?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8(output.stdout).ok()?;
-        parse_nvidia_smi_output(&stdout)
-    }
-
-    fn parse_rocm_output(stdout: &str) -> Option<usize> {
-        let gfx_count = stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| {
-                let lower = line.to_ascii_lowercase();
-                lower.contains("gfx")
-                    || lower.starts_with("gpu[")
-                    || lower.starts_with("card series")
-            })
-            .count();
-        (gfx_count > 0).then_some(gfx_count)
-    }
-
-    fn rocm_gpu_count() -> Option<usize> {
-        let rocminfo = run_subprocess_with_timeout(Command::new("rocminfo"), GPU_PROBE_TIMEOUT);
-        if let Some(output) = rocminfo
-            && output.status.success()
-            && let Ok(stdout) = String::from_utf8(output.stdout)
-            && let Some(count) = parse_rocm_output(&stdout)
-        {
-            return Some(count);
-        }
-
-        let mut rocm_smi_cmd = Command::new("rocm-smi");
-        rocm_smi_cmd.arg("--showproductname");
-        let rocm_smi = run_subprocess_with_timeout(rocm_smi_cmd, GPU_PROBE_TIMEOUT);
-        if let Some(output) = rocm_smi
-            && output.status.success()
-            && let Ok(stdout) = String::from_utf8(output.stdout)
-            && let Some(count) = parse_rocm_output(&stdout)
-        {
-            return Some(count);
-        }
-        None
-    }
-
-    // ⚠ THESE SIX ARE NOT OUR CONFIGURATION AND ARE DELIBERATELY KEPT.
-    //
-    // `CUDA_VISIBLE_DEVICES` and its vendor siblings are read by the NVIDIA /
-    // ROCm drivers themselves: when one is set, the masked cards do not exist
-    // as far as any CUDA context in this process is concerned. Reading them is
-    // OBSERVING THE HARDWARE as the driver presents it, not reading a setting
-    // out of the environment. Ignoring them would make this function report
-    // cards the runtime cannot open — a config file cannot overrule a driver
-    // mask. They are therefore not in `RETIRED_ENV_VARS` and must not be.
-    let masked = env_gpu_count(&[
-        "GPU_VISIBLE_DEVICES",
-        "CUDA_VISIBLE_DEVICES",
-        "NVIDIA_VISIBLE_DEVICES",
-        "HIP_VISIBLE_DEVICES",
-        "ROCR_VISIBLE_DEVICES",
-        "ROCM_VISIBLE_DEVICES",
-    ]);
-    // Explicit config count (`models.tree_runtime.gpu_count`, was the
-    // `FOREX_GPU_COUNT` env var).
-    let configured = current_tree_runtime().gpu_count;
-
-    match (masked, configured) {
-        // Both answered and they disagree: the SAFER (smaller) number binds
-        // and the disagreement is logged with both values. Taking the larger
-        // would either open a card the driver has masked away or oversubscribe
-        // one the operator asked to leave alone.
-        (Some(mask_count), Some(config_count)) if mask_count != config_count => {
-            let effective = mask_count.min(config_count);
-            tracing::warn!(
-                target: "neoethos_models::tree_config",
-                driver_visible_devices = mask_count,
-                configured_gpu_count = config_count,
-                effective = effective,
-                "GPU count disagreement: a *_VISIBLE_DEVICES driver mask reports \
-                 {mask_count} card(s) while models.tree_runtime.gpu_count says \
-                 {config_count}; the safer (smaller) value {effective} binds"
-            );
-            return effective;
-        }
-        (Some(count), _) => return count,
-        (None, Some(count)) => return count,
-        (None, None) => {}
-    }
-
-    if let Some(count) = nvidia_smi_gpu_count() {
-        return count;
-    }
-
-    if let Some(count) = rocm_gpu_count() {
-        return count;
-    }
-
-    0
-}
-
 /// Count only NVIDIA devices visible to CUDA.
-///
-/// The general [`gpu_count`] intentionally recognises ROCm for cross-vendor
-/// model backends. CUDA model routing must not use that answer: an AMD card is
-/// not evidence that CubeCL/Candle/XGBoost CUDA can initialize.
 pub fn nvidia_gpu_count() -> usize {
     fn parse_visible_devices(devices: &str) -> Option<usize> {
         let trimmed = devices.trim();
@@ -546,13 +358,13 @@ pub fn nvidia_gpu_count() -> usize {
         Some(count)
     }
 
-    for key in ["CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"] {
-        if let Ok(devices) = env::var(key)
-            && let Some(count) = parse_visible_devices(&devices)
-        {
-            return count;
-        }
-    }
+    let driver_mask = ["CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"]
+        .into_iter()
+        .find_map(|key| {
+            env::var(key)
+                .ok()
+                .and_then(|value| parse_visible_devices(&value))
+        });
 
     const NVIDIA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     let mut command = Command::new("nvidia-smi");
@@ -561,20 +373,24 @@ pub fn nvidia_gpu_count() -> usize {
     std::thread::spawn(move || {
         let _ = sender.send(command.output());
     });
-    let Ok(Ok(output)) = receiver.recv_timeout(NVIDIA_PROBE_TIMEOUT) else {
-        return 0;
+    let detected = match receiver.recv_timeout(NVIDIA_PROBE_TIMEOUT) {
+        Ok(Ok(output)) if output.status.success() => String::from_utf8(output.stdout)
+            .map(|stdout| {
+                stdout
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .count()
+            })
+            .unwrap_or(0),
+        _ => 0,
     };
-    if !output.status.success() {
-        return 0;
-    }
-    let Ok(stdout) = String::from_utf8(output.stdout) else {
-        return 0;
-    };
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .count()
+    let driver_visible = driver_mask.map_or(detected, |masked| masked.min(detected));
+    current_tree_runtime()
+        .gpu_count
+        .map_or(driver_visible, |configured_cap| {
+            configured_cap.min(driver_visible)
+        })
 }
 
 pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) -> (usize, f64) {

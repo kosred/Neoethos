@@ -7,10 +7,15 @@ build = "build.rs"
 
 [features]
 default = []
-resident-search-slice2-host-contract = []
-resident-search-slice2-compile-contract = []
 cuda = ["dep:cust", "dep:vector-ta"]
 cuda-device-fixtures = ["cuda"]
+# Real AMD HIP ownership API only. Does not enable CUDA or claim HIP Search.
+hip-runtime = []
+hip-session-kernels = ["hip-runtime"]
+# The existing native TU set, translated by official HIPIFY and compiled as
+# AMD HIP. Explicit HIP adapters remain separate from CUDA-only Rust APIs.
+hip-native-kernels = ["hip-session-kernels"]
+hip-device-fixtures = ["hip-native-kernels"]
 
 [dependencies]
 cust = { version = "0.3.2", optional = true }
@@ -28,3 +33,8 @@ sha2.workspace = true
 [dev-dependencies]
 cc = "1.2"
 sha2.workspace = true
+
+[[example]]
+name = "hip_runtime_probe"
+path = "examples/hip_runtime_probe.rs"
+required-features = ["hip-runtime"]

@@ -90,8 +90,15 @@ fn cpu_decode_consumes_the_pin_and_requires_the_sealed_zero_gpu_authority() {
         &[
             "materialize_pinned_canonical_timeframe_v1",
             "generation.lease",
+            "into_full_parts",
         ],
     );
+    for duplicate in ["ohlcv().clone()", "artifact().clone()"] {
+        assert!(
+            !materialize.contains(duplicate),
+            "pinned decode must move its owned frame: {duplicate}"
+        );
+    }
     let canonical = read("src/core/canonical_ohlcv.rs");
     let reopen = section(
         &canonical,
@@ -127,9 +134,10 @@ fn app_moves_one_pin_only_inside_the_selected_prepared_factory() {
     );
     let worker = section(
         &app,
-        "let feature_handle = tokio::task::spawn_blocking",
-        "\n        });",
+        "let feature_handle = spawn_discovery_cpu_stage",
+        "\n        );",
     );
+    require_all(worker, &["Arc::clone(&execution)", "feature_cpu"]);
     let dispatch = worker
         .find("prepare_canonical_discovery_run_input_v3")
         .expect("prepared dispatcher");
@@ -143,49 +151,31 @@ fn app_moves_one_pin_only_inside_the_selected_prepared_factory() {
 }
 
 #[test]
-fn cli_pins_exact_leases_before_dispatch_and_never_reopens_from_a_receipt() {
+fn cli_discovery_pins_exact_leases_before_dispatch_and_never_reopens_from_a_receipt() {
     let cli = sibling("neoethos-cli", "src/main.rs");
-    let full = sibling("neoethos-cli", "src/canonical_full_run.rs");
     let discover = section(
         &cli,
         "fn cmd_discover(args: &[String])",
         "\nfn cmd_batch_discover",
     );
-    let full_run = section(
-        &full,
-        "pub fn run(args: &[String], settings: &neoethos_core::Settings)",
-        "\n#[cfg(not(feature = \"gpu-nvidia-full\"))]",
+    let pin_token = "let mut pinned_selection = pin_direct_timeframe_selection";
+    require_all(
+        discover,
+        &[
+            "prepare_canonical_discovery_run_input_v3",
+            "into_cpu_dataset_after_no_physical_gpu_v1",
+            pin_token,
+        ],
     );
-    for (label, source, pin_token) in [
-        (
-            "discover",
-            discover,
-            "let mut pinned_selection = pin_direct_timeframe_selection",
-        ),
-        (
-            "full",
-            full_run,
-            "let pinned_series = pin_exact_canonical_series_v1",
-        ),
-    ] {
-        require_all(
-            source,
-            &[
-                "prepare_canonical_discovery_run_input_v3",
-                "into_cpu_dataset_after_no_physical_gpu_v1",
-                pin_token,
-            ],
-        );
-        let pin = source.find(pin_token).unwrap();
-        let dispatch = source
-            .find("prepare_canonical_discovery_run_input_v3")
-            .unwrap();
-        assert!(pin < dispatch, "{label} must pin before device admission");
-        assert!(
-            !source.contains("CanonicalSearchInput::from_exact_series_receipt"),
-            "{label} may not detach the receipt and reopen values"
-        );
-    }
+    let pin = discover.find(pin_token).unwrap();
+    let dispatch = discover
+        .find("prepare_canonical_discovery_run_input_v3")
+        .unwrap();
+    assert!(pin < dispatch, "Discovery must pin before device admission");
+    assert!(
+        !discover.contains("CanonicalSearchInput::from_exact_series_receipt"),
+        "Discovery may not detach the receipt and reopen values"
+    );
 }
 
 #[test]

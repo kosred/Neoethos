@@ -2920,7 +2920,10 @@ fn build_validation_windows(
     horizon: usize,
 ) -> Vec<(Vec<f32>, Vec<f64>, Vec<f32>)> {
     let validation_window = horizon.max(8).min(values.len() / 6).max(4);
-    let min_training_rows = horizon.max(16).max(validation_window * 2);
+    // Every fold must satisfy the same minimum as build_training_series and
+    // exact_training_series_from_frame. Short input previously produced, e.g.,
+    // a 22-row fold which the real forecaster immediately rejected.
+    let min_training_rows = horizon.max(32).max(validation_window * 2);
     if values.len() <= min_training_rows + validation_window {
         return Vec::new();
     }
@@ -2952,12 +2955,10 @@ fn exact_training_series_from_frame(frame: &FeatureFrame) -> Result<(Vec<f32>, V
         "swarm forecaster requires at least 32 exact quant_close rows; got {}",
         frame.n_samples()
     );
-    let column_index = frame
-        .names
-        .iter()
-        .position(|name| name == SWARM_PRICE_COLUMN)
-        .context("swarm forecaster training requires exact `quant_close`")?;
-    let column = frame.feature_column(column_index)?;
+    let column_name = frame.model_base_feature_name(SWARM_PRICE_COLUMN)?;
+    // Swarm predicts prices, not normalized scores. Resolve the exact base
+    // timeframe alias and follow preserved raw lineage through model views.
+    let column = frame.raw_model_column(&column_name)?;
     anyhow::ensure!(
         column.len() == frame.timestamps.len(),
         "swarm quant_close/timestamp mismatch: {} values vs {} timestamps",

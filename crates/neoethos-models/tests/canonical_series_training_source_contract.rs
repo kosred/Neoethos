@@ -108,11 +108,18 @@ fn training_has_a_receipt_bound_entrypoint_and_shared_dataset_execution_body() {
     }
 
     let shared = function_body(&source, "fn train_dataset_with_progress<R>(");
-    assert!(
-        shared.contains("prepare_multitimeframe_features_with_options")
-            && shared.contains("train_models_parallel_with_progress"),
-        "the exact-series entry does not converge on the real full training pipeline"
-    );
+    for required in [
+        "prepare_multitimeframe_features_raw_with_options",
+        "raw_model_frame.fit_normalization(training_rows, true, &training_feature_control())",
+        "raw_model_frame.with_fitted_normalization(&fit)?",
+        "raw_frame: raw_model_frame",
+        "train_models_parallel_with_progress",
+    ] {
+        assert!(
+            shared.contains(required),
+            "the exact-series entry must use the shared raw-once, model-owned fit and full training pipeline: missing `{required}`"
+        );
+    }
 }
 
 #[test]
@@ -253,7 +260,6 @@ fn full_nvidia_training_refuses_the_explicit_cpu_bayes_boundary_until_its_gpu_ro
 
     let config = read("config.yaml");
     for required in [
-        "  enable_gpu: true",
         "  enable_gpu_preference: gpu",
         "  device: gpu:0",
         "  statistical_device: gpu:0",
@@ -312,83 +318,6 @@ fn burn_exit_and_sac_training_consume_the_exact_planned_device_policy() {
 }
 
 #[test]
-fn full_run_preflights_the_complete_training_dispatch_on_exact_cuda_zero() {
-    let models = read("crates/neoethos-models/src/training_orchestrator.rs");
-    let preflight = function_body(&models, "pub fn preflight_full_nvidia_cuda_training(");
-
-    for required in [
-        "self.create_dispatch_plan()?",
-        "self.validate_dispatch_plan(&dispatch_plan)?",
-        "self.build_training_configs_with_hardware_plan(&dispatch_plan, &hardware_plan)?",
-        "DEFAULT_BOOTSTRAP_EXPERT_NAMES",
-        "canonical_model_name(&config.name)",
-        ".difference(&planned_canonical)",
-        ".difference(&required_voters)",
-        "missing_voters.is_empty()",
-        "unconsumed_models.is_empty()",
-        "self.hardware_execution_plan()",
-        "AcceleratorBackend::Cuda",
-        "WorkloadKind::StrategySearch",
-        "WorkloadKind::TreeTraining",
-        "WorkloadKind::DeepTraining",
-        "WorkloadKind::RlTraining",
-        "self.validate_nvidia_model_config_v1(&config)?",
-    ] {
-        assert!(
-            preflight.contains(required),
-            "full NVIDIA training preflight is missing `{required}`"
-        );
-    }
-
-    let strict_model = function_body(&models, "fn validate_nvidia_model_config_v1(");
-    for required in [
-        "supports_nvidia_cuda_for_model",
-        "full_nvidia_device_policy_for_config",
-        "CudaDevicePolicy::Gpu { ordinal: 0 }",
-    ] {
-        assert!(
-            strict_model.contains(required),
-            "strict full-GPU model authority is missing `{required}`"
-        );
-    }
-
-    let cpu_pin = function_body(&models, "fn pin_cpu_only_model_device(");
-    for required in [
-        "model_requires_cuda_in_full_nvidia_run",
-        "\"device\"",
-        "\"cpu\"",
-        "\"__planned_backend\"",
-        "\"__planned_device\"",
-    ] {
-        assert!(
-            cpu_pin.contains(required),
-            "CPU-only model planning is not explicit about `{required}`"
-        );
-    }
-
-    let cli = read("crates/neoethos-cli/src/canonical_full_run.rs");
-    let run = function_body(&cli, "pub fn run(");
-    let preflight_at = run
-        .find("preflight_full_nvidia_cuda_training")
-        .expect("canonical full run must preflight training");
-    let evidence_at = run
-        .find("store.open_plan")
-        .expect("canonical full run must open its plan");
-    let search_at = [
-        "run_prepared_canonical_trendbar_research_with_cpu_training_handoff_v3",
-        "run_canonical_trendbar_gpu_only_compact_v1",
-    ]
-    .into_iter()
-    .filter_map(|entrypoint| run.find(entrypoint))
-    .min()
-    .expect("canonical full run must execute its prepared discovery entrypoint");
-    assert!(
-        preflight_at < evidence_at && preflight_at < search_at,
-        "training dispatch/device failures must be detected before evidence loading and expensive search"
-    );
-}
-
-#[test]
 fn sac_enablement_does_not_auto_train_the_unconsumed_exit_agent() {
     let models = read("crates/neoethos-models/src/training_orchestrator.rs");
     let dispatch = function_body(&models, "fn create_dispatch_plan(&self)");
@@ -429,7 +358,7 @@ fn property_search_does_not_auto_train_a_second_unconsumed_genetic_expert() {
     );
     assert!(
         !dispatch.contains("requested_models.push(\"genetic\".to_string())"),
-        "prop_search_enabled still auto-trains a genetic model artifact that no production loader consumes"
+        "property-search configuration still auto-trains a genetic model artifact that no production loader consumes"
     );
 
     let bootstrap = read("crates/neoethos-models/src/ensemble_inference/bootstrap.rs");
@@ -448,15 +377,79 @@ fn exact_training_normalization_is_fit_only_to_the_purged_pre_holdout_rows() {
         "oos_training_boundary",
         "normalization_training_rows",
         "drop_columns_without_normalization_training_support: true",
-        "0..keep",
-        "label_horizon_bars",
-        "t < cutoff",
+        "final_model_training_rows_v1(",
+        "oos_training_boundary.map(|(_, _, _, keep)| keep)",
+        "purged_training_prefix_v1(timestamps, cutoff, &self.settings)",
+        "raw_model_frame.fit_normalization(training_rows, true, &training_feature_control())",
+        "raw_model_frame.with_fitted_normalization(&fit)?",
+        "frame.row_window(0, keep)?",
+        "labels.truncate(keep)",
+        "source_row_indices.truncate(keep)",
     ] {
         assert!(
             shared.contains(required),
             "exact training normalization boundary is missing `{required}`"
         );
     }
+    let compact_shared = shared.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        compact_shared.contains(
+            "normalization_training_rows: Some(final_model_training_rows_v1( base_ohlcv.len(), oos_training_boundary.map(|(_, _, _, keep)| keep), )?)"
+        ) && compact_shared.contains(
+            "let training_rows = opts .normalization_training_rows .clone() .context(\"model normalization requires an explicit final training row range\")?"
+        ),
+        "the exact purged prefix must feed the model fit through its saved recipe without a replacement range"
+    );
+    let final_rows = function_body(&source, "fn final_model_training_rows_v1(");
+    for required in [
+        "let end = purged_rows.unwrap_or(total_rows)",
+        "end > 0 && end <= total_rows",
+        "Ok(0..end)",
+    ] {
+        assert!(
+            final_rows.contains(required),
+            "the final fit range must remain exactly 0..purged_rows with an explicit full deployment-refit fallback: missing `{required}`"
+        );
+    }
+
+    let prefix = function_body(&source, "fn purged_training_prefix_v1(");
+    for required in [
+        ".take_while(|&&timestamp| timestamp < cutoff)",
+        "let purge = effective_label_horizon_bars_v1(settings)",
+        "in_sample.saturating_sub(purge)",
+    ] {
+        assert!(
+            prefix.contains(required),
+            "shared training prefix must use the strict cutoff and effective label purge: missing `{required}`"
+        );
+    }
+    let horizon = function_body(&source, "pub(crate) fn effective_label_horizon_bars_v1(");
+    let horizon = horizon.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        horizon.contains(
+            "if settings.models.label_horizon_bars > 0 { settings.models.label_horizon_bars } else { settings.risk.meta_label_max_hold_bars.max(1) }"
+        ),
+        "configured-zero label horizons must retain the positive holding-period fallback used by training and labels"
+    );
+    let ordered_stages = [
+        "purged_training_prefix_v1(",
+        "final_model_training_rows_v1(",
+        "prepare_multitimeframe_features_raw_with_options(",
+        "raw_model_frame.fit_normalization(",
+        "raw_model_frame.with_fitted_normalization(&fit)?",
+        "frame.row_window(0, keep)?",
+        "project_dense_training_suffix(&frame)?",
+        "train_models_parallel_with_progress(",
+    ]
+    .map(|stage| {
+        shared
+            .find(stage)
+            .unwrap_or_else(|| panic!("training must contain stage `{stage}`"))
+    });
+    assert!(
+        ordered_stages.windows(2).all(|pair| pair[0] < pair[1]),
+        "resolve the purged fit boundary before raw production, fit before transform, and lock the training prefix before projection and dispatch"
+    );
 }
 
 #[test]

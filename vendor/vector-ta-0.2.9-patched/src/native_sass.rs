@@ -17,13 +17,6 @@ impl ArchRequestSource {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct NativeArchInputs<'a> {
-    pub(crate) explicit_archs: Option<&'a str>,
-    pub(crate) detected_archs: &'a [u32],
-    pub(crate) nvcc_supported_archs: &'a [u32],
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeArchPlan {
     pub(crate) source: ArchRequestSource,
@@ -61,16 +54,6 @@ pub(crate) struct VerifiedNativeCubin {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum NativeSassError {
-    InvalidArchitecture {
-        value: String,
-    },
-    NoTargetArchitectures,
-    NvccArchitecturesUnavailable,
-    UnsupportedArchitectures {
-        requested: Vec<u32>,
-        supported: Vec<u32>,
-        missing: Vec<u32>,
-    },
     DuplicateArtifact {
         stem: String,
         arch: u32,
@@ -121,25 +104,6 @@ pub(crate) enum NativeSassError {
 impl fmt::Display for NativeSassError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidArchitecture { value } => {
-                write!(f, "invalid CUDA architecture {value:?}")
-            }
-            Self::NoTargetArchitectures => write!(
-                f,
-                "no CUDA architecture was selected: set CUDA_ARCHS or build on a host with a visible NVIDIA device"
-            ),
-            Self::NvccArchitecturesUnavailable => write!(
-                f,
-                "nvcc did not report any supported GPU architectures; exact native-SASS support cannot be proven"
-            ),
-            Self::UnsupportedArchitectures {
-                requested,
-                supported,
-                missing,
-            } => write!(
-                f,
-                "requested CUDA architectures {requested:?}, but nvcc supports {supported:?}; missing exact SASS targets {missing:?}"
-            ),
             Self::DuplicateArtifact { stem, arch } => {
                 write!(f, "duplicate native cubin for {stem} sm_{arch}")
             }
@@ -191,109 +155,6 @@ impl fmt::Display for NativeSassError {
 }
 
 impl std::error::Error for NativeSassError {}
-
-fn parse_architecture(value: &str) -> Result<u32, NativeSassError> {
-    let trimmed = value.trim();
-    let unprefixed = trimmed
-        .strip_prefix("sm_")
-        .or_else(|| trimmed.strip_prefix("compute_"))
-        .unwrap_or(trimmed);
-
-    let arch = if let Some((major, minor)) = unprefixed.split_once('.') {
-        let major = major
-            .parse::<u32>()
-            .map_err(|_| NativeSassError::InvalidArchitecture {
-                value: value.to_owned(),
-            })?;
-        let minor = minor
-            .parse::<u32>()
-            .map_err(|_| NativeSassError::InvalidArchitecture {
-                value: value.to_owned(),
-            })?;
-        if minor > 9 {
-            return Err(NativeSassError::InvalidArchitecture {
-                value: value.to_owned(),
-            });
-        }
-        major
-            .checked_mul(10)
-            .and_then(|base| base.checked_add(minor))
-            .ok_or_else(|| NativeSassError::InvalidArchitecture {
-                value: value.to_owned(),
-            })?
-    } else {
-        unprefixed
-            .parse::<u32>()
-            .map_err(|_| NativeSassError::InvalidArchitecture {
-                value: value.to_owned(),
-            })?
-    };
-
-    if arch < 10 {
-        return Err(NativeSassError::InvalidArchitecture {
-            value: value.to_owned(),
-        });
-    }
-    Ok(arch)
-}
-
-fn parse_architecture_list(value: &str) -> Result<Vec<u32>, NativeSassError> {
-    let tokens: Vec<&str> = value
-        .split(|character: char| character == ',' || character.is_ascii_whitespace())
-        .filter(|token| !token.is_empty())
-        .collect();
-    if tokens.is_empty() {
-        return Err(NativeSassError::InvalidArchitecture {
-            value: value.to_owned(),
-        });
-    }
-    tokens.into_iter().map(parse_architecture).collect()
-}
-
-pub(crate) fn plan_native_architectures(
-    inputs: NativeArchInputs<'_>,
-) -> Result<NativeArchPlan, NativeSassError> {
-    let (mut requested, source) = if let Some(explicit) = inputs.explicit_archs {
-        (
-            parse_architecture_list(explicit)?,
-            ArchRequestSource::ExplicitList,
-        )
-    } else if inputs.detected_archs.is_empty() {
-        return Err(NativeSassError::NoTargetArchitectures);
-    } else {
-        (
-            inputs.detected_archs.to_vec(),
-            ArchRequestSource::DetectedVisibleDevices,
-        )
-    };
-
-    requested.sort_unstable();
-    requested.dedup();
-    if inputs.nvcc_supported_archs.is_empty() {
-        return Err(NativeSassError::NvccArchitecturesUnavailable);
-    }
-
-    let mut supported = inputs.nvcc_supported_archs.to_vec();
-    supported.sort_unstable();
-    supported.dedup();
-    let missing: Vec<u32> = requested
-        .iter()
-        .copied()
-        .filter(|arch| !supported.contains(arch))
-        .collect();
-    if !missing.is_empty() {
-        return Err(NativeSassError::UnsupportedArchitectures {
-            requested,
-            supported,
-            missing,
-        });
-    }
-
-    Ok(NativeArchPlan {
-        source,
-        architectures: requested,
-    })
-}
 
 pub(crate) fn native_cubin_filename(stem: &str, arch: u32) -> String {
     format!("{stem}_sm{arch}.cubin")
@@ -423,19 +284,21 @@ pub(crate) fn verify_native_cubin(
 }
 
 fn list_ptx_proves_absence(artifact_path: &Path, stdout: &str, stderr: &str) -> bool {
-    if stdout.is_empty() && stderr.is_empty() {
-        return true;
-    }
-    if !stdout.is_empty() {
-        return false;
-    }
+    // CUDA versions emit this informational line on either stream. Accept
+    // exactly one complete, path-bound diagnostic, never mixed output or PTX.
+    let output = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => return true,
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => return false,
+    };
 
-    let diagnostic = if let Some(line) = stderr.strip_suffix("\r\n") {
+    let diagnostic = if let Some(line) = output.strip_suffix("\r\n") {
         line
-    } else if let Some(line) = stderr.strip_suffix('\n') {
+    } else if let Some(line) = output.strip_suffix('\n') {
         line
     } else {
-        stderr
+        output
     };
     if diagnostic.contains('\r') || diagnostic.contains('\n') {
         return false;
@@ -502,5 +365,151 @@ pub(crate) fn select_exact_native_cubin<'a>(
             stem: stem.to_owned(),
             arch: requested,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ELF: &[u8] = b"\x7fELFsynthetic-parser-fixture";
+
+    fn report<'a>(stdout: &'a str, stderr: &'a str) -> CuobjdumpReport<'a> {
+        CuobjdumpReport {
+            list_ptx_succeeded: true,
+            list_ptx_stdout: stdout,
+            list_ptx_stderr: stderr,
+            dump_sass_succeeded: true,
+            dump_sass_stdout: "code for sm_86\n",
+            dump_sass_stderr: "",
+        }
+    }
+
+    fn no_ptx_message(path: &Path) -> String {
+        format!(
+            "cuobjdump info    : No PTX file found to extract from '{}'. You may try with -all option.",
+            path.display()
+        )
+    }
+
+    #[test]
+    fn no_ptx_listing_accepts_empty_successful_inspection() {
+        assert_eq!(
+            verify_native_cubin(86, Path::new("native.cubin"), ELF, report("", "")),
+            Ok(VerifiedNativeCubin {
+                arch: 86,
+                byte_len: ELF.len()
+            })
+        );
+    }
+
+    #[test]
+    fn no_ptx_listing_accepts_exact_info_on_either_stream() {
+        for path in [
+            Path::new(r"C:\CUDA artifact directory\exact_sm86.cubin"),
+            Path::new("/tmp/CUDA artifact directory/exact_sm86.cubin"),
+        ] {
+            for ending in ["", "\n", "\r\n"] {
+                let message = no_ptx_message(path) + ending;
+                for inspection in [report(&message, ""), report("", &message)] {
+                    assert!(verify_native_cubin(86, path, ELF, inspection).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_ptx_listing_rejects_payload_unknown_and_mixed_streams() {
+        let path = Path::new("native.cubin");
+        let message = no_ptx_message(path);
+        for payload in [
+            "PTX file    1: native.sm_86.ptx\n",
+            ".version 8.0\n.target sm_86\n",
+            "unknown tool output",
+            " ",
+        ] {
+            let mixed = format!("{message}\n{payload}");
+            for inspection in [
+                report(payload, ""),
+                report("", payload),
+                report(&mixed, ""),
+                report("", &mixed),
+                report(&message, payload),
+                report(payload, &message),
+            ] {
+                assert!(matches!(
+                    verify_native_cubin(86, path, ELF, inspection),
+                    Err(NativeSassError::EmbeddedPtx { .. })
+                ));
+            }
+        }
+        assert!(matches!(
+            verify_native_cubin(86, path, ELF, report(&message, &message)),
+            Err(NativeSassError::EmbeddedPtx { .. })
+        ));
+    }
+
+    #[test]
+    fn no_ptx_listing_rejects_rebound_malformed_and_injected_paths() {
+        let path = Path::new("native.cubin");
+        let message = no_ptx_message(path);
+        for malformed in [
+            no_ptx_message(Path::new("different.cubin")),
+            message.replace("info    :", "info :"),
+            message.replace("'native.cubin'", "native.cubin"),
+            format!("{message} extra"),
+            format!("\n{message}"),
+            format!("{message}\n\n"),
+            format!("{message}\r"),
+            format!("{message}\n{message}"),
+        ] {
+            for inspection in [report(&malformed, ""), report("", &malformed)] {
+                assert!(matches!(
+                    verify_native_cubin(86, path, ELF, inspection),
+                    Err(NativeSassError::EmbeddedPtx { .. })
+                ));
+            }
+        }
+        for injected in [Path::new("native\n.cubin"), Path::new("native\r.cubin")] {
+            let message = no_ptx_message(injected);
+            assert!(matches!(
+                verify_native_cubin(86, injected, ELF, report(&message, "")),
+                Err(NativeSassError::EmbeddedPtx { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn no_ptx_listing_does_not_override_tool_or_sass_failure() {
+        let path = Path::new("native.cubin");
+        let message = no_ptx_message(path);
+        let mut inspection = report(&message, "");
+        inspection.list_ptx_succeeded = false;
+        assert!(matches!(
+            verify_native_cubin(86, path, ELF, inspection),
+            Err(NativeSassError::CuobjdumpInspectionFailed {
+                operation: "--list-ptx",
+                ..
+            })
+        ));
+        inspection = report(&message, "");
+        inspection.dump_sass_succeeded = false;
+        assert!(matches!(
+            verify_native_cubin(86, path, ELF, inspection),
+            Err(NativeSassError::CuobjdumpInspectionFailed {
+                operation: "--dump-sass",
+                ..
+            })
+        ));
+        inspection = report(&message, "");
+        inspection.dump_sass_stdout = "code for sm_89\n";
+        assert!(matches!(
+            verify_native_cubin(86, path, ELF, inspection),
+            Err(NativeSassError::WrongSassArchitecture { .. })
+        ));
+        assert!(matches!(
+            verify_native_cubin(86, path, b".version 8.0", report(&message, "")),
+            Err(NativeSassError::NotElfCubin { .. })
+        ));
     }
 }

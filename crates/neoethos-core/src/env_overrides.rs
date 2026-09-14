@@ -304,15 +304,15 @@ pub const RETIRED_ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "NEOETHOS_BOT_ROCM_PRECISIONS",
-        "system.hardware.rocm_precisions in the config file",
+        "NOTHING — ROCm/HIP is future work and has no active runtime/config surface",
     ),
     (
         "NEOETHOS_BOT_WGPU_PRECISIONS",
-        "system.hardware.wgpu_precisions in the config file",
+        "NOTHING — the Vulkan/WGPU runtime was retired",
     ),
     (
         "NEOETHOS_BOT_WGPU_DEVICES",
-        "system.hardware.wgpu_device_names in the config file",
+        "NOTHING — Vulkan/WGPU adapter selection was retired",
     ),
 ];
 

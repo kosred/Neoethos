@@ -26,15 +26,15 @@ use crate::runtime::artifacts::TrainingSummaryMetadata;
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
-use super::common::build_tree_runtime_predictions;
 #[cfg(feature = "catboost")]
 use super::common::{
     CATBOOST_MODEL_FILE_NAME, atomic_write, calibrate_three_class_probabilities,
-    default_training_summary, ensure_feature_columns_match, feature_frame_to_tree_f32_row_major,
+    ensure_feature_columns_match, feature_frame_to_tree_f32_row_major,
     normalize_three_class_probabilities, read_runtime_metadata, read_tree_json_artifact,
-    remap_labels_to_tree_targets, tree_artifact_paths, tree_runtime_metadata,
-    write_runtime_metadata, write_tree_json_artifact,
+    remap_labels_to_tree_targets, required_tree_training_summary, tree_artifact_paths,
+    tree_runtime_metadata, write_runtime_metadata, write_tree_json_artifact,
 };
+use super::common::{build_tree_runtime_predictions, validate_tree_training_summary};
 use super::config::*;
 
 #[cfg(feature = "catboost")]
@@ -210,14 +210,7 @@ fn validate_runtime_artifact(
             artifact.feature_columns.len()
         );
     }
-    if artifact.training_summary.dataset_rows == 0 {
-        bail!("CatBoost runtime artifact requires non-zero dataset_rows");
-    }
-    if artifact.training_summary.dataset_rows
-        != artifact.training_summary.train_rows + artifact.training_summary.val_rows
-    {
-        bail!("CatBoost runtime artifact training summary is inconsistent");
-    }
+    validate_tree_training_summary(&artifact.training_summary, "CatBoost runtime artifact")?;
     if artifact.iterations < 1 {
         bail!(
             "CatBoost runtime artifact has invalid iteration count {}",
@@ -387,7 +380,7 @@ impl CatBoostExpert {
             "loss_function".into(),
             ParamValue::String("MultiClass".into()),
         );
-        params.insert("use_best_model".into(), ParamValue::Bool(false));
+        params.insert("use_best_model".into(), ParamValue::Bool(true));
         params
     }
 
@@ -402,10 +395,8 @@ impl CatBoostExpert {
     }
 
     #[cfg(feature = "catboost")]
-    fn stored_training_summary(&self) -> TrainingSummaryMetadata {
-        self.training_summary
-            .clone()
-            .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
+    fn stored_training_summary(&self) -> Result<TrainingSummaryMetadata> {
+        required_tree_training_summary(self.training_summary.as_ref(), "CatBoost")
     }
 
     fn ensure_runtime_state_ready(&self) -> Result<()> {
@@ -416,17 +407,7 @@ impl CatBoostExpert {
             .training_summary
             .as_ref()
             .context("CatBoost runtime state is missing training summary metadata")?;
-        if summary.dataset_rows == 0 {
-            bail!("CatBoost runtime state has zero dataset_rows in training summary");
-        }
-        if summary.dataset_rows != summary.train_rows + summary.val_rows {
-            bail!(
-                "CatBoost runtime state has inconsistent training summary: dataset_rows={} train_rows={} val_rows={}",
-                summary.dataset_rows,
-                summary.train_rows,
-                summary.val_rows
-            );
-        }
+        validate_tree_training_summary(summary, "CatBoost runtime state")?;
         if self.model.is_none() {
             bail!("CatBoost runtime state is missing its native model");
         }
@@ -474,14 +455,17 @@ impl CatBoostExpert {
         visible_nvidia_devices: usize,
         model_dimensions: usize,
         feature_count: usize,
-    ) -> CatBoostRuntimeArtifact {
+    ) -> Result<CatBoostRuntimeArtifact> {
         let iterations = param_int(&self.config.params, "iterations", 500).max(1);
         let depth = param_int(&self.config.params, "depth", 8).max(1);
         let learning_rate = param_float(&self.config.params, "learning_rate", 0.05);
         let l2_leaf_reg = param_float(&self.config.params, "l2_leaf_reg", 3.0);
         let probability_temperature =
             param_float(&self.config.params, "probability_temperature", 1.0);
-        let use_best_model = param_bool(&self.config.params, "use_best_model", false);
+        let use_best_model = self
+            .training_summary
+            .as_ref()
+            .is_some_and(|summary| summary.val_rows > 0);
         let thread_count = self
             .config
             .cpu_threads
@@ -489,7 +473,7 @@ impl CatBoostExpert {
             .max(1);
         let loss_function = param_string(&self.config.params, "loss_function", "MultiClass");
 
-        CatBoostRuntimeArtifact::new(
+        Ok(CatBoostRuntimeArtifact::new(
             executable,
             resolved_device,
             &self.config.requested_device_policy,
@@ -507,8 +491,8 @@ impl CatBoostExpert {
             self.idx,
             &loss_function,
             self.feature_columns.clone(),
-            self.stored_training_summary(),
-        )
+            self.stored_training_summary()?,
+        ))
     }
 
     #[cfg(feature = "catboost")]
@@ -571,6 +555,19 @@ impl CatBoostExpert {
             }
             if metadata.feature_columns.is_empty() {
                 bail!("CatBoost runtime metadata must contain at least one feature column");
+            }
+            validate_tree_training_summary(
+                &metadata.training_summary,
+                "CatBoost runtime metadata",
+            )?;
+            if let Some(artifact) = runtime_artifact {
+                validate_runtime_artifact(artifact, metadata.feature_columns.len())?;
+                if metadata.feature_columns != artifact.feature_columns {
+                    bail!("CatBoost metadata feature columns do not match the runtime artifact");
+                }
+                if metadata.training_summary != artifact.training_summary {
+                    bail!("CatBoost metadata training summary does not match the runtime artifact");
+                }
             }
             return Ok(metadata);
         }
@@ -651,16 +648,12 @@ impl CatBoostExpert {
     }
 
     #[cfg(feature = "catboost")]
-    fn write_training_files(
-        &self,
-        dir: &Path,
+    fn write_dataset_file(
+        dataset_path: &Path,
         x: &FeatureFrame,
         y: &[i32],
-    ) -> Result<(PathBuf, PathBuf, PathBuf)> {
-        let learn_path = dir.join("learn.tsv");
-        let cd_path = dir.join("learn.cd");
-        let model_path = dir.join(CATBOOST_MODEL_FILE_NAME);
-
+        dataset_name: &str,
+    ) -> Result<()> {
         let labels = remap_labels_to_tree_targets(y)?
             .into_iter()
             .map(|value| value as i32)
@@ -668,30 +661,63 @@ impl CatBoostExpert {
         let (flat_x, rows, cols) = feature_frame_to_tree_f32_row_major(x)?;
         validate_training_frame(&flat_x, rows, cols, &labels)?;
 
-        {
-            let mut writer =
-                std::io::BufWriter::new(std::fs::File::create(&learn_path).with_context(|| {
-                    format!("create CatBoost learn set {}", learn_path.display())
-                })?);
+        let mut writer =
+            std::io::BufWriter::new(std::fs::File::create(dataset_path).with_context(|| {
+                format!(
+                    "create CatBoost {dataset_name} set {}",
+                    dataset_path.display()
+                )
+            })?);
 
-            for row_idx in 0..rows {
-                use std::io::Write;
-                write!(writer, "{}", labels[row_idx]).with_context(|| {
-                    format!("write label row {row_idx} to {}", learn_path.display())
-                })?;
-                for feature in &flat_x[row_idx * cols..(row_idx + 1) * cols] {
-                    write!(writer, "\t{feature}").with_context(|| {
-                        format!("write feature row {row_idx} to {}", learn_path.display())
-                    })?;
-                }
-                writeln!(writer).with_context(|| {
-                    format!("write newline row {row_idx} to {}", learn_path.display())
+        for row_idx in 0..rows {
+            write!(writer, "{}", labels[row_idx]).with_context(|| {
+                format!("write label row {row_idx} to {}", dataset_path.display())
+            })?;
+            for feature in &flat_x[row_idx * cols..(row_idx + 1) * cols] {
+                write!(writer, "\t{feature}").with_context(|| {
+                    format!("write feature row {row_idx} to {}", dataset_path.display())
                 })?;
             }
-            writer
-                .flush()
-                .with_context(|| format!("flush CatBoost learn set {}", learn_path.display()))?;
+            writeln!(writer).with_context(|| {
+                format!("write newline row {row_idx} to {}", dataset_path.display())
+            })?;
         }
+        writer.flush().with_context(|| {
+            format!(
+                "flush CatBoost {dataset_name} set {}",
+                dataset_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "catboost")]
+    fn write_training_files(
+        &self,
+        dir: &Path,
+        x: &FeatureFrame,
+        y: &[i32],
+        val_x: Option<&FeatureFrame>,
+        val_y: Option<&[i32]>,
+    ) -> Result<(PathBuf, Option<PathBuf>, PathBuf, PathBuf)> {
+        let learn_path = dir.join("learn.tsv");
+        let cd_path = dir.join("learn.cd");
+        let model_path = dir.join(CATBOOST_MODEL_FILE_NAME);
+
+        Self::write_dataset_file(&learn_path, x, y, "learn")?;
+        let test_path = match (val_x, val_y) {
+            (Some(validation_frame), Some(validation_labels)) => {
+                let path = dir.join("validation.tsv");
+                Self::write_dataset_file(&path, validation_frame, validation_labels, "validation")?;
+                Some(path)
+            }
+            (None, None) => None,
+            _ => bail!(
+                "CatBoost training files require both validation features and labels or neither"
+            ),
+        };
+
+        let cols = x.n_features();
 
         {
             let mut writer = std::io::BufWriter::new(
@@ -712,7 +738,7 @@ impl CatBoostExpert {
                 .with_context(|| format!("flush CatBoost cd file {}", cd_path.display()))?;
         }
 
-        Ok((learn_path, cd_path, model_path))
+        Ok((learn_path, test_path, cd_path, model_path))
     }
 
     #[cfg(feature = "catboost")]
@@ -720,6 +746,7 @@ impl CatBoostExpert {
         &self,
         executable: &Path,
         learn_path: &Path,
+        test_path: Option<&Path>,
         cd_path: &Path,
         model_path: &Path,
         train_dir: &Path,
@@ -795,14 +822,21 @@ impl CatBoostExpert {
             .arg("--random-seed")
             .arg(self.idx.to_string());
 
-        // CatBoost CLI booleans are PRESENCE-only flags: passing an explicit
-        // "true"/"false" value makes the parser treat it as a misplaced freearg
-        // ("freearg 'false' is misplaced"). So `--has-header` is omitted (our
-        // learn-set is written WITHOUT a header row) and `--use-best-model` is
-        // added only when enabled (and only meaningful with an eval set).
-        if param_bool(&self.config.params, "use_best_model", false) {
+        if let Some(test_path) = test_path {
+            command.arg("--test-set").arg(test_path);
+            if !param_bool(&self.config.params, "use_best_model", true) {
+                bail!(
+                    "CatBoost validation was supplied with use_best_model=false; refusing to retain post-optimum trees"
+                );
+            }
             command.arg("--use-best-model");
         }
+
+        // CatBoost CLI booleans are PRESENCE-only flags: passing an explicit
+        // "true"/"false" value makes the parser treat it as a misplaced freearg
+        // ("freearg 'false' is misplaced"). `--has-header` is omitted because
+        // both TSV datasets are written without headers. `--use-best-model` is
+        // emitted above only when the test set makes it effective.
 
         command.arg("--task-type").arg(task_type);
         if let ResolvedCudaDevicePolicy::Cuda { ordinal } = resolved_device {
@@ -884,24 +918,16 @@ impl CatBoostExpert {
         val_y: Option<&[i32]>,
         lease_width: usize,
     ) -> Result<()> {
-        // M6: CatBoost trains via the upstream CLI executable, which
-        // already supports `--test-set` + `--use-best-model` for
-        // val-driven early stopping. Wiring those flags safely requires
-        // additional CD/data-file plumbing that is non-trivial to do
-        // from this code path; for now record that val data was supplied
-        // so an operator can audit whether early-stopping kicked in. The
-        // CatBoost adapter then proceeds with the standard CLI training.
         match (val_x, val_y) {
             (Some(validation_frame), Some(validation_labels)) => {
+                if validation_frame.n_samples() == 0 || validation_labels.is_empty() {
+                    bail!("CatBoost validation features and labels must be non-empty");
+                }
                 if validation_frame.n_features() != x.n_features()
                     || validation_frame.n_samples() != validation_labels.len()
                 {
                     bail!("CatBoost validation frame/label shape does not match training schema");
                 }
-                tracing::info!(
-                    model = "catboost",
-                    "CatBoost val frame supplied; CLI training currently ignores it (--test-set wiring is a follow-up)"
-                );
             }
             (None, None) => {}
             _ => bail!(
@@ -920,6 +946,14 @@ impl CatBoostExpert {
                     y.len()
                 );
             }
+            let training_feature_columns = feature_columns_from_frame(x);
+            if let Some(validation_frame) = val_x
+                && feature_columns_from_frame(validation_frame) != training_feature_columns
+            {
+                bail!(
+                    "CatBoost validation feature names or ordering do not match the training schema"
+                );
+            }
             self.config.cpu_threads = Some(
                 self.config
                     .cpu_threads
@@ -933,11 +967,17 @@ impl CatBoostExpert {
                 std::fs::create_dir_all(&train_dir).with_context(|| {
                     format!("create CatBoost train dir {}", train_dir.display())
                 })?;
-                let (learn_path, cd_path, model_path) =
-                    self.write_training_files(&temp_dir, x, y)?;
+                let (learn_path, test_path, cd_path, model_path) =
+                    self.write_training_files(&temp_dir, x, y, val_x, val_y)?;
                 let executable = self.resolve_executable()?;
-                let (resolved_device, visible_nvidia_devices) =
-                    self.train_cli(&executable, &learn_path, &cd_path, &model_path, &train_dir)?;
+                let (resolved_device, visible_nvidia_devices) = self.train_cli(
+                    &executable,
+                    &learn_path,
+                    test_path.as_deref(),
+                    &cd_path,
+                    &model_path,
+                    &train_dir,
+                )?;
 
                 let model_bytes = std::fs::read(&model_path)
                     .with_context(|| format!("read CatBoost artifact {}", model_path.display()))?;
@@ -951,8 +991,16 @@ impl CatBoostExpert {
                     );
                 }
 
-                self.feature_columns = feature_columns_from_frame(x);
-                self.training_summary = Some(default_training_summary(x));
+                let val_rows = val_x.map_or(0, FeatureFrame::n_samples);
+                let dataset_rows = x
+                    .n_samples()
+                    .checked_add(val_rows)
+                    .context("CatBoost training summary row count overflow")?;
+                let training_summary =
+                    TrainingSummaryMetadata::new(dataset_rows, x.n_samples(), 0, val_rows);
+                validate_tree_training_summary(&training_summary, "CatBoost training")?;
+                self.feature_columns = training_feature_columns.clone();
+                self.training_summary = Some(training_summary);
                 self.model_bytes = Some(model_bytes);
                 let runtime_artifact = self.build_runtime_artifact(
                     Some(&executable),
@@ -960,7 +1008,7 @@ impl CatBoostExpert {
                     visible_nvidia_devices,
                     model_dimensions,
                     self.feature_columns.len(),
-                );
+                )?;
                 validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
                 self.runtime_artifact = Some(runtime_artifact);
                 self.model = Some(model);
@@ -1048,7 +1096,7 @@ impl ExpertModel for CatBoostExpert {
             let metadata = tree_runtime_metadata(
                 "catboost",
                 self.feature_columns.clone(),
-                self.stored_training_summary(),
+                self.stored_training_summary()?,
             )?;
             let (model_path, metadata_path) = tree_artifact_paths(path, CATBOOST_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
@@ -1062,7 +1110,7 @@ impl ExpertModel for CatBoostExpert {
                         visible_nvidia_devices,
                         3,
                         self.feature_columns.len(),
-                    )
+                    )?
                 }
             };
             validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
@@ -1145,18 +1193,11 @@ impl ExpertModel for CatBoostExpert {
                         visible_nvidia_devices,
                         model.get_dimensions_count(),
                         self.feature_columns.len(),
-                    )
+                    )?
                 }
             };
             validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
-            if metadata_training_summary.dataset_rows == 0 {
-                bail!("CatBoost metadata training summary must record non-zero dataset_rows");
-            }
-            if metadata_training_summary.dataset_rows
-                != metadata_training_summary.train_rows + metadata_training_summary.val_rows
-            {
-                bail!("CatBoost metadata training summary is inconsistent");
-            }
+            validate_tree_training_summary(&metadata_training_summary, "CatBoost metadata")?;
             self.apply_runtime_artifact(&runtime_artifact)?;
             self.model_bytes = Some(model_bytes);
             self.runtime_artifact = Some(runtime_artifact);
@@ -1255,13 +1296,15 @@ mod tests {
         let training_summary = default_training_summary(&frame);
         expert.feature_columns = feature_columns_from_frame(&frame);
         expert.training_summary = Some(training_summary.clone());
-        let runtime_artifact = expert.build_runtime_artifact(
-            None,
-            ResolvedCudaDevicePolicy::Cpu,
-            0,
-            3,
-            expert.feature_columns.len(),
-        );
+        let runtime_artifact = expert
+            .build_runtime_artifact(
+                None,
+                ResolvedCudaDevicePolicy::Cpu,
+                0,
+                3,
+                expert.feature_columns.len(),
+            )
+            .expect("build runtime artifact");
         let metadata =
             tree_runtime_metadata("catboost", expert.feature_columns.clone(), training_summary)
                 .expect("valid runtime metadata");
@@ -1309,7 +1352,7 @@ mod tests {
                 "trend".to_string(),
                 "volatility".to_string(),
             ],
-            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+            training_summary: TrainingSummaryMetadata::new(9, 9, 0, 0),
         };
 
         let err = super::validate_runtime_artifact(&artifact, 3)
@@ -1343,13 +1386,15 @@ mod tests {
         let training_summary = default_training_summary(&frame);
         expert.feature_columns = feature_columns_from_frame(&frame);
         expert.training_summary = Some(training_summary.clone());
-        let runtime_artifact = expert.build_runtime_artifact(
-            None,
-            ResolvedCudaDevicePolicy::Cpu,
-            0,
-            3,
-            expert.feature_columns.len(),
-        );
+        let runtime_artifact = expert
+            .build_runtime_artifact(
+                None,
+                ResolvedCudaDevicePolicy::Cpu,
+                0,
+                3,
+                expert.feature_columns.len(),
+            )
+            .expect("build runtime artifact");
         let metadata_path = artifact_dir.join("metadata.json");
         assert!(
             !metadata_path.exists(),

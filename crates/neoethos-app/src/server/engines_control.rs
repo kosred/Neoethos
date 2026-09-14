@@ -9,16 +9,12 @@
 //! one is already running returns 409 Conflict. Stopping when nothing is
 //! running returns 200 with `{"running": false}` — idempotent.
 //!
-//! Engine state ("Idle" / "Running" / "Failed: …" / "Succeeded") is
-//! tracked through a `EngineSlot` held inside `AppApiState`. The
+//! Engine state, including distinct Degraded and Failed outcomes, is
+//! tracked through an `EngineSlot` held inside `AppApiState`. The
 //! background task that drives each job drains the `ServiceEvent`
 //! channel and writes the latest `JobState` back into the slot, which
 //! `/engines/status` then reads.
 
-#[expect(
-    dead_code,
-    reason = "Chunk4C entrypoint adapters consume this crate-private typed boundary"
-)]
 mod typed_execution_v1;
 #[allow(
     unused_imports,
@@ -29,8 +25,8 @@ pub(crate) use typed_execution_v1::{
     TypedDiscoveryGenerationOverrideV1, TypedDiscoveryOverridesV1, TypedDiscoverySettingsGateV1,
     TypedHigherTimeframePolicyV1, TypedLegacyExecutionAdmissionErrorV1,
     TypedLegacyExecutionAdmissionV1, TypedLegacyExecutionJobHandleV1,
-    TypedLegacyExecutionSnapshotV1, TypedLegacyExecutionStartErrorV1,
-    TypedLegacyExecutionTerminalV1, TypedTrainingExecutionIntentV1, TypedTrainingSelectionPolicyV1,
+    TypedLegacyExecutionStartErrorV1, TypedLegacyExecutionTerminalV1,
+    TypedTrainingExecutionIntentV1, TypedTrainingSelectionPolicyV1,
     detach_typed_legacy_execution_observer_v1, start_typed_discovery_execution_v1,
     start_typed_training_execution_v1,
 };
@@ -59,10 +55,9 @@ use crate::app_services::jobs::{JobKind, JobState};
 use super::errors::actionable_error;
 use super::state::{AppApiState, CanonicalNativeResearchCancellationOutcomeV1};
 
-/// Shared request body for `start` endpoints. Discovery requires an exact
-/// canonical `dataset_selection`; the legacy symbol/base fields may only
-/// assert consistency with it. Training still resolves symbol/base through
-/// its existing configuration path because it shares this wire type.
+/// Discovery requires an exact canonical `dataset_selection`; the legacy
+/// symbol/base fields may only assert consistency with it. Training uses the
+/// separate exact-handoff request below, not this wire type.
 ///
 /// `higher_tfs` is the MTF context discovery considers alongside
 /// `base_tf`. When omitted, the server resolves the operator's configured
@@ -81,15 +76,25 @@ pub struct StartJobBody {
     pub base_tf: Option<String>,
     pub higher_tfs: Option<Vec<String>>,
     /// #194: optional GA hyperparameter overrides. When `None` the
-    /// engine uses the defaults baked into
-    /// `neoethos_search::DiscoveryConfig::default()`; sending any field
+    /// engine uses the captured operator Settings; sending any field
     /// here replaces only that knob. The UI's "Advanced" expander
     /// builds this struct from the operator's sliders.
     pub population: Option<usize>,
     pub generations: Option<usize>,
     pub max_indicators: Option<usize>,
+    /// Omitted retains the saved limit; zero explicitly validates all GA-returned candidates.
     pub target_candidates: Option<usize>,
     pub portfolio_size: Option<usize>,
+}
+
+/// Training has no per-request search overrides or ambient data selectors.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrainingStartBody {
+    /// Exact persisted Discovery → Training identity, never a filesystem path.
+    pub training_handoff: String,
+    #[serde(default)]
+    pub mode: crate::app_services::training::TrainingMode,
 }
 
 fn resolve_discovery_selection(body: &StartJobBody) -> Result<SelectedDatasetGenerationV1> {
@@ -124,6 +129,21 @@ fn resolve_discovery_selection(body: &StartJobBody) -> Result<SelectedDatasetGen
         );
     }
     Ok(selected)
+}
+
+fn resolve_discovery_overrides(
+    body: &StartJobBody,
+) -> Result<TypedDiscoveryOverridesV1, &'static str> {
+    TypedDiscoveryOverridesV1::checked_new(
+        body.population.filter(|value| *value > 0),
+        body.generations
+            .filter(|value| *value > 0)
+            .map(TypedDiscoveryGenerationOverrideV1::Exact),
+        body.max_indicators.filter(|value| *value > 0),
+        None,
+        body.target_candidates,
+        body.portfolio_size.filter(|value| *value > 0),
+    )
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -391,10 +411,10 @@ pub async fn discovery_start(
     let dataset_identity = dataset_selection.identity().clone();
     let symbol = dataset_identity.symbol_name().to_owned();
     let base_timeframe = dataset_identity.timeframe();
-    let higher_timeframes = match body.higher_tfs {
+    let higher_timeframes = match &body.higher_tfs {
         Some(labels) => {
             let parsed = labels
-                .into_iter()
+                .iter()
                 .map(|label| {
                     label
                         .trim()
@@ -415,16 +435,7 @@ pub async fn discovery_start(
         }
         None => TypedHigherTimeframePolicyV1::Configured,
     };
-    let overrides = match TypedDiscoveryOverridesV1::checked_new(
-        body.population.filter(|value| *value > 0),
-        body.generations
-            .filter(|value| *value > 0)
-            .map(TypedDiscoveryGenerationOverrideV1::Exact),
-        body.max_indicators.filter(|value| *value > 0),
-        None,
-        body.target_candidates.filter(|value| *value > 0),
-        body.portfolio_size.filter(|value| *value > 0),
-    ) {
+    let overrides = match resolve_discovery_overrides(&body) {
         Ok(overrides) => overrides,
         Err(detail) => {
             return actionable_error(
@@ -441,7 +452,9 @@ pub async fn discovery_start(
         overrides,
         settings_gate: TypedDiscoverySettingsGateV1::None,
         dataset_policy: TypedDiscoveryDatasetPolicyV1::Exact(dataset_selection.clone()),
-        training_after_success: true,
+        // This endpoint starts ResearchOnly Discovery. A later model handoff
+        // must consume the validated result, not reopen by symbol/timeframe.
+        training_after_success: false,
     };
     let mut handle = match start_typed_discovery_execution_v1(state.clone(), intent) {
         Ok(handle) => handle,
@@ -500,41 +513,18 @@ pub async fn discovery_stop(State(state): State<AppApiState>) -> Json<StopRespon
 
 pub async fn training_start(
     State(state): State<AppApiState>,
-    body: Option<Json<StartJobBody>>,
+    Json(body): Json<TrainingStartBody>,
 ) -> Response {
-    let body = body.map(|Json(b)| b).unwrap_or_default();
-    let selection = match (body.symbol, body.base_tf) {
-        (None, None) => TypedTrainingSelectionPolicyV1::Configured,
-        (Some(symbol), Some(base_tf)) => {
-            let symbol = symbol.trim().to_uppercase();
-            if symbol.is_empty() {
-                return actionable_error(
-                    StatusCode::BAD_REQUEST,
-                    "Training symbol must not be empty.",
-                    &anyhow::anyhow!("empty Training symbol"),
-                );
-            }
-            let base_timeframe = match base_tf.trim().parse::<CanonicalTimeframe>() {
-                Ok(timeframe) => timeframe,
-                Err(error) => {
-                    return actionable_error(
-                        StatusCode::BAD_REQUEST,
-                        "Training base_tf must be a canonical timeframe.",
-                        &anyhow::anyhow!(error.to_string()),
-                    );
-                }
-            };
-            TypedTrainingSelectionPolicyV1::Exact {
-                symbol,
-                base_timeframe,
+    let selection = match body.mode {
+        crate::app_services::training::TrainingMode::TrainModels => {
+            TypedTrainingSelectionPolicyV1::DiscoveryHandoff {
+                identity_sha256: body.training_handoff,
             }
         }
-        _ => {
-            return actionable_error(
-                StatusCode::BAD_REQUEST,
-                "Training requires both symbol and base_tf together, or neither to use Settings.",
-                &anyhow::anyhow!("partial Training symbol/base_tf selection"),
-            );
+        crate::app_services::training::TrainingMode::StrategyOnly => {
+            TypedTrainingSelectionPolicyV1::StrategyResearchHandoff {
+                identity_sha256: body.training_handoff,
+            }
         }
     };
     let mut handle = match start_typed_training_execution_v1(
@@ -711,6 +701,102 @@ fn typed_legacy_admission_error_response_v1(
 #[cfg(test)]
 mod exact_dataset_selection_tests {
     use super::*;
+
+    #[test]
+    fn engine_wire_preserves_degraded_without_calling_it_success_or_failure() {
+        for (job, expected, wire) in [
+            (JobState::Queued, EngineRunState::Running, "Running"),
+            (JobState::Running, EngineRunState::Running, "Running"),
+            (JobState::Succeeded, EngineRunState::Succeeded, "Succeeded"),
+            (JobState::Degraded, EngineRunState::Degraded, "Degraded"),
+            (JobState::Failed, EngineRunState::Failed, "Failed"),
+            (JobState::Cancelled, EngineRunState::Cancelled, "Cancelled"),
+        ] {
+            let state = EngineRunState::from(job);
+            assert_eq!(state, expected);
+            assert_eq!(state.as_str(), wire);
+        }
+        assert_eq!(EngineRunState::Idle.as_str(), "Idle");
+    }
+
+    #[test]
+    fn discovery_wire_distinguishes_omitted_all_and_positive_validation_caps() {
+        for (json, expected) in [
+            (serde_json::json!({}), 200),
+            (serde_json::json!({"target_candidates": 0}), 0),
+            (serde_json::json!({"target_candidates": 1}), 1),
+            (serde_json::json!({"target_candidates": 7}), 7),
+        ] {
+            let body: StartJobBody = serde_json::from_value(json).unwrap();
+            let overrides = resolve_discovery_overrides(&body).unwrap();
+            let mut config = neoethos_search::DiscoveryConfig {
+                candidate_count: 200,
+                ..Default::default()
+            };
+            overrides.apply(&mut config);
+            assert_eq!(config.candidate_count, expected);
+        }
+        // The validation-limit sentinel must not relax unrelated dimensions.
+        for overrides in [
+            TypedDiscoveryOverridesV1::checked_new(Some(0), None, None, None, None, None),
+            TypedDiscoveryOverridesV1::checked_new(None, None, Some(0), None, None, None),
+            TypedDiscoveryOverridesV1::checked_new(None, None, None, Some(0), None, None),
+            TypedDiscoveryOverridesV1::checked_new(None, None, None, None, None, Some(0)),
+        ] {
+            assert!(overrides.is_err());
+        }
+    }
+
+    #[test]
+    fn training_wire_requires_one_handoff_and_rejects_every_ignored_override() {
+        let identity = "a".repeat(64);
+        let valid = serde_json::json!({"training_handoff": identity});
+        let body: TrainingStartBody = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(body.training_handoff, identity);
+        assert_eq!(
+            body.mode,
+            crate::app_services::training::TrainingMode::TrainModels
+        );
+        let selected: TrainingStartBody = serde_json::from_value(serde_json::json!({
+            "training_handoff": identity, "mode": "strategy_only"
+        }))
+        .unwrap();
+        assert_eq!(
+            selected.mode,
+            crate::app_services::training::TrainingMode::StrategyOnly
+        );
+        for mode in [
+            serde_json::json!(null),
+            serde_json::json!("unknown"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                serde_json::from_value::<TrainingStartBody>(serde_json::json!({
+                    "training_handoff": identity, "mode": mode
+                }))
+                .is_err()
+            );
+        }
+        assert!(serde_json::from_value::<TrainingStartBody>(serde_json::json!({})).is_err());
+        for field in [
+            "symbol",
+            "base_tf",
+            "dataset_selection",
+            "higher_tfs",
+            "population",
+            "generations",
+            "max_indicators",
+            "target_candidates",
+            "portfolio_size",
+        ] {
+            let mut ambiguous = valid.clone();
+            ambiguous[field] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<TrainingStartBody>(ambiguous).is_err(),
+                "{field}"
+            );
+        }
+    }
     use neoethos_data::{BarTimestampConvention, CanonicalDatasetIdentity, CanonicalTimeframe};
 
     fn selected_identity() -> CanonicalDatasetIdentity {
@@ -786,15 +872,15 @@ mod exact_dataset_selection_tests {
 
 // ─── EngineRunState (wire-friendly subset of JobState) ────────────────────
 
-/// Compact engine state for `/engines/status`. We collapse Queued and
-/// Running into the same "Running" label (the UI only cares whether
-/// it should show a green dot + a "Stop" button), and Degraded into
-/// Succeeded (still a terminal-OK outcome).
+/// Compact engine state for `/engines/status`. Queued and Running share
+/// the stoppable Running label. Degraded stays distinct: research may be
+/// saved even though a requested output was refused or incomplete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineRunState {
     Idle,
     Running,
     Succeeded,
+    Degraded,
     Failed,
     Cancelled,
 }
@@ -805,6 +891,7 @@ impl EngineRunState {
             EngineRunState::Idle => "Idle",
             EngineRunState::Running => "Running",
             EngineRunState::Succeeded => "Succeeded",
+            EngineRunState::Degraded => "Degraded",
             EngineRunState::Failed => "Failed",
             EngineRunState::Cancelled => "Cancelled",
         }
@@ -815,7 +902,8 @@ impl From<JobState> for EngineRunState {
     fn from(value: JobState) -> Self {
         match value {
             JobState::Queued | JobState::Running => EngineRunState::Running,
-            JobState::Succeeded | JobState::Degraded => EngineRunState::Succeeded,
+            JobState::Succeeded => EngineRunState::Succeeded,
+            JobState::Degraded => EngineRunState::Degraded,
             JobState::Failed => EngineRunState::Failed,
             JobState::Cancelled => EngineRunState::Cancelled,
         }

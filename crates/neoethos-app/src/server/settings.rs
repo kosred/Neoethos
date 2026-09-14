@@ -69,6 +69,10 @@ pub struct SettingsDto {
     /// `SystemConfig::enable_gpu_preference`. `auto` picks the best device and,
     /// with the never-OOM auto-tuner, fits any card; `cpu` forces the CPU lane.
     pub compute_mode: String,
+    /// Discovery-only device policy (`models.prop_search_device`). An empty
+    /// value inherits `compute_mode`; `cuda_required` selects CUDA and fails
+    /// closed if the admitted run cannot seal a real CUDA device.
+    pub search_device: String,
     /// Risky-Mode goal — see `SystemConfig::risky_*`. Start/target balances
     /// (account ccy) + horizon (days). The operator sets these and they
     /// pressure the Risky discovery search toward strategies that can hit the
@@ -76,6 +80,25 @@ pub struct SettingsDto {
     pub risky_start_balance: f64,
     pub risky_target_balance: f64,
     pub risky_horizon_days: u32,
+    /// Search-time sizing scenario. These are the exact resolved values copied
+    /// into Generation 0 and the later validation backtests; they are not the
+    /// fixed live `risk_per_trade` setting.
+    pub shared_search_risk_min: f64,
+    pub shared_search_risk_max: f64,
+    pub risky_search_risk_min: f64,
+    pub risky_search_risk_max: f64,
+    pub prop_firm_search_risk_min: f64,
+    pub prop_firm_search_risk_max: f64,
+    pub search_high_quality_confidence: f64,
+    /// Effective Prop-firm discovery-window objective and constraints. The
+    /// values come from the same resolver the search invokes.
+    pub prop_firm_search_profit_target_pct: f64,
+    pub prop_firm_search_max_daily_loss_pct: f64,
+    pub prop_firm_search_max_drawdown_pct: f64,
+    pub prop_firm_search_min_trading_days: usize,
+    pub prop_firm_search_window_days: usize,
+    pub prop_firm_search_window_count: usize,
+    pub prop_firm_search_pass_rate: f64,
     /// Auto-cull retirement → automatic Discovery on the same symbol+TF to
     /// refill the gap (the retired strategy stays blacklisted forever).
     pub auto_rediscover_on_cull: bool,
@@ -133,9 +156,26 @@ pub struct SettingsUpdateDto {
     pub trading_mode: Option<String>,
     /// `"auto"` | `"cpu"` | `"gpu"`. Unknown values are rejected (400).
     pub compute_mode: Option<String>,
+    /// Discovery-only canonical device policy: empty (inherit), `auto`, `cpu`
+    /// or `cuda_required`.
+    pub search_device: Option<String>,
     pub risky_start_balance: Option<f64>,
     pub risky_target_balance: Option<f64>,
     pub risky_horizon_days: Option<u32>,
+    pub shared_search_risk_min: Option<f64>,
+    pub shared_search_risk_max: Option<f64>,
+    pub risky_search_risk_min: Option<f64>,
+    pub risky_search_risk_max: Option<f64>,
+    pub prop_firm_search_risk_min: Option<f64>,
+    pub prop_firm_search_risk_max: Option<f64>,
+    pub search_high_quality_confidence: Option<f64>,
+    pub prop_firm_search_profit_target_pct: Option<f64>,
+    pub prop_firm_search_max_daily_loss_pct: Option<f64>,
+    pub prop_firm_search_max_drawdown_pct: Option<f64>,
+    pub prop_firm_search_min_trading_days: Option<usize>,
+    pub prop_firm_search_window_days: Option<usize>,
+    pub prop_firm_search_window_count: Option<usize>,
+    pub prop_firm_search_pass_rate: Option<f64>,
     pub auto_rediscover_on_cull: Option<bool>,
     pub news_calendar_enabled: Option<bool>,
     pub news_calendar_source: Option<String>,
@@ -503,6 +543,56 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
     neoethos_core::storage::json::write_bytes_atomic(path, contents.as_bytes())
 }
 
+fn invalid_search_parameter(message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": message.into(),
+            "code": "invalid_discovery_parameter",
+        })),
+    )
+        .into_response()
+}
+
+fn validate_fraction(name: &str, value: f64) -> Result<(), Response> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(invalid_search_parameter(format!(
+            "{name} must be a finite fraction in [0, 1]; 0.01 means 1%"
+        )))
+    }
+}
+
+fn validate_risk_band(name: &str, min: f64, max: f64) -> Result<(), Response> {
+    validate_fraction(&format!("{name} minimum"), min)?;
+    validate_fraction(&format!("{name} maximum"), max)?;
+    if min > max {
+        return Err(invalid_search_parameter(format!(
+            "{name} minimum ({min}) cannot exceed maximum ({max})"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_search_device(raw: &str) -> Result<String, Response> {
+    let device = raw.trim().to_ascii_lowercase();
+    if matches!(device.as_str(), "" | "auto" | "cpu" | "cuda_required") {
+        Ok(device)
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "unknown search_device `{raw}`. Expected one of: inherit (empty), auto, cpu, cuda_required."
+                ),
+                "code": "invalid_search_device",
+            })),
+        )
+            .into_response())
+    }
+}
+
 /// POST /settings — merge-update + persist to config.yaml.
 ///
 /// Validation rules:
@@ -657,21 +747,160 @@ pub async fn update_settings(
         }
         settings.system.enable_gpu_preference = mode;
     }
-    // Risky-Mode goal (positive values only; the search + projection read these).
-    if let Some(v) = payload.risky_start_balance {
-        if v > 0.0 {
-            settings.system.risky_start_balance_usd = v;
-        }
+    if let Some(raw) = payload.search_device {
+        let device = match normalize_search_device(&raw) {
+            Ok(device) => device,
+            Err(response) => return response,
+        };
+        settings.models.prop_search_device = device;
     }
-    if let Some(v) = payload.risky_target_balance {
-        if v > 0.0 {
-            settings.system.risky_target_balance_usd = v;
+    // Risky objective: validate the proposed tuple atomically. Silently
+    // ignoring one bad field used to leave a different target on disk from the
+    // one the Discovery form appeared to save.
+    if payload.risky_start_balance.is_some()
+        || payload.risky_target_balance.is_some()
+        || payload.risky_horizon_days.is_some()
+    {
+        let start = payload
+            .risky_start_balance
+            .unwrap_or(settings.system.risky_start_balance_usd);
+        let target = payload
+            .risky_target_balance
+            .unwrap_or(settings.system.risky_target_balance_usd);
+        let horizon = payload
+            .risky_horizon_days
+            .unwrap_or(settings.system.risky_horizon_days);
+        if !start.is_finite() || start <= 0.0 {
+            return invalid_search_parameter("Risky start balance must be finite and positive");
         }
+        if !target.is_finite() || target <= start {
+            return invalid_search_parameter(
+                "Risky target balance must be finite and greater than the start balance",
+            );
+        }
+        if horizon == 0 {
+            return invalid_search_parameter("Risky horizon must be at least one day");
+        }
+        settings.system.risky_start_balance_usd = start;
+        settings.system.risky_target_balance_usd = target;
+        settings.system.risky_horizon_days = horizon;
     }
-    if let Some(v) = payload.risky_horizon_days {
-        if v > 0 {
-            settings.system.risky_horizon_days = v;
+
+    // Search sizing is separate from the fixed live risk-per-trade setting.
+    // Resolve partial edits against the exact same profile the evaluator uses,
+    // validate each pair, then persist both endpoints together.
+    let current_risk = neoethos_search::discovery::resolve_discovery_risk_profile(&settings);
+    if payload.shared_search_risk_min.is_some() || payload.shared_search_risk_max.is_some() {
+        let min = payload
+            .shared_search_risk_min
+            .unwrap_or(current_risk.shared_band.0);
+        let max = payload
+            .shared_search_risk_max
+            .unwrap_or(current_risk.shared_band.1);
+        if let Err(response) = validate_risk_band("Shared search risk band", min, max) {
+            return response;
         }
+        settings.risk.min_risk_per_trade = min;
+        settings.risk.max_risk_per_trade = max;
+    }
+
+    let current_risk = neoethos_search::discovery::resolve_discovery_risk_profile(&settings);
+    if payload.risky_search_risk_min.is_some() || payload.risky_search_risk_max.is_some() {
+        let current = current_risk.risky_band();
+        let min = payload.risky_search_risk_min.unwrap_or(current.0);
+        let max = payload.risky_search_risk_max.unwrap_or(current.1);
+        if let Err(response) = validate_risk_band("Risky search risk band", min, max) {
+            return response;
+        }
+        settings.risk.risky_min_risk_per_trade = Some(min);
+        settings.risk.risky_max_risk_per_trade = Some(max);
+    }
+
+    if payload.prop_firm_search_risk_min.is_some() || payload.prop_firm_search_risk_max.is_some() {
+        let current = current_risk.prop_firm_band();
+        let min = payload.prop_firm_search_risk_min.unwrap_or(current.0);
+        let max = payload.prop_firm_search_risk_max.unwrap_or(current.1);
+        if let Err(response) = validate_risk_band("Prop-firm search risk band", min, max) {
+            return response;
+        }
+        settings.risk.prop_firm_min_risk_per_trade = Some(min);
+        settings.risk.prop_firm_max_risk_per_trade = Some(max);
+    }
+
+    if let Some(value) = payload.search_high_quality_confidence {
+        if !value.is_finite() || value <= 0.0 || value > 1.0 {
+            return invalid_search_parameter(
+                "Search high-quality confidence must be a finite fraction in (0, 1]",
+            );
+        }
+        settings.risk.high_quality_confidence = value;
+    }
+
+    let prop_gate_changed = payload.prop_firm_search_profit_target_pct.is_some()
+        || payload.prop_firm_search_max_daily_loss_pct.is_some()
+        || payload.prop_firm_search_max_drawdown_pct.is_some()
+        || payload.prop_firm_search_min_trading_days.is_some()
+        || payload.prop_firm_search_window_days.is_some()
+        || payload.prop_firm_search_window_count.is_some()
+        || payload.prop_firm_search_pass_rate.is_some();
+    if prop_gate_changed {
+        let current = neoethos_search::discovery::resolve_prop_firm_discovery_gate(
+            &settings.models.discovery_runtime.prop_firm_gate,
+        );
+        let profit_target = payload
+            .prop_firm_search_profit_target_pct
+            .unwrap_or(current.rules.min_profit_target_pct);
+        let daily_loss = payload
+            .prop_firm_search_max_daily_loss_pct
+            .unwrap_or(current.rules.max_daily_loss_pct);
+        let max_drawdown = payload
+            .prop_firm_search_max_drawdown_pct
+            .unwrap_or(current.rules.max_overall_drawdown_pct);
+        let min_days = payload
+            .prop_firm_search_min_trading_days
+            .unwrap_or(current.rules.min_trading_days);
+        let window_days = payload
+            .prop_firm_search_window_days
+            .unwrap_or(current.window_days);
+        let window_count = payload
+            .prop_firm_search_window_count
+            .unwrap_or(current.n_windows);
+        let pass_rate = payload.prop_firm_search_pass_rate.unwrap_or(
+            current
+                .pass_rate
+                .max(settings.models.prop_firm_min_pass_rate),
+        );
+
+        for (name, value) in [
+            ("Prop-firm search profit target", profit_target),
+            ("Prop-firm search daily-loss limit", daily_loss),
+            ("Prop-firm search overall-drawdown limit", max_drawdown),
+            ("Prop-firm search pass rate", pass_rate),
+        ] {
+            if let Err(response) = validate_fraction(name, value) {
+                return response;
+            }
+        }
+        if window_days == 0 {
+            return invalid_search_parameter("Prop-firm search window must be at least one day");
+        }
+        if min_days > window_days {
+            return invalid_search_parameter(
+                "Prop-firm minimum trading days cannot exceed the search-window length",
+            );
+        }
+
+        let gate = &mut settings.models.discovery_runtime.prop_firm_gate;
+        gate.profit_target_pct = Some(profit_target);
+        gate.max_daily_loss_pct = Some(daily_loss);
+        gate.max_overall_drawdown_pct = Some(max_drawdown);
+        gate.min_trading_days = Some(min_days);
+        gate.window_days = window_days;
+        gate.n_windows = window_count;
+        // Two historical keys feed one max() decision. A save through the
+        // canonical Discovery form aligns both so the operator sees one value.
+        gate.pass_rate = pass_rate;
+        settings.models.prop_firm_min_pass_rate = pass_rate;
     }
     if let Some(b) = payload.auto_rediscover_on_cull {
         settings.system.auto_rediscover_on_cull = b;
@@ -847,6 +1076,15 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         other => other.to_string(),
     };
     let trading_mode_divergent = effective_discovery_mode != requested_mode;
+    let search_risk = neoethos_search::discovery::resolve_discovery_risk_profile(settings);
+    let risky_search_risk = search_risk.risky_band();
+    let prop_firm_search_risk = search_risk.prop_firm_band();
+    let prop_firm_search_gate = neoethos_search::discovery::resolve_prop_firm_discovery_gate(
+        &settings.models.discovery_runtime.prop_firm_gate,
+    );
+    let prop_firm_search_pass_rate = prop_firm_search_gate
+        .pass_rate
+        .max(settings.models.prop_firm_min_pass_rate.clamp(0.0, 1.0));
     if trading_mode_divergent {
         tracing::error!(
             target: "neoethos_app::server::settings",
@@ -867,9 +1105,24 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         effective_discovery_mode,
         trading_mode_divergent,
         compute_mode: settings.system.enable_gpu_preference.clone(),
+        search_device: settings.models.prop_search_device.clone(),
         risky_start_balance: settings.system.risky_start_balance_usd,
         risky_target_balance: settings.system.risky_target_balance_usd,
         risky_horizon_days: settings.system.risky_horizon_days,
+        shared_search_risk_min: search_risk.shared_band.0,
+        shared_search_risk_max: search_risk.shared_band.1,
+        risky_search_risk_min: risky_search_risk.0,
+        risky_search_risk_max: risky_search_risk.1,
+        prop_firm_search_risk_min: prop_firm_search_risk.0,
+        prop_firm_search_risk_max: prop_firm_search_risk.1,
+        search_high_quality_confidence: search_risk.high_quality_confidence,
+        prop_firm_search_profit_target_pct: prop_firm_search_gate.rules.min_profit_target_pct,
+        prop_firm_search_max_daily_loss_pct: prop_firm_search_gate.rules.max_daily_loss_pct,
+        prop_firm_search_max_drawdown_pct: prop_firm_search_gate.rules.max_overall_drawdown_pct,
+        prop_firm_search_min_trading_days: prop_firm_search_gate.rules.min_trading_days,
+        prop_firm_search_window_days: prop_firm_search_gate.window_days,
+        prop_firm_search_window_count: prop_firm_search_gate.n_windows,
+        prop_firm_search_pass_rate,
         auto_rediscover_on_cull: settings.system.auto_rediscover_on_cull,
         news_calendar_enabled: settings.news.news_calendar_enabled,
         news_calendar_source: settings.news.news_calendar_source.clone(),
@@ -892,5 +1145,63 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         live_ml_gate: settings.models.live_ml_gate,
         blend_gate_floor: settings.models.blend_gate_floor,
         blend_veto_below: settings.models.blend_veto_below,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_settings_view_reports_resolved_mode_risk_and_gate() {
+        let mut settings = Settings::default();
+        settings.risk.risky_min_risk_per_trade = Some(0.03);
+        settings.risk.risky_max_risk_per_trade = Some(0.21);
+        settings.risk.prop_firm_min_risk_per_trade = Some(0.001);
+        settings.risk.prop_firm_max_risk_per_trade = Some(0.009);
+        settings.risk.high_quality_confidence = 0.70;
+        settings
+            .models
+            .discovery_runtime
+            .prop_firm_gate
+            .profit_target_pct = Some(0.085);
+        settings.models.discovery_runtime.prop_firm_gate.pass_rate = 0.45;
+        settings.models.prop_firm_min_pass_rate = 0.60;
+        settings.models.prop_search_device = "cuda_required".to_string();
+
+        let view = dto_from_settings(&settings);
+        assert_eq!(
+            (view.risky_search_risk_min, view.risky_search_risk_max),
+            (0.03, 0.21)
+        );
+        assert_eq!(
+            (
+                view.prop_firm_search_risk_min,
+                view.prop_firm_search_risk_max
+            ),
+            (0.001, 0.009)
+        );
+        assert_eq!(view.search_high_quality_confidence, 0.70);
+        assert_eq!(view.prop_firm_search_profit_target_pct, 0.085);
+        assert_eq!(view.prop_firm_search_pass_rate, 0.60);
+        assert_eq!(view.search_device, "cuda_required");
+    }
+
+    #[test]
+    fn discovery_risk_band_validation_rejects_inversion_and_non_finite_values() {
+        assert!(validate_risk_band("test", 0.01, 0.02).is_ok());
+        assert!(validate_risk_band("test", 0.03, 0.02).is_err());
+        assert!(validate_risk_band("test", f64::NAN, 0.02).is_err());
+        assert!(validate_risk_band("test", 0.01, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn discovery_device_accepts_only_canonical_cpu_auto_or_cuda_policy() {
+        for accepted in ["", "auto", "CPU", " cuda_required "] {
+            assert!(normalize_search_device(accepted).is_ok(), "{accepted}");
+        }
+        for rejected in ["gpu", "vulkan", "rocm", "hip", "off"] {
+            assert!(normalize_search_device(rejected).is_err(), "{rejected}");
+        }
     }
 }

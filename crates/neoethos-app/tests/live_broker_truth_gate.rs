@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
+use neoethos_app::app_services::account_risk::AccountRiskRegistry;
 use neoethos_app::app_services::live_trading::{StartRequest, start};
 use neoethos_app::server::risky::RiskyScenarioQuery;
 use neoethos_app::server::state::AppApiState;
-use neoethos_app::server::strategy_lab::PromotionQuery;
+use neoethos_app::server::strategy_lab::PromoteBody;
 
 const BROKER_TRUTH_UNAVAILABLE: &str = "BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1";
 
@@ -90,16 +93,19 @@ fn replay_config_refuses_before_flat_spread_or_operator_commission_is_resolved()
 
 #[tokio::test(flavor = "current_thread")]
 async fn live_start_is_refused_before_portfolio_loading_or_loop_spawn() {
-    let result = start(StartRequest {
-        portfolio_path: "this-portfolio-must-not-be-read-before-broker-truth.json".to_owned(),
-        lot_size: 0.01,
-        stop_loss_pips: Some(20.0),
-        take_profit_pips: Some(40.0),
-        warmup_bars: 1_000,
-        cull_after_consecutive_losses: 6,
-        cull_min_win_rate_pct: 57.0,
-        cull_window_trades: 10,
-    });
+    let result = start(
+        StartRequest {
+            portfolio_path: "this-portfolio-must-not-be-read-before-broker-truth.json".to_owned(),
+            lot_size: 0.01,
+            stop_loss_pips: Some(20.0),
+            take_profit_pips: Some(40.0),
+            warmup_bars: 1_000,
+            cull_after_consecutive_losses: 6,
+            cull_min_win_rate_pct: 57.0,
+            cull_window_trades: 10,
+        },
+        Arc::new(AccountRiskRegistry::new()),
+    );
 
     let error = match result {
         Ok(handle) => {
@@ -111,6 +117,32 @@ async fn live_start_is_refused_before_portfolio_loading_or_loop_spawn() {
     assert_broker_truth_refusal(&error);
 }
 
+#[test]
+fn every_live_portfolio_receives_the_same_account_risk_registry() {
+    let state = include_str!("../src/server/state.rs");
+    let autonomous = include_str!("../src/server/autonomous.rs");
+    let live = include_str!("../src/app_services/live_trading.rs");
+
+    assert!(
+        state.contains("pub account_risk:"),
+        "AppApiState no longer owns the process-lifetime account-risk registry"
+    );
+    assert!(
+        autonomous.contains("start(req, state.account_risk.clone())"),
+        "autonomous portfolio workers no longer receive the shared registry"
+    );
+    for retired in ["let mut prop_firm_manager", "RiskManager::from_settings"] {
+        assert!(
+            !live.contains(retired),
+            "live trading recreated the retired per-engine prop-firm authority via {retired}"
+        );
+    }
+    assert!(
+        live.contains("SharedAccountRiskAuthority"),
+        "live trading is not connected to the durable account authority"
+    );
+}
+
 async fn response_text(response: axum::response::Response) -> String {
     let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
@@ -119,7 +151,7 @@ async fn response_text(response: axum::response::Response) -> String {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn risky_projection_is_refused_before_default_win_rate_or_reward_math() {
+async fn hypothetical_risky_projection_is_labelled_and_does_not_require_broker_ticks() {
     let response = neoethos_app::server::risky::scenarios(
         axum::extract::State(AppApiState::default()),
         axum::extract::Query(RiskyScenarioQuery {
@@ -132,42 +164,64 @@ async fn risky_projection_is_refused_before_default_win_rate_or_reward_math() {
         }),
     )
     .await;
-    let body = response_text(response).await;
-    assert!(
-        body.contains(BROKER_TRUTH_UNAVAILABLE),
-        "Risky projection executed heuristic defaults instead of failing closed: {body}"
-    );
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["basis"], "hypothetical_stationary_outcomes");
+    let risk = body["riskFraction"].as_f64().unwrap();
+    assert!((risk - 0.10).abs() < 1e-12);
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn promotion_status_is_refused_before_loading_heuristic_quality_metrics() {
-    let response = neoethos_app::server::strategy_lab::promotion_status(
+async fn promotion_post_still_refuses_before_loading_heuristic_quality_metrics() {
+    let response = neoethos_app::server::strategy_lab::promote(
         axum::extract::State(AppApiState::default()),
-        axum::extract::Query(PromotionQuery {
+        axum::Json(PromoteBody {
             symbol: Some("EURUSD".to_owned()),
             base_tf: Some("M5".to_owned()),
         }),
     )
     .await;
+    assert!(
+        !response.status().is_success(),
+        "readiness must not unlock promotion"
+    );
     let body = response_text(response).await;
     assert!(
         body.contains(BROKER_TRUTH_UNAVAILABLE),
-        "promotion evaluated non-broker-real quality metrics: {body}"
+        "POST must retain its independent financial authority: {body}"
     );
 }
 
 #[test]
-fn live_parity_is_refused_before_default_pip_or_broker_bar_fetch() {
+fn live_signal_parity_reads_its_selected_portfolio_without_a_deployment_permit() {
+    let missing = std::env::temp_dir().join(format!(
+        "neoethos-missing-parity-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    assert!(!missing.exists());
     let result = neoethos_app::app_services::live_parity::run_live_parity_check(
-        "this-portfolio-must-not-be-read-before-broker-truth.json",
+        missing.to_str().unwrap(),
         1_000,
         3_000,
     );
     let error = match result {
-        Ok(_) => panic!("live parity resolved default pip/risk geometry without broker truth"),
+        Ok(_) => panic!("signal parity must not synthesize a missing portfolio"),
         Err(error) => error,
     };
-    assert_broker_truth_refusal(&error);
+    let message = format!("{error:#}");
+    assert!(message.contains("load live portfolio"), "{message}");
+    assert!(
+        !message.contains(BROKER_TRUTH_UNAVAILABLE),
+        "signal diagnostics are not deployment approval"
+    );
+    let source = include_str!("../src/app_services/live_parity.rs");
+    assert!(source.contains("fetch_bound_broker_symbol_blocking"));
+    assert!(!source.contains("exact_pip_size_v1"));
+    assert!(!source.contains("symbol_metadata::resolve"));
 }
 
 #[test]
@@ -198,15 +252,28 @@ fn prop_firm_challenge_is_refused_before_loading_trade_returns() {
 }
 
 #[test]
-fn live_eligibility_gate_is_refused_before_loading_quality_metrics() {
-    let result = neoethos_app::app_services::live_gate::evaluate_for_portfolio(
+fn disabled_demo_check_is_not_misreported_as_live_approval() {
+    let settings = neoethos_core::Settings::default();
+    let decision = neoethos_app::app_services::live_gate::evaluate_for_portfolio_with_settings(
         "this-portfolio-must-not-be-read-before-broker-truth.json",
+        &settings,
+    )
+    .unwrap();
+    assert!(!decision.enabled);
+    assert!(decision.criteria.is_empty());
+    assert!(
+        decision
+            .summary
+            .contains("OOS, broker and risk checks still apply")
     );
-    let error = match result {
-        Ok(_) => panic!("live eligibility consumed unverified financial artifacts"),
-        Err(error) => error,
-    };
-    assert_broker_truth_refusal(&error);
+    let mut settings = settings;
+    settings.models.demo_forward_gate.enabled = true;
+    let error = neoethos_app::app_services::live_gate::evaluate_for_portfolio_with_settings(
+        "missing.live_portfolio.json",
+        &settings,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("load live portfolio"));
 }
 
 #[test]
@@ -235,16 +302,52 @@ fn obsolete_local_pnl_fallback_implementation_is_not_shipped() {
         .find("async fn refresh_once(")
         .expect("bridge refresh entry point exists");
     let scoped = &bridge_source[refresh..];
-    let gate = scoped
-        .find("current_broker_financial_truth_capability_v1")
-        .expect("bridge refresh has a broker-truth gate");
-    let first_work = scoped
-        .find("tokio::task::spawn_blocking")
-        .expect("bridge refresh has a blocking credential load");
     assert!(
-        gate < first_work,
-        "bridge loads local/account state before the live financial truth gate"
+        !scoped.contains("current_broker_financial_truth_capability_v1"),
+        "current broker balances must not be blocked by historical replay certification"
     );
+    assert!(scoped.contains("load_account_runtime(&request)"));
+    assert!(scoped.contains("snapshot.unrealized_pnl_by_position"));
+    assert!(scoped.contains("execution_account_id(&settings)?"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_non_profitable_hypothetical_edge_does_not_invent_a_bet_or_profit_date() {
+    let response = neoethos_app::server::risky::scenarios(
+        axum::extract::State(AppApiState::default()),
+        axum::extract::Query(RiskyScenarioQuery {
+            starting_usd: Some(100.0),
+            target_usd: Some(1000.0),
+            risk_fraction: None,
+            win_rate: Some(0.4),
+            reward_to_risk: Some(1.0),
+            trades_per_day: Some(10.0),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["riskFraction"], 0.0);
+    assert!(body["expectedDays"].is_null());
+    assert_eq!(body["basis"], "hypothetical_stationary_outcomes_no_bet");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_invalid_explicit_risk_is_refused_not_replaced_with_a_default() {
+    let response = neoethos_app::server::risky::scenarios(
+        axum::extract::State(AppApiState::default()),
+        axum::extract::Query(RiskyScenarioQuery {
+            starting_usd: Some(100.0),
+            target_usd: Some(1000.0),
+            risk_fraction: Some(-0.2),
+            win_rate: Some(0.6),
+            reward_to_risk: Some(2.0),
+            trades_per_day: Some(10.0),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert!(response_text(response).await.contains("riskFraction"));
 }
 
 #[test]
@@ -256,10 +359,6 @@ fn superseded_local_pnl_knobs_and_fixture_docs_are_not_shipped() {
         "NEOETHOS_BOT_PNL_CIRCUIT_BREAKER_FRACTION",
     ];
     for (name, source) in [
-        (
-            "core config",
-            include_str!("../../neoethos-core/src/config.rs"),
-        ),
         (
             "app runtime accessors",
             include_str!("../src/app_services/env_overrides.rs"),
@@ -295,6 +394,21 @@ fn superseded_local_pnl_knobs_and_fixture_docs_are_not_shipped() {
                 "{name} still advertises the superseded local-PnL control {token}"
             );
         }
+    }
+
+    // Migration-only tombstones are required so a config written by the older
+    // release is named and ignored rather than hard-failing at startup. They
+    // are not fields or runtime controls and therefore are intentionally not
+    // part of the shipped-surface scan above.
+    let core_config = include_str!("../../neoethos-core/src/config.rs");
+    for retired in [
+        "path: \"app_runtime.pnl_audit_drift_fraction\"",
+        "path: \"app_runtime.pnl_circuit_breaker_fraction\"",
+    ] {
+        assert!(
+            core_config.contains(retired),
+            "sealed config loader is missing migration tombstone {retired}"
+        );
     }
 
     let obsolete_fixture_readme = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

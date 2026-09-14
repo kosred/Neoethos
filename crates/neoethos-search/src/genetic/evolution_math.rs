@@ -5,7 +5,9 @@ use super::strategy_gene::Gene;
 use neoethos_core::utils::fnv1a64_update;
 use rand::Rng;
 use rand::seq::index::sample;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -172,6 +174,27 @@ fn draw_weighted_offset(weights: &[f64], rng: &mut impl Rng) -> usize {
     weights.len().saturating_sub(1)
 }
 
+// For n <= 2^26 every integer in the triangular sum is exactly representable
+// in f64. Binary-searching that sum therefore preserves the old ordered
+// subtraction's inclusive boundary, total, and single RNG draw. Above this
+// bound retain the general floating-point reduction rather than approximate it.
+fn rank_offset_for_target(count: usize, target: f64) -> usize {
+    debug_assert!(count > 0 && count <= (1 << 26));
+    let n = count as u64;
+    let (mut low, mut high) = (0, count - 1);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let terms = middle as u64 + 1;
+        let cumulative = (terms * (2 * n - terms + 1) / 2) as f64;
+        if target <= cumulative {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
+}
+
 pub fn select_parent_index(
     scores: &[f64],
     candidate_indices: &[usize],
@@ -203,6 +226,13 @@ pub fn select_parent_index(
             winner
         }
         ParentSelectionPolicy::RankWeighted => {
+            let count = candidate_indices.len();
+            if count <= (1 << 26) {
+                let n = count as u64;
+                let total = (n * (n + 1) / 2) as f64;
+                let target = rng.random_range(0.0..total);
+                return candidate_indices[rank_offset_for_target(count, target)];
+            }
             let weights = rank_weights(candidate_indices);
             candidate_indices[draw_weighted_offset(&weights, rng)]
         }
@@ -250,7 +280,12 @@ pub fn select_survivor_indices(
                     rng,
                 );
                 selected.push(idx);
-                available.retain(|candidate| *candidate != idx);
+                // IDs start unique/sorted and removal preserves that order.
+                // Do not re-filter the entire population for each survivor.
+                let offset = available
+                    .binary_search(&idx)
+                    .expect("selected available parent");
+                available.remove(offset);
             }
             selected.sort_unstable();
             selected
@@ -410,6 +445,31 @@ impl SeenSignatureMemoryRuntimeOverrides {
 static SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES: OnceLock<SeenSignatureMemoryRuntimeOverrides> =
     OnceLock::new();
 
+// One exact discovery-ledger hand-off to the next GA constructed on this
+// execution thread. The default configuration deliberately has no global seen
+// file, so the caller's validated receipt/config-bound hashes need an in-memory
+// carrier. Thread-local + one-shot semantics prevent hashes from one concurrent
+// discovery or an aborted earlier run from leaking into another search.
+thread_local! {
+    static STAGED_SEEN_SIGNATURE_HASHES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn clear_staged_seen_signature_hashes_on_this_thread() {
+    STAGED_SEEN_SIGNATURE_HASHES.with(|staged| staged.borrow_mut().clear());
+}
+
+pub(crate) fn stage_seen_signature_hashes_for_next_current_on_this_thread(hashes: &[u64]) {
+    STAGED_SEEN_SIGNATURE_HASHES.with(|staged| {
+        let mut staged = staged.borrow_mut();
+        staged.clear();
+        staged.extend_from_slice(hashes);
+    });
+}
+
+fn take_staged_seen_signature_hashes_on_this_thread() -> Vec<u64> {
+    STAGED_SEEN_SIGNATURE_HASHES.with(|staged| std::mem::take(&mut *staged.borrow_mut()))
+}
+
 /// Install process-wide seen-signature-memory overrides. Returns
 /// `Err(existing)` when overrides were already installed earlier (the
 /// first install wins).
@@ -484,6 +544,9 @@ impl SeenSignatureMemory {
                     }
                 }
             }
+        }
+        for signature in take_staged_seen_signature_hashes_on_this_thread() {
+            memory.insert_in_memory(signature);
         }
         memory
     }
@@ -794,37 +857,94 @@ fn random_coarse_threshold(rng: &mut impl Rng) -> f64 {
 /// Returns `None` when the cube is empty or has zero finite values.
 pub fn derive_adaptive_threshold_ladder_from_features(
     features: &neoethos_data::FeatureFrame,
-) -> Option<[f64; 6]> {
+) -> anyhow::Result<Option<[f64; 6]>> {
     let n_cols = features.n_features();
     let n_rows = features.n_samples();
     if n_cols == 0 || n_rows == 0 {
-        return None;
+        return Ok(None);
     }
 
-    // Per-column median |value|. `feature_column` yields one contiguous series
-    // per call — for the mmap backing this is a single feature-major row read,
-    // so the scan is sequential rather than strided across the whole matrix.
+    // Per-column median |value|. Project RAM-sized multi-column batches and
+    // score independent batches in parallel. The former implementation issued
+    // one full Vortex scan per column and fully sorted every column, making this
+    // supposedly cheap pre-search calibration take hours on dense M5/M1 data.
+    // `select_nth_unstable_by` returns the exact same rank (`len / 2`) as that
+    // full sort without paying O(n log n); no approximate quantile is used.
+    let projection_plan =
+        neoethos_data::adaptive_feature_projection_plan(features, rayon::current_num_threads())?;
+    tracing::info!(
+        target: "neoethos_search::adaptive_thresholds",
+        rows = n_rows,
+        columns = n_cols,
+        columns_per_projection = projection_plan.columns_per_batch,
+        concurrent_projections = projection_plan.concurrent_batches,
+        projection_budget_bytes = projection_plan.budget_bytes,
+        "deriving the exact adaptive threshold ladder in bounded parallel projections"
+    );
+    derive_adaptive_threshold_ladder_with_projection_schedule(
+        features,
+        projection_plan.columns_per_batch,
+        projection_plan.concurrent_batches,
+    )
+}
+
+// Keep the mathematical reduction independent of the live RAM probe so tests
+// can prove that different admitted schedules do not change the search space.
+// Production always enters through the adaptive planner above.
+fn derive_adaptive_threshold_ladder_with_projection_schedule(
+    features: &neoethos_data::FeatureFrame,
+    columns_per_batch: usize,
+    concurrent_batches: usize,
+) -> anyhow::Result<Option<[f64; 6]>> {
+    let n_cols = features.n_features();
+    let n_rows = features.n_samples();
+    if n_cols == 0 || n_rows == 0 {
+        return Ok(None);
+    }
+    let column_indices = (0..n_cols).collect::<Vec<_>>();
     let mut per_col_median_abs: Vec<f64> = Vec::with_capacity(n_cols);
-    for c in 0..n_cols {
-        let column = features.feature_column(c).ok()?;
-        let mut abs_vals: Vec<f64> = column
-            .values
-            .iter()
-            .zip(&column.validity)
-            .filter_map(|(value, validity)| validity.is_valid().then_some(value.abs()))
-            .collect();
-        if abs_vals.is_empty() {
-            continue;
-        }
-        abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = abs_vals[abs_vals.len() / 2];
-        if median.is_finite() && median >= 0.0 {
-            per_col_median_abs.push(median);
+    let columns_per_batch = columns_per_batch.max(1);
+    let wave_columns = columns_per_batch
+        .saturating_mul(concurrent_batches.max(1))
+        .max(1);
+    for wave in column_indices.chunks(wave_columns) {
+        let wave_medians = wave
+            .par_chunks(columns_per_batch)
+            .map(|indices| -> anyhow::Result<Vec<f64>> {
+                let projection = features.project_columns(indices, 0..n_rows)?;
+                anyhow::ensure!(
+                    projection.columns.len() == indices.len(),
+                    "adaptive-threshold projection returned {} columns for {} indices",
+                    projection.columns.len(),
+                    indices.len()
+                );
+                let mut medians = Vec::with_capacity(indices.len());
+                for column in &projection.columns {
+                    let mut abs_values = column
+                        .values
+                        .iter()
+                        .zip(&column.validity)
+                        .filter_map(|(value, validity)| validity.is_valid().then_some(value.abs()))
+                        .collect::<Vec<_>>();
+                    if abs_values.is_empty() {
+                        continue;
+                    }
+                    let middle = abs_values.len() / 2;
+                    let (_, median, _) = abs_values.select_nth_unstable_by(middle, f64::total_cmp);
+                    if median.is_finite() && *median >= 0.0 {
+                        medians.push(*median);
+                    }
+                }
+                Ok(medians)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for medians in wave_medians {
+            per_col_median_abs.extend(medians);
         }
     }
 
     if per_col_median_abs.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Pool: percentile points on the per-column-median sample.
@@ -848,10 +968,10 @@ pub fn derive_adaptive_threshold_ladder_from_features(
     for i in 1..ladder.len() {
         if ladder[i] < ladder[i - 1] {
             // Degenerate distribution — bail to static fallback.
-            return None;
+            return Ok(None);
         }
     }
-    Some(ladder)
+    Ok(Some(ladder))
 }
 
 /// Reset every derived/financial metric on a Gene that was inherited from a
@@ -912,10 +1032,10 @@ pub fn new_random_gene(
         let tp = (sl * rr).clamp(bounds.tp_min_pips, bounds.tp_max_pips);
         (sl, tp)
     };
-    // Adaptive stops (Stage 2c): when enabled, seed a searchable volatility
-    // multiplier so the stop scales with volatility at entry (the fixed sl/tp
-    // above are then ignored in favour of `mult × vol-distance`). Off → 0.0 =
-    // fixed-stop, byte-identical to before.
+    // Adaptive stops: seed a searchable volatility multiplier so the absolute
+    // stop scales at entry. The sl/tp pair above still owns the dimensionless
+    // reward:risk ratio, so every random gene can express a different exit.
+    // Off → 0.0 = fixed-stop, byte-identical to before.
     let stop_vol_mult = if crate::stop_target::adaptive_stops_enabled() {
         rng.random_range(0.5..=3.0)
     } else {
@@ -1085,15 +1205,13 @@ pub fn crossover(a: &Gene, b: &Gene, generation: usize, rng: &mut impl Rng) -> G
     } else {
         b.use_displacement
     };
-    child.tp_pips = if rng.random_bool(0.5) {
-        a.tp_pips
+    // Stop and target are one exit-geometry trait. Inheriting their halves from
+    // different parents can manufacture an out-of-band reward:risk ratio that
+    // neither parent was evaluated with.
+    (child.sl_pips, child.tp_pips) = if rng.random_bool(0.5) {
+        (a.sl_pips, a.tp_pips)
     } else {
-        b.tp_pips
-    };
-    child.sl_pips = if rng.random_bool(0.5) {
-        a.sl_pips
-    } else {
-        b.sl_pips
+        (b.sl_pips, b.tp_pips)
     };
     // Adaptive-stop multiplier is inherited like the fixed stops so the GA can
     // recombine it (0.0 on both parents => stays fixed-stop).
@@ -1170,13 +1288,29 @@ pub fn mutate(
             2 => {
                 let range = 0.2 * intensity as f64;
                 if mutated.stop_vol_mult > 0.0 {
-                    // Adaptive-stop gene: perturb the volatility multiplier (the
-                    // active stop knob) instead of the unused fixed pips. Clamped
-                    // to a sane band so the stop stays a small multiple of the
-                    // bar's vol distance.
+                    // Adaptive-stop gene: both active exit traits evolve. The
+                    // multiplier controls stop distance; tp/sl controls payoff.
                     mutated.stop_vol_mult = (mutated.stop_vol_mult
                         * rng.random_range((1.0 - range)..(1.0 + range)))
                     .clamp(0.3, 4.0);
+                    let bounds = current_gene_stop_bounds();
+                    let stop = if mutated.sl_pips.is_finite() && mutated.sl_pips > 0.0 {
+                        mutated
+                            .sl_pips
+                            .clamp(bounds.sl_min_pips, bounds.sl_max_pips)
+                    } else {
+                        bounds.mid_pair().0
+                    };
+                    let current_reward_risk = crate::stop_target::effective_adaptive_reward_risk(
+                        mutated.sl_pips,
+                        mutated.tp_pips,
+                        0.5 * (bounds.rr_min + bounds.rr_max),
+                    );
+                    let reward_risk = (current_reward_risk
+                        * rng.random_range((1.0 - range)..(1.0 + range)))
+                    .clamp(bounds.rr_min, bounds.rr_max);
+                    mutated.sl_pips = stop;
+                    mutated.tp_pips = stop * reward_risk;
                 } else {
                     // Fixed-stop gene: mutate inside the SAME band the
                     // initialiser draws from, resolved for this dataset. Using
@@ -1219,14 +1353,16 @@ pub fn mutate(
 // the old name now get a compile error pointing at the canonical
 // function — which is what we want.
 
-pub fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]], growth_objective: bool) {
+pub fn apply_metrics(
+    genes: &mut [Gene],
+    metrics: &[[f64; 11]],
+    config: &super::strategy_gene::EvaluationConfig,
+    evaluation_span_days: f64,
+) {
     for (gene, m) in genes.iter_mut().zip(metrics.iter()) {
-        // Scoring Phase B (2026-05-25): call the canonical
-        // `crate::scoring::ga_fitness` directly rather than the
-        // local `#[deprecated]` `score_from_metrics` shim.
-        // scoring_version 5 (2026-07-02): Risky discovery evolves under the
-        // Kelly log-growth objective; everything else keeps the v4 formula.
-        gene.fitness = if growth_objective {
+        gene.fitness = if let Some(goal) = config.growth_goal {
+            crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
+        } else if config.growth_objective {
             crate::scoring::ga_fitness_growth(m)
         } else {
             crate::scoring::ga_fitness(m)
@@ -1329,8 +1465,13 @@ mod tests {
         let band = current_gene_stop_bounds();
         let smc = crate::genetic::SmcSearchConfig::default();
         let mut rng = rand::rng();
+        let mut distinct_adaptive_ratios = std::collections::BTreeSet::new();
+        let mut adaptive_ratio_mutated = false;
         for _ in 0..200 {
             let gene = new_random_gene(8, 4, 0, &smc, &mut rng);
+            let gene_ratio = gene.tp_pips / gene.sl_pips;
+            assert!(gene_ratio >= band.rr_min - 1e-9 && gene_ratio <= band.rr_max + 1e-9);
+            distinct_adaptive_ratios.insert((gene_ratio * 1_000_000.0).round() as i64);
             assert!(
                 gene.sl_pips >= band.sl_min_pips - 1e-9 && gene.sl_pips <= band.sl_max_pips + 1e-9,
                 "initialised sl {} outside [{}, {}]",
@@ -1339,6 +1480,14 @@ mod tests {
                 band.sl_max_pips
             );
             let mutated = mutate(&gene, 8, 4, 1, &smc, 0, &mut rng);
+            let mutated_ratio = mutated.tp_pips / mutated.sl_pips;
+            assert!(
+                mutated_ratio >= band.rr_min - 1e-9 && mutated_ratio <= band.rr_max + 1e-9,
+                "mutated adaptive ratio {mutated_ratio} outside [{}, {}]",
+                band.rr_min,
+                band.rr_max
+            );
+            adaptive_ratio_mutated |= (mutated_ratio - gene_ratio).abs() > 1e-12;
             assert!(
                 mutated.sl_pips >= band.sl_min_pips - 1e-9
                     && mutated.sl_pips <= band.sl_max_pips + 1e-9,
@@ -1348,6 +1497,12 @@ mod tests {
                 band.sl_max_pips
             );
         }
+        assert!(
+            distinct_adaptive_ratios.len() > 20,
+            "random population collapsed to only {} adaptive exit ratios",
+            distinct_adaptive_ratios.len()
+        );
+        assert!(adaptive_ratio_mutated, "adaptive ratio never mutated");
 
         // Leave the process as we found it so no later test inherits an H4 scale.
         clear_gene_stop_atr_scale();
@@ -1357,6 +1512,140 @@ mod tests {
     fn rank_weights_follow_candidate_order() {
         let weights = rank_weights(&[10, 20, 30, 40]);
         assert_eq!(weights, vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn rank_draw_matches_legacy_choices_and_rng_state_including_sparse_candidate_ids() {
+        use rand::{SeedableRng, rngs::StdRng};
+        for count in [0, 1, 2, 7, 200, 2_107, 21_069] {
+            let candidates = (0..count).map(|i| 3 * (count - i) + 7).collect::<Vec<_>>();
+            let weights = rank_weights(&candidates);
+            let mut old_rng = StdRng::seed_from_u64(731);
+            let mut new_rng = old_rng.clone();
+            for _ in 0..1_024 {
+                let expected = if count == 0 {
+                    0
+                } else {
+                    candidates[draw_weighted_offset(&weights, &mut old_rng)]
+                };
+                let actual = select_parent_index(
+                    &[],
+                    &candidates,
+                    ParentSelectionPolicy::RankWeighted,
+                    4,
+                    0.75,
+                    &mut new_rng,
+                );
+                assert_eq!(actual, expected, "population={count}");
+            }
+            assert_eq!(
+                new_rng.random::<u64>(),
+                old_rng.random::<u64>(),
+                "RNG draw count"
+            );
+        }
+    }
+
+    #[test]
+    fn rank_cumulative_boundaries_keep_the_earlier_candidate() {
+        for count in [1usize, 2, 11, 21_069, 1 << 26] {
+            assert_eq!(rank_offset_for_target(count, 0.0), 0);
+            let n = count as u64;
+            for offset in [0, count / 2, count - 1] {
+                let terms = offset as u64 + 1;
+                let boundary = (terms * (2 * n - terms + 1) / 2) as f64;
+                assert_eq!(rank_offset_for_target(count, boundary), offset);
+                assert_eq!(rank_offset_for_target(count, boundary.next_down()), offset);
+                if offset + 1 < count {
+                    assert_eq!(
+                        rank_offset_for_target(count, boundary.next_up()),
+                        offset + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn survivor_removal_preserves_rank_and_tournament_draw_sequences() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let scores = (0..257).map(|i| 1.0 / (i + 1) as f64).collect::<Vec<_>>();
+        for policy in [
+            SurvivorSelectionPolicy::RankWeighted,
+            SurvivorSelectionPolicy::Tournament,
+        ] {
+            for count in [0, 1, 27, 257, 300] {
+                let mut old_rng = StdRng::seed_from_u64(51);
+                let mut new_rng = old_rng.clone();
+                let mut available = (0..scores.len()).collect::<Vec<_>>();
+                let mut expected = Vec::new();
+                while !available.is_empty() && expected.len() < count {
+                    let idx = if policy == SurvivorSelectionPolicy::RankWeighted {
+                        available[draw_weighted_offset(&rank_weights(&available), &mut old_rng)]
+                    } else {
+                        select_parent_index(
+                            &scores,
+                            &available,
+                            ParentSelectionPolicy::Tournament,
+                            4,
+                            0.75,
+                            &mut old_rng,
+                        )
+                    };
+                    expected.push(idx);
+                    available.retain(|candidate| *candidate != idx);
+                }
+                expected.sort_unstable();
+                assert_eq!(
+                    select_survivor_indices(&scores, count, policy, 0.75, 4, &mut new_rng),
+                    expected
+                );
+                assert_eq!(new_rng.random::<u64>(), old_rng.random::<u64>());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "bounded bookkeeping benchmark; run explicitly, not on every test invocation"]
+    fn benchmark_rank_parent_selection_at_m30_population() {
+        use rand::{SeedableRng, rngs::StdRng};
+        use std::{hint::black_box, time::Instant};
+        let candidates = (0..21_069).collect::<Vec<_>>();
+        let mut old_rng = StdRng::seed_from_u64(19);
+        let mut new_rng = old_rng.clone();
+        let started = Instant::now();
+        let expected = (0..10_000)
+            .map(|_| {
+                // Include the old per-draw allocation/reduction, not a cached oracle.
+                black_box(draw_weighted_offset(
+                    &rank_weights(black_box(&candidates)),
+                    &mut old_rng,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let old_elapsed = started.elapsed();
+        let started = Instant::now();
+        let actual = (0..10_000)
+            .map(|_| {
+                black_box(select_parent_index(
+                    &[],
+                    black_box(&candidates),
+                    ParentSelectionPolicy::RankWeighted,
+                    4,
+                    0.75,
+                    &mut new_rng,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let new_elapsed = started.elapsed();
+        assert_eq!(actual, expected);
+        assert_eq!(new_rng.random::<u64>(), old_rng.random::<u64>());
+        eprintln!(
+            "GA rank benchmark population=21069 draws=10000 legacy_s={:.6} optimized_s={:.6} exact_choices=true debug_assertions={}",
+            old_elapsed.as_secs_f64(),
+            new_elapsed.as_secs_f64(),
+            cfg!(debug_assertions)
+        );
     }
 
     #[test]
@@ -1465,7 +1754,11 @@ mod tests {
     fn derive_ladder_returns_none_for_all_nan_cube() {
         let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((10, 3));
         data.fill(f64::NAN);
-        assert!(derive_adaptive_threshold_ladder_from_features(&frame_of(data)).is_none());
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame_of(data))
+                .expect("all-NaN scan must not fail")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1479,6 +1772,7 @@ mod tests {
             data[(r, 3)] = -(r as f64) * 0.02; // negative side
         }
         let ladder = derive_adaptive_threshold_ladder_from_features(&frame_of(data))
+            .expect("adaptive-threshold scan must not fail")
             .expect("non-degenerate cube must produce ladder");
         // Monotone ascending
         for i in 1..ladder.len() {
@@ -1495,6 +1789,205 @@ mod tests {
             assert!(v.is_finite());
             assert!(*v >= 1e-4);
             assert!(*v <= 10.0);
+        }
+    }
+
+    fn ladder_vortex_copy(
+        features: &neoethos_data::FeatureFrame,
+        root: &std::path::Path,
+    ) -> neoethos_data::FeatureFrame {
+        use neoethos_data::core::feature_run_lease::FeatureRunLease;
+        use neoethos_data::core::vortex_feature_store::{
+            VortexFeatureStore, VortexFeatureStoreOptions,
+        };
+
+        let neoethos_data::FeatureData::InMemory(columns) = &features.data else {
+            panic!("ladder fixture must start in RAM")
+        };
+        let lease = std::sync::Arc::new(
+            FeatureRunLease::create(root, "adaptive-ladder-parity").expect("isolated Vortex lease"),
+        );
+        let store = VortexFeatureStore::create(
+            lease,
+            &features.timestamps,
+            columns,
+            VortexFeatureStoreOptions::default(),
+        )
+        .expect("persist exact ladder fixture");
+        neoethos_data::FeatureFrame::from_vortex(
+            features.timestamps.clone(),
+            store,
+            features.plan().clone(),
+            features.provenance().clone(),
+        )
+        .expect("Vortex ladder frame")
+    }
+
+    #[test]
+    fn derive_ladder_matches_hand_calculated_upper_medians_and_percentile_ranks() {
+        use FeatureCellValidity::{Gap, Stale, Valid, Warmup};
+        use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+
+        let central = f64::from_bits(0.8_f64.to_bits() + 1);
+        let medians = [
+            0.0,
+            f64::MIN_POSITIVE,
+            0.001,
+            0.1,
+            central,
+            1.5,
+            3.0,
+            9.0,
+            20.0,
+        ];
+        let mut columns = medians
+            .into_iter()
+            .enumerate()
+            .map(|(index, median)| {
+                // Four valid magnitudes: [0.5m, 0.75m, m, 2m]. The upper
+                // median is exactly m, not the average of the middle pair.
+                FeatureColumnF64::new(
+                    format!("known_median_{index}"),
+                    vec![
+                        -median * 0.5,
+                        median * 2.0,
+                        median,
+                        -median * 0.75,
+                        f64::MAX,
+                        -99.0,
+                        42.0,
+                    ],
+                    vec![Valid, Valid, Valid, Valid, Warmup, Gap, Stale],
+                )
+                .expect("known median column")
+            })
+            .collect::<Vec<_>>();
+        columns.push(
+            FeatureColumnF64::new("all_invalid", vec![f64::NAN; 7], vec![Warmup; 7])
+                .expect("all-invalid column"),
+        );
+        let ram = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(7),
+            columns,
+        )
+        .expect("analytic ladder fixture");
+        let temporary = tempfile::tempdir().expect("isolated analytic Vortex root");
+        let vortex = ladder_vortex_copy(&ram, temporary.path());
+        // Nine contributing columns: round(p * 8) selects 1, 2, 4, 6, 7, 8.
+        // The first and last selected values exercise both explicit clamps.
+        let expected = [1e-4_f64, 0.001, central, 3.0, 9.0, 10.0].map(f64::to_bits);
+        for frame in [&ram, &vortex] {
+            let actual = derive_adaptive_threshold_ladder_from_features(frame)
+                .expect("analytic ladder scan")
+                .expect("known medians produce a ladder");
+            assert_eq!(actual.map(f64::to_bits), expected);
+        }
+    }
+
+    #[test]
+    fn derive_ladder_is_bit_exact_across_ram_vortex_workers_and_projection_schedules() {
+        use FeatureCellValidity::{Gap, Valid, Warmup};
+        use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureData};
+
+        let rows = 2_053;
+        let columns = (0..19)
+            .map(|column| {
+                let values = (0..rows)
+                    .map(|row| {
+                        let sign = if row % 2 == 0 { -1.0 } else { 1.0 };
+                        sign * match column % 5 {
+                            0 => 0.0,
+                            1 => f64::MIN_POSITIVE * (row % 7 + 1) as f64,
+                            2 => f64::from_bits(1.0_f64.to_bits() + (row % 31) as u64),
+                            3 => f64::MAX / (row % 17 + 1) as f64,
+                            _ => ((row * 37 + column * 13) % 509) as f64 / 64.0,
+                        }
+                    })
+                    .collect();
+                let validity = (0..rows)
+                    .map(|row| {
+                        if column == 18 || row % 17 == 0 {
+                            Warmup
+                        } else if row % 23 == 0 {
+                            Gap
+                        } else {
+                            Valid
+                        }
+                    })
+                    .collect();
+                FeatureColumnF64::new(format!("mixed_δοκιμή_{column}"), values, validity)
+                    .expect("mixed precision/validity column")
+            })
+            .collect();
+        let ram = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+        .expect("mixed ladder fixture");
+        let FeatureData::InMemory(raw_columns) = &ram.data else {
+            unreachable!()
+        };
+        // Independent full-sort reference: no projection planner, parallel
+        // collection or select_nth implementation is reused by this oracle.
+        let mut medians = raw_columns
+            .iter()
+            .filter_map(|column| {
+                let mut magnitudes = column
+                    .values
+                    .iter()
+                    .zip(&column.validity)
+                    .filter(|(value, validity)| value.is_finite() && validity.is_valid())
+                    .map(|(value, _)| value.abs())
+                    .collect::<Vec<_>>();
+                magnitudes.sort_by(f64::total_cmp);
+                magnitudes.get(magnitudes.len() / 2).copied()
+            })
+            .collect::<Vec<_>>();
+        medians.sort_by(f64::total_cmp);
+        let expected = [0.10, 0.25, 0.50, 0.75, 0.90, 0.99].map(|percentile| {
+            let index = (percentile * (medians.len() - 1) as f64).round() as usize;
+            medians[index].clamp(1e-4, 10.0).to_bits()
+        });
+        let temporary = tempfile::tempdir().expect("isolated parity Vortex root");
+        let vortex = ladder_vortex_copy(&ram, temporary.path());
+        for workers in [1, 2, 5] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("isolated parity worker pool");
+            for frame in [&ram, &vortex] {
+                assert_eq!(
+                    pool.install(|| derive_adaptive_threshold_ladder_from_features(frame))
+                        .expect("live-planned ladder")
+                        .expect("nonempty ladder")
+                        .map(f64::to_bits),
+                    expected,
+                );
+                for (batch_columns, concurrent_batches) in [
+                    (1, 1),
+                    (1, 3),
+                    (2, 3),
+                    (5, 2),
+                    (19, 1),
+                    (usize::MAX, usize::MAX),
+                ] {
+                    let actual = pool
+                        .install(|| {
+                            derive_adaptive_threshold_ladder_with_projection_schedule(
+                                frame,
+                                batch_columns,
+                                concurrent_batches,
+                            )
+                        })
+                        .expect("scheduled ladder")
+                        .expect("nonempty ladder")
+                        .map(f64::to_bits);
+                    assert_eq!(
+                        actual, expected,
+                        "workers={workers}, batch_columns={batch_columns}, concurrent_batches={concurrent_batches}",
+                    );
+                }
+            }
         }
     }
 

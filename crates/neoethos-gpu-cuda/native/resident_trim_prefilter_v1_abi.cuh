@@ -8,6 +8,9 @@
 namespace neoethos::resident_trim_prefilter_v1 {
 
 constexpr std::uint32_t NEO_RESIDENT_TRIM_PREFILTER_ABI_V1 = 1U;
+constexpr std::uint32_t NEO_RESIDENT_TRIM_PREFILTER_IMPORT_ABI_V2 = 2U;
+constexpr std::uint32_t NEO_RESIDENT_TRIM_PREFILTER_SCORE_BATCH_ABI_V2 = 2U;
+constexpr std::uint32_t NEO_RESIDENT_TRIM_PREFILTER_SELECTED_MAP_READ_ABI_V2 = 2U;
 
 constexpr std::int32_t NEO_TRIM_PREFILTER_STATUS_OK_V1 = 0;
 constexpr std::int32_t NEO_TRIM_PREFILTER_STATUS_INVALID_ARGUMENT_V1 = -1;
@@ -218,6 +221,35 @@ struct NeoResidentTrimPrefilterViewsV1 {
   std::uint8_t cuda_build_manifest_sha256[32];
 };
 
+/// Additive streaming-score descriptor. Values and validity are local
+/// bar-major batch buffers; the destination scores retain the immutable global
+/// parent ordinals. The V1 import/plan/view layouts remain byte-for-byte stable.
+struct NeoResidentTrimPrefilterScoreBatchV2 {
+  std::uint32_t abi_version;
+  std::uint32_t reserved;
+  const double* batch_values_bar_major;
+  const unsigned char* batch_validity_u4;
+  std::uint64_t batch_row_count;
+  std::uint64_t batch_column_count;
+  std::uint64_t local_batch_stride;
+  std::uint64_t global_parent_column_start;
+  const std::uint32_t* global_parent_ordinals_device;
+  cudaEvent_t batch_ready_event;
+};
+
+/// Bounded control-plane readback used only between the V2 screening and
+/// compact-materialization passes. The selected feature payload never crosses
+/// to host.
+struct NeoResidentTrimPrefilterSelectedMapReadV2 {
+  std::uint32_t abi_version;
+  std::uint32_t reserved;
+  std::uint64_t selected_capacity;
+  std::uint64_t selected_count;
+  std::uint64_t selected_map_readback_bytes;
+  std::uint32_t* selected_global_parent_ordinals_host;
+  cudaEvent_t selected_map_readback_ready_event;
+};
+
 static_assert(sizeof(void*) == 8,
               "resident trim/prefilter V1 requires a 64-bit ABI");
 static_assert(sizeof(NeoResidentTrimPrefilterImportV1) == 560,
@@ -236,6 +268,46 @@ static_assert(sizeof(NeoResidentTrimPrefilterReadyEventV1) == 56,
               "ready-event ABI changed");
 static_assert(sizeof(NeoResidentTrimPrefilterViewsV1) == 344,
               "resident trim/prefilter views ABI changed");
+static_assert(sizeof(NeoResidentTrimPrefilterScoreBatchV2) == 72,
+              "resident trim/prefilter score-batch V2 ABI changed");
+static_assert(sizeof(NeoResidentTrimPrefilterSelectedMapReadV2) == 48,
+              "resident trim/prefilter selected-map read V2 ABI changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, abi_version) == 0,
+              "score-batch V2 abi_version offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, reserved) == 4,
+              "score-batch V2 reserved offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, batch_values_bar_major) == 8,
+              "score-batch V2 values offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, batch_validity_u4) == 16,
+              "score-batch V2 validity offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, batch_row_count) == 24,
+              "score-batch V2 row count offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, batch_column_count) == 32,
+              "score-batch V2 column count offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, local_batch_stride) == 40,
+              "score-batch V2 stride offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, global_parent_column_start) == 48,
+              "score-batch V2 global start offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, global_parent_ordinals_device) == 56,
+              "score-batch V2 ordinal pointer offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterScoreBatchV2, batch_ready_event) == 64,
+              "score-batch V2 ready event offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterSelectedMapReadV2, abi_version) == 0,
+              "selected-map read V2 abi_version offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterSelectedMapReadV2, reserved) == 4,
+              "selected-map read V2 reserved offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterSelectedMapReadV2, selected_capacity) == 8,
+              "selected-map read V2 capacity offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterSelectedMapReadV2, selected_count) == 16,
+              "selected-map read V2 count offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterSelectedMapReadV2, selected_map_readback_bytes) == 24,
+              "selected-map read V2 byte count offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterSelectedMapReadV2,
+                       selected_global_parent_ordinals_host) == 32,
+              "selected-map read V2 host pointer offset changed");
+static_assert(offsetof(NeoResidentTrimPrefilterSelectedMapReadV2,
+                       selected_map_readback_ready_event) == 40,
+              "selected-map read V2 ready event offset changed");
 
 struct NeoResidentTrimPrefilterRunV1;
 
@@ -258,6 +330,17 @@ extern "C" std::int32_t create_resident_trim_prefilter_run_v1(
 
 extern "C" std::int32_t enqueue_resident_trim_prefilter_stage_v1(
     NeoResidentTrimPrefilterRunV1* run, std::uint32_t stage);
+
+extern "C" std::int32_t enqueue_resident_trim_prefilter_score_batch_v2(
+    NeoResidentTrimPrefilterRunV1* run,
+    const NeoResidentTrimPrefilterScoreBatchV2* batch);
+
+extern "C" std::int32_t seal_resident_trim_prefilter_selected_map_v2(
+    NeoResidentTrimPrefilterRunV1* run);
+
+extern "C" std::int32_t read_resident_trim_prefilter_selected_map_v2(
+    NeoResidentTrimPrefilterRunV1* run,
+    NeoResidentTrimPrefilterSelectedMapReadV2* read);
 
 extern "C" std::int32_t seal_resident_trim_prefilter_views_v1(
     NeoResidentTrimPrefilterRunV1* run,

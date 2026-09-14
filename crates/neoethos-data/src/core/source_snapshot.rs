@@ -215,7 +215,7 @@ fn check_free_disk(path: &Path, source_bytes: u64, limits: &ImportLimits) -> Res
 }
 
 #[cfg(unix)]
-fn available_disk_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn available_disk_bytes(path: &Path) -> Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .context("staging path contains an interior NUL")?;
@@ -230,7 +230,7 @@ fn available_disk_bytes(path: &Path) -> Result<u64> {
 }
 
 #[cfg(windows)]
-fn available_disk_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn available_disk_bytes(path: &Path) -> Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {

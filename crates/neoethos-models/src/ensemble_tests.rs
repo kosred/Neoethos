@@ -120,7 +120,7 @@ fn validate_meta_metadata_rejects_inconsistent_training_summary() {
         CapabilityState::Implemented,
         vec!["feature".to_string()],
         default_three_class_label_mapping(),
-        crate::runtime::artifacts::TrainingSummaryMetadata::raw_for_validation(12, 8, 1),
+        crate::runtime::artifacts::TrainingSummaryMetadata::raw_for_validation(12, 8, 0, 1),
     );
 
     let err = validate_meta_metadata(&metadata, "meta_stack")

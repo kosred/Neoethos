@@ -324,7 +324,10 @@ fn run_tool(program: &str, arguments: &[&str], operation: &str) -> Result<String
     })
 }
 
-pub(crate) fn resolve_exact_cuda_architectures() -> Result<ExactCudaArchitectures, String> {
+pub(crate) fn resolve_exact_cuda_architectures_for_tools(
+    nvcc: &str,
+    nvidia_smi: &str,
+) -> Result<ExactCudaArchitectures, String> {
     for name in [
         "NEOETHOS_CUDA_BUILD_MODE",
         "NEOETHOS_CUDA_ARCHS",
@@ -360,18 +363,16 @@ pub(crate) fn resolve_exact_cuda_architectures() -> Result<ExactCudaArchitecture
     )?;
     validate_legacy_architecture_inputs(early_inputs, request)?;
 
-    let nvidia_smi = read_optional_env("NVIDIA_SMI")?.unwrap_or_else(|| "nvidia-smi".to_owned());
     let visible_compute_capabilities = match request {
         ArchitectureRequest::HostAuto => Some(run_tool(
-            &nvidia_smi,
+            nvidia_smi,
             &["--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
             "detect visible NVIDIA compute capabilities",
         )?),
         ArchitectureRequest::CrossReleaseExplicit(_) => None,
     };
-    let nvcc = read_optional_env("CUDACXX")?.unwrap_or_else(|| "nvcc".to_owned());
     let nvcc_real_architectures = run_tool(
-        &nvcc,
+        nvcc,
         &["--list-gpu-code"],
         "list nvcc real CUDA architectures",
     )?;
@@ -392,4 +393,10 @@ pub(crate) fn resolve_exact_cuda_architectures() -> Result<ExactCudaArchitecture
         architectures.numeric.replace(';', ",sm_")
     );
     Ok(architectures)
+}
+
+pub(crate) fn resolve_exact_cuda_architectures() -> Result<ExactCudaArchitectures, String> {
+    let nvidia_smi = read_optional_env("NVIDIA_SMI")?.unwrap_or_else(|| "nvidia-smi".to_owned());
+    let nvcc = read_optional_env("CUDACXX")?.unwrap_or_else(|| "nvcc".to_owned());
+    resolve_exact_cuda_architectures_for_tools(&nvcc, &nvidia_smi)
 }

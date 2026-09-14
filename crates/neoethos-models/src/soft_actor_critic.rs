@@ -394,7 +394,7 @@ fn sac_runtime_metadata(
         CapabilityState::Implemented,
         feature_columns,
         canonical_three_class_label_mapping(),
-        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0),
+        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0, 0),
     )
 }
 
@@ -443,12 +443,16 @@ fn validate_sac_metadata(
             metadata.training_summary.dataset_rows
         );
     }
-    if metadata.training_summary.train_rows + metadata.training_summary.val_rows
-        != metadata.training_summary.dataset_rows
-    {
+    let accounted_rows = metadata
+        .training_summary
+        .train_rows
+        .checked_add(metadata.training_summary.embargo_rows)
+        .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows));
+    if accounted_rows != Some(metadata.training_summary.dataset_rows) {
         bail!(
-            "sac metadata rows are inconsistent: train_rows {} + val_rows {} != dataset_rows {}",
+            "sac metadata rows are inconsistent: train_rows {} + embargo_rows {} + val_rows {} != dataset_rows {}",
             metadata.training_summary.train_rows,
+            metadata.training_summary.embargo_rows,
             metadata.training_summary.val_rows,
             metadata.training_summary.dataset_rows
         );
@@ -613,16 +617,16 @@ fn resolve_sac_runtime_metadata(
         &artifact.feature_columns,
         artifact.train_rows,
     )?;
+    if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+        validate_sac_metadata(embedded, &artifact.feature_columns, artifact.train_rows)?;
+        if embedded != &reconstructed {
+            bail!("sac embedded runtime metadata does not match reconstructed artifact state");
+        }
+    }
     match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
         Ok(metadata) => {
             validate_sac_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
-            if metadata.model_name != reconstructed.model_name
-                || metadata.family != reconstructed.family
-                || metadata.state != reconstructed.state
-                || metadata.feature_columns != reconstructed.feature_columns
-                || metadata.label_mapping != reconstructed.label_mapping
-                || metadata.training_summary != reconstructed.training_summary
-            {
+            if metadata != reconstructed {
                 bail!(
                     "sac metadata sidecar mismatch with reconstructed runtime metadata at {}",
                     metadata_path.display()

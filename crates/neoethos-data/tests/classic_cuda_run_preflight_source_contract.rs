@@ -34,25 +34,42 @@ fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
 fn gpu_run_plan_preflights_the_complete_admission_before_feature_allocation() {
     let hpc = source("src/core/hpc_ta.rs");
     let prepare = function_body(&hpc, "pub fn prepare_classic_ta_run_plan(");
+    assert!(prepare.contains("prepare_classic_ta_run_plan_with_working_set("));
+    let prepare_with_working_set = function_body(
+        &hpc,
+        "pub(crate) fn prepare_classic_ta_run_plan_with_working_set(",
+    );
     assert!(
-        prepare.contains("build_classic_ta_admission_plan")
-            && prepare.contains("build_exact_classic_cuda_plan")
-            && prepare.contains("resolve_gpu_only_classic_plan"),
+        prepare_with_working_set.contains("build_classic_ta_admission_plan")
+            && prepare_with_working_set.contains("build_exact_classic_cuda_plan")
+            && prepare_with_working_set.contains("resolve_gpu_only_classic_plan"),
         "one allocation-free run plan must capture admission and resolve every CUDA route"
     );
 
     let data = source("src/lib.rs");
-    let cube = function_body(
+    let wrapper = function_body(
         &data,
         "fn prepare_multitimeframe_features_with_optional_cutoff(",
     );
     assert_eq!(
-        cube.matches("prepare_classic_ta_run_plan(").count(),
+        wrapper
+            .matches("prepare_multitimeframe_features_with_feature_math_authority_v3(")
+            .count(),
+        1,
+        "the compatibility wrapper must enter the shared multi-timeframe authority exactly once"
+    );
+    let cube = function_body(
+        &data,
+        "fn prepare_multitimeframe_features_with_feature_math_authority_v3(",
+    );
+    assert_eq!(
+        cube.matches("prepare_classic_ta_run_plan_with_working_set(")
+            .count(),
         1,
         "the multi-timeframe cube must capture exactly one RAM/admission decision"
     );
     let preflight = cube
-        .find("prepare_classic_ta_run_plan(")
+        .find("prepare_classic_ta_run_plan_with_working_set(")
         .expect("run preflight is present");
     let first_feature = cube
         .find("compute_hpc_feature_frame_sized_with_classic_plan(")
@@ -72,9 +89,16 @@ fn gpu_run_plan_preflights_the_complete_admission_before_feature_allocation() {
 #[test]
 fn frame_execution_consumes_the_frozen_admission_instead_of_reprobing_ram() {
     let hpc = source("src/core/hpc_ta.rs");
-    let execute = function_body(
+    let wrapper = function_body(
         &hpc,
         "pub fn compute_classic_ta_columns_sized_report_with_run_plan(",
+    );
+    assert!(wrapper.contains("compute_classic_ta_columns_sized_report_with_control("));
+    assert!(wrapper.contains("run_plan,"));
+    assert!(!wrapper.contains("prepare_classic_ta_run_plan("));
+    let execute = function_body(
+        &hpc,
+        "fn compute_classic_ta_columns_sized_report_with_control(",
     );
     assert!(
         execute.contains("run_plan.admission.clone()")

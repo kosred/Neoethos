@@ -8,7 +8,7 @@
 //! active, a bounded coordinator-thread recheck also observes raw leases that
 //! share the broker but cannot emit an app command when they drop.
 
-use neoethos_core::execution::{BudgetedCpuExecutor, BudgetedCpuExecutorError};
+use neoethos_core::execution::{BudgetedCpuExecutor, BudgetedCpuExecutorError, BudgetedCpuScope};
 use neoethos_core::execution_budget::{
     AcquireError, AuxiliarySlotLease, AuxiliarySlotLimit, AuxiliarySlotRequest, BrokerSnapshot,
     CompositeAdmissionAuthority, CompositeAdmissionRequest, CompositeAdmissionSnapshot, CpuLease,
@@ -325,7 +325,7 @@ impl AdmittedCpuLease {
     /// return or panic unwinding, the executor first drops the raw lease and
     /// this wrapper then wakes the coordinator.
     pub fn execute<R, Work>(
-        mut self,
+        self,
         executor: &BudgetedCpuExecutor,
         work: Work,
     ) -> Result<R, BudgetedCpuExecutorError>
@@ -333,12 +333,26 @@ impl AdmittedCpuLease {
         R: Send,
         Work: FnOnce() -> R + Send,
     {
+        self.execute_with_scope(executor, |_| work())
+    }
+
+    /// Lend proof of the exact admitted pool to consumers that must share the
+    /// existing reservation, rather than acquiring a second CPU budget.
+    pub fn execute_with_scope<R, Work>(
+        mut self,
+        executor: &BudgetedCpuExecutor,
+        work: Work,
+    ) -> Result<R, BudgetedCpuExecutorError>
+    where
+        R: Send,
+        Work: FnOnce(&BudgetedCpuScope<'_>) -> R + Send,
+    {
         let transfer = self
             .lease
             .take()
             .expect("an admitted lease can be executed only once")
             .into_transfer();
-        executor.execute(transfer, work)
+        executor.execute_with_scope(transfer, work)
     }
 }
 

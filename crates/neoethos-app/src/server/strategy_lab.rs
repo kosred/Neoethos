@@ -1,18 +1,17 @@
 //! `/strategy_lab/*` — Promotion Gate status + promote-to-live (F-330).
 //!
 //! The Strategy Lab pipeline is Discovery → Training → Validation →
-//! **Promotion Gate**. Promotion is intentionally fail-closed today: search
-//! emits `neoethos.search-promotion-summary.v3`, whose selection-envelope plus
-//! typed holdout payload still does
-//! not prove the exact in-sample/holdout/forward/prop windows. Both endpoints
-//! return 412 and copy zero files until search-core emits an exact composite
-//! v3 authority and this loader verifies that new schema.
+//! **Promotion Gate**. GET is a read-only readiness diagnostic: absent or
+//! unverified evidence is a successful HOLD response, not deployment permission.
+//! POST retains the independent broker-truth and opaque composite-copy gates.
+//! Selection/calibration metrics and ResearchOnly evidence cannot authorize
+//! promotion; the exact installed candidate and independent final OOS evidence
+//! are not yet connected to this symbol/timeframe endpoint.
 //!
 //! Endpoints:
 //!   - `GET  /strategy_lab/promotion?symbol=EURUSD&base_tf=M5`
-//!       Evaluate the latest portfolio for that symbol/timeframe
-//!       against the promotion gate and return the decision +
-//!       per-criterion breakdown. Read-only.
+//!       Describe the current exact evidence gaps for that symbol/timeframe.
+//!       No candidate is selected by recency or profit. Read-only.
 //!   - `POST /strategy_lab/promote`  (body: {symbol, baseTf})
 //!       If the gate passes, copy the trained artifacts from
 //!       `models/<symbol>/<tf>/` to `live_models/<symbol>/<tf>/` so the
@@ -70,8 +69,8 @@ pub struct PromotionResponseDto {
     pub symbol: String,
     pub base_tf: String,
     pub portfolio_size: usize,
-    /// Portfolio-aggregate metrics the gate evaluated (None when the
-    /// portfolio is empty after an exact composite-v3 authority is available).
+    /// None when promotion metrics cannot be evaluated from exact evidence.
+    /// The diagnostic GET never substitutes selection/calibration metrics.
     pub aggregate: Option<PromotionMetrics>,
     pub decision: PromotionDecision,
     /// The thresholds in effect, echoed so the UI can render
@@ -82,23 +81,41 @@ pub struct PromotionResponseDto {
 // ─── GET /strategy_lab/promotion ───────────────────────────────────────────
 
 pub async fn promotion_status(
-    State(_state): State<AppApiState>,
+    State(state): State<AppApiState>,
     Query(q): Query<PromotionQuery>,
 ) -> Response {
-    // 2026-06-04 PARITY: empty → resolved from config.yaml inside
-    // evaluate_promotion_for (shared SystemConfig resolvers), not a hardcoded
-    // "EURUSD"/"M5" that ignored the operator's configured symbol/base.
+    promotion_status_for_config(q, state.config_path().to_path_buf()).await
+}
+
+/// Same handler path with one captured config path; tests need no global override.
+async fn promotion_status_for_config(
+    q: PromotionQuery,
+    config_path: std::path::PathBuf,
+) -> Response {
     let symbol = q.symbol.unwrap_or_default();
     let base_tf = q.base_tf.unwrap_or_default();
-
-    let result =
-        tokio::task::spawn_blocking(move || evaluate_promotion_for(&symbol, &base_tf)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        evaluate_promotion_for(&config_path, &symbol, &base_tf)
+    })
+    .await;
     match result {
         Ok(Ok(dto)) => Json(dto).into_response(),
-        Ok(Err(err)) => promotion_error_response(
-            err,
-            "Could not evaluate the promotion gate. Run Discovery first to produce a \
-             receipt-bound portfolio for this exact dataset, then retry.",
+        Ok(Err(err))
+            if matches!(
+                err.downcast_ref::<PromotionAuthorizationError>(),
+                Some(PromotionAuthorizationError::UnsafePathLeaf { .. })
+            ) =>
+        {
+            actionable_error(
+                StatusCode::BAD_REQUEST,
+                "Use one safe symbol and a canonical base timeframe.",
+                &err,
+            )
+        }
+        Ok(Err(err)) => actionable_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not read the configured promotion-readiness state. Check the configuration file.",
+            &err,
         ),
         Err(join_err) => internal_panic("Evaluating the promotion gate", join_err),
     }
@@ -147,8 +164,76 @@ struct AuthorizedPromotionEvaluation {
     copy_permit: PromotionCopyPermit,
 }
 
-fn evaluate_promotion_for(symbol: &str, base_tf: &str) -> anyhow::Result<PromotionResponseDto> {
-    Ok(evaluate_authorized_promotion_for(symbol, base_tf)?.response)
+fn evaluate_promotion_for(
+    config_path: &Path,
+    symbol: &str,
+    base_tf: &str,
+) -> anyhow::Result<PromotionResponseDto> {
+    let settings = Settings::from_yaml(config_path)
+        .map_err(|e| anyhow::anyhow!("{} not loadable: {e}", config_path.display()))?;
+    let symbol = if symbol.trim().is_empty() {
+        settings.system.resolve_symbol()
+    } else {
+        symbol.trim().to_uppercase()
+    };
+    let base_tf = if base_tf.trim().is_empty() {
+        settings.system.resolve_base_timeframe()
+    } else {
+        base_tf.trim().to_uppercase()
+    };
+    // Reject unsafe selectors before constructing even a diagnostic file path.
+    validate_promotion_path_leafs(&symbol, &base_tf).map_err(anyhow::Error::new)?;
+    let targets = read_model_targets_for_promotion(&settings.system.data_dir, &symbol, &base_tf)
+        .map(|file| file.portfolio.len());
+    Ok(promotion_readiness_response(
+        symbol,
+        base_tf,
+        load_gate_config(&settings),
+        targets,
+    ))
+}
+
+/// File validation is diagnostic here, never an opaque copy permit. There is no
+/// exact installed-candidate selector in this endpoint, so even a valid legacy
+/// target/sidecar pair cannot produce PROMOTE or supply final-OOS metrics.
+fn promotion_readiness_response(
+    symbol: String,
+    base_tf: String,
+    config: PromotionGateConfig,
+    targets: Result<usize, PromotionAuthorizationError>,
+) -> PromotionResponseDto {
+    let (portfolio_size, target_status) = match targets {
+        Ok(count) => (
+            count,
+            format!("Validated target/sidecar binding contains {count} entries (diagnostic only)."),
+        ),
+        Err(error) => (
+            0,
+            format!(
+                "Target/sidecar evidence unavailable: {error}. Portfolio size 0 means no verified \
+                 target count, not proof that no research candidates exist."
+            ),
+        ),
+    };
+    PromotionResponseDto {
+        symbol,
+        base_tf,
+        portfolio_size,
+        aggregate: None,
+        decision: PromotionDecision {
+            promoted: false,
+            criteria: Vec::new(),
+            summary: format!(
+                "HOLD — {target_status} Missing candidate selection: this symbol/timeframe route \
+                 does not select an exact installed candidate/training-handoff identity. \
+                 Independent final OOS evidence is unverified for promotion. Exact composite \
+                 in-sample/calibration/final-holdout promotion authority is unavailable. \
+                 Selection/calibration metrics and ResearchOnly V2/V3 results are not permits. \
+                 Metric thresholds were not evaluated; POST promotion remains separately gated."
+            ),
+        },
+        config,
+    }
 }
 
 fn evaluate_authorized_promotion_for(
@@ -222,6 +307,34 @@ fn authorize_model_targets_for_promotion(
     base_tf: &str,
 ) -> Result<(ModelTargetsFile, PromotionCopyPermit), PromotionAuthorizationError> {
     let validated_path = validate_promotion_path_leafs(symbol, base_tf)?;
+    let file = read_model_targets_for_promotion(data_root, symbol, base_tf)?;
+    // The exact target/sidecar binding is not independent final OOS or a
+    // composite promotion permit. Keep every authorization predicate unchanged.
+    let copy_permit = authorize_exact_composite_promotion_v3(
+        validated_path,
+        file.promotion_summary_authority.envelope.artifact_kind(),
+        CompositeAuthorityChecksV3 {
+            exact_receipt_config_sidecar: true,
+            exact_composite_scope: false,
+            required_evidence_complete: false,
+            required_evidence_passed: false,
+        },
+    )?;
+    debug_assert_eq!(
+        file.promotion_summary_authority.envelope.artifact_kind(),
+        REQUIRED_COMPOSITE_PROMOTION_AUTHORITY_KIND_V3,
+        "only search-core composite v3 may mint a promotion copy permit"
+    );
+    Ok((file, copy_permit))
+}
+
+/// Exact existing file/receipt/config/sidecar checks, without creating permission.
+fn read_model_targets_for_promotion(
+    data_root: &Path,
+    symbol: &str,
+    base_tf: &str,
+) -> Result<ModelTargetsFile, PromotionAuthorizationError> {
+    validate_promotion_path_leafs(symbol, base_tf)?;
     let canonical_timeframe = base_tf.parse::<CanonicalTimeframe>().map_err(|_| {
         PromotionAuthorizationError::UnsafePathLeaf {
             field: "base timeframe",
@@ -376,27 +489,7 @@ fn authorize_model_targets_for_promotion(
         });
     }
 
-    // The current search-core writer emits a V2 whole-DiscoveryInput scope.
-    // Its OOS booleans and per-kind hashes are diagnostic only: they cannot
-    // prove the exact 80/20 in-sample + held-out/forward/prop composite. Keep
-    // the v3 target/sidecar equality diagnostics above, but deliberately mint
-    // no permit until search-core ships the exact composite v3 authority.
-    let copy_permit = authorize_exact_composite_promotion_v3(
-        validated_path,
-        actual_authority.artifact_kind(),
-        CompositeAuthorityChecksV3 {
-            exact_receipt_config_sidecar: true,
-            exact_composite_scope: false,
-            required_evidence_complete: false,
-            required_evidence_passed: false,
-        },
-    )?;
-    debug_assert_eq!(
-        actual_authority.artifact_kind(),
-        REQUIRED_COMPOSITE_PROMOTION_AUTHORITY_KIND_V3,
-        "only search-core composite v3 may mint a promotion copy permit"
-    );
-    Ok((file, copy_permit))
+    Ok(file)
 }
 
 // ─── POST /strategy_lab/promote ────────────────────────────────────────────
@@ -497,6 +590,10 @@ fn promote_if_gated(symbol: &str, base_tf: &str) -> anyhow::Result<PromoteRespon
         message,
     })
 }
+
+#[cfg(test)]
+#[path = "strategy_lab_diagnostic_tests.rs"]
+mod diagnostic_tests;
 
 #[cfg(test)]
 mod tests {

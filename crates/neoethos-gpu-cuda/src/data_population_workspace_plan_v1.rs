@@ -203,8 +203,15 @@ pub struct SealedNativeCudaDataPopulationPreflightFactsV1 {
     allocator_context_reserve_bytes: u64,
     compute_capability_major: u16,
     compute_capability_minor: u16,
+    multiprocessor_count: u32,
+    warp_size: u32,
     cuda_build_manifest_sha256: [u8; 32],
     cuda_build_artifact_sha256: [u8; 32],
+    /// Process-local handle retained only so allocation-free native scratch
+    /// queries can run on the exact admitted stream before any stage plan is
+    /// bound. It is deliberately excluded from the public API and from the
+    /// facts hash because the source admission identity already binds it.
+    run_stream_handle: usize,
     facts_identity_sha256: [u8; 32],
 }
 
@@ -237,6 +244,14 @@ impl SealedNativeCudaDataPopulationPreflightFactsV1 {
         self.compute_capability_minor
     }
 
+    pub const fn multiprocessor_count(&self) -> u32 {
+        self.multiprocessor_count
+    }
+
+    pub const fn warp_size(&self) -> u32 {
+        self.warp_size
+    }
+
     pub const fn cuda_build_manifest_sha256(&self) -> [u8; 32] {
         self.cuda_build_manifest_sha256
     }
@@ -247,6 +262,10 @@ impl SealedNativeCudaDataPopulationPreflightFactsV1 {
 
     pub const fn facts_identity_sha256(&self) -> [u8; 32] {
         self.facts_identity_sha256
+    }
+
+    pub(crate) const fn run_stream_handle_v2(&self) -> usize {
+        self.run_stream_handle
     }
 }
 
@@ -562,6 +581,8 @@ pub fn native_cuda_data_population_preflight_facts_v1(
     hasher.update(DATA_POPULATION_ALLOCATOR_RESERVE_BYTES_V1.to_le_bytes());
     hasher.update(admission.compute_capability_major.to_le_bytes());
     hasher.update(admission.compute_capability_minor.to_le_bytes());
+    hasher.update(admission.multiprocessor_count.to_le_bytes());
+    hasher.update(admission.warp_size.to_le_bytes());
     hasher.update(admission.cuda_build_identity.manifest_sha256);
     hasher.update(admission.cuda_build_identity.artifact_sha256);
     let facts_identity_sha256 = hasher.finalize().into();
@@ -572,8 +593,11 @@ pub fn native_cuda_data_population_preflight_facts_v1(
         allocator_context_reserve_bytes: DATA_POPULATION_ALLOCATOR_RESERVE_BYTES_V1,
         compute_capability_major: admission.compute_capability_major,
         compute_capability_minor: admission.compute_capability_minor,
+        multiprocessor_count: admission.multiprocessor_count,
+        warp_size: admission.warp_size,
         cuda_build_manifest_sha256: admission.cuda_build_identity.manifest_sha256,
         cuda_build_artifact_sha256: admission.cuda_build_identity.artifact_sha256,
+        run_stream_handle: admission.run_stream.as_inner() as usize,
         facts_identity_sha256,
     }
 }
@@ -633,6 +657,8 @@ pub fn bind_data_population_gpu_workspace_plan_v1(
         context_api_version,
         compute_capability_major,
         compute_capability_minor,
+        multiprocessor_count,
+        warp_size,
         free_memory_bytes_snapshot,
         ..
     } = native;
@@ -643,11 +669,14 @@ pub fn bind_data_population_gpu_workspace_plan_v1(
     } = cuda_build_identity;
     let run_device = seal_gpu_only_run_device_admission_v3(GpuOnlyRunDeviceAdmissionRequestV3 {
         source_admission_identity_sha256: admission_identity_sha256,
+        native_preflight_facts_identity_sha256: plan.native_admission_facts_identity_sha256,
         workspace_plan_identity_sha256: plan.workspace_plan_identity_sha256,
         selected_device_ordinal: ordinal,
         device_uuid,
         compute_capability_major,
         compute_capability_minor,
+        multiprocessor_count,
+        warp_size,
         run_stream,
         primary_context,
         driver_version,
@@ -668,5 +697,44 @@ pub fn bind_data_population_gpu_workspace_plan_v1(
             error.to_string(),
         )
     })?;
+    Ok(AdmittedNativeCudaDataPopulationRunV1 { run_device })
+}
+
+/// Reseal the exact same primary context and stream after the bounded
+/// screening resources have been retired. This is not a second device
+/// acquisition or memory probe: the final plan must bind the original native
+/// facts identity and the original pre-materialization free-memory snapshot.
+pub fn upgrade_feature_screening_run_to_data_population_v2(
+    run_device: GpuOnlyRunDeviceAdmissionV3,
+    plan: SealedDataPopulationGpuWorkspacePlanV1,
+) -> Result<AdmittedNativeCudaDataPopulationRunV1, DataPopulationWorkspacePlanErrorV1> {
+    if run_device.native_preflight_facts_identity_sha256()
+        != plan.native_admission_facts_identity_sha256
+    {
+        return Err(DataPopulationWorkspacePlanErrorV1::new(
+            DataPopulationWorkspacePlanErrorCodeV1::AdmissionFactsMismatch,
+            "selected Data+population plan does not bind the original screening admission facts",
+        ));
+    }
+    if plan.required_device_bytes_including_reserve() > run_device.phase_one_free_bytes_snapshot() {
+        return Err(DataPopulationWorkspacePlanErrorV1::new(
+            DataPopulationWorkspacePlanErrorCodeV1::InsufficientExactOrdinalMemory,
+            "selected Data+population plan exceeds the original free-memory snapshot",
+        ));
+    }
+    let run_device = run_device
+        .reseal_for_data_population_v2(
+            plan.workspace_plan_identity_sha256,
+            plan.native_admission_facts_identity_sha256,
+            plan.classic_ta_implementation_sha256,
+            plan.exact_math_authority,
+            plan.limits,
+        )
+        .map_err(|error| {
+            DataPopulationWorkspacePlanErrorV1::new(
+                DataPopulationWorkspacePlanErrorCodeV1::RunDeviceAdmissionFailure,
+                error.to_string(),
+            )
+        })?;
     Ok(AdmittedNativeCudaDataPopulationRunV1 { run_device })
 }

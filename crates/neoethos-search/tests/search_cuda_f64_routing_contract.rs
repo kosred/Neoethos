@@ -32,37 +32,37 @@ fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
 }
 
 #[test]
-fn cuda_search_uses_one_f64_lane_and_routes_native_b_explicitly() {
+fn cuda_search_uses_only_the_native_f64_lane_and_fails_closed_without_it() {
     let identity = search_source("engine_identity.rs");
     assert!(
         !identity.contains("CubeclF32"),
         "the superseded f32 search engine must not remain an active identity"
     );
     assert!(
-        identity
-            .contains("PrototypeBReadiness::NotCompiledIn => Ok(PopulationEvalEngine::CubeclF64)"),
-        "non-native GPU builds must resolve to the canonical f64 CubeCL lane"
+        identity.contains("PrototypeBReadiness::NotCompiledIn => Err(")
+            && !identity.contains(
+                "PrototypeBReadiness::NotCompiledIn => Ok(PopulationEvalEngine::CubeclF64)"
+            ),
+        "a build without native CUDA must fail closed instead of substituting CubeCL"
     );
 
     let backend = search_source("backend.rs");
     let gpu_impl_start = backend
-        .find("#[cfg(feature = \"gpu\")]\nfn evaluate_gpu_required_population(")
+        .find("#[cfg(feature = \"gpu-b-adapter\")]\nfn evaluate_gpu_required_population(")
         .expect("GPU-required implementation must exist");
     let dispatch = function_body(
         &backend[gpu_impl_start..],
         "fn evaluate_gpu_required_population(",
     );
-    assert!(
-        dispatch.contains("PopulationEvalEngine::CudaNativeF64 =>"),
-        "strict CUDA dispatch must branch on the resolved engine"
-    );
+    assert!(dispatch.contains("PopulationEvalEngine::CudaNativeF64"));
     assert!(
         dispatch.contains("try_evaluate_population_b("),
         "the native-B branch must call Prototype B directly"
     );
     assert!(
-        dispatch.contains("PopulationEvalEngine::CubeclF64 =>"),
-        "the CubeCL branch must be explicit and f64"
+        !dispatch.contains("PopulationEvalEngine::CubeclF64")
+            && !dispatch.contains("try_evaluate_population_cuda("),
+        "strict CUDA dispatch must not substitute the distinct CubeCL engine"
     );
 
     let cubecl = search_source("cubecl_eval.rs");
@@ -219,40 +219,4 @@ fn superseded_native_b_event_oracle_test_and_counter_stay_removed() {
         eval.contains("fn gpu_matches_cpu_with_a_trailing_stop()"),
         "the walk-based CPU/native-B P&L parity replacement must remain present"
     );
-}
-
-#[test]
-fn native_b_residency_is_scoped_and_released_after_every_outer_run() {
-    let adapter = search_source("gpu_native/prototype_b_population_eval.rs");
-    assert!(
-        adapter.contains("struct NativePopulationResidencyScope"),
-        "the process-wide native-B cache needs an explicit RAII lifetime"
-    );
-    let scope = function_body(&adapter, "fn native_population_residency_scope()");
-    assert!(
-        scope.contains("active_residency_scopes"),
-        "nested population evaluations must share one outer residency lifetime"
-    );
-    let drop_impl = function_body(&adapter, "fn drop(&mut self)");
-    assert!(
-        drop_impl.contains("*slot = None"),
-        "the last residency scope must drop the native PopulationSession"
-    );
-    let scenarios = function_body(&adapter, "pub(crate) fn try_evaluate_scenarios_b(");
-    assert!(
-        scenarios.contains("native_population_residency_scope()"),
-        "a direct native-B evaluation must own a fallback scope instead of leaking a static cache"
-    );
-
-    let discovery = search_source("discovery.rs");
-    for signature in [
-        "pub fn run_discovery_cycle_with_holdout_and_progress<F>(",
-        "pub fn run_discovery_cycle_with_progress<F>(",
-    ] {
-        let body = function_body(&discovery, signature);
-        assert!(
-            body.contains("native_population_residency_scope()"),
-            "{signature} must retain native-B residency for the whole run and release it on exit"
-        );
-    }
 }

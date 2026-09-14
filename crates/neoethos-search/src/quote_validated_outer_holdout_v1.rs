@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
 use neoethos_broker_truth::{
-    EvidenceWindowV1, ExecutionEconomicsArtifactClassV1, ExecutionEconomicsPromotionEligibilityV1,
-    QuoteValidatedExecutionEconomicsLedgerV1, QuoteValidatedResearchAuthorityV1,
-    QuoteValidatedResearchPromotionEligibilityV1, QuoteValidatedResearchReplayReceiptV1,
-    SealedHistoricalQuoteValidatedResearchLedgerV1,
+    AccountMoneyV1, EvidenceWindowV1, ExecutionEconomicsArtifactClassV1,
+    ExecutionEconomicsPromotionEligibilityV1, QuoteValidatedExecutionEconomicsLedgerV1,
+    QuoteValidatedResearchAuthorityV1, QuoteValidatedResearchPromotionEligibilityV1,
+    QuoteValidatedResearchReplayReceiptV1, SealedHistoricalQuoteValidatedResearchLedgerV1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -95,17 +95,41 @@ fn stable_sha256<T: Serialize>(
     domain: &str,
     value: &T,
 ) -> Result<String, QuoteValidatedOuterHoldoutErrorV1> {
-    let bytes = serde_json::to_vec(value).map_err(|error| {
+    // Preserve the exact historical domain + compact JSON identity without
+    // allocating a second expanded copy of every nested portfolio receipt.
+    struct HashWriter(Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut hash = HashWriter(Sha256::new());
+    hash.0.update(domain.as_bytes());
+    hash.0.update([0]);
+    // JSON byte arrays emit a write for each number and separator. Batch those
+    // tiny fragments before SHA-256 without materializing the expanded JSON or
+    // changing a single byte of the historical identity stream.
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, hash);
+    serde_json::to_writer(&mut writer, value).map_err(|error| {
         outer_error(
             QuoteValidatedOuterHoldoutErrorCodeV1::ArtifactEncodingFailed,
             format!("cannot encode {domain}: {error}"),
         )
     })?;
-    let mut hasher = Sha256::new();
-    hasher.update(domain.as_bytes());
-    hasher.update([0]);
-    hasher.update(bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    // into_inner flushes the final partial block and propagates its error;
+    // dropping a buffered writer would silently discard a flush failure.
+    let hash = writer.into_inner().map_err(|error| {
+        outer_error(
+            QuoteValidatedOuterHoldoutErrorCodeV1::ArtifactEncodingFailed,
+            format!("cannot finish encoding {domain}: {error}"),
+        )
+    })?;
+    Ok(format!("{:x}", hash.0.finalize()))
 }
 
 #[derive(Serialize)]
@@ -287,6 +311,7 @@ pub struct QuoteValidatedOuterHoldoutTradeOutcomeV1 {
     quote_ledger_sha256: String,
     execution_economics_ledger_sha256: String,
     exit_timestamp_unix_ms: i64,
+    account_currency: String,
     net_pnl_account_currency: f64,
     net_pips: f64,
     r_multiple: f64,
@@ -305,6 +330,10 @@ impl QuoteValidatedOuterHoldoutTradeOutcomeV1 {
         self.exit_timestamp_unix_ms
     }
 
+    pub fn account_currency(&self) -> &str {
+        &self.account_currency
+    }
+
     pub const fn net_pnl_account_currency(&self) -> f64 {
         self.net_pnl_account_currency
     }
@@ -320,34 +349,71 @@ impl QuoteValidatedOuterHoldoutTradeOutcomeV1 {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct QuoteValidatedOuterHoldoutMetricsV1 {
+    metric_basis: &'static str,
+    initial_balance: AccountMoneyV1,
+    ending_balance: f64,
     net_profit: f64,
+    net_return_fraction: f64,
     sharpe: Option<f64>,
+    sharpe_unavailable_reason: &'static str,
     peak_equity: f64,
     max_drawdown: f64,
+    max_drawdown_fraction: f64,
     win_rate: Option<f64>,
     profit_factor: Option<f64>,
     expectancy: Option<f64>,
     trade_count: usize,
     consistency: Option<f64>,
     max_daily_drawdown: f64,
+    max_daily_drawdown_fraction: Option<f64>,
     entry_unavailable: usize,
 }
 
 impl QuoteValidatedOuterHoldoutMetricsV1 {
+    /// Closed-trade balance observations, not mark-to-market portfolio equity.
+    pub const fn metric_basis(&self) -> &'static str {
+        self.metric_basis
+    }
+
+    pub fn initial_balance(&self) -> &AccountMoneyV1 {
+        &self.initial_balance
+    }
+
+    pub const fn ending_balance(&self) -> f64 {
+        self.ending_balance
+    }
+
     pub const fn net_profit(&self) -> f64 {
         self.net_profit
     }
 
+    /// Fraction of starting capital, not percentage points.
+    pub const fn net_return_fraction(&self) -> f64 {
+        self.net_return_fraction
+    }
+
+    /// Unavailable without a regular marked-equity and benchmark return series.
+    /// Irregular closed-trade cash outcomes do not supply those observations.
     pub const fn sharpe(&self) -> Option<f64> {
         self.sharpe
     }
 
+    pub const fn sharpe_unavailable_reason(&self) -> &'static str {
+        self.sharpe_unavailable_reason
+    }
+
+    /// Compatibility name: this is the realized balance peak, not open equity.
     pub const fn peak_equity(&self) -> f64 {
         self.peak_equity
     }
 
     pub const fn max_drawdown(&self) -> f64 {
         self.max_drawdown
+    }
+
+    /// Maximum closed-balance decline divided by its contemporaneous peak.
+    pub const fn max_drawdown_fraction(&self) -> f64 {
+        self.max_drawdown_fraction
     }
 
     pub const fn win_rate(&self) -> Option<f64> {
@@ -374,90 +440,174 @@ impl QuoteValidatedOuterHoldoutMetricsV1 {
         self.max_daily_drawdown
     }
 
+    /// UTC-day peak-to-trough closed-balance fraction, not a prop-firm rule.
+    /// Unavailable if any observed day starts at a non-positive cash balance;
+    /// closed cash alone cannot establish insolvency while other trades are open.
+    pub const fn max_daily_drawdown_fraction(&self) -> Option<f64> {
+        self.max_daily_drawdown_fraction
+    }
+
     pub const fn entry_unavailable(&self) -> usize {
         self.entry_unavailable
     }
 }
 
+fn finite_metric_v1(label: &str, value: f64) -> Result<f64, QuoteValidatedOuterHoldoutErrorV1> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(outer_error(
+            QuoteValidatedOuterHoldoutErrorCodeV1::InvalidMetricInput,
+            format!("quote-validated {label} is not finite"),
+        ))
+    }
+}
+
 fn derive_complete_quote_validated_metrics_v1(
+    initial_balance: &AccountMoneyV1,
     trade_outcomes: &[QuoteValidatedOuterHoldoutTradeOutcomeV1],
     entry_unavailable: usize,
 ) -> Result<QuoteValidatedOuterHoldoutMetricsV1, QuoteValidatedOuterHoldoutErrorV1> {
-    let pnl = trade_outcomes
-        .iter()
-        .map(QuoteValidatedOuterHoldoutTradeOutcomeV1::net_pnl_account_currency)
-        .collect::<Vec<_>>();
-    if pnl.iter().any(|value| !value.is_finite()) {
+    // Revalidate because AccountMoneyV1 also has an untrusted Deserialize path.
+    let initial_balance = AccountMoneyV1::new(initial_balance.currency(), initial_balance.amount())
+        .map_err(|error| {
+            outer_error(
+                QuoteValidatedOuterHoldoutErrorCodeV1::InvalidMetricInput,
+                error.to_string(),
+            )
+        })?;
+    let start = initial_balance.amount();
+    if start <= 0.0 {
         return Err(outer_error(
             QuoteValidatedOuterHoldoutErrorCodeV1::InvalidMetricInput,
-            "quote-validated net PnL contains a non-finite value",
+            "quote-validated starting balance must be positive",
+        ));
+    }
+    for outcome in trade_outcomes {
+        if outcome.account_currency() != initial_balance.currency() {
+            return Err(outer_error(
+                QuoteValidatedOuterHoldoutErrorCodeV1::BindingMismatch,
+                "closed execution currency differs from the run's starting balance currency",
+            ));
+        }
+        finite_metric_v1("net PnL", outcome.net_pnl_account_currency())?;
+        finite_metric_v1("net pips", outcome.net_pips())?;
+        finite_metric_v1("R multiple", outcome.r_multiple())?;
+    }
+    if trade_outcomes
+        .windows(2)
+        .any(|pair| pair[0].exit_timestamp_unix_ms() > pair[1].exit_timestamp_unix_ms())
+    {
+        return Err(outer_error(
+            QuoteValidatedOuterHoldoutErrorCodeV1::ReceiptOrderMismatch,
+            "closed execution outcomes are not chronological",
         ));
     }
 
-    let trade_count = pnl.len();
-    let net_profit = pnl.iter().sum::<f64>();
-    let expectancy = (trade_count > 0).then_some(net_profit / trade_count as f64);
-    let wins = pnl.iter().filter(|value| **value > 0.0).count();
-    let win_rate = (trade_count > 0).then_some(wins as f64 / trade_count as f64);
-    let gross_profit = pnl.iter().filter(|value| **value > 0.0).sum::<f64>();
-    let gross_loss = -pnl.iter().filter(|value| **value < 0.0).sum::<f64>();
-    let profit_factor = (gross_loss > 0.0).then_some(gross_profit / gross_loss);
+    let trade_count = trade_outcomes.len();
+    let mut net_profit = 0.0;
+    let mut gross_profit = 0.0;
+    let mut gross_loss = 0.0;
+    let mut wins = 0_usize;
+    let mut equity = start;
+    let mut peak_equity = start;
+    let mut max_drawdown = 0.0_f64;
+    let mut max_drawdown_fraction = 0.0_f64;
+    let mut max_daily_drawdown = 0.0_f64;
+    let mut max_daily_drawdown_fraction = Some(0.0_f64);
+    let mut previous_day = None;
+    let mut day_peak = start;
+    let mut day_pnl = 0.0;
+    let mut active_days = 0_usize;
+    let mut positive_days = 0_usize;
 
-    let sharpe = if trade_count >= 2 {
-        let mean = net_profit / trade_count as f64;
-        let variance = pnl
-            .iter()
-            .map(|value| {
-                let delta = value - mean;
-                delta * delta
-            })
-            .sum::<f64>()
-            / (trade_count - 1) as f64;
-        (variance > 0.0).then_some(mean / variance.sqrt())
+    // Only one balance observation is known per exit timestamp. An arbitrary
+    // ordering of simultaneous portfolio closes must not invent interim peaks.
+    // This ordered cash-ledger pass uses constant auxiliary memory.
+    for closes in trade_outcomes
+        .chunk_by(|left, right| left.exit_timestamp_unix_ms() == right.exit_timestamp_unix_ms())
+    {
+        let day = closes[0].exit_timestamp_unix_ms().div_euclid(86_400_000);
+        if previous_day != Some(day) {
+            if previous_day.is_some() && day_pnl > 0.0 {
+                positive_days += 1;
+            }
+            active_days += 1;
+            previous_day = Some(day);
+            day_peak = equity;
+            if day_peak <= 0.0 {
+                max_daily_drawdown_fraction = None;
+            }
+            day_pnl = 0.0;
+        }
+        let mut close_pnl = 0.0;
+        for outcome in closes {
+            let pnl = outcome.net_pnl_account_currency();
+            close_pnl = finite_metric_v1("simultaneous closed PnL", close_pnl + pnl)?;
+            if pnl > 0.0 {
+                wins += 1;
+                gross_profit = finite_metric_v1("gross winning PnL", gross_profit + pnl)?;
+            } else if pnl < 0.0 {
+                gross_loss = finite_metric_v1("gross losing PnL", gross_loss - pnl)?;
+            }
+        }
+        net_profit = finite_metric_v1("total net PnL", net_profit + close_pnl)?;
+        equity = finite_metric_v1("closing balance", start + net_profit)?;
+        day_pnl = finite_metric_v1("daily net PnL", day_pnl + close_pnl)?;
+        peak_equity = peak_equity.max(equity);
+        day_peak = day_peak.max(equity);
+        let drawdown = finite_metric_v1("closed-balance drawdown", peak_equity - equity)?;
+        let daily_drawdown = finite_metric_v1("daily closed-balance drawdown", day_peak - equity)?;
+        max_drawdown = max_drawdown.max(drawdown);
+        max_drawdown_fraction = max_drawdown_fraction.max(finite_metric_v1(
+            "closed-balance drawdown fraction",
+            drawdown / peak_equity,
+        )?);
+        max_daily_drawdown = max_daily_drawdown.max(daily_drawdown);
+        if let Some(maximum) = max_daily_drawdown_fraction {
+            max_daily_drawdown_fraction = Some(maximum.max(finite_metric_v1(
+                "daily closed-balance drawdown fraction",
+                daily_drawdown / day_peak,
+            )?));
+        }
+    }
+    if previous_day.is_some() && day_pnl > 0.0 {
+        positive_days += 1;
+    }
+    let expectancy = (trade_count > 0).then(|| net_profit / trade_count as f64);
+    let win_rate = (trade_count > 0).then(|| wins as f64 / trade_count as f64);
+    let profit_factor = if gross_loss > 0.0 {
+        Some(finite_metric_v1(
+            "profit factor",
+            gross_profit / gross_loss,
+        )?)
     } else {
         None
     };
-
-    let mut equity = 0.0_f64;
-    let mut peak_equity = 0.0_f64;
-    let mut max_drawdown = 0.0_f64;
-    let mut daily = BTreeMap::<i64, Vec<f64>>::new();
-    for outcome in trade_outcomes {
-        equity += outcome.net_pnl_account_currency();
-        peak_equity = peak_equity.max(equity);
-        max_drawdown = max_drawdown.max(peak_equity - equity);
-        daily
-            .entry(outcome.exit_timestamp_unix_ms().div_euclid(86_400_000))
-            .or_default()
-            .push(outcome.net_pnl_account_currency());
-    }
-    let mut max_daily_drawdown = 0.0_f64;
-    let mut positive_days = 0_usize;
-    for day in daily.values() {
-        let mut day_equity = 0.0_f64;
-        let mut day_peak = 0.0_f64;
-        for value in day {
-            day_equity += value;
-            day_peak = day_peak.max(day_equity);
-            max_daily_drawdown = max_daily_drawdown.max(day_peak - day_equity);
-        }
-        if day_equity > 0.0 {
-            positive_days += 1;
-        }
-    }
-    let consistency = (!daily.is_empty()).then_some(positive_days as f64 / daily.len() as f64);
+    let consistency = (active_days > 0).then(|| positive_days as f64 / active_days as f64);
+    let net_return_fraction = finite_metric_v1("net return fraction", net_profit / start)?;
 
     Ok(QuoteValidatedOuterHoldoutMetricsV1 {
+        metric_basis: "closed_trade_balance_at_exit_timestamps",
+        initial_balance,
+        ending_balance: equity,
         net_profit,
-        sharpe,
+        net_return_fraction,
+        // Trade cash PnL is neither a periodic return series nor marked equity.
+        // Keep the existing optional field explicitly unavailable until those
+        // observations and the benchmark policy are supplied by the producer.
+        sharpe: None,
+        sharpe_unavailable_reason: "regular_mark_to_market_and_benchmark_returns_not_supplied",
         peak_equity,
         max_drawdown,
+        max_drawdown_fraction,
         win_rate,
         profit_factor,
         expectancy,
         trade_count,
         consistency,
         max_daily_drawdown,
+        max_daily_drawdown_fraction,
         entry_unavailable,
     })
 }
@@ -602,7 +752,7 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
     ordered_signals: &[Vec<i8>],
     search_config_hash: &str,
     expected_holdout_scope: &CanonicalSearchArtifactScopeV2,
-    initial_balance: f64,
+    initial_balance: AccountMoneyV1,
     pip_value_per_lot: f64,
     replay_set: LockedPortfolioOuterHoldoutReplaySetV1,
 ) -> Result<QuoteValidatedOuterHoldoutResearchEvidenceV1, QuoteValidatedOuterHoldoutErrorV1> {
@@ -619,8 +769,8 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
             "sealed replay set holdout scope differs from the locked final outer holdout",
         ));
     }
-    if !initial_balance.is_finite()
-        || initial_balance <= 0.0
+    if !initial_balance.amount().is_finite()
+        || initial_balance.amount() <= 0.0
         || !pip_value_per_lot.is_finite()
         || pip_value_per_lot <= 0.0
     {
@@ -692,6 +842,53 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
         return Err(outer_error(
             QuoteValidatedOuterHoldoutErrorCodeV1::BindingMismatch,
             "sealed replay set canonical signal plan differs from recomputed final signals",
+        ));
+    }
+
+    evaluate_bound_quote_ledgers_v1(
+        initial_balance,
+        BoundPipValues::Fixed(pip_value_per_lot),
+        replay_set,
+        canonical_search_input_receipt_sha256,
+        canonical_signal_plan_sha256,
+        portfolio_identity_sha256,
+        holdout_scope_identity_sha256,
+    )
+}
+
+// Both signal-plan versions share the same sealed-fill, economics and metric
+// consumer. Only their input-identity/provenance validation differs.
+enum BoundPipValues<'a> {
+    Fixed(f64),
+    PerClosedTrade(&'a [f64]),
+}
+
+fn evaluate_bound_quote_ledgers_v1(
+    initial_balance: AccountMoneyV1,
+    pip_values: BoundPipValues<'_>,
+    replay_set: LockedPortfolioOuterHoldoutReplaySetV1,
+    canonical_search_input_receipt_sha256: String,
+    canonical_signal_plan_sha256: String,
+    portfolio_identity_sha256: String,
+    holdout_scope_identity_sha256: String,
+) -> Result<QuoteValidatedOuterHoldoutResearchEvidenceV1, QuoteValidatedOuterHoldoutErrorV1> {
+    let valid_pip_values = match &pip_values {
+        BoundPipValues::Fixed(value) => value.is_finite() && *value > 0.0,
+        BoundPipValues::PerClosedTrade(values) => {
+            values.len() == replay_set.ordered_execution_economics_ledgers.len()
+                && values.len()
+                    == replay_set
+                        .ordered_quote_ledgers
+                        .iter()
+                        .filter(|ledger| !ledger.positions().is_empty())
+                        .count()
+                && values.iter().all(|value| value.is_finite() && *value > 0.0)
+        }
+    };
+    if !valid_pip_values {
+        return Err(outer_error(
+            QuoteValidatedOuterHoldoutErrorCodeV1::InvalidMetricInput,
+            "quote-validated metrics require a positive finite pip value per lot for every closed trade",
         ));
     }
 
@@ -792,12 +989,14 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
                 format!("closed quote position {ordinal} has no ordered economics ledger"),
             )
         })?;
-        execution.canonical_json_bytes().map_err(|error| {
-            outer_error(
-                QuoteValidatedOuterHoldoutErrorCodeV1::BindingMismatch,
-                format!("execution economics ledger {ordinal} is invalid: {error}"),
-            )
-        })?;
+        execution
+            .validate_against_quote_ledger(quote_ledger)
+            .map_err(|error| {
+                outer_error(
+                    QuoteValidatedOuterHoldoutErrorCodeV1::BindingMismatch,
+                    format!("execution economics ledger {ordinal} is invalid: {error}"),
+                )
+            })?;
         if execution.quote_ledger_sha256() != quote_ledger.ledger_sha256()
             || execution.artifact_class() != ExecutionEconomicsArtifactClassV1::ResearchOnly
             || execution.promotion_eligibility()
@@ -824,7 +1023,19 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
             ));
         }
         previous_exit_timestamp = Some(exit_timestamp_unix_ms);
+        if execution.account_currency() != initial_balance.currency() {
+            return Err(outer_error(
+                QuoteValidatedOuterHoldoutErrorCodeV1::BindingMismatch,
+                format!(
+                    "execution economics ledger {ordinal} currency differs from the run's starting balance"
+                ),
+            ));
+        }
         let net_pnl_account_currency = execution.net_pnl_account_currency().amount();
+        let pip_value_per_lot = match &pip_values {
+            BoundPipValues::Fixed(value) => *value,
+            BoundPipValues::PerClosedTrade(values) => values[trade_outcomes.len()],
+        };
         let pip_money = pip_value_per_lot * execution.filled_lots();
         if !pip_money.is_finite() || pip_money <= 0.0 {
             return Err(outer_error(
@@ -837,6 +1048,7 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
             quote_ledger_sha256: quote_ledger.ledger_sha256().to_owned(),
             execution_economics_ledger_sha256: execution.ledger_sha256().to_owned(),
             exit_timestamp_unix_ms,
+            account_currency: execution.account_currency().to_owned(),
             net_pnl_account_currency,
             net_pips,
             r_multiple: net_pips / risk_pips,
@@ -849,7 +1061,11 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
         ));
     }
 
-    let metrics = derive_complete_quote_validated_metrics_v1(&trade_outcomes, entry_unavailable)?;
+    let metrics = derive_complete_quote_validated_metrics_v1(
+        &initial_balance,
+        &trade_outcomes,
+        entry_unavailable,
+    )?;
     let ordered_execution_economics_ledger_sha256s = replay_set
         .ordered_execution_economics_ledgers
         .iter()
@@ -860,7 +1076,7 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
         canonical_search_input_receipt_sha256,
         canonical_signal_plan_sha256,
         portfolio_identity_sha256,
-        search_config_hash: search_config_hash.to_owned(),
+        search_config_hash: replay_set.search_config_hash,
         holdout_scope_identity_sha256,
         account_id: replay_set.account_id,
         symbol_id: replay_set.symbol_id,
@@ -904,3 +1120,114 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
         trade_outcomes,
     })
 }
+
+#[cfg(test)]
+#[path = "quote_validated_outer_holdout_metrics_tests.rs"]
+mod metrics_tests;
+
+#[cfg(test)]
+mod streaming_identity_tests {
+    use super::*;
+    use serde::ser::SerializeSeq;
+
+    #[test]
+    fn streaming_hash_preserves_historical_compact_json_bytes_and_errors() {
+        #[derive(Serialize)]
+        struct Fixture<'a> {
+            text: &'a str,
+            values: [f64; 4],
+            nested: Option<[u64; 2]>,
+        }
+        let value = Fixture {
+            text: "Δοκιμή\n\"quoted\"\\path",
+            values: [-0.0, 1.0 / 3.0, f64::MIN_POSITIVE, f64::MAX],
+            nested: Some([0, u64::MAX]),
+        };
+        let mut old = Sha256::new();
+        old.update(b"neoethos.locked-final-portfolio.v1\0");
+        old.update(serde_json::to_vec(&value).unwrap());
+        assert_eq!(
+            canonical_locked_portfolio_identity_sha256_v1(&value).unwrap(),
+            format!("{:x}", old.finalize())
+        );
+        struct Refused;
+        impl Serialize for Refused {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("intentional encoding refusal"))
+            }
+        }
+        let error = canonical_locked_portfolio_identity_sha256_v1(&Refused).unwrap_err();
+        assert_eq!(
+            error.code(),
+            QuoteValidatedOuterHoldoutErrorCodeV1::ArtifactEncodingFailed
+        );
+        assert!(error.detail().contains("intentional encoding refusal"));
+    }
+
+    #[test]
+    fn streaming_hash_accepts_a_lazy_large_sequence_without_an_expanded_json_buffer() {
+        struct Repeated;
+        impl Serialize for Repeated {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut sequence = serializer.serialize_seq(Some(100_000))?;
+                for _ in 0..100_000 {
+                    sequence.serialize_element(&7_u8)?;
+                }
+                sequence.end()
+            }
+        }
+        let mut expected = Sha256::new();
+        expected.update(b"neoethos.locked-final-portfolio.v1\0[7");
+        for _ in 1..100_000 {
+            expected.update(b",7");
+        }
+        expected.update(b"]");
+        assert_eq!(
+            canonical_locked_portfolio_identity_sha256_v1(&Repeated).unwrap(),
+            format!("{:x}", expected.finalize())
+        );
+    }
+
+    #[test]
+    fn buffered_hash_preserves_full_and_partial_blocks_and_late_errors() {
+        for length in [0, 1, 65_535, 65_536, 65_537, 131_073] {
+            // Both many small writes and a single string larger than the buffer.
+            let bytes = vec![255_u8; length];
+            let text = "x".repeat(length);
+            let value = (&bytes, &text, "end\n\"\\α");
+            let mut expected = Sha256::new();
+            expected.update(b"neoethos.locked-final-portfolio.v1\0");
+            expected.update(serde_json::to_vec(&value).unwrap());
+            assert_eq!(
+                canonical_locked_portfolio_identity_sha256_v1(&value).unwrap(),
+                format!("{:x}", expected.finalize()),
+                "payload length {length}"
+            );
+        }
+        struct LateRefusal;
+        impl Serialize for LateRefusal {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut sequence = serializer.serialize_seq(None)?;
+                for _ in 0..100_000 {
+                    sequence.serialize_element(&255_u8)?;
+                }
+                Err(serde::ser::Error::custom("refused after buffered output"))
+            }
+        }
+        let error = canonical_locked_portfolio_identity_sha256_v1(&LateRefusal).unwrap_err();
+        assert_eq!(
+            error.code(),
+            QuoteValidatedOuterHoldoutErrorCodeV1::ArtifactEncodingFailed
+        );
+        assert!(error.detail().contains("refused after buffered output"));
+    }
+}
+
+#[path = "quote_validated_outer_holdout_v2.rs"]
+mod prelocked;
+pub use prelocked::{
+    CanonicalSignalAccountRiskPolicyV3, CanonicalSignalExitPolicyV2, LockedCanonicalSignalPlanV3,
+    LockedPortfolioOuterHoldoutReplaySetV3, QuoteEntryFinancialInputsV3,
+    QuoteEntrySizingEvidenceV3, QuoteReplayLotConstraintsV3, QuoteValidatedDecisionProvenanceV3,
+    QuoteValidatedOuterHoldoutResearchEvidenceV3, evaluate_locked_portfolio_outer_holdout_v3,
+};

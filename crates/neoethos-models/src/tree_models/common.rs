@@ -110,7 +110,43 @@ pub fn tree_runtime_metadata(
 }
 
 pub fn default_training_summary(frame: &FeatureFrame) -> TrainingSummaryMetadata {
-    TrainingSummaryMetadata::new(frame.n_samples(), frame.n_samples(), 0)
+    TrainingSummaryMetadata::new(frame.n_samples(), frame.n_samples(), 0, 0)
+}
+
+pub fn validate_tree_training_summary(
+    summary: &TrainingSummaryMetadata,
+    model_name: &str,
+) -> Result<()> {
+    if summary.dataset_rows == 0 {
+        bail!("{model_name} training summary must record non-zero dataset_rows");
+    }
+    if summary.train_rows == 0 {
+        bail!("{model_name} training summary must record non-zero train_rows");
+    }
+    let partition_rows = summary
+        .train_rows
+        .checked_add(summary.embargo_rows)
+        .and_then(|rows| rows.checked_add(summary.val_rows));
+    if partition_rows != Some(summary.dataset_rows) {
+        bail!(
+            "{model_name} training summary is inconsistent: dataset_rows={} train_rows={} embargo_rows={} val_rows={}",
+            summary.dataset_rows,
+            summary.train_rows,
+            summary.embargo_rows,
+            summary.val_rows
+        );
+    }
+    Ok(())
+}
+
+pub fn required_tree_training_summary(
+    summary: Option<&TrainingSummaryMetadata>,
+    model_name: &str,
+) -> Result<TrainingSummaryMetadata> {
+    let summary = summary
+        .with_context(|| format!("{model_name} model is missing training summary metadata"))?;
+    validate_tree_training_summary(summary, model_name)?;
+    Ok(summary.clone())
 }
 
 pub fn tree_artifact_paths(root: &Path, model_file_name: &str) -> (PathBuf, PathBuf) {

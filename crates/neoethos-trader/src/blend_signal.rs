@@ -3,8 +3,9 @@
 //! López de Prado meta-labeling: the **genes decide DIRECTION** (the
 //! OOS-validated edge, untouched), and the **ML ensemble decides BET/SIZE** —
 //! it can only SHRINK conviction or VETO a trade, never flip Long↔Short and
-//! never manufacture a trade from Flat. This makes "do not degrade the
-//! validated gene edge" a STRUCTURAL invariant, not a hope.
+//! never manufacture a trade from Flat. Preserving direction does not preserve
+//! profitability: vetoing or resizing winners can reduce the validated edge.
+//! The combined strategy therefore needs its own out-of-sample evaluation.
 //!
 //! The blend CORE here (math + [`BlendedSignalEngine`] + invariants) is
 //! always compiled and depends on NOTHING heavy — [`MlDecision`] is a local
@@ -33,8 +34,7 @@ pub struct MlDecision {
 }
 
 impl MlDecision {
-    /// Neutral — the ensemble abstains (warmup/NaN rows): no directional lean,
-    /// no gate, no veto.
+    /// A valid uninformative vote, not a replacement for invalid/warmup rows.
     pub fn neutral() -> Self {
         Self {
             dir_probs: [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
@@ -187,6 +187,26 @@ impl BlendConfig {
 /// - confidence ∈ [0,1]; `gate_floor` keeps a healthy bar tradeable; a hard
 ///   regime/anomaly collapse (or, in MlConfirm, ML disagreement) ⇒ Flat.
 pub fn blend_decision(dir: Direction, ml: &MlDecision, cfg: &BlendConfig) -> (Direction, f64) {
+    if matches!(dir, Direction::Flat) {
+        return (Direction::Flat, 0.0);
+    }
+    if matches!(cfg.mode, BlendMode::GenesOnly) {
+        return (dir, 1.0);
+    }
+    // Invalid ensemble rows deliberately carry NaN, not neutral probabilities.
+    // f64::clamp preserves NaN, and the ordered comparisons below then return
+    // false. Without this check a directional signal could leave with NaN size.
+    // Check all components, including the non-selected directional probability.
+    if ml.dir_probs.iter().any(|value| !value.is_finite())
+        || !ml.regime_gate.is_finite()
+        || !ml.anomaly_scale.is_finite()
+        || !cfg.gate_floor.is_finite()
+        || !(0.0..=1.0).contains(&cfg.gate_floor)
+        || !cfg.veto_below.is_finite()
+        || !(0.0..=cfg.gate_floor).contains(&cfg.veto_below)
+    {
+        return (Direction::Flat, 0.0);
+    }
     let p_side = match dir {
         Direction::Long => ml.dir_probs[1] as f64,
         Direction::Short => ml.dir_probs[2] as f64,
@@ -201,7 +221,7 @@ pub fn blend_decision(dir: Direction, ml: &MlDecision, cfg: &BlendConfig) -> (Di
     let m = (agreement * g * s).clamp(0.0, 1.0);
 
     let disagree_veto = matches!(cfg.mode, BlendMode::MlConfirm) && p_side < cfg.veto_below;
-    if disagree_veto || m < cfg.veto_below {
+    if disagree_veto || m <= 0.0 || m < cfg.veto_below {
         // Skip the trade entirely — Flat, NOT confidence 0 (the DecisionEngine
         // floors sizing to min_volume, so confidence 0 would still open a trade).
         (Direction::Flat, 0.0)
@@ -211,11 +231,11 @@ pub fn blend_decision(dir: Direction, ml: &MlDecision, cfg: &BlendConfig) -> (Di
 }
 
 /// A [`SignalEngine`] that serves precomputed gene directions, optionally gated
-/// by precomputed per-bar [`MlDecision`]s. With `mode == GenesOnly` or no ML
-/// vector for the symbol, it is byte-identical to
+/// by precomputed per-bar [`MlDecision`]s. With `mode == GenesOnly`, it is
+/// byte-identical to
 /// [`crate::gene_signal::PrecomputedSignalEngine`] (confidence 1.0 directional /
-/// 0.0 flat, `SignalSource::Strategy`) — the hard fallback when the ensemble is
-/// absent / failed to load / column-mismatched.
+/// 0.0 flat, `SignalSource::Strategy`). In an ML mode, missing or invalid
+/// decisions make the bar ineligible; they never restore unscaled gene sizing.
 pub struct BlendedSignalEngine {
     per_symbol_dir: HashMap<String, Vec<Direction>>,
     per_symbol_ml: HashMap<String, Vec<MlDecision>>,
@@ -243,8 +263,8 @@ impl BlendedSignalEngine {
     }
 
     /// Blended engine: gene directions gated by per-bar ML decisions.
-    /// `ml.len()` should equal `directions.len()`; missing entries fall back to
-    /// the gene-only path for that bar (defensive).
+    /// `ml.len()` should equal `directions.len()`; missing entries make that
+    /// bar ineligible rather than silently switching the requested strategy.
     pub fn new(
         symbol: &str,
         directions: Vec<Direction>,
@@ -301,7 +321,7 @@ impl SignalEngine for BlendedSignalEngine {
 
         match (self.cfg.mode, ml) {
             // Gene-only fallback — byte-identical to PrecomputedSignalEngine.
-            (BlendMode::GenesOnly, _) | (_, None) => {
+            (BlendMode::GenesOnly, _) => {
                 let confidence = if dir == Direction::Flat { 0.0 } else { 1.0 };
                 Signal {
                     symbol: entry.symbol.clone(),
@@ -312,6 +332,14 @@ impl SignalEngine for BlendedSignalEngine {
                     tp_pips,
                 }
             }
+            (_, None) => Signal {
+                symbol: entry.symbol.clone(),
+                dir: Direction::Flat,
+                confidence: 0.0,
+                source: SignalSource::Blend,
+                sl_pips,
+                tp_pips,
+            },
             (_, Some(decision)) => {
                 let (out_dir, confidence) = blend_decision(dir, &decision, &self.cfg);
                 Signal {
@@ -377,6 +405,124 @@ mod tests {
             assert_eq!(a.dir, b.dir);
             assert_eq!(a.confidence, b.confidence);
             assert_eq!(a.source, b.source); // both SignalSource::Strategy
+        }
+    }
+
+    #[test]
+    fn direct_genes_only_blend_does_not_consult_invalid_ml() {
+        let invalid = MlDecision {
+            dir_probs: [f64::NAN; 3],
+            regime_gate: f64::NAN,
+            anomaly_scale: f64::NAN,
+        };
+        for dir in [Direction::Long, Direction::Short, Direction::Flat] {
+            let confidence = if dir == Direction::Flat { 0.0 } else { 1.0 };
+            assert_eq!(
+                blend_decision(dir, &invalid, &BlendConfig::default()),
+                (dir, confidence)
+            );
+        }
+    }
+
+    #[test]
+    fn every_nonfinite_model_component_vetoes_both_entry_directions() {
+        for mode in [BlendMode::MlConfirm, BlendMode::MlScale] {
+            let cfg = BlendConfig {
+                mode,
+                ..Default::default()
+            };
+            for dir in [Direction::Long, Direction::Short] {
+                for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                    for component in 0..5 {
+                        let mut ml = strong_buy();
+                        match component {
+                            0..=2 => ml.dir_probs[component] = invalid,
+                            3 => ml.regime_gate = invalid,
+                            _ => ml.anomaly_scale = invalid,
+                        }
+                        assert_eq!(
+                            blend_decision(dir, &ml, &cfg),
+                            (Direction::Flat, 0.0),
+                            "{mode:?} {dir:?} component={component} value={invalid}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_gate_still_vetoes_when_operator_cutoff_is_zero() {
+        for mode in [BlendMode::MlConfirm, BlendMode::MlScale] {
+            let cfg = BlendConfig {
+                mode,
+                veto_below: 0.0,
+                ..Default::default()
+            };
+            for dir in [Direction::Long, Direction::Short] {
+                for zero in [0.0, -0.0] {
+                    let mut regime_veto = strong_buy();
+                    regime_veto.regime_gate = zero;
+                    let mut anomaly_veto = strong_buy();
+                    anomaly_veto.anomaly_scale = zero;
+                    for ml in [regime_veto, anomaly_veto] {
+                        assert_eq!(blend_decision(dir, &ml, &cfg), (Direction::Flat, 0.0));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_direct_blend_config_cannot_panic_or_create_an_entry() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 2.0] {
+            for cfg in [
+                BlendConfig {
+                    mode: BlendMode::MlScale,
+                    gate_floor: invalid,
+                    ..Default::default()
+                },
+                BlendConfig {
+                    mode: BlendMode::MlScale,
+                    veto_below: invalid,
+                    ..Default::default()
+                },
+            ] {
+                assert_eq!(
+                    blend_decision(Direction::Long, &strong_buy(), &cfg),
+                    (Direction::Flat, 0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blended_engine_keeps_invalid_and_missing_ml_rows_ineligible() {
+        let invalid = MlDecision {
+            dir_probs: [f64::NAN; 3],
+            regime_gate: f64::NAN,
+            anomaly_scale: f64::NAN,
+        };
+        let mut engine = BlendedSignalEngine::new(
+            "EURUSD",
+            vec![Direction::Long; 3],
+            vec![strong_buy(), invalid],
+            BlendConfig {
+                mode: BlendMode::MlScale,
+                ..Default::default()
+            },
+        )
+        .with_brackets("EURUSD", vec![12.0; 3], vec![24.0; 3]);
+        let valid = engine.evaluate(&entry(), &[]);
+        assert_eq!(valid.dir, Direction::Long);
+        assert_eq!(valid.confidence, 0.9);
+        for _ in 0..2 {
+            let rejected = engine.evaluate(&entry(), &[]);
+            assert_eq!(rejected.dir, Direction::Flat);
+            assert_eq!(rejected.confidence, 0.0);
+            assert_eq!(rejected.source, SignalSource::Blend);
+            assert_eq!(rejected.sl_pips, 12.0);
+            assert_eq!(rejected.tp_pips, 24.0);
         }
     }
 

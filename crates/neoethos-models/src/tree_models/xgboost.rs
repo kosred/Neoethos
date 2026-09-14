@@ -1,15 +1,15 @@
 // Tree-models XGBoost expert. Native-only imports and helpers are gated by the
 // exact `xgboost` feature so standalone feature builds remain warning-clean.
 
-use super::common::build_tree_runtime_predictions;
 #[cfg(feature = "xgboost")]
 use super::common::{
-    XGBOOST_MODEL_FILE_NAME, calibrate_three_class_probabilities, default_training_summary,
-    ensure_feature_columns_match, feature_frame_to_tree_f32_row_major,
-    normalize_three_class_probabilities, read_runtime_metadata, read_tree_json_artifact,
-    remap_labels_to_tree_targets, tree_artifact_paths, tree_runtime_metadata,
+    XGBOOST_MODEL_FILE_NAME, calibrate_three_class_probabilities, ensure_feature_columns_match,
+    feature_frame_to_tree_f32_row_major, normalize_three_class_probabilities,
+    read_runtime_metadata, read_tree_json_artifact, remap_labels_to_tree_targets,
+    required_tree_training_summary, tree_artifact_paths, tree_runtime_metadata,
     write_runtime_metadata, write_tree_json_artifact,
 };
+use super::common::{build_tree_runtime_predictions, validate_tree_training_summary};
 use super::config::*;
 use crate::base::ExpertModel;
 #[cfg(feature = "xgboost")]
@@ -50,7 +50,7 @@ use xgb::{PredictConfig, PredictType};
 const XGBOOST_RUNTIME_FILE_NAME: &str = "xgboost_runtime.json";
 
 /// One-time runtime probe: does the *linked* libxgboost actually support the
-/// CUDA device? A present GPU (`gpu_count() > 0`) is NOT enough —
+/// CUDA device? A present NVIDIA GPU (`nvidia_gpu_count() > 0`) is NOT enough —
 /// the `xgb` crate's bundled libxgboost is built CPU-only by default, so a
 /// CUDA-device booster fails at `update()` ("update XGBoost booster at
 /// iteration 0"). That single failure used to sink SIX models at once (xgboost,
@@ -156,6 +156,8 @@ struct XGBoostRuntimeArtifact {
     predictor: String,
     num_parallel_tree: u32,
     probability_temperature: f64,
+    #[serde(default)]
+    best_iteration_end: Option<u32>,
     gpu_only: bool,
     cpu_threads: Option<usize>,
 }
@@ -166,6 +168,7 @@ pub struct XGBoostExpert {
     gpu_only_disabled: bool,
     pub(crate) feature_columns: Vec<String>,
     training_summary: Option<TrainingSummaryMetadata>,
+    best_iteration_end: Option<u32>,
     #[cfg(feature = "xgboost")]
     _model: Option<xgb::Booster>,
     #[cfg(not(feature = "xgboost"))]
@@ -193,6 +196,7 @@ impl XGBoostExpert {
             gpu_only_disabled: false,
             feature_columns: Vec::new(),
             training_summary: None,
+            best_iteration_end: None,
             _model: None,
         }
     }
@@ -411,7 +415,7 @@ impl XGBoostExpert {
             configured_params: self.config.params.clone(),
             resolved_params: self.runtime_params()?,
             feature_columns: self.feature_columns.clone(),
-            training_summary: self.stored_training_summary(),
+            training_summary: self.stored_training_summary()?,
             requested_device_policy: self.config.requested_device_policy.clone(),
             device_pref: self.config.device_pref,
             booster_variant: self.booster_variant(),
@@ -422,6 +426,7 @@ impl XGBoostExpert {
             predictor: self.predictor()?.to_string(),
             num_parallel_tree: self.tree_num_parallel(),
             probability_temperature: self.probability_temperature(),
+            best_iteration_end: self.best_iteration_end,
             gpu_only: self.config.gpu_only,
             cpu_threads: self.config.cpu_threads,
         })
@@ -553,10 +558,8 @@ impl XGBoostExpert {
     }
 
     #[cfg(feature = "xgboost")]
-    fn stored_training_summary(&self) -> TrainingSummaryMetadata {
-        self.training_summary
-            .clone()
-            .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
+    fn stored_training_summary(&self) -> Result<TrainingSummaryMetadata> {
+        required_tree_training_summary(self.training_summary.as_ref(), "XGBoost")
     }
 
     fn ensure_runtime_state_ready(&self) -> Result<()> {
@@ -567,15 +570,10 @@ impl XGBoostExpert {
             .training_summary
             .as_ref()
             .context("XGBoost runtime state is missing training summary metadata")?;
-        if summary.dataset_rows == 0 {
-            bail!("XGBoost runtime state has zero dataset_rows in training summary");
-        }
-        if summary.dataset_rows != summary.train_rows + summary.val_rows {
+        validate_tree_training_summary(summary, "XGBoost runtime state")?;
+        if summary.val_rows > 0 && self.best_iteration_end.is_none() {
             bail!(
-                "XGBoost runtime state has inconsistent training summary: dataset_rows={} train_rows={} val_rows={}",
-                summary.dataset_rows,
-                summary.train_rows,
-                summary.val_rows
+                "XGBoost runtime state records validation rows but is missing the best iteration"
             );
         }
         if self._model.is_none() {
@@ -600,23 +598,26 @@ impl XGBoostExpert {
                 artifact.feature_columns
             );
         }
-        if artifact.training_summary.dataset_rows != expected_training_summary.dataset_rows
-            || artifact.training_summary.train_rows != expected_training_summary.train_rows
-            || artifact.training_summary.val_rows != expected_training_summary.val_rows
-        {
+        if artifact.training_summary != *expected_training_summary {
             bail!(
                 "XGBoost runtime artifact training-summary mismatch: expected {:?}, got {:?}",
                 expected_training_summary,
                 artifact.training_summary
             );
         }
-        if artifact.training_summary.dataset_rows == 0 {
-            bail!("XGBoost runtime artifact must record non-zero dataset_rows");
-        }
-        if artifact.training_summary.dataset_rows
-            != artifact.training_summary.train_rows + artifact.training_summary.val_rows
-        {
-            bail!("XGBoost runtime artifact training summary is inconsistent");
+        validate_tree_training_summary(&artifact.training_summary, "XGBoost runtime artifact")?;
+        match (
+            artifact.training_summary.val_rows,
+            artifact.best_iteration_end,
+        ) {
+            (0, Some(_)) => {
+                bail!("XGBoost runtime artifact records a best iteration without validation rows")
+            }
+            (_, Some(0)) => bail!("XGBoost runtime artifact best iteration end must be positive"),
+            (1.., None) => {
+                bail!("XGBoost runtime artifact records validation rows but no best iteration")
+            }
+            _ => {}
         }
         if !artifact.probability_temperature.is_finite() || artifact.probability_temperature <= 0.0
         {
@@ -750,6 +751,7 @@ impl XGBoostExpert {
                     y.len()
                 );
             }
+            let training_feature_columns = feature_columns_from_frame(x);
             self.config.cpu_threads = Some(
                 self.config
                     .cpu_threads
@@ -799,6 +801,9 @@ impl XGBoostExpert {
 
             let dval = match (val_x, val_y) {
                 (Some(vx), Some(vy)) => {
+                    if vx.n_samples() == 0 || vy.is_empty() {
+                        anyhow::bail!("XGBoost validation features and labels must be non-empty");
+                    }
                     if vx.n_features() != x.n_features() {
                         anyhow::bail!(
                             "XGBoost validation column count mismatch: train {}, val {}",
@@ -811,6 +816,11 @@ impl XGBoostExpert {
                             "XGBoost validation row/label mismatch: {} rows vs {} labels",
                             vx.n_samples(),
                             vy.len()
+                        );
+                    }
+                    if feature_columns_from_frame(vx) != training_feature_columns {
+                        anyhow::bail!(
+                            "XGBoost validation feature names or ordering do not match the training schema"
                         );
                     }
                     let (vflat, v_rows, _vcols) = feature_frame_to_tree_f32_row_major(vx)?;
@@ -888,7 +898,7 @@ impl XGBoostExpert {
                 "XGBoost booster device"
             );
             self.apply_variant_params(&mut model)?;
-            self.feature_columns = feature_columns_from_frame(x);
+            self.feature_columns = training_feature_columns;
             self.set_runtime_attributes(&mut model)?;
 
             let mut best_loss = f32::INFINITY;
@@ -906,7 +916,14 @@ impl XGBoostExpert {
                         .get("mlogloss")
                         .or_else(|| metrics.get("merror"))
                         .copied()
-                        .unwrap_or(f32::INFINITY);
+                        .context(
+                            "XGBoost validation evaluation did not return mlogloss or merror",
+                        )?;
+                    if !val_loss.is_finite() {
+                        bail!(
+                            "XGBoost validation evaluation returned non-finite loss {val_loss} at iteration {iteration}"
+                        );
+                    }
                     if val_loss < best_loss {
                         best_loss = val_loss;
                         best_iter = iteration;
@@ -927,7 +944,31 @@ impl XGBoostExpert {
                 }
             }
 
-            self.training_summary = Some(default_training_summary(x));
+            let best_iteration_end = if dval.is_some() {
+                let best_iteration_end = u32::try_from(best_iter)
+                    .context("XGBoost best iteration was negative")?
+                    .checked_add(1)
+                    .context("XGBoost best iteration overflow")?;
+                model
+                    .set_attribute("best_iteration_end", &best_iteration_end.to_string())
+                    .context("persist XGBoost best iteration on native booster")?;
+                model
+                    .set_attribute("best_validation_loss", &best_loss.to_string())
+                    .context("persist XGBoost best validation loss on native booster")?;
+                Some(best_iteration_end)
+            } else {
+                None
+            };
+            let val_rows = val_x.map_or(0, FeatureFrame::n_samples);
+            let dataset_rows = x
+                .n_samples()
+                .checked_add(val_rows)
+                .context("XGBoost training summary row count overflow")?;
+            let training_summary =
+                TrainingSummaryMetadata::new(dataset_rows, x.n_samples(), 0, val_rows);
+            validate_tree_training_summary(&training_summary, "XGBoost training")?;
+            self.training_summary = Some(training_summary);
+            self.best_iteration_end = best_iteration_end;
             self.gpu_only_disabled = false;
             self._model = Some(model);
             Ok(())
@@ -976,7 +1017,7 @@ impl ExpertModel for XGBoostExpert {
                     _type: PredictType::Normal,
                     training: false,
                     iteration_begin: 0,
-                    iteration_end: 0,
+                    iteration_end: self.best_iteration_end.map(i64::from).unwrap_or(0),
                     strict_shape: true,
                 };
                 let (probabilities, shape) = model
@@ -1008,7 +1049,7 @@ impl ExpertModel for XGBoostExpert {
             let metadata = tree_runtime_metadata(
                 "xgboost",
                 self.feature_columns.clone(),
-                self.stored_training_summary(),
+                self.stored_training_summary()?,
             )?;
             let (model_path, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
@@ -1016,7 +1057,7 @@ impl ExpertModel for XGBoostExpert {
             Self::validate_runtime_artifact(
                 &self.runtime_artifact()?,
                 &self.feature_columns,
-                &self.stored_training_summary(),
+                &self.stored_training_summary()?,
             )?;
             model
                 .save(&model_path)
@@ -1048,6 +1089,10 @@ impl ExpertModel for XGBoostExpert {
                 if metadata.feature_columns.is_empty() {
                     bail!("XGBoost runtime metadata must contain at least one feature column");
                 }
+                validate_tree_training_summary(
+                    &metadata.training_summary,
+                    "XGBoost runtime metadata",
+                )?;
                 metadata
             } else {
                 let (feature_columns, training_summary) =
@@ -1073,6 +1118,7 @@ impl ExpertModel for XGBoostExpert {
             let metadata_training_summary = metadata.training_summary.clone();
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
+            self.best_iteration_end = None;
             if let Some(artifact) = runtime_artifact {
                 Self::validate_runtime_artifact(
                     &artifact,
@@ -1094,6 +1140,7 @@ impl ExpertModel for XGBoostExpert {
                     predictor,
                     num_parallel_tree,
                     probability_temperature,
+                    best_iteration_end,
                     gpu_only,
                     cpu_threads,
                 } = artifact;
@@ -1104,10 +1151,7 @@ impl ExpertModel for XGBoostExpert {
                         feature_columns
                     );
                 }
-                if training_summary.dataset_rows != metadata_training_summary.dataset_rows
-                    || training_summary.train_rows != metadata_training_summary.train_rows
-                    || training_summary.val_rows != metadata_training_summary.val_rows
-                {
+                if training_summary != metadata_training_summary {
                     bail!(
                         "XGBoost runtime artifact training-summary mismatch: metadata {:?}, runtime artifact {:?}",
                         metadata_training_summary,
@@ -1121,6 +1165,7 @@ impl ExpertModel for XGBoostExpert {
                 self.config.cpu_threads = cpu_threads;
                 self.feature_columns = feature_columns;
                 self.training_summary = Some(training_summary);
+                self.best_iteration_end = best_iteration_end;
                 self.config.params.insert(
                     "probability_temperature".into(),
                     ParamValue::Float(probability_temperature),
@@ -1169,6 +1214,38 @@ impl ExpertModel for XGBoostExpert {
             }
             let mut model = xgb::Booster::load(&model_path)
                 .with_context(|| format!("load XGBoost artifact {}", model_path.display()))?;
+            let native_best_iteration_end = model
+                .get_attribute("best_iteration_end")
+                .context("read XGBoost best iteration from native booster")?
+                .map(|value| {
+                    value.parse::<u32>().with_context(|| {
+                        format!("XGBoost native booster has invalid best_iteration_end `{value}`")
+                    })
+                })
+                .transpose()?;
+            if native_best_iteration_end == Some(0) {
+                bail!("XGBoost native booster best_iteration_end must be positive");
+            }
+            if metadata_training_summary.val_rows > 0 && native_best_iteration_end.is_none() {
+                bail!(
+                    "XGBoost metadata records validation rows but the native booster has no best iteration"
+                );
+            }
+            if metadata_training_summary.val_rows == 0 && native_best_iteration_end.is_some() {
+                bail!(
+                    "XGBoost native booster records a best iteration but metadata has no validation rows"
+                );
+            }
+            if self.best_iteration_end.is_some()
+                && self.best_iteration_end != native_best_iteration_end
+            {
+                bail!(
+                    "XGBoost best iteration mismatch: runtime artifact {:?}, native booster {:?}",
+                    self.best_iteration_end,
+                    native_best_iteration_end
+                );
+            }
+            self.best_iteration_end = native_best_iteration_end;
             self.apply_runtime_device(&mut model)?;
             self._model = Some(model);
             self.gpu_only_disabled = false;
@@ -1355,7 +1432,7 @@ mod tests {
                 ParamValue::String("hist".to_string()),
             )]),
             feature_columns: vec!["momentum".to_string()],
-            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+            training_summary: TrainingSummaryMetadata::new(9, 9, 0, 0),
             requested_device_policy: "cpu".to_string(),
             device_pref: super::DevicePreference::Cpu,
             booster_variant: "gbtree".to_string(),
@@ -1366,6 +1443,7 @@ mod tests {
             predictor: "cpu_predictor".to_string(),
             num_parallel_tree: 1,
             probability_temperature: 0.0,
+            best_iteration_end: None,
             gpu_only: false,
             cpu_threads: Some(4),
         };
@@ -1373,7 +1451,7 @@ mod tests {
         let err = XGBoostExpert::validate_runtime_artifact(
             &artifact,
             &["momentum".to_string()],
-            &TrainingSummaryMetadata::new(9, 9, 0),
+            &TrainingSummaryMetadata::new(9, 9, 0, 0),
         )
         .expect_err("non-positive probability_temperature should fail");
         assert!(err.to_string().contains("probability_temperature"));

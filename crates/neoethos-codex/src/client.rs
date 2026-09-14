@@ -262,7 +262,7 @@ impl CodexClient {
 
         let status = response.status();
         let text = response.text().await?;
-        return self.finish_chat(&request, status, text);
+        self.finish_chat(&request, status, text)
     }
 
     /// Build + send ONE Responses-API request. Split out of `chat` so the 401

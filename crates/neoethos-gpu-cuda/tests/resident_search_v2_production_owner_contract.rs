@@ -71,14 +71,72 @@ fn assert_rust_ffi_not_fixture_gated(source: &str, symbol: &str) {
     let offset = source
         .find(&needle)
         .unwrap_or_else(|| panic!("missing Rust FFI declaration {symbol:?}"));
-    let prefix_start = source[..offset]
-        .rfind("\n    fn ")
-        .or_else(|| source[..offset].rfind("unsafe extern \"C\""))
-        .unwrap_or(0);
-    let attached = &source[prefix_start..offset];
+    let block_marker = "unsafe extern \"C\" {";
+    let block_start = source[..offset]
+        .rfind(block_marker)
+        .unwrap_or_else(|| panic!("missing extern block for {symbol:?}"));
+    let body_start = block_start + block_marker.len();
+    // Inspect attached attributes, not an arbitrary earlier function or a fixed
+    // lookbehind window that can include a preceding fixture-only item.
+    let block_attributes_start = source[..block_start]
+        .rfind(|character| character == ';' || character == '}')
+        .map_or(0, |previous_item_end| previous_item_end + 1);
+    let declaration_start = source[body_start..offset]
+        .rfind(';')
+        .map_or(body_start, |previous_declaration_end| {
+            body_start + previous_declaration_end + 1
+        });
+    for attached in [
+        &source[block_attributes_start..block_start],
+        &source[declaration_start..offset],
+    ] {
+        assert!(
+            !attached.contains("cuda-device-fixtures"),
+            "Rust FFI declaration {symbol:?} remains fixture-gated"
+        );
+    }
+}
+
+#[test]
+fn rust_ffi_gate_scan_checks_attached_attributes_without_preceding_fixture_leakage() {
+    let source = r#"
+impl Earlier {
+    fn earlier_method() {}
+}
+#[cfg(feature = "cuda-device-fixtures")]
+struct EarlierFixture;
+unsafe extern "C" {
+    fn first_production();
+    #[cfg(feature = "cuda-device-fixtures")]
+    fn preceding_fixture(
+        long_argument: *const [u8; 2048],
+        another_argument: *const [u64; 4096],
+    ) -> i32;
+    #[allow(dead_code)]
+    fn later_production();
+    #[cfg(feature = "cuda-device-fixtures")]
+    fn gated_target();
+}
+"#;
+    assert_rust_ffi_not_fixture_gated(source, "first_production");
+    assert_rust_ffi_not_fixture_gated(source, "later_production");
     assert!(
-        !attached.contains("cuda-device-fixtures"),
-        "Rust FFI declaration {symbol:?} remains fixture-gated"
+        std::panic::catch_unwind(|| {
+            assert_rust_ffi_not_fixture_gated(source, "gated_target");
+        })
+        .is_err()
+    );
+    let gated_block = r#"
+#[cfg(feature = "cuda-device-fixtures")]
+unsafe extern "C" {
+    fn gated_target();
+}
+"#;
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_rust_ffi_not_fixture_gated(gated_block, "gated_target");
+        })
+        .is_err()
     );
 }
 
@@ -103,7 +161,10 @@ fn v2_create_export_and_gene_evaluator_are_in_the_normal_cuda_archive() {
     assert_rust_ffi_not_fixture_gated(&population_rust, enqueue);
     require_all(
         &population_rust,
-        &["pub(crate) fn enqueue_resident_gene_metrics_v2("],
+        &[
+            "pub(crate) fn enqueue_resident_gene_metrics_owned_v2(",
+            "Result<ResidentSearchPopulationCompletionLeaseV2, ResidentSearchPopulationEnqueueRejectedV2>",
+        ],
     );
 
     for symbol in [
@@ -321,7 +382,9 @@ fn first_production_seam_turns_green_only_the_owned_bridge_facts() {
     assert!(!readiness.whole_workspace_preallocated());
     assert!(!readiness.unified_device_fault_authority());
     assert!(readiness.native_bridge_production_sealed());
-    assert!(readiness.terminal_cleanup_lease());
+    // The older V2 bridge is not complete end-to-end cleanup authority. The
+    // separately owned Slice2 terminal path must not turn this readiness green.
+    assert!(!readiness.terminal_cleanup_lease());
     assert!(!readiness.production_ready());
 }
 
@@ -371,10 +434,10 @@ fn rust_abi_and_diagnostics_have_one_production_authority() {
 #[test]
 fn dead_code_exceptions_are_narrow_and_counted() {
     let sources = [
-        ("src/lib.rs", 1_usize),
-        ("src/resident_search_v2.rs", 9),
+        ("src/lib.rs", 0_usize),
+        ("src/resident_search_v2.rs", 15),
         ("src/resident_feature_store_v3.rs", 3),
-        ("src/population.rs", 5),
+        ("src/population.rs", 2),
         ("src/resident_generation_v1.rs", 0),
     ];
 
@@ -395,25 +458,25 @@ fn dead_code_exceptions_are_narrow_and_counted() {
     require_all(
         &lib,
         &[
-            "The pre-existing V1 generation owner was source-contract-only.",
-            "#[allow(dead_code)]\nmod resident_generation_v1;",
+            "#[cfg(feature = \"cuda\")]\nmod resident_generation_v1;",
+            "pub use resident_generation_v1::{",
         ],
     );
 }
 
 #[test]
-fn real_card_v3_to_search_owner_test_is_part_of_the_normal_cuda_test_module() {
+fn real_card_v3_to_search_owner_test_keeps_its_explicit_device_fixture_boundary() {
     let device = read_required("src/resident_population_session_v3_device_tests.rs");
     require_all(
         &device,
         &[
-            "fn resident_store_v3_moves_into_search_v2_and_enqueues_on_real_cuda()",
+            "#[cfg(feature = \"cuda-device-fixtures\")]\n#[test]\nfn resident_store_v3_moves_into_search_v2_and_enqueues_on_real_cuda()",
             "NEOETHOS_REQUIRE_GPU",
             "discovery_generation_semantics_sha256_v1()",
             "feature_count: RESIDENT_SMC_COLUMN_NAMES_V3.len()",
             ".consume_into_resident_search_run_v2(",
             ".upload_resident_scenarios_v2(",
-            ".enqueue_resident_gene_metrics_v2(&settings)?",
+            ".enqueue_resident_gene_metrics_fixture_v2(&settings)?",
             ".consume_host_metrics_v1()?",
             "assert_eq!(counters.gene_upload_bytes, 0)",
             "let lease = search.record_consumer_completion()?;",

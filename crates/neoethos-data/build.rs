@@ -30,10 +30,11 @@ fn main() {
     //
     // This guard runs before vector-ta invokes nvcc. The native build separately
     // records and validates its exact cubin registry and compiler provenance.
-    if let Ok(value) = std::env::var("CUDA_FAST_MATH") {
-        if value != "0" {
-            panic!(
-                "neoethos-data was built with `--features gpu-cuda` and CUDA_FAST_MATH={value:?}.\n\
+    if let Ok(value) = std::env::var("CUDA_FAST_MATH")
+        && value != "0"
+    {
+        panic!(
+            "neoethos-data was built with `--features gpu-cuda` and CUDA_FAST_MATH={value:?}.\n\
                  \n\
                  `--use_fast_math` turns on FMA contraction, flush-to-zero denormals and \
                  approximate div/sqrt/rcp in vector-ta's indicator kernels. Those kernels feed \
@@ -43,7 +44,6 @@ fn main() {
                  exactly this with `-fmad=false` and a measured 0.62 %% divergence to justify it.\n\
                  \n\
                  Unset CUDA_FAST_MATH (or set it to 0) and rebuild."
-            );
-        }
+        );
     }
 }

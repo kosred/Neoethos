@@ -146,7 +146,7 @@ fn adaptive_runtime_metadata(
         CapabilityState::Implemented,
         feature_columns,
         canonical_three_class_label_mapping(),
-        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0),
+        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0, 0),
     )
 }
 
@@ -186,16 +186,7 @@ fn resolve_adaptive_runtime_metadata(
                     metadata_path.display()
                 )
             })?;
-            if metadata.model_name != reconstructed.model_name
-                || metadata.family != reconstructed.family
-                || metadata.state != reconstructed.state
-                || metadata.feature_columns != reconstructed.feature_columns
-                || metadata.label_mapping != reconstructed.label_mapping
-                || metadata.training_summary.dataset_rows
-                    != reconstructed.training_summary.dataset_rows
-                || metadata.training_summary.train_rows != reconstructed.training_summary.train_rows
-                || metadata.training_summary.val_rows != reconstructed.training_summary.val_rows
-            {
+            if metadata != reconstructed {
                 bail!(
                     "{} metadata sidecar mismatch with reconstructed metadata at {}",
                     model_name,
@@ -299,9 +290,12 @@ fn validate_adaptive_metadata(
     if metadata.training_summary.dataset_rows == 0 {
         bail!("adaptive artifact metadata must record non-zero training rows");
     }
-    if metadata.training_summary.dataset_rows
-        != metadata.training_summary.train_rows + metadata.training_summary.val_rows
-    {
+    let accounted_rows = metadata
+        .training_summary
+        .train_rows
+        .checked_add(metadata.training_summary.embargo_rows)
+        .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows));
+    if accounted_rows != Some(metadata.training_summary.dataset_rows) {
         bail!("adaptive artifact metadata training summary is inconsistent");
     }
     Ok(())
@@ -782,7 +776,7 @@ fn balanced_class_weights(labels: &[usize], classes: usize) -> Vec<f64> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "adaptive-models", feature = "statistical-gpu")))]
 pub(super) fn clamped_balanced_class_slack_weights_v1(labels: &[usize]) -> Result<[f64; 3]> {
     let mut counts = [0_u32; 3];
     for &label in labels {
@@ -1166,11 +1160,9 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
                     }
 
                     if scores.iter().any(|s| !s.is_finite()) {
-                        tracing::warn!(
-                            target: "online_learner",
-                            "non-finite scores in argmax; skipping update"
+                        bail!(
+                            "online_pa produced non-finite class scores at training row {row}"
                         );
-                        continue;
                     }
                     let predicted_class = scores
                         .iter()
@@ -1190,11 +1182,9 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
                     let tau = (margin * sample_weights[*target_class] / (2.0 * norm_sq))
                         .min(self.aggressiveness);
                     if !tau.is_finite() || tau < 0.0 {
-                        tracing::warn!(
-                            target: "online_learner",
-                            "OPA tau non-finite or negative ({tau}); skipping update"
+                        bail!(
+                            "online_pa produced invalid update magnitude {tau} at training row {row}"
                         );
-                        continue;
                     }
                     for col in 0..n_cols {
                         weights[(*target_class, col)] += tau * x_row[col];
@@ -1602,11 +1592,9 @@ fn fit_fallback_online_committee(
                 let target = if labels[row] == class_idx { 1.0 } else { 0.0 };
                 let error = (probabilities[(0, class_idx)] - target) * sample_weight;
                 if !error.is_finite() {
-                    tracing::warn!(
-                        target: "online_learner",
-                        "Hoeffding error non-finite; skipping update"
+                    bail!(
+                        "online_hoeffding fallback produced non-finite error at row {row}, class {class_idx}"
                     );
-                    continue;
                 }
                 for col in 0..cols {
                     weights[(class_idx, col)] -=
@@ -2979,7 +2967,7 @@ mod tests {
             state: CapabilityState::Implemented,
             feature_columns: vec!["f1".to_string(), "f2".to_string()],
             label_mapping: canonical_three_class_label_mapping(),
-            training_summary: TrainingSummaryMetadata::raw_for_validation(8, 7, 0),
+            training_summary: TrainingSummaryMetadata::raw_for_validation(8, 7, 0, 0),
         };
 
         let err = validate_adaptive_metadata(

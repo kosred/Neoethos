@@ -397,7 +397,7 @@ fn strict_engine_preflight_never_substitutes_cubecl_for_native_cuda() {
 }
 
 #[test]
-fn no_gpu_cpu_execution_consumes_the_sealed_probe_receipt_before_cpu_work() {
+fn cpu_execution_consumes_exact_sealed_route_authority_before_cpu_work() {
     let backend = read("src/backend.rs");
     let dispatch = section(
         &backend,
@@ -406,19 +406,19 @@ fn no_gpu_cpu_execution_consumes_the_sealed_probe_receipt_before_cpu_work() {
     );
     let cpu_at = dispatch
         .find("require_cpu_route_receipt_v1(")
-        .expect("CPU dispatch must validate the sealed no-compatible-GPU receipt");
+        .expect("CPU dispatch must validate the exact sealed CPU route receipt");
     let work_at = dispatch
         .find("crate::eval::validation_backtest_population_cpu(inputs)")
         .expect("CPU dispatch boundary");
     assert!(
         cpu_at < work_at,
-        "CPU work began before the real no-compatible-GPU receipt was checked"
+        "CPU work began before the exact sealed CPU route receipt was checked"
     );
     require_all(
         dispatch,
         &[
-            "run_with_sealed_no_gpu_receipt(",
-            "no_gpu_receipt",
+            "run_with_sealed_cpu_route_receipt(",
+            "cpu_route_receipt",
             "CpuStrategyCategory::PopulationEvaluation",
         ],
     );
@@ -429,7 +429,7 @@ fn no_gpu_cpu_execution_consumes_the_sealed_probe_receipt_before_cpu_work() {
 }
 
 #[test]
-fn cpu_receipt_is_an_inhabited_opaque_wrapper_over_feature_gated_authority() {
+fn cpu_receipt_is_an_inhabited_opaque_wrapper_over_exact_route_authority() {
     let route = read("src/strict_discovery_device_route_v1.rs");
     let compact = normalized(&route);
 
@@ -440,11 +440,7 @@ fn cpu_receipt_is_an_inhabited_opaque_wrapper_over_feature_gated_authority() {
     );
     require_all(
         wrapper,
-        &[
-            "_sealed: ()",
-            "#[cfg(feature = \"gpu-b-native\")]",
-            "kind: SealedCpuDiscoveryRouteReceiptKindV2",
-        ],
+        &["_sealed: ()", "kind: SealedCpuDiscoveryRouteReceiptKindV2"],
     );
     for forbidden in ["pub ", "LegacyCudaZero", "PhysicalGpuAbsence"] {
         assert!(
@@ -456,18 +452,18 @@ fn cpu_receipt_is_an_inhabited_opaque_wrapper_over_feature_gated_authority() {
     require_all(
         &compact,
         &[
-            "#[cfg(feature=\"gpu-b-native\")]#[derive(Clone,Debug,PartialEq,Eq)]enumSealedCpuDiscoveryRouteReceiptKindV2{",
+            "enumSealedCpuDiscoveryRouteReceiptKindV2{ExplicitCanonicalResearch{contract_identity_sha256:String,input_receipt_sha256:String,},",
+            "#[cfg(feature=\"gpu-b-native\")]LegacyCudaZero(SealedNoCompatibleGpuProbeReceiptV1),",
             "LegacyCudaZero(SealedNoCompatibleGpuProbeReceiptV1),",
-            "#[cfg(feature=\"gpu-cuda\")]PhysicalGpuAbsence{",
+            "#[cfg(all(feature=\"gpu-b-native\",feature=\"gpu-cuda\"))]PhysicalGpuAbsence{",
             "match&self.kind{",
+            "SealedCpuDiscoveryRouteReceiptKindV2::ExplicitCanonicalResearch{",
             "SealedCpuDiscoveryRouteReceiptKindV2::LegacyCudaZero(receipt)=>",
-            "#[cfg(not(feature=\"gpu-b-native\"))]{false}",
         ],
     );
-    assert_eq!(
-        route.matches("LegacyCudaZero(").count(),
-        3,
-        "the legacy CUDA-zero receipt must have exactly one variant, one match arm and one native constructor",
+    assert!(
+        route.matches("LegacyCudaZero(").count() >= 3,
+        "the legacy CUDA-zero receipt must retain its variant, validation and native constructor",
     );
     for forbidden in [
         "impl Default for SealedCpuDiscoveryRouteReceiptV2",

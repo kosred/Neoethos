@@ -25,16 +25,24 @@ fn final_identity_is_not_minted_before_runtime_normalization_evidence() {
         .split_once("pub(crate) fn seal_gpu_resident_feature_store_v3(")
         .expect("final resident seal must exist")
         .1;
+    let seal = seal
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
     let fit = seal
         .find("validate_runtime_evidence(&evidence)")
         .expect("normalization evidence must be validated");
     let finalize = seal
-        .find("finalize_after_normalization_v4(normalization_fit_sha256)")
-        .expect("feature identity must finalize from the validated fit digest");
+        .find("finalize_after_normalization_v4(normalization_fit_sha256,normalization_fitted_state.as_ref(),)")
+        .expect("feature identity must finalize from validated native digest and portable fits");
     assert!(
         fit < finalize,
         "fit evidence must precede identity finalization"
     );
+    let portable = seal
+        .find(".portable_fitted_state(&normalization_names,&evidence)?")
+        .expect("actual runtime words must be decoded against the exact ordered names");
+    assert!(fit < portable && portable < finalize);
 }
 
 #[test]
@@ -116,7 +124,10 @@ fn enabled_and_disabled_normalization_build_distinct_honest_plan_topologies() {
     for token in [
         "if self.normalization_enabled",
         "FeatureOperationTagV1::Normalization",
-        "Some(normalization_fit_sha256)",
+        "normalization:robust-f64",
+        "SEARCH_NORMALIZATION_POLICY_VERSION",
+        "normalization_fitted_state: Option<&SearchNormalizationFittedStateV1>",
+        "fitted.fitted_state_hash()?",
         "canonical_disabled_normalization_fit_sha256_v4()",
         "normalization node is forbidden when disabled",
     ] {
@@ -141,6 +152,7 @@ fn sealed_store_retains_exact_plan_provenance_and_source_leases() {
         "feature_plan: FeaturePlanV1",
         "source_provenance: DatasetFeatureArtifactProvenanceV1",
         "resident_sources: MaterializedPinnedResidentCanonicalSourcesV1",
+        "normalization_fitted_state: Option<SearchNormalizationFittedStateV1>",
     ] {
         assert!(sealed.contains(field), "sealed store is missing {field}");
     }

@@ -1,6 +1,11 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
+// M_PI is not standard C++; preserve binary64 pi on MSVC as well.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846264338327950288
+#endif
+
 // ===========================================================================
 // NEOETHOS f64 LANE  --  closer 4, round 3
 //

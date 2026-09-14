@@ -38,6 +38,7 @@ use neoethos_execution_budget::CpuLease;
 use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction, project_expert_frame};
 use crate::forecasting::swarm_impl::SwarmForecaster;
 use crate::runtime::capabilities::ModelFamily;
+use crate::runtime::feature_input::{MODEL_FEATURE_INPUT_FILE_V1, ModelFeatureInputV1};
 
 const SWARM_PRICE_COLUMN: &str = "quant_close";
 
@@ -54,6 +55,22 @@ impl SwarmForecasterAdapter {
             artifact_dir,
             feature_columns: vec![SWARM_PRICE_COLUMN.to_string()],
         }
+    }
+
+    fn from_artifact_dir(artifact_dir: &Path) -> Result<Self> {
+        let mut adapter = Self::new(artifact_dir.to_path_buf());
+        if let Some(parent) = artifact_dir.parent() {
+            let input_path = parent.join(MODEL_FEATURE_INPUT_FILE_V1);
+            match std::fs::symlink_metadata(&input_path) {
+                Ok(_) => {
+                    let input = ModelFeatureInputV1::read_from_path(&input_path)?;
+                    adapter.feature_columns = vec![input.base_feature_name(SWARM_PRICE_COLUMN)?];
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("inspect swarm model input contract"),
+            }
+        }
+        Ok(adapter)
     }
 
     /// Map a forecast vs the last price into a modest 3-class lean.
@@ -134,10 +151,13 @@ impl ExpertModel for SwarmForecasterAdapter {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        if n_rows < 16 {
+        if n_rows < 32 {
             return Ok(out);
         }
-        let column = projected.feature_column(0)?;
+        // A univariate price forecaster consumes the observed price, not its
+        // robust z-score. The model view retains exact raw lineage through
+        // row/column projections; never invert a clipped normalization fit.
+        let column = projected.raw_model_column(&self.feature_columns[0])?;
         if let Some(reason) = column
             .validity
             .iter()
@@ -206,9 +226,9 @@ impl ExpertLoader for SwarmForecasterAdapterLoader {
         probe
             .load(artifact_dir)
             .with_context(|| format!("SwarmForecaster::load({}) failed", artifact_dir.display()))?;
-        Ok(Box::new(SwarmForecasterAdapter::new(
-            artifact_dir.to_path_buf(),
-        )))
+        Ok(Box::new(SwarmForecasterAdapter::from_artifact_dir(
+            artifact_dir,
+        )?))
     }
 }
 
@@ -221,6 +241,40 @@ pub fn register_swarm_loader(registry: &mut super::ExpertRegistry) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SwarmTestDirectory(PathBuf);
+
+    impl SwarmTestDirectory {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "neoethos-swarm-input-{}-{sequence}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for SwarmTestDirectory {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "ERROR cleaning owned Swarm fixture {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
 
     #[test]
     fn adapter_identity() {
@@ -259,5 +313,136 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-5, "probs must sum to 1, got {sum}");
         assert!(p.iter().all(|&x| (0.0..=1.0).contains(&x)));
         assert!(p[1] > p[2], "upward forecast must lean buy");
+    }
+
+    #[test]
+    fn trained_swarm_reloads_exact_base_alias_and_predicts_raw_prices_from_frozen_views() {
+        use neoethos_data::{FeatureBuildControl, FeatureBuildOptions, FeatureColumnF64};
+        use neoethos_execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
+        use std::sync::Arc;
+
+        let width = WorkerLimit::new(1).unwrap();
+        let lease = CpuPermitBroker::new(width)
+            .acquire(CpuPermitRequest::local(width))
+            .unwrap();
+        for prefixed in [false, true] {
+            let name = if prefixed {
+                "M1_quant_close"
+            } else {
+                SWARM_PRICE_COLUMN
+            };
+            let prices: Vec<f64> = (0..64).map(|row| 1.1 + row as f64 * 0.0001).collect();
+            let raw = Arc::new(
+                neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns_with_options(
+                    neoethos_data::test_fixtures::canonical_test_timestamps(64),
+                    vec![
+                        FeatureColumnF64::new(
+                            name,
+                            prices.clone(),
+                            vec![FeatureCellValidity::Valid; 64],
+                        )
+                        .unwrap(),
+                    ],
+                    FeatureBuildOptions {
+                        prefix_base_features: prefixed,
+                        normalization_training_rows: Some(0..40),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            );
+            let fit = raw
+                .fit_normalization(0..40, true, &FeatureBuildControl::default())
+                .unwrap();
+            let normalized = raw.with_fitted_normalization(&fit).unwrap();
+            assert!(
+                normalized
+                    .feature_column(0)
+                    .unwrap()
+                    .values
+                    .iter()
+                    .any(|value| *value < 0.0)
+            );
+            let input = ModelFeatureInputV1::from_training_frame(
+                raw.provenance().bindings()[0].dataset_identity(),
+                &normalized,
+                Some(raw.timestamps[44]),
+                4,
+            )
+            .unwrap();
+            let root = SwarmTestDirectory::new();
+            let artifact_dir = root.path().join("swarm_forecaster");
+            neoethos_core::storage::json::write_bytes_atomic(
+                &root.path().join(MODEL_FEATURE_INPUT_FILE_V1),
+                &input.to_json_bytes().unwrap(),
+            )
+            .unwrap();
+            let mut model = SwarmForecaster::new(64.0);
+            model.config.horizon = 2;
+            model
+                .fit_from_frame(&normalized.row_window(0, 40).unwrap(), "EURUSD", &lease)
+                .unwrap();
+            assert_eq!(
+                model.values,
+                prices[..40]
+                    .iter()
+                    .map(|value| *value as f32)
+                    .collect::<Vec<_>>()
+            );
+            model.save(&artifact_dir).unwrap();
+            let adapter = SwarmForecasterAdapterLoader.load(&artifact_dir).unwrap();
+            assert_eq!(adapter.feature_columns(), &[name.to_owned()]);
+            let short = adapter
+                .predict(&normalized.row_window(26, 48).unwrap(), &lease)
+                .unwrap();
+            assert_eq!(short.len(), 22);
+            assert!(
+                short
+                    .iter()
+                    .all(|prediction| prediction.validity == FeatureCellValidity::Warmup)
+            );
+            // Identical observed window, different numerical wrapper: neither
+            // normalized values nor future rows may become the price series.
+            let actual = adapter
+                .predict(&normalized.row_window(16, 48).unwrap(), &lease)
+                .unwrap();
+            let expected = adapter
+                .predict(&raw.row_window(16, 48).unwrap(), &lease)
+                .unwrap();
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(actual.kind, expected.kind);
+                assert_eq!(actual.validity, expected.validity);
+                assert_eq!(
+                    actual
+                        .values
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .values
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(actual.len(), 32);
+            assert!(
+                actual[..31]
+                    .iter()
+                    .all(|prediction| !prediction.validity.is_valid())
+            );
+            assert!(actual[31].validity.is_valid());
+        }
+    }
+
+    #[test]
+    fn malformed_swarm_input_contract_cannot_fall_back_to_legacy_column() {
+        let root = SwarmTestDirectory::new();
+        let input_path = root.path().join(MODEL_FEATURE_INPUT_FILE_V1);
+        std::fs::write(&input_path, b"{}").unwrap();
+        assert!(
+            SwarmForecasterAdapter::from_artifact_dir(&root.path().join("swarm_forecaster"))
+                .is_err()
+        );
     }
 }

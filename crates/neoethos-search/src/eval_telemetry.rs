@@ -293,8 +293,8 @@ fn device_registry() -> &'static Mutex<BTreeMap<&'static str, DeviceMetrics>> {
 
 /// Is a usable CUDA card + the native f64 prototype-B lane actually present?
 /// The ONLY true hardware check — a mere feature/env flag is not enough. False
-/// on every build without prototype B compiled in (Vulkan/ROCm/CPU), so those
-/// hosts report "no card" as the normal, expected state.
+/// on every build without prototype B compiled in, so CPU-only hosts report
+/// "no card" as the normal, expected state.
 fn card_present() -> bool {
     #[cfg(feature = "gpu-b-adapter")]
     {

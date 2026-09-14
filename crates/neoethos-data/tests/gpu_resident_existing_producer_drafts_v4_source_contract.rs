@@ -28,6 +28,37 @@ fn require_in_order(source: &str, tokens: &[&str]) {
     }
 }
 
+fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing function signature `{signature}`"));
+    let open = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .expect("function has no opening brace");
+    let mut depth = 0usize;
+    for (offset, byte) in source.as_bytes()[open..].iter().copied().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1).expect("unbalanced closing brace");
+                if depth == 0 {
+                    return &source[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("function `{signature}` has no closing brace");
+}
+
+fn without_whitespace(source: &str) -> String {
+    source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
 #[test]
 fn smc_regime_and_footprint_drafts_use_the_existing_owner_authorities() {
     let store = read("src/core/gpu_resident_feature_store_v3.rs");
@@ -115,13 +146,7 @@ fn smc_memory_is_sized_by_the_runtime_owner_before_device_acquisition() {
 #[test]
 fn factory_appends_all_seven_column_drafts_in_canonical_order() {
     let store = read("src/core/gpu_resident_feature_store_v3.rs");
-    let resolve = store
-        .split_once("fn resolve(")
-        .expect("crate-owned factory resolve")
-        .1
-        .split_once("fn prepare_smc(")
-        .expect("factory resolve terminator")
-        .0;
+    let resolve = function_body(&store, "fn resolve_resident_producer_pass_v2(");
     require_in_order(
         resolve,
         &[
@@ -134,30 +159,37 @@ fn factory_appends_all_seven_column_drafts_in_canonical_order() {
             "htf_draft",
         ],
     );
-    assert!(resolve.contains("into_materialization_v4()"));
+    let factory = function_body(&store, "fn resolve(");
+    assert!(factory.contains("prepared_recipe.into_materialization_v4()?"));
+    assert!(factory.contains("for draft in resolved_pass.drafts"));
 }
 
 #[test]
 fn runtime_appends_every_admitted_family_before_normalization() {
     let store = read("src/core/gpu_resident_feature_store_v3.rs");
-    let materialize = store
-        .split_once("pub fn materialize_gpu_only_feature_store_v3(")
-        .expect("strict materializer")
-        .1
-        .split_once("#[cfg(test)]")
-        .expect("strict materializer terminator")
-        .0;
+    let materialize = function_body(
+        &store,
+        "fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(",
+    );
     require_in_order(
         materialize,
         &[
             "pending_smc_batch.append_to",
-            "append_resident_classic_ta_recipe_v4",
-            "quant_runtime.append_to",
-            "session_runtime.append_to",
-            "regime_input.append_to",
-            "append_resident_footprint_v2",
-            "prepared_htf_append.append_to",
+            "append_post_smc_producers_v2",
             "apply_resident_robust_normalization_v2",
+        ],
+    );
+    let post_smc = function_body(&store, "fn append_post_smc_producers_v2(");
+    let post_smc = without_whitespace(post_smc);
+    require_in_order(
+        &post_smc,
+        &[
+            "append_resident_classic_ta_recipe_v4",
+            "post_smc.quant_runtime.append_to",
+            "post_smc.session_runtime.append_to",
+            "post_smc.regime_input.append_to",
+            "append_resident_footprint_v2",
+            "post_smc.htf_append.append_to",
         ],
     );
 }

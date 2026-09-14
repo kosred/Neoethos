@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use ndarray::Array2;
+use ndarray::{Array2, Axis};
 use neoethos_data::FeatureFrame;
 use neoethos_execution_budget::CpuLease;
 use rand::{Rng, SeedableRng};
@@ -31,7 +31,7 @@ use crate::runtime::capabilities::{
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     FeatureScaler, METADATA_FILE_NAME, ensure_feature_columns_match, feature_matrix_from_frame,
-    read_json, remap_three_class_labels, softmax_rows, write_json,
+    read_json, remap_three_class_labels, softmax_rows, temporal_train_validation_split, write_json,
 };
 
 const NEAT_ARTIFACT_FILE_NAME: &str = "neat.json";
@@ -40,6 +40,8 @@ const NEAT_RUNTIME_BACKEND: &str = "symbios_neat_cpu";
 #[cfg(feature = "neuro-evolution-gpu")]
 const NEAT_CUDA_FITNESS_BACKEND: &str = "symbios_neat_cuda_fitness";
 const DEFAULT_NEAT_SPECIES_ELITISM: usize = 0;
+const MIN_NEAT_POPULATION: usize = 24;
+const MIN_NEAT_GENERATIONS: usize = 8;
 
 /// Checked, backend-local narrowing for symbios-neat, whose evaluator accepts
 /// f32 inputs. The shared typed frame and scaler remain f64, and values that
@@ -104,6 +106,7 @@ struct NeatArtifact {
     fitted: bool,
     dataset_rows: usize,
     train_rows: usize,
+    embargo_rows: usize,
     val_rows: usize,
     runtime_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,8 +127,12 @@ impl Default for NeatArtifact {
         let config = NeatConfig::minimal(1, 3);
         Self {
             config: config.clone(),
-            generations: 48,
-            population_size: 96,
+            // Serde fallback for an old artifact that does not record its
+            // topology. These are validity floors, not a second training
+            // capacity; configured training gets its population from the
+            // orchestrator.
+            generations: MIN_NEAT_GENERATIONS,
+            population_size: MIN_NEAT_POPULATION,
             mutation_rate: 0.85,
             species_elitism: DEFAULT_NEAT_SPECIES_ELITISM,
             compatibility_threshold: 2.5,
@@ -140,6 +147,7 @@ impl Default for NeatArtifact {
             fitted: false,
             dataset_rows: 0,
             train_rows: 0,
+            embargo_rows: 0,
             val_rows: 0,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
@@ -470,6 +478,7 @@ pub struct NeatExpert {
     fitted: bool,
     dataset_rows: usize,
     train_rows: usize,
+    embargo_rows: usize,
     val_rows: usize,
     runtime_backend: String,
     requested_device_policy: String,
@@ -487,14 +496,17 @@ impl NeatExpert {
     }
 
     pub fn new(input_dim: usize) -> Self {
-        Self::with_config(input_dim, 96, 48)
+        // Placeholder used by the artifact loader; `load` replaces the entire
+        // recorded topology. Keep only the validity floors here so training
+        // capacity has one source in the orchestrator.
+        Self::with_config(input_dim, MIN_NEAT_POPULATION, MIN_NEAT_GENERATIONS)
     }
 
     pub fn with_config(input_dim: usize, population_size: usize, generations: usize) -> Self {
         Self {
             config: build_neat_config(input_dim),
-            generations: generations.max(8),
-            population_size: population_size.max(24),
+            generations: generations.max(MIN_NEAT_GENERATIONS),
+            population_size: population_size.max(MIN_NEAT_POPULATION),
             mutation_rate: 0.85,
             species_elitism: DEFAULT_NEAT_SPECIES_ELITISM,
             compatibility_threshold: 2.5,
@@ -506,6 +518,7 @@ impl NeatExpert {
             fitted: false,
             dataset_rows: 0,
             train_rows: 0,
+            embargo_rows: 0,
             val_rows: 0,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             requested_device_policy: default_neat_requested_device_policy(),
@@ -541,20 +554,6 @@ impl NeatExpert {
         };
         self.effective_device_policy = "unresolved".to_string();
         self
-    }
-
-    fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
-        if rows <= 4 {
-            return ((0..rows).collect(), Vec::new());
-        }
-
-        let val_rows = ((rows as f64) * 0.2).round() as usize;
-        let val_rows = val_rows.clamp(1, rows.saturating_sub(1));
-        let train_rows = rows - val_rows;
-
-        let train = (0..train_rows).collect::<Vec<_>>();
-        let val = (train_rows..rows).collect::<Vec<_>>();
-        (train, val)
     }
 
     fn slice_rows(features: &Array2<f32>, indices: &[usize]) -> Array2<f32> {
@@ -808,7 +807,11 @@ impl NeatExpert {
                 ),
             );
         }
-        if self.train_rows == 0 || self.train_rows + self.val_rows != self.dataset_rows {
+        let accounted_rows = self
+            .train_rows
+            .checked_add(self.embargo_rows)
+            .and_then(|rows| rows.checked_add(self.val_rows));
+        if self.train_rows == 0 || accounted_rows != Some(self.dataset_rows) {
             return (
                 Some("neat_unknown".to_string()),
                 append_runtime_degraded_reason(
@@ -849,7 +852,11 @@ impl NeatExpert {
         if self.dataset_rows == 0 || self.train_rows == 0 {
             bail!("NEAT training summary is incomplete");
         }
-        if self.train_rows + self.val_rows != self.dataset_rows {
+        let accounted_rows = self
+            .train_rows
+            .checked_add(self.embargo_rows)
+            .and_then(|rows| rows.checked_add(self.val_rows));
+        if accounted_rows != Some(self.dataset_rows) {
             bail!("NEAT training summary is inconsistent");
         }
         if self.runtime_backend.trim().is_empty() {
@@ -933,9 +940,12 @@ impl NeatExpert {
             bail!("NEAT artifact label mapping mismatch");
         }
 
-        if metadata.training_summary.dataset_rows
-            != metadata.training_summary.train_rows + metadata.training_summary.val_rows
-        {
+        let accounted_rows = metadata
+            .training_summary
+            .train_rows
+            .checked_add(metadata.training_summary.embargo_rows)
+            .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows));
+        if accounted_rows != Some(metadata.training_summary.dataset_rows) {
             bail!("NEAT artifact training summary is inconsistent");
         }
         if metadata.training_summary.train_rows == 0 {
@@ -975,7 +985,9 @@ impl NeatExpert {
             bail!("NEAT artifact scaler contains non-finite or non-positive stds");
         }
 
-        if artifact.population_size < 24 || artifact.generations < 8 {
+        if artifact.population_size < MIN_NEAT_POPULATION
+            || artifact.generations < MIN_NEAT_GENERATIONS
+        {
             bail!(
                 "NEAT artifact search topology is invalid: generations={}, population_size={}",
                 artifact.generations,
@@ -996,8 +1008,14 @@ impl NeatExpert {
         if artifact.train_rows == 0 {
             bail!("NEAT artifact train_rows must be greater than zero");
         }
-        if artifact.train_rows + artifact.val_rows != artifact.dataset_rows {
-            bail!("NEAT artifact train_rows + val_rows must equal dataset_rows");
+        let accounted_rows = artifact
+            .train_rows
+            .checked_add(artifact.embargo_rows)
+            .and_then(|rows| rows.checked_add(artifact.val_rows));
+        if accounted_rows != Some(artifact.dataset_rows) {
+            bail!(
+                "NEAT artifact train_rows + embargo_rows + val_rows must equal dataset_rows"
+            );
         }
         if artifact.runtime_backend.trim().is_empty() {
             bail!("NEAT artifact must persist a runtime backend label");
@@ -1112,6 +1130,7 @@ impl NeatExpert {
             bail!("NEAT artifact dataset row count does not match metadata");
         }
         if metadata.training_summary.train_rows != artifact.train_rows
+            || metadata.training_summary.embargo_rows != artifact.embargo_rows
             || metadata.training_summary.val_rows != artifact.val_rows
         {
             bail!("NEAT artifact training summary does not match metadata");
@@ -1148,6 +1167,7 @@ impl NeatExpert {
             TrainingSummaryMetadata::new(
                 artifact.dataset_rows,
                 artifact.train_rows,
+                artifact.embargo_rows,
                 artifact.val_rows,
             ),
         )
@@ -1157,20 +1177,8 @@ impl NeatExpert {
         sidecar: &RuntimeArtifactMetadata,
         embedded: &RuntimeArtifactMetadata,
     ) -> Result<()> {
-        if sidecar.model_name != embedded.model_name
-            || sidecar.family != embedded.family
-            || sidecar.state != embedded.state
-        {
-            bail!("NEAT metadata identity mismatch between sidecar and embedded payload");
-        }
-        if sidecar.feature_columns != embedded.feature_columns {
-            bail!("NEAT metadata feature columns drift between sidecar and embedded");
-        }
-        if sidecar.label_mapping != embedded.label_mapping {
-            bail!("NEAT metadata label mapping drift between sidecar and embedded");
-        }
-        if sidecar.training_summary != embedded.training_summary {
-            bail!("NEAT metadata training summary drift between sidecar and embedded");
+        if sidecar != embedded {
+            bail!("NEAT runtime metadata drift between sidecar and embedded payload");
         }
         Ok(())
     }
@@ -1225,26 +1233,28 @@ impl ExpertModel for NeatExpert {
     fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
         lease.scope(|| {
             let (features, feature_columns) = feature_matrix_from_frame(x)?;
-            let scaler = FeatureScaler::fit(&features)?;
-            let scaled = neat_backend_f32_matrix(&scaler.transform(&features)?)?;
             let labels = remap_three_class_labels(y)?;
-            if scaled.nrows() < 32 {
+            if features.nrows() < 32 {
                 bail!(
                     "NEAT requires at least 32 rows, received {}",
-                    scaled.nrows()
+                    features.nrows()
                 );
             }
+
+            let split = temporal_train_validation_split(features.nrows());
+            let scaler = FeatureScaler::fit(&features.select(Axis(0), &split.train_indices))?;
+            let scaled = neat_backend_f32_matrix(&scaler.transform(&features)?)?;
 
             self.config = build_neat_config(scaled.ncols());
             self.feature_columns = feature_columns;
             self.scaler = Some(scaler);
             self.dataset_rows = scaled.nrows();
-            let (train_indices, val_indices) = Self::split_train_val_indices(scaled.nrows());
-            let train_features = Self::slice_rows(&scaled, &train_indices);
-            let val_features = Self::slice_rows(&scaled, &val_indices);
-            let train_labels = Self::slice_labels(&labels, &train_indices);
-            let val_labels = Self::slice_labels(&labels, &val_indices);
+            let train_features = Self::slice_rows(&scaled, &split.train_indices);
+            let val_features = Self::slice_rows(&scaled, &split.validation_indices);
+            let train_labels = Self::slice_labels(&labels, &split.train_indices);
+            let val_labels = Self::slice_labels(&labels, &split.validation_indices);
             self.train_rows = train_features.nrows();
+            self.embargo_rows = split.embargo_rows;
             self.val_rows = val_features.nrows();
             self.runtime_backend = NEAT_RUNTIME_BACKEND.to_string();
 
@@ -1282,7 +1292,12 @@ impl ExpertModel for NeatExpert {
             CapabilityState::Implemented,
             self.feature_columns.clone(),
             default_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(self.dataset_rows, self.train_rows, self.val_rows),
+            TrainingSummaryMetadata::new(
+                self.dataset_rows,
+                self.train_rows,
+                self.embargo_rows,
+                self.val_rows,
+            ),
         )?;
         write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
         write_json(
@@ -1302,6 +1317,7 @@ impl ExpertModel for NeatExpert {
                 fitted: self.fitted,
                 dataset_rows: self.dataset_rows,
                 train_rows: self.train_rows,
+                embargo_rows: self.embargo_rows,
                 val_rows: self.val_rows,
                 runtime_backend: self.runtime_backend.clone(),
                 runtime_backend_kind: Some(neat_runtime_backend_kind(&self.runtime_backend)),
@@ -1334,6 +1350,7 @@ impl ExpertModel for NeatExpert {
         let next_fitted = artifact.fitted;
         let next_dataset_rows = artifact.dataset_rows;
         let next_train_rows = artifact.train_rows;
+        let next_embargo_rows = artifact.embargo_rows;
         let next_val_rows = artifact.val_rows;
         let next_runtime_backend = artifact.runtime_backend;
         let next_requested_device_policy =
@@ -1357,6 +1374,7 @@ impl ExpertModel for NeatExpert {
         self.fitted = next_fitted;
         self.dataset_rows = next_dataset_rows;
         self.train_rows = next_train_rows;
+        self.embargo_rows = next_embargo_rows;
         self.val_rows = next_val_rows;
         self.runtime_backend = next_runtime_backend;
         self.requested_device_policy = next_requested_device_policy;
@@ -1446,11 +1464,13 @@ mod tests {
         let metadata: crate::runtime::artifacts::RuntimeArtifactMetadata =
             read_json(&path.join(METADATA_FILE_NAME))?;
         assert_eq!(metadata.training_summary.dataset_rows, 32);
-        assert_eq!(metadata.training_summary.train_rows, 26);
+        assert_eq!(metadata.training_summary.train_rows, 25);
+        assert_eq!(metadata.training_summary.embargo_rows, 1);
         assert_eq!(metadata.training_summary.val_rows, 6);
 
         let artifact: NeatArtifact = read_json(&path.join(NEAT_ARTIFACT_FILE_NAME))?;
-        assert_eq!(artifact.train_rows, 26);
+        assert_eq!(artifact.train_rows, 25);
+        assert_eq!(artifact.embargo_rows, 1);
         assert_eq!(artifact.val_rows, 6);
         assert_eq!(artifact.runtime_backend, NEAT_RUNTIME_BACKEND);
         assert_eq!(
@@ -1497,7 +1517,10 @@ mod tests {
 
         let mut loaded = NeatExpert::with_config(2, 24, 8);
         loaded.load(&path)?;
-        assert_eq!(loaded.train_rows + loaded.val_rows, loaded.dataset_rows);
+        assert_eq!(
+            loaded.train_rows + loaded.embargo_rows + loaded.val_rows,
+            loaded.dataset_rows
+        );
         let _ = std::fs::remove_dir_all(&path);
         Ok(())
     }
@@ -1532,7 +1555,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["f1".to_string()],
             default_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(32, 26, 6),
+            TrainingSummaryMetadata::new(32, 25, 1, 6),
         );
         let artifact = NeatArtifact {
             config: build_neat_config(1),
@@ -1555,6 +1578,7 @@ mod tests {
             fitted: true,
             dataset_rows: 32,
             train_rows: 32,
+            embargo_rows: 0,
             val_rows: 1,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
@@ -1568,7 +1592,10 @@ mod tests {
 
         let err = NeatExpert::validate_loaded_artifact(&metadata, &artifact)
             .expect_err("inconsistent train/val rows should be rejected");
-        assert!(err.to_string().contains("train_rows + val_rows"));
+        assert!(
+            err.to_string()
+                .contains("train_rows + embargo_rows + val_rows")
+        );
         Ok(())
     }
 
@@ -1580,7 +1607,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["f1".to_string()],
             default_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(32, 26, 6),
+            TrainingSummaryMetadata::new(32, 25, 1, 6),
         );
         let artifact = NeatArtifact {
             config: build_neat_config(1),
@@ -1602,7 +1629,8 @@ mod tests {
             },
             fitted: true,
             dataset_rows: 32,
-            train_rows: 26,
+            train_rows: 25,
+            embargo_rows: 1,
             val_rows: 6,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
@@ -1628,7 +1656,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["f1".to_string()],
             default_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(32, 26, 6),
+            TrainingSummaryMetadata::new(32, 25, 1, 6),
         );
         let artifact = NeatArtifact {
             config: build_neat_config(1),
@@ -1650,7 +1678,8 @@ mod tests {
             },
             fitted: true,
             dataset_rows: 32,
-            train_rows: 26,
+            train_rows: 25,
+            embargo_rows: 1,
             val_rows: 6,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),

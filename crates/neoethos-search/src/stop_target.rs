@@ -26,6 +26,8 @@ pub enum StopDistanceError {
     TailCapExceeded { bars: usize, cap: usize },
     /// A caller-supplied scalar was non-finite or non-positive.
     InvalidScalar { name: &'static str, value: f64 },
+    /// An archived recipe cannot safely reproduce the causal base producer.
+    InvalidSettings { detail: String },
     /// Every distance came out non-finite / non-positive.
     Degenerate { median: f64 },
 }
@@ -47,6 +49,9 @@ impl std::fmt::Display for StopDistanceError {
             ),
             Self::InvalidScalar { name, value } => {
                 write!(f, "stop-distance series got a non-usable {name} = {value}")
+            }
+            Self::InvalidSettings { detail } => {
+                write!(f, "invalid adaptive-stop settings: {detail}")
             }
             Self::Degenerate { median } => write!(
                 f,
@@ -160,7 +165,8 @@ pub fn current_stop_target_runtime_overrides() -> StopTargetRuntimeOverrides {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolEnsembleWeights {
     pub yang_zhang: f64,
     pub garman_klass: f64,
@@ -187,7 +193,8 @@ impl VolEnsembleWeights {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StopTargetSettings {
     pub vol_estimator: String,
     pub vol_window: usize,
@@ -243,9 +250,155 @@ pub struct StopTargetSettings {
     pub ema_fast_period: usize,
     pub ema_slow_period: usize,
     pub atr_period: usize,
+    #[serde(deserialize_with = "deserialize_required_stop_option")]
     pub weights: Option<VolEnsembleWeights>,
+    #[serde(deserialize_with = "deserialize_required_stop_option")]
     pub weights_trend: Option<VolEnsembleWeights>,
+    #[serde(deserialize_with = "deserialize_required_stop_option")]
     pub weights_range: Option<VolEnsembleWeights>,
+}
+
+fn deserialize_required_stop_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    serde::Deserialize::deserialize(deserializer)
+}
+
+/// The entire recipe used by the shared causal adaptive-base producer, plus
+/// the enable decision and legacy RR fallback. This is archived with the
+/// Search evaluator, not reconstructed from defaults at quote replay time.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedAdaptiveStopsPolicyV1 {
+    schema_version: u16,
+    log_operation_schedule: String,
+    enabled: bool,
+    reward_risk_fallback: f64,
+    settings: StopTargetSettings,
+}
+
+impl ResolvedAdaptiveStopsPolicyV1 {
+    pub fn capture_current() -> Result<Self, StopDistanceError> {
+        Self::checked_new(
+            resolved_adaptive_base_settings(),
+            adaptive_stops_enabled(),
+            adaptive_stops_rr(),
+        )
+    }
+
+    pub fn checked_new(
+        settings: StopTargetSettings,
+        enabled: bool,
+        reward_risk_fallback: f64,
+    ) -> Result<Self, StopDistanceError> {
+        let policy = Self {
+            schema_version: 1,
+            log_operation_schedule: STOP_TARGET_LOG_OPERATION_SCHEDULE_V3.to_owned(),
+            enabled,
+            reward_risk_fallback,
+            settings,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), StopDistanceError> {
+        if self.schema_version != 1
+            || self.log_operation_schedule != STOP_TARGET_LOG_OPERATION_SCHEDULE_V3
+        {
+            return Err(StopDistanceError::InvalidSettings {
+                detail: "unsupported archived adaptive-stop math/schema".to_owned(),
+            });
+        }
+        if !self.reward_risk_fallback.is_finite() || self.reward_risk_fallback <= 0.0 {
+            return Err(StopDistanceError::InvalidScalar {
+                name: "reward_risk_fallback",
+                value: self.reward_risk_fallback,
+            });
+        }
+        validate_adaptive_base_settings(&self.settings)
+    }
+
+    pub fn settings(&self) -> &StopTargetSettings {
+        &self.settings
+    }
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+    pub fn reward_risk_fallback(&self) -> f64 {
+        self.reward_risk_fallback
+    }
+}
+
+fn validate_adaptive_base_settings(settings: &StopTargetSettings) -> Result<(), StopDistanceError> {
+    let invalid = |detail: &str| StopDistanceError::InvalidSettings {
+        detail: detail.to_owned(),
+    };
+    // Parkinson is the actual shared producer. Other estimators consume open
+    // or full-window regime weights and cannot silently use close as open.
+    if settings.vol_estimator != "parkinson" {
+        return Err(invalid(
+            "shared adaptive base requires its recorded Parkinson estimator",
+        ));
+    }
+    for (name, value) in [
+        ("ewma_lambda", settings.ewma_lambda),
+        ("tail_alpha", settings.tail_alpha),
+        ("stop_k_vol", settings.stop_k_vol),
+        ("stop_k_tail", settings.stop_k_tail),
+        ("meta_label_min_dist", settings.meta_label_min_dist),
+        ("regime_adx_trend", settings.regime_adx_trend),
+        ("regime_adx_range", settings.regime_adx_range),
+        ("hurst_trend", settings.hurst_trend),
+        ("hurst_range", settings.hurst_range),
+        ("rr_trend", settings.rr_trend),
+        ("rr_range", settings.rr_range),
+        ("rr_neutral", settings.rr_neutral),
+        ("min_risk_reward", settings.min_risk_reward),
+        ("atr_stop_multiplier", settings.atr_stop_multiplier),
+        ("structure_min_atr_mult", settings.structure_min_atr_mult),
+        ("structure_max_atr_mult", settings.structure_max_atr_mult),
+    ] {
+        if !value.is_finite() {
+            return Err(StopDistanceError::InvalidScalar { name, value });
+        }
+    }
+    if settings.vol_window < 2
+        || settings.tail_window < 3
+        || settings.vol_horizon_bars == 0
+        || settings.tail_step == 0
+        || settings.atr_period == 0
+        || settings.atr_period > usize::MAX - 2
+        || !(0.0..1.0).contains(&settings.tail_alpha)
+        || settings.stop_k_vol < 0.0
+        || settings.stop_k_tail < 0.0
+        || settings.meta_label_min_dist < 0.0
+    {
+        return Err(invalid("invalid archived volatility/tail window or scale"));
+    }
+    for weights in [
+        settings.weights,
+        settings.weights_trend,
+        settings.weights_range,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if [
+            weights.yang_zhang,
+            weights.garman_klass,
+            weights.rogers_satchell,
+            weights.parkinson,
+        ]
+        .iter()
+        .any(|value| !value.is_finite())
+        {
+            return Err(invalid("nonfinite archived ensemble weight"));
+        }
+    }
+    Ok(())
 }
 
 impl Default for StopTargetSettings {
@@ -419,13 +572,19 @@ fn vol_yang_zhang(
         0.0
     };
 
-    let sigma_o2 = rolling_var(&o_ret, window);
-    let sigma_c2 = rolling_var(&c_ret, window);
-    let sigma_rs2 = rolling_mean(&rs, window);
+    // Row zero has no previous close, so it is not an observation of the
+    // opening return. Feeding that NaN into the rolling accumulators poisons
+    // every later window: even subtracting the sentinel cannot recover a
+    // finite sum. All three terms must use the same complete periods, 1..n.
+    // A window of W returns first becomes available on OHLC row W.
+    let sigma_o2 = rolling_var(&o_ret[1..], window);
+    let sigma_c2 = rolling_var(&c_ret[1..], window);
+    let sigma_rs2 = rolling_mean(&rs[1..], window);
 
     let mut sigma = vec![0.0; n];
-    for i in 0..n {
-        let mut val = sigma_o2[i] + k * sigma_c2[i] + (1.0 - k) * sigma_rs2[i];
+    for i in 1..n {
+        let j = i - 1;
+        let mut val = sigma_o2[j] + k * sigma_c2[j] + (1.0 - k) * sigma_rs2[j];
         if !val.is_finite() {
             val = 0.0;
         }
@@ -992,6 +1151,11 @@ fn structure_distances(
 
 /// Per-bar stop distance (price units) = `max(k_vol × vol, k_tail × tail)`.
 ///
+/// A non-finite cell means that the stop is unavailable at that bar. In
+/// particular, warm-up is not a zero-volatility observation: consumers must
+/// skip new adaptive entries until every enabled component has enough history.
+/// Never fill an unavailable cell from the median of future observations.
+///
 /// Returns a typed [`StopDistanceError`] rather than `None` so a caller cannot
 /// treat "too long to compute" the same way it treats "too short to have a
 /// stop". Both used to arrive as `None`; only one of them is a reason to fall
@@ -1077,20 +1241,47 @@ pub fn compute_stop_distance_series(
         .map(|(c, s)| c * s * scale)
         .collect();
 
+    // Range estimators consume W bars; Yang-Zhang and EWMA also need the
+    // preceding close. Blends include Yang-Zhang. Disabled components must not
+    // delay the first usable stop.
+    let vol_first = match settings.vol_estimator.to_ascii_lowercase().as_str() {
+        "parkinson" | "park" | "garman_klass" | "gk" | "rogers_satchell" | "rs" => {
+            settings.vol_window.saturating_sub(1)
+        }
+        _ => settings.vol_window,
+    };
     let mut dist = Vec::with_capacity(close.len());
     for i in 0..close.len() {
-        let base = (settings.stop_k_vol * vol_dist[i]).max(settings.stop_k_tail * tail_dist[i]);
-        dist.push(base.max(settings.meta_label_min_dist));
+        let vol_ready = settings.stop_k_vol == 0.0
+            || (i >= vol_first && vol_dist[i].is_finite() && vol_dist[i] >= 0.0);
+        let tail_ready = settings.stop_k_tail == 0.0
+            || (i >= settings.tail_window && tail_dist[i].is_finite() && tail_dist[i] >= 0.0);
+        if !vol_ready || !tail_ready || !close[i].is_finite() || close[i] <= 0.0 {
+            dist.push(f64::NAN);
+            continue;
+        }
+        let vol = if settings.stop_k_vol == 0.0 {
+            0.0
+        } else {
+            settings.stop_k_vol * vol_dist[i]
+        };
+        let tail = if settings.stop_k_tail == 0.0 {
+            0.0
+        } else {
+            settings.stop_k_tail * tail_dist[i]
+        };
+        let value = vol.max(tail).max(settings.meta_label_min_dist);
+        dist.push(if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            f64::NAN
+        });
     }
 
-    let med = median_ignore_nan(&dist);
-    if !med.is_finite() || med <= 0.0 {
-        return Err(StopDistanceError::Degenerate { median: med });
-    }
-    for v in &mut dist {
-        if !v.is_finite() {
-            *v = med;
-        }
+    if !dist.iter().any(|value| value.is_finite() && *value > 0.0) {
+        return Err(StopDistanceError::Degenerate {
+            median: median_ignore_nan(&dist),
+        });
     }
 
     Ok(dist)
@@ -1237,9 +1428,9 @@ pub fn adaptive_sl_tp_pips_series(
     let mut sl_pips = Vec::with_capacity(dist.len());
     let mut tp_pips = Vec::with_capacity(dist.len());
     for d in dist {
-        let sl = (d * vol_mult / pip_size).max(1e-9);
+        let sl = d * vol_mult / pip_size;
         sl_pips.push(sl);
-        tp_pips.push((sl * rr).max(1e-9));
+        tp_pips.push(sl * rr);
     }
     Ok((sl_pips, tp_pips))
 }
@@ -1253,6 +1444,7 @@ pub fn adaptive_sl_tp_pips_series(
 /// different strategy. Parkinson depends only on high/low/close, which every
 /// path has, so the base is identical everywhere. A gene's `stop_vol_mult` then
 /// scales this shared series.
+/// Unavailable warm-up cells remain NaN; they are not tradable stop distances.
 ///
 /// This is the ONE production entry point for the shared base, so it is also
 /// where the process-wide cost cap is read — every caller therefore sees the
@@ -1269,21 +1461,53 @@ pub fn adaptive_base_pips_series(
     close: &[f64],
     pip_size: f64,
 ) -> Result<Vec<f64>, StopDistanceError> {
+    adaptive_base_pips_series_with_settings(
+        high,
+        low,
+        close,
+        pip_size,
+        &resolved_adaptive_base_settings(),
+    )
+}
+
+/// Capture exactly the recipe the existing process-owned producer uses.
+pub fn resolved_adaptive_base_settings() -> StopTargetSettings {
+    let overrides = current_stop_target_runtime_overrides();
+    let mut settings = StopTargetSettings::default();
+    settings.vol_estimator = "parkinson".to_string();
+    settings.tail_max_bars = overrides.tail_max_bars;
+    settings.tail_step = overrides.tail_step;
+    settings
+}
+
+/// Replay an archived shared-base recipe without consulting runtime settings.
+/// Warm-up/cap refusal and every arithmetic operation are the existing path.
+pub fn adaptive_base_pips_series_with_settings(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    pip_size: f64,
+    settings: &StopTargetSettings,
+) -> Result<Vec<f64>, StopDistanceError> {
     if !(pip_size.is_finite() && pip_size > 0.0) {
         return Err(StopDistanceError::InvalidScalar {
             name: "pip_size",
             value: pip_size,
         });
     }
-    let overrides = current_stop_target_runtime_overrides();
-    let mut settings = StopTargetSettings::default();
-    settings.vol_estimator = "parkinson".to_string();
-    settings.tail_max_bars = overrides.tail_max_bars;
-    settings.tail_step = overrides.tail_step;
+    validate_adaptive_base_settings(settings)?;
+    if high.len() != close.len()
+        || low.len() != close.len()
+        || settings.tail_step > usize::MAX.saturating_sub(close.len())
+    {
+        return Err(StopDistanceError::InvalidSettings {
+            detail: "unaligned price arrays or overflowing tail sampling step".to_owned(),
+        });
+    }
     // `open` is unused by the Parkinson estimator — pass `close` as a harmless
     // placeholder so callers without an open series get the identical result.
-    let dist = compute_stop_distance_series(close, high, low, close, &settings)?;
-    Ok(dist.iter().map(|d| (d / pip_size).max(1e-9)).collect())
+    let dist = compute_stop_distance_series(close, high, low, close, settings)?;
+    Ok(dist.iter().map(|d| d / pip_size).collect())
 }
 
 /// Median ATR of a dataset, in PIPS — the scale unit for the gene stop/target
@@ -1347,8 +1571,63 @@ pub fn adaptive_stops_enabled() -> bool {
     true
 }
 
-/// Reward:risk multiple for adaptive stops (`TP = rr × stop`). The operator
-/// wants ~2R kept out of the stop.
+/// Resolve the reward:risk encoded by one gene's fixed stop/target pair.
+///
+/// Adaptive stops replace the gene's absolute stop distance with a
+/// volatility-scaled one, but they must not also erase its independently
+/// evolved exit geometry.  The dimensionless `target_pips / stop_pips` ratio is
+/// therefore retained and applied to the adaptive stop. `fallback` exists only
+/// for legacy/corrupt genes whose stored pair cannot define a positive finite
+/// ratio.
+#[inline]
+pub fn effective_adaptive_reward_risk(stop_pips: f64, target_pips: f64, fallback: f64) -> f64 {
+    if stop_pips.is_finite() && stop_pips > 0.0 && target_pips.is_finite() && target_pips > 0.0 {
+        let reward_risk = target_pips / stop_pips;
+        if reward_risk.is_finite() && reward_risk > 0.0 {
+            return reward_risk;
+        }
+    }
+    if fallback.is_finite() && fallback > 0.0 {
+        fallback
+    } else {
+        2.0
+    }
+}
+
+/// Shared per-entry geometry for Search and archived quote replay. The
+/// availability boolean is independent of the cell: an enabled series with a
+/// missing/warm-up cell forbids entry; an absent series retains fixed geometry.
+/// Fixed values remain unchanged here, exactly as in the existing evaluator;
+/// the admitting caller owns their domain validation.
+#[inline]
+pub fn resolve_entry_stop_target_pips(
+    sl_pips: f64,
+    tp_pips: f64,
+    vol_mult: f64,
+    adaptive_base: Option<f64>,
+    adaptive_series_enabled: bool,
+    reward_risk_fallback: f64,
+) -> Option<(f64, f64)> {
+    if vol_mult > 0.0 && adaptive_series_enabled {
+        if let Some(distance) = adaptive_base {
+            // Preserve the evaluator's operation order, including RR before
+            // target multiplication. Do not algebraically rearrange f64 math.
+            let sl = vol_mult * distance;
+            let reward_risk =
+                effective_adaptive_reward_risk(sl_pips, tp_pips, reward_risk_fallback);
+            let tp = reward_risk * sl;
+            if sl.is_finite() && sl > 0.0 && tp.is_finite() && tp > 0.0 {
+                return Some((sl, tp));
+            }
+        }
+        return None;
+    }
+    Some((sl_pips, tp_pips))
+}
+
+/// Legacy reward:risk fallback for adaptive stops. New and valid genes carry
+/// their active ratio in `tp_pips / sl_pips`; this value is consulted only when
+/// a migrated/corrupt gene cannot provide a positive finite ratio.
 ///
 /// 2026-08-10: was `NEOETHOS_ADAPTIVE_STOP_RR`, default 2.0. Deliberately NOT
 /// pointed at `risk.min_risk_reward` even though both ship 2.0 and both are a
@@ -1365,6 +1644,322 @@ pub fn adaptive_stops_rr() -> f64 {
 #[cfg(test)]
 mod adaptive_stop_tests {
     use super::*;
+
+    #[test]
+    fn shared_entry_geometry_preserves_fixed_disabled_warmup_and_exact_multiplication_order() {
+        assert_eq!(
+            resolve_entry_stop_target_pips(7.3, 19.7, 0.0, Some(2.1), true, 2.0),
+            Some((7.3, 19.7))
+        );
+        assert_eq!(
+            resolve_entry_stop_target_pips(7.3, 19.7, 1.3, None, false, 2.0),
+            Some((7.3, 19.7))
+        );
+        assert_eq!(
+            resolve_entry_stop_target_pips(7.3, 19.7, 1.3, Some(2.1), false, 2.0),
+            Some((7.3, 19.7))
+        );
+        for base in [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(0.0),
+            Some(-1.0),
+        ] {
+            assert_eq!(
+                resolve_entry_stop_target_pips(7.3, 19.7, 1.3, base, true, 2.0),
+                None
+            );
+        }
+        for (sl, tp, mult, base, fallback) in [
+            (7.3, 19.7, 1.3, 2.1, 2.0),
+            (0.000_013, 0.000_057, 1.9, 0.000_011, 2.0),
+            (0.0, 11.0, 0.8, 4.1, 3.7),
+        ] {
+            let actual =
+                resolve_entry_stop_target_pips(sl, tp, mult, Some(base), true, fallback).unwrap();
+            let expected_sl: f64 = mult * base;
+            let expected_tp = effective_adaptive_reward_risk(sl, tp, fallback) * expected_sl;
+            assert_eq!(actual.0.to_bits(), expected_sl.to_bits());
+            assert_eq!(actual.1.to_bits(), expected_tp.to_bits());
+        }
+        assert_eq!(
+            resolve_entry_stop_target_pips(7.3, 19.7, f64::MAX, Some(f64::MAX), true, 2.0),
+            None
+        );
+    }
+
+    #[test]
+    fn archived_adaptive_recipe_replays_exact_values_without_runtime_reconstruction() {
+        let (high, low, close) = synthetic_bars(1_000);
+        let captured = ResolvedAdaptiveStopsPolicyV1::capture_current().unwrap();
+        let default = adaptive_base_pips_series(&high, &low, &close, 0.0001).unwrap();
+        let explicit = adaptive_base_pips_series_with_settings(
+            &high,
+            &low,
+            &close,
+            0.0001,
+            captured.settings(),
+        )
+        .unwrap();
+        assert!(
+            default
+                .iter()
+                .zip(&explicit)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+
+        let mut settings = captured.settings().clone();
+        settings.vol_window = 17;
+        settings.tail_window = 23;
+        settings.vol_horizon_bars = 9;
+        settings.tail_alpha = 0.91;
+        settings.tail_step = 3;
+        settings.tail_max_bars = 1_000;
+        settings.stop_k_vol = 0.7;
+        settings.stop_k_tail = 2.2;
+        settings.atr_stop_multiplier = 1.9;
+        settings.structure_lookback_bars = 77;
+        settings.weights = Some(VolEnsembleWeights {
+            yang_zhang: 0.1,
+            garman_klass: 0.2,
+            rogers_satchell: 0.3,
+            parkinson: 0.4,
+        });
+        let archived = ResolvedAdaptiveStopsPolicyV1::checked_new(settings, true, 3.7).unwrap();
+        let bytes = serde_json::to_vec(&archived).unwrap();
+        let restored: ResolvedAdaptiveStopsPolicyV1 = serde_json::from_slice(&bytes).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, archived);
+        let actual = adaptive_base_pips_series_with_settings(
+            &high,
+            &low,
+            &close,
+            0.0001,
+            restored.settings(),
+        )
+        .unwrap();
+        let expected =
+            compute_stop_distance_series(&close, &high, &low, &close, archived.settings()).unwrap();
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| a.to_bits() == (b / 0.0001).to_bits())
+        );
+        assert!(
+            actual
+                .iter()
+                .zip(&default)
+                .skip(100)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "non-default archived recipe must affect the actual stop math"
+        );
+        for end in [101, 227, 731] {
+            let prefix = adaptive_base_pips_series_with_settings(
+                &high[..end],
+                &low[..end],
+                &close[..end],
+                0.0001,
+                restored.settings(),
+            )
+            .unwrap();
+            assert!(
+                prefix
+                    .iter()
+                    .zip(&actual)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
+        let mut capped = restored.settings().clone();
+        capped.tail_max_bars = 999;
+        assert_eq!(
+            adaptive_base_pips_series_with_settings(&high, &low, &close, 0.0001, &capped),
+            Err(StopDistanceError::TailCapExceeded {
+                bars: 1_000,
+                cap: 999
+            })
+        );
+    }
+
+    #[test]
+    fn archived_adaptive_recipe_refuses_missing_math_fields_and_noncausal_estimator() {
+        let captured = ResolvedAdaptiveStopsPolicyV1::capture_current().unwrap();
+        let original = serde_json::to_value(&captured).unwrap();
+        for field in original["settings"].as_object().unwrap().keys() {
+            let mut missing = original.clone();
+            missing["settings"].as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<ResolvedAdaptiveStopsPolicyV1>(missing).is_err(),
+                "missing full-recipe field {field} was defaulted"
+            );
+        }
+        for field in ["schema_version", "log_operation_schedule"] {
+            let mut changed = original.clone();
+            changed[field] = if field == "schema_version" {
+                2.into()
+            } else {
+                "unknown-math".into()
+            };
+            assert!(
+                serde_json::from_value::<ResolvedAdaptiveStopsPolicyV1>(changed)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let (high, low, close) = synthetic_bars(200);
+        let mut wrong = captured.settings().clone();
+        wrong.vol_estimator = "yang_zhang".to_owned();
+        assert!(matches!(
+            adaptive_base_pips_series_with_settings(&high, &low, &close, 0.0001, &wrong),
+            Err(StopDistanceError::InvalidSettings { .. })
+        ));
+        assert!(matches!(
+            adaptive_base_pips_series_with_settings(
+                &high[..199],
+                &low,
+                &close,
+                0.0001,
+                captured.settings()
+            ),
+            Err(StopDistanceError::InvalidSettings { .. })
+        ));
+        let duplicate =
+            serde_json::to_string(&captured)
+                .unwrap()
+                .replacen('{', "{\"enabled\":true,", 1);
+        assert!(serde_json::from_str::<ResolvedAdaptiveStopsPolicyV1>(&duplicate).is_err());
+    }
+
+    // Independent two-pass implementation of Yang & Zhang (2000), equations
+    // 3 and 7-10. It uses ordinary f64 ln and no production rolling helpers.
+    fn yang_zhang_window_oracle(
+        open: &[f64],
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        end: usize,
+        window: usize,
+    ) -> f64 {
+        let mut opening = Vec::with_capacity(window);
+        let mut closing = Vec::with_capacity(window);
+        let mut rs_sum = 0.0;
+        for i in (end + 1 - window)..=end {
+            opening.push((open[i] / close[i - 1]).ln());
+            closing.push((close[i] / open[i]).ln());
+            rs_sum += (high[i] / open[i]).ln() * (high[i] / close[i]).ln()
+                + (low[i] / open[i]).ln() * (low[i] / close[i]).ln();
+        }
+        let sample_variance = |values: &[f64]| {
+            let mean = values.iter().sum::<f64>() / window as f64;
+            values
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / (window - 1) as f64
+        };
+        let k = 0.34 / (1.34 + (window + 1) as f64 / (window - 1) as f64);
+        (sample_variance(&opening)
+            + k * sample_variance(&closing)
+            + (1.0 - k) * rs_sum / window as f64)
+            .sqrt()
+    }
+
+    #[test]
+    fn yang_zhang_recovers_after_the_unobserved_first_opening_return() {
+        let close = vec![1.1; 128];
+        let high = vec![1.101; close.len()];
+        let low = vec![1.099; close.len()];
+        let window = 7;
+        let actual = vol_yang_zhang(&close, &high, &low, &close, window);
+        let expected = yang_zhang_window_oracle(&close, &high, &low, &close, window, window);
+        assert!(expected > 0.0, "intrabar range is not a flat price path");
+        assert!(actual[..window].iter().all(|value| *value == 0.0));
+        for (i, value) in actual.iter().enumerate().skip(window) {
+            assert!(
+                (*value - expected).abs() <= 1e-12,
+                "row {i}: expected {expected}, got {value}"
+            );
+        }
+        // Reproduce the original fault using the unchanged rolling helper:
+        // one missing initial value poisons its running sum forever.
+        let mut legacy_rs = vec![expected * expected; close.len()];
+        legacy_rs[0] = f64::NAN;
+        assert!(rolling_mean(&legacy_rs, window).iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn yang_zhang_matches_independent_window_math_and_never_reads_the_suffix() {
+        let mut open = Vec::<f64>::new();
+        let mut high = Vec::new();
+        let mut low = Vec::new();
+        let mut close = Vec::new();
+        for i in 0..240 {
+            let o = 1.1 + (i as f64 * 0.31).sin() * 0.003;
+            let c = o + (i as f64 * 0.71).cos() * 0.001;
+            open.push(o);
+            high.push(o.max(c) + 0.0004 + (i % 3) as f64 * 0.0001);
+            low.push(o.min(c) - 0.0003 - (i % 5) as f64 * 0.0001);
+            close.push(c);
+        }
+        for window in [2, 7, 50] {
+            let actual = vol_yang_zhang(&open, &high, &low, &close, window);
+            for i in window..close.len() {
+                let expected = yang_zhang_window_oracle(&open, &high, &low, &close, i, window);
+                assert!(
+                    (actual[i] - expected).abs() <= 1e-12,
+                    "window {window}, row {i}: expected {expected}, got {}",
+                    actual[i]
+                );
+            }
+            for prefix_len in [51, 127, 211] {
+                let prefix = vol_yang_zhang(
+                    &open[..prefix_len],
+                    &high[..prefix_len],
+                    &low[..prefix_len],
+                    &close[..prefix_len],
+                    window,
+                );
+                assert_eq!(prefix, actual[..prefix_len]);
+            }
+        }
+    }
+
+    #[test]
+    fn default_stop_distance_retains_intrabar_risk_when_closes_do_not_move() {
+        let close = vec![1.1; 256];
+        let high = vec![1.101; close.len()];
+        let low = vec![1.099; close.len()];
+        let settings = StopTargetSettings::default();
+        let dist = compute_stop_distance_series(&close, &high, &low, &close, &settings)
+            .expect("nonzero intrabar ranges must not become a degenerate zero-risk series");
+        let expected = yang_zhang_window_oracle(
+            &close,
+            &high,
+            &low,
+            &close,
+            settings.vol_window,
+            settings.vol_window,
+        ) * 1.1
+            * (settings.vol_horizon_bars as f64).sqrt();
+        assert!(
+            dist[..settings.tail_window]
+                .iter()
+                .all(|value| value.is_nan())
+        );
+        for value in &dist[settings.tail_window..] {
+            assert!((*value - expected).abs() <= 1e-12);
+        }
+    }
+
+    #[test]
+    fn adaptive_reward_risk_is_gene_owned_with_a_legacy_fallback() {
+        assert_eq!(effective_adaptive_reward_risk(20.0, 70.0, 9.0), 3.5);
+        assert_eq!(effective_adaptive_reward_risk(0.0, 70.0, 2.25), 2.25);
+        assert_eq!(effective_adaptive_reward_risk(20.0, f64::NAN, 2.25), 2.25);
+        assert_eq!(effective_adaptive_reward_risk(0.0, 0.0, f64::NAN), 2.0);
+    }
 
     #[test]
     fn stop_target_safe_log_is_the_frozen_quant_semantic_v3_schedule() {
@@ -1399,11 +1994,9 @@ mod adaptive_stop_tests {
     }
 
     #[test]
-    fn canonical_resident_adaptive_view_golden_is_bit_frozen() {
-        use sha2::{Digest, Sha256};
-
+    fn canonical_adaptive_view_warmup_is_unavailable_and_ready_values_unchanged() {
         const ROWS: usize = 160;
-        const CHECKPOINTS: [usize; 7] = [0, 48, 49, 99, 100, 101, 159];
+        const CHECKPOINTS: [usize; 3] = [100, 101, 159];
         let mut high = Vec::with_capacity(ROWS);
         let mut low = Vec::with_capacity(ROWS);
         let mut close = Vec::with_capacity(ROWS);
@@ -1418,30 +2011,14 @@ mod adaptive_stop_tests {
 
         let base = adaptive_base_pips_series(&high, &low, &close, 1e-4)
             .expect("canonical 160-row adaptive fixture must build");
-        let mut bytes = Vec::with_capacity(base.len() * std::mem::size_of::<f64>());
-        for value in &base {
-            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
-        }
-        let digest = Sha256::digest(bytes);
-        let digest_hex = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        // The old whole-series golden froze 1e-9-pip warm-up entries into the
+        // CUDA contract. Keep the already-ready values bit-exact, but explicitly
+        // reject that old warm-up policy rather than blessing its digest again.
+        assert!(base[..100].iter().all(|value| value.is_nan()));
         let checkpoint_bits = CHECKPOINTS.map(|index| base[index].to_bits());
-        eprintln!("adaptive-golden-sha256={digest_hex}");
-        eprintln!("adaptive-golden-checkpoints={checkpoint_bits:x?}");
-
-        assert_eq!(
-            digest_hex,
-            "f407ad99d1bdc238602ab1b28065e61e828183e56e97528759a1d992274ba78b"
-        );
         assert_eq!(
             checkpoint_bits,
             [
-                0x3e11_2e0b_e826_d695,
-                0x3e11_2e0b_e826_d695,
-                0x4001_049e_d07d_1db7,
-                0x4001_0569_5b28_6744,
                 0x4001_0fae_b68c_45f7,
                 0x4001_055c_7dca_6cbb,
                 0x4001_0569_3d50_cb03,
@@ -1470,8 +2047,10 @@ mod adaptive_stop_tests {
             .expect("series builds on a long-enough dataset");
         assert_eq!(sl.len(), n);
         assert_eq!(tp.len(), n);
-        // Reward:risk held exactly, per bar.
-        for i in 0..n {
+        assert!(sl[..s.tail_window].iter().all(|value| value.is_nan()));
+        assert!(tp[..s.tail_window].iter().all(|value| value.is_nan()));
+        // Reward:risk held exactly on every available bar.
+        for i in s.tail_window..n {
             assert!(
                 (tp[i] - 2.0 * sl[i]).abs() < 1e-9,
                 "TP must be exactly rr*SL"
@@ -1484,7 +2063,7 @@ mod adaptive_stop_tests {
             w.sort_by(|a, b| a.partial_cmp(b).unwrap());
             w[w.len() / 2]
         };
-        let calm = median(&sl[60..n / 2]);
+        let calm = median(&sl[s.tail_window..n / 2]);
         let volatile = median(&sl[n / 2 + 60..]);
         assert!(
             volatile > calm,
@@ -1753,7 +2332,77 @@ mod adaptive_stop_tests {
         settings.tail_max_bars = 2_000;
         let capped_at_len = compute_stop_distance_series(&close, &high, &low, &close, &settings)
             .expect("a cap at the series length must not bite");
-        assert_eq!(capped_at_len, uncapped);
+        assert!(
+            capped_at_len
+                .iter()
+                .zip(&uncapped)
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+        );
+    }
+
+    #[test]
+    fn adaptive_stop_warmup_and_every_ready_value_are_prefix_causal() {
+        let (high, low, close) = synthetic_bars(1_000);
+        let full = adaptive_base_pips_series(&high, &low, &close, 0.0001).unwrap();
+        assert!(full[..100].iter().all(|value| value.is_nan()));
+        assert!(
+            full[100..]
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        );
+        for end in [101, 160, 257, 701] {
+            let prefix =
+                adaptive_base_pips_series(&high[..end], &low[..end], &close[..end], 0.0001)
+                    .expect("a complete tail window permits entries even in a short prefix");
+            for i in 0..end {
+                assert_eq!(prefix[i].to_bits(), full[i].to_bits(), "end={end}, row={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_zero_risk_bars_do_not_borrow_a_future_stop() {
+        let close = vec![1.1; 220];
+        let mut high = close.clone();
+        let mut low = close.clone();
+        for i in 120..close.len() {
+            high[i] += 0.001;
+            low[i] -= 0.001;
+        }
+        let full = adaptive_base_pips_series(&high, &low, &close, 0.0001).unwrap();
+        assert!(full[..120].iter().all(|value| value.is_nan()));
+        assert!(
+            full[120..]
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        );
+        let prefix = adaptive_base_pips_series(&high[..121], &low[..121], &close[..121], 0.0001)
+            .expect("one usable observation is not an entirely degenerate series");
+        assert!(
+            prefix
+                .iter()
+                .zip(&full)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
+
+    #[test]
+    fn disabled_tail_does_not_extend_range_estimator_warmup() {
+        let (high, low, close) = synthetic_bars(200);
+        let settings = StopTargetSettings {
+            vol_estimator: "parkinson".to_owned(),
+            vol_window: 7,
+            stop_k_tail: 0.0,
+            ..StopTargetSettings::default()
+        };
+        let distances =
+            compute_stop_distance_series(&close, &high, &low, &close, &settings).unwrap();
+        assert!(distances[..6].iter().all(|value| value.is_nan()));
+        assert!(
+            distances[6..]
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        );
     }
 
     /// The tail term is not decoration: proving it moves the stop is what makes

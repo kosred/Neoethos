@@ -2,15 +2,25 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
-function readJson(relativePath: string): Record<string, any> {
+type TauriConfig = {
+  productName?: string;
+  bundle?: {
+    resources?: Record<string, string>;
+    externalBin?: string[];
+  };
+};
+
+function readJson(relativePath: string): TauriConfig {
   const url = new URL(relativePath, import.meta.url);
   assert.ok(existsSync(url), `missing required Tauri config ${relativePath}`);
-  return JSON.parse(readFileSync(url, "utf8"));
+  return JSON.parse(readFileSync(url, "utf8")) as TauriConfig;
 }
 
-function readOptionalJson(relativePath: string): Record<string, any> | undefined {
+function readOptionalJson(relativePath: string): TauriConfig | undefined {
   const url = new URL(relativePath, import.meta.url);
-  return existsSync(url) ? JSON.parse(readFileSync(url, "utf8")) : undefined;
+  return existsSync(url)
+    ? JSON.parse(readFileSync(url, "utf8")) as TauriConfig
+    : undefined;
 }
 
 test("ordinary cargo builds never require release-generated bundle resources", () => {

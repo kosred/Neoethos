@@ -346,8 +346,9 @@ impl PinnedCanonicalSeriesV1 {
             );
             let frame =
                 materialize_pinned_canonical_timeframe_v1(generation.manifest, generation.lease)?;
-            frames.insert(timeframe.clone(), frame.ohlcv().clone());
-            source_artifacts.insert(timeframe, frame.artifact().clone());
+            let (ohlcv, artifact) = frame.into_full_parts()?;
+            frames.insert(timeframe.clone(), ohlcv);
+            source_artifacts.insert(timeframe, artifact);
         }
         Ok(SymbolDataset {
             symbol,

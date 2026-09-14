@@ -266,6 +266,75 @@ fn native_admission_binds_exact_hardware_context_build_and_memory_snapshot() {
 }
 
 #[test]
+fn selected_device_topology_is_captured_once_hashed_and_carried_without_reprobe() {
+    let admission = read("src/run_device_admission_v1.rs");
+    let selection = section(
+        &admission,
+        "fn select_lowest_compatible_cuda_ordinal_v1(",
+        "\n}",
+    );
+    for attribute in [
+        "DeviceAttribute::MultiprocessorCount",
+        "DeviceAttribute::WarpSize",
+    ] {
+        assert_exactly_once(selection, attribute);
+    }
+    require_all(
+        selection,
+        &[
+            ".filter(|count| *count > 0)",
+            ".filter(|size| *size > 0)",
+            "multiprocessor_count,",
+            "warp_size,",
+        ],
+    );
+    let native = section(
+        &admission,
+        "struct SealedNativeCudaRunDeviceAdmissionV1 {",
+        "\n}",
+    );
+    require_all(native, &["multiprocessor_count: u32", "warp_size: u32"]);
+    let hash = section(&admission, "fn hash_native_admission_v1(", "\n}");
+    require_all(
+        hash,
+        &[
+            "candidate.multiprocessor_count.to_le_bytes()",
+            "candidate.warp_size.to_le_bytes()",
+        ],
+    );
+
+    let stage = read("src/data_population_workspace_plan_v1.rs");
+    let facts = section(
+        &stage,
+        "struct SealedNativeCudaDataPopulationPreflightFactsV1 {",
+        "\n}",
+    );
+    require_all(facts, &["multiprocessor_count: u32", "warp_size: u32"]);
+    let facts_sealer = section(
+        &stage,
+        "fn native_cuda_data_population_preflight_facts_v1(",
+        "\n}",
+    );
+    require_all(
+        facts_sealer,
+        &[
+            "admission.multiprocessor_count.to_le_bytes()",
+            "admission.warp_size.to_le_bytes()",
+        ],
+    );
+
+    let carrier = read("src/resident_feature_store_v3.rs");
+    let request = section(
+        &carrier,
+        "struct GpuOnlyRunDeviceAdmissionRequestV3 {",
+        "\n}",
+    );
+    require_all(request, &["multiprocessor_count: u32", "warp_size: u32"]);
+    assert!(!stage.contains("DeviceAttribute::"));
+    assert!(!carrier.contains("DeviceAttribute::"));
+}
+
+#[test]
 fn run_device_admission_is_move_only_and_has_no_bare_authority_constructor() {
     let source = read("src/run_device_admission_v1.rs");
     for declaration in [

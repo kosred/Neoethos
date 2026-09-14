@@ -1,24 +1,12 @@
-//! Honest goal report — the "no fake results" output side.
+//! Exploratory goal scenarios from independently resampled, realized trade
+//! R-multiples. Cadence and the goal horizon use elapsed calendar days.
 //!
-//! The operator's Risky goal is to reach a target (100 EUR -> 50k) within a
-//! horizon and then graduate to a steady-income mode. A backtest's headline net
-//! profit answers none of the questions that actually matter for that: *how
-//! likely* is the target, *how long* would it take, and *how often does the
-//! account blow up first*. Worse, at high risk the mean terminal balance is
-//! dragged up by a few lucky paths while the median path is ruined — so a single
-//! "expected 50k" number is the exact fiction the operator asked to avoid.
-//!
-//! This module Monte-Carlos the selected portfolio's REAL per-trade R-multiples
-//! (each already net of the broker costs Decision D charges) across a sweep of
-//! risk levels, and reports, per risk level: P(reach target), P(ruin), median
-//! AND mean terminal balance, and the median time-to-target. The risk that
-//! MAXIMISES P(reach target) is surfaced — for a positive-edge strategy that is
-//! moderate (near-Kelly), never the maximum, so this is also how the sizing
-//! ceiling gets an honest recommendation instead of a guess.
-//!
-//! R-multiples are size-independent (pnl / risk_amount), so re-applying an
-//! arbitrary per-trade risk fraction `f` as `equity *= 1 + f*R` is exact: `f` is
-//! the fraction of equity risked, `R` the outcome in units of that risk.
+//! These are conditional bootstrap outcomes, not calibrated probabilities of
+//! future success or an executable replay at the reference starting capital.
+//! Applying `equity *= 1 + f*R` assumes fixed fractional sizing and transferable
+//! R-multiples. It does not reproduce confidence sizing, concurrent positions,
+//! broker lot/margin limits, changing costs, or dependence between trades.
+//! No output from this module changes the v6 GA objective or authorizes risk.
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -27,13 +15,12 @@ use rand_chacha::ChaCha8Rng;
 /// (a 100 EUR account at 2 EUR cannot realistically recover to 50k).
 const RUIN_FLOOR_FRACTION: f64 = 0.02;
 
-/// Monte-Carlo paths per risk level. Large enough that P(reach) is stable to
-/// ~0.3% and cheap: paths short-circuit at target or ruin.
+/// Monte-Carlo paths per risk level; paths short-circuit at target or ruin.
+/// Sampling precision within this model does not establish model validity.
 const DEFAULT_PATHS: usize = 20_000;
 
-/// The risk-per-trade fractions swept by default. Spans conservative to the
-/// operator's 30% ceiling so the frontier shows where P(reach) peaks and where
-/// the "20-pip challenge" 30% setting actually lands.
+/// Fixed diagnostic risk scenarios, not the resolved search/live risk band.
+/// Their bootstrap outcomes never install a risk fraction into either engine.
 pub const DEFAULT_RISK_LEVELS: &[f64] = &[0.05, 0.10, 0.15, 0.20, 0.30];
 
 /// One risk level's simulated outcome distribution.
@@ -61,7 +48,9 @@ pub struct RiskOutcome {
 pub struct GoalReport {
     pub start_balance: f64,
     pub target_balance: f64,
+    /// Elapsed calendar days, not trading weekdays.
     pub horizon_days: f64,
+    /// Realized trades per elapsed calendar day, including inactive dates.
     pub trades_per_day: f64,
     pub trades_in_horizon: usize,
     /// How many real trades fed the bootstrap (0 => the report is not meaningful).
@@ -70,6 +59,21 @@ pub struct GoalReport {
     pub frontier: Vec<RiskOutcome>,
     /// The risk fraction on the frontier with the highest P(reach target).
     pub best_risk_fraction: f64,
+}
+
+/// Match the projection's calendar horizon to the full evaluated interval.
+/// Do not derive this from a trading-days-per-month convention: weekends and
+/// inactive days still consume the operator's deadline. Invalid or absent
+/// exposure is unavailable rather than silently substituted with one day.
+pub(crate) fn calendar_trades_per_day(
+    total_trades: usize,
+    observed_calendar_days: f64,
+) -> Option<f64> {
+    if !observed_calendar_days.is_finite() || observed_calendar_days <= 0.0 {
+        return None;
+    }
+    let rate = total_trades as f64 / observed_calendar_days;
+    rate.is_finite().then_some(rate)
 }
 
 fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
@@ -148,6 +152,7 @@ fn simulate_one_risk(
 ///
 /// `r_multiples` must be net of costs (Decision D). `seed` makes the report
 /// reproducible (slice 5): the same inputs always produce the same frontier.
+/// `trades_per_day` and `horizon_days` must both use elapsed calendar days.
 pub fn build_report(
     r_multiples: &[f64],
     start_balance: f64,
@@ -210,9 +215,8 @@ pub fn build_report(
 }
 
 impl GoalReport {
-    /// Human-readable multi-line summary for the discovery log / CLI. Leads with
-    /// the honest headline: the risk that maximises P(reach), and the fact that
-    /// the operator's 30% ceiling is usually NOT it.
+    /// Human-readable conditional scenario summary, never live-risk advice or
+    /// independent evidence of the financial goal being achievable.
     pub fn render(&self) -> String {
         use std::fmt::Write as _;
         let mut s = String::new();
@@ -223,7 +227,7 @@ impl GoalReport {
         }
         let _ = writeln!(
             s,
-            "GOAL REPORT — reach {:.0} from {:.0} within {:.0} days (~{:.1} trades/day, \
+            "GOAL REPORT — bootstrap scenario: reach {:.0} from {:.0} within {:.0} calendar days (~{:.3} trades/calendar day, \
              {} real trades bootstrapped, avg {:.3} R/trade net of costs)",
             self.target_balance,
             self.start_balance,
@@ -231,6 +235,10 @@ impl GoalReport {
             self.trades_per_day,
             self.n_trades_sampled,
             self.avg_r_multiple,
+        );
+        let _ = writeln!(
+            s,
+            "  Approximation: IID trade resampling and fixed risk fractions; not a confidence-sized/netted account replay or a calibrated probability of future success."
         );
         let _ = writeln!(
             s,
@@ -260,9 +268,9 @@ impl GoalReport {
         }
         let _ = writeln!(
             s,
-            "  Honest read: P(reach) peaks at {:.0}% risk; higher risk trades a \
-             lower median (often ruin) for a fatter but rarer lottery tail. \
-             'mean-end' far above 'median-end' means the average is lottery-driven.",
+            "  Within this bootstrap only, the largest sampled P(reach) is at {:.0}% risk. \
+             This is not a sizing recommendation or trading authorization; dependence, \
+             broker constraints and reference-capital feasibility remain unverified.",
             self.best_risk_fraction * 100.0,
         );
         s
@@ -272,6 +280,47 @@ impl GoalReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_cadence_includes_weekends_and_inactive_days() {
+        // Twenty trades across four weeks are not one trade per calendar day,
+        // even though the interval contains twenty trading weekdays.
+        let rate = calendar_trades_per_day(20, 28.0).unwrap();
+        let report = build_report(&[1.0], 100.0, 50_000.0, 28.0, rate, &[], 17);
+        assert_eq!(report.trades_in_horizon, 20);
+        assert_ne!(report.trades_in_horizon, 28);
+        // Extending exposure without new trades lowers the projected cadence.
+        assert_eq!(calendar_trades_per_day(20, 56.0), Some(rate / 2.0));
+        assert_eq!(calendar_trades_per_day(0, 28.0), Some(0.0));
+    }
+
+    #[test]
+    fn calendar_cadence_refuses_unknown_or_invalid_exposure() {
+        for days in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(calendar_trades_per_day(20, days), None);
+        }
+        assert_eq!(calendar_trades_per_day(usize::MAX, f64::MIN_POSITIVE), None);
+        // A fractional day remains exact; there is no weekday/month rounding.
+        assert_eq!(calendar_trades_per_day(1, 0.5), Some(2.0));
+    }
+
+    #[test]
+    fn rendered_goal_report_labels_calendar_units_and_model_limitations() {
+        let report = build_report(&[1.0], 100.0, 50_000.0, 7.0, 1.0, &[0.05], 17);
+        let rendered = report.render();
+        for required in [
+            "calendar days",
+            "trades/calendar day",
+            "IID trade resampling and fixed risk fractions",
+            "not a confidence-sized/netted account replay",
+            "not a sizing recommendation or trading authorization",
+        ] {
+            assert!(
+                rendered.contains(required),
+                "missing scenario limitation: {required}"
+            );
+        }
+    }
 
     // A 2RR edge at ~45% win rate: wins = +2R, losses = -1R.
     fn edge_2r_45pct() -> Vec<f64> {
@@ -287,9 +336,9 @@ mod tests {
 
     #[test]
     fn a_positive_edge_reaches_the_target_more_often_at_moderate_risk_than_at_max() {
-        // The core honest claim: for a positive edge, P(reach) is NOT monotonic
-        // in risk — it peaks at a moderate level and falls at extreme risk where
-        // ruin dominates. This is the whole reason 30% fixed is wrong.
+        // Within this synthetic fixed-fraction model, higher risk is not
+        // necessarily a higher chance of reaching the finite-horizon target.
+        // This does not establish an optimal risk policy for an actual account.
         let r = edge_2r_45pct();
         let rep = build_report(&r, 100.0, 50_000.0, 180.0, 2.0, DEFAULT_RISK_LEVELS, 42);
         assert_eq!(rep.frontier.len(), DEFAULT_RISK_LEVELS.len());

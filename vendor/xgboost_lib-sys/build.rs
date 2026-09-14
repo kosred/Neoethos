@@ -147,7 +147,18 @@ fn main() {
         let mut config = cmake::Config::new(&xgb_root);
         config
             .generator("Ninja")
-            .define("CMAKE_BUILD_TYPE", "RelWithDebInfo");
+            .define("CMAKE_BUILD_TYPE", "RelWithDebInfo")
+            // Upstream defaults this OFF and writes DLL/LIB/PDB outputs into
+            // `xgboost/lib` in the vendored source tree. Cargo builds must be
+            // hermetic: all generated artifacts belong under OUT_DIR.
+            .define("KEEP_BUILD_ARTIFACTS_IN_BINARY_DIR", "ON");
+
+        if target.ends_with("-msvc") {
+            // dmlc enables /EHsc only in its own CMake directory. The sibling
+            // XGBoost objects also need C++ unwinding when their C API catches
+            // an error, otherwise intermediate RAII resources are not released.
+            config.cxxflag("/EHsc");
+        }
 
         #[cfg(feature = "cuda")]
         {

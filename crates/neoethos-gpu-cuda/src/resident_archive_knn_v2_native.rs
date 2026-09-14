@@ -1,31 +1,29 @@
-use super::{
-    ResidentSearchSlice2AllocationCategoryV2, ResidentSearchSlice2AsyncAllocationArgsV2,
-    ResidentSearchSlice2CalibrationBindingV2, ResidentSearchSlice2ScoringArchiveReceiptV2,
-};
-#[cfg(feature = "cuda")]
+use super::ResidentSearchSlice2CalibrationBindingV2;
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 use crate::population::RawResidentScoringPopulationSourceV2;
-#[cfg(feature = "cuda")]
-use crate::resident_generation_v1::{NativeResidentGenerationRunV1, RawReadyEventV1};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+use crate::resident_archive_output_v3::{
+    RawResidentArchiveExportReceiptV3, RawResidentArchiveGeneScalarV3,
+    ResidentArchiveExportContextV3,
+};
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+use crate::resident_generation_v1::{
+    NativeResidentGenerationRunV1, RawReadyEventV1, selected_generation_abi_v1,
+};
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 use crate::resident_search_v2::RawResidentGenerationGeneViewV2;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 use std::ffi::c_void;
 
-const SCORING_ARCHIVE_ALIGNMENT_BYTES_V2: u64 = 256;
-const GENE_SCALAR_BYTES_V2: u64 = 72;
-const TERM_INDEX_BYTES_V2: u64 = 8;
-const TERM_WEIGHT_BYTES_V2: u64 = 8;
-const METRIC_ROW_BYTES_V2: u64 = 104;
-const SIGNATURE_WORD_BYTES_V2: u64 = 8;
-const HASH_BYTES_V2: u64 = 8;
-const SCORE_BYTES_V2: u64 = 8;
-const EXACT_NEIGHBOR_KEY_BYTES_V2: u64 = 32;
-const ADMISSION_FLAG_BYTES_V2: u64 = 4;
-const ADMISSION_OFFSET_BYTES_V2: u64 = 8;
-const SIGNATURE_WORD_COUNT_V2: u64 = 4;
-const NOVELTY_NEIGHBOR_COUNT_V2: u64 = 15;
-const MAX_TERMS_PER_GENE_V2: u64 = 16;
-const ARCHIVE_CONTROL_AND_SEAL_BYTES_V2: u64 = 256;
+/// Select the native archive protocol, not a device capability or a caller ID.
+/// CUDA keeps its existing wire value; the HIP build uses its distinct ABI.
+pub(crate) const fn selected_archive_abi_v2() -> u32 {
+    if cfg!(feature = "hip-native-kernels") {
+        0x0001_0002
+    } else {
+        2
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +36,10 @@ pub(super) struct RawResidentArchiveKnnArenaRegionV2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawResidentArchiveKnnBindV2 {
     pub(super) abi_version: u32,
+    #[cfg(not(feature = "hip-native-kernels"))]
     pub(super) reserved: u32,
+    #[cfg(feature = "hip-native-kernels")]
+    pub(super) backend_kind: u32,
     pub(super) fitness_scores: RawResidentArchiveKnnArenaRegionV2,
     pub(super) decision_keys: RawResidentArchiveKnnArenaRegionV2,
     pub(super) cub_scratch: RawResidentArchiveKnnArenaRegionV2,
@@ -62,10 +63,16 @@ pub(crate) struct RawResidentArchiveKnnBindV2 {
     pub(super) max_terms_per_gene: u32,
     pub(super) reserved_extents: u32,
     pub(super) device_uuid: [u8; 16],
+    #[cfg(not(feature = "hip-native-kernels"))]
     pub(super) primary_context_identity: u64,
+    #[cfg(feature = "hip-native-kernels")]
+    pub(super) hip_lease_identity: u64,
     pub(super) search_stream_identity: u64,
     pub(super) active_pool_identity: u64,
+    #[cfg(not(feature = "hip-native-kernels"))]
     pub(super) cuda_build_identity: u64,
+    #[cfg(feature = "hip-native-kernels")]
+    pub(super) hip_build_identity: u64,
     pub(super) kernel_semantics_identity: u64,
     pub(super) binary64_math_identity: u64,
     pub(super) plan_identity: u64,
@@ -74,9 +81,9 @@ pub(crate) struct RawResidentArchiveKnnBindV2 {
     pub(super) post_trim_receipt_identity: u64,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 pub(crate) enum NativeResidentScoringNoveltyRunV1 {}
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 pub(crate) enum NativeResidentArchiveKnnOwnerV2 {}
 
 #[repr(C)]
@@ -114,8 +121,23 @@ pub(crate) struct RawResidentArchiveKnnTerminalV2 {
     pub(super) validator_digest: u64,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 impl RawResidentArchiveKnnTerminalV2 {
+    pub(crate) fn archive_export_context_v3(
+        &self,
+        feature_count: u64,
+        max_terms: u32,
+    ) -> ResidentArchiveExportContextV3 {
+        ResidentArchiveExportContextV3 {
+            run_identity: self.run_identity,
+            packed_commit_word: self.packed_commit_word,
+            candidate_count: (self.packed_commit_word >> 17) & 0xffff,
+            feature_count,
+            max_terms,
+            terminal_generation: (self.packed_commit_word >> 1) & 0xffff,
+        }
+    }
+
     pub(crate) fn validates_committed_v2(
         &self,
         pending: &RawResidentArchiveKnnPendingV2,
@@ -136,7 +158,10 @@ impl RawResidentArchiveKnnTerminalV2 {
                 digest = digest.wrapping_mul(1_099_511_628_211);
             }
         }
-        self.abi_version == 2
+        binding.selected_backend_matches_v2()
+            && pending.abi_version == selected_archive_abi_v2()
+            && pending.flags == 0
+            && self.abi_version == selected_archive_abi_v2()
             && self.terminal_status == 1
             && self.device_fault_word == 0
             && self.validation_fault_word == 0
@@ -151,7 +176,7 @@ impl RawResidentArchiveKnnTerminalV2 {
             && self.same_stream_enqueue_count == pending.same_stream_enqueue_count
             && self.completion_event_identity == pending.completion_event_identity
             && self.validator_digest == digest
-            && ready.abi_version == 1
+            && ready.abi_version == selected_generation_abi_v1()
             && ready.reserved == 0
             && ready.event_id == pending.completion_event_identity
             && ready.generation_index == generation
@@ -168,7 +193,22 @@ const _: [(); 8] = [(); std::mem::align_of::<RawResidentArchiveKnnPendingV2>()];
 const _: [(); 104] = [(); std::mem::size_of::<RawResidentArchiveKnnTerminalV2>()];
 const _: [(); 8] = [(); std::mem::align_of::<RawResidentArchiveKnnTerminalV2>()];
 
-#[cfg(feature = "cuda")]
+impl RawResidentArchiveKnnBindV2 {
+    pub(crate) fn archive_capacity_v3(&self) -> u64 {
+        self.archive_capacity
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels", test))]
+    fn selected_backend_matches_v2(&self) -> bool {
+        #[cfg(feature = "hip-native-kernels")]
+        let backend_matches = self.backend_kind == 2;
+        #[cfg(not(feature = "hip-native-kernels"))]
+        let backend_matches = self.reserved == 0;
+        self.abi_version == selected_archive_abi_v2() && backend_matches
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 unsafe extern "C" {
     pub(crate) fn bind_preallocated_resident_archive_knn_v2(
         scoring: *mut NativeResidentScoringNoveltyRunV1,
@@ -208,83 +248,25 @@ unsafe extern "C" {
         session: *mut c_void,
         owner: *mut NativeResidentArchiveKnnOwnerV2,
     ) -> i32;
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScoringArchiveArenaRegionV2 {
-    FitnessScores,
-    DecisionKeys,
-    CubScratch,
-    ArchiveGeneScalars,
-    ArchiveTermIndices,
-    ArchiveTermWeights,
-    ArchiveMetricRows,
-    ArchiveSignatures,
-    ArchiveHashes,
-    CurrentPopulationSignatures,
-    NoveltyScores,
-    ExactTopKKeys,
-    AdmissionFlags,
-    AdmissionOffsets,
-    ArchiveControlAndSeal,
+    pub(crate) fn copy_resident_archive_terminal_candidates_v4(
+        owner: *mut NativeResidentArchiveKnnOwnerV2,
+        expected_terminal: *const RawResidentArchiveKnnTerminalV2,
+        scalars: *mut RawResidentArchiveGeneScalarV3,
+        term_indices: *mut u64,
+        term_weights: *mut f64,
+        metrics: *mut neoethos_gpu_contracts::device::NeoPopulationMetricRow,
+        admission_sequences: *mut u64,
+        candidate_capacity: u64,
+        term_capacity: u64,
+        receipt: *mut RawResidentArchiveExportReceiptV3,
+    ) -> i32;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RegionV2 {
     offset_bytes: u64,
     size_bytes: u64,
-}
-
-impl RegionV2 {
-    const fn new(offset_bytes: u64, size_bytes: u64) -> Self {
-        Self {
-            offset_bytes,
-            size_bytes,
-        }
-    }
-
-    #[cfg(test)]
-    const fn end_v2(self) -> Option<u64> {
-        self.offset_bytes.checked_add(self.size_bytes)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScoringArchiveArenaLayoutErrorV2 {
-    AllocationOrdinalMismatch {
-        observed: u8,
-    },
-    AllocationCategoryMismatch,
-    AllocationAlignmentMismatch {
-        observed: u64,
-    },
-    AllocationFlagsMismatch {
-        observed: u32,
-    },
-    CubScratchAlignmentMismatch {
-        observed: u64,
-    },
-    RegionSizeMismatch {
-        region: ScoringArchiveArenaRegionV2,
-        expected: u64,
-        observed: u64,
-    },
-    ReplacementSubtotalMismatch {
-        expected: u64,
-        observed: u64,
-    },
-    ArithmeticOverflow {
-        region: ScoringArchiveArenaRegionV2,
-    },
-    ReceiptTotalMismatch {
-        expected: u64,
-        observed: u64,
-    },
-    AllocationTotalMismatch {
-        expected: u64,
-        observed_requested: u64,
-        observed_aligned: u64,
-    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -304,13 +286,129 @@ pub(super) struct ResidentScoringArchiveArenaLayoutV2 {
     admission_flags: RegionV2,
     admission_offsets: RegionV2,
     archive_control_and_seal: RegionV2,
-    replacement_subtotal_bytes: u64,
     total_device_bytes: u64,
-    stream_identity: u64,
-    pool_identity: u64,
 }
 
 impl ResidentScoringArchiveArenaLayoutV2 {
+    fn archive_retention_word_count_v3(archive_capacity: u64) -> Result<u64, &'static str> {
+        if archive_capacity == 0 {
+            return Err("Slice2 archive retention requires nonzero capacity");
+        }
+        let table_capacity = archive_capacity
+            .checked_mul(2)
+            .and_then(u64::checked_next_power_of_two)
+            .ok_or("Slice2 archive hash table capacity overflow")?;
+        archive_capacity
+            .checked_mul(6)
+            .and_then(|words| words.checked_add(table_capacity))
+            .ok_or("Slice2 archive retention word count overflow")
+    }
+
+    /// Exact frozen ABI layout. Only the CUB extent is device/toolkit dependent;
+    /// it must come from the native preliminary combined-admission query.
+    pub(super) fn from_native_scratch_v2(
+        population_count: u64,
+        archive_capacity: u64,
+        cub_scratch_bytes: u64,
+        signature_word_count: u32,
+        novelty_neighbor_count: u32,
+    ) -> Result<Self, &'static str> {
+        if population_count == 0 || population_count > i32::MAX as u64 {
+            return Err("Slice2 population exceeds the native CUB item-count domain");
+        }
+        if archive_capacity == 0 || archive_capacity > u16::MAX as u64 {
+            return Err("Slice2 archive capacity exceeds the native packed-count domain");
+        }
+        if cub_scratch_bytes == 0 || cub_scratch_bytes % 256 != 0 {
+            return Err("Slice2 requires nonzero aligned native CUB scratch measurement");
+        }
+        if signature_word_count < 4 {
+            return Err("Slice2 signatures must also fit four disjoint CUB key/value arrays");
+        }
+        if novelty_neighbor_count == 0 {
+            return Err("Slice2 requires a nonzero configured novelty neighborhood");
+        }
+        fn region(cursor: &mut u64, count: u64, stride: u64) -> Result<RegionV2, &'static str> {
+            let bytes = count
+                .checked_mul(stride)
+                .ok_or("Slice2 region product overflow")?;
+            let size_bytes = bytes
+                .checked_add(255)
+                .ok_or("Slice2 region alignment overflow")?
+                / 256
+                * 256;
+            let offset_bytes = *cursor;
+            *cursor = cursor
+                .checked_add(size_bytes)
+                .ok_or("Slice2 arena offset overflow")?;
+            Ok(RegionV2 {
+                offset_bytes,
+                size_bytes,
+            })
+        }
+        let mut cursor = 0;
+        // Native sizeof(GeneScalarV1)=72, metric row=104 including candidate
+        // and scenario identities, exact kNN key=32.
+        // At least four signature words provide the four population-sized u64
+        // arrays reused by stable CUB ranking before ALL words are rebuilt.
+        let fitness_scores = region(&mut cursor, population_count, 8)?;
+        let decision_keys = region(&mut cursor, population_count, 8)?;
+        let cub_scratch = region(&mut cursor, 1, cub_scratch_bytes)?;
+        // Active and staged banks coexist until the generation commits. A
+        // failed replacement must leave every prior archive byte recoverable.
+        let archive_bank_count = archive_capacity.checked_mul(2).ok_or("Slice2 archive banks overflow")?;
+        let archive_gene_scalars = region(&mut cursor, archive_bank_count, 72)?;
+        let archive_term_indices = region(&mut cursor, archive_bank_count, 16 * 8)?;
+        let archive_term_weights = region(&mut cursor, archive_bank_count, 16 * 8)?;
+        let archive_metric_rows = region(
+            &mut cursor,
+            archive_bank_count,
+            std::mem::size_of::<neoethos_gpu_contracts::device::NeoPopulationMetricRow>() as u64,
+        )?;
+        let signature_stride_bytes = u64::from(signature_word_count) * 8;
+        let archive_signatures = region(&mut cursor, archive_bank_count, signature_stride_bytes)?;
+        // Keep the two content-hash and two admission-sequence banks first.
+        // The remaining words hold a <=50%-loaded slot+1 hash table, an indexed
+        // min-heap and its inverse, rebuilt from the staged bank each generation.
+        let archive_hashes = region(
+            &mut cursor,
+            Self::archive_retention_word_count_v3(archive_capacity)?,
+            8,
+        )?;
+        let current_population_signatures =
+            region(&mut cursor, population_count, signature_stride_bytes)?;
+        let novelty_scores = region(&mut cursor, population_count, 8)?;
+        let exact_top_k_keys = region(&mut cursor, population_count, u64::from(novelty_neighbor_count) * 32)?;
+        let admission_flags = region(&mut cursor, population_count, 4)?;
+        let admission_offsets = region(&mut cursor, population_count, 8)?;
+        let archive_control_and_seal = region(&mut cursor, 1, 256)?;
+        if cursor > isize::MAX as u64 {
+            return Err("Slice2 arena exceeds the native addressable allocation domain");
+        }
+        Ok(Self {
+            fitness_scores,
+            decision_keys,
+            cub_scratch,
+            archive_gene_scalars,
+            archive_term_indices,
+            archive_term_weights,
+            archive_metric_rows,
+            archive_signatures,
+            archive_hashes,
+            current_population_signatures,
+            novelty_scores,
+            exact_top_k_keys,
+            admission_flags,
+            admission_offsets,
+            archive_control_and_seal,
+            total_device_bytes: cursor,
+        })
+    }
+
+    pub(super) fn total_device_bytes_v2(&self) -> u64 {
+        self.total_device_bytes
+    }
+
     pub(super) fn into_native_bind_v2(
         self,
         calibration: ResidentSearchSlice2CalibrationBindingV2,
@@ -330,8 +428,11 @@ impl ResidentScoringArchiveArenaLayoutV2 {
         }
 
         RawResidentArchiveKnnBindV2 {
-            abi_version: 2,
+            abi_version: selected_archive_abi_v2(),
+            #[cfg(not(feature = "hip-native-kernels"))]
             reserved: 0,
+            #[cfg(feature = "hip-native-kernels")]
+            backend_kind: 2,
             fitness_scores: raw(self.fitness_scores),
             decision_keys: raw(self.decision_keys),
             cub_scratch: raw(self.cub_scratch),
@@ -355,10 +456,16 @@ impl ResidentScoringArchiveArenaLayoutV2 {
             max_terms_per_gene,
             reserved_extents: 0,
             device_uuid: calibration.device_uuid,
+            #[cfg(not(feature = "hip-native-kernels"))]
             primary_context_identity: calibration.primary_context_identity,
+            #[cfg(feature = "hip-native-kernels")]
+            hip_lease_identity: calibration.hip_lease_identity,
             search_stream_identity: calibration.search_stream_identity,
             active_pool_identity: calibration.active_pool_identity,
+            #[cfg(not(feature = "hip-native-kernels"))]
             cuda_build_identity: calibration.cuda_build_identity,
+            #[cfg(feature = "hip-native-kernels")]
+            hip_build_identity: calibration.hip_build_identity,
             kernel_semantics_identity: calibration.kernel_semantics_identity,
             binary64_math_identity: calibration.binary64_math_identity,
             plan_identity: calibration.plan_identity,
@@ -367,486 +474,568 @@ impl ResidentScoringArchiveArenaLayoutV2 {
             post_trim_receipt_identity,
         }
     }
-
-    #[cfg(test)]
-    fn regions_v2(&self) -> [RegionV2; 15] {
-        [
-            self.fitness_scores,
-            self.decision_keys,
-            self.cub_scratch,
-            self.archive_gene_scalars,
-            self.archive_term_indices,
-            self.archive_term_weights,
-            self.archive_metric_rows,
-            self.archive_signatures,
-            self.archive_hashes,
-            self.current_population_signatures,
-            self.novelty_scores,
-            self.exact_top_k_keys,
-            self.admission_flags,
-            self.admission_offsets,
-            self.archive_control_and_seal,
-        ]
-    }
-
-    #[cfg(all(test, feature = "resident-search-slice2-host-contract"))]
-    pub(super) fn test_archive_gene_scalars_v2(&self) -> (u64, u64) {
-        (
-            self.archive_gene_scalars.offset_bytes,
-            self.archive_gene_scalars.size_bytes,
-        )
-    }
-
-    #[cfg(all(test, feature = "resident-search-slice2-host-contract"))]
-    pub(super) fn test_total_device_bytes_v2(&self) -> u64 {
-        self.total_device_bytes
-    }
-}
-
-fn require_region_size_v2(
-    region: ScoringArchiveArenaRegionV2,
-    observed: u64,
-    expected: u64,
-) -> Result<(), ScoringArchiveArenaLayoutErrorV2> {
-    if observed == expected {
-        Ok(())
-    } else {
-        Err(ScoringArchiveArenaLayoutErrorV2::RegionSizeMismatch {
-            region,
-            expected,
-            observed,
-        })
-    }
-}
-
-fn append_region_v2(
-    cursor: &mut u64,
-    region: ScoringArchiveArenaRegionV2,
-    size_bytes: u64,
-) -> Result<RegionV2, ScoringArchiveArenaLayoutErrorV2> {
-    let offset_bytes = *cursor;
-    *cursor = cursor
-        .checked_add(size_bytes)
-        .ok_or(ScoringArchiveArenaLayoutErrorV2::ArithmeticOverflow { region })?;
-    Ok(RegionV2::new(offset_bytes, size_bytes))
-}
-
-fn checked_aligned_product_v2(
-    region: ScoringArchiveArenaRegionV2,
-    factors: &[u64],
-) -> Result<u64, ScoringArchiveArenaLayoutErrorV2> {
-    let logical_bytes = factors
-        .iter()
-        .copied()
-        .try_fold(1_u64, |value, factor| value.checked_mul(factor));
-    logical_bytes
-        .and_then(|bytes| bytes.checked_add(SCORING_ARCHIVE_ALIGNMENT_BYTES_V2 - 1))
-        .map(|bytes| bytes & !(SCORING_ARCHIVE_ALIGNMENT_BYTES_V2 - 1))
-        .ok_or(ScoringArchiveArenaLayoutErrorV2::ArithmeticOverflow { region })
-}
-
-pub(super) fn checked_expected_slice2_layout_v2(
-    population_count: u64,
-    archive_capacity: u64,
-) -> Result<super::ResidentSearchSlice2AlignedLayoutV2, ScoringArchiveArenaLayoutErrorV2> {
-    let archive_gene_scalars = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::ArchiveGeneScalars,
-        &[archive_capacity, GENE_SCALAR_BYTES_V2],
-    )?;
-    let archive_term_indices = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::ArchiveTermIndices,
-        &[archive_capacity, MAX_TERMS_PER_GENE_V2, TERM_INDEX_BYTES_V2],
-    )?;
-    let archive_term_weights = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::ArchiveTermWeights,
-        &[
-            archive_capacity,
-            MAX_TERMS_PER_GENE_V2,
-            TERM_WEIGHT_BYTES_V2,
-        ],
-    )?;
-    let archive_metric_rows = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::ArchiveMetricRows,
-        &[archive_capacity, METRIC_ROW_BYTES_V2],
-    )?;
-    let archive_signatures = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::ArchiveSignatures,
-        &[
-            archive_capacity,
-            SIGNATURE_WORD_COUNT_V2,
-            SIGNATURE_WORD_BYTES_V2,
-        ],
-    )?;
-    let archive_hashes = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::ArchiveHashes,
-        &[archive_capacity, HASH_BYTES_V2],
-    )?;
-    let current_population_signatures = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::CurrentPopulationSignatures,
-        &[
-            population_count,
-            SIGNATURE_WORD_COUNT_V2,
-            SIGNATURE_WORD_BYTES_V2,
-        ],
-    )?;
-    let novelty_scores = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::NoveltyScores,
-        &[population_count, SCORE_BYTES_V2],
-    )?;
-    let exact_top_k_keys = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::ExactTopKKeys,
-        &[
-            population_count,
-            NOVELTY_NEIGHBOR_COUNT_V2,
-            EXACT_NEIGHBOR_KEY_BYTES_V2,
-        ],
-    )?;
-    let admission_flags = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::AdmissionFlags,
-        &[population_count, ADMISSION_FLAG_BYTES_V2],
-    )?;
-    let admission_offsets = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::AdmissionOffsets,
-        &[population_count, ADMISSION_OFFSET_BYTES_V2],
-    )?;
-    let archive_control_and_seal = ARCHIVE_CONTROL_AND_SEAL_BYTES_V2;
-    let regions = [
-        (
-            ScoringArchiveArenaRegionV2::ArchiveGeneScalars,
-            archive_gene_scalars,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveTermIndices,
-            archive_term_indices,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveTermWeights,
-            archive_term_weights,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveMetricRows,
-            archive_metric_rows,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveSignatures,
-            archive_signatures,
-        ),
-        (ScoringArchiveArenaRegionV2::ArchiveHashes, archive_hashes),
-        (
-            ScoringArchiveArenaRegionV2::CurrentPopulationSignatures,
-            current_population_signatures,
-        ),
-        (ScoringArchiveArenaRegionV2::NoveltyScores, novelty_scores),
-        (ScoringArchiveArenaRegionV2::ExactTopKKeys, exact_top_k_keys),
-        (ScoringArchiveArenaRegionV2::AdmissionFlags, admission_flags),
-        (
-            ScoringArchiveArenaRegionV2::AdmissionOffsets,
-            admission_offsets,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveControlAndSeal,
-            archive_control_and_seal,
-        ),
-    ];
-    let replacement_subtotal_bytes =
-        regions
-            .iter()
-            .try_fold(0_u64, |subtotal, (region, size_bytes)| {
-                subtotal
-                    .checked_add(*size_bytes)
-                    .ok_or(ScoringArchiveArenaLayoutErrorV2::ArithmeticOverflow { region: *region })
-            })?;
-
-    Ok(super::ResidentSearchSlice2AlignedLayoutV2 {
-        archive_gene_scalars,
-        archive_term_indices,
-        archive_term_weights,
-        archive_metric_rows,
-        archive_signatures,
-        archive_hashes,
-        current_population_signatures,
-        novelty_scores,
-        exact_top_k_keys,
-        admission_flags,
-        admission_offsets,
-        archive_control_and_seal,
-        replacement_subtotal_bytes,
-    })
-}
-
-pub(super) fn validate_scoring_archive_arena_layout_v2(
-    allocation: ResidentSearchSlice2AsyncAllocationArgsV2,
-    receipt: ResidentSearchSlice2ScoringArchiveReceiptV2,
-    population_count: u64,
-    archive_capacity: u64,
-) -> Result<ResidentScoringArchiveArenaLayoutV2, ScoringArchiveArenaLayoutErrorV2> {
-    if allocation.ordinal != 2 {
-        return Err(
-            ScoringArchiveArenaLayoutErrorV2::AllocationOrdinalMismatch {
-                observed: allocation.ordinal,
-            },
-        );
-    }
-    if allocation.category != ResidentSearchSlice2AllocationCategoryV2::ScoringArchiveArena {
-        return Err(ScoringArchiveArenaLayoutErrorV2::AllocationCategoryMismatch);
-    }
-    if allocation.alignment_bytes != SCORING_ARCHIVE_ALIGNMENT_BYTES_V2 {
-        return Err(
-            ScoringArchiveArenaLayoutErrorV2::AllocationAlignmentMismatch {
-                observed: allocation.alignment_bytes,
-            },
-        );
-    }
-    if allocation.flags != 0 {
-        return Err(ScoringArchiveArenaLayoutErrorV2::AllocationFlagsMismatch {
-            observed: allocation.flags,
-        });
-    }
-    if receipt.cub_scratch_bytes % SCORING_ARCHIVE_ALIGNMENT_BYTES_V2 != 0 {
-        return Err(
-            ScoringArchiveArenaLayoutErrorV2::CubScratchAlignmentMismatch {
-                observed: receipt.cub_scratch_bytes,
-            },
-        );
-    }
-
-    let expected_fitness_score_bytes = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::FitnessScores,
-        &[population_count, SCORE_BYTES_V2],
-    )?;
-    let expected_decision_key_bytes = checked_aligned_product_v2(
-        ScoringArchiveArenaRegionV2::DecisionKeys,
-        &[population_count, SCORE_BYTES_V2],
-    )?;
-    require_region_size_v2(
-        ScoringArchiveArenaRegionV2::FitnessScores,
-        receipt.fitness_score_bytes,
-        expected_fitness_score_bytes,
-    )?;
-    require_region_size_v2(
-        ScoringArchiveArenaRegionV2::DecisionKeys,
-        receipt.decision_key_bytes,
-        expected_decision_key_bytes,
-    )?;
-
-    let expected_layout = checked_expected_slice2_layout_v2(population_count, archive_capacity)?;
-    let expected_regions = [
-        (
-            ScoringArchiveArenaRegionV2::ArchiveGeneScalars,
-            receipt.layout.archive_gene_scalars,
-            expected_layout.archive_gene_scalars,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveTermIndices,
-            receipt.layout.archive_term_indices,
-            expected_layout.archive_term_indices,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveTermWeights,
-            receipt.layout.archive_term_weights,
-            expected_layout.archive_term_weights,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveMetricRows,
-            receipt.layout.archive_metric_rows,
-            expected_layout.archive_metric_rows,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveSignatures,
-            receipt.layout.archive_signatures,
-            expected_layout.archive_signatures,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveHashes,
-            receipt.layout.archive_hashes,
-            expected_layout.archive_hashes,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::CurrentPopulationSignatures,
-            receipt.layout.current_population_signatures,
-            expected_layout.current_population_signatures,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::NoveltyScores,
-            receipt.layout.novelty_scores,
-            expected_layout.novelty_scores,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ExactTopKKeys,
-            receipt.layout.exact_top_k_keys,
-            expected_layout.exact_top_k_keys,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::AdmissionFlags,
-            receipt.layout.admission_flags,
-            expected_layout.admission_flags,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::AdmissionOffsets,
-            receipt.layout.admission_offsets,
-            expected_layout.admission_offsets,
-        ),
-        (
-            ScoringArchiveArenaRegionV2::ArchiveControlAndSeal,
-            receipt.layout.archive_control_and_seal,
-            expected_layout.archive_control_and_seal,
-        ),
-    ];
-    for (region, observed, expected) in expected_regions {
-        require_region_size_v2(region, observed, expected)?;
-    }
-
-    let replacement_subtotal_bytes =
-        expected_regions
-            .iter()
-            .try_fold(0_u64, |subtotal, (region, observed, _)| {
-                subtotal
-                    .checked_add(*observed)
-                    .ok_or(ScoringArchiveArenaLayoutErrorV2::ArithmeticOverflow { region: *region })
-            })?;
-    if replacement_subtotal_bytes != expected_layout.replacement_subtotal_bytes {
-        return Err(
-            ScoringArchiveArenaLayoutErrorV2::ReplacementSubtotalMismatch {
-                expected: expected_layout.replacement_subtotal_bytes,
-                observed: replacement_subtotal_bytes,
-            },
-        );
-    }
-    if receipt.layout.replacement_subtotal_bytes != replacement_subtotal_bytes {
-        return Err(
-            ScoringArchiveArenaLayoutErrorV2::ReplacementSubtotalMismatch {
-                expected: replacement_subtotal_bytes,
-                observed: receipt.layout.replacement_subtotal_bytes,
-            },
-        );
-    }
-
-    let mut cursor = 0_u64;
-    let fitness_scores = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::FitnessScores,
-        receipt.fitness_score_bytes,
-    )?;
-    let decision_keys = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::DecisionKeys,
-        receipt.decision_key_bytes,
-    )?;
-    let cub_scratch = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::CubScratch,
-        receipt.cub_scratch_bytes,
-    )?;
-    let archive_gene_scalars = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::ArchiveGeneScalars,
-        receipt.layout.archive_gene_scalars,
-    )?;
-    let archive_term_indices = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::ArchiveTermIndices,
-        receipt.layout.archive_term_indices,
-    )?;
-    let archive_term_weights = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::ArchiveTermWeights,
-        receipt.layout.archive_term_weights,
-    )?;
-    let archive_metric_rows = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::ArchiveMetricRows,
-        receipt.layout.archive_metric_rows,
-    )?;
-    let archive_signatures = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::ArchiveSignatures,
-        receipt.layout.archive_signatures,
-    )?;
-    let archive_hashes = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::ArchiveHashes,
-        receipt.layout.archive_hashes,
-    )?;
-    let current_population_signatures = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::CurrentPopulationSignatures,
-        receipt.layout.current_population_signatures,
-    )?;
-    let novelty_scores = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::NoveltyScores,
-        receipt.layout.novelty_scores,
-    )?;
-    let exact_top_k_keys = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::ExactTopKKeys,
-        receipt.layout.exact_top_k_keys,
-    )?;
-    let admission_flags = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::AdmissionFlags,
-        receipt.layout.admission_flags,
-    )?;
-    let admission_offsets = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::AdmissionOffsets,
-        receipt.layout.admission_offsets,
-    )?;
-    let archive_control_and_seal = append_region_v2(
-        &mut cursor,
-        ScoringArchiveArenaRegionV2::ArchiveControlAndSeal,
-        receipt.layout.archive_control_and_seal,
-    )?;
-
-    if receipt.total_device_bytes != cursor {
-        return Err(ScoringArchiveArenaLayoutErrorV2::ReceiptTotalMismatch {
-            expected: cursor,
-            observed: receipt.total_device_bytes,
-        });
-    }
-    if allocation.requested_bytes != cursor || allocation.aligned_bytes != cursor {
-        return Err(ScoringArchiveArenaLayoutErrorV2::AllocationTotalMismatch {
-            expected: cursor,
-            observed_requested: allocation.requested_bytes,
-            observed_aligned: allocation.aligned_bytes,
-        });
-    }
-
-    Ok(ResidentScoringArchiveArenaLayoutV2 {
-        fitness_scores,
-        decision_keys,
-        cub_scratch,
-        archive_gene_scalars,
-        archive_term_indices,
-        archive_term_weights,
-        archive_metric_rows,
-        archive_signatures,
-        archive_hashes,
-        current_population_signatures,
-        novelty_scores,
-        exact_top_k_keys,
-        admission_flags,
-        admission_offsets,
-        archive_control_and_seal,
-        replacement_subtotal_bytes,
-        total_device_bytes: cursor,
-        stream_identity: allocation.stream_identity,
-        pool_identity: allocation.pool_identity,
-    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        ResidentSearchSlice2AlignedLayoutV2, ResidentSearchSlice2AllocationCategoryV2,
-        ResidentSearchSlice2AsyncAllocationArgsV2, ResidentSearchSlice2ScoringArchiveReceiptV2,
-    };
     use super::*;
 
-    const HOST_FIXTURE_CUB_BYTES: u64 = 65_536;
-    const HOST_FIXTURE_TOTAL_BYTES: u64 = 23_776_768;
+    // Synthetic wire values exercise the pure layout/validation code only;
+    // they never enter native code or manufacture a runtime admission owner.
+    fn host_test_binding_v3() -> RawResidentArchiveKnnBindV2 {
+        ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(7, 9, 256, 4, 3)
+            .unwrap()
+            .into_native_bind_v2(
+                ResidentSearchSlice2CalibrationBindingV2 {
+                    device_uuid: [11; 16],
+                    #[cfg(not(feature = "hip-native-kernels"))]
+                    primary_context_identity: 13,
+                    #[cfg(feature = "hip-native-kernels")]
+                    hip_lease_identity: 13,
+                    search_stream_identity: 17,
+                    active_pool_identity: 19,
+                    #[cfg(not(feature = "hip-native-kernels"))]
+                    cuda_build_identity: 23,
+                    #[cfg(feature = "hip-native-kernels")]
+                    hip_build_identity: 23,
+                    kernel_semantics_identity: 29,
+                    binary64_math_identity: 31,
+                    plan_identity: 37,
+                    run_identity: 41,
+                },
+                7,
+                9,
+                4,
+                3,
+                4,
+                43,
+                47,
+            )
+    }
+
+    #[test]
+    fn archive_selected_backend_keeps_exact_wire_offsets_and_calibration() {
+        let binding = host_test_binding_v3();
+        assert_eq!(std::mem::size_of::<RawResidentArchiveKnnBindV2>(), 384);
+        assert_eq!(std::mem::align_of::<RawResidentArchiveKnnBindV2>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(RawResidentArchiveKnnBindV2, device_uuid),
+            288
+        );
+        assert_eq!(
+            std::mem::offset_of!(RawResidentArchiveKnnBindV2, search_stream_identity),
+            312
+        );
+        assert_eq!(
+            std::mem::offset_of!(RawResidentArchiveKnnBindV2, active_pool_identity),
+            320
+        );
+        #[cfg(not(feature = "hip-native-kernels"))]
+        {
+            assert_eq!(selected_archive_abi_v2(), 2);
+            assert_eq!(
+                std::mem::offset_of!(RawResidentArchiveKnnBindV2, reserved),
+                4
+            );
+            assert_eq!(
+                std::mem::offset_of!(RawResidentArchiveKnnBindV2, primary_context_identity),
+                304
+            );
+            assert_eq!(
+                std::mem::offset_of!(RawResidentArchiveKnnBindV2, cuda_build_identity),
+                328
+            );
+            assert_eq!(
+                (
+                    binding.reserved,
+                    binding.primary_context_identity,
+                    binding.cuda_build_identity
+                ),
+                (0, 13, 23)
+            );
+        }
+        #[cfg(feature = "hip-native-kernels")]
+        {
+            assert_eq!(selected_archive_abi_v2(), 0x0001_0002);
+            assert_eq!(
+                std::mem::offset_of!(RawResidentArchiveKnnBindV2, backend_kind),
+                4
+            );
+            assert_eq!(
+                std::mem::offset_of!(RawResidentArchiveKnnBindV2, hip_lease_identity),
+                304
+            );
+            assert_eq!(
+                std::mem::offset_of!(RawResidentArchiveKnnBindV2, hip_build_identity),
+                328
+            );
+            assert_eq!(
+                (
+                    binding.backend_kind,
+                    binding.hip_lease_identity,
+                    binding.hip_build_identity
+                ),
+                (2, 13, 23)
+            );
+        }
+        assert_eq!(binding.device_uuid, [11; 16]);
+        assert_eq!(
+            (binding.search_stream_identity, binding.active_pool_identity),
+            (17, 19)
+        );
+        assert_eq!(
+            (
+                binding.kernel_semantics_identity,
+                binding.binary64_math_identity
+            ),
+            (29, 31)
+        );
+        assert_eq!((binding.plan_identity, binding.run_identity), (37, 41));
+        assert_eq!(
+            (
+                binding.full_workspace_receipt_identity,
+                binding.post_trim_receipt_identity
+            ),
+            (43, 47)
+        );
+        assert_eq!(
+            (
+                binding.signature_word_count,
+                binding.novelty_neighbor_count,
+                binding.max_terms_per_gene
+            ),
+            (4, 3, 4)
+        );
+        assert!(binding.selected_backend_matches_v2());
+        let mut foreign = binding;
+        foreign.abi_version ^= 0x0001_0000;
+        assert!(!foreign.selected_backend_matches_v2());
+        let mut malformed = binding;
+        #[cfg(feature = "hip-native-kernels")]
+        {
+            malformed.backend_kind = 0;
+        }
+        #[cfg(not(feature = "hip-native-kernels"))]
+        {
+            malformed.reserved = 2;
+        }
+        assert!(!malformed.selected_backend_matches_v2());
+    }
+
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+    #[test]
+    fn archive_terminal_requires_matching_backend_pending_and_ready_protocols() {
+        let binding = host_test_binding_v3();
+        let pending = RawResidentArchiveKnnPendingV2 {
+            abi_version: selected_archive_abi_v2(),
+            run_identity: 41,
+            terminal_host_receipt_identity: 67,
+            completion_event_identity: 73,
+            same_stream_enqueue_count: 79,
+            ..Default::default()
+        };
+        let ready = RawReadyEventV1 {
+            abi_version: selected_generation_abi_v1(),
+            event_id: 73,
+            generation_index: 3,
+            same_stream_enqueue_count: 79,
+            ..Default::default()
+        };
+        let terminal = RawResidentArchiveKnnTerminalV2 {
+            abi_version: selected_archive_abi_v2(),
+            terminal_status: 1,
+            receipt_identity: 67,
+            run_identity: 41,
+            packed_commit_word: 0x0000_0002_0004_0007, // store1, generation3, count2, epoch1
+            collision_count: 7,
+            compact_async_d2h_count: 1,
+            compact_async_d2h_bytes: 104,
+            completion_event_query_count: 1,
+            same_stream_enqueue_count: 79,
+            completion_event_identity: 73,
+            // Literal little-endian FNV-1a checkpoint for [packed, 7, 41, 0].
+            validator_digest: 0xab89_9d2f_f8b5_49cc,
+            ..Default::default()
+        };
+        assert!(terminal.validates_committed_v2(&pending, &binding, &ready));
+        let mut wrong_binding = binding;
+        wrong_binding.abi_version ^= 0x0001_0000;
+        assert!(!terminal.validates_committed_v2(&pending, &wrong_binding, &ready));
+        let mut wrong_pending = pending;
+        wrong_pending.abi_version ^= 0x0001_0000;
+        assert!(!terminal.validates_committed_v2(&wrong_pending, &binding, &ready));
+        wrong_pending = pending;
+        wrong_pending.flags = 1;
+        assert!(!terminal.validates_committed_v2(&wrong_pending, &binding, &ready));
+        let mut wrong_terminal = terminal;
+        wrong_terminal.abi_version ^= 0x0001_0000;
+        assert!(!wrong_terminal.validates_committed_v2(&pending, &binding, &ready));
+        let mut wrong_ready = ready;
+        wrong_ready.abi_version ^= 0x0001_0000;
+        assert!(!terminal.validates_committed_v2(&pending, &binding, &wrong_ready));
+        // Keep existing event, transfer and fault checks active on both backends.
+        for mutate in [
+            |v: &mut RawResidentArchiveKnnTerminalV2| v.device_fault_word = 1,
+            |v: &mut RawResidentArchiveKnnTerminalV2| v.validation_fault_word = 1,
+            |v: &mut RawResidentArchiveKnnTerminalV2| v.compact_async_d2h_count = 2,
+            |v: &mut RawResidentArchiveKnnTerminalV2| v.compact_async_d2h_bytes = 105,
+            |v: &mut RawResidentArchiveKnnTerminalV2| v.completion_event_query_count = 0,
+            |v: &mut RawResidentArchiveKnnTerminalV2| v.completion_stream_synchronize_count = 1,
+            |v: &mut RawResidentArchiveKnnTerminalV2| v.completion_event_identity ^= 1,
+            |v: &mut RawResidentArchiveKnnTerminalV2| v.same_stream_enqueue_count ^= 1,
+            |v: &mut RawResidentArchiveKnnTerminalV2| v.validator_digest ^= 1,
+        ] {
+            let mut invalid = terminal;
+            mutate(&mut invalid);
+            assert!(!invalid.validates_committed_v2(&pending, &binding, &ready));
+        }
+    }
+
+    #[test]
+    fn slice2_native_admission_layout_matches_all_fifteen_native_regions() {
+        let population = 33;
+        let archive = 65;
+        let scratch = 1_024;
+        let layout = ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+            population, archive, scratch, 4, 15,
+        )
+        .expect("checked layout, not a device measurement");
+        let regions = [
+            (layout.fitness_scores, population * 8),
+            (layout.decision_keys, population * 8),
+            (layout.cub_scratch, scratch),
+            (layout.archive_gene_scalars, 2 * archive * 72),
+            (layout.archive_term_indices, 2 * archive * 16 * 8),
+            (layout.archive_term_weights, 2 * archive * 16 * 8),
+            (layout.archive_metric_rows, 2 * archive * 104),
+            (layout.archive_signatures, 2 * archive * 4 * 8),
+            (layout.archive_hashes, (6 * archive + 256) * 8),
+            (layout.current_population_signatures, population * 4 * 8),
+            (layout.novelty_scores, population * 8),
+            (layout.exact_top_k_keys, population * 15 * 32),
+            (layout.admission_flags, population * 4),
+            (layout.admission_offsets, population * 8),
+            (layout.archive_control_and_seal, 256),
+        ];
+        let mut end = 0;
+        for (region, logical_bytes) in regions {
+            assert_eq!(region.offset_bytes, end);
+            assert_eq!(region.size_bytes, logical_bytes.div_ceil(256) * 256);
+            assert_eq!(region.offset_bytes % 256, 0);
+            end += region.size_bytes;
+        }
+        assert_eq!(layout.total_device_bytes_v2(), end);
+        type MetricRow = neoethos_gpu_contracts::device::NeoPopulationMetricRow;
+        assert_eq!(std::mem::size_of::<MetricRow>(), 104);
+        assert_eq!(std::mem::offset_of!(MetricRow, candidate_id), 0);
+        assert_eq!(std::mem::offset_of!(MetricRow, scenario_id), 8);
+        assert_eq!(std::mem::offset_of!(MetricRow, values), 16);
+        let scoring_abi = include_str!("../native/resident_scoring_novelty_v1_abi.cuh");
+        assert!(
+            scoring_abi
+                .contains("using NeoResidentScoringNoveltyMetricRowV1 = ::NeoPopulationMetricRow;")
+        );
+        assert!(scoring_abi.contains("sizeof(NeoResidentScoringNoveltyMetricRowV1) == 104"));
+        assert!(layout.current_population_signatures.size_bytes >= population * 4 * 8);
+        assert!(ARCHIVE_CUDA_SOURCE_V2.contains("static_assert(sizeof(ExactNeighborKeyV2) == 32"));
+        assert!(
+            include_str!("../native/resident_generation_v1_abi.cuh")
+                .contains("sizeof(NeoResidentGenerationGeneScalarV1) == 72")
+        );
+    }
+
+    #[test]
+    fn slice2_native_admission_layout_refuses_unmeasured_scratch_and_overflow() {
+        for (population, archive, scratch) in [
+            (0, 1, 256),
+            (1, 0, 256),
+            (i32::MAX as u64 + 1, 1, 256),
+            (1, u16::MAX as u64 + 1, 256),
+            (1, 1, 0),
+            (1, 1, 255),
+            (1, 1, u64::MAX - 255),
+        ] {
+            assert!(
+                ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+                    population, archive, scratch, 4, 15,
+                )
+                .is_err()
+            );
+        }
+        for words in [0, 1, 3] {
+            assert!(
+                ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(1, 1, 256, words, 15)
+                    .is_err()
+            );
+        }
+        assert!(
+            ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+                i32::MAX as u64,
+                1,
+                256,
+                u32::MAX,
+                15,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn slice2_native_admission_layout_charges_wide_signatures_without_raising_term_stride() {
+        let population = 200;
+        let archive = 65;
+        let narrow = ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+            population, archive, 1_024, 4, 15,
+        )
+        .unwrap();
+        let wide = ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+            population, archive, 1_024, 31, 15,
+        )
+        .unwrap();
+        let align = |bytes: u64| bytes.div_ceil(256) * 256;
+        assert_eq!(wide.archive_signatures.size_bytes, align(2 * archive * 31 * 8));
+        assert_eq!(
+            wide.current_population_signatures.size_bytes,
+            align(population * 31 * 8)
+        );
+        assert_eq!(
+            wide.total_device_bytes_v2() - narrow.total_device_bytes_v2(),
+            align(2 * archive * 31 * 8) - align(2 * archive * 4 * 8) + align(population * 31 * 8)
+                - align(population * 4 * 8)
+        );
+        assert_eq!(wide.archive_term_indices, narrow.archive_term_indices);
+        assert_eq!(wide.archive_term_weights, narrow.archive_term_weights);
+        assert_eq!(wide.cub_scratch, narrow.cub_scratch);
+        assert!(wide.current_population_signatures.size_bytes >= population * 4 * 8);
+    }
+
+    #[test]
+    fn slice2_native_admission_layout_charges_configured_neighbors_and_rollback_banks() {
+        let align = |bytes: u64| bytes.div_ceil(256) * 256;
+        let population = 33;
+        let capacity = 65;
+        for neighbors in [1_u32, 7, 15, 31, 65] {
+            let layout = ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+                population, capacity, 1_024, 4, neighbors,
+            ).unwrap();
+            assert_eq!(layout.exact_top_k_keys.size_bytes, align(population * u64::from(neighbors) * 32));
+            assert_eq!(layout.archive_gene_scalars.size_bytes, align(2 * capacity * 72));
+            assert_eq!(layout.archive_term_indices.size_bytes, align(2 * capacity * 16 * 8));
+            assert_eq!(layout.archive_term_weights.size_bytes, align(2 * capacity * 16 * 8));
+            assert_eq!(layout.archive_metric_rows.size_bytes, align(2 * capacity * 104));
+            assert_eq!(layout.archive_signatures.size_bytes, align(2 * capacity * 4 * 8));
+            assert_eq!(layout.archive_hashes.size_bytes, align((6 * capacity + 256) * 8));
+            // The old one-bank reservation cannot fit the inactive payload;
+            // this negative control must fail even after alignment padding.
+            assert!(layout.archive_metric_rows.size_bytes > align(capacity * 104));
+        }
+        assert!(ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+            1, 1, 256, 4, 0,
+        ).is_err());
+        assert!(ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+            i32::MAX as u64, 1, 256, 4, u32::MAX,
+        ).is_err());
+    }
+
+    #[test]
+    fn slice2_native_admission_layout_charges_indexed_retention_at_capacity_boundaries() {
+        let align = |bytes: u64| bytes.div_ceil(256) * 256;
+        for (capacity, table_capacity) in [
+            (1_u64, 2_u64),
+            (2, 4),
+            (3, 8),
+            (4, 8),
+            (5, 16),
+            (7, 16),
+            (8, 16),
+            (9, 32),
+            (32_767, 65_536),
+            (32_768, 65_536),
+            (32_769, 131_072),
+            (65_535, 131_072),
+        ] {
+            let layout = ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+                3, capacity, 256, 4, 15,
+            ).unwrap();
+            let table_start = 4 * capacity;
+            let heap_start = table_start + table_capacity;
+            let inverse_start = heap_start + capacity;
+            let words = inverse_start + capacity;
+            assert_eq!(
+                ResidentScoringArchiveArenaLayoutV2::archive_retention_word_count_v3(capacity),
+                Ok(words),
+            );
+            assert!(table_capacity.is_power_of_two());
+            assert!(table_capacity >= 2 * capacity);
+            assert_eq!(layout.archive_hashes.size_bytes, align(words * 8));
+            assert!(layout.archive_hashes.size_bytes >= (inverse_start + capacity) * 8);
+            assert_eq!(
+                layout.current_population_signatures.offset_bytes,
+                layout.archive_hashes.offset_bytes + layout.archive_hashes.size_bytes,
+            );
+            // The old four-bank-only logical extent never covers the index.
+            // For tiny capacities existing alignment padding can cover it;
+            // once A>=5 the old physical reservation is also insufficient.
+            assert!(words * 8 > 4 * capacity * 8);
+            if capacity >= 5 {
+                assert!(layout.archive_hashes.size_bytes > align(4 * capacity * 8));
+            }
+        }
+    }
+
+    #[test]
+    fn slice2_native_admission_retention_words_refuse_zero_and_checked_overflow() {
+        for capacity in [
+            0,
+            u64::MAX,                 // 2A overflows.
+            (1_u64 << 62) + 1,         // The next power of two overflows.
+            u64::MAX / 6 + 1,          // 6A overflows.
+            1_u64 << 61,              // 6A and H fit separately, but their sum does not.
+        ] {
+            assert!(
+                ResidentScoringArchiveArenaLayoutV2::archive_retention_word_count_v3(capacity)
+                    .is_err(),
+                "capacity={capacity}",
+            );
+        }
+        // The public layout keeps the existing packed archive-count bounds.
+        for capacity in [0, 65_536, u64::MAX] {
+            assert!(ResidentScoringArchiveArenaLayoutV2::from_native_scratch_v2(
+                3, capacity, 256, 4, 15,
+            ).is_err());
+        }
+    }
+
+    #[test]
+    fn native_archive_knn_v2_dynamic_signatures_preserve_cub_rebuild_and_active_stride() {
+        let build = definition_body_v2(ARCHIVE_CUDA_SOURCE_V2, "build_population_signatures_v2");
+        assert_source_steps_v2(
+            build,
+            &[
+                "scalar.term_count > expected.max_terms_per_gene",
+                "signatures + candidate * signature_word_count",
+                "word < signature_word_count",
+                "signature[word] = 0ull;",
+                "candidate * expected.max_terms_per_gene",
+                "term < expected.max_terms_per_gene",
+                "feature >= expected.feature_count",
+                "feature / 64ull >= signature_word_count",
+                "signature[feature / 64ull] |= 1ull << (feature % 64ull);",
+            ],
+        );
+        assert!(!build.contains("local[NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2]"));
+        validate_stable_three_pass_cub_rank_v2(ARCHIVE_CUDA_SOURCE_V2).unwrap();
+        let rank = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "enqueue_resident_archive_score_and_rank_v2",
+        );
+        assert_eq!(
+            source_occurrences_v2(rank, "owner->binding.signature_word_count"),
+            3
+        );
+        let knn = definition_body_v2(ARCHIVE_CUDA_SOURCE_V2, "exact_archive_population_knn_v2");
+        assert_source_steps_v2(
+            knn,
+            &[
+                "std::uint64_t intersection = 0;",
+                "std::uint64_t union_count = 0;",
+                "word < signature_word_count",
+                "union_count > 32",
+                "static_cast<std::uint32_t>(union_count - intersection)",
+            ],
+        );
+        let stage = definition_body_v2(ARCHIVE_CUDA_SOURCE_V2, "stage_ranked_archive_tail_v2");
+        assert_source_steps_v2(
+            stage,
+            &[
+                "current.term_weights, candidate, expected.max_terms_per_gene",
+                "archive_term_weights, archived, NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2",
+                "term < NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2",
+                "term < expected.max_terms_per_gene ? current.term_indices[candidate * expected.max_terms_per_gene + term] : 0ull",
+                "term < expected.max_terms_per_gene ? current.term_weights[candidate * expected.max_terms_per_gene + term] : 0.0",
+                "word < signature_word_count",
+                "archive_signatures[destination * signature_word_count + word]",
+                "current_signatures[candidate * signature_word_count + word]",
+            ],
+        );
+        let scoring = include_str!("../native/resident_scoring_novelty_v1.cu");
+        for name in [
+            "query_slice2_combined_scoring_archive_run_v2",
+            "create_slice2_combined_scoring_archive_run_v2",
+        ] {
+            let body = definition_body_v2(scoring, name);
+            assert!(remove_ascii_whitespace_v2(body).contains(
+                "binding->signature_word_count!=resident_archive_knn_v2::signature_word_count_v2(plan->feature_count)"
+            ));
+            assert!(body.contains("binding->max_terms_per_gene != plan->max_terms_per_gene"));
+        }
+    }
+
+    #[test]
+    fn native_archive_knn_v2_economic_rejection_keeps_signatures_and_does_not_mask_faults() {
+        let build = definition_body_v2(ARCHIVE_CUDA_SOURCE_V2, "build_population_signatures_v2");
+        assert_source_steps_v2(
+            build,
+            &[
+                "scoring_seal_valid_v2(scoring_seal)",
+                "scalar.term_count > expected.max_terms_per_gene",
+                "classify_resident_metrics_v2(row.values)",
+                "metric_status == ResidentMetricStatusV2::Fault",
+                "latch_device_fault_v2(control, kNonFiniteMetricFaultV2)",
+                "signature[word] = 0ull",
+                "signature[feature / 64ull] |= 1ull << (feature % 64ull)",
+                "const bool mode_passed = policy.mode == 1u",
+                "row.values[5] > policy.minimum_profit_factor",
+                "row.values[1] > policy.minimum_sharpe",
+                "row.values[kNetMetricSlotV2] > policy.minimum_net",
+                "metric_status == ResidentMetricStatusV2::Finite && row.values[kTradeCountMetricSlotV2] > 0.0 && mode_passed",
+            ],
+        );
+        // An invalid monthly-equity metric is excluded, but a finite-metric
+        // objective rejection must not silently change CPU archive eligibility.
+        assert!(!build.contains("fitness_scores"));
+        let blend = definition_body_v2(ARCHIVE_CUDA_SOURCE_V2, "build_blended_rank_inputs_v2");
+        assert_source_steps_v2(
+            blend,
+            &[
+                "scoring_seal_valid_v2(scoring_seal)",
+                "!isfinite(fitness_scores[candidate]) && fitness_scores[candidate] != rejected_fitness",
+                "!isfinite(novelty_scores[candidate])",
+                "latch_device_fault_v2(control, kNonFiniteMetricFaultV2)",
+                "if (isfinite(fitness_scores[candidate]))",
+                "minimum_fitness =",
+                "maximum_fitness =",
+                "maximum_novelty =",
+                "double fitness_range = any_finite_fitness ? __dsub_rn(maximum_fitness, minimum_fitness) : 1.0e-9",
+                "ordinal_keys[candidate] = candidate",
+                "ordinal_values[candidate] = candidate",
+                "fitness_scores[candidate] == rejected_fitness",
+                "decision_keys[candidate] = 1ull",
+                "continue;",
+                "const double normalized_fitness =",
+                "decision_keys[candidate] = ordered_finite_f64_key_v2(blended)",
+            ],
+        );
+        validate_stable_three_pass_cub_rank_v2(ARCHIVE_CUDA_SOURCE_V2).unwrap();
+    }
+
     const ARCHIVE_ABI_SOURCE_V2: &str = include_str!("../native/resident_archive_knn_v2_abi.cuh");
     const ARCHIVE_CUDA_SOURCE_V2: &str = include_str!("../native/resident_archive_knn_v2.cu");
+    fn production_archive_source_v2() -> String {
+        const GUARD: &str = "#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)";
+        assert_eq!(ARCHIVE_CUDA_SOURCE_V2.matches(GUARD).count(), 1);
+        let start = ARCHIVE_CUDA_SOURCE_V2.find(GUARD).unwrap();
+        let end = start + ARCHIVE_CUDA_SOURCE_V2[start..].find("#endif").unwrap() + "#endif".len();
+        let fixture = &ARCHIVE_CUDA_SOURCE_V2[start..end];
+        assert_eq!(fixture.matches("#if").count(), 1, "fixture guard cannot nest or hide production");
+        assert_eq!(fixture.matches("extern \"C\"").count(), 1);
+        assert!(fixture.contains("extern \"C\" std::int32_t fixture_check_adaptive_archive_index_v3("));
+        assert!(fixture.contains("fixture_check_adaptive_archive_index_kernel_v3<<<1, 1"));
+        assert_eq!(ARCHIVE_CUDA_SOURCE_V2[end..].trim(), "}  // namespace neoethos::resident_archive_knn_v2");
+        // Exempt only this named final, feature-gated algorithm fixture. Every
+        // production function still participates in the original whole-TU bans.
+        format!("{}{}", &ARCHIVE_CUDA_SOURCE_V2[..start], &ARCHIVE_CUDA_SOURCE_V2[end..])
+    }
     const SEARCH_ABI_SOURCE_V2: &str =
         include_str!("../native/resident_search_generation_v2_abi.cuh");
     const POPULATION_CUDA_SOURCE_V2: &str = include_str!("../native/prototype_b_population.cu");
@@ -866,7 +1055,7 @@ mod tests {
 
         let create = definition_body_v2(
             POPULATION_CUDA_SOURCE_V2,
-            "neoethos_gpu_cuda_population_create_resident_search_slice2_v3",
+            "neoethos_gpu_cuda_population_create_resident_search_slice2_adaptive_v3",
         );
         assert!(create.contains("create_resident_search_combined_impl_v3("));
         assert!(create.contains("binding"));
@@ -907,7 +1096,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
     #[test]
     fn rust_archive_knn_v2_ffi_signatures_match_the_frozen_native_abi() {
         use crate::population::RawResidentScoringPopulationSourceV2;
@@ -943,10 +1132,32 @@ mod tests {
         ) -> i32 = try_complete_resident_archive_terminal_v2;
         let _: unsafe extern "C" fn(*mut c_void, *mut NativeResidentArchiveKnnOwnerV2) -> i32 =
             neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2;
+        let _: unsafe extern "C" fn(
+            *mut NativeResidentArchiveKnnOwnerV2,
+            *const RawResidentArchiveKnnTerminalV2,
+            *mut RawResidentArchiveGeneScalarV3,
+            *mut u64,
+            *mut f64,
+            *mut neoethos_gpu_contracts::device::NeoPopulationMetricRow,
+            *mut u64,
+            u64,
+            u64,
+            *mut RawResidentArchiveExportReceiptV3,
+        ) -> i32 = copy_resident_archive_terminal_candidates_v4;
     }
 
     fn source_occurrences_v2(source: &str, needle: &str) -> usize {
         source.match_indices(needle).count()
+    }
+
+    fn source_simple_assignments_v3(source: &str, target: &str) -> usize {
+        source
+            .match_indices(target)
+            .filter(|(offset, _)| {
+                let suffix = source[offset + target.len()..].trim_start();
+                suffix.starts_with('=') && !suffix.starts_with("==")
+            })
+            .count()
     }
 
     fn definition_body_v2<'a>(source: &'a str, symbol: &str) -> &'a str {
@@ -1022,11 +1233,31 @@ mod tests {
         }
     }
 
+    fn assert_source_steps_v2(source: &str, steps: &[&str]) {
+        let source = remove_ascii_whitespace_v2(source);
+        let mut cursor = 0;
+        for step in steps {
+            let step = remove_ascii_whitespace_v2(step);
+            let offset = source[cursor..]
+                .find(&step)
+                .unwrap_or_else(|| panic!("missing or out-of-order source step `{step}`"));
+            cursor += offset + step.len();
+        }
+    }
+
     fn validate_stable_three_pass_cub_rank_v2(source: &str) -> Result<(), String> {
-        if source_occurrences_v2(source, "cub::DeviceRadixSort::SortPairs(") != 2 {
+        if source_occurrences_v2(
+            source,
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
+        ) != 2
+        {
             return Err("rank must contain exactly two ascending stable CUB passes".to_owned());
         }
-        if source_occurrences_v2(source, "cub::DeviceRadixSort::SortPairsDescending(") != 1 {
+        if source_occurrences_v2(
+            source,
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(",
+        ) != 1
+        {
             return Err("rank must contain exactly one descending stable CUB pass".to_owned());
         }
         if source.contains("population_rank_less_v2")
@@ -1098,9 +1329,9 @@ mod tests {
             );
         }
         for pass in [
-            "cub::DeviceRadixSort::SortPairs(owner->cub_scratch,scratch_bytes,rank_keys_a,rank_keys_b,rank_values_a,rank_values_b,",
-            "cub::DeviceRadixSort::SortPairs(owner->cub_scratch,scratch_bytes,rank_keys_a,rank_keys_b,rank_values_b,rank_values_a,",
-            "cub::DeviceRadixSort::SortPairsDescending(owner->cub_scratch,scratch_bytes,rank_keys_a,rank_keys_b,rank_values_a,rank_values_b,",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(owner->cub_scratch,scratch_bytes,rank_keys_a,rank_keys_b,rank_values_a,rank_values_b,",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(owner->cub_scratch,scratch_bytes,rank_keys_a,rank_keys_b,rank_values_b,rank_values_a,",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(owner->cub_scratch,scratch_bytes,rank_keys_a,rank_keys_b,rank_values_a,rank_values_b,",
         ] {
             if !compact_score.contains(pass) {
                 return Err(format!("stable CUB pass is missing `{pass}`"));
@@ -1113,11 +1344,11 @@ mod tests {
         let mut cursor = 0;
         for step in [
             "build_blended_rank_inputs_v2<<<",
-            "cub::DeviceRadixSort::SortPairs(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
             "gather_gene_identity_rank_keys_v2<<<",
-            "cub::DeviceRadixSort::SortPairs(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
             "gather_blended_rank_keys_v2<<<",
-            "cub::DeviceRadixSort::SortPairsDescending(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(",
             "copy_ranked_ordinals_v2<<<",
             "build_population_signatures_v2<<<",
             "seal_ranked_population_v2<<<",
@@ -1130,251 +1361,19 @@ mod tests {
         Ok(())
     }
 
-    fn valid_receipt(cub_scratch_bytes: u64) -> ResidentSearchSlice2ScoringArchiveReceiptV2 {
-        let layout = ResidentSearchSlice2AlignedLayoutV2 {
-            archive_gene_scalars: 3_600_128,
-            archive_term_indices: 6_400_000,
-            archive_term_weights: 6_400_000,
-            archive_metric_rows: 5_200_128,
-            archive_signatures: 1_600_000,
-            archive_hashes: 400_128,
-            current_population_signatures: 6_400,
-            novelty_scores: 1_792,
-            exact_top_k_keys: 96_000,
-            admission_flags: 1_024,
-            admission_offsets: 1_792,
-            archive_control_and_seal: 256,
-            replacement_subtotal_bytes: 23_707_648,
-        };
-        ResidentSearchSlice2ScoringArchiveReceiptV2 {
-            fitness_score_bytes: 1_792,
-            decision_key_bytes: 1_792,
-            cub_scratch_bytes,
-            total_device_bytes: 1_792 + 1_792 + cub_scratch_bytes + 23_707_648,
-            layout,
-        }
-    }
-
-    fn valid_allocation(total_device_bytes: u64) -> ResidentSearchSlice2AsyncAllocationArgsV2 {
-        ResidentSearchSlice2AsyncAllocationArgsV2 {
-            ordinal: 2,
-            category: ResidentSearchSlice2AllocationCategoryV2::ScoringArchiveArena,
-            requested_bytes: total_device_bytes,
-            aligned_bytes: total_device_bytes,
-            alignment_bytes: SCORING_ARCHIVE_ALIGNMENT_BYTES_V2,
-            flags: 0,
-            stream_identity: 0x1001,
-            pool_identity: 0x2002,
-        }
-    }
-
     #[test]
-    fn host_fixture_layout_has_every_exact_offset_and_end() {
-        let receipt = valid_receipt(HOST_FIXTURE_CUB_BYTES);
-        let allocation = valid_allocation(receipt.total_device_bytes);
-        let authority = validate_scoring_archive_arena_layout_v2(allocation, receipt, 200, 50_000)
-            .expect("valid layout");
-
-        assert_eq!(authority.fitness_scores, RegionV2::new(0, 1_792));
-        assert_eq!(authority.decision_keys, RegionV2::new(1_792, 1_792));
-        assert_eq!(authority.cub_scratch, RegionV2::new(3_584, 65_536));
-        assert_eq!(
-            authority.archive_gene_scalars,
-            RegionV2::new(69_120, 3_600_128)
-        );
-        assert_eq!(
-            authority.archive_term_indices,
-            RegionV2::new(3_669_248, 6_400_000)
-        );
-        assert_eq!(
-            authority.archive_term_weights,
-            RegionV2::new(10_069_248, 6_400_000)
-        );
-        assert_eq!(
-            authority.archive_metric_rows,
-            RegionV2::new(16_469_248, 5_200_128)
-        );
-        assert_eq!(
-            authority.archive_signatures,
-            RegionV2::new(21_669_376, 1_600_000)
-        );
-        assert_eq!(authority.archive_hashes, RegionV2::new(23_269_376, 400_128));
-        assert_eq!(
-            authority.current_population_signatures,
-            RegionV2::new(23_669_504, 6_400)
-        );
-        assert_eq!(authority.novelty_scores, RegionV2::new(23_675_904, 1_792));
-        assert_eq!(
-            authority.exact_top_k_keys,
-            RegionV2::new(23_677_696, 96_000)
-        );
-        assert_eq!(authority.admission_flags, RegionV2::new(23_773_696, 1_024));
-        assert_eq!(
-            authority.admission_offsets,
-            RegionV2::new(23_774_720, 1_792)
-        );
-        assert_eq!(
-            authority.archive_control_and_seal,
-            RegionV2::new(23_776_512, 256)
-        );
-        assert_eq!(authority.replacement_subtotal_bytes, 23_707_648);
-        assert_eq!(authority.total_device_bytes, HOST_FIXTURE_TOTAL_BYTES);
-        assert_eq!(authority.stream_identity, 0x1001);
-        assert_eq!(authority.pool_identity, 0x2002);
-    }
-
-    #[test]
-    fn runtime_population_and_archive_extents_drive_the_checked_layout() {
-        let receipt = ResidentSearchSlice2ScoringArchiveReceiptV2 {
-            fitness_score_bytes: 3_328,
-            decision_key_bytes: 3_328,
-            cub_scratch_bytes: HOST_FIXTURE_CUB_BYTES,
-            layout: ResidentSearchSlice2AlignedLayoutV2 {
-                archive_gene_scalars: 72_192,
-                archive_term_indices: 128_000,
-                archive_term_weights: 128_000,
-                archive_metric_rows: 104_192,
-                archive_signatures: 32_000,
-                archive_hashes: 8_192,
-                current_population_signatures: 12_800,
-                novelty_scores: 3_328,
-                exact_top_k_keys: 192_000,
-                admission_flags: 1_792,
-                admission_offsets: 3_328,
-                archive_control_and_seal: 256,
-                replacement_subtotal_bytes: 686_080,
-            },
-            total_device_bytes: 758_272,
-        };
-        let allocation = valid_allocation(receipt.total_device_bytes);
-
-        let authority = validate_scoring_archive_arena_layout_v2(allocation, receipt, 400, 1_000)
-            .expect("runtime shape must be admitted");
-
-        assert_eq!(authority.fitness_scores.size_bytes, 3_328);
-        assert_eq!(authority.archive_gene_scalars.size_bytes, 72_192);
-        assert_eq!(authority.replacement_subtotal_bytes, 686_080);
-        assert_eq!(authority.total_device_bytes, 758_272);
-    }
-
-    #[test]
-    fn runtime_cub_size_moves_following_offsets_with_checked_nonoverlap() {
-        let receipt = valid_receipt(131_072);
-        let allocation = valid_allocation(receipt.total_device_bytes);
-        let authority = validate_scoring_archive_arena_layout_v2(allocation, receipt, 200, 50_000)
-            .expect("valid layout");
-        let regions = authority.regions_v2();
-
-        assert_eq!(authority.archive_gene_scalars.offset_bytes, 134_656);
-        assert_eq!(authority.total_device_bytes, 23_842_304);
-        for pair in regions.windows(2) {
-            assert_eq!(pair[0].end_v2().expect("checked end"), pair[1].offset_bytes);
-            assert_eq!(pair[1].offset_bytes % SCORING_ARCHIVE_ALIGNMENT_BYTES_V2, 0);
-        }
-        assert_eq!(
-            regions.last().unwrap().end_v2(),
-            Some(authority.total_device_bytes)
-        );
-    }
-
-    #[test]
-    fn one_field_and_total_drift_are_rejected() {
-        let mut field_drift = valid_receipt(HOST_FIXTURE_CUB_BYTES);
-        field_drift.layout.archive_hashes -= SCORING_ARCHIVE_ALIGNMENT_BYTES_V2;
-        field_drift.layout.replacement_subtotal_bytes -= SCORING_ARCHIVE_ALIGNMENT_BYTES_V2;
-        field_drift.total_device_bytes -= SCORING_ARCHIVE_ALIGNMENT_BYTES_V2;
-        let field_allocation = valid_allocation(field_drift.total_device_bytes);
-        assert_eq!(
-            validate_scoring_archive_arena_layout_v2(field_allocation, field_drift, 200, 50_000),
-            Err(ScoringArchiveArenaLayoutErrorV2::RegionSizeMismatch {
-                region: ScoringArchiveArenaRegionV2::ArchiveHashes,
-                expected: 400_128,
-                observed: 399_872,
-            })
-        );
-
-        let mut total_drift = valid_receipt(HOST_FIXTURE_CUB_BYTES);
-        total_drift.total_device_bytes += SCORING_ARCHIVE_ALIGNMENT_BYTES_V2;
-        let total_allocation = valid_allocation(total_drift.total_device_bytes);
-        assert_eq!(
-            validate_scoring_archive_arena_layout_v2(total_allocation, total_drift, 200, 50_000),
-            Err(ScoringArchiveArenaLayoutErrorV2::ReceiptTotalMismatch {
-                expected: HOST_FIXTURE_TOTAL_BYTES,
-                observed: HOST_FIXTURE_TOTAL_BYTES + SCORING_ARCHIVE_ALIGNMENT_BYTES_V2,
-            })
-        );
-
-        let mut overflow = valid_receipt(HOST_FIXTURE_CUB_BYTES);
-        overflow.cub_scratch_bytes = u64::MAX - 255;
-        overflow.total_device_bytes = 0;
-        let overflow_allocation = valid_allocation(0);
-        assert_eq!(
-            validate_scoring_archive_arena_layout_v2(overflow_allocation, overflow, 200, 50_000),
-            Err(ScoringArchiveArenaLayoutErrorV2::ArithmeticOverflow {
-                region: ScoringArchiveArenaRegionV2::CubScratch,
-            })
-        );
-    }
-
-    #[test]
-    fn allocation_contract_and_runtime_cub_alignment_drift_are_rejected() {
-        let receipt = valid_receipt(HOST_FIXTURE_CUB_BYTES);
-
-        let mut ordinal = valid_allocation(receipt.total_device_bytes);
-        ordinal.ordinal = 1;
-        assert_eq!(
-            validate_scoring_archive_arena_layout_v2(ordinal, receipt, 200, 50_000),
-            Err(ScoringArchiveArenaLayoutErrorV2::AllocationOrdinalMismatch { observed: 1 })
-        );
-
-        let mut category = valid_allocation(receipt.total_device_bytes);
-        category.category = ResidentSearchSlice2AllocationCategoryV2::GenerationArena;
-        assert_eq!(
-            validate_scoring_archive_arena_layout_v2(category, receipt, 200, 50_000),
-            Err(ScoringArchiveArenaLayoutErrorV2::AllocationCategoryMismatch)
-        );
-
-        let mut alignment = valid_allocation(receipt.total_device_bytes);
-        alignment.alignment_bytes = 128;
-        assert_eq!(
-            validate_scoring_archive_arena_layout_v2(alignment, receipt, 200, 50_000),
-            Err(ScoringArchiveArenaLayoutErrorV2::AllocationAlignmentMismatch { observed: 128 })
-        );
-
-        let mut flags = valid_allocation(receipt.total_device_bytes);
-        flags.flags = 1;
-        assert_eq!(
-            validate_scoring_archive_arena_layout_v2(flags, receipt, 200, 50_000),
-            Err(ScoringArchiveArenaLayoutErrorV2::AllocationFlagsMismatch { observed: 1 })
-        );
-
-        let unaligned_receipt = valid_receipt(HOST_FIXTURE_CUB_BYTES + 1);
-        let unaligned_allocation = valid_allocation(unaligned_receipt.total_device_bytes);
-        assert_eq!(
-            validate_scoring_archive_arena_layout_v2(
-                unaligned_allocation,
-                unaligned_receipt,
-                200,
-                50_000,
-            ),
-            Err(
-                ScoringArchiveArenaLayoutErrorV2::CubScratchAlignmentMismatch {
-                    observed: HOST_FIXTURE_CUB_BYTES + 1,
-                }
-            )
-        );
-    }
-
-    #[test]
-    fn native_archive_knn_v2_declares_and_defines_only_the_seven_split_entrypoints() {
-        const SPLIT_ENTRYPOINTS: [&str; 7] = [
+    fn native_archive_knn_v2_declares_ten_lifecycle_policy_and_terminal_export_entrypoints() {
+        const SPLIT_ENTRYPOINTS: [&str; 10] = [
             "bind_preallocated_resident_archive_knn_v2",
+            "configure_resident_archive_novelty_v3",
+            "configure_resident_archive_policy_v3",
             "enqueue_resident_archive_score_and_rank_v2",
             "enqueue_resident_archive_stage_from_rank_v2",
             "enqueue_resident_archive_evolve_and_publish_v2",
             "enqueue_resident_archive_terminal_seal_v2",
             "try_complete_resident_archive_terminal_v2",
             "neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2",
+            "copy_resident_archive_terminal_candidates_v4",
         ];
         for symbol in SPLIT_ENTRYPOINTS {
             let call_token = format!("{symbol}(");
@@ -1384,16 +1383,70 @@ mod tests {
                 "ABI must declare `{symbol}` exactly once"
             );
             assert_eq!(
-                source_occurrences_v2(ARCHIVE_CUDA_SOURCE_V2, &call_token),
+                source_occurrences_v2(&remove_ascii_whitespace_v2(ARCHIVE_CUDA_SOURCE_V2),
+                    &remove_ascii_whitespace_v2(&format!("extern \"C\" std::int32_t {symbol}("))),
                 1,
                 "CUDA TU must define `{symbol}` exactly once"
             );
         }
         assert_eq!(
-            source_occurrences_v2(ARCHIVE_CUDA_SOURCE_V2, "extern \"C\""),
+            source_occurrences_v2(&production_archive_source_v2(), "extern \"C\""),
             SPLIT_ENTRYPOINTS.len(),
-            "the dedicated CUDA TU must export exactly the seven C entrypoints"
+            "the dedicated CUDA TU exposes seven lifecycle entries, two immutable policy setters and terminal-only export"
         );
+
+        let configure = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "configure_resident_archive_novelty_v3",
+        );
+        assert_source_steps_v2(
+            configure,
+            &[
+                "owner == nullptr || !std::isfinite(novelty_weight)",
+                "novelty_weight < 0.0 || novelty_weight > 1.0",
+                "return NEO_ARCHIVE_KNN_STATUS_INVALID_ARGUMENT_V2;",
+                "owner->poisoned || owner->phase != HostPhaseV2::Bound || owner->novelty_configured",
+                "return NEO_ARCHIVE_KNN_STATUS_STATE_ERROR_V2;",
+                "expected_run_identity == 0 || expected_run_identity != owner->binding.run_identity",
+                "expected_run_identity != owner->retained_gene_view.expected_run_token",
+                "return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;",
+                "owner->novelty_weight = novelty_weight;",
+                "owner->novelty_configured = true;",
+                "return NEO_ARCHIVE_KNN_STATUS_OK_V2;",
+            ],
+        );
+        assert_eq!(
+            source_simple_assignments_v3(ARCHIVE_CUDA_SOURCE_V2, "owner->novelty_weight"),
+            1,
+            "only the checked, pre-generation setter may change the run policy"
+        );
+        // A comparison is not a write, but an extra assignment with ANY RHS
+        // must still fail the policy-immutability guard.
+        let changed_policy = format!("{ARCHIVE_CUDA_SOURCE_V2}\nowner->novelty_weight = 0.35;");
+        assert_eq!(
+            source_simple_assignments_v3(&changed_policy, "owner->novelty_weight"),
+            2
+        );
+        let score = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "enqueue_resident_archive_score_and_rank_v2",
+        );
+        assert!(score.contains("owner->novelty_weight"));
+        assert_source_excludes_v2(
+            configure,
+            &["cudaMemcpy", "cudaMalloc", "cudaEvent", "<<<"],
+            "immutable pre-generation policy setter",
+        );
+        let policy = definition_body_v2(ARCHIVE_CUDA_SOURCE_V2, "configure_resident_archive_policy_v3");
+        assert_source_steps_v2(policy, &[
+            "policy == nullptr || policy->abi_version != 3u || policy->mode > 3u",
+            "!std::isfinite(policy->minimum_net)", "!std::isfinite(policy->minimum_profit_factor)",
+            "!std::isfinite(policy->minimum_sharpe)", "configure_resident_archive_novelty_v3(",
+            "if (status != NEO_ARCHIVE_KNN_STATUS_OK_V2) return status;",
+            "owner->policy = *policy", "owner->adaptive_policy_configured = true",
+        ]);
+        assert_source_excludes_v2(policy, &["cudaMemcpy", "cudaMalloc", "cudaEvent", "<<<"],
+            "immutable pre-generation adaptive archive policy setter");
 
         for obsolete in [
             "query_resident_archive_knn_allocation_v2(",
@@ -1418,8 +1471,8 @@ mod tests {
 
         let mutants = [
             ARCHIVE_CUDA_SOURCE_V2.replacen(
-                "cub::DeviceRadixSort::SortPairsDescending(",
-                "cub::DeviceRadixSort::SortPairs(",
+                "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(",
+                "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
                 1,
             ),
             ARCHIVE_CUDA_SOURCE_V2.replacen(
@@ -1498,9 +1551,12 @@ mod tests {
             "total_device_bytes",
             "device_uuid",
             "primary_context_identity",
+            "hip_lease_identity",
             "search_stream_identity",
             "active_pool_identity",
             "cuda_build_identity",
+            "hip_build_identity",
+            "backend_kind",
             "kernel_semantics_identity",
             "binary64_math_identity",
             "plan_identity",
@@ -1606,8 +1662,13 @@ mod tests {
             ],
             "single-word terminal authority",
         );
+        // Power-of-two hash-table boundary assertions legitimately mention
+        // 65,536 slots; that is not a fixed archive capacity or payload array.
+        let header_without_index_boundary_assertions = ARCHIVE_ABI_SOURCE_V2.lines()
+            .filter(|line| !line.trim_start().starts_with("static_assert(archive_hash_table_capacity_v3("))
+            .collect::<Vec<_>>().join("\n");
         assert_source_excludes_v2(
-            ARCHIVE_ABI_SOURCE_V2,
+            &header_without_index_boundary_assertions,
             &["65'536", "65536"],
             "dynamic archive ABI",
         );
@@ -1621,17 +1682,104 @@ mod tests {
             ARCHIVE_CUDA_SOURCE_V2,
             "bind_preallocated_resident_archive_knn_v2",
         );
-        assert!(bind_definition.contains("binding->reserved != 0"));
+        assert!(bind_definition.contains("!backend_identity_v3::archive_backend_valid(*binding)"));
         assert!(bind_definition.contains("binding->reserved_extents != 0"));
         let release_signature = "neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2(void*session,NeoResidentArchiveKnnOwnerV2*owner)";
         assert!(compact_abi.contains(release_signature));
         assert!(compact_cuda.contains(release_signature));
     }
 
+    fn validate_archive_backend_source_v3(source: &str) -> Result<(), &'static str> {
+        for (symbol, hip, cuda) in [
+            (
+                "archive_backend_valid",
+                "value.backend_kind==2u",
+                "value.reserved==0u",
+            ),
+            (
+                "archive_owner_identity",
+                "(value.hip_lease_identity)",
+                "(value.primary_context_identity)",
+            ),
+            (
+                "archive_build_identity",
+                "(value.hip_build_identity)",
+                "(value.cuda_build_identity)",
+            ),
+        ] {
+            let body = remove_ascii_whitespace_v2(definition_body_v2(source, symbol));
+            let branches =
+                format!("#ifdefined(__HIP_PLATFORM_AMD__)return{hip};#elsereturn{cuda};#endif");
+            if !body.contains(&branches) {
+                return Err("archive selector must retain both exact backend identities");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_archive_backend_selectors_keep_cuda_checks_and_real_hip_owner_checks() {
+        let source = include_str!("../native/resident_backend_identity_v3.cuh");
+        validate_archive_backend_source_v3(source).unwrap();
+        for (old, replacement) in [
+            ("value.backend_kind == 2u", "value.backend_kind == 0u"),
+            ("value.reserved == 0u", "true"),
+            (
+                "(value.hip_lease_identity)",
+                "(value.primary_context_identity)",
+            ),
+            ("(value.hip_build_identity)", "(value.cuda_build_identity)"),
+        ] {
+            let mutant = source.replacen(old, replacement, 1);
+            assert_ne!(mutant, source);
+            assert!(validate_archive_backend_source_v3(&mutant).is_err());
+        }
+        assert!(ARCHIVE_ABI_SOURCE_V2.contains("NEO_RESIDENT_ARCHIVE_KNN_ABI_V2 = 0x00010002u"));
+        assert!(ARCHIVE_ABI_SOURCE_V2.contains("NEO_RESIDENT_ARCHIVE_KNN_ABI_V2 = 2;"));
+        let export = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "copy_resident_archive_terminal_candidates_v4",
+        );
+        assert_source_steps_v2(
+            export,
+            &[
+                "std::memcmp(&normalized, owner->terminal_host, sizeof(normalized)) != 0",
+                "#if defined(__HIP_PLATFORM_AMD__)",
+                "!resident_search_hip_v1::validate_population_owner_v1(",
+                "owner->terminal_lifecycle.population_lifetime_owner_v2()",
+                "owner->binding, owner->arena_access.admitted_run_stream",
+                "owner->poisoned = true;",
+                "return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;",
+                "#else",
+                "cuCtxGetCurrent(&current_context) != CUDA_SUCCESS",
+                "cuCtxGetId(current_context, &current_context_id) != CUDA_SUCCESS",
+                "current_context_id != backend_identity_v3::archive_owner_identity(owner->binding)",
+                "#endif",
+                "count > owner->binding.archive_capacity",
+                "cudaMemcpy(scalars,",
+            ],
+        );
+        // These are the same native sorter implementations used for both the
+        // scratch query and execution, not a replacement host ranking path.
+        let primitives = include_str!("../native/resident_parallel_primitives_v1.cuh");
+        assert_source_steps_v2(
+            primitives,
+            &[
+                "#if defined(__HIP_PLATFORM_AMD__)",
+                "#include <hipcub/hipcub.hpp>",
+                "namespace neoethos_parallel_primitives_v1 = ::hipcub;",
+                "#else",
+                "#include <cub/cub.cuh>",
+                "namespace neoethos_parallel_primitives_v1 = ::cub;",
+                "#endif",
+            ],
+        );
+    }
+
     #[test]
     fn native_archive_knn_v2_never_owns_allocations_frees_or_event_creation() {
         assert_source_excludes_v2(
-            ARCHIVE_CUDA_SOURCE_V2,
+            &production_archive_source_v2(),
             &[
                 "cudaMalloc",
                 "cudaFree",
@@ -1773,6 +1921,130 @@ mod tests {
                 "cuStreamSynchronize",
             ],
             "terminal poll",
+        );
+    }
+
+    #[test]
+    fn native_archive_knn_v2_publish_updates_the_retained_alias_before_reuse() {
+        let generation = include_str!("../native/resident_generation_v1.cu");
+        let evolve = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "enqueue_resident_archive_evolve_and_publish_v2",
+        );
+        // The prepared pointer aliases this exact owner member; the existing
+        // accept function updates it. A second archive-side setter is not needed.
+        assert_source_steps_v2(
+            evolve,
+            &[
+                "enqueue_resident_generation_offspring_from_finite_rows_v2(owner->generation, &owner->finite_rows, owner->decision_keys, &owner->retained_gene_view, &prepared)",
+                "publish_generation_and_archive_v2<<<",
+                "status = launch_status_v2();",
+                "if (status != NEO_ARCHIVE_KNN_STATUS_OK_V2)",
+                "accept_resident_generation_combined_publish_v2(&prepared)",
+                "if (status != 0)",
+                "TerminalLifecycleV2 generation_after{};",
+                "owner->phase = HostPhaseV2::Published;",
+            ],
+        );
+        let offspring = definition_body_v2(
+            generation,
+            "enqueue_resident_generation_offspring_from_finite_rows_v2",
+        );
+        assert!(
+            remove_ascii_whitespace_v2(offspring)
+                .contains("prepared->retained_generation_view_=retained_generation_view;")
+        );
+        let accept =
+            definition_body_v2(generation, "accept_resident_generation_combined_publish_v2");
+        assert_source_steps_v2(
+            accept,
+            &[
+                "prepared->retained_generation_view_ != nullptr",
+                "prepared->retained_generation_view_->expected_generation_index == prepared->expected_old_generation_index_",
+                "prepared->retained_generation_view_->expected_store_epoch == prepared->expected_old_store_epoch_",
+                "if (!exact)",
+                "return NEO_RESIDENT_STATUS_IDENTITY_MISMATCH_V1;",
+                "rotate_resident_generation_stores_v1(generation);",
+                "prepared->retained_generation_view_->expected_generation_index = prepared->expected_next_generation_index_;",
+                "prepared->retained_generation_view_->expected_store_epoch = prepared->expected_next_store_epoch_;",
+                "generation->ready_receipt_token_v2 = nullptr;",
+                "return NEO_RESIDENT_STATUS_OK_V1;",
+            ],
+        );
+        assert_source_excludes_v2(
+            accept,
+            &[
+                "cudaMemcpy",
+                "cudaEventSynchronize",
+                "cudaStreamSynchronize",
+            ],
+            "planned host bookkeeping is not device completion proof",
+        );
+    }
+
+    #[test]
+    fn native_archive_knn_v2_terminal_export_checks_identity_extents_and_copy_completion() {
+        let export = definition_body_v2(
+            ARCHIVE_CUDA_SOURCE_V2,
+            "copy_resident_archive_terminal_candidates_v4",
+        );
+        assert_source_steps_v2(
+            export,
+            &[
+                "*receipt = {};",
+                "owner == nullptr || expected_terminal == nullptr",
+                "owner->poisoned || owner->phase != HostPhaseV2::TerminalComplete",
+                "!owner->terminal_event_proven || owner->terminal_host == nullptr",
+                "owner->candidates_exported",
+                "normalized.completion_event_query_count != owner->completion_event_query_count",
+                "normalized.terminal_status != NEO_ARCHIVE_KNN_TERMINAL_COMMITTED_V2",
+                "normalized.device_fault_word != 0",
+                "normalized.validation_fault_word != 0",
+                "normalized.completion_event_query_count = 0;",
+                "std::memcmp(&normalized, owner->terminal_host, sizeof(normalized)) != 0",
+                "cuCtxGetCurrent(&current_context) != CUDA_SUCCESS",
+                "cuCtxGetId(current_context, &current_context_id) != CUDA_SUCCESS",
+                "current_context_id != backend_identity_v3::archive_owner_identity(owner->binding)",
+                "count > owner->binding.archive_capacity",
+                "!checked_mul_v2(count, NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2, &terms)",
+                "!checked_mul_v2(count, sizeof(GeneScalarV2), &scalar_bytes)",
+                "!checked_mul_v2(terms, sizeof(std::uint64_t), &index_bytes)",
+                "!checked_mul_v2(terms, sizeof(double), &weight_bytes)",
+                "!checked_mul_v2(count, sizeof(MetricRowV2), &metric_bytes)",
+                "!checked_mul_v2(count, sizeof(std::uint64_t), &sequence_bytes)",
+                "!checked_add_v2(scalar_bytes, index_bytes, &total_bytes)",
+                "!checked_add_v2(total_bytes, weight_bytes, &total_bytes)",
+                "!checked_add_v2(total_bytes, metric_bytes, &total_bytes)",
+                "!checked_add_v2(total_bytes, sequence_bytes, &total_bytes)",
+                "candidate_capacity != count || term_capacity != terms",
+                "count != 0 && (scalars == nullptr || term_indices == nullptr || term_weights == nullptr || metrics == nullptr || admission_sequences == nullptr)",
+                "const auto bank_offset = owner->adaptive_policy_configured",
+                "unpack_store_v2(normalized.packed_commit_word) * owner->binding.archive_capacity : 0ull",
+                "const auto bank_terms = bank_offset * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2",
+                "if (count != 0 &&",
+                "cudaMemcpy(scalars, owner->archive_gene_scalars + bank_offset, scalar_bytes, cudaMemcpyDeviceToHost) != cudaSuccess",
+                "cudaMemcpy(term_indices, owner->archive_term_indices + bank_terms, index_bytes, cudaMemcpyDeviceToHost) != cudaSuccess",
+                "cudaMemcpy(term_weights, owner->archive_term_weights + bank_terms, weight_bytes, cudaMemcpyDeviceToHost) != cudaSuccess",
+                "cudaMemcpy(metrics, owner->archive_metric_rows + bank_offset, metric_bytes, cudaMemcpyDeviceToHost) != cudaSuccess",
+                "cudaMemcpy(admission_sequences, owner->archive_hashes + 2 * owner->binding.archive_capacity + bank_offset, sequence_bytes, cudaMemcpyDeviceToHost) != cudaSuccess",
+                "return poison_owner_v2(owner, NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2);",
+                "receipt->abi_version = 4;",
+                "receipt->run_identity = normalized.run_identity;",
+                "receipt->packed_commit_word = normalized.packed_commit_word;",
+                "receipt->candidate_count = count;",
+                "receipt->term_count = terms;",
+                "receipt->feature_count = owner->retained_gene_view.feature_count;",
+                "receipt->host_copy_count = count == 0 ? 0 : 5;",
+                "receipt->host_copy_bytes = total_bytes;",
+                "owner->candidates_exported = true;",
+                "return NEO_ARCHIVE_KNN_STATUS_OK_V2;",
+            ],
+        );
+        assert_eq!(source_occurrences_v2(export, "cudaMemcpy("), 5);
+        assert_source_excludes_v2(
+            export,
+            &["cudaMemcpyAsync", "cudaMalloc", "cudaEventRecord", "<<<"],
+            "one-shot completed archive export",
         );
     }
 

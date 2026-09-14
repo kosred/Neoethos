@@ -1,6 +1,7 @@
 #pragma once
 
 #include "resident_generation_v2_abi.cuh"
+#include "resident_generation_adaptive_v3_abi.cuh"
 #include "resident_scoring_novelty_v1_abi.cuh"
 
 #include <cuda_runtime_api.h>
@@ -11,11 +12,42 @@
 
 namespace neoethos::resident_archive_knn_v2 {
 struct NeoResidentArchiveKnnBindV2;
+struct NeoResidentArchiveKnnOwnerV2;
+struct NeoResidentArchiveKnnTerminalV2;
 }
 
 namespace neoethos::resident_search_generation_v2 {
 
 constexpr std::uint32_t NEO_RESIDENT_SEARCH_GENERATION_ABI_V2 = 2;
+
+/// Additive terminal-only census of the last evaluated population. Its term
+/// buffers use the admitted active K, not the archive's fixed storage stride.
+struct NeoResidentPopulationExportReceiptV3 {
+  std::uint32_t abi_version;
+  std::uint32_t reserved;
+  std::uint64_t run_identity;
+  std::uint64_t packed_commit_word;
+  std::uint64_t evaluated_generation;
+  std::uint64_t candidate_count;
+  std::uint64_t term_count;
+  std::uint64_t feature_count;
+  std::uint64_t host_copy_count;
+  std::uint64_t host_copy_bytes;
+};
+static_assert(sizeof(NeoResidentPopulationExportReceiptV3) == 72);
+static_assert(alignof(NeoResidentPopulationExportReceiptV3) == 8);
+static_assert(offsetof(NeoResidentPopulationExportReceiptV3, evaluated_generation) == 24);
+static_assert(offsetof(NeoResidentPopulationExportReceiptV3, host_copy_bytes) == 64);
+
+extern "C" std::int32_t copy_resident_last_evaluated_population_v3(
+    resident_generation_v1::NeoResidentGenerationRunV1* generation,
+    resident_archive_knn_v2::NeoResidentArchiveKnnOwnerV2* archive,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnTerminalV2* expected_terminal,
+    resident_generation_v1::NeoResidentGenerationGeneScalarV1* scalars,
+    std::uint64_t* term_indices, double* term_weights,
+    resident_generation_v1::NeoResidentGenerationMetricRowV1* metrics,
+    std::uint64_t candidate_capacity, std::uint64_t term_capacity,
+    NeoResidentPopulationExportReceiptV3* receipt);
 
 /// Exact process-lifetime CUDA facts reserved before the Search plans are
 /// sealed. Raw handles never leave gpu-cuda; the public owner exposes only a
@@ -78,7 +110,11 @@ static_assert(sizeof(NeoResidentSearchCombinedAdmissionV2) == 592,
 /// the same population lifetime without treating the receipt address as it.
 struct NeoResidentScoringPopulationSourceV2 {
   std::uint32_t abi_version;
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint32_t selected_hip_ordinal;
+#else
   std::uint32_t selected_cuda_ordinal;
+#endif
   cudaStream_t admitted_run_stream;
   cudaEvent_t metrics_ready_event;
   cudaEvent_t scoring_ready_event;
@@ -148,6 +184,50 @@ extern "C" std::int32_t
 neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
     void* session,
     const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const NeoResidentSearchCombinedAdmissionV2* admission,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
+    resident_generation_v1::NeoResidentGenerationRunV1** generation,
+    resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1** scoring);
+
+/// The nullable adaptive descriptor is included in the generation allocation
+/// before the combined admission is sealed. Legacy entrypoints above pass null;
+/// an adaptive caller must pass the same policy to preliminary query, Slice2
+/// query and creation. No policy arena is allocated after combined admission.
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_query_resident_search_combined_adaptive_v3(
+    void* session,
+    const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
+    const resident_generation_v1::NeoResidentAdaptivePolicyV3* adaptive_policy,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const NeoResidentSearchRuntimeFactsV2* expected_runtime,
+    NeoResidentSearchCombinedAdmissionV2* admission);
+
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_query_resident_search_slice2_adaptive_v3(
+    void* session,
+    const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
+    const resident_generation_v1::NeoResidentAdaptivePolicyV3* adaptive_policy,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const NeoResidentSearchRuntimeFactsV2* expected_runtime,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
+    NeoResidentSearchCombinedAdmissionV2* admission);
+
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_create_resident_search_combined_adaptive_v3(
+    void* session,
+    const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
+    const resident_generation_v1::NeoResidentAdaptivePolicyV3* adaptive_policy,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const NeoResidentSearchCombinedAdmissionV2* admission,
+    resident_generation_v1::NeoResidentGenerationRunV1** generation,
+    resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1** scoring);
+
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_create_resident_search_slice2_adaptive_v3(
+    void* session,
+    const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
+    const resident_generation_v1::NeoResidentAdaptivePolicyV3* adaptive_policy,
     const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
     const NeoResidentSearchCombinedAdmissionV2* admission,
     const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,

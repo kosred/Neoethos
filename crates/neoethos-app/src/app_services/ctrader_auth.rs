@@ -1,13 +1,9 @@
 //! cTrader auth value-types.
 //!
-//! The legacy interactive OAuth state machine (AwaitingAuthorizationCode →
-//! ListeningForCallback → ExchangingToken → AccessTokenReady) was removed
-//! when the egui wizard came down, and the residual `CTraderAuthSession`
-//! state machine (auth-state enum, account summary, snapshot) followed in
-//! the 2026-08-08 dead-code purge — production drives cTrader through
-//! `app_services::reauth` + `CTraderTokenBundle` directly. What remains
-//! here are the two live DTOs: `CTraderTokenBundle` (secure_store /
-//! bridge) and `CTraderDiscoveredAccount` (broker_api / live auth).
+//! Production drives cTrader through `app_services::reauth` plus
+//! `CTraderTokenBundle`. This module contains only the two live DTOs:
+//! `CTraderTokenBundle` (secure_store / bridge) and
+//! `CTraderDiscoveredAccount` (broker_api / live auth).
 
 use serde::{Deserialize, Serialize};
 

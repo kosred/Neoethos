@@ -32,8 +32,11 @@ system:
   multi_resolution_enabled: true
   multi_resolution_timeframes:
   - M1
+  - M2
   - M3
+  - M4
   - M5
+  - M10
   - M15
   - M30
   - H1
@@ -46,8 +49,11 @@ system:
   base_timeframe: M1
   higher_timeframes:
   - M1
+  - M2
   - M3
+  - M4
   - M5
+  - M10
   - M15
   - M30
   - H1
@@ -57,19 +63,14 @@ system:
   - W1
   - MN1
   poll_interval_seconds: 60
-  metrics_db_path: metrics.sqlite
   cache_dir: cache
   enable_gpu_preference: auto
-  enable_gpu: false
   device: cpu
   max_training_rows_per_tf: 0
   hardware:
     cpu_budget: null
     training_precision: null
     cuda_precisions: null
-    rocm_precisions: null
-    wgpu_precisions: null
-    wgpu_device_names: []
 risk:
   preset: ftmo
   initial_balance: 10000.0
@@ -80,7 +81,7 @@ risk:
   risky_min_risk_per_trade: null
   risky_max_risk_per_trade: 0.3
   prop_firm_min_risk_per_trade: null
-  prop_firm_max_risk_per_trade: null
+  prop_firm_max_risk_per_trade: 0.01
   max_portfolio_risk: 0.04
   daily_drawdown_limit: 0.04
   total_drawdown_limit: 0.07
@@ -139,7 +140,7 @@ models:
   rllib_num_workers: 0
   auto_enable_rllib: false
   use_neuroevolution: true
-  rl_population_size: 5
+  rl_population_size: 96
   rl_timesteps: 10000000
   rl_eval_episodes: 15
   rl_network_arch:
@@ -175,14 +176,13 @@ models:
   evo_population: 32
   evo_islands: 4
   evo_sigma: 0.25
-  prop_search_enabled: false
   prop_search_population: 100
   prop_search_population_auto: true
   prop_search_generations: 50
   prop_search_max_hours: 0.5
   prop_search_max_rows: 0
   prop_search_max_rows_by_tf: {}
-  prop_search_portfolio_size: 3000
+  prop_search_portfolio_size: 4
   prop_search_max_indicators: 12
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: auto
@@ -191,7 +191,7 @@ models:
   prop_search_val_min_trades_per_month: 0
   prop_search_val_min_trades_per_day: 0.0
   prop_search_min_win_rate: 0.0
-  prop_search_min_payoff_ratio: 2.0
+  prop_search_min_payoff_ratio: 0.0
   prop_search_min_net_expectancy_per_trade: 0.0
   prop_search_min_expectancy_t_stat: 0.0
   prop_search_max_in_market: 0.0
@@ -316,6 +316,7 @@ models:
   search_runtime:
     seed: null
     novelty_weight: 0.0
+    novelty_neighbors: 15
     stagnation_patience: 2
     tournament_size_override: null
     archive_cap_override: null
@@ -339,7 +340,7 @@ models:
     convergence_min_elapsed_fraction: 0.5
   discovery_runtime:
     prefilter_top_k: 240
-    prefilter_insample_frac: 0.8
+    prefilter_insample_frac: 1.0
     prefilter_min_per_timeframe: 6
     funnel_stage1_pct: 0.25
     stage1_window: earliest
@@ -477,7 +478,7 @@ models:
     maxDrawdownPct: 25.0
     minTrades: 30
   demo_forward_gate:
-    enabled: true
+    enabled: false
     minDemoTrades: 100
     forwardTolerance: 0.2
 news:

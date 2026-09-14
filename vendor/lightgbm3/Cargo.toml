@@ -53,7 +53,6 @@ cuda = ["lightgbm3-sys/cuda"]
 default = []
 gpu = ["lightgbm3-sys/gpu"]
 openmp = ["lightgbm3-sys/openmp"]
-polars = ["dep:polars"]
 
 [lib]
 name = "lightgbm3"
@@ -61,10 +60,6 @@ path = "src/lib.rs"
 
 [dependencies.lightgbm3-sys]
 version = "1"
-
-[dependencies.polars]
-version = ">=0.47"
-optional = true
 
 [dependencies.serde_json]
 version = "1"

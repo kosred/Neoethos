@@ -21,16 +21,21 @@ use crate::canonical_native_generation_zero_publication_v1::{
     publish_canonical_native_generation_zero_research_result_v1,
 };
 #[cfg(all(target_os = "linux", feature = "gpu-cuda"))]
+use crate::canonical_native_generation_zero_result_v1::seal_canonical_native_generation_zero_research_result_v1;
+#[cfg(all(target_os = "linux", feature = "gpu-cuda"))]
 use crate::canonical_native_generation_zero_result_v1::{
-    preflight_canonical_native_generation_zero_result_v1,
-    seal_canonical_native_generation_zero_research_result_v1,
+    CanonicalNativeFeatureMetadataSizeV1, preflight_canonical_native_generation_zero_result_v1,
 };
 #[cfg(all(target_os = "linux", feature = "gpu-cuda"))]
 use crate::data_selection::CanonicalGpuResidentSearchInputReceiptV3;
 #[cfg(all(target_os = "linux", feature = "gpu-cuda"))]
+use crate::gpu_resident_feature_screening_v2::{
+    begin_resident_feature_screening_run_v2, prepare_resident_feature_screening_v2,
+};
+#[cfg(all(target_os = "linux", feature = "gpu-cuda"))]
 use crate::prepared_discovery_run_input_v3::{
-    ResidentGenerationZeroStageErrorV1,
-    prepare_prepared_canonical_trendbar_research_run_input_capped_v5,
+    ResidentGenerationZeroStageErrorV1, prepare_canonical_resident_generation_zero_authorities_v5,
+    prepare_compact_selected_canonical_trendbar_research_run_input_capped_v6,
     run_prepared_canonical_trendbar_research_generation_zero_gated_typed_v5,
 };
 #[cfg(all(target_os = "linux", feature = "gpu-cuda"))]
@@ -71,6 +76,7 @@ pub enum CanonicalNativeDiscoveryExecutionStageV1 {
     ExactSourcePin,
     NativePreflight,
     NativeAdmission,
+    ResidentFeatureScreening,
     ResidentDataMaterialization,
     NativeReceiptBinding,
     GenerationZeroEvaluation,
@@ -418,6 +424,25 @@ fn map_exact_pin_error_v1(error: anyhow::Error) -> CanonicalNativeDiscoveryExecu
 }
 
 #[cfg(all(target_os = "linux", feature = "gpu-cuda"))]
+fn decode_canonical_sha256_v1(value: &str, field: &'static str) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && value.bytes().any(|byte| byte != b'0'),
+        "{field} is not one canonical non-zero lower-hex SHA-256"
+    );
+    let mut decoded = [0_u8; 32];
+    for (index, slot) in decoded.iter_mut().enumerate() {
+        let offset = index * 2;
+        *slot = u8::from_str_radix(&value[offset..offset + 2], 16)
+            .with_context(|| format!("decode {field} byte {index}"))?;
+    }
+    Ok(decoded)
+}
+
+#[cfg(all(target_os = "linux", feature = "gpu-cuda"))]
 fn run_canonical_native_discovery_generation_zero_cuda_v1<F>(
     startup_settings: &neoethos_core::Settings,
     runtime_install_receipt: &CanonicalNativeRuntimeInstallReceiptV1,
@@ -434,14 +459,6 @@ where
 {
     use CanonicalNativeDiscoveryExecutionErrorCodeV1 as Code;
     use CanonicalNativeDiscoveryExecutionStageV1 as Stage;
-
-    if !neoethos_gpu_cuda::runtime_available() || neoethos_gpu_cuda::device_count() == 0 {
-        return Err(execution_error_v1(
-            Stage::NativeCapabilityGate,
-            Code::NativeCudaRequired,
-            "no physical CUDA runtime/device is available",
-        ));
-    }
 
     probe_cancellation_v1(cancellation, Stage::ContractArtifactRead)?;
     let request = resolve_canonical_native_discovery_request_v1(
@@ -515,18 +532,173 @@ where
         ));
     }
 
-    let feature_count =
-        usize::try_from(prepared.workspace_extent().column_count()).map_err(|_| {
+    let parent_feature_count = usize::try_from(prepared.workspace_extent().column_count())
+        .map_err(|_| {
             execution_error_v1(
                 Stage::NativePreflight,
                 Code::PreflightRejected,
                 "prepared feature count does not fit this process",
             )
         })?;
-    let preflight = preflight_canonical_native_generation_zero_result_v1(&request, feature_count)
-        .map_err(|error| {
-        execution_error_v1(Stage::NativePreflight, Code::PreflightRejected, error)
+    let mut screening_config = request.config().clone();
+    if screening_config.max_indicators == 0 {
+        screening_config.max_indicators = parent_feature_count;
+    }
+    let authorities = prepare_canonical_resident_generation_zero_authorities_v5(
+        &screening_config,
+        request.loaded_contract().contract(),
+    )
+    .map_err(|error| {
+        execution_error_v1(
+            Stage::NativePreflight,
+            Code::PreflightRejected,
+            format!("{error:#}"),
+        )
     })?;
+    let canonical_source_receipt_identity = request
+        .loaded_contract()
+        .contract()
+        .input_receipt()
+        .identity_sha256()
+        .map_err(|error| {
+            execution_error_v1(Stage::NativePreflight, Code::PreflightRejected, error)
+        })?;
+    let canonical_source_receipt_sha256 = decode_canonical_sha256_v1(
+        &canonical_source_receipt_identity,
+        "canonical source input receipt identity",
+    )
+    .map_err(|error| execution_error_v1(Stage::NativePreflight, Code::PreflightRejected, error))?;
+
+    probe_cancellation_v1(cancellation, Stage::NativeAdmission)?;
+    let admission = neoethos_gpu_cuda::acquire_discovery_run_device_admission_v1().map_err(
+        |error| {
+            let code = match error.code() {
+                neoethos_gpu_cuda::DiscoveryRunDeviceAdmissionErrorCodeV1::CudaEnumerationFailure
+                | neoethos_gpu_cuda::DiscoveryRunDeviceAdmissionErrorCodeV1::NoCompatibleCudaOrdinal
+                | neoethos_gpu_cuda::DiscoveryRunDeviceAdmissionErrorCodeV1::VisibleGpuWithoutStrictBackend
+                | neoethos_gpu_cuda::DiscoveryRunDeviceAdmissionErrorCodeV1::VisibleGpuBuildIncompatible => {
+                    Code::NativeCudaRequired
+                }
+                _ => Code::AdmissionRejected,
+            };
+            execution_error_v1(Stage::NativeAdmission, code, error)
+        },
+    )?;
+    let native_facts = match &admission {
+        neoethos_gpu_cuda::SealedDiscoveryRunDeviceAdmissionV1::NativeCuda(native) => {
+            neoethos_gpu_cuda::native_cuda_data_population_preflight_facts_v1(native)
+        }
+        neoethos_gpu_cuda::SealedDiscoveryRunDeviceAdmissionV1::CpuNoPhysicalGpu(_) => {
+            return Err(execution_error_v1(
+                Stage::NativeAdmission,
+                Code::NativeCudaRequired,
+                "the exact one-shot device admission found no physical CUDA device",
+            ));
+        }
+    };
+
+    let screening = prepare_resident_feature_screening_v2(
+        &screening_config,
+        authorities.evaluation_config(),
+        &prepared,
+        canonical_source_receipt_sha256,
+        &native_facts,
+    )
+    .map_err(|error| {
+        execution_error_v1(
+            Stage::NativePreflight,
+            Code::PreflightRejected,
+            format!("{error:#}"),
+        )
+    })?;
+    let (screening_schema, trim_workspace, screening_scope, screening_plan) =
+        screening.into_parts();
+    let authorities = authorities
+        .bind_stage1_time_scope_v2(&screening_config, screening_scope, &prepared)
+        .map_err(|error| {
+            execution_error_v1(
+                Stage::NativePreflight,
+                Code::PreflightRejected,
+                format!("{error:#}"),
+            )
+        })?;
+    let screening_workspace = prepared
+        .seal_feature_screening_workspace_plan_v2(native_facts, trim_workspace)
+        .map_err(|error| {
+            execution_error_v1(Stage::NativePreflight, Code::PreflightRejected, error)
+        })?;
+    let trim_memory = screening_workspace.trim_prefilter_preflight().clone();
+    let admitted_screening = neoethos_gpu_cuda::bind_feature_screening_gpu_workspace_plan_v2(
+        admission,
+        screening_workspace,
+    )
+    .map_err(|error| execution_error_v1(Stage::NativeAdmission, Code::AdmissionRejected, error))?;
+
+    probe_cancellation_v1(cancellation, Stage::ResidentFeatureScreening)?;
+    let continuation = neoethos_data::begin_prepared_gpu_only_feature_two_pass_v2(
+        prepared,
+        admitted_screening,
+        screening_schema,
+        |inputs| begin_resident_feature_screening_run_v2(screening_plan, &trim_memory, inputs),
+    )
+    .map_err(|error| {
+        execution_error_v1(
+            Stage::ResidentFeatureScreening,
+            Code::MaterializationRejected,
+            error,
+        )
+    })?;
+    let scored = neoethos_data::stream_score_batches_v2(continuation).map_err(|error| {
+        execution_error_v1(
+            Stage::ResidentFeatureScreening,
+            Code::MaterializationRejected,
+            error,
+        )
+    })?;
+    let selected_map = neoethos_data::seal_selected_map_v2(scored).map_err(|error| {
+        execution_error_v1(
+            Stage::ResidentFeatureScreening,
+            Code::MaterializationRejected,
+            error,
+        )
+    })?;
+    let compact =
+        neoethos_data::prepare_compact_selected_store_v2(selected_map).map_err(|error| {
+            execution_error_v1(
+                Stage::ResidentFeatureScreening,
+                Code::MaterializationRejected,
+                error,
+            )
+        })?;
+    let selected_feature_count = usize::try_from(compact.workspace_extent().column_count())
+        .map_err(|_| {
+            execution_error_v1(
+                Stage::NativePreflight,
+                Code::PreflightRejected,
+                "selected compact feature count does not fit this process",
+            )
+        })?;
+    // Charge the actual selected recipe before resident materialization. This
+    // is only a persistence byte envelope; no provisional fit/plan is sealed.
+    let canonical_plan_max_bytes =
+        compact
+            .canonical_feature_plan_max_bytes_v3()
+            .map_err(|error| {
+                execution_error_v1(Stage::NativePreflight, Code::PreflightRejected, error)
+            })?;
+    let feature_metadata = CanonicalNativeFeatureMetadataSizeV1::checked_from_recipe_v3(
+        compact.workspace_extent().row_count(),
+        compact.ordered_feature_names_v2(),
+        compact.normalization_enabled_v3(),
+        canonical_plan_max_bytes,
+    )
+    .map_err(|error| execution_error_v1(Stage::NativePreflight, Code::PreflightRejected, error))?;
+    let preflight = preflight_canonical_native_generation_zero_result_v1(
+        &request,
+        selected_feature_count,
+        feature_metadata,
+    )
+    .map_err(|error| execution_error_v1(Stage::NativePreflight, Code::PreflightRejected, error))?;
     let configured_population = preflight.configured_population();
     let population_cap = preflight.population_cap();
     let preflight_term_cap = preflight.term_cap();
@@ -535,23 +707,22 @@ where
         native_config.max_indicators = preflight.resolved_max_indicators();
     }
 
-    let execution_stage = std::cell::Cell::new(Stage::NativeAdmission);
+    let execution_stage = std::cell::Cell::new(Stage::NativePreflight);
     let anchor = request.exact_series().anchor().identity().clone();
-    let prepared_v5 = prepare_prepared_canonical_trendbar_research_run_input_capped_v5(
+    let prepared_v5 = prepare_compact_selected_canonical_trendbar_research_run_input_capped_v6(
         &native_config,
-        request.loaded_contract().contract(),
-        prepared,
+        authorities,
+        screening_scope,
+        compact,
+        &native_facts,
         population_cap,
-        |prepared, admitted| {
+        |admitted| {
             execution_stage.set(Stage::ResidentDataMaterialization);
             if cancellation.is_cancelled() {
                 return Err(anyhow::Error::new(ExecutorCancellationMarkerV1));
             }
-            let store =
-                neoethos_data::materialize_prepared_gpu_only_feature_store_for_data_population_v3(
-                    prepared, admitted,
-                )
-                .context("materialize exact admitted resident Data store")?;
+            let store = neoethos_data::materialize_compact_selected_store_v2(admitted)
+                .context("materialize exact admitted compact resident Data store")?;
             if store.pinned_source_projection_v1() != &cpu_projection {
                 anyhow::bail!(
                     "materialized Data source projection disagrees with financial input authority"
@@ -576,6 +747,7 @@ where
             match stage {
                 Stage::ResidentDataMaterialization => Code::MaterializationRejected,
                 Stage::NativeReceiptBinding => Code::ReceiptRejected,
+                Stage::NativePreflight => Code::PreflightRejected,
                 _ => Code::AdmissionRejected,
             }
         };
@@ -626,80 +798,102 @@ where
         ),
     })?;
 
-    probe_cancellation_v1(cancellation, Stage::ResultPublication)?;
-    let gene_count = milestone.search_result().genes.len();
-    let metric_row_count = milestone.search_result().metrics.len();
-    let metric_value_count_per_row = milestone
-        .search_result()
-        .metrics
-        .first()
-        .map_or(0, |row| row.len());
-    let (view, compact_seal) = seal_canonical_native_generation_zero_research_result_v1(
-        &request,
-        preflight,
-        financial_contract,
-        native_receipt_v3,
-        sizing_receipt_v2,
-        evaluation_config,
-        &milestone,
-    )
-    .map_err(|error| {
-        execution_error_v1(Stage::ResultPublication, Code::ResultSealingRejected, error)
-    })?;
-    let publication = publish_canonical_native_generation_zero_research_result_v1(
-        request.canonical_root(),
-        &view,
-        &compact_seal,
-        || {
-            if cancellation.is_cancelled() {
-                Err(CanonicalNativeGenerationZeroPublicationGateRejectionV1::Cancelled)
-            } else {
-                Ok(())
-            }
-        },
-    )
-    .map_err(|error| {
-        let code = match error.kind() {
-            CanonicalNativeGenerationZeroPublicationErrorKindV1::PreInstallRejected(
-                CanonicalNativeGenerationZeroPublicationGateRejectionV1::Cancelled,
-            ) => Code::Cancelled,
-            _ => Code::PublicationRejected,
-        };
-        execution_error_v1(Stage::ResultPublication, code, error)
-    })?;
+    #[cfg(target_os = "linux")]
+    {
+        probe_cancellation_v1(cancellation, Stage::ResultPublication)?;
+        let gene_count = milestone.search_result().genes.len();
+        let metric_row_count = milestone.search_result().metrics.len();
+        let metric_value_count_per_row = milestone
+            .search_result()
+            .metrics
+            .first()
+            .map_or(0, |row| row.len());
+        let (view, compact_seal) = seal_canonical_native_generation_zero_research_result_v1(
+            &request,
+            preflight,
+            financial_contract,
+            native_receipt_v3,
+            sizing_receipt_v2,
+            evaluation_config,
+            &milestone,
+        )
+        .map_err(|error| {
+            execution_error_v1(Stage::ResultPublication, Code::ResultSealingRejected, error)
+        })?;
+        let publication = publish_canonical_native_generation_zero_research_result_v1(
+            request.canonical_root(),
+            &view,
+            &compact_seal,
+            || {
+                if cancellation.is_cancelled() {
+                    Err(CanonicalNativeGenerationZeroPublicationGateRejectionV1::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .map_err(|error| {
+            let code = match error.kind() {
+                CanonicalNativeGenerationZeroPublicationErrorKindV1::PreInstallRejected(
+                    CanonicalNativeGenerationZeroPublicationGateRejectionV1::Cancelled,
+                ) => Code::Cancelled,
+                _ => Code::PublicationRejected,
+            };
+            execution_error_v1(Stage::ResultPublication, code, error)
+        })?;
 
-    Ok(PublishedCanonicalNativeGenerationZeroResearchV1 {
-        relative_path: publication.relative_path().to_owned(),
-        byte_count: publication.byte_count(),
-        file_sha256: publication.file_sha256().to_owned(),
-        reused_identical: publication.reused_identical(),
-        evidence_identity_sha256: publication.evidence_identity_sha256().to_owned(),
-        financial_input_receipt_identity_sha256: publication
-            .financial_input_receipt_identity_sha256()
-            .to_owned(),
-        native_input_receipt_identity_sha256: publication
-            .native_input_receipt_identity_sha256()
-            .to_owned(),
-        population_sizing_receipt_identity_sha256: publication
-            .population_sizing_receipt_identity_sha256()
-            .to_owned(),
-        configured_population,
-        resolved_population: publication.resolved_population(),
-        population_cap,
-        hard_growth_cap,
-        term_cap: preflight_term_cap,
-        stage1_row_start,
-        stage1_row_end,
-        selected_device_ordinal: publication.selected_device_ordinal(),
-        engine: publication.engine().to_owned(),
-        parent_h2d_bytes: publication.parent_h2d_bytes(),
-        adaptive_h2d_bytes: publication.adaptive_h2d_bytes(),
-        metric_rows: publication.metric_rows(),
-        metric_bytes: publication.metric_bytes(),
-        gene_count,
-        metric_row_count,
-        metric_value_count_per_row,
-        consumer_completion_confirmed: publication.consumer_completion_confirmed(),
-        replay_identity_sealed: publication.replay_identity_sealed(),
-    })
+        Ok(PublishedCanonicalNativeGenerationZeroResearchV1 {
+            relative_path: publication.relative_path().to_owned(),
+            byte_count: publication.byte_count(),
+            file_sha256: publication.file_sha256().to_owned(),
+            reused_identical: publication.reused_identical(),
+            evidence_identity_sha256: publication.evidence_identity_sha256().to_owned(),
+            financial_input_receipt_identity_sha256: publication
+                .financial_input_receipt_identity_sha256()
+                .to_owned(),
+            native_input_receipt_identity_sha256: publication
+                .native_input_receipt_identity_sha256()
+                .to_owned(),
+            population_sizing_receipt_identity_sha256: publication
+                .population_sizing_receipt_identity_sha256()
+                .to_owned(),
+            configured_population,
+            resolved_population: publication.resolved_population(),
+            population_cap,
+            hard_growth_cap,
+            term_cap: preflight_term_cap,
+            stage1_row_start,
+            stage1_row_end,
+            selected_device_ordinal: publication.selected_device_ordinal(),
+            engine: publication.engine().to_owned(),
+            parent_h2d_bytes: publication.parent_h2d_bytes(),
+            adaptive_h2d_bytes: publication.adaptive_h2d_bytes(),
+            metric_rows: publication.metric_rows(),
+            metric_bytes: publication.metric_bytes(),
+            gene_count,
+            metric_row_count,
+            metric_value_count_per_row,
+            consumer_completion_confirmed: publication.consumer_completion_confirmed(),
+            replay_identity_sealed: publication.replay_identity_sealed(),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            request,
+            preflight,
+            financial_contract,
+            native_receipt_v3,
+            sizing_receipt_v2,
+            evaluation_config,
+            milestone,
+            configured_population,
+            population_cap,
+            hard_growth_cap,
+            preflight_term_cap,
+            stage1_row_start,
+            stage1_row_end,
+        );
+        unreachable!("the public platform gate never executes the CUDA adapter off Linux")
+    }
 }

@@ -168,7 +168,7 @@ mod lightgbm_tests {
     }
 
     #[test]
-    fn lightgbm_gpu_only_policy_refuses_resolved_cpu() {
+    fn lightgbm_gpu_only_policy_fails_before_cpu_training() {
         let (frame, labels) = sample_frame(1_000, 10);
         let train = frame.row_window(0, 800).expect("training window");
         let lease = one_worker_lease();
@@ -185,9 +185,8 @@ mod lightgbm_tests {
             .expect_err("GPU-only policy must never execute resolved CPU training");
         let message = error.to_string();
         assert!(
-            message.contains("gpu-only mode is set")
-                && message.contains("resolved device is `cpu`")
-                && message.contains("models.tree_runtime.lightgbm_gpu"),
+            message.contains("LightGBM CUDA policy `gpu` cannot be honoured")
+                && message.contains("models.tree_runtime.lightgbm_gpu is false"),
             "unexpected GPU-only error: {error}"
         );
     }

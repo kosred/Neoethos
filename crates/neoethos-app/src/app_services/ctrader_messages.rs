@@ -250,12 +250,12 @@ pub const CTRADER_ORDER_TRIGGER_METHOD_DOUBLE_OPPOSITE: i32 = 4;
 // correlate to). Before this change, a heartbeat arriving between
 // the application-auth response and the account-list response would
 // fail `parse_open_api_envelope` with the generic "failed to parse
-// cTrader JSON envelope" error, and the wizard's account-discovery
-// leg would abort. Phase X1 walkthrough on 2026-05-19 caught this:
+// cTrader JSON envelope" error, and account discovery would abort.
+// The 2026-05-19 end-to-end walkthrough caught this:
 // even though the OAuth token bundle was received, the next message
 // off the wire was a heartbeat-shaped frame the parser couldn't
-// accept, and the wizard reported "OAuth error: failed to parse
-// cTrader JSON envelope". With #[serde(default)] both fields fall
+// accept, and Broker Setup reported "OAuth error: failed to parse cTrader
+// JSON envelope". With #[serde(default)] both fields fall
 // back to "" / Value::Null on absence, the heartbeat-skip loop in
 // the transport (`is_matching_open_api_response`) gets a chance to
 // fire, and the genuine account-list response is read on the next
@@ -518,9 +518,9 @@ const CTRADER_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const CTRADER_MAX_WEBSOCKET_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const CTRADER_MAX_WEBSOCKET_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 
-type ProductionCTraderBudget = CTraderOperationBudget<SystemCTraderMonotonicClock>;
+pub(crate) type ProductionCTraderBudget = CTraderOperationBudget<SystemCTraderMonotonicClock>;
 type ProductionCTraderDeadlineIo = DeadlineIo<TcpStream, SystemCTraderMonotonicClock>;
-type ProductionCTraderSocket = WebSocket<MaybeTlsStream<ProductionCTraderDeadlineIo>>;
+pub(crate) type ProductionCTraderSocket = WebSocket<MaybeTlsStream<ProductionCTraderDeadlineIo>>;
 
 struct ProductionCTraderSocketConnector {
     endpoint_host: String,
@@ -748,16 +748,7 @@ impl ProductionCTraderOpenApiTransport {
         &self,
         cancellation: Option<&HistoricalRequestCancellation>,
     ) -> Result<ProductionCTraderOpenApiSession> {
-        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
-        let url = ctrader_json_wss_url(&self.endpoint_host);
-        let budget = CTraderOperationBudget::new(
-            SystemCTraderMonotonicClock,
-            CTRADER_CONNECT_TIMEOUT,
-            cancellation.cloned(),
-        )?;
-        let mut connector = ProductionCTraderSocketConnector::new(&self.endpoint_host, url.clone());
-        let socket = establish_ctrader_socket_with_connector(&mut connector, &budget)
-            .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
+        let socket = connect_ctrader_socket(&self.endpoint_host, cancellation)?;
         Ok(ProductionCTraderOpenApiSession {
             socket,
             historical_admission: ConnectionHistoricalAdmission::new(
@@ -765,6 +756,24 @@ impl ProductionCTraderOpenApiTransport {
             ),
         })
     }
+}
+
+/// Shared bounded connector; execution and query sessions use the same
+/// DeadlineIo, TLS/WebSocket limits and connection budget. No request is sent here.
+pub(crate) fn connect_ctrader_socket(
+    endpoint_host: &str,
+    cancellation: Option<&HistoricalRequestCancellation>,
+) -> Result<ProductionCTraderSocket> {
+    crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
+    let url = ctrader_json_wss_url(endpoint_host);
+    let budget = CTraderOperationBudget::new(
+        SystemCTraderMonotonicClock,
+        CTRADER_CONNECT_TIMEOUT,
+        cancellation.cloned(),
+    )?;
+    let mut connector = ProductionCTraderSocketConnector::new(endpoint_host, url.clone());
+    establish_ctrader_socket_with_connector(&mut connector, &budget)
+        .with_context(|| format!("failed to connect to cTrader endpoint {url}"))
 }
 
 fn ctrader_deadline_io_mut(
@@ -779,7 +788,7 @@ fn ctrader_deadline_io_mut(
     }
 }
 
-fn arm_ctrader_socket_budget(
+pub(crate) fn arm_ctrader_socket_budget(
     socket: &mut ProductionCTraderSocket,
     timeout: Duration,
     cancellation: Option<&HistoricalRequestCancellation>,
@@ -791,7 +800,7 @@ fn arm_ctrader_socket_budget(
     Ok(budget)
 }
 
-fn arm_ctrader_socket_with_budget(
+pub(crate) fn arm_ctrader_socket_with_budget(
     socket: &mut ProductionCTraderSocket,
     budget: ProductionCTraderBudget,
     phase: CTraderIoPhase,
@@ -800,7 +809,7 @@ fn arm_ctrader_socket_with_budget(
     Ok(())
 }
 
-fn is_ctrader_socket_poll_timeout(error: &tungstenite::Error) -> bool {
+pub(crate) fn is_ctrader_socket_poll_timeout(error: &tungstenite::Error) -> bool {
     matches!(
         error,
         tungstenite::Error::Io(error)
@@ -1479,7 +1488,7 @@ pub fn build_order_details_request(
 pub fn parse_open_api_envelope(response_json: &str) -> Result<CTraderOpenApiJsonMessage> {
     serde_json::from_str(response_json).with_context(|| {
         // v0.4.13 — include the head of the offending body and total
-        // length so the wizard's "OAuth error: …" surface has enough
+        // length so the Broker Setup OAuth error surface has enough
         // signal to tell heartbeat-shaped frames apart from genuine
         // schema drifts. We cap at 200 chars to avoid leaking long
         // access tokens; cTrader access tokens are ~512 chars, so a

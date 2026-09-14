@@ -148,7 +148,7 @@ fn native_success_records_exact_parent_view_and_all_intermediate_readback_counte
     }
     assert!(!NATIVE_RECEIPT.contains(concat!("compact_result_", "readback_count")));
     assert!(ADAPTER.contains("record_successful_native_population_v1"));
-    assert!(ADAPTER.contains("read_residency_counters_v1"));
+    assert!(NATIVE_RUN.contains("read_residency_counters_v1"));
     assert!(ADAPTER.contains("require_exact_native_population_rows"));
     for required in [
         "selected_device_ordinal",

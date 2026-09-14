@@ -11,6 +11,27 @@ use std::fmt;
 pub const POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V1: u16 = 1;
 pub const POPULATION_AUTO_HARD_GROWTH_CAP_V1: usize = 16_384;
 pub const POPULATION_AUTO_ALLOCATOR_RESERVE_BYTES_V1: u64 = 64 * 1024 * 1024;
+/// One auto-sized CPU generation should remain observable and cancellable.
+/// The population is calibrated against the exact Stage-1 timeframe view, so
+/// this is a latency target rather than a rows-per-candidate guess.
+pub const CPU_POPULATION_AUTO_TARGET_GENERATION_NS_V1: u64 = 20_000_000_000;
+/// Keep one quarter of the memory that was still available after constructing
+/// the exact Stage-1 cache outside the GA admission budget.
+const CPU_POPULATION_AUTO_MEMORY_NUMERATOR_V1: u64 = 3;
+const CPU_POPULATION_AUTO_MEMORY_DENOMINATOR_V1: u64 = 4;
+/// `synthesize_signals_and_confidence_cpu` has three simultaneously-live
+/// row-sized buffers per active worker: f64 combined, i8 signals, and f64
+/// confidences.
+const CPU_POPULATION_AUTO_SCRATCH_BYTES_PER_ROW_V1: u64 = 17;
+/// `fast_evaluate_strategy_core` retains two f64 arrays per month bucket.
+const CPU_POPULATION_AUTO_SCRATCH_BYTES_PER_MONTH_V1: u64 = 16;
+/// The runtime archive is hard-bounded to this count in
+/// `GeneticSearchRuntimeOverrides::effective_archive_cap`.
+const CPU_POPULATION_AUTO_MAX_ARCHIVE_CANDIDATES_V1: u64 = 200_000;
+const CPU_POPULATION_AUTO_GENE_STRING_RESERVE_BYTES_V1: u64 = 64;
+const CPU_POPULATION_AUTO_LIVE_GENE_COPIES_V1: u64 = 4;
+const CPU_POPULATION_AUTO_SCALAR_BYTES_PER_CANDIDATE_V1: u64 = 256;
+const CPU_POPULATION_AUTO_NOVELTY_BYTES_PER_TERM_V1: u64 = 64;
 #[cfg(all(test, feature = "gpu-b-adapter"))]
 pub(crate) const QUALITY_SCREEN_MAX_STAGED_CLONES_V1: usize = 131_072;
 #[cfg(all(test, feature = "gpu-b-adapter"))]
@@ -35,6 +56,8 @@ pub enum PopulationAutoSizingErrorCodeV1 {
     UnsupportedSchema,
     IdentityMismatch,
     InvalidReceipt,
+    CpuCalibrationUnavailable,
+    CpuMemoryNoRoom,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +222,10 @@ pub enum PopulationAutoSizingRouteV1 {
     CpuNoCompatibleGpu {
         authority: PopulationAutoCpuAuthorityV1,
     },
+    CpuExplicitResearch {
+        contract_identity_sha256: String,
+        input_receipt_sha256: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +242,87 @@ pub(crate) struct PopulationAutoSizingRequestV1 {
     pub(crate) parent_dataset_identity_sha256: String,
     pub(crate) stage1_window: PopulationAutoStage1WindowV1,
     pub(crate) route: PopulationAutoSizingRouteV1,
+    pub(crate) cpu_plan: Option<CpuPopulationAutoPlanV1>,
+}
+
+/// Measured CPU throughput plus a structural peak-memory plan for the exact
+/// Stage-1 timeframe view. Primitive measurements and every derived cap are
+/// hashed into the sizing receipt; validation recomputes the derived values
+/// without probing the live machine again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CpuPopulationAutoPlanV1 {
+    worker_count: u64,
+    calibration_candidates: u64,
+    calibration_elapsed_ns: u64,
+    available_memory_bytes: u64,
+    total_memory_bytes: u64,
+    admitted_memory_bytes: u64,
+    worker_scratch_bytes: u64,
+    gene_bytes_at_term_cap: u64,
+    retained_bytes_per_candidate: u64,
+    archive_reserve_bytes: u64,
+    representable_population_cap: u64,
+    memory_population_cap: u64,
+    raw_time_cap: u64,
+    effective_time_cap: u64,
+    occupancy_floor_overrode_time_target: bool,
+    growth_cap: u64,
+}
+
+impl CpuPopulationAutoPlanV1 {
+    pub const fn worker_count(&self) -> u64 {
+        self.worker_count
+    }
+
+    pub const fn calibration_candidates(&self) -> u64 {
+        self.calibration_candidates
+    }
+
+    pub const fn calibration_elapsed_ns(&self) -> u64 {
+        self.calibration_elapsed_ns
+    }
+
+    pub const fn available_memory_bytes(&self) -> u64 {
+        self.available_memory_bytes
+    }
+
+    pub const fn admitted_memory_bytes(&self) -> u64 {
+        self.admitted_memory_bytes
+    }
+
+    pub const fn worker_scratch_bytes(&self) -> u64 {
+        self.worker_scratch_bytes
+    }
+
+    pub const fn retained_bytes_per_candidate(&self) -> u64 {
+        self.retained_bytes_per_candidate
+    }
+
+    pub const fn representable_population_cap(&self) -> u64 {
+        self.representable_population_cap
+    }
+
+    pub const fn memory_population_cap(&self) -> u64 {
+        self.memory_population_cap
+    }
+
+    pub const fn raw_time_cap(&self) -> u64 {
+        self.raw_time_cap
+    }
+
+    pub const fn growth_cap(&self) -> u64 {
+        self.growth_cap
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CpuPopulationAutoCalibrationV1 {
+    pub(crate) worker_count: usize,
+    pub(crate) calibration_candidates: usize,
+    pub(crate) calibration_elapsed_ns: u64,
+    pub(crate) available_memory_bytes: u64,
+    pub(crate) total_memory_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,6 +363,7 @@ pub struct PopulationAutoSizingReceiptV1 {
     parent_dataset_identity_sha256: String,
     stage1_window: PopulationAutoStage1WindowV1,
     route: PopulationAutoSizingRouteV1,
+    cpu_plan: Option<CpuPopulationAutoPlanV1>,
     admitted_budget_bytes: u64,
     allocator_reserve_bytes: u64,
     parent_device_bytes: u64,
@@ -378,6 +487,10 @@ impl PopulationAutoSizingReceiptV1 {
         &self.route
     }
 
+    pub const fn cpu_plan(&self) -> Option<&CpuPopulationAutoPlanV1> {
+        self.cpu_plan.as_ref()
+    }
+
     fn computed_identity_sha256(&self) -> Result<String, PopulationAutoSizingErrorV1> {
         let mut body = self.clone();
         body.identity_sha256.clear();
@@ -463,6 +576,12 @@ impl PopulationAutoSizingReceiptV1 {
                         "native population-auto sizing receipt has inconsistent plan facts",
                     ));
                 }
+                if self.cpu_plan.is_some() {
+                    return Err(sizing_error_v1(
+                        PopulationAutoSizingErrorCodeV1::InvalidReceipt,
+                        "native CUDA sizing receipt must not carry a CPU calibration plan",
+                    ));
+                }
             }
             PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { authority } => {
                 let identity = match authority {
@@ -489,6 +608,49 @@ impl PopulationAutoSizingReceiptV1 {
                     ));
                 }
             }
+            PopulationAutoSizingRouteV1::CpuExplicitResearch {
+                contract_identity_sha256,
+                input_receipt_sha256,
+            } => {
+                if !is_sha256(contract_identity_sha256) || !is_sha256(input_receipt_sha256) {
+                    return Err(sizing_error_v1(
+                        PopulationAutoSizingErrorCodeV1::InvalidReceipt,
+                        "explicit CPU research route requires exact lowercase SHA-256 contract and input identities",
+                    ));
+                }
+            }
+        }
+        let cpu_route = matches!(
+            &self.route,
+            PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { .. }
+                | PopulationAutoSizingRouteV1::CpuExplicitResearch { .. }
+        );
+        match (cpu_route, self.population_auto, self.cpu_plan.as_ref()) {
+            (true, true, Some(plan)) => validate_cpu_population_auto_plan_v1(
+                plan,
+                evaluation_rows,
+                month_capacity,
+                population_auto_term_cap_v1(feature_count, requested_max_indicators)?,
+            )?,
+            (true, true, None) => {
+                return Err(sizing_error_v1(
+                    PopulationAutoSizingErrorCodeV1::CpuCalibrationUnavailable,
+                    "CPU population-auto receipt has no exact-timeframe calibration plan",
+                ));
+            }
+            (true, false, Some(_)) => {
+                return Err(sizing_error_v1(
+                    PopulationAutoSizingErrorCodeV1::InvalidReceipt,
+                    "CPU sizing receipt carries a calibration plan while population_auto is disabled",
+                ));
+            }
+            (false, _, Some(_)) => {
+                return Err(sizing_error_v1(
+                    PopulationAutoSizingErrorCodeV1::InvalidReceipt,
+                    "non-CPU sizing receipt carries a CPU calibration plan",
+                ));
+            }
+            _ => {}
         }
         let expected = self.computed_identity_sha256()?;
         if expected != self.identity_sha256 {
@@ -512,6 +674,7 @@ impl PopulationAutoSizingReceiptV1 {
             parent_dataset_identity_sha256: self.parent_dataset_identity_sha256.clone(),
             stage1_window: self.stage1_window.clone(),
             route: self.route.clone(),
+            cpu_plan: self.cpu_plan.clone(),
         };
         let rebuilt = build_population_auto_sizing_receipt_v1(primitive_request)?;
         if rebuilt != *self {
@@ -522,6 +685,223 @@ impl PopulationAutoSizingReceiptV1 {
         }
         Ok(())
     }
+}
+
+pub(crate) fn population_auto_term_cap_v1(
+    feature_count: usize,
+    requested_max_indicators: usize,
+) -> Result<usize, PopulationAutoSizingErrorV1> {
+    if feature_count == 0 || feature_count > i32::MAX as usize {
+        return Err(sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::InvalidInput,
+            "population-auto feature count must fit the signed i32 gene-index ABI",
+        ));
+    }
+    let template_floor = crate::genetic::seed_templates::PROFESSIONAL_TEMPLATE_MAX_TERMS_V1;
+    let term_cap = feature_count.min(requested_max_indicators.max(template_floor));
+    if term_cap == 0 {
+        return Err(sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::InvalidInput,
+            "population-auto term cap resolved to zero",
+        ));
+    }
+    Ok(term_cap)
+}
+
+fn derive_cpu_population_auto_plan_v1(
+    calibration: CpuPopulationAutoCalibrationV1,
+    evaluation_rows: usize,
+    month_capacity: usize,
+    term_cap: usize,
+) -> Result<CpuPopulationAutoPlanV1, PopulationAutoSizingErrorV1> {
+    if calibration.worker_count == 0
+        || calibration.calibration_candidates < calibration.worker_count
+        || calibration.calibration_elapsed_ns == 0
+        || calibration.available_memory_bytes == 0
+        || calibration.total_memory_bytes == 0
+        || calibration.available_memory_bytes > calibration.total_memory_bytes
+        || evaluation_rows == 0
+        || month_capacity == 0
+        || term_cap == 0
+    {
+        return Err(sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::InvalidInput,
+            "CPU population-auto calibration requires a saturated non-zero sample, exact extents, and a valid live RAM snapshot",
+        ));
+    }
+
+    let workers = checked_u64(calibration.worker_count, "CPU calibration worker count")?;
+    let candidates = checked_u64(
+        calibration.calibration_candidates,
+        "CPU calibration candidate count",
+    )?;
+    let rows = checked_u64(evaluation_rows, "CPU calibration rows")?;
+    let months = checked_u64(month_capacity, "CPU calibration month capacity")?;
+    let terms = checked_u64(term_cap, "CPU calibration term cap")?;
+
+    let admitted_memory_bytes = calibration
+        .available_memory_bytes
+        .checked_mul(CPU_POPULATION_AUTO_MEMORY_NUMERATOR_V1)
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "CPU population-auto admitted-memory multiplication overflow",
+            )
+        })?
+        / CPU_POPULATION_AUTO_MEMORY_DENOMINATOR_V1;
+    let worker_scratch_bytes = rows
+        .checked_mul(CPU_POPULATION_AUTO_SCRATCH_BYTES_PER_ROW_V1)
+        .and_then(|bytes| {
+            months
+                .checked_mul(CPU_POPULATION_AUTO_SCRATCH_BYTES_PER_MONTH_V1)
+                .and_then(|month_bytes| bytes.checked_add(month_bytes))
+        })
+        .and_then(|bytes| bytes.checked_mul(workers))
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "CPU population-auto worker scratch extent overflow",
+            )
+        })?;
+    let term_heap_bytes = terms
+        .checked_mul((std::mem::size_of::<usize>() + std::mem::size_of::<f64>()) as u64)
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "CPU population-auto gene term heap overflow",
+            )
+        })?;
+    let gene_bytes_at_term_cap = (std::mem::size_of::<crate::genetic::Gene>() as u64)
+        .checked_add(term_heap_bytes)
+        .and_then(|bytes| bytes.checked_add(CPU_POPULATION_AUTO_GENE_STRING_RESERVE_BYTES_V1))
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "CPU population-auto gene footprint overflow",
+            )
+        })?;
+    let retained_bytes_per_candidate = gene_bytes_at_term_cap
+        .checked_mul(CPU_POPULATION_AUTO_LIVE_GENE_COPIES_V1)
+        .and_then(|bytes| {
+            terms
+                .checked_mul(CPU_POPULATION_AUTO_NOVELTY_BYTES_PER_TERM_V1)
+                .and_then(|novelty| bytes.checked_add(novelty))
+        })
+        .and_then(|bytes| bytes.checked_add(CPU_POPULATION_AUTO_SCALAR_BYTES_PER_CANDIDATE_V1))
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "CPU population-auto retained candidate footprint overflow",
+            )
+        })?;
+    let archive_reserve_bytes = gene_bytes_at_term_cap
+        .checked_mul(CPU_POPULATION_AUTO_MAX_ARCHIVE_CANDIDATES_V1)
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "CPU population-auto archive reserve overflow",
+            )
+        })?;
+    let population_budget = admitted_memory_bytes
+        .checked_sub(worker_scratch_bytes)
+        .and_then(|bytes| bytes.checked_sub(archive_reserve_bytes))
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::CpuMemoryNoRoom,
+                format!(
+                    "CPU population-auto admitted RAM {admitted_memory_bytes} B cannot host {worker_scratch_bytes} B of exact-timeframe worker scratch plus {archive_reserve_bytes} B of bounded archive reserve"
+                ),
+            )
+        })?;
+    let memory_population_cap = population_budget / retained_bytes_per_candidate;
+    let representable_population_cap = (i32::MAX as u64) / terms;
+    if memory_population_cap == 0 || representable_population_cap == 0 {
+        return Err(sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::CpuMemoryNoRoom,
+            "CPU population-auto has no room for one representable candidate after exact-timeframe scratch and archive reserves",
+        ));
+    }
+
+    let raw_time_cap_u128 = (candidates as u128)
+        .checked_mul(CPU_POPULATION_AUTO_TARGET_GENERATION_NS_V1 as u128)
+        .ok_or_else(|| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                "CPU population-auto time-cap numerator overflow",
+            )
+        })?
+        / calibration.calibration_elapsed_ns as u128;
+    let raw_time_cap = raw_time_cap_u128.min(u64::MAX as u128) as u64;
+    let occupancy_floor = workers
+        .min(memory_population_cap)
+        .min(representable_population_cap);
+    let effective_time_cap = raw_time_cap.max(occupancy_floor);
+    let occupancy_floor_overrode_time_target = effective_time_cap != raw_time_cap;
+    let growth_cap = memory_population_cap
+        .min(effective_time_cap)
+        .min(representable_population_cap);
+
+    Ok(CpuPopulationAutoPlanV1 {
+        worker_count: workers,
+        calibration_candidates: candidates,
+        calibration_elapsed_ns: calibration.calibration_elapsed_ns,
+        available_memory_bytes: calibration.available_memory_bytes,
+        total_memory_bytes: calibration.total_memory_bytes,
+        admitted_memory_bytes,
+        worker_scratch_bytes,
+        gene_bytes_at_term_cap,
+        retained_bytes_per_candidate,
+        archive_reserve_bytes,
+        representable_population_cap,
+        memory_population_cap,
+        raw_time_cap,
+        effective_time_cap,
+        occupancy_floor_overrode_time_target,
+        growth_cap,
+    })
+}
+
+pub(crate) fn seal_cpu_population_auto_plan_v1(
+    calibration: CpuPopulationAutoCalibrationV1,
+    evaluation_rows: usize,
+    month_capacity: usize,
+    term_cap: usize,
+) -> Result<CpuPopulationAutoPlanV1, PopulationAutoSizingErrorV1> {
+    derive_cpu_population_auto_plan_v1(calibration, evaluation_rows, month_capacity, term_cap)
+}
+
+fn validate_cpu_population_auto_plan_v1(
+    plan: &CpuPopulationAutoPlanV1,
+    evaluation_rows: usize,
+    month_capacity: usize,
+    term_cap: usize,
+) -> Result<(), PopulationAutoSizingErrorV1> {
+    let calibration = CpuPopulationAutoCalibrationV1 {
+        worker_count: usize::try_from(plan.worker_count).map_err(|_| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::InvalidReceipt,
+                "CPU sizing worker count does not fit this process",
+            )
+        })?,
+        calibration_candidates: usize::try_from(plan.calibration_candidates).map_err(|_| {
+            sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::InvalidReceipt,
+                "CPU sizing calibration count does not fit this process",
+            )
+        })?,
+        calibration_elapsed_ns: plan.calibration_elapsed_ns,
+        available_memory_bytes: plan.available_memory_bytes,
+        total_memory_bytes: plan.total_memory_bytes,
+    };
+    let expected =
+        derive_cpu_population_auto_plan_v1(calibration, evaluation_rows, month_capacity, term_cap)?;
+    if expected != *plan {
+        return Err(sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::InvalidReceipt,
+            "CPU population-auto plan derived facts do not match its bound measurements",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_request_v1(
@@ -587,10 +967,7 @@ fn validate_request_v1(
             "population-auto stage1 window identity is detached from the parent/range",
         ));
     }
-    let template_floor = crate::genetic::seed_templates::PROFESSIONAL_TEMPLATE_MAX_TERMS_V1;
-    Ok(request
-        .feature_count
-        .min(request.requested_max_indicators.max(template_floor)))
+    population_auto_term_cap_v1(request.feature_count, request.requested_max_indicators)
 }
 
 pub(crate) fn seal_population_auto_sizing_receipt_v1(
@@ -611,6 +988,69 @@ fn build_population_auto_sizing_receipt_v1(
             "every receipt-governed search requires run-scoped migration to be disabled until migrant term extents are enforced before every ingest and upload",
         ));
     }
+    let representable_population_cap = (i32::MAX as usize) / term_cap;
+    if request.configured_population > representable_population_cap {
+        return Err(sizing_error_v1(
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+            format!(
+                "configured population {} at term cap {term_cap} exceeds the signed i32 packed-gene offset capacity {representable_population_cap}",
+                request.configured_population
+            ),
+        ));
+    }
+
+    let cpu_route = matches!(
+        &request.route,
+        PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { .. }
+            | PopulationAutoSizingRouteV1::CpuExplicitResearch { .. }
+    );
+    let cpu_plan = match (
+        cpu_route,
+        request.population_auto,
+        request.cpu_plan.as_ref(),
+    ) {
+        (true, true, Some(plan)) => {
+            validate_cpu_population_auto_plan_v1(
+                plan,
+                request.evaluation_rows,
+                request.month_capacity,
+                term_cap,
+            )?;
+            if request.configured_population as u64 > plan.memory_population_cap
+                || request.configured_population as u64 > plan.representable_population_cap
+            {
+                return Err(sizing_error_v1(
+                    PopulationAutoSizingErrorCodeV1::CpuMemoryNoRoom,
+                    format!(
+                        "configured CPU population {} exceeds exact-timeframe memory cap {} or signed-offset cap {}",
+                        request.configured_population,
+                        plan.memory_population_cap,
+                        plan.representable_population_cap
+                    ),
+                ));
+            }
+            Some(plan.clone())
+        }
+        (true, true, None) => {
+            return Err(sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::CpuCalibrationUnavailable,
+                "CPU population_auto requires a measured exact-timeframe calibration plan",
+            ));
+        }
+        (true, false, Some(_)) => {
+            return Err(sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::InvalidInput,
+                "CPU calibration was supplied while population_auto is disabled",
+            ));
+        }
+        (false, _, Some(_)) => {
+            return Err(sizing_error_v1(
+                PopulationAutoSizingErrorCodeV1::InvalidInput,
+                "CPU calibration was supplied for a non-CPU route",
+            ));
+        }
+        _ => None,
+    };
 
     let native_plan: Option<NativePopulationAutoPlanFactsV1> = match &request.route {
         PopulationAutoSizingRouteV1::NativeCuda {
@@ -640,14 +1080,15 @@ fn build_population_auto_sizing_receipt_v1(
                 ));
             }
         }
-        PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { .. } => None,
+        PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { .. }
+        | PopulationAutoSizingRouteV1::CpuExplicitResearch { .. } => None,
     };
 
     // The occupancy floor and hard growth cap are both 16,384 today. Thus a
     // raw 20-second target below that knee is evidence (and an explicit
     // override flag), not a smaller growth limit. Memory still wins below it.
-    let (resolved_population, resolution_reason) = match native_plan {
-        Some(plan) if request.population_auto => {
+    let (resolved_population, resolution_reason) = match (native_plan, cpu_plan.as_ref()) {
+        (Some(plan), None) if request.population_auto => {
             let resolved = request.configured_population.max(plan.growth_cap);
             let reason = if resolved > request.configured_population {
                 "native_cuda_auto_grew"
@@ -658,9 +1099,27 @@ fn build_population_auto_sizing_receipt_v1(
             };
             (resolved, reason)
         }
-        Some(_) => (request.configured_population, "auto_disabled"),
-        None if request.population_auto => (request.configured_population, "cpu_no_compatible_gpu"),
-        None => (request.configured_population, "auto_disabled"),
+        (Some(_), None) => (request.configured_population, "auto_disabled"),
+        (None, Some(plan)) if request.population_auto => {
+            let growth_cap = usize::try_from(plan.growth_cap).map_err(|_| {
+                sizing_error_v1(
+                    PopulationAutoSizingErrorCodeV1::ArithmeticOverflow,
+                    "CPU growth cap does not fit this process",
+                )
+            })?;
+            let resolved = request.configured_population.max(growth_cap);
+            let reason = if resolved > request.configured_population {
+                "cpu_exact_timeframe_auto_grew"
+            } else if request.configured_population as u64 > plan.growth_cap {
+                "cpu_configured_above_time_target_no_shrink"
+            } else {
+                "cpu_configured_at_growth_cap"
+            };
+            (resolved, reason)
+        }
+        (None, None) => (request.configured_population, "auto_disabled"),
+        (Some(_), Some(_)) => unreachable!("one exact route cannot be both native and CPU"),
+        (None, Some(_)) => unreachable!("disabled CPU auto cannot carry a calibration plan"),
     };
 
     let (resolved_gene_device_bytes, resolved_scenario_device_bytes) = match native_plan {
@@ -679,21 +1138,39 @@ fn build_population_auto_sizing_receipt_v1(
         None => (0, 0),
     };
 
-    let plan = native_plan.unwrap_or(NativePopulationAutoPlanFactsV1 {
-        admitted_budget_bytes: 0,
-        parent_device_bytes: 0,
-        gene_bytes_per_candidate_at_term_cap: 0,
-        gene_fixed_overhead_bytes: 0,
-        scenario_device_bytes_per_candidate: 0,
-        configured_gene_device_bytes: 0,
-        configured_scenario_device_bytes: 0,
-        fixed_gene_capacity: 0,
-        memory_population_cap: 0,
-        raw_time_cap: 0,
-        effective_time_cap: 0,
-        occupancy_floor_overrode_time_target: false,
-        hard_growth_cap: POPULATION_AUTO_HARD_GROWTH_CAP_V1,
-        growth_cap: 0,
+    let plan = native_plan.unwrap_or_else(|| {
+        let cpu = cpu_plan.as_ref();
+        NativePopulationAutoPlanFactsV1 {
+            admitted_budget_bytes: cpu.map_or(0, |plan| plan.admitted_memory_bytes),
+            parent_device_bytes: 0,
+            gene_bytes_per_candidate_at_term_cap: 0,
+            gene_fixed_overhead_bytes: 0,
+            scenario_device_bytes_per_candidate: 0,
+            configured_gene_device_bytes: 0,
+            configured_scenario_device_bytes: 0,
+            fixed_gene_capacity: cpu.map_or(0, |plan| {
+                usize::try_from(plan.representable_population_cap)
+                    .expect("validated CPU representable cap")
+            }),
+            memory_population_cap: cpu.map_or(0, |plan| {
+                usize::try_from(plan.memory_population_cap).expect("validated CPU memory cap")
+            }),
+            raw_time_cap: cpu.map_or(0, |plan| {
+                usize::try_from(plan.raw_time_cap).expect("validated CPU time cap")
+            }),
+            effective_time_cap: cpu.map_or(0, |plan| {
+                usize::try_from(plan.effective_time_cap).expect("validated CPU time cap")
+            }),
+            occupancy_floor_overrode_time_target: cpu
+                .is_some_and(|plan| plan.occupancy_floor_overrode_time_target),
+            hard_growth_cap: cpu.map_or(POPULATION_AUTO_HARD_GROWTH_CAP_V1, |plan| {
+                usize::try_from(plan.representable_population_cap)
+                    .expect("validated CPU representable cap")
+            }),
+            growth_cap: cpu.map_or(0, |plan| {
+                usize::try_from(plan.growth_cap).expect("validated CPU growth cap")
+            }),
+        }
     });
     let mut receipt = PopulationAutoSizingReceiptV1 {
         schema_version: POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V1,
@@ -723,6 +1200,7 @@ fn build_population_auto_sizing_receipt_v1(
         parent_dataset_identity_sha256: request.parent_dataset_identity_sha256,
         stage1_window: request.stage1_window,
         route: request.route,
+        cpu_plan: request.cpu_plan,
         admitted_budget_bytes: plan.admitted_budget_bytes,
         allocator_reserve_bytes: if native_plan.is_some() {
             POPULATION_AUTO_ALLOCATOR_RESERVE_BYTES_V1
@@ -794,7 +1272,8 @@ pub(crate) fn quality_screen_candidate_chunk_v1(
     };
     let route_gene_capacity = match receipt.route() {
         PopulationAutoSizingRouteV1::NativeCuda { .. } => receipt.fixed_gene_capacity(),
-        PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { .. } => usize::MAX,
+        PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { .. }
+        | PopulationAutoSizingRouteV1::CpuExplicitResearch { .. } => usize::MAX,
     };
     let mut chunk = candidates
         .min(QUALITY_SCREEN_MAX_STAGED_BASE_GENES_V1)
@@ -814,4 +1293,119 @@ pub(crate) fn quality_screen_candidate_chunk_v1(
         ));
     }
     Ok(chunk)
+}
+
+#[cfg(test)]
+mod cpu_population_auto_tests {
+    use super::*;
+
+    fn sha(byte: char) -> String {
+        std::iter::repeat_n(byte, 64).collect()
+    }
+
+    fn calibration(elapsed_ns: u64, available_gib: u64) -> CpuPopulationAutoCalibrationV1 {
+        CpuPopulationAutoCalibrationV1 {
+            worker_count: 10,
+            calibration_candidates: 40,
+            calibration_elapsed_ns: elapsed_ns,
+            available_memory_bytes: available_gib * 1024 * 1024 * 1024,
+            total_memory_bytes: 32 * 1024 * 1024 * 1024,
+        }
+    }
+
+    fn cpu_request(plan: Option<CpuPopulationAutoPlanV1>) -> PopulationAutoSizingRequestV1 {
+        let parent_dataset = sha('2');
+        PopulationAutoSizingRequestV1 {
+            population_auto: true,
+            configured_population: 200,
+            resident_parent_rows: 100_000,
+            evaluation_rows: 25_000,
+            feature_count: 240,
+            month_capacity: 240,
+            requested_max_indicators: 16,
+            migration_enabled: false,
+            parent_canonical_scope_identity_sha256: sha('1'),
+            parent_dataset_identity_sha256: parent_dataset.clone(),
+            stage1_window: seal_population_auto_stage1_window_v1(
+                &parent_dataset,
+                "selection_stage1",
+                75_000,
+                100_000,
+            )
+            .expect("stage1"),
+            route: PopulationAutoSizingRouteV1::CpuExplicitResearch {
+                contract_identity_sha256: sha('3'),
+                input_receipt_sha256: sha('4'),
+            },
+            cpu_plan: plan,
+        }
+    }
+
+    #[test]
+    fn measured_cpu_throughput_sets_the_generation_cap_without_a_static_population_ceiling() {
+        let fast = seal_cpu_population_auto_plan_v1(calibration(10_000_000, 16), 25_000, 240, 16)
+            .expect("fast plan");
+        let slow = seal_cpu_population_auto_plan_v1(calibration(20_000_000, 16), 25_000, 240, 16)
+            .expect("slow plan");
+
+        assert_eq!(fast.raw_time_cap(), 80_000);
+        assert_eq!(slow.raw_time_cap(), 40_000);
+        assert_eq!(fast.raw_time_cap(), slow.raw_time_cap() * 2);
+        assert_eq!(fast.representable_population_cap(), i32::MAX as u64 / 16);
+        assert!(fast.growth_cap() > POPULATION_AUTO_HARD_GROWTH_CAP_V1 as u64);
+    }
+
+    #[test]
+    fn exact_timeframe_rows_reduce_the_ram_cap_through_real_worker_scratch() {
+        let short =
+            seal_cpu_population_auto_plan_v1(calibration(1_000_000_000, 16), 25_000, 240, 16)
+                .expect("short timeframe plan");
+        let long =
+            seal_cpu_population_auto_plan_v1(calibration(1_000_000_000, 16), 2_500_000, 240, 16)
+                .expect("long timeframe plan");
+
+        assert!(long.worker_scratch_bytes() > short.worker_scratch_bytes());
+        assert!(long.memory_population_cap() < short.memory_population_cap());
+    }
+
+    #[test]
+    fn cpu_auto_requires_a_bound_calibration_and_receipt_rebuilds_it_exactly() {
+        let plan =
+            seal_cpu_population_auto_plan_v1(calibration(1_000_000_000, 16), 25_000, 240, 16)
+                .expect("CPU plan");
+        let receipt = seal_population_auto_sizing_receipt_v1(cpu_request(Some(plan)))
+            .expect("CPU sizing receipt");
+        assert_eq!(receipt.resolved_population(), 800);
+        assert_eq!(receipt.resolution_reason(), "cpu_exact_timeframe_auto_grew");
+        receipt.validate().expect("self-validating CPU receipt");
+
+        let missing = seal_population_auto_sizing_receipt_v1(cpu_request(None)).unwrap_err();
+        assert_eq!(
+            missing.code(),
+            PopulationAutoSizingErrorCodeV1::CpuCalibrationUnavailable
+        );
+    }
+
+    #[test]
+    fn configured_cpu_population_is_not_silently_shrunk_but_true_ram_overflow_fails_closed() {
+        let plan =
+            seal_cpu_population_auto_plan_v1(calibration(4_000_000_000, 16), 25_000, 240, 16)
+                .expect("slow CPU plan");
+        let receipt = seal_population_auto_sizing_receipt_v1(cpu_request(Some(plan)))
+            .expect("configured population fits RAM");
+        assert_eq!(receipt.raw_time_cap(), 200);
+        assert_eq!(receipt.resolved_population(), 200);
+
+        let tiny_plan =
+            seal_cpu_population_auto_plan_v1(calibration(1_000_000_000, 1), 25_000, 240, 16)
+                .expect("small but non-zero plan");
+        let mut request = cpu_request(Some(tiny_plan));
+        request.configured_population = usize::MAX / 4;
+        let error = seal_population_auto_sizing_receipt_v1(request).unwrap_err();
+        assert!(matches!(
+            error.code(),
+            PopulationAutoSizingErrorCodeV1::ArithmeticOverflow
+                | PopulationAutoSizingErrorCodeV1::CpuMemoryNoRoom
+        ));
+    }
 }

@@ -3,6 +3,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../cuda_build_arch.rs"]
+mod cuda_build_arch;
+
 #[path = "build_support/native_cuda_build.rs"]
 mod native_cuda_build;
 
@@ -11,13 +14,13 @@ mod native_sass;
 
 use native_cuda_build::{
     ArtifactCompiler, ArtifactJob, ArtifactVerifier, KernelJob, NativeCompileOptions,
-    NativePrecision, discover_native_architectures, expand_native_artifact_jobs,
-    inspect_native_cubin, native_nvcc_args, order_kernel_jobs_longest_first,
-    run_native_artifact_jobs, run_native_artifact_verifications, validate_unique_kernel_jobs,
+    NativePrecision, expand_native_artifact_jobs, inspect_native_cubin, native_nvcc_args,
+    order_kernel_jobs_longest_first, run_native_artifact_jobs, run_native_artifact_verifications,
+    validate_unique_kernel_jobs,
 };
 use native_sass::{
-    NativeArchPlan, NativeArtifact, native_cubin_filename, select_exact_native_cubin,
-    validate_native_manifest,
+    ArchRequestSource, NativeArchPlan, NativeArtifact, native_cubin_filename,
+    select_exact_native_cubin, validate_native_manifest,
 };
 
 fn main() {
@@ -37,12 +40,31 @@ fn main() {
     println!("cargo:rustc-env=VECTOR_TA_CUDA_NVCC_VERSION=unknown");
 
     if env::var("CARGO_FEATURE_CUDA_BUILD_NATIVE").is_ok() {
-        compile_cuda_kernels(cargo_jobserver.as_ref());
+        if env::var_os("DOCS_RS").is_some() {
+            // docs.rs and explicit DOCS_RS source checks type-check the CUDA
+            // API but must not manufacture native cubins or a usable build
+            // identity. An empty registry keeps every runtime load fail-closed.
+            write_docs_rs_native_cubin_registry();
+        } else {
+            compile_cuda_kernels(cargo_jobserver.as_ref());
+        }
     }
 
     if is_nightly() {
         println!("cargo:rustc-cfg=rustc_is_nightly");
     }
+}
+
+fn write_docs_rs_native_cubin_registry() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("Cargo sets OUT_DIR"));
+    let registry = "// @generated for DOCS_RS source checking; no executable CUDA artifacts.\n\
+pub(super) const COMPILED_ARCHS: &[u32] = &[];\n\
+pub(super) const COMPILED_ARCH_SOURCE: &str = \"docs_rs_source_check_only\";\n\
+pub(super) const NVCC_VERSION: &str = \"unavailable\";\n\
+pub(super) const NATIVE_CUBIN_COUNT: usize = 0;\n\
+pub(super) static NATIVE_CUBINS: &[crate::native_sass::NativeArtifact<'static>] = &[];\n";
+    std::fs::write(out_dir.join("vector_ta_native_cubin_registry.rs"), registry)
+        .expect("write fail-closed DOCS_RS native cubin registry");
 }
 
 thread_local! {
@@ -91,7 +113,7 @@ fn run_queued_kernel_jobs(cargo_jobserver: Option<&jobserver::Client>, cuda_path
 
     let source_count = jobs.len();
     let nvcc = PathBuf::from(native_nvcc_path(cuda_path));
-    let arch_plan = target_arch_plan(&nvcc);
+    let arch_plan = target_arch_plan();
     let stems = jobs
         .iter()
         .map(|job| job.cubin_stem.clone())
@@ -816,17 +838,32 @@ fn is_f64_lane_source(rel_src: &str) -> bool {
         .any(|needle| rel_src.ends_with(needle))
 }
 
-fn target_arch_plan(nvcc: &Path) -> NativeArchPlan {
-    let explicit_archs = env::var("CUDA_ARCHS").ok();
-    let nvidia_smi =
-        PathBuf::from(env::var_os("NVIDIA_SMI").unwrap_or_else(|| "nvidia-smi".into()));
-    let plan = discover_native_architectures(nvcc, &nvidia_smi, explicit_archs.as_deref())
-        .unwrap_or_else(|error| {
-            panic!(
-                "vector-ta: cannot build an exact native-SASS registry: {error}. No non-native, \
+fn target_arch_plan() -> NativeArchPlan {
+    let resolved = cuda_build_arch::resolve_exact_cuda_architectures().unwrap_or_else(|error| {
+        panic!(
+            "vector-ta: cannot build an exact native-SASS registry: {error}. No non-native, \
                  nearest-architecture, or CPU substitution path is permitted."
-            )
-        });
+        )
+    });
+    let plan = NativeArchPlan {
+        source: match resolved.resolution_mode {
+            "host_auto" => ArchRequestSource::DetectedVisibleDevices,
+            "cross_release_explicit" => ArchRequestSource::ExplicitList,
+            other => panic!("vector-ta: unsupported resolved CUDA architecture mode {other:?}"),
+        },
+        architectures: resolved
+            .numeric
+            .split(';')
+            .map(|architecture| {
+                architecture.parse::<u32>().unwrap_or_else(|error| {
+                    panic!(
+                        "vector-ta: shared CUDA resolver returned invalid architecture \
+                         {architecture:?}: {error}"
+                    )
+                })
+            })
+            .collect(),
+    };
 
     let joined: Vec<String> = plan
         .architectures
@@ -907,19 +944,21 @@ fn reject_free_form_nvcc_args() {
     });
     native_cuda_build::reject_free_form_nvcc_args(Some(value)).unwrap_or_else(|error| {
         panic!(
-            "vector-ta: {error}. Remove NVCC_ARGS and use the reviewed CUDA_ARCHS, CUDA_DEBUG, \
-             and CUDA_FILTER controls instead. Refusing before launching nvcc."
+            "vector-ta: {error}. Remove NVCC_ARGS and use the reviewed \
+             NEOETHOS_CUDA_BUILD_MODE, NEOETHOS_CUDA_ARCHS, CUDA_DEBUG, and CUDA_FILTER controls \
+             instead. Refusing before launching nvcc."
         )
     });
 }
 
 fn compile_cuda_kernels(cargo_jobserver: Option<&jobserver::Client>) {
     println!("cargo:rerun-if-changed=kernels/cuda");
+    println!("cargo:rerun-if-changed=../cuda_build_arch.rs");
 
-    println!("cargo:rerun-if-env-changed=CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=NVIDIA_SMI");
     println!("cargo:rerun-if-env-changed=CUDA_FILTER");
     println!("cargo:rerun-if-env-changed=CUDA_KERNEL_DIR");
+    println!("cargo:rerun-if-env-changed=CUDACXX");
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=CUOBJDUMP");
     println!("cargo:rerun-if-env-changed=NVCC_ARGS");
@@ -2724,13 +2763,14 @@ fn compile_kernel(_cuda_path: &str, rel_src: &'static str, cubin_stem: &'static 
 }
 
 fn native_nvcc_path(cuda_path: &str) -> String {
-    env::var("NVCC").unwrap_or_else(|_| {
-        if cfg!(target_os = "windows") {
-            format!("{cuda_path}/bin/nvcc.exe")
-        } else {
-            format!("{cuda_path}/bin/nvcc")
-        }
-    })
+    if env::var_os("NVCC").is_some() {
+        panic!(
+            "vector-ta: NVCC is a rejected compiler-path authority; use the shared CUDACXX \
+             setting so every CUDA component validates and invokes the same compiler"
+        );
+    }
+    let _ = cuda_path;
+    env::var("CUDACXX").unwrap_or_else(|_| "nvcc".to_owned())
 }
 
 fn native_cuobjdump_path(cuda_path: &str) -> String {
@@ -2911,6 +2951,7 @@ impl ArtifactCompiler for NativeNvccCompiler {
     }
 
     fn finish(&self, job: &ArtifactJob, output: std::process::Output) -> Result<(), String> {
+        native_cuda_build::preserve_nvcc_output(job, &output, |line| println!("{line}"))?;
         if !output.status.success() {
             return Err(format!(
                 "nvcc --cubin failed for {} at exact sm_{} with {:?}; stdout={:?}; stderr={:?}",

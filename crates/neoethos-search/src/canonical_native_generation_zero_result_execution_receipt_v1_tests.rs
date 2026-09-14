@@ -114,6 +114,7 @@ fn execution_facts_bind_p_f_t_k_s_l_and_authoritative_metric_bytes() {
         |facts| facts.population_cap = 9,
         |facts| facts.hard_growth_cap = 9,
         |facts| facts.max_concurrent_scenario_count = 0,
+        |facts| facts.max_concurrent_scenario_count = facts.sizing_resolved_population + 1,
         |facts| facts.month_capacity = 0,
         |facts| facts.sizing_stage1_row_end = facts.sizing_stage1_row_start,
         |facts| facts.milestone_stage1_row_end -= 1,
@@ -157,12 +158,14 @@ fn zero_indicator_sentinel_binds_the_resolved_feature_count_not_raw_zero() {
 }
 
 #[test]
-fn population_cap_binding_accepts_both_hard_cap_branches_and_never_shrinks_configured_p() {
-    assert_eq!(RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2, 16_384);
-    for (population_cap, expected_hard_cap) in [
-        (4_096, 4_096),
-        (20_000, RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2),
-    ] {
+fn population_cap_binding_uses_the_external_result_cap_below_the_native_signed_extent() {
+    assert_eq!(
+        RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
+        i32::MAX as usize
+    );
+    for (population_cap, expected_hard_cap) in
+        [(4_096, 4_096), (20_000, 20_000), (1_000_000, 1_000_000)]
+    {
         let mut facts = valid_execution_facts_v1();
         facts.population_cap = population_cap;
         facts.hard_growth_cap = expected_hard_cap;
@@ -185,21 +188,21 @@ fn population_cap_binding_accepts_both_hard_cap_branches_and_never_shrinks_confi
     refresh_population_execution_facts_v1(&mut exact_cap);
     validate_execution_facts_v1(&exact_cap).expect("configured P exactly at Pcap is not shrunk");
 
-    let mut above_growth_no_shrink = valid_execution_facts_v1();
-    above_growth_no_shrink.request_configured_population = 20_000;
-    above_growth_no_shrink.sizing_configured_population = 20_000;
-    above_growth_no_shrink.sizing_resolved_population = 20_000;
-    above_growth_no_shrink.population_cap = 30_000;
-    above_growth_no_shrink.hard_growth_cap = RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2;
-    refresh_population_execution_facts_v1(&mut above_growth_no_shrink);
-    validate_execution_facts_v1(&above_growth_no_shrink)
-        .expect("configured P above the growth cap is admitted without shrink below external Pcap");
+    let mut large_chunked_population = valid_execution_facts_v1();
+    large_chunked_population.request_configured_population = 20_000;
+    large_chunked_population.sizing_configured_population = 20_000;
+    large_chunked_population.sizing_resolved_population = 20_000;
+    large_chunked_population.population_cap = 30_000;
+    large_chunked_population.hard_growth_cap = 30_000;
+    refresh_population_execution_facts_v1(&mut large_chunked_population);
+    validate_execution_facts_v1(&large_chunked_population)
+        .expect("large total P remains valid when execution uses bounded scenario chunks");
 
     for (population_cap, hard_growth_cap) in [
         (4_096, 4_097),
         (4_096, 4_095),
-        (20_000, 20_000),
-        (20_000, RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2 - 1),
+        (20_000, 16_384),
+        (20_000, 19_999),
     ] {
         let mut wrong = valid_execution_facts_v1();
         wrong.population_cap = population_cap;

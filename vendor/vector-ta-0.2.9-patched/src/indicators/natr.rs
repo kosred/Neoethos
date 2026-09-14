@@ -40,10 +40,6 @@ impl Default for NatrParams {
     }
 }
 
-// TA-Lib's private TA_IS_ZERO contract.  NATR uses it only for the close
-// denominator; period one deliberately emits raw True Range.
-const NATR_TA_EPSILON: f64 = 1.0e-14;
-
 #[inline(always)]
 fn natr_true_range(high: f64, low: f64, previous_close: f64) -> f64 {
     // TA-Lib compares and replaces in this exact order.  In particular, a
@@ -75,7 +71,7 @@ fn natr_wilder_step(previous: f64, true_range: f64, period: usize) -> f64 {
 fn natr_output_value(atr: f64, close: f64, period: usize) -> f64 {
     if period <= 1 {
         atr
-    } else if close > -NATR_TA_EPSILON && close < NATR_TA_EPSILON {
+    } else if close == 0.0 {
         0.0
     } else {
         (atr / close) * 100.0
@@ -1958,7 +1954,7 @@ mod tests {
     }
 
     #[test]
-    fn talib_natr_stream_and_batch_preserve_authoritative_edges() {
+    fn talib_natr_stream_and_batch_preserve_exact_zero_and_small_nonzero_edges() {
         let high = [10.0, 12.0, 13.0, 15.0, 16.0];
         let low = [8.0, 9.0, 10.0, 11.0, 12.0];
         let close = [9.0, 10.0, 12.0, 14.0, 5.0e-15];
@@ -1973,7 +1969,8 @@ mod tests {
             .collect();
         assert!(streamed[1].is_nan());
         assert_eq!(streamed[2].to_bits(), 25.0f64.to_bits());
-        assert_eq!(streamed[4].to_bits(), 0.0f64.to_bits());
+        let expected_small_close = (3.75_f64 / 5.0e-15_f64) * 100.0;
+        assert_eq!(streamed[4].to_bits(), expected_small_close.to_bits());
 
         let batch = natr_batch_slice(
             &high,
@@ -1985,7 +1982,7 @@ mod tests {
         .expect("TA-Lib-authoritative batch fixture must evaluate");
         assert!(batch.values[1].is_nan());
         assert_eq!(batch.values[2].to_bits(), 25.0f64.to_bits());
-        assert_eq!(batch.values[4].to_bits(), 0.0f64.to_bits());
+        assert_eq!(batch.values[4].to_bits(), expected_small_close.to_bits());
     }
 
     macro_rules! generate_all_natr_tests {

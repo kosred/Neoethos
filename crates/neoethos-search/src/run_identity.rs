@@ -1,31 +1,11 @@
-//! **Run identity**: what this run was configured to look for, and whether that
-//! is arithmetically possible.
+//! Resolved search configuration and cost/exit-geometry diagnostics.
 //!
-//! Two things live here, both landed 2026-08-09 after the adversarial review of
-//! the "174 candidates screened, 0 survived" run:
-//!
-//! 1. [`ResolvedConfigStamp`] — the ~30 decision-critical values the run
-//!    actually resolved, plus a hash over them. A prior run could not be
-//!    attributed to a config file after the fact: the repo `config.yaml` and the
-//!    operator's store config disagreed on `prefilter_top_k` (240 vs 50) and on
-//!    the payoff floor (2.0 vs 0.0), and nothing in the artifacts said which one
-//!    had been in force. Every run now writes what it resolved.
-//!
-//! 2. [`assert_payoff_floor_reachable`] — the CONFIG-IDENTITY GATE. It refuses
-//!    to start a run whose configured payoff floor cannot be reached under that
-//!    run's own trailing settings, SL/TP clamps and charged cost. The whole
-//!    point is to make "the screen is broken" impossible to confuse with "the
-//!    market said no".
-//!
-//! ## What this is NOT
-//!
-//! Nothing here has any expected value in money. The arithmetic below decides
-//! whether a question is ASKABLE, not whether the answer is profitable. Exit
-//! geometry, clamps, RR and timeframe REDISTRIBUTE the (win-rate, payoff) split;
-//! on a driftless price the product is fixed at −cost. Measured on real EURUSD
-//! bars: expectancy was −4.15 pips per trade in EVERY trailing configuration
-//! while the payoff ratio moved from 0.91 to 2.53. A future reader must not
-//! read this module as a profit-seeking change.
+//! A full-TP/full-SL payoff ratio describes only those two terminal outcomes.
+//! It is not an upper bound on the average winning/losing trade ratio when
+//! trailing, time limits or session exits can realize smaller losses. A prior
+//! sample's observed payoff is likewise not a bound on a different strategy.
+//! Search admission validates configuration domains; actual candidate results
+//! still have to satisfy the unchanged quality, validation and OOS targets.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -35,6 +15,34 @@ use crate::discovery::DiscoveryConfig;
 
 pub const RESOLVED_CONFIG_STAMP_SCHEMA_VERSION_V2: u16 = 2;
 pub const POPULATION_AUTO_SEARCH_AUTHORITY_SCHEMA_VERSION_V1: u16 = 1;
+
+/// Mandatory algorithm version in the private hash body, not a user setting.
+/// Binds the three-way evidence partition, unique selected-candidate labels,
+/// and price-gross-only currency-conversion fees even with unchanged knobs.
+/// Both stamp producers use this token; old stamps fail their current self-hash
+/// and cannot carry old two-way ledgers into the CPU selection authority.
+const SEARCH_ALGORITHM_SEMANTICS_V1: &str = "neoethos.search.algorithm.is-calibration-holdout-80-10-10.unique-labels.price-gross-conversion-fee.v1";
+
+/// Include corrected execution/stop/admission arithmetic in every config key.
+/// Computed once, not once per candidate. This separates existing cached scores
+/// and checkpoints even when the user's knobs and dataset are unchanged.
+fn cpu_execution_source_sha256() -> &'static str {
+    use sha2::{Digest, Sha256};
+    static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        let mut hash = Sha256::new();
+        hash.update(b"neoethos.cpu-execution-source.v1\0");
+        for source in [
+            include_bytes!("eval.rs").as_slice(),
+            include_bytes!("stop_target.rs").as_slice(),
+            include_bytes!("run_identity.rs").as_slice(),
+        ] {
+            hash.update((source.len() as u64).to_le_bytes());
+            hash.update(source);
+        }
+        format!("{:x}", hash.finalize())
+    })
+}
 
 fn deserialize_required_option<'de, D, T>(
     deserializer: D,
@@ -46,23 +54,8 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
-/// Maximum payoff ratio EVER observed on real bars under the production
-/// trailing configuration (`trailing_enabled: true`, `be_trigger_r: 1.0`,
-/// `atr_multiplier: 1.0`), across the full SL/TP grid and every timeframe.
-///
-/// MEASUREMENT (2026-08-09, real EURUSD bars, cost charged): payoff 0.87 at
-/// sl6/tp45 AND 0.87 at sl6/tp300 — avg_win 6.10 vs 6.11 pips. The take-profit
-/// is dead code under this trail: the stop sits at entry the instant a trade
-/// touches +1R, and it is tested BEFORE the take-profit on every subsequent
-/// bar, so reaching 3R requires climbing 1R→3R without ever retracing 1R from
-/// the running high. The best cell anywhere in the grid was 1.08.
-///
-/// This is an EMPIRICAL constant, not arithmetic. It is used only to refuse a
-/// run whose floor sits above a number no cell of a real-bar grid has ever
-/// reached under this exit geometry — which is exactly the run that produced
-/// "0 of 174" and reported it as a verdict on the market. Re-measure it if the
-/// trailing implementation changes; the arithmetic ceiling below does not
-/// depend on it.
+/// Historical sample statistic retained for API compatibility and diagnosis.
+/// It is NOT a mathematical ceiling and must never authorize a search refusal.
 pub const MEASURED_TRAILING_PAYOFF_CEILING: f64 = 1.08;
 
 /// The inputs the payoff ceiling is computed from. Every one of them is a
@@ -131,11 +124,10 @@ pub enum BindingConstraint {
     TakeProfitClamp,
     /// The stop clamp's lower bound floors the denominator.
     StopClamp,
-    /// Cost alone exceeds the widest expressible take-profit: no exit can pay.
+    /// The fixed round-trip charge exceeds the widest take-profit distance.
     CostExceedsTakeProfit,
-    /// The trail arms and then concedes the exit before the take-profit is ever
-    /// tested. Not an arithmetic bound — an empirical one, see
-    /// [`MEASURED_TRAILING_PAYOFF_CEILING`].
+    /// Legacy diagnostic variant. Current code never treats a sample's
+    /// trailing payoff as an admission constraint.
     TrailingGiveBack,
 }
 
@@ -154,16 +146,11 @@ impl BindingConstraint {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayoffCeiling {
-    /// Highest payoff ratio the search space can express AT ALL, over the box
-    /// mutation can reach: `(tp_max − c) / (sl_min + c)`.
-    ///
-    /// This is an exact upper bound with the trail OFF. No exit pays more than
-    /// the widest take-profit minus cost; no full-stop loss is smaller than the
-    /// tightest stop plus cost.
+    /// Full-TP/full-SL payoff reference: (tp_max - c) / (sl_min + c).
+    /// This does not bound average win/loss ratios with partial/session exits.
     pub arithmetic_ceiling: f64,
-    /// Same bound restricted to what the INITIALISER can draw, where TP is
-    /// additionally capped at `initializer_rr_max × sl`. Generation 0 cannot
-    /// exceed this even though later generations can.
+    /// Full-TP/full-SL reference restricted to the initializer's upper RR band.
+    /// It does not bound generation 0's realized average winning/losing trades.
     pub initializer_ceiling: f64,
     /// The TP that produced [`Self::arithmetic_ceiling`], in pips.
     pub ceiling_tp_pips: f64,
@@ -177,17 +164,12 @@ pub struct PayoffCeiling {
     /// collapses toward, NOT a maximum.
     #[serde(deserialize_with = "deserialize_required_option")]
     pub trailing_armed_floor_payoff: Option<f64>,
-    /// The ceiling the gate actually enforces: the arithmetic one, lowered to
-    /// [`MEASURED_TRAILING_PAYOFF_CEILING`] when the trail is in the
-    /// `give_back <= be_trigger` regime that measurement covered.
+    /// Legacy serialized field. Now equals the barrier reference and is
+    /// advisory only; it is not enforced as a search-admission ceiling.
     pub enforced_ceiling: f64,
     pub binding: BindingConstraint,
-    /// `true` when the trail is ON and LOOSER than its arm trigger
-    /// (`give_back > be_trigger`). No real-bar measurement covers that geometry,
-    /// so [`Self::enforced_ceiling`] is the barrier arithmetic alone and a floor
-    /// that passes here has not been checked against anything empirical. It is
-    /// also the reward-hack corner — payoff 2.53 at expectancy −4.18 pips per
-    /// trade — which only the net-expectancy gate can refuse.
+    /// True whenever trailing is enabled: there is no proved universal
+    /// average-win/loss ceiling for any trailing geometry.
     pub trailing_ceiling_unmeasured: bool,
     /// Win rate at which a strategy sitting EXACTLY at the configured floor
     /// breaks even in gross-R terms: `1 / (1 + floor)`.
@@ -216,14 +198,10 @@ fn finite(name: &str, v: f64) -> Result<f64> {
     Ok(v)
 }
 
-/// The arithmetic, as a pure function so the gate is verifiable without a run.
-///
-/// Maximising `(tp − c) / (sl + c)` over the reachable box is monotone in both
-/// arguments, so the maximiser is `tp = tp_max`, `sl = sl_min`. Mutation clamps
-/// SL and TP INDEPENDENTLY (`evolution_math` mutation arm 2), so the initialiser's
-/// reward:risk ceiling does not bind the reachable box — it is reported
-/// separately rather than folded in, because a gate must only refuse what is
-/// PROVABLY unreachable.
+/// Full-stop/full-target geometry as a pure diagnostic. The box reference
+/// maximizes (tp - cost) / (sl + cost); the initializer reference additionally
+/// respects its upper RR constraint. Neither bounds the realized average
+/// win/loss ratio when some exits occur before a full SL or TP.
 pub fn max_achievable_payoff(inputs: &PayoffCeilingInputs) -> Result<PayoffCeiling> {
     let sl_min = finite("sl_min_pips", inputs.sl_min_pips)?;
     let sl_max = finite("sl_max_pips", inputs.sl_max_pips)?;
@@ -269,12 +247,16 @@ pub fn max_achievable_payoff(inputs: &PayoffCeilingInputs) -> Result<PayoffCeili
     let numer = tp_max - cost;
     let arithmetic_ceiling = if numer <= 0.0 { 0.0 } else { numer / denom };
 
-    let init_tp = tp_max.min((rr_max * sl_min).max(0.0));
+    // With a positive fixed cost, an RR-constrained payoff increases with
+    // SL until TP hits its cap, then decreases. The maximum is at that kink
+    // (clamped to the allowed SL interval), not necessarily at the smallest SL.
+    let init_sl = (tp_max / rr_max).clamp(sl_min, sl_max);
+    let init_tp = tp_max.min(rr_max * init_sl);
     let init_numer = init_tp - cost;
     let initializer_ceiling = if init_numer <= 0.0 {
         0.0
     } else {
-        init_numer / denom
+        init_numer / (init_sl + cost)
     };
 
     // Which term pins it. Cost first (it can dominate outright), then whichever
@@ -284,7 +266,7 @@ pub fn max_achievable_payoff(inputs: &PayoffCeilingInputs) -> Result<PayoffCeili
     // the honest "what do I change" answer only when the stop is already at the
     // floor of what a broker will accept. We report the TP clamp when the
     // numerator is the smaller lever and the stop clamp otherwise.
-    let mut binding = if numer <= 0.0 {
+    let binding = if numer <= 0.0 {
         BindingConstraint::CostExceedsTakeProfit
     } else if tp_max <= sl_min {
         BindingConstraint::TakeProfitClamp
@@ -292,71 +274,13 @@ pub fn max_achievable_payoff(inputs: &PayoffCeilingInputs) -> Result<PayoffCeili
         BindingConstraint::StopClamp
     };
 
-    // WHICH TRAIL REGIME THE MEASUREMENT COVERS. Corrected 2026-08-09 after the
-    // adversarial review, in BOTH directions — the first cut was wrong twice:
-    //
-    //   * `give_back <= be_trigger` (the measured point is give_back == trigger
-    //     == 1.0, and anything tighter concedes the exit EARLIER, so its payoff
-    //     is bounded by the measured one). The first cut tested
-    //     `give_back >= be_trigger`, which let `trailing_stop_multiplier: 0.5`
-    //     walk straight past the gate into a configuration whose realised payoff
-    //     is STRICTLY LOWER than the one being refused.
-    //
-    //   * `give_back > be_trigger` is NOT covered and must not be treated as if
-    //     it were. It is looser, so it pays MORE: the same review measured
-    //     payoff 2.53 at `trail_mult = 3`. Enforcing 1.08 there would refuse a
-    //     configuration that demonstrably reaches 2.0 — a false refusal, which
-    //     is exactly the failure this gate exists to end, pointed the other way.
-    //
-    // At and below the trigger, `hi − give_back × sl` sits at or below entry the
-    // instant the trail arms, so the `max(entry + min_lock)` floor binds
-    // immediately and every armed trade can exit for `min_lock` pips gross.
-    // Because the trailed stop is tested BEFORE the take-profit on every later
-    // bar (eval.rs:1013-1041), the take-profit only pays on paths that never
-    // retrace `give_back × sl` after arming.
-    // Two DIFFERENT conditions, deliberately not collapsed into one:
-    //   * `armed_at_or_below_entry` — the armed stop is at/below entry, so the
-    //     min-lock floor binds and the collapse value is computable. Needs
-    //     `give_back >= be_trigger`.
-    //   * `trail_bounded_by_measurement` — the realised payoff cannot exceed the
-    //     measured 1.08. Needs `give_back <= be_trigger` (tighter than measured
-    //     concedes the exit earlier and therefore pays less).
-    // They coincide only at `give_back == be_trigger`, which is the point that
-    // was actually measured.
+    // A trailing exit can realize a small loss or reach TP before retracing.
+    // No observed sample average bounds every possible sequence of such exits.
     let trail_on = inputs.trailing_enabled;
-    let armed_at_or_below_entry = trail_on && give_back >= be_trigger && give_back > 0.0;
-    let trail_degenerate = trail_on && give_back <= be_trigger;
-    // The loose-trail corner: no measurement bounds it, so the gate falls back
-    // to barrier arithmetic. That is the REWARD HACK corner (payoff 2.53 at
-    // expectancy −4.18 pips per trade). What stops it is not this gate — it is
-    // the unconditional net-expectancy check in `TargetProfile::evaluate`. This
-    // flag exists so a run that passed the gate for this reason is identifiable
-    // in the ledger afterwards rather than indistinguishable from a measured one.
-    let trailing_ceiling_unmeasured = trail_on && give_back > be_trigger;
-    let trailing_armed_floor_payoff = if armed_at_or_below_entry {
-        Some((min_lock - cost) / denom)
-    } else {
-        None
-    };
-
-    let mut enforced_ceiling = arithmetic_ceiling;
-    if trail_degenerate && MEASURED_TRAILING_PAYOFF_CEILING < enforced_ceiling {
-        enforced_ceiling = MEASURED_TRAILING_PAYOFF_CEILING;
-        binding = BindingConstraint::TrailingGiveBack;
-    }
-    if trailing_ceiling_unmeasured {
-        tracing::warn!(
-            target: "neoethos_search::run_identity",
-            trailing_be_trigger_r = be_trigger,
-            trailing_give_back_r = give_back,
-            enforced_ceiling,
-            "the trail is LOOSER than the arm trigger — no measurement bounds this exit \
-             geometry, so the enforced payoff ceiling is the barrier arithmetic alone. The \
-             review measured payoff 2.53 at give-back 3.0 with expectancy −4.18 pips per \
-             trade: a payoff floor cannot refuse that configuration and only the \
-             net-expectancy gate can."
-        );
-    }
+    let trailing_armed_floor_payoff = (trail_on && give_back >= be_trigger && give_back > 0.0)
+        .then_some((min_lock - cost) / denom);
+    let trailing_ceiling_unmeasured = trail_on;
+    let enforced_ceiling = arithmetic_ceiling; // legacy field: diagnostic only
 
     Ok(PayoffCeiling {
         arithmetic_ceiling,
@@ -381,106 +305,24 @@ pub fn max_achievable_payoff(inputs: &PayoffCeilingInputs) -> Result<PayoffCeili
     })
 }
 
-/// THE CONFIG-IDENTITY GATE.
+/// Validate domains and return the configured payoff diagnostic.
 ///
-/// Refuses to start a run whose configured payoff floor exceeds what its own
-/// resolved (trailing config, SL clamp, TP clamp, cost) can produce. A floor of
-/// `0.0` disables the profile gate entirely and is always accepted.
-///
-/// BEHAVIOUR CHANGE, stated explicitly: a configuration that previously ran for
-/// hours and reported "0 survived" now REFUSES TO START and prints why. It
-/// permits nothing new. It refuses exactly one class of run: the one whose
-/// answer was fixed before a bar was read.
+/// Kept under the historical API name for existing callers. A measured sample
+/// or the full-stop barrier ratio cannot prove that a target average win/loss
+/// ratio is unreachable. The target itself is unchanged and is checked against
+/// the candidate's realized trades in the quality/validation funnel.
 pub fn assert_payoff_floor_reachable(
     configured_floor: f64,
     inputs: &PayoffCeilingInputs,
 ) -> Result<PayoffCeiling> {
-    let mut ceiling = max_achievable_payoff(inputs)?;
+    let mut diagnostic = max_achievable_payoff(inputs)?;
     if !configured_floor.is_finite() {
         bail!("configured payoff floor is not finite ({configured_floor})");
     }
-    // The floor's own break-even win rate, which is what the operator is really
-    // asking for when they set it.
-    ceiling.required_win_rate_at_floor = if configured_floor > 0.0 {
-        1.0 / (1.0 + configured_floor)
-    } else {
-        1.0 / (1.0 + ceiling.enforced_ceiling)
-    };
-
-    if configured_floor <= 0.0 {
-        return Ok(ceiling);
+    if configured_floor > 0.0 {
+        diagnostic.required_win_rate_at_floor = 1.0 / (1.0 + configured_floor);
     }
-    if configured_floor <= ceiling.enforced_ceiling {
-        return Ok(ceiling);
-    }
-
-    let trail_note = match ceiling.trailing_armed_floor_payoff {
-        Some(floor_payoff) => format!(
-            "\n  trailing:           ENABLED, arms at {:.2}R and gives back {:.2}R \
-             (give-back >= trigger, so the armed stop is floored at entry + {:.1} pips \
-             and is tested BEFORE the take-profit on every later bar).\n  \
-             every armed trade that is not a clean unretraced run to the take-profit \
-             exits for {:.2} pips net, i.e. a payoff of {:.3}.\n  \
-             MEASURED on real EURUSD bars under exactly this configuration: payoff 0.87 \
-             at sl6/tp45 AND 0.87 at sl6/tp300 (avg_win 6.10 vs 6.11 pips — the \
-             take-profit is dead code); best cell anywhere in the grid {:.2}.",
-            inputs.trailing_be_trigger_r,
-            inputs.trailing_give_back_r,
-            inputs.trailing_min_lock_pips,
-            inputs.trailing_min_lock_pips - inputs.cost_pips_round_trip,
-            floor_payoff,
-            MEASURED_TRAILING_PAYOFF_CEILING,
-        ),
-        None if ceiling.trailing_ceiling_unmeasured => format!(
-            "\n  trailing:           ENABLED and LOOSER than its trigger (arms at {:.2}R, \
-             gives back {:.2}R). No real-bar measurement covers this geometry, so the ceiling \
-             above is the barrier arithmetic alone — the review measured payoff 2.53 here at \
-             expectancy -4.18 pips per trade, which a payoff floor cannot refuse.",
-            inputs.trailing_be_trigger_r, inputs.trailing_give_back_r,
-        ),
-        None => "\n  trailing:           off — the ceiling above is the exact barrier \
-                 arithmetic."
-            .to_string(),
-    };
-
-    bail!(
-        "REFUSING TO START: the configured payoff floor is unreachable under this run's \
-         own settings. This is a report on the configuration, not on the market.\n\
-         \n  configured floor:   {floor:.3}  (models.prop_search_min_payoff_ratio)\n  \
-         achievable ceiling: {ceiling_v:.3}\n  \
-         binding constraint: {binding}\n\
-         \n  arithmetic ceiling (trail off): (tp_max {tp:.1} - cost {cost:.2}) / \
-         (sl_min {sl:.1} + cost {cost:.2}) = {arith:.3}\n  \
-         initialiser-only ceiling (rr <= {rr:.2}):                                  {init:.3}\
-         {trail_note}\n\
-         \n  WIN RATES at the ceiling barriers (sl {sl:.1} / tp {tp:.1}, cost {cost:.2} pips):\n    \
-         required by the configured floor : {req_wr:.2}%  (break-even at payoff {floor:.3})\n    \
-         cost-charged break-even          : {be_wr:.2}%\n    \
-         zero-edge base rate (driftless)  : {base_wr:.2}%\n    \
-         edge that must be paid for       : {edge:+.2} win-rate points\n\
-         \n  Every survival path in the quality screen is gated by \
-         `target_profile.accepts()` (discovery.rs), so with this floor the run's \
-         outcome is decided before a bar is read.\n  \
-         Fix one of: lower `models.prop_search_min_payoff_ratio`; turn the discovery \
-         trailing off; widen the take-profit clamp; or tighten the stop clamp. \
-         NOTE: none of those has any expected value in money — measured, expectancy \
-         held at -4.15 pips per trade while the payoff ratio moved from 0.91 to 2.53. \
-         They only make the question askable.",
-        floor = configured_floor,
-        ceiling_v = ceiling.enforced_ceiling,
-        binding = ceiling.binding.label(),
-        tp = inputs.tp_max_pips,
-        sl = inputs.sl_min_pips,
-        cost = inputs.cost_pips_round_trip,
-        arith = ceiling.arithmetic_ceiling,
-        rr = inputs.initializer_rr_max,
-        init = ceiling.initializer_ceiling,
-        trail_note = trail_note,
-        req_wr = ceiling.required_win_rate_at_floor * 100.0,
-        be_wr = ceiling.breakeven_win_rate_at_ceiling * 100.0,
-        base_wr = ceiling.zero_edge_base_rate * 100.0,
-        edge = ceiling.edge_points_required_to_break_even() * 100.0,
-    )
+    Ok(diagnostic)
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +456,8 @@ pub struct ResolvedConfigStamp {
 /// Everything except the hash, so the hash can be computed over it.
 #[derive(Serialize)]
 struct StampBody<'a> {
+    cpu_execution_source_sha256: &'a str,
+    search_algorithm_semantics: &'static str,
     schema_version: u16,
     symbol: &'a str,
     timeframe: &'a str,
@@ -673,6 +517,8 @@ struct StampBody<'a> {
 impl ResolvedConfigStamp {
     fn hash_body_v2(&self) -> StampBody<'_> {
         StampBody {
+            cpu_execution_source_sha256: cpu_execution_source_sha256(),
+            search_algorithm_semantics: SEARCH_ALGORITHM_SEMANTICS_V1,
             schema_version: self.schema_version,
             symbol: &self.symbol,
             timeframe: &self.timeframe,
@@ -1039,7 +885,7 @@ pub fn config_hash_for(
     .map(|s| s.config_hash)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PopulationAutoSelectionSemanticsV1 {
     schema_version: u16,
     resolved_config_stamp_hash: String,
@@ -1054,6 +900,8 @@ pub struct PopulationAutoSelectionSemanticsV1 {
     stage1_row_start: u64,
     stage1_row_end: u64,
     stage1_identity_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
 }
 
 /// Strict persisted authority for the selection-changing population decision.
@@ -1071,6 +919,10 @@ pub struct PopulationAutoSearchAuthorityV1 {
     population_auto_sizing_receipt:
         crate::population_auto_sizing_receipt_v1::PopulationAutoSizingReceiptV1,
     search_config_hash: String,
+    /// Legacy authorities omit the goal; new goal-aware runs bind it separately
+    /// from the unchanged resolved-config stamp schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
 }
 
 impl PopulationAutoSearchAuthorityV1 {
@@ -1092,6 +944,10 @@ impl PopulationAutoSearchAuthorityV1 {
         &self.search_config_hash
     }
 
+    pub const fn growth_goal(&self) -> Option<crate::scoring::RiskyGrowthGoal> {
+        self.growth_goal
+    }
+
     fn semantic_projection_unchecked_v1(&self) -> Result<PopulationAutoSelectionSemanticsV1> {
         let receipt = &self.population_auto_sizing_receipt;
         let stage1 = receipt.stage1_window();
@@ -1109,6 +965,7 @@ impl PopulationAutoSearchAuthorityV1 {
             stage1_row_start: stage1.row_start(),
             stage1_row_end: stage1.row_end(),
             stage1_identity_sha256: stage1.identity_sha256().to_owned(),
+            growth_goal: self.growth_goal,
         })
     }
 
@@ -1137,6 +994,13 @@ impl PopulationAutoSearchAuthorityV1 {
             .map_err(anyhow::Error::new)?;
         let stamp = &self.resolved_config_stamp;
         let receipt = &self.population_auto_sizing_receipt;
+        if let Some(goal) = self.growth_goal {
+            anyhow::ensure!(
+                stamp.mode == "risky",
+                "growth goal requires Risky selection mode"
+            );
+            goal.validate().map_err(anyhow::Error::msg)?;
+        }
         anyhow::ensure!(
             stamp.population == receipt.resolved_population(),
             "resolved-config population is detached from its sizing receipt"
@@ -1186,6 +1050,16 @@ pub fn build_population_auto_search_authority_v1(
     normalize_features: bool,
 ) -> Result<PopulationAutoSearchAuthorityV1> {
     receipt.validate().map_err(anyhow::Error::new)?;
+    let growth_goal = matches!(config.mode, crate::discovery::DiscoveryMode::Risky).then_some(
+        crate::scoring::RiskyGrowthGoal {
+            start_balance: config.risky_start_balance,
+            target_balance: config.risky_target_balance,
+            horizon_days: config.risky_horizon_days,
+        },
+    );
+    if let Some(goal) = growth_goal {
+        goal.validate().map_err(anyhow::Error::msg)?;
+    }
     anyhow::ensure!(
         config.population == receipt.configured_population(),
         "requested DiscoveryConfig population does not match the sizing receipt"
@@ -1217,6 +1091,7 @@ pub fn build_population_auto_search_authority_v1(
         resolved_config_stamp,
         population_auto_sizing_receipt: receipt.clone(),
         search_config_hash: String::new(),
+        growth_goal,
     };
     authority.search_config_hash = authority.computed_search_config_hash_v1()?;
     authority.validate()?;
@@ -1294,6 +1169,8 @@ pub fn stamp_resolved_config(
         crate::discovery::Stage1Window::MostRecent => "most_recent",
     };
     let body = StampBody {
+        cpu_execution_source_sha256: cpu_execution_source_sha256(),
+        search_algorithm_semantics: SEARCH_ALGORITHM_SEMANTICS_V1,
         schema_version: RESOLVED_CONFIG_STAMP_SCHEMA_VERSION_V2,
         symbol: &config.evaluation_symbol,
         timeframe: &config.timeframe_label,
@@ -1445,8 +1322,9 @@ mod tests {
         let c = max_achievable_payoff(&i).unwrap();
         // (45 - 2.89) / (6 + 2.89) = 42.11 / 8.89
         assert!((c.arithmetic_ceiling - (42.11 / 8.89)).abs() < 1e-9);
-        // Initialiser can only draw tp <= 2.5 * 6 = 15 → (15 - 2.89)/8.89.
-        assert!((c.initializer_ceiling - (12.11 / 8.89)).abs() < 1e-9);
+        // Initializer optimum: SL=45/2.5=18, TP=45. Moving SL below the
+        // TP/RR kink increases the relative cost and REDUCES this ratio.
+        assert!((c.initializer_ceiling - (42.11 / 20.89)).abs() < 1e-9);
         assert!(c.trailing_armed_floor_payoff.is_none());
         assert_eq!(c.binding, BindingConstraint::StopClamp);
         // With the trail off the enforced ceiling is the arithmetic one.
@@ -1467,11 +1345,12 @@ mod tests {
     }
 
     #[test]
-    fn trailing_regime_lowers_the_enforced_ceiling_to_the_measured_one() {
+    fn trailing_sample_average_does_not_replace_the_barrier_diagnostic() {
         let i = production_inputs();
         let c = max_achievable_payoff(&i).unwrap();
-        assert_eq!(c.binding, BindingConstraint::TrailingGiveBack);
-        assert!((c.enforced_ceiling - MEASURED_TRAILING_PAYOFF_CEILING).abs() < 1e-12);
+        assert_eq!(c.binding, BindingConstraint::StopClamp);
+        assert_eq!(c.enforced_ceiling, c.arithmetic_ceiling);
+        assert!(c.trailing_ceiling_unmeasured);
         // The armed trade's floor exit is (2.0 - 2.89) / 8.89 — NEGATIVE. The
         // trail turns a would-be loser into a small loss dressed as a win, which
         // is exactly the mechanism that pinned the measured payoff near 1.0.
@@ -1481,23 +1360,14 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_refuses_the_run_that_produced_zero_of_174() {
-        let i = production_inputs();
-        let err = assert_payoff_floor_reachable(2.0, &i).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("REFUSING TO START"), "{msg}");
-        // Both numbers must be printed.
-        assert!(msg.contains("2.000"), "configured floor missing: {msg}");
-        assert!(msg.contains("1.080"), "ceiling missing: {msg}");
-        // The binding constraint must be named.
-        assert!(msg.contains("trailing give-back"), "{msg}");
-        // The required win rate next to the zero-edge base rate.
-        assert!(msg.contains("zero-edge base rate"), "{msg}");
-        assert!(msg.contains("33.33%"), "1/(1+2) missing: {msg}");
-        // 6 / (6 + 45) = 11.7647%
-        assert!(msg.contains("11.76%"), "driftless base rate missing: {msg}");
-        // (6 + 2.89) / 51 = 17.4314%
-        assert!(msg.contains("17.43%"), "break-even win rate missing: {msg}");
+    fn valid_payoff_targets_are_evaluated_not_prejudged_by_a_historical_sample() {
+        let inputs = production_inputs();
+        for target in [2.0, 5.0, 20.0] {
+            let diagnostic = assert_payoff_floor_reachable(target, &inputs)
+                .expect("a sample average is not a universal performance bound");
+            assert_eq!(diagnostic.required_win_rate_at_floor, 1.0 / (1.0 + target));
+        }
+        assert!(assert_payoff_floor_reachable(f64::NAN, &inputs).is_err());
     }
 
     #[test]
@@ -1515,54 +1385,42 @@ mod tests {
         i.trailing_enabled = false;
         let c = assert_payoff_floor_reachable(2.0, &i).expect("reachable with the trail off");
         assert!(c.enforced_ceiling > 2.0);
-        // …and it must still refuse a floor above the arithmetic ceiling.
-        assert!(assert_payoff_floor_reachable(5.0, &i).is_err());
+        // A partial loss at a timeout can make the realized payoff larger
+        // than the full-SL reference even with trailing disabled.
+        assert!(assert_payoff_floor_reachable(5.0, &i).is_ok());
     }
 
-    /// UPDATED 2026-08-09 — the previous version of this test encoded the hole
-    /// the review found. It asserted that `give_back = 0.4` escapes the measured
-    /// ceiling, on the reasoning that the armed stop sits ABOVE entry and so the
-    /// geometry differs from the measured one. The geometry does differ; the
-    /// BOUND does not. A tighter give-back concedes the exit EARLIER, so its
-    /// average win — and therefore its payoff — cannot exceed the measured
-    /// point's. The old rule let `trailing_stop_multiplier: 0.5` walk past the
-    /// gate into a configuration whose realised payoff is strictly LOWER than
-    /// the one being refused.
     #[test]
-    fn a_tighter_trail_than_the_measured_one_is_still_bounded_by_it() {
-        let mut i = production_inputs();
-        i.trailing_give_back_r = 0.4;
-        let c = max_achievable_payoff(&i).unwrap();
-        assert_eq!(c.binding, BindingConstraint::TrailingGiveBack);
-        assert!((c.enforced_ceiling - MEASURED_TRAILING_PAYOFF_CEILING).abs() < 1e-12);
-        assert!(!c.trailing_ceiling_unmeasured);
-        // The armed stop is above entry here, so the min-lock collapse value is
-        // NOT applicable and must not be reported as if it were.
-        assert!(c.trailing_armed_floor_payoff.is_none());
-        // And the gate refuses the 2.0 floor for it, as it does for the measured
-        // point — the whole reason the hole mattered.
-        assert!(assert_payoff_floor_reachable(2.0, &i).is_err());
+    fn tight_and_loose_trails_both_require_realized_trade_evidence() {
+        for give_back in [0.4, 1.0, 3.0] {
+            let mut inputs = production_inputs();
+            inputs.trailing_give_back_r = give_back;
+            let diagnostic = assert_payoff_floor_reachable(2.0, &inputs).unwrap();
+            assert!(diagnostic.trailing_ceiling_unmeasured);
+            assert_ne!(diagnostic.binding, BindingConstraint::TrailingGiveBack);
+            assert_eq!(diagnostic.enforced_ceiling, diagnostic.arithmetic_ceiling);
+            assert_eq!(
+                diagnostic.trailing_armed_floor_payoff.is_some(),
+                give_back >= 1.0
+            );
+        }
     }
 
-    /// The other direction, which the review's proposed fix would have got
-    /// wrong: a LOOSER trail pays MORE. The same review measured payoff 2.53 at
-    /// give-back 3.0, so borrowing the 1.08 number there would be a FALSE
-    /// REFUSAL of a configuration that demonstrably reaches 2.0. The gate must
-    /// fall back to barrier arithmetic and SAY that nothing measured covers it.
     #[test]
-    fn a_looser_trail_than_the_measured_one_is_unmeasured_not_refused() {
-        let mut i = production_inputs();
-        i.trailing_give_back_r = 3.0;
-        let c = max_achievable_payoff(&i).unwrap();
-        assert!(
-            c.trailing_ceiling_unmeasured,
-            "the ledger must be able to identify a run that passed for this reason"
-        );
-        assert!((c.enforced_ceiling - c.arithmetic_ceiling).abs() < 1e-12);
-        assert_ne!(c.binding, BindingConstraint::TrailingGiveBack);
-        // Payoff 2.53 was measured here at expectancy -4.18 pips per trade. The
-        // payoff floor cannot refuse it; only the net-expectancy gate can.
-        assert!(assert_payoff_floor_reachable(2.0, &i).is_ok());
+    fn initializer_reference_matches_an_independent_grid_maximum() {
+        let mut inputs = production_inputs();
+        inputs.trailing_enabled = false;
+        for cost in [0.0, 0.5, 2.89] {
+            inputs.cost_pips_round_trip = cost;
+            let result = max_achievable_payoff(&inputs).unwrap();
+            let mut observed = 0.0_f64;
+            for step in 0..=14_000 {
+                let sl = 6.0 + f64::from(step) / 1_000.0;
+                let tp = (2.5 * sl).min(45.0);
+                observed = observed.max((tp - cost) / (sl + cost));
+            }
+            assert!((result.initializer_ceiling - observed).abs() < 1e-12);
+        }
     }
 
     #[test]
@@ -1573,7 +1431,9 @@ mod tests {
         let c = max_achievable_payoff(&i).unwrap();
         assert_eq!(c.arithmetic_ceiling, 0.0);
         assert_eq!(c.binding, BindingConstraint::CostExceedsTakeProfit);
-        assert!(assert_payoff_floor_reachable(0.5, &i).is_err());
+        // Costs still appear explicitly; candidate net profitability remains
+        // mandatory downstream rather than inferred from this coarse input.
+        assert!(assert_payoff_floor_reachable(0.5, &i).is_ok());
     }
 
     #[test]
@@ -1649,6 +1509,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_arithmetic_cannot_reuse_the_current_config_cache_key() {
+        let mut config = DiscoveryConfig::default();
+        config.evaluation_symbol = "EURUSD".to_owned();
+        config.target_profile.min_payoff_ratio = 0.5;
+        config.evaluation_spread_pips = 1.89;
+        config.evaluation_commission_per_trade = 10.0;
+        let mut inputs = production_inputs();
+        inputs.cost_pips_round_trip = cost_pips_round_trip(
+            config.evaluation_spread_pips,
+            config.evaluation_commission_per_trade,
+            10.0,
+        );
+        let diagnostic = assert_payoff_floor_reachable(0.5, &inputs).unwrap();
+        let mut stamp = stamp_resolved_config(&config, &inputs, diagnostic, 10.0, false).unwrap();
+        let mut old_body = serde_json::to_value(stamp.hash_body_v2()).unwrap();
+        let source = old_body
+            .as_object_mut()
+            .unwrap()
+            .remove("cpu_execution_source_sha256")
+            .unwrap();
+        assert_eq!(source.as_str(), Some(cpu_execution_source_sha256()));
+        let old_hash = crate::artifact_io::stable_json_hash(&old_body).unwrap();
+        assert_ne!(stamp.config_hash, old_hash);
+        stamp.config_hash = old_hash;
+        assert!(
+            stamp
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("self-hash mismatch")
+        );
+    }
+
+    #[test]
     fn the_stamp_separates_population_auto_and_stage1_search_semantics() {
         let mut base = crate::discovery::DiscoveryConfig::default();
         base.target_profile.min_payoff_ratio = 0.5;
@@ -1720,6 +1614,371 @@ mod tests {
             stamp_for(&first_order),
             stamp_for(&opposite_order),
             "HashMap insertion order must not change the canonical config hash"
+        );
+    }
+
+    #[test]
+    fn current_algorithm_token_is_mandatory_and_rejects_old_or_missing_versions() {
+        let config = DiscoveryConfig {
+            evaluation_symbol: "EURUSD".to_owned(),
+            evaluation_spread_pips: 1.89,
+            evaluation_commission_per_trade: 10.0,
+            ..DiscoveryConfig::default()
+        };
+        let mut inputs = production_inputs();
+        inputs.cost_pips_round_trip = cost_pips_round_trip(
+            config.evaluation_spread_pips,
+            config.evaluation_commission_per_trade,
+            10.0,
+        );
+        let ceiling =
+            assert_payoff_floor_reachable(config.target_profile.min_payoff_ratio, &inputs).unwrap();
+        let stamp = stamp_resolved_config(&config, &inputs, ceiling, 10.0, false).unwrap();
+        assert_eq!(stamp.config_hash, stamp.computed_config_hash_v2().unwrap());
+        assert_eq!(
+            stamp.config_hash,
+            stamp_resolved_config(&config, &inputs, ceiling, 10.0, false)
+                .unwrap()
+                .config_hash
+        );
+
+        let mut old_body = stamp.hash_body_v2();
+        old_body.search_algorithm_semantics = "neoethos.search.algorithm.two-way.v0";
+        let old_hash = crate::artifact_io::stable_json_hash(&old_body).unwrap();
+        let encoded = serde_json::to_string(&stamp.hash_body_v2()).unwrap();
+        let field = format!(
+            "\"search_algorithm_semantics\":{},",
+            serde_json::to_string(SEARCH_ALGORITHM_SEMANTICS_V1).unwrap()
+        );
+        assert_eq!(encoded.matches(&field).count(), 1);
+        // Preserve every other byte and its order, including the CURRENT source
+        // digest: refusal must depend on the algorithm token, not map ordering.
+        let missing = encoded.replacen(&field, "", 1);
+        let missing_hash = format!(
+            "fnv64:{:016x}",
+            crate::artifact_io::fnv1a64(missing.as_bytes())
+        );
+        for obsolete_hash in [old_hash, missing_hash] {
+            assert_ne!(obsolete_hash, stamp.config_hash);
+            let mut obsolete = stamp.clone();
+            obsolete.config_hash = obsolete_hash;
+            let decoded: ResolvedConfigStamp =
+                serde_json::from_slice(&serde_json::to_vec(&obsolete).unwrap()).unwrap();
+            assert!(
+                decoded
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("self-hash mismatch")
+            );
+        }
+    }
+
+    fn cpu_selection_authority_fixture() -> (
+        DiscoveryConfig,
+        crate::population_auto_sizing_receipt_v1::PopulationAutoSizingReceiptV1,
+    ) {
+        use crate::population_auto_sizing_receipt_v1::{
+            CpuPopulationAutoCalibrationV1, PopulationAutoSizingRequestV1,
+            PopulationAutoSizingRouteV1, seal_cpu_population_auto_plan_v1,
+            seal_population_auto_sizing_receipt_v1, seal_population_auto_stage1_window_v1,
+        };
+        let config = DiscoveryConfig {
+            population: 200,
+            population_auto: true,
+            max_indicators: 4,
+            evaluation_symbol: "EURUSD".to_owned(),
+            evaluation_spread_pips: 1.89,
+            evaluation_commission_per_trade: 10.0,
+            runtime_overrides: crate::discovery::DiscoveryRuntimeOverrides {
+                funnel_stage1_pct: 0.25,
+                stage1_window: crate::discovery::Stage1Window::Earliest,
+                ..Default::default()
+            },
+            ..DiscoveryConfig::default()
+        };
+        // Synthetic measurements exercise the real CPU receipt/authority
+        // builders, not a device probe, financial permit, or runtime benchmark.
+        let cpu_plan = seal_cpu_population_auto_plan_v1(
+            CpuPopulationAutoCalibrationV1 {
+                worker_count: 2,
+                calibration_candidates: 8,
+                calibration_elapsed_ns: 1_000_000_000,
+                available_memory_bytes: 8 * 1024 * 1024 * 1024,
+                total_memory_bytes: 8 * 1024 * 1024 * 1024,
+            },
+            25,
+            12,
+            4,
+        )
+        .unwrap();
+        let receipt = seal_population_auto_sizing_receipt_v1(PopulationAutoSizingRequestV1 {
+            population_auto: true,
+            configured_population: 200,
+            resident_parent_rows: 100,
+            evaluation_rows: 25,
+            feature_count: 4,
+            month_capacity: 12,
+            requested_max_indicators: 4,
+            migration_enabled: false,
+            parent_canonical_scope_identity_sha256: "a".repeat(64),
+            parent_dataset_identity_sha256: "b".repeat(64),
+            stage1_window: seal_population_auto_stage1_window_v1(
+                &"b".repeat(64),
+                "selection_stage1",
+                0,
+                25,
+            )
+            .unwrap(),
+            route: PopulationAutoSizingRouteV1::CpuExplicitResearch {
+                contract_identity_sha256: "c".repeat(64),
+                input_receipt_sha256: "d".repeat(64),
+            },
+            cpu_plan: Some(cpu_plan),
+        })
+        .unwrap();
+        (config, receipt)
+    }
+
+    #[test]
+    fn algorithm_version_propagates_through_the_actual_cpu_selection_hash() {
+        let (config, receipt) = cpu_selection_authority_fixture();
+        let current =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        current.validate().unwrap();
+        assert_eq!(
+            current.search_config_hash(),
+            population_auto_semantic_config_hash_for_v1(&config, &receipt, 10.0, false).unwrap()
+        );
+        let mut old_body = current.resolved_config_stamp.hash_body_v2();
+        old_body.search_algorithm_semantics = "neoethos.search.algorithm.two-way.v0";
+        let old_hash = crate::artifact_io::stable_json_hash(&old_body).unwrap();
+        let mut old = current.clone();
+        old.resolved_config_stamp.config_hash = old_hash;
+        // Even recomputing the outer unkeyed identity cannot repair an old
+        // inner algorithm stamp. This is the method the real CPU path hashes.
+        old.search_config_hash = old.computed_search_config_hash_v1().unwrap();
+        assert_ne!(old.search_config_hash, current.search_config_hash);
+        assert!(
+            old.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("self-hash mismatch")
+        );
+    }
+
+    #[test]
+    fn population_auto_growth_goal_changes_selection_hash_and_roundtrips() {
+        let (mut config, receipt) = cpu_selection_authority_fixture();
+        config.mode = crate::discovery::DiscoveryMode::Risky;
+        config.risky_start_balance = 100.0;
+        config.risky_target_balance = 50_000.0;
+        config.risky_horizon_days = 180.0;
+        let original =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        let expected_goal = crate::scoring::RiskyGrowthGoal {
+            start_balance: 100.0,
+            target_balance: 50_000.0,
+            horizon_days: 180.0,
+        };
+        assert_eq!(original.growth_goal(), Some(expected_goal));
+        let encoded = serde_json::to_vec(&original).unwrap();
+        let restored: PopulationAutoSearchAuthorityV1 = serde_json::from_slice(&encoded).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, original);
+
+        for field in 0..3 {
+            let mut changed = config.clone();
+            match field {
+                0 => changed.risky_start_balance = 200.0,
+                1 => changed.risky_target_balance = 60_000.0,
+                _ => changed.risky_horizon_days = 240.0,
+            }
+            let authority =
+                build_population_auto_search_authority_v1(&changed, &receipt, 10.0, false).unwrap();
+            // The old stamp does not contain these fields: the additional
+            // semantic projection must bind all three independently.
+            assert_eq!(
+                authority.resolved_config_stamp(),
+                original.resolved_config_stamp()
+            );
+            assert_ne!(
+                authority.search_config_hash(),
+                original.search_config_hash()
+            );
+            assert!(!authority.semantically_matches(&original).unwrap());
+        }
+        let mut tampered = original.clone();
+        tampered.growth_goal.as_mut().unwrap().horizon_days = 240.0;
+        assert!(
+            tampered
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("semantic hash mismatch")
+        );
+    }
+
+    #[test]
+    fn population_auto_growth_goal_rejects_malformed_and_wrong_mode() {
+        let (mut config, receipt) = cpu_selection_authority_fixture();
+        config.mode = crate::discovery::DiscoveryMode::Risky;
+        config.risky_start_balance = 100.0;
+        config.risky_target_balance = 50_000.0;
+        config.risky_horizon_days = 180.0;
+        let original =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        for field in 0..3 {
+            let mut invalid = config.clone();
+            match field {
+                0 => invalid.risky_start_balance = 0.0,
+                1 => invalid.risky_target_balance = invalid.risky_start_balance,
+                _ => invalid.risky_horizon_days = f64::NAN,
+            }
+            assert!(
+                build_population_auto_search_authority_v1(&invalid, &receipt, 10.0, false).is_err()
+            );
+        }
+        let mut malformed = original.clone();
+        malformed.growth_goal.as_mut().unwrap().horizon_days = 0.0;
+        malformed.search_config_hash = malformed.computed_search_config_hash_v1().unwrap();
+        assert!(malformed.validate().is_err());
+        for mode in [
+            crate::discovery::DiscoveryMode::PropFirm,
+            crate::discovery::DiscoveryMode::Strict,
+        ] {
+            config.mode = mode;
+            let mut wrong_mode =
+                build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+            assert_eq!(wrong_mode.growth_goal(), None);
+            wrong_mode.growth_goal = original.growth_goal();
+            wrong_mode.search_config_hash = wrong_mode.computed_search_config_hash_v1().unwrap();
+            assert!(
+                wrong_mode
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires Risky selection mode")
+            );
+        }
+    }
+
+    #[test]
+    fn population_auto_growth_goal_preserves_none_wire_and_matches_live_policy() {
+        let (mut config, receipt) = cpu_selection_authority_fixture();
+        config.mode = crate::discovery::DiscoveryMode::Risky;
+        config.risky_start_balance = 100.0;
+        config.risky_target_balance = 50_000.0;
+        config.risky_horizon_days = 180.0;
+        let authority =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        let stamp = authority.resolved_config_stamp();
+        // Use explicit local scalars; the test must not resolve ambient broker
+        // metadata or mutate the operation's settings to exercise this boundary.
+        let mut evaluation = crate::genetic::EvaluationConfig {
+            symbol: stamp.symbol.clone(),
+            account_currency: "USD".to_owned(),
+            initial_equity: stamp.initial_balance,
+            trailing_enabled: stamp.trailing_enabled,
+            trailing_atr_multiplier: stamp.trailing_give_back_r,
+            trailing_be_trigger_r: stamp.trailing_be_trigger_r,
+            trailing_min_lock_pips: stamp.trailing_min_lock_pips,
+            pip_value: 0.0001,
+            spread_pips: stamp.spread_pips,
+            commission_per_trade: stamp.commission_per_trade,
+            pip_value_per_lot: stamp.pip_value_per_lot,
+            swap_long_pips_per_day: stamp.swap_long_pips_per_day,
+            swap_short_pips_per_day: stamp.swap_short_pips_per_day,
+            pnl_conversion_fee_rate: 0.0,
+            kill_zones_enabled: stamp.kill_zones_enabled,
+            session_spread_pips: stamp.session_spread_pips,
+            risk_per_trade_min: stamp.risk_per_trade_min,
+            risk_per_trade_max: stamp.risk_per_trade_max,
+            growth_objective: true,
+            growth_goal: authority.growth_goal(),
+            ..crate::genetic::EvaluationConfig::default()
+        };
+        let adaptive = crate::stop_target::ResolvedAdaptiveStopsPolicyV1::checked_new(
+            crate::stop_target::StopTargetSettings {
+                vol_estimator: "parkinson".to_owned(),
+                atr_stop_multiplier: 1.5,
+                ..crate::stop_target::StopTargetSettings::default()
+            },
+            true,
+            2.0,
+        )
+        .unwrap();
+        let policy = crate::live_portfolio::LiveTradingPolicyV1::from_search_authority(
+            &authority,
+            &evaluation,
+            false,
+            &adaptive,
+        )
+        .unwrap();
+        assert_eq!(
+            policy.sealed_evaluation_config().unwrap().growth_goal,
+            authority.growth_goal()
+        );
+        evaluation.growth_goal.as_mut().unwrap().horizon_days = 240.0;
+        assert!(
+            crate::live_portfolio::LiveTradingPolicyV1::from_search_authority(
+                &authority,
+                &evaluation,
+                false,
+                &adaptive,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("growth goal disagrees")
+        );
+        evaluation.growth_goal = None;
+        assert!(
+            crate::live_portfolio::LiveTradingPolicyV1::from_search_authority(
+                &authority,
+                &evaluation,
+                false,
+                &adaptive,
+            )
+            .is_err()
+        );
+
+        // Compatibility is for current-source legacy None framing, not a
+        // relaxation of the resolved stamp's compiled-source identity check.
+        let mut legacy = authority.clone();
+        legacy.growth_goal = None;
+        legacy.search_config_hash = legacy.computed_search_config_hash_v1().unwrap();
+        legacy.validate().unwrap();
+        let mut old_projection =
+            serde_json::to_value(authority.selection_semantics_v1().unwrap()).unwrap();
+        old_projection
+            .as_object_mut()
+            .unwrap()
+            .remove("growth_goal");
+        assert_eq!(
+            serde_json::to_value(legacy.selection_semantics_v1().unwrap()).unwrap(),
+            old_projection
+        );
+        let encoded = serde_json::to_vec(&legacy).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("growth_goal"));
+        let restored: PopulationAutoSearchAuthorityV1 = serde_json::from_slice(&encoded).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), encoded);
+        crate::live_portfolio::LiveTradingPolicyV1::from_search_authority(
+            &restored,
+            &evaluation,
+            false,
+            &adaptive,
+        )
+        .unwrap();
+        evaluation.growth_goal = authority.growth_goal();
+        assert!(
+            crate::live_portfolio::LiveTradingPolicyV1::from_search_authority(
+                &restored,
+                &evaluation,
+                false,
+                &adaptive,
+            )
+            .is_err()
         );
     }
 

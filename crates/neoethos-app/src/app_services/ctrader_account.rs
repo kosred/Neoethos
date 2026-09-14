@@ -24,8 +24,6 @@ use crate::app_services::ctrader_messages::{
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CTRADER_DEAL_LOOKBACK_HOURS: i64 = 24;
@@ -62,6 +60,9 @@ pub struct CTraderPositionSnapshot {
     pub position_id: i64,
     pub symbol_id: i64,
     pub trade_side: String,
+    /// Positive broker wire volume, preserved exactly for close/reconcile requests.
+    pub volume_raw_centi_units: i64,
+    /// Base units for display; never reconstruct the wire volume from this value.
     pub volume: f64,
     pub open_timestamp_ms: Option<i64>,
     pub price: Option<f64>,
@@ -125,6 +126,16 @@ pub struct CTraderDealSnapshot {
     pub component_sum_account_currency: Option<f64>,
 }
 
+/// Account-scoped deal-history response with the broker's truncation bit.
+/// Callers that need absence/completeness proof must inspect `has_more`; a
+/// plain `Vec` cannot distinguish "all rows" from "first chunk only".
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderDealListBundle {
+    pub account_id: i64,
+    pub deals: Vec<CTraderDealSnapshot>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CTraderReconcileSnapshot {
     pub account_id: i64,
@@ -151,29 +162,6 @@ pub struct CTraderAccountRuntimeSnapshot {
     /// permitted because a wrong label changes the meaning of every monetary
     /// value in this snapshot.
     pub deposit_asset_name: String,
-}
-
-// The account-runtime backend (trait + production impl) loads trader balance /
-// reconcile / recent-deals for the live account panel. `dead_code` because the
-// production server doesn't yet poll account runtime through this seam — the
-// live engine wires it in Phase 2-5. Exercised today only by the stub in tests.
-#[allow(dead_code)]
-pub trait CTraderAccountRuntimeBackend: Send + Sync {
-    fn load_account_runtime(
-        &self,
-        request: &CTraderAccountRuntimeRequest,
-    ) -> Result<CTraderAccountRuntimeSnapshot>;
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Default)]
-pub struct ProductionCTraderAccountRuntimeBackend;
-
-#[cfg(test)]
-#[derive(Clone)]
-pub struct StubCTraderAccountRuntimeBackend {
-    outcome: Arc<Mutex<Option<Result<CTraderAccountRuntimeSnapshot, String>>>>,
-    last_request: Arc<Mutex<Option<CTraderAccountRuntimeRequest>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +239,8 @@ struct DealListPayload {
     ctid_trader_account_id: i64,
     #[serde(default, rename = "deal")]
     deals: Vec<DealPayload>,
+    #[serde(default, rename = "hasMore")]
+    has_more: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,6 +437,13 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
             .positions
             .into_iter()
             .map(|position| -> Result<CTraderPositionSnapshot> {
+                let volume_raw_centi_units = position.trade_data.volume;
+                anyhow::ensure!(
+                    volume_raw_centi_units > 0,
+                    "cTrader position {} has non-positive centi-unit volume: {}",
+                    position.position_id,
+                    volume_raw_centi_units
+                );
                 let (swap, commission, mirroring_commission, used_margin) =
                     if position.swap.is_some()
                         || position.commission.is_some()
@@ -484,7 +481,8 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
                     position_id: position.position_id,
                     symbol_id: position.trade_data.symbol_id,
                     trade_side: trade_side_label(position.trade_data.trade_side),
-                    volume: volume_to_units(position.trade_data.volume),
+                    volume_raw_centi_units,
+                    volume: volume_to_units(volume_raw_centi_units),
                     open_timestamp_ms: position.trade_data.open_timestamp,
                     price: position.price,
                     stop_loss: position.stop_loss,
@@ -519,6 +517,11 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
 }
 
 pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSnapshot>> {
+    Ok(parse_deal_list_bundle_response(response_json)?.deals)
+}
+
+/// Parse `ProtoOADealListRes` without discarding `hasMore`.
+pub fn parse_deal_list_bundle_response(response_json: &str) -> Result<CTraderDealListBundle> {
     let envelope: DealListEnvelope = serde_json::from_str(response_json)
         .context("failed to parse cTrader deal list response")?;
     if envelope.payload_type != CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE {
@@ -528,12 +531,16 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
         ));
     }
     let account_id = envelope.payload.ctid_trader_account_id;
-    Ok(envelope
-        .payload
-        .deals
-        .into_iter()
-        .map(|deal| deal_payload_to_snapshot(account_id, deal))
-        .collect::<Result<Vec<_>>>()?)
+    Ok(CTraderDealListBundle {
+        account_id,
+        deals: envelope
+            .payload
+            .deals
+            .into_iter()
+            .map(|deal| deal_payload_to_snapshot(account_id, deal))
+            .collect::<Result<Vec<_>>>()?,
+        has_more: envelope.payload.has_more,
+    })
 }
 
 /// Parse a `ProtoOADealListByPositionIdRes` (payload type 2180).
@@ -779,6 +786,7 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
         .account_id
         .parse::<i64>()
         .context("cTrader account id must be numeric")?;
+    anyhow::ensure!(account_id > 0, "cTrader account id must be positive");
     // Resilient: retry transient cold-connection / CANT_ROUTE failures and
     // surface the real cTrader error instead of a misleading "received N"
     // count. All 7 responses are required for a broker-truthful account
@@ -832,6 +840,22 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
         CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE,
     )?;
     ensure_success_payload_type(&responses[6], CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE)?;
+
+    // Every response after application authentication belongs to the requested
+    // account, even when its deal/position arrays are empty. Check the envelope
+    // before parsers discard it or asset names acquire monetary meaning.
+    for response in &responses[1..] {
+        let envelope = parse_open_api_envelope(response)?;
+        anyhow::ensure!(
+            envelope
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64)
+                == Some(account_id),
+            "cTrader account-runtime response identity differs from requested account {account_id} (payload type {})",
+            envelope.payload_type
+        );
+    }
 
     let trader = parse_trader_response(&responses[2])?;
     let reconcile = parse_reconcile_response(&responses[3])?;
@@ -892,7 +916,7 @@ fn resolve_deposit_asset_name(
     Ok(asset.name.clone())
 }
 
-fn reconcile_broker_unrealized_pnl(
+pub(super) fn reconcile_broker_unrealized_pnl(
     reconcile: &CTraderReconcileSnapshot,
     pnl: &CTraderUnrealizedPnLSnapshot,
 ) -> Result<BTreeMap<i64, CTraderPositionUnrealizedPnL>> {
@@ -903,6 +927,10 @@ fn reconcile_broker_unrealized_pnl(
             reconcile.account_id
         ));
     }
+
+    // Empty accounts still require a supported wire scale. Row-level scaling
+    // alone cannot validate moneyDigits when there are no position rows.
+    required_money_digits(Some(pnl.money_digits), "unrealized_pnl.money_digits")?;
 
     let mut open_ids = BTreeSet::new();
     for position in &reconcile.positions {
@@ -958,53 +986,6 @@ pub fn load_account_runtime(
 ) -> Result<CTraderAccountRuntimeSnapshot> {
     let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
     load_account_runtime_with_transport(&transport, request)
-}
-
-impl CTraderAccountRuntimeBackend for ProductionCTraderAccountRuntimeBackend {
-    fn load_account_runtime(
-        &self,
-        request: &CTraderAccountRuntimeRequest,
-    ) -> Result<CTraderAccountRuntimeSnapshot> {
-        load_account_runtime(request)
-    }
-}
-
-#[cfg(test)]
-impl StubCTraderAccountRuntimeBackend {
-    pub fn success(snapshot: CTraderAccountRuntimeSnapshot) -> Self {
-        Self {
-            outcome: Arc::new(Mutex::new(Some(Ok(snapshot)))),
-            last_request: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn failure(message: impl Into<String>) -> Self {
-        Self {
-            outcome: Arc::new(Mutex::new(Some(Err(message.into())))),
-            last_request: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn last_request(&self) -> Option<CTraderAccountRuntimeRequest> {
-        self.last_request.lock().expect("last request lock").clone()
-    }
-}
-
-#[cfg(test)]
-impl CTraderAccountRuntimeBackend for StubCTraderAccountRuntimeBackend {
-    fn load_account_runtime(
-        &self,
-        request: &CTraderAccountRuntimeRequest,
-    ) -> Result<CTraderAccountRuntimeSnapshot> {
-        *self.last_request.lock().expect("last request lock") = Some(request.clone());
-        let outcome = self
-            .outcome
-            .lock()
-            .expect("runtime outcome lock")
-            .take()
-            .unwrap_or_else(|| Err("stub cTrader account runtime backend exhausted".to_string()));
-        outcome.map_err(|message| anyhow!(message))
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1089,9 +1070,10 @@ struct HistoricalTradeDataPayload {
     close_timestamp: Option<u64>,
 }
 
-/// One historical order. `volume`/`executedVolume` are cents → lots via
-/// `volume_to_units` (NOT moneyDigits-scaled — `ProtoOAOrder` carries no
-/// moneyDigits). Prices pass through raw; all timestamps are ms.
+/// One historical order. Broker centi-units and base units remain distinct
+/// from lots. The parser cannot infer lots: the broker API consumer joins
+/// the same account/symbol's current lotSize separately, for display only.
+/// Prices pass through raw; all timestamps are ms.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CTraderHistoricalOrderSnapshot {
@@ -1101,8 +1083,13 @@ pub struct CTraderHistoricalOrderSnapshot {
     pub side: String,
     pub order_type: String,
     pub order_status: String,
-    pub volume_lots: f64,
+    pub volume_raw_centi_units: i64,
+    pub executed_volume_raw_centi_units: Option<i64>,
+    pub volume_units: f64,
+    pub executed_volume_units: Option<f64>,
+    pub volume_lots: Option<f64>,
     pub executed_volume_lots: Option<f64>,
+    pub lot_size_raw_centi_units: Option<i64>,
     pub execution_price: Option<f64>,
     pub limit_price: Option<f64>,
     pub stop_price: Option<f64>,
@@ -1127,20 +1114,33 @@ pub struct CTraderOrderHistoryBundle {
     pub account_id: i64,
     pub orders: Vec<CTraderHistoricalOrderSnapshot>,
     pub has_more: bool,
+    /// Current metadata observation, not proof of lotSize at historical fills.
+    pub lot_size_observed_at_unix_ms: Option<i64>,
+    pub lot_size_error: Option<String>,
 }
 
 fn historical_order_payload_to_snapshot(
     p: HistoricalOrderPayload,
-) -> CTraderHistoricalOrderSnapshot {
-    CTraderHistoricalOrderSnapshot {
+) -> Result<CTraderHistoricalOrderSnapshot> {
+    let volume_units = checked_reported_volume_to_units(p.trade_data.volume)?;
+    let executed_volume_units = p
+        .executed_volume
+        .map(checked_reported_volume_to_units)
+        .transpose()?;
+    Ok(CTraderHistoricalOrderSnapshot {
         order_id: p.order_id,
         position_id: p.position_id,
         symbol_id: p.trade_data.symbol_id,
         side: trade_side_label(p.trade_data.trade_side),
         order_type: order_type_label(p.order_type),
         order_status: order_status_label(p.order_status),
-        volume_lots: volume_to_units(p.trade_data.volume),
-        executed_volume_lots: p.executed_volume.map(volume_to_units),
+        volume_raw_centi_units: p.trade_data.volume,
+        executed_volume_raw_centi_units: p.executed_volume,
+        volume_units,
+        executed_volume_units,
+        volume_lots: None,
+        executed_volume_lots: None,
+        lot_size_raw_centi_units: None,
         execution_price: p.execution_price,
         limit_price: p.limit_price,
         stop_price: p.stop_price,
@@ -1157,7 +1157,7 @@ fn historical_order_payload_to_snapshot(
         close_timestamp_ms: p.trade_data.close_timestamp.map(|t| t as i64),
         expiration_timestamp_ms: p.expiration_timestamp,
         utc_last_update_timestamp_ms: p.utc_last_update_timestamp,
-    }
+    })
 }
 
 pub fn parse_order_list_response(response_json: &str) -> Result<CTraderOrderHistoryBundle> {
@@ -1172,12 +1172,14 @@ pub fn parse_order_list_response(response_json: &str) -> Result<CTraderOrderHist
     Ok(CTraderOrderHistoryBundle {
         account_id: envelope.payload.ctid_trader_account_id,
         has_more: envelope.payload.has_more,
+        lot_size_observed_at_unix_ms: None,
+        lot_size_error: None,
         orders: envelope
             .payload
             .order
             .into_iter()
             .map(historical_order_payload_to_snapshot)
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -1304,12 +1306,15 @@ struct ExpectedMarginEntryPayload {
     sell_margin: i64,
 }
 
-/// One (volume → buy/sell margin) entry. `moneyDigits` is on the PARENT Res,
-/// scaling buy/sellMargin; `volume` is cents → lots.
+/// One (volume → buy/sell margin) entry. Parent moneyDigits scales money,
+/// never volume. Lots stay absent until the requested symbol's lotSize is joined.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CTraderExpectedMarginEntry {
-    pub volume_lots: f64,
+    pub volume_raw_centi_units: i64,
+    pub volume_units: f64,
+    pub volume_lots: Option<f64>,
+    pub lot_size_raw_centi_units: Option<i64>,
     pub buy_margin: f64,
     pub sell_margin: f64,
 }
@@ -1318,7 +1323,11 @@ pub struct CTraderExpectedMarginEntry {
 #[serde(rename_all = "camelCase")]
 pub struct CTraderExpectedMarginBundle {
     pub account_id: i64,
+    /// The response does not echo symbolId; the API consumer binds the request.
+    pub symbol_id: Option<i64>,
     pub entries: Vec<CTraderExpectedMarginEntry>,
+    pub lot_size_observed_at_unix_ms: Option<i64>,
+    pub lot_size_error: Option<String>,
 }
 
 pub fn parse_expected_margin_response(response_json: &str) -> Result<CTraderExpectedMarginBundle> {
@@ -1334,13 +1343,19 @@ pub fn parse_expected_margin_response(response_json: &str) -> Result<CTraderExpe
         required_money_digits(envelope.payload.money_digits, "expectedMargin.moneyDigits")?;
     Ok(CTraderExpectedMarginBundle {
         account_id: envelope.payload.ctid_trader_account_id,
+        symbol_id: None,
+        lot_size_observed_at_unix_ms: None,
+        lot_size_error: None,
         entries: envelope
             .payload
             .margin
             .into_iter()
             .map(|m| -> Result<CTraderExpectedMarginEntry> {
                 Ok(CTraderExpectedMarginEntry {
-                    volume_lots: volume_to_units(m.volume),
+                    volume_raw_centi_units: m.volume,
+                    volume_units: checked_reported_volume_to_units(m.volume)?,
+                    volume_lots: None,
+                    lot_size_raw_centi_units: None,
                     buy_margin: scaled_money(m.buy_margin, digits)?,
                     sell_margin: scaled_money(m.sell_margin, digits)?,
                 })
@@ -1458,6 +1473,14 @@ fn required_money_digits(value: Option<u32>, field: &str) -> Result<u32> {
 
 fn volume_to_units(value: i64) -> f64 {
     value as f64 / 100.0
+}
+
+fn checked_reported_volume_to_units(value: i64) -> Result<f64> {
+    anyhow::ensure!(
+        (0..=crate::app_services::broker_deal_economics::MAX_EXACT_BROKER_VOLUME).contains(&value),
+        "cTrader reported an invalid or inexact centi-unit volume: {value}"
+    );
+    Ok(volume_to_units(value))
 }
 
 fn account_type_label(value: i32) -> String {

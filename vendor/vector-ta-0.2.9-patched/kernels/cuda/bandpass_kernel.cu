@@ -6,6 +6,11 @@
 #include <math_constants.h>
 #include <math.h>
 
+// M_PI is not standard C++; preserve binary64 pi on MSVC as well.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846264338327950288
+#endif
+
 
 static __forceinline__ __device__ bool is_finite_f32(float x) {
     return !isnan(x) && !isinf(x);

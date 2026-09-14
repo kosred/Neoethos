@@ -548,7 +548,7 @@ fn rl_runtime_metadata(
         CapabilityState::Implemented,
         feature_columns,
         canonical_three_class_label_mapping(),
-        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0),
+        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0, 0),
     )
 }
 
@@ -670,12 +670,16 @@ fn validate_rl_metadata(
             metadata.training_summary.dataset_rows
         );
     }
-    if metadata.training_summary.train_rows + metadata.training_summary.val_rows
-        != metadata.training_summary.dataset_rows
-    {
+    let accounted_rows = metadata
+        .training_summary
+        .train_rows
+        .checked_add(metadata.training_summary.embargo_rows)
+        .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows));
+    if accounted_rows != Some(metadata.training_summary.dataset_rows) {
         bail!(
-            "RL metadata rows are inconsistent: train_rows {} + val_rows {} != dataset_rows {}",
+            "RL metadata rows are inconsistent: train_rows {} + embargo_rows {} + val_rows {} != dataset_rows {}",
             metadata.training_summary.train_rows,
+            metadata.training_summary.embargo_rows,
             metadata.training_summary.val_rows,
             metadata.training_summary.dataset_rows
         );
@@ -703,16 +707,7 @@ fn resolve_rl_runtime_metadata(
                         metadata_path.display()
                     )
                 })?;
-            if metadata.model_name != reconstructed.model_name
-                || metadata.family != reconstructed.family
-                || metadata.state != reconstructed.state
-                || metadata.feature_columns != reconstructed.feature_columns
-                || metadata.label_mapping != reconstructed.label_mapping
-                || metadata.training_summary.dataset_rows
-                    != reconstructed.training_summary.dataset_rows
-                || metadata.training_summary.train_rows != reconstructed.training_summary.train_rows
-                || metadata.training_summary.val_rows != reconstructed.training_summary.val_rows
-            {
+            if metadata != reconstructed {
                 bail!(
                     "RL metadata sidecar mismatch with reconstructed runtime metadata at {}",
                     metadata_path.display()

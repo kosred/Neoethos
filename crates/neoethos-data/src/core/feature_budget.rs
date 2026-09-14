@@ -1,74 +1,20 @@
-//! Hardware-derived ceiling on how wide the indicator vocabulary may get.
+//! Hardware-derived working-set width for the Classic/vector-ta producer.
 //!
-//! # The number that forced this module to exist
+//! The frozen run plan admits a deterministic subset of indicator/period
+//! outputs against one measurement, sized at the largest direct source frame.
+//! Every timeframe then uses that same vocabulary; later memory pressure must
+//! never silently change its columns. Deferred IDs remain explicit in the
+//! admission report and can be covered by the existing streaming search.
 //!
-//! Repairing the two dispatch mistakes in `hpc_ta` takes the base-timeframe
-//! vocabulary from **66 columns to roughly 800** — a 12x multiplication of the
-//! widest object the system builds. That is the point of the fix, but a
-//! vocabulary that OOMs is not an improvement, so the width is capped by the
-//! MACHINE and never by a user parameter.
+//! This budget covers f64 staging, not every producer's scratch or the final
+//! f64-plus-validity cube. The retained-output preflight and higher-timeframe
+//! scheduler in lib.rs perform additional checks before feature computation.
+//! On Windows the live budget is bounded by process commit headroom as well as
+//! physical RAM. A probe is not an OS/process-wide reservation.
 //!
-//! ## The arithmetic, at the real shapes
-//!
-//! One f64 column is `rows * 8` bytes. At the 843,456-bar reference frame:
-//!
-//! | columns | bytes/column | per timeframe |
-//! |--------:|-------------:|--------------:|
-//! |      66 |     6.75 MB  |    **445 MB** (today) |
-//! |     233 |     6.75 MB  |    **1.57 GB** (shape fix alone) |
-//! |     804 |     6.75 MB  |    **5.43 GB** (shape fix + output enumeration) |
-//!
-//! The EURUSD M5 store actually holds **1,054,320** bars, where one column is
-//! 8.43 MB and 804 columns cost **6.78 GB per timeframe**.
-//!
-//! Downstream the cube narrows to f32 (`lib.rs` documents that narrowing), so
-//! the assembled 3-timeframe cube at 804 columns/TF is
-//! `843,456 * 2412 * 4 = 8.14 GB` — and `should_build_cube_in_ram` already
-//! sizes THAT against free RAM. What it does not size, and what this module
-//! does, is the f64 STAGING peak inside `compute_classic_ta_columns`: every
-//! column of one timeframe is live as a `Vec<f64>` before any of it reaches the
-//! cube.
-//!
-//! ## What is capped, and by what
-//!
-//! [`VocabularyBudget::for_frame`] converts free RAM into a maximum column
-//! count. It spends at most [`STAGING_RAM_FRACTION`] of *available* memory,
-//! never a constant, so the same binary produces a 66-column vocabulary on a
-//! laptop and an 800-column one on a 128 GB box without any flag being set.
-//!
-//! Two deliberate properties:
-//!
-//! * **The floor is the status quo.** [`MIN_COLUMNS`] is 66 — the vocabulary
-//!   every historical result was produced on. A machine too small to afford
-//!   more still gets exactly what it got before, with a WARN saying so. The cap
-//!   can never make the system worse than it was.
-//! * **The cut is deterministic and counted.** Ids are admitted in
-//!   `ALL_INDICATORS` order until the planned column count reaches the cap;
-//!   everything past it is recorded as `DropReason::OverBudget` with its name.
-//!   A truncated vocabulary is loud, not silent.
-//!
-//! ## Two properties that were WRONG in the first cut of this module
-//!
-//! Both were found by review and both were load-bearing:
-//!
-//! 1. **The budget must not be sized from the FRAME.** `for_frame(n)` called
-//!    once per timeframe made the admitted id set a function of that
-//!    timeframe's row count — base M5 (1,054,320 rows) truncated while H1
-//!    (70,288) and H4 (17,572) did not, so the per-TF cube widths diverged by
-//!    ~140 columns and `lib.rs`'s width invariant bailed the in-RAM cube to the
-//!    disk path on every run on any box under ~40 GB free. The column SET must
-//!    be a function of the id list and the machine, never of the frame. The
-//!    caller therefore sizes ONE budget from the run's WIDEST frame (the base
-//!    timeframe) via [`VocabularyBudget::for_run`] and passes it to every
-//!    timeframe — see `hpc_ta::compute_classic_ta_columns_sized`.
-//!
-//! 2. **The cap must cover EVERY stage that stages columns.** The period sweep
-//!    used to run entirely outside the budget, so `max_columns` was not the
-//!    peak: at the M5 store's depth its 130 columns are another 1.10 GB of
-//!    staging that nothing accounted for. [`VocabularyBudget::reserve`] carves
-//!    the sweep's planned width out FIRST — it is the historical vocabulary and
-//!    therefore has first claim — and the base pass is admitted against what is
-//!    left.
+//! MIN_COLUMNS preserves the historical planning floor; it is NOT permission
+//! to execute an unaffordable plan. A frozen plan that no longer fits must be
+//! refused or streamed without dropping its admitted columns.
 
 use crate::core::indicator_ledger::planned_output_count;
 
@@ -79,18 +25,15 @@ pub const STAGING_VALUE_BYTES: u64 = 8;
 
 /// Share of *available* RAM the f64 indicator staging buffers may occupy.
 ///
-/// A quarter, not a half: the same process is about to hold the f32 cube
-/// (sized separately by `should_build_cube_in_ram` at 1.5x + 2 GB), the source
-/// OHLCV, and rayon's per-worker transients. Peak is therefore a function of
-/// the machine at every step, which is the never-OOM invariant.
+/// A quarter leaves room for the f64-plus-validity cube, source OHLCV and
+/// per-worker transients. This planning fraction is not an OOM guarantee.
 pub const STAGING_RAM_FRACTION: f64 = 0.25;
 
 /// Never plan fewer columns than the vocabulary the system already had.
 ///
 /// 66 = 13 swept indicators x 5 periods + `ttm_trend`. Below this the cap would
-/// be a regression rather than a guard, so on a machine that cannot afford 66
-/// columns we take the memory risk and say so at WARN — the alternative is
-/// silently searching a smaller space than last week.
+/// change the requested search. Keep the plan and let execution preflight
+/// reject it if the measured allocation headroom is insufficient.
 pub const MIN_COLUMNS: usize = 66;
 
 /// Absolute ceiling regardless of how much RAM the box has.
@@ -101,18 +44,17 @@ pub const MIN_COLUMNS: usize = 66;
 /// message rather than an allocator.
 pub const MAX_COLUMNS_HARD_CEILING: usize = 4096;
 
-/// The reference frame used in this module's documented arithmetic — the bar
-/// count the operator's sizing question was asked at.
+/// Historical reference frame retained by the arithmetic regression tests.
 pub const REFERENCE_ROWS: usize = 843_456;
 
 /// Bytes one f64 column of `rows` values costs.
 pub const fn column_bytes(rows: usize) -> u64 {
-    rows as u64 * STAGING_VALUE_BYTES
+    (rows as u64).saturating_mul(STAGING_VALUE_BYTES)
 }
 
 /// Bytes `columns` f64 columns of `rows` values cost.
 pub const fn staging_bytes(rows: usize, columns: usize) -> u64 {
-    column_bytes(rows) * columns as u64
+    column_bytes(rows).saturating_mul(columns as u64)
 }
 
 /// A sized, hardware-derived plan for one timeframe's indicator vocabulary.
@@ -120,8 +62,8 @@ pub const fn staging_bytes(rows: usize, columns: usize) -> u64 {
 pub struct VocabularyBudget {
     /// Bars in the frame being built.
     pub rows: usize,
-    /// Free RAM the decision was made against, in bytes. `0` means the probe
-    /// failed, in which case the budget collapses to [`MIN_COLUMNS`].
+    /// Allocation headroom at planning time, in bytes. `0` means exhausted or
+    /// unknown; the planning floor is not permission to allocate it.
     pub available_bytes: u64,
     /// Bytes the staging buffers are allowed to occupy.
     pub budget_bytes: u64,
@@ -139,10 +81,9 @@ impl VocabularyBudget {
     /// Correct only for a single-frame build. A multi-timeframe build must use
     /// [`VocabularyBudget::for_run`] with the widest frame's row count and pass
     /// the SAME budget to every timeframe — otherwise the admitted id set (and
-    /// therefore the column width) varies per timeframe. See this module's
-    /// header, property 1.
+    /// therefore the column width) varies per timeframe.
     pub fn for_frame(rows: usize) -> Self {
-        Self::from_available(rows, neoethos_core::available_memory_bytes())
+        Self::from_available(rows, neoethos_core::allocation_headroom_bytes())
     }
 
     /// Size ONE budget for a whole multi-timeframe run from its WIDEST frame.
@@ -212,7 +153,7 @@ impl VocabularyBudget {
                 "{:.2}",
                 self.planned_bytes(admitted_planned_columns) as f64 / 1e9
             ),
-            "indicator vocabulary budget (f64 staging peak, derived from free RAM — never from a \
+            "indicator vocabulary budget (f64 staging, derived from allocation headroom — never from a \
              user parameter)"
         );
         if self.floor_binds {
@@ -223,8 +164,8 @@ impl VocabularyBudget {
                 available_gb = format!("{:.2}", self.available_bytes as f64 / 1e9),
                 min_columns = MIN_COLUMNS,
                 "this machine cannot afford even the historical {MIN_COLUMNS}-column vocabulary \
-                 within its staging budget; building it anyway because narrowing below the \
-                 status quo would be a silent regression. Expect memory pressure."
+                 within its staging budget; the planning floor does not authorize allocation. \
+                 Execution preflight must still admit the complete frozen output."
             );
         }
         if admitted_planned_columns < planned_columns {
@@ -323,6 +264,14 @@ mod tests {
         let b = VocabularyBudget::from_available(REFERENCE_ROWS, 0);
         assert_eq!(b.max_columns, MIN_COLUMNS);
         assert!(b.floor_binds);
+    }
+
+    #[test]
+    fn staging_size_overflow_cannot_wrap_into_an_affordable_plan() {
+        assert_eq!(staging_bytes(usize::MAX, usize::MAX), u64::MAX);
+        let budget = VocabularyBudget::from_available(usize::MAX, 1_000);
+        assert!(budget.floor_binds);
+        assert!(budget.planned_bytes(MIN_COLUMNS) > budget.budget_bytes);
     }
 
     #[test]

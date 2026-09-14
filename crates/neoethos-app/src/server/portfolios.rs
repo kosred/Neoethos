@@ -46,7 +46,7 @@ fn find_artifacts(root: &Path) -> Vec<PathBuf> {
         for ent in rd.flatten() {
             visited += 1;
             if visited > 200_000 {
-                break;
+                return out;
             }
             let p = ent.path();
             if p.is_dir() {
@@ -68,19 +68,14 @@ fn read_entry(p: &Path) -> PortfolioEntry {
         .map(|d| d.as_millis() as i64);
 
     let (mut symbol, mut base_tf, mut gene_count) = (None, None, None);
-    if let Ok(txt) = std::fs::read_to_string(p) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-            symbol = v.get("symbol").and_then(|x| x.as_str()).map(String::from);
-            base_tf = v
-                .get("base_tf")
-                .or_else(|| v.get("base_timeframe"))
-                .and_then(|x| x.as_str())
-                .map(String::from);
-            gene_count = v
-                .get("genes")
-                .or_else(|| v.get("full_genes"))
-                .and_then(|x| x.as_array())
-                .map(|a| a.len());
+    match neoethos_search::load_live_portfolio_json(p) {
+        Ok(artifact) => {
+            symbol = Some(artifact.symbol);
+            base_tf = Some(artifact.base_tf);
+            gene_count = Some(artifact.genes.len());
+        }
+        Err(error) => {
+            tracing::warn!(path = %p.display(), %error, "portfolio list found an invalid artifact");
         }
     }
 

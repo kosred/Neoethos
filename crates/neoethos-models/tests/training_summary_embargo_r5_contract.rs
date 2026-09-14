@@ -7,7 +7,15 @@ use syn::{
     Expr, ExprBinary, ExprCall, ImplItemFn, ItemFn, ItemStruct, Member, Pat, Stmt, Type, UseTree,
 };
 
-const AUTHORITY_SOURCE_FILE_COUNT: usize = 81;
+// Reviewed after retiring three superseded test-only GPU modules:
+// bayesian_gpu_tests.rs, adaptive_gpu_tests.rs, and adaptive_vfdt_gpu_tests.rs.
+// The complete recursive census also includes the four connected-input additions:
+// promotion_candidate_training_v1/codec.rs,
+// promotion_candidate_training_v1/compact_handoff_tests.rs,
+// promotion_candidate_training_v1/wire.rs, and runtime/feature_input.rs.
+// Also includes the reviewed private installer fixture exporter:
+// promotion_candidate_training_fixture_export_tests.rs.
+const AUTHORITY_SOURCE_FILE_COUNT: usize = 83;
 const SUMMARY_FILE: &str = "runtime/artifacts.rs";
 const BAYESIAN_PRODUCER_FILE: &str = "statistical/bayesian_impl.rs";
 const LINEAR_PRODUCER_FILE: &str = "statistical/linear_impl.rs";
@@ -107,7 +115,7 @@ fn type_is_usize(ty: &Type) -> bool {
 }
 
 #[test]
-fn recursive_81_file_ast_census_requires_typed_four_way_summary() {
+fn recursive_83_file_ast_census_requires_typed_four_way_summary() {
     let sources = parse_authority_sources();
     let mut declarations = Vec::new();
     for source in &sources {

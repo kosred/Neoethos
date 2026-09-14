@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail, ensure};
+use neoethos_core::research_conversion_fee::ResearchPnlConversionFeePolicyV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -135,6 +136,100 @@ pub struct CanonicalTrendbarResearchExecutionContractV3 {
     swap_long_pips_per_day: f64,
     swap_short_pips_per_day: f64,
     pnl_conversion_fee_rate: f64,
+    /// Mandatory nested policy version; pre-policy wire must not be reinterpreted.
+    pnl_conversion_fee_policy: ResearchPnlConversionFeePolicyV1,
+}
+
+/// Explicit compact wire body. Its receipt must come from the same enclosing
+/// artifact; attaching it restores and validates the unchanged V3 contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalTrendbarResearchExecutionContractRefV1 {
+    schema_version: u16,
+    contract_schema_version: u16,
+    contract_identity_sha256: String,
+    artifact_class: HistoricalResearchArtifactClassV1,
+    promotion_eligibility: HistoricalResearchPromotionEligibilityV1,
+    input_receipt_sha256: String,
+    symbol: String,
+    account_currency: String,
+    assumption_source_id: String,
+    assumption_source_sha256: String,
+    pip_size: f64,
+    pip_value_per_lot: f64,
+    screening_costs: CanonicalTrendbarScreeningCostEnvelopeV2,
+    swap_long_pips_per_day: f64,
+    swap_short_pips_per_day: f64,
+    pnl_conversion_fee_rate: f64,
+    pnl_conversion_fee_policy: ResearchPnlConversionFeePolicyV1,
+}
+
+impl CanonicalTrendbarResearchExecutionContractRefV1 {
+    pub fn from_contract(contract: &CanonicalTrendbarResearchExecutionContractV3) -> Result<Self> {
+        let contract_identity_sha256 = contract.identity_sha256()?;
+        Ok(Self {
+            schema_version: 1,
+            contract_schema_version: contract.schema_version,
+            contract_identity_sha256,
+            artifact_class: contract.artifact_class,
+            promotion_eligibility: contract.promotion_eligibility,
+            input_receipt_sha256: contract.input_receipt_sha256.clone(),
+            symbol: contract.symbol.clone(),
+            account_currency: contract.account_currency.clone(),
+            assumption_source_id: contract.assumption_source_id.clone(),
+            assumption_source_sha256: contract.assumption_source_sha256.clone(),
+            pip_size: contract.pip_size,
+            pip_value_per_lot: contract.pip_value_per_lot,
+            screening_costs: contract.screening_costs.clone(),
+            swap_long_pips_per_day: contract.swap_long_pips_per_day,
+            swap_short_pips_per_day: contract.swap_short_pips_per_day,
+            pnl_conversion_fee_rate: contract.pnl_conversion_fee_rate,
+            pnl_conversion_fee_policy: contract.pnl_conversion_fee_policy,
+        })
+    }
+
+    pub fn input_receipt_sha256(&self) -> &str {
+        &self.input_receipt_sha256
+    }
+
+    pub fn attach(
+        &self,
+        receipt: &CanonicalSearchInputReceiptV2,
+    ) -> Result<CanonicalTrendbarResearchExecutionContractV3> {
+        ensure!(
+            self.schema_version == 1,
+            "unsupported shared screening-contract schema"
+        );
+        validate_sha256("shared screening contract", &self.contract_identity_sha256)?;
+        ensure!(
+            receipt.identity_sha256().map_err(anyhow::Error::new)? == self.input_receipt_sha256,
+            "shared screening contract names a different receipt"
+        );
+        let contract = CanonicalTrendbarResearchExecutionContractV3 {
+            schema_version: self.contract_schema_version,
+            artifact_class: self.artifact_class,
+            promotion_eligibility: self.promotion_eligibility,
+            input_receipt: receipt.clone(),
+            input_receipt_sha256: self.input_receipt_sha256.clone(),
+            symbol: self.symbol.clone(),
+            account_currency: self.account_currency.clone(),
+            assumption_source_id: self.assumption_source_id.clone(),
+            assumption_source_sha256: self.assumption_source_sha256.clone(),
+            pip_size: self.pip_size,
+            pip_value_per_lot: self.pip_value_per_lot,
+            screening_costs: self.screening_costs.clone(),
+            swap_long_pips_per_day: self.swap_long_pips_per_day,
+            swap_short_pips_per_day: self.swap_short_pips_per_day,
+            pnl_conversion_fee_rate: self.pnl_conversion_fee_rate,
+            pnl_conversion_fee_policy: self.pnl_conversion_fee_policy,
+        };
+        contract.validate_against_receipt(receipt)?;
+        ensure!(
+            contract.identity_sha256()? == self.contract_identity_sha256,
+            "shared screening contract changed its exact identity"
+        );
+        Ok(contract)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,7 +276,13 @@ impl CanonicalTrendbarResearchExecutionContractV3 {
             )?,
             swap_long_pips_per_day: assumptions.swap_long_pips_per_day,
             swap_short_pips_per_day: assumptions.swap_short_pips_per_day,
-            pnl_conversion_fee_rate: assumptions.pnl_conversion_fee_rate,
+            pnl_conversion_fee_rate: effective_contract_conversion_fee_rate(
+                assumptions.symbol,
+                assumptions.account_currency,
+                assumptions.pnl_conversion_fee_rate,
+            )?,
+            pnl_conversion_fee_policy:
+                ResearchPnlConversionFeePolicyV1::AbsoluteRealizedPriceGrossDebitV1,
         };
         contract.validate()?;
         Ok(contract)
@@ -257,7 +358,67 @@ impl CanonicalTrendbarResearchExecutionContractV3 {
         self.pnl_conversion_fee_rate
     }
 
+    /// Compare the exact scalar account/cost inputs without rehashing the receipt.
+    /// Callers must separately validate this contract and their input binding.
+    /// This checks neither the remaining evaluation policy nor live authority.
+    pub fn validate_evaluation_costs(&self, evaluation: &crate::EvaluationConfig) -> Result<()> {
+        for (field, actual, expected) in [
+            ("symbol", evaluation.symbol.as_str(), self.symbol()),
+            (
+                "account_currency",
+                evaluation.account_currency.as_str(),
+                self.account_currency(),
+            ),
+        ] {
+            ensure!(
+                actual == expected,
+                "netted bar costs/account differ from the exact saved screening assumptions: {field} (evaluation {actual:?}, contract {expected:?})"
+            );
+        }
+        for (field, actual, expected) in [
+            ("pip_value", evaluation.pip_value, self.pip_size()),
+            (
+                "pip_value_per_lot",
+                evaluation.pip_value_per_lot,
+                self.pip_value_per_lot(),
+            ),
+            (
+                "spread_pips",
+                evaluation.spread_pips,
+                self.screening_spread_and_slippage_round_trip_pips(),
+            ),
+            (
+                "commission_per_trade",
+                evaluation.commission_per_trade,
+                self.round_trip_commission_account_per_lot(),
+            ),
+            (
+                "swap_long_pips_per_day",
+                evaluation.swap_long_pips_per_day,
+                self.swap_long_pips_per_day(),
+            ),
+            (
+                "swap_short_pips_per_day",
+                evaluation.swap_short_pips_per_day,
+                self.swap_short_pips_per_day(),
+            ),
+            (
+                "pnl_conversion_fee_rate",
+                evaluation.pnl_conversion_fee_rate,
+                self.pnl_conversion_fee_rate(),
+            ),
+        ] {
+            ensure!(
+                actual == expected,
+                "netted bar costs/account differ from the exact saved screening assumptions: {field} (evaluation {actual:?}, contract {expected:?})"
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
+        #[cfg(test)]
+        tests::CONTRACT_VALIDATIONS.with(|calls| calls.set(calls.get() + 1));
         ensure!(
             self.schema_version == CANONICAL_TRENDBAR_RESEARCH_EXECUTION_SCHEMA_VERSION_V3,
             "unsupported canonical-trendbar research contract schema {}",
@@ -298,6 +459,16 @@ impl CanonicalTrendbarResearchExecutionContractV3 {
         ensure!(
             (0.0..1.0).contains(&self.pnl_conversion_fee_rate),
             "pnl_conversion_fee_rate must be in [0, 1)"
+        );
+        ensure!(
+            effective_contract_conversion_fee_rate(
+                &self.symbol,
+                &self.account_currency,
+                self.pnl_conversion_fee_rate
+            )?
+            .to_bits()
+                == self.pnl_conversion_fee_rate.to_bits(),
+            "same-currency research contract must carry zero effective conversion fee"
         );
         Ok(())
     }
@@ -350,7 +521,8 @@ impl CanonicalTrendbarResearchExecutionContractV3 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalTrendbarResearchDiscoveryResultV3 {
     schema_version: u16,
     artifact_class: HistoricalResearchArtifactClassV1,
@@ -457,6 +629,9 @@ impl Drop for CanonicalTrendbarResearchExecutionScopeV3 {
 pub(crate) fn install_canonical_trendbar_research_execution_v3(
     contract: &CanonicalTrendbarResearchExecutionContractV3,
 ) -> Result<CanonicalTrendbarResearchExecutionScopeV3> {
+    // This is the trust boundary for every new scope, including decoded or
+    // caller-modified contracts. The published deep clone has no mutable access
+    // or interior mutability; changing the caller's copy cannot change it.
     contract.validate()?;
     let mut active = lock_active();
     if active.is_some() {
@@ -474,6 +649,8 @@ pub(crate) fn install_canonical_trendbar_research_execution_v3(
     Ok(CanonicalTrendbarResearchExecutionScopeV3 { token })
 }
 
+/// Return only the snapshot validated by installation, while its scope is active.
+/// The slot retains an Arc, so callers cannot obtain unique mutable access to it.
 pub(crate) fn active_canonical_trendbar_research_execution_v3()
 -> Option<Arc<CanonicalTrendbarResearchExecutionContractV3>> {
     lock_active()
@@ -522,6 +699,21 @@ fn validate_account_currency(value: &str) -> Result<()> {
         "account_currency must be an exact three-letter uppercase code"
     );
     Ok(())
+}
+
+fn effective_contract_conversion_fee_rate(symbol: &str, account: &str, rate: f64) -> Result<f64> {
+    use neoethos_core::research_conversion_fee::{
+        effective_conversion_fee_rate_v1, validate_conversion_fee_rate_v1,
+    };
+    validate_conversion_fee_rate_v1(rate).map_err(anyhow::Error::msg)?;
+    if rate == 0.0 {
+        return Ok(rate);
+    }
+    ensure!(
+        symbol.len() == 6 && symbol.bytes().all(|byte| byte.is_ascii_uppercase()),
+        "nonzero research conversion fee requires an exact six-letter FX symbol"
+    );
+    effective_conversion_fee_rate_v1(rate, &symbol[3..], account).map_err(anyhow::Error::msg)
 }
 
 fn validate_sha256(label: &str, value: &str) -> Result<()> {
@@ -573,6 +765,300 @@ fn push_string(target: &mut Vec<u8>, value: &str) {
 mod tests {
     use super::*;
 
+    std::thread_local! {
+        pub(super) static CONTRACT_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn installed_research_scope_validates_once_and_shares_immutable_authority() -> Result<()> {
+        use crate::historical_evaluation_authority::{
+            HistoricalEvaluationAuthorityV1, require_historical_evaluation_authority_v1,
+        };
+
+        const CHILD: &str = "NEOETHOS_TEST_RESEARCH_SCOPE_ONCE_CHILD";
+        const TEST: &str = "canonical_trendbar_research::tests::installed_research_scope_validates_once_and_shares_immutable_authority";
+        const COMPLETED: &str = "validated-research-scope-once-pass";
+        if std::env::var_os(CHILD).is_none() {
+            // The active scope is process-wide; do not leak authority into other tests.
+            let mut child = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while child.try_wait()?.is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill()?;
+                    let output = child.wait_with_output()?;
+                    bail!(
+                        "research-scope child timed out:\n{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            print!("{stdout}");
+            eprint!("{stderr}");
+            ensure!(
+                output.status.success()
+                    && stdout.contains("test result: ok. 1 passed; 0 failed;")
+                    && stdout.lines().any(|line| line.ends_with(COMPLETED)),
+                "isolated research-scope test did not complete exactly once"
+            );
+            return Ok(());
+        }
+
+        assert!(active_canonical_trendbar_research_execution_v3().is_none());
+        assert!(require_historical_evaluation_authority_v1().is_err());
+        let frame = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let anchor = frame.provenance().bindings()[0].dataset_identity();
+        let receipt = CanonicalSearchInputReceiptV2::from_feature_frame(anchor, &frame)?;
+        let mut original = CanonicalTrendbarResearchExecutionContractV3::new(
+            receipt,
+            CanonicalTrendbarResearchCostAssumptionsV2 {
+                symbol: "EURUSD",
+                account_currency: "USD",
+                assumption_source_id: "validated-scope-test",
+                assumption_source_sha256: &"a".repeat(64),
+                pip_size: 0.0001,
+                pip_value_per_lot: 10.0,
+                full_spread_pips_assumption: 1.5,
+                slippage_pips_per_fill_assumption: 0.5,
+                commission_account_per_lot_per_fill_assumption: 7.0,
+                swap_long_pips_per_day: -0.25,
+                swap_short_pips_per_day: 0.1,
+                pnl_conversion_fee_rate: 0.0,
+            },
+        )?;
+        // Deserialization itself is not authority: installation must still reject
+        // changed receipt bindings and invalid scalar costs before publication.
+        for (field, value) in [
+            ("input_receipt_sha256", serde_json::json!("0".repeat(64))),
+            ("pip_value_per_lot", serde_json::json!(0.0)),
+        ] {
+            let mut wire = serde_json::to_value(&original)?;
+            wire[field] = value;
+            let invalid = serde_json::from_value(wire)?;
+            CONTRACT_VALIDATIONS.with(|calls| calls.set(0));
+            assert!(install_canonical_trendbar_research_execution_v3(&invalid).is_err());
+            assert_eq!(CONTRACT_VALIDATIONS.with(|calls| calls.get()), 1);
+            assert!(active_canonical_trendbar_research_execution_v3().is_none());
+        }
+
+        CONTRACT_VALIDATIONS.with(|calls| calls.set(0));
+        let scope = install_canonical_trendbar_research_execution_v3(&original)?;
+        assert_eq!(CONTRACT_VALIDATIONS.with(|calls| calls.get()), 1);
+        let snapshot = active_canonical_trendbar_research_execution_v3().unwrap();
+        assert_eq!(snapshot.as_ref(), &original);
+        let mut shared = Arc::clone(&snapshot);
+        assert!(Arc::get_mut(&mut shared).is_none());
+        original.pip_value_per_lot = 0.0;
+        assert_eq!(snapshot.pip_value_per_lot(), 10.0);
+
+        std::thread::scope(|threads| {
+            for _ in 0..10 {
+                let expected = &snapshot;
+                threads.spawn(move || {
+                    CONTRACT_VALIDATIONS.with(|calls| calls.set(0));
+                    for _ in 0..100 {
+                        let authority = require_historical_evaluation_authority_v1().unwrap();
+                        let HistoricalEvaluationAuthorityV1::CanonicalTrendbarResearch(actual) =
+                            authority
+                        else {
+                            panic!("active research scope was not selected");
+                        };
+                        assert!(Arc::ptr_eq(&actual, expected));
+                        assert_eq!(actual.pip_value_per_lot(), 10.0);
+                    }
+                    assert_eq!(CONTRACT_VALIDATIONS.with(|calls| calls.get()), 0);
+                });
+            }
+        });
+        assert_eq!(CONTRACT_VALIDATIONS.with(|calls| calls.get()), 1);
+        assert!(install_canonical_trendbar_research_execution_v3(&snapshot).is_err());
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &active_canonical_trendbar_research_execution_v3().unwrap()
+        ));
+        drop(scope);
+        assert!(active_canonical_trendbar_research_execution_v3().is_none());
+        assert!(require_historical_evaluation_authority_v1().is_err());
+        // Retaining an old Arc does not reinstall authority; a mutated original
+        // must be validated again and cannot establish the next scope.
+        assert!(install_canonical_trendbar_research_execution_v3(&original).is_err());
+        let next_scope = install_canonical_trendbar_research_execution_v3(&snapshot)?;
+        drop(next_scope);
+        assert!(active_canonical_trendbar_research_execution_v3().is_none());
+        println!("{COMPLETED}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "explicit real-receipt lookup benchmark; run alone with an external timeout"]
+    fn real_receipt_synthetic_cost_contract_lookup_benchmark() -> Result<()> {
+        use crate::historical_evaluation_authority::{
+            HistoricalEvaluationAuthorityV1, require_historical_evaluation_authority_v1,
+        };
+
+        #[derive(Deserialize)]
+        struct TrialReturns {
+            search_input_receipt: CanonicalSearchInputReceiptV2,
+        }
+
+        // Read the exact recorded receipt, not a regenerated feature fixture.
+        // These USD costs are deliberately synthetic: this measures validation
+        // overhead, not the original run's financial authority or GA throughput.
+        let source = std::env::var_os("NEOETHOS_TEST_RESEARCH_SCOPE_RECEIPT_FILE")
+            .context("set NEOETHOS_TEST_RESEARCH_SCOPE_RECEIPT_FILE to trial_returns.v3.json")?;
+        let source = std::path::PathBuf::from(source);
+        let setup_started = std::time::Instant::now();
+        let file = std::fs::File::open(&source)?;
+        let source_bytes = file.metadata()?.len();
+        let TrialReturns {
+            search_input_receipt,
+        } = serde_json::from_reader(std::io::BufReader::new(file))?;
+        let plan_width = search_input_receipt
+            .recorded_feature_plan()?
+            .context("benchmark requires the actual recorded feature plan")?
+            .final_outputs()
+            .len();
+        let contract = CanonicalTrendbarResearchExecutionContractV3::new(
+            search_input_receipt,
+            CanonicalTrendbarResearchCostAssumptionsV2 {
+                symbol: "EURUSD",
+                account_currency: "USD",
+                assumption_source_id: "real-receipt-synthetic-cost-benchmark",
+                assumption_source_sha256: &"a".repeat(64),
+                pip_size: 0.0001,
+                pip_value_per_lot: 10.0,
+                full_spread_pips_assumption: 1.5,
+                slippage_pips_per_fill_assumption: 0.5,
+                commission_account_per_lot_per_fill_assumption: 7.0,
+                swap_long_pips_per_day: -0.25,
+                swap_short_pips_per_day: 0.1,
+                pnl_conversion_fee_rate: 0.0,
+            },
+        )?;
+        assert!(active_canonical_trendbar_research_execution_v3().is_none());
+        let scope = install_canonical_trendbar_research_execution_v3(&contract)?;
+        let setup_ms = setup_started.elapsed().as_secs_f64() * 1_000.0;
+
+        // Exactly one old-style validation; no additional warmup iterations.
+        CONTRACT_VALIDATIONS.with(|calls| calls.set(0));
+        let old_started = std::time::Instant::now();
+        let old = require_historical_evaluation_authority_v1()?;
+        let HistoricalEvaluationAuthorityV1::CanonicalTrendbarResearch(old) = old else {
+            bail!("benchmark did not receive its installed research scope");
+        };
+        old.validate()?;
+        std::hint::black_box(old);
+        let old_per_call_us = old_started.elapsed().as_secs_f64() * 1_000_000.0;
+        assert_eq!(CONTRACT_VALIDATIONS.with(|calls| calls.get()), 1);
+
+        const LOOKUPS: usize = 1_000;
+        CONTRACT_VALIDATIONS.with(|calls| calls.set(0));
+        let new_started = std::time::Instant::now();
+        for _ in 0..LOOKUPS {
+            std::hint::black_box(require_historical_evaluation_authority_v1()?);
+        }
+        let new_per_call_us = new_started.elapsed().as_secs_f64() * 1_000_000.0 / LOOKUPS as f64;
+        assert_eq!(CONTRACT_VALIDATIONS.with(|calls| calls.get()), 0);
+        println!(
+            "real_receipt_synthetic_cost_contract source={source:?} source_bytes={source_bytes} anchor={} receipt_sha256={} plan_width={plan_width} setup_ms={setup_ms:.6} old_lookups=1 old_validations=1 old_per_call_us={old_per_call_us:.6} new_lookups={LOOKUPS} new_validations=0 new_per_call_us={new_per_call_us:.6}",
+            contract.input_receipt().anchor_dataset_identity(),
+            contract.input_receipt_sha256(),
+        );
+        drop(scope);
+        assert!(active_canonical_trendbar_research_execution_v3().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_screening_contract_roundtrip_keeps_v3_hash_and_rejects_changed_costs() {
+        let frame = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let anchor = frame.provenance().bindings()[0].dataset_identity();
+        let receipt = CanonicalSearchInputReceiptV2::from_feature_frame(anchor, &frame).unwrap();
+        let contract = CanonicalTrendbarResearchExecutionContractV3::new(
+            receipt.clone(),
+            CanonicalTrendbarResearchCostAssumptionsV2 {
+                symbol: "EURUSD",
+                account_currency: "USD",
+                assumption_source_id: "shared-contract-test",
+                assumption_source_sha256: &"a".repeat(64),
+                pip_size: 0.0001,
+                pip_value_per_lot: 10.0,
+                full_spread_pips_assumption: 1.5,
+                slippage_pips_per_fill_assumption: 0.5,
+                commission_account_per_lot_per_fill_assumption: 7.0,
+                swap_long_pips_per_day: -0.25,
+                swap_short_pips_per_day: 0.1,
+                pnl_conversion_fee_rate: 0.01,
+            },
+        )
+        .unwrap();
+        let compact =
+            CanonicalTrendbarResearchExecutionContractRefV1::from_contract(&contract).unwrap();
+        let bytes = serde_json::to_vec(&compact).unwrap();
+        let mut missing_policy = serde_json::to_value(&compact).unwrap();
+        missing_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("pnl_conversion_fee_policy");
+        assert!(
+            serde_json::from_value::<CanonicalTrendbarResearchExecutionContractRefV1>(
+                missing_policy
+            )
+            .is_err()
+        );
+        let mut missing_full_policy = serde_json::to_value(&contract).unwrap();
+        missing_full_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("pnl_conversion_fee_policy");
+        assert!(
+            serde_json::from_value::<CanonicalTrendbarResearchExecutionContractV3>(
+                missing_full_policy
+            )
+            .is_err()
+        );
+        assert_eq!(
+            contract.pnl_conversion_fee_rate(),
+            0.0,
+            "USD quote on USD account has no conversion fee"
+        );
+        let mut different_fee = contract.clone();
+        different_fee.account_currency = "EUR".to_owned();
+        different_fee.pnl_conversion_fee_rate = 0.005;
+        different_fee.validate().unwrap();
+        assert_ne!(
+            different_fee.identity_sha256().unwrap(),
+            contract.identity_sha256().unwrap()
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("feature_plan_canonical_bytes"));
+        let compact: CanonicalTrendbarResearchExecutionContractRefV1 =
+            serde_json::from_slice(&bytes).unwrap();
+        let restored = compact.attach(&receipt).unwrap();
+        assert_eq!(restored, contract);
+        assert_eq!(
+            restored.identity_sha256().unwrap(),
+            contract.identity_sha256().unwrap()
+        );
+        let mut changed = compact.clone();
+        changed.screening_costs.full_spread_pips_assumption += 0.1;
+        assert!(changed.attach(&receipt).is_err());
+        let mut changed = compact.clone();
+        changed.input_receipt_sha256 = "0".repeat(64);
+        assert!(changed.attach(&receipt).is_err());
+        let mut changed = compact;
+        changed.contract_schema_version += 1;
+        assert!(changed.attach(&receipt).is_err());
+    }
+
     #[test]
     fn screening_cost_envelope_v2_counts_two_fill_sides() {
         let costs = CanonicalTrendbarScreeningCostEnvelopeV2::new(1.5, 0.5, 7.0)
@@ -604,5 +1090,19 @@ mod tests {
         assert!(
             serde_json::from_value::<CanonicalTrendbarScreeningCostEnvelopeV2>(legacy).is_err()
         );
+    }
+
+    #[test]
+    fn effective_contract_fee_never_infers_currency_for_an_ambiguous_symbol() {
+        assert_eq!(
+            effective_contract_conversion_fee_rate("EURUSD", "USD", 0.01).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            effective_contract_conversion_fee_rate("EURUSD", "EUR", 0.01).unwrap(),
+            0.01
+        );
+        assert!(effective_contract_conversion_fee_rate("EURUSD.pro", "USD", 0.01).is_err());
+        assert!(effective_contract_conversion_fee_rate("EURUSD", "USD", f64::NAN).is_err());
     }
 }

@@ -204,6 +204,13 @@ fn install_inner_v1(
     let symbol = handoff.canonical_series().anchor().identity().symbol_name();
     let model_artifacts =
         model_artifacts_v1(staging, symbol, handoff.base_timeframe().as_str(), planned)?;
+    crate::runtime::feature_input::load_model_feature_input_for_handoff_v1(staging, &handoff)
+        .map_err(|error| {
+            refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::InputReceiptMismatch,
+                format!("candidate model preprocessing is not bound to this handoff: {error:#}"),
+            )
+        })?;
     let handoff_identity_sha256 = handoff.identity_sha256()?;
     let evidence = TrainingEvidenceWriteV1 {
         schema: EVIDENCE_SCHEMA_V1,
@@ -599,7 +606,10 @@ fn read_bounded_file_v1(
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     File::open(path)
-        .and_then(|mut file| file.read_to_end(&mut bytes))
+        .and_then(|file| {
+            file.take((maximum as u64).saturating_add(1))
+                .read_to_end(&mut bytes)
+        })
         .map_err(|error| tree_error_v1(format!("read installed evidence: {error}")))?;
     if bytes.len() > maximum || bytes.len() as u64 != metadata.len() {
         return Err(tree_changed_v1(

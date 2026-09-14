@@ -272,6 +272,46 @@ impl FeatureNodeV1 {
         self.operation
     }
 
+    pub const fn semantic_version(&self) -> u32 {
+        self.semantic_version
+    }
+
+    pub const fn fitted_state_hash(&self) -> Option<[u8; 32]> {
+        self.fitted_state_hash
+    }
+
+    pub fn outputs(&self) -> &[FeatureOutputV1] {
+        &self.outputs
+    }
+
+    /// Rename output slots without changing the node's formula, source,
+    /// dependencies, validity semantics or fitted state. A wrapping transform
+    /// can thereby keep the original graph without duplicate output names.
+    pub fn with_output_names(&self, names: Vec<String>) -> Result<Self, FeatureContractError> {
+        if names.len() != self.outputs.len() {
+            return Err(FeatureContractError::new(
+                "output rename count differs from node schema",
+            ));
+        }
+        let outputs = names
+            .into_iter()
+            .zip(&self.outputs)
+            .map(|(name, output)| FeatureOutputV1::f64(name, output.validity_semantic_version))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::build(
+            self.id.clone(),
+            self.operation,
+            self.semantic_version,
+            self.inputs.clone(),
+            outputs,
+            self.parameters.clone(),
+            self.formula_manifest_hash,
+            self.semantic_source_hash,
+            self.fitted_state_hash,
+            self.source.clone(),
+        )
+    }
+
     pub const fn formula_manifest_hash(&self) -> [u8; 32] {
         self.formula_manifest_hash
     }

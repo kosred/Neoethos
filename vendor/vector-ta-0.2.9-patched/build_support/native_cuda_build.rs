@@ -1,6 +1,6 @@
 use crate::native_sass::{
-    CuobjdumpReport, NativeArchInputs, NativeArchPlan, NativeSassError, VerifiedNativeCubin,
-    native_cubin_filename, plan_native_architectures, verify_native_cubin,
+    CuobjdumpReport, NativeSassError, VerifiedNativeCubin, native_cubin_filename,
+    verify_native_cubin,
 };
 use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
@@ -92,11 +92,6 @@ pub(crate) enum BuildSupportError {
         stdout: String,
         stderr: String,
     },
-    InvalidToolOutput {
-        tool: PathBuf,
-        operation: &'static str,
-        output: String,
-    },
     ArtifactRead {
         path: PathBuf,
         message: String,
@@ -145,15 +140,6 @@ impl fmt::Display for BuildSupportError {
             } => write!(
                 formatter,
                 "{} {operation} failed with {code:?}; stdout={stdout:?}; stderr={stderr:?}",
-                tool.display()
-            ),
-            Self::InvalidToolOutput {
-                tool,
-                operation,
-                output,
-            } => write!(
-                formatter,
-                "{} {operation} returned no usable exact architectures: {output:?}",
                 tool.display()
             ),
             Self::ArtifactRead { path, message } => {
@@ -302,78 +288,6 @@ fn run_tool(
     Ok(output)
 }
 
-fn parse_architecture(value: &str) -> Option<u32> {
-    let trimmed = value.trim();
-    let unprefixed = trimmed
-        .strip_prefix("sm_")
-        .or_else(|| trimmed.strip_prefix("compute_"))
-        .unwrap_or(trimmed);
-    if let Some((major, minor)) = unprefixed.split_once('.') {
-        let major = major.parse::<u32>().ok()?;
-        let minor = minor.parse::<u32>().ok()?;
-        return (minor <= 9).then(|| major * 10 + minor);
-    }
-    let digits = unprefixed
-        .chars()
-        .take_while(|character| character.is_ascii_digit())
-        .collect::<String>();
-    (digits.len() >= 2).then(|| digits.parse().ok()).flatten()
-}
-
-pub(crate) fn discover_native_architectures(
-    nvcc: &Path,
-    nvidia_smi: &Path,
-    explicit_architectures: Option<&str>,
-) -> Result<NativeArchPlan, BuildSupportError> {
-    let supported_output = run_tool(nvcc, "--list-gpu-arch", &["--list-gpu-arch"])?;
-    let supported_text = String::from_utf8_lossy(&supported_output.stdout);
-    let mut supported = supported_text
-        .lines()
-        .filter_map(parse_architecture)
-        .collect::<Vec<_>>();
-    supported.sort_unstable();
-    supported.dedup();
-    if supported.is_empty() {
-        return Err(BuildSupportError::InvalidToolOutput {
-            tool: nvcc.to_path_buf(),
-            operation: "--list-gpu-arch",
-            output: supported_text.into_owned(),
-        });
-    }
-
-    let detected = if explicit_architectures.is_some() {
-        Vec::new()
-    } else {
-        let detected_output = run_tool(
-            nvidia_smi,
-            "--query-gpu=compute_cap",
-            &["--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
-        )?;
-        let detected_text = String::from_utf8_lossy(&detected_output.stdout);
-        let mut architectures = detected_text
-            .lines()
-            .filter_map(parse_architecture)
-            .collect::<Vec<_>>();
-        architectures.sort_unstable();
-        architectures.dedup();
-        if architectures.is_empty() {
-            return Err(BuildSupportError::InvalidToolOutput {
-                tool: nvidia_smi.to_path_buf(),
-                operation: "--query-gpu=compute_cap",
-                output: detected_text.into_owned(),
-            });
-        }
-        architectures
-    };
-
-    plan_native_architectures(NativeArchInputs {
-        explicit_archs: explicit_architectures,
-        detected_archs: &detected,
-        nvcc_supported_archs: &supported,
-    })
-    .map_err(BuildSupportError::from)
-}
-
 pub(crate) fn inspect_native_cubin(
     cuobjdump: &Path,
     artifact_path: &Path,
@@ -417,6 +331,119 @@ pub(crate) fn inspect_native_cubin(
 pub(crate) trait ArtifactCompiler: Sync {
     fn command(&self, job: &ArtifactJob) -> Result<Command, String>;
     fn finish(&self, job: &ArtifactJob, output: Output) -> Result<(), String>;
+}
+
+/// Preserve every byte before deciding whether a compiler invocation succeeded.
+/// Artifact filenames already include the exact architecture and are unique in
+/// OUT_DIR, so concurrent compiler jobs cannot overwrite each other's streams.
+pub(crate) fn preserve_nvcc_output(
+    job: &ArtifactJob,
+    output: &Output,
+    mut emit: impl FnMut(&str),
+) -> Result<(), String> {
+    let directory = job
+        .output_path
+        .parent()
+        .ok_or("NVCC artifact has no output directory")?
+        .join("native-build-logs");
+    let filename = job
+        .output_path
+        .file_name()
+        .ok_or("NVCC artifact has no filename")?;
+    let directory_result = std::fs::create_dir_all(&directory);
+    let mut failures = Vec::new();
+    if let Err(error) = &directory_result {
+        failures.push(format!("create {}: {error}", directory.display()));
+    }
+    for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        let mut log_name = filename.to_os_string();
+        log_name.push(format!(".{stream}.log"));
+        let path = directory.join(log_name);
+        if directory_result.is_ok() {
+            // Attempt both streams even if one write fails. Do not decode or
+            // trim the persisted evidence, including an unterminated last line.
+            if let Err(error) = std::fs::write(&path, bytes) {
+                failures.push(format!("write {}: {error}", path.display()));
+            } else {
+                emit(&format!(
+                    "vector-ta NVCC {stream}: {} ({} bytes)",
+                    path.display(),
+                    bytes.len()
+                ));
+            }
+        }
+        for line in String::from_utf8_lossy(bytes).lines() {
+            if let Some(is_error) = nvcc_diagnostic_is_error(line) {
+                // Cargo's error directive itself fails the build. Preserve the
+                // compiler's exit-status authority even for contradictory text.
+                let directive = if is_error && !output.status.success() {
+                    "error"
+                } else {
+                    "warning"
+                };
+                let qualifier = if is_error && output.status.success() {
+                    "nvcc exited successfully but reported: "
+                } else {
+                    ""
+                };
+                emit(&format!(
+                    "cargo:{directive}=vector-ta {} sm_{} {stream}: {qualifier}{line}",
+                    job.rel_src, job.arch
+                ));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot preserve complete NVCC output for {} sm_{}: {}; status={:?}; stdout={:?}; stderr={:?}",
+            job.rel_src,
+            job.arch,
+            failures.join("; "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+/// Recognize NVCC/PTXAS/NVLINK and host-compiler diagnostic headers, not
+/// arbitrary filenames or informational lines containing 'warning'/'error'.
+fn nvcc_diagnostic_is_error(line: &str) -> Option<bool> {
+    let lower = line.trim().to_ascii_lowercase();
+    for (kind, is_error) in [
+        ("fatal error", true),
+        ("error", true),
+        ("fatal", true),
+        ("warning", false),
+    ] {
+        for (offset, _) in lower.match_indices(kind) {
+            let prefix = lower[..offset].trim_end();
+            if !(prefix.is_empty()
+                || prefix.ends_with(':')
+                || prefix.ends_with(')')
+                || matches!(prefix, "nvcc" | "ptxas" | "nvlink" | "cl" | "cl.exe"))
+            {
+                continue;
+            }
+            let suffix = lower[offset + kind.len()..].trim_start();
+            let Some((code, _)) = suffix.split_once(':') else {
+                continue;
+            };
+            let code = code.trim();
+            if code.is_empty()
+                || (code.starts_with('#') || code.starts_with('c') || code.starts_with("lnk"))
+                    && code.chars().any(|c| c.is_ascii_digit())
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '#' | '-'))
+            {
+                return Some(is_error);
+            }
+        }
+    }
+    None
 }
 
 pub(crate) trait ArtifactVerifier: Sync {

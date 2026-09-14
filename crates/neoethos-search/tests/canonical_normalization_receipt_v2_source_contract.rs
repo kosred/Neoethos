@@ -26,7 +26,6 @@ fn search_does_not_mint_or_choose_the_data_normalization_authority() {
         "enabled: bool",
         "fn consume",
         "seal_canonical_robust_normalization_split_from_pinned_v2",
-        "seal_canonical_robust_normalization_split_from_frame_v2",
         "prepare_resident_robust_normalization_input_v2",
         "sealed_data_runtime_normalization_mode_v2",
         "normalization_scratch_bytes",
@@ -36,6 +35,7 @@ fn search_does_not_mint_or_choose_the_data_normalization_authority() {
     }
     for forbidden in [
         "pub fn seal(",
+        "seal_canonical_robust_normalization_split_from_frame_v2",
         "training_rows: Range<usize>, enabled: bool",
         "row_count: usize, training_rows",
     ] {

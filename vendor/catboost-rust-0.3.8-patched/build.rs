@@ -39,49 +39,6 @@ fn get_platform_info() -> (String, String) {
     (os.to_string(), arch.to_string())
 }
 
-fn stage_selected_runtime(source: &Path, destination: &Path) {
-    if !source.is_file() {
-        panic!(
-            "catboost-rust: selected runtime is missing: {}",
-            source.display()
-        );
-    }
-    let source_len = source
-        .metadata()
-        .unwrap_or_else(|error| {
-            panic!(
-                "catboost-rust: failed to inspect selected runtime {}: {error}",
-                source.display()
-            )
-        })
-        .len();
-    if source_len == 0 {
-        panic!(
-            "catboost-rust: selected runtime is empty: {}",
-            source.display()
-        );
-    }
-    let copied_bytes = fs::copy(source, destination).unwrap_or_else(|error| {
-        panic!(
-            "catboost-rust: failed to stage selected runtime {} as {}: {error}",
-            source.display(),
-            destination.display()
-        )
-    });
-    if copied_bytes != source_len {
-        panic!(
-            "catboost-rust: staged {copied_bytes} of {source_len} bytes from {} to {}",
-            source.display(),
-            destination.display()
-        );
-    }
-    eprintln!(
-        "INFO catboost-rust: staged selected runtime {} -> {} ({source_len} bytes)",
-        source.display(),
-        destination.display()
-    );
-}
-
 fn download_model_interface_headers(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let version = get_catboost_version();
 
@@ -390,7 +347,7 @@ fn main() {
     });
 
     let lib_dest_path = target_dir.join(lib_filename);
-    stage_selected_runtime(&lib_source_path, &lib_dest_path);
+    build_support::stage_selected_runtime(&lib_source_path, &lib_dest_path);
 
     // On macOS/Linux, change the install name/soname to use @loader_path/$ORIGIN
     // This needs to be done on the source library in OUT_DIR before linking

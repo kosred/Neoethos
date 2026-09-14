@@ -18,7 +18,7 @@ use crate::runtime::prediction::RuntimePrediction;
 use super::common::{
     FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME, cpu_backend_for_policy,
     ensure_feature_columns_match, feature_matrix_from_frame, read_json, remap_three_class_labels,
-    softmax_rows, statistical_device_policy, write_json,
+    softmax_rows, statistical_device_policy, temporal_train_validation_split, write_json,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,30 +62,6 @@ fn sigmoid(value: f64) -> f64 {
     }
 }
 
-fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
-    if rows <= 6 {
-        return ((0..rows).collect(), Vec::new());
-    }
-
-    let val_rows = ((rows as f64) * 0.2).round() as usize;
-    let val_rows = val_rows.clamp(1, rows.saturating_sub(2));
-    let embargo_rows = if rows >= 20 {
-        ((rows as f64) * 0.02).round() as usize
-    } else {
-        0
-    };
-    let embargo_rows = embargo_rows.clamp(0, rows.saturating_sub(val_rows + 1));
-    let train_rows = rows.saturating_sub(val_rows + embargo_rows);
-
-    if train_rows == 0 {
-        return ((0..rows).collect(), Vec::new());
-    }
-
-    let train = (0..train_rows).collect::<Vec<_>>();
-    let val = (train_rows + embargo_rows..rows).collect::<Vec<_>>();
-    (train, val)
-}
-
 /// GROUP E remediation 2026-05-25: 5 hand-rolled functions replaced
 /// with a single delegation to the canonical `write_dir_with_backup`
 /// helper in `neoethos-core::storage::json`. Saves ~60 LOC of duplicate
@@ -110,6 +86,7 @@ fn runtime_metadata(
     feature_columns: Vec<String>,
     dataset_rows: usize,
     train_rows: usize,
+    embargo_rows: usize,
     val_rows: usize,
 ) -> Result<RuntimeArtifactMetadata> {
     try_build_runtime_artifact_metadata(
@@ -118,7 +95,12 @@ fn runtime_metadata(
         CapabilityState::Implemented,
         feature_columns,
         canonical_three_class_label_mapping(),
-        TrainingSummaryMetadata::new_unchecked(dataset_rows, train_rows, val_rows),
+        TrainingSummaryMetadata::new_unchecked(
+            dataset_rows,
+            train_rows,
+            embargo_rows,
+            val_rows,
+        ),
     )
 }
 
@@ -438,12 +420,17 @@ fn validate_runtime_metadata(
             "runtime metadata mismatch for {expected_model_name}: training rows must be non-zero"
         );
     }
-    if metadata.training_summary.train_rows + metadata.training_summary.val_rows
-        != metadata.training_summary.dataset_rows
+    if metadata
+        .training_summary
+        .train_rows
+        .checked_add(metadata.training_summary.embargo_rows)
+        .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows))
+        != Some(metadata.training_summary.dataset_rows)
     {
         bail!(
-            "runtime metadata mismatch for {expected_model_name}: training rows {} + validation rows {} must equal dataset rows {}",
+            "runtime metadata mismatch for {expected_model_name}: training rows {} + embargo rows {} + validation rows {} must equal dataset rows {}",
             metadata.training_summary.train_rows,
+            metadata.training_summary.embargo_rows,
             metadata.training_summary.val_rows,
             metadata.training_summary.dataset_rows
         );
@@ -472,15 +459,7 @@ fn resolve_runtime_metadata_from_artifact(
                 )
             })?;
             if let Some(embedded) = artifact.runtime_metadata.as_ref()
-                && (embedded.model_name != metadata.model_name
-                    || embedded.family != metadata.family
-                    || embedded.state != metadata.state
-                    || embedded.feature_columns != metadata.feature_columns
-                    || embedded.label_mapping != metadata.label_mapping
-                    || embedded.training_summary.dataset_rows
-                        != metadata.training_summary.dataset_rows
-                    || embedded.training_summary.train_rows != metadata.training_summary.train_rows
-                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows)
+                && embedded != &metadata
             {
                 bail!(
                     "runtime metadata sidecar mismatch with embedded bayes_logit metadata at {}",
@@ -648,7 +627,10 @@ impl BayesianLogitExpert {
             );
         }
         let labels = remap_three_class_labels(y)?;
-        let (train_indices, val_indices) = split_train_val_indices(rows);
+        let split = temporal_train_validation_split(rows);
+        let embargo_rows = split.embargo_rows;
+        let train_indices = split.train_indices;
+        let val_indices = split.validation_indices;
         let train_labels = train_indices
             .iter()
             .map(|idx| labels[*idx])
@@ -709,6 +691,7 @@ impl BayesianLogitExpert {
             feature_columns.clone(),
             rows,
             train_labels.len(),
+            embargo_rows,
             val_indices.len(),
         )?;
         self.model = Some(BayesianOneVsRestArtifact {
@@ -1047,7 +1030,9 @@ mod tests {
 
     #[test]
     fn split_train_val_indices_leaves_temporal_embargo_gap() {
-        let (train, val) = split_train_val_indices(50);
+        let split = temporal_train_validation_split(50);
+        let train = split.train_indices;
+        let val = split.validation_indices;
         assert!(!val.is_empty(), "validation split should be present");
         let last_train = *train.last().expect("train rows");
         let first_val = *val.first().expect("val rows");
@@ -1055,6 +1040,7 @@ mod tests {
             first_val > last_train + 1,
             "expected embargo gap between train and val"
         );
+        assert_eq!(split.embargo_rows, first_val - last_train - 1);
     }
 
     #[test]
@@ -1105,6 +1091,7 @@ mod tests {
                     vec!["f1".to_string(), "f2".to_string()],
                     8,
                     6,
+                    0,
                     2,
                 )
                 .expect("build metadata"),
@@ -1145,6 +1132,7 @@ mod tests {
                     vec!["f1".to_string(), "f2".to_string()],
                     8,
                     6,
+                    0,
                     2,
                 )
                 .expect("build metadata"),
@@ -1177,7 +1165,7 @@ mod tests {
             state: CapabilityState::Implemented,
             feature_columns: vec!["f1".to_string(), "f2".to_string()],
             label_mapping: canonical_three_class_label_mapping(),
-            training_summary: TrainingSummaryMetadata::raw_for_validation(8, 0, 8),
+            training_summary: TrainingSummaryMetadata::raw_for_validation(8, 0, 0, 8),
         };
 
         let err = validate_runtime_metadata(

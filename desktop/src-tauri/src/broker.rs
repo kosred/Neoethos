@@ -395,6 +395,7 @@ pub async fn place_order(
             Some("NeoEthos".to_string()),
             // Manual Buy/Sell from the Trade screen — no admission decision to honour.
             None,
+            None,
         )
         .map_err(|e| e.to_string())?;
         Ok::<ExecResult, String>(ExecResult {
@@ -415,7 +416,7 @@ pub async fn place_order(
 #[tauri::command]
 pub async fn close_position(position_id: i64, volume: i64) -> Result<ExecResult, String> {
     spawn_blocking(move || {
-        let outcome = broker_api::close_position_blocking(position_id, volume, None)
+        let outcome = broker_api::close_position_blocking(position_id, volume, None, None)
             .map_err(|e| e.to_string())?;
         Ok::<ExecResult, String>(ExecResult {
             status: format!("{:?}", outcome.status),
@@ -435,11 +436,17 @@ pub async fn close_position(position_id: i64, volume: i64) -> Result<ExecResult,
 /// safe to call once at startup. Returns whether it spawned (false = creds /
 /// token missing — the UI then shows no live prices until re-auth).
 pub fn start_spot_streamer() {
-    // Run in the tokio context (the streamer does an internal tokio::spawn for
-    // its reconnect loop) but off the UI thread.
+    // Symbol discovery performs synchronous DNS/WSS work and creates the
+    // transport's short-lived Tokio I/O runtime.  It must therefore start on
+    // Tokio's blocking pool, not directly inside this async task: calling the
+    // transport's `Runtime::block_on` from an async worker panics before the
+    // streamer can be installed.  Once discovery succeeds, `spawn(...)`
+    // installs its own async reconnect loop from this blocking runtime context.
     tauri::async_runtime::spawn(async {
-        let spawned = live_spots_streamer::try_spawn_with_defaults_blocking();
-        log::info!("spot streamer spawned: {spawned}");
+        match spawn_blocking(live_spots_streamer::try_spawn_with_defaults_blocking).await {
+            Ok(spawned) => log::info!("spot streamer spawned: {spawned}"),
+            Err(error) => log::error!("spot streamer startup blocking task panicked: {error}"),
+        }
     });
 }
 

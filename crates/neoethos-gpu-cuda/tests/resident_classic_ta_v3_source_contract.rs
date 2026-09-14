@@ -13,6 +13,30 @@ fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(workspace_root().join(path)).unwrap_or_default()
 }
 
+fn braced_item<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing source item `{signature}`"));
+    let open = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("missing opening brace for `{signature}`"));
+    let mut depth = 0_u32;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("missing closing brace for `{signature}`");
+}
+
 #[test]
 fn classic_ta_executor_is_gpu_cuda_owned_and_borrows_the_one_shot_carrier() {
     let runtime = read("crates/neoethos-gpu-cuda/src/resident_classic_ta_v3.rs");
@@ -303,16 +327,28 @@ fn classic_runtime_uses_admitted_global_bindings_after_smc_not_local_zero_ordina
         ".map(|route|ResidentFeatureColumnBindingV3{ordinal:route.destination_column(),"
     ));
 
-    let smc = data
+    let materialize = braced_item(
+        &data,
+        "fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(",
+    );
+    let post_smc = braced_item(&data, "fn append_post_smc_producers_v2(");
+    let smc = materialize
         .find("pending_smc_batch.append_to(&mut assembler)?")
         .expect("SMC append");
-    let classic = data
-        .find("assembler.append_resident_classic_ta_recipe_v4(")
-        .expect("globally bound Classic append");
+    let post_smc_call = materialize
+        .find("append_post_smc_producers_v2(execution.post_smc, &mut assembler)?")
+        .expect("post-SMC producer append");
     assert!(
-        smc < classic,
+        smc < post_smc_call,
         "SMC must occupy its admitted span before Classic"
     );
+    let classic = post_smc
+        .find("assembler.append_resident_classic_ta_recipe_v4(")
+        .expect("globally bound Classic append");
+    let quant = post_smc
+        .find(".quant_runtime")
+        .expect("post-Classic Quant append");
+    assert!(classic < quant, "Classic must be the first post-SMC producer");
 
     let memory_preflight = data
         .find("preflight_resident_classic_ta_memory_v4(")

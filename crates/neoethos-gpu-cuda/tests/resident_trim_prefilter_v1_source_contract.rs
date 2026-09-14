@@ -308,7 +308,7 @@ fn rust_owner_is_move_only_same_run_and_leaks_on_ambiguous_drop() {
         "pub fn from_raw",
         "pub fn raw_",
         "pub fn wait",
-        "pub fn read",
+        "pub fn read_raw",
         "Deserialize",
     ] {
         assert!(
@@ -557,10 +557,159 @@ fn cpcv_and_prefix_windows_match_current_order_and_geometry() {
             "valid_available_combinations, MAXIMUM_REFIT_FOLDS_V1",
             "target_valid_rank = next_fold * step",
             "fit_tail_offset = selection_rows - capped_rows",
-            "std::uint64_t prefix_train_end = static_cast<std::uint64_t>(",
+            "const std::uint64_t requested_end = static_cast<std::uint64_t>(",
             "floor(insample_fraction * static_cast<double>(selection_rows)))",
-            "prefix_exclusive_end = prefix_train_end - 1U",
+            "requested_end < selection_rows ? requested_end : selection_rows",
+            "max_hold_bars > 0U ? max_hold_bars : 1U",
+            "return fit_end > horizon ? fit_end - horizon : 0U",
+            "prefix_exclusive_end = label_safe_prefix_fit_rows_v1(",
+            "selection_rows, insample_fraction, max_hold_bars)",
         ],
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn single_fit_keeps_the_complete_label_horizon_inside_the_configured_prefix() {
+    use neoethos_gpu_cuda::resident_trim_prefilter_v1::resident_trim_prefilter_prefix_fit_rows_v1 as fit_rows;
+
+    for (rows, fraction, horizon, expected) in [
+        (1_000, 1.0, 24, 976),
+        (1_000, 0.8, 24, 776),
+        (10_000, 0.8, 40, 7_960),
+        (1_001, 0.8, 24, 776),
+    ] {
+        let actual = fit_rows(rows, fraction, horizon).expect("valid selection-prefix fit");
+        assert_eq!(actual, expected);
+        let prefix_end = (rows as f64 * fraction).floor() as u64;
+        assert!(actual - 1 + horizon < prefix_end);
+        assert_eq!(actual + horizon, prefix_end);
+    }
+    // A zero configured horizon still reserves the CPU minimum of one bar.
+    assert_eq!(fit_rows(1_000, 1.0, 0).unwrap(), 999);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn single_fit_preserves_zero_one_and_two_rows_without_inventing_samples() {
+    use neoethos_gpu_cuda::resident_trim_prefilter_v1::resident_trim_prefilter_prefix_fit_rows_v1 as fit_rows;
+
+    for (horizon, expected) in [(801, 0), (800, 0), (799, 1), (798, 2), (797, 3)] {
+        let actual = fit_rows(1_000, 0.8, horizon).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual >= 3, expected == 3);
+    }
+    assert_eq!(fit_rows(0, 1.0, 24).unwrap(), 0);
+    assert_eq!(fit_rows(1_000, f64::MIN_POSITIVE, 24).unwrap(), 0);
+    assert_eq!(fit_rows(1_000, 1.0, u64::MAX).unwrap(), 0);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn single_fit_accepts_one_but_refuses_invalid_fractions_and_inexact_extents() {
+    use neoethos_gpu_cuda::resident_trim_prefilter_v1::resident_trim_prefilter_prefix_fit_rows_v1 as fit_rows;
+
+    for fraction in [0.0, -0.1, 1.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(fit_rows(1_000, fraction, 24).is_err());
+    }
+    assert_eq!(fit_rows(1_u64 << 53, 1.0, 24).unwrap(), (1_u64 << 53) - 24);
+    assert!(fit_rows((1_u64 << 53) + 1, 1.0, 24).is_err());
+}
+
+#[test]
+fn production_prefilter_is_one_fit_even_when_post_ga_cpcv_is_enabled() {
+    let search = fs::read_to_string(
+        manifest_dir().join("../neoethos-search/src/gpu_resident_feature_screening_v2.rs"),
+    )
+    .expect("read production Search resident feature-screening source");
+    let prepare = braced_item(
+        &search,
+        "pub(crate) fn prepare_resident_feature_screening_v2(",
+    );
+    require_all(
+        prepare,
+        &[
+            "config.runtime_overrides.resolved_prefilter_insample_frac()",
+            "resident_trim_prefilter_prefix_fit_rows_v1(",
+            "retained_selection_rows,",
+            "insample_fraction,",
+            "max_hold_bars,",
+            "fit_rows >= 3",
+            "cpcv_split_count: 0,",
+            "cpcv_test_group_count: 0,",
+            "cpcv_embargo_fraction: 0.0,",
+            "cpcv_purge_fraction: 0.0,",
+            "cpcv_max_rows: 0,",
+            "selection_row_start = outer_split_at - retained_selection_rows",
+            "selection_row_end: outer_split_at",
+            "holdout_row_start: outer_split_at",
+            "holdout_row_end: parent_row_count",
+        ],
+    );
+    assert!(!prepare.contains("config.enable_cpcv"));
+    assert!(!prepare.contains("config.cpcv_"));
+    assert!(!prepare.contains("insample_fraction.to_bits() == 0.8"));
+    assert!(search.contains("fit-below-three-keeps-all;no-pre-ga-cpcv;"));
+
+    let rust = read_required("src/resident_trim_prefilter_v1.rs");
+    let cuda = read_required("native/resident_trim_prefilter_v1.cu");
+    assert!(rust.contains("fields.insample_fraction > 1.0"));
+    assert!(!rust.contains("fields.insample_fraction >= 1.0"));
+    assert!(cuda.contains("plan->insample_fraction > 1.0"));
+    assert!(!cuda.contains("plan->insample_fraction >= 1.0"));
+    require_all(
+        braced_item(
+            &cuda,
+            "extern \"C\" std::int32_t enqueue_resident_trim_prefilter_stage_v1(",
+        ),
+        &["selection_rows, run->plan.insample_fraction, run->plan.max_hold_bars,"],
+    );
+}
+
+#[test]
+fn short_fit_keep_all_has_matching_allocation_and_streaming_stage_transitions() {
+    let cuda = read_required("native/resident_trim_prefilter_v1.cu");
+    require_all(
+        braced_item(&cuda, "bool prefilter_active_v1("),
+        &[
+            "plan->parent_column_count > plan->resolved_top_k",
+            "explicit_cpcv || label_safe_prefix_fit_rows_v1(",
+            "plan->insample_fraction, plan->max_hold_bars) >= 3U",
+        ],
+    );
+    assert!(
+        braced_item(&cuda, "bool fill_allocation_receipt_v1(")
+            .contains("const bool prefilter_active = prefilter_active_v1(plan)")
+    );
+    assert!(
+        braced_item(
+            &cuda,
+            "extern \"C\" std::int32_t create_resident_trim_prefilter_run_v1("
+        )
+        .contains("run->prefilter_active = prefilter_active_v1(plan)")
+    );
+    let seal = braced_item(
+        &cuda,
+        "extern \"C\" std::int32_t seal_resident_trim_prefilter_selected_map_v2(",
+    );
+    let active = braced_item(seal, "if (run->prefilter_active)");
+    assert!(active.contains("validate_streamed_score_coverage_kernel_v2"));
+    assert!(!active.contains("run->next_stage = STAGE_RANK_V1"));
+    let coverage_check = seal
+        .find("run->v2_scored_column_count != run->plan.parent_column_count")
+        .unwrap();
+    let advance = seal.find("run->next_stage = STAGE_RANK_V1").unwrap();
+    let enqueue = seal
+        .find("while (run->next_stage <= STAGE_DEVICE_SEAL_V1)")
+        .unwrap();
+    assert!(coverage_check < advance && advance < enqueue);
+    let stage = braced_item(
+        &cuda,
+        "extern \"C\" std::int32_t enqueue_resident_trim_prefilter_stage_v1(",
+    );
+    assert!(
+        braced_item(stage, "if (!run->prefilter_active)")
+            .contains("fill_identity_selected_map_kernel_v1")
     );
 }
 
@@ -598,6 +747,10 @@ fn pairwise_correlation_is_exact_ordered_two_pass_f64_not_a_parallel_reduction()
     for forbidden in [
         "cub::DeviceReduce",
         "cub::BlockReduce",
+        "hipcub::DeviceReduce",
+        "hipcub::BlockReduce",
+        "neoethos_parallel_primitives_v1::DeviceReduce",
+        "neoethos_parallel_primitives_v1::BlockReduce",
         "atomicAdd",
         "float sum_",
         "--use_fast_math",
@@ -615,8 +768,8 @@ fn official_cub_sort_and_select_preserve_score_ties_and_parent_order() {
     require_all(
         &cuda,
         &[
-            "cub::DeviceSelect::Flagged(",
-            "cub::DeviceRadixSort::SortPairsDescending(",
+            "neoethos_parallel_primitives_v1::DeviceSelect::Flagged(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(",
             "monotone_nonnegative_f64_key_v1(",
             "input_parent_indices_are_ascending",
             "stable_equal_keys_preserve_parent_index_order",
@@ -638,6 +791,50 @@ fn official_cub_sort_and_select_preserve_score_ties_and_parent_order() {
             "ranking authority drifts via {forbidden:?}"
         );
     }
+}
+
+#[test]
+fn parallel_primitives_share_one_backend_for_scratch_queries_and_execution() {
+    let header = read_required("native/resident_parallel_primitives_v1.cuh");
+    let amd = section(&header, "#if defined(__HIP_PLATFORM_AMD__)", "#else");
+    let cuda = section(&header, "#else", "#endif");
+    require_all(
+        amd,
+        &[
+            "#include <hipcub/hipcub.hpp>",
+            "namespace neoethos_parallel_primitives_v1 = ::hipcub;",
+        ],
+    );
+    require_all(
+        cuda,
+        &[
+            "#include <cub/cub.cuh>",
+            "namespace neoethos_parallel_primitives_v1 = ::cub;",
+        ],
+    );
+    assert!(!header.contains("namespace cub ="));
+    for source in [
+        "native/resident_generation_v1.cu",
+        "native/resident_scoring_novelty_v1.cu",
+        "native/resident_archive_knn_v2.cu",
+        "native/resident_trim_prefilter_v1.cu",
+    ] {
+        let source = read_required(source);
+        require_all(
+            &source,
+            &[
+                "#include \"resident_parallel_primitives_v1.cuh\"",
+                "neoethos_parallel_primitives_v1::Device",
+            ],
+        );
+        assert!(!source.contains("cub::Device"));
+        assert!(!source.contains("#include <cub/"));
+        assert!(!source.contains("#include <hipcub/"));
+    }
+    require_all(
+        &read_required("build.rs"),
+        &["cargo:rerun-if-changed=native/resident_parallel_primitives_v1.cuh"],
+    );
 }
 
 #[test]
@@ -686,56 +883,83 @@ fn allocation_is_checked_same_context_and_charges_every_buffer() {
 
 #[test]
 fn allocation_and_plan_hashes_bind_every_semantic_and_memory_component() {
-    let search =
-        fs::read_to_string(manifest_dir().join(
-            "../neoethos-search/src/gpu_full_discovery/gpu_resident_trim_prefilter_view_v1.rs",
-        ))
-        .expect("read additive Search resident trim/prefilter source");
-    let allocation_hash = section(&search, "let allocation_plan_sha256 = sha256_v1(&[", "]);");
+    let rust = read_required("src/resident_trim_prefilter_v1.rs");
+    let allocation_hash = section(
+        &rust,
+        "let allocation_plan_sha256 = trim_workspace_identity_v2(",
+        ");\n        Ok(SealedResidentTrimPrefilterWorkspacePreflightV2",
+    );
     require_all(
         allocation_hash,
         &[
-            "&long_labels_bytes.to_le_bytes()",
-            "&short_labels_bytes.to_le_bytes()",
-            "&label_census_bytes.to_le_bytes()",
-            "&fold_descriptor_bytes.to_le_bytes()",
-            "&column_score_bytes.to_le_bytes()",
-            "&column_instability_bytes.to_le_bytes()",
-            "&column_rankability_bytes.to_le_bytes()",
-            "&state_template_timeframe_metadata_bytes.to_le_bytes()",
-            "&radix_key_ping_pong_bytes.to_le_bytes()",
-            "&radix_index_ping_pong_bytes.to_le_bytes()",
-            "&timeframe_group_counter_bytes.to_le_bytes()",
-            "&selected_column_map_bytes.to_le_bytes()",
-            "&selected_column_count_bytes.to_le_bytes()",
-            "&cub_select_scratch_bytes.to_le_bytes()",
-            "&cub_radix_sort_scratch_bytes.to_le_bytes()",
-            "&device_seal_bytes.to_le_bytes()",
-            "&retained_device_bytes.to_le_bytes()",
-            "&peak_device_bytes.to_le_bytes()",
-            "&full_discovery_reserve_bytes.to_le_bytes()",
+            "self.selection_row_count",
+            "self.parent_column_count",
+            "self.long_labels_bytes",
+            "self.short_labels_bytes",
+            "self.label_census_bytes",
+            "self.fold_descriptor_bytes",
+            "self.column_score_bytes",
+            "self.column_instability_bytes",
+            "self.column_rankability_bytes",
+            "self.schema_metadata_bytes",
+            "self.radix_key_ping_pong_bytes",
+            "self.radix_index_ping_pong_bytes",
+            "self.timeframe_group_counter_bytes",
+            "self.selected_column_map_bytes",
+            "self.selected_column_count_bytes",
+            "self.cub_select_scratch_bytes",
+            "self.cub_radix_sort_scratch_bytes",
+            "self.device_seal_bytes",
+            "self.retained_device_bytes",
+            "self.peak_device_bytes",
+            "screening_workspace_reserve_bytes",
         ],
     );
-    let plan_hash = section(&search, "fn compute_resolved_plan_identity_v1(", "\n}");
+    let search = fs::read_to_string(
+        manifest_dir().join("../neoethos-search/src/gpu_resident_feature_screening_v2.rs"),
+    )
+    .expect("read production Search resident feature-screening source");
+    let plan_hash = section(
+        &search,
+        "let mut plan_identity = Sha256::new();",
+        "let plan = BoundResidentFeatureScreeningPlanV2",
+    );
     require_all(
         plan_hash,
         &[
-            "&plan.semantics.parent_column_count.to_le_bytes()",
-            "&plan.semantics.configured_top_k.to_le_bytes()",
-            "&plan.semantics.resolved_top_k.to_le_bytes()",
-            "&plan.semantics.minimum_per_timeframe.to_le_bytes()",
-            "&plan.semantics.insample_fraction_bits.to_le_bytes()",
-            "&plan.semantics.max_hold_bars.to_le_bytes()",
-            "&plan.semantics.atr_period.to_le_bytes()",
-            "&plan.semantics.stop_atr_multiplier_bits.to_le_bytes()",
-            "&plan.semantics.reward_risk_ratio_bits.to_le_bytes()",
-            "&plan.semantics.round_trip_cost_price_bits.to_le_bytes()",
-            "&plan.semantics.cpcv_split_count.to_le_bytes()",
-            "&plan.semantics.cpcv_test_group_count.to_le_bytes()",
-            "&plan.semantics.cpcv_embargo_fraction_bits.to_le_bytes()",
-            "&plan.semantics.cpcv_purge_fraction_bits.to_le_bytes()",
-            "&plan.semantics.cpcv_max_rows.to_le_bytes()",
-            "&plan.selected_cuda_ordinal.to_le_bytes()",
+            "RESIDENT_FEATURE_SCREENING_SEMANTICS_V2.as_bytes()",
+            "template.parent_row_count",
+            "template.parent_column_count",
+            "template.global_row_cap",
+            "template.timeframe_row_cap",
+            "template.outer_split_at",
+            "template.selection_row_start",
+            "template.selection_row_end",
+            "template.holdout_row_start",
+            "template.holdout_row_end",
+            "template.configured_top_k",
+            "template.resolved_top_k",
+            "template.minimum_per_timeframe",
+            "template.insample_fraction",
+            "template.max_hold_bars",
+            "template.stop_atr_multiplier",
+            "template.reward_risk_ratio",
+            "template.round_trip_cost_price",
+            "template.cpcv_split_count",
+            "template.cpcv_test_group_count",
+            "template.cpcv_embargo_fraction",
+            "template.cpcv_purge_fraction",
+            "template.cpcv_max_rows",
+            "identity.admission_identity_sha256()",
+            "identity.workspace_plan_identity_sha256()",
+            "identity.canonical_search_input_receipt_sha256()",
+            "identity.canonical_content_merkle_sha256()",
+            "identity.normalization_fit_sha256()",
+            "identity.feature_plan_sha256()",
+            "identity.source_provenance_sha256()",
+            "identity.ordered_feature_schema_sha256()",
+            "identity.column_classification_content_sha256()",
+            "memory.allocation_plan_sha256()",
         ],
     );
 }
@@ -937,7 +1161,7 @@ fn cuda_feature_builds_and_exports_trim_prefilter_without_stub_authority() {
     require_all(
         &build,
         &[
-            "const DEVICE_SOURCES: [&str; 8] = [",
+            "const DEVICE_SOURCES: [&str; 16] = [",
             "\"native/resident_trim_prefilter_v1.cu\",",
             "cargo:rerun-if-changed=native/resident_trim_prefilter_v1_abi.cuh",
         ],
@@ -1108,13 +1332,17 @@ fn additive_v2_score_batches_bind_local_stride_and_global_parent_order() {
             "->global_parent_ordinal",
         ],
     );
+    let compact_address: String = checked_address
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
     assert!(
-        checked_address.contains("row >=")
+        cuda.contains("constexpr std::uint64_t U64_MAX_V1 = ~std::uint64_t{0};")
+            && checked_address.contains("row >=")
             && checked_address.contains("local_column >=")
-            && (checked_address.contains("numeric_limits<std::uint64_t>::max()")
-                || checked_address.contains("__builtin_mul_overflow")
-                || checked_address.contains("checked_mul")),
-        "V2 address helper must reject row/column bounds and multiplication overflow"
+            && compact_address.contains("row>(U64_MAX_V1-local_column)/batch->local_batch_stride")
+            && !checked_address.contains("std::numeric_limits"),
+        "V2 address helper must preserve the exact overflow bound with a device-compatible constant"
     );
     assert_eq!(
         score_kernel
@@ -1167,6 +1395,20 @@ fn score_batch_addressing_honors_padded_stride_and_noncontiguous_parent_ordinals
 
     assert_eq!(resolved.local_offset(), 17);
     assert_eq!(resolved.global_parent_ordinal(), 3);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn score_batch_addressing_preserves_exact_u64_limit_and_rejects_overflow() {
+    use neoethos_gpu_cuda::resident_trim_prefilter_v1::checked_resident_trim_prefilter_score_batch_address_v2 as address;
+
+    let ordinals = [7, 6, 5, 4, 3, 2, 1, 0];
+    let boundary = address(u64::MAX / 8, 7, 8, 8, 0, &ordinals)
+        .expect("the largest representable local offset remains valid");
+    assert_eq!(boundary.local_offset(), u64::MAX);
+    assert_eq!(boundary.global_parent_ordinal(), 0);
+    assert!(address(u64::MAX / 8 + 1, 0, 8, 8, 0, &ordinals).is_err());
+    assert!(address(u64::MAX / 3, 1, 2, 3, 0, &ordinals).is_err());
 }
 
 #[test]
@@ -1256,4 +1498,27 @@ fn v2_selected_map_exposes_typed_seal_and_public_capacity_invariant() {
             .contains("selected_count <= self.selected_capacity"),
         "public selected-map receipt must expose capacity >= actual"
     );
+}
+
+#[test]
+fn selected_map_read_failure_retains_the_pinned_async_destination() {
+    let rust = read_required("src/resident_trim_prefilter_v1.rs");
+    let read = braced_item(&rust, "pub fn read_bounded_selected_map_v2(");
+    let failure = braced_item(read, "if status != STATUS_OK_V1 {");
+    let retain = failure.find("mem::forget(selected_host);").unwrap();
+    let refusal = failure.find("return Err(").unwrap();
+    assert!(
+        retain < refusal,
+        "retain before an ambiguous readback error returns"
+    );
+    assert!(!failure.contains("sealed.armed = false"));
+    assert!(!failure.contains("enqueue_resident_trim_prefilter_release_v1"));
+    let release = read.find("let release_status =").unwrap();
+    let disarm = read.find("sealed.armed = false;").unwrap();
+    assert!(read.find("mem::forget(selected_host);").unwrap() < release);
+    assert!(
+        release < disarm,
+        "success still releases before disarming the owner"
+    );
+    assert_eq!(read.matches("mem::forget(selected_host);").count(), 1);
 }

@@ -143,7 +143,6 @@ fn every_gpu_registry_query_rejects_unknown_or_mismatched_name_family_pairs() {
     let registry = registry_source();
     for marker in [
         "pub fn supports_nvidia_cuda_for_model(",
-        "pub fn supports_gpu_for_model(",
         "pub fn prefers_gpu_for_model(",
     ] {
         let body = function_body(&registry, marker);
@@ -152,6 +151,11 @@ fn every_gpu_registry_query_rejects_unknown_or_mismatched_name_family_pairs() {
             "GPU registry query `{marker}` must reject unknown names and mismatched families"
         );
     }
+    let generic_support = function_body(&registry, "pub fn supports_gpu_for_model(");
+    assert!(
+        generic_support.contains("supports_nvidia_cuda_for_model(name, family)"),
+        "generic GPU support must inherit exact name/family validation from the CUDA authority"
+    );
 }
 
 #[test]

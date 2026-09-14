@@ -237,7 +237,7 @@ impl PrototypePopulationWorkload {
                     );
                     candidate_supported = false;
                 }
-            } else if !self.adaptive_at_entry_is_supported(stop_vol_multiplier) {
+            } else if !self.adaptive_at_entry_is_supported(index, stop_vol_multiplier) {
                 insert_unsupported(
                     &mut unsupported,
                     PrototypeBcIneligibilityReason::AdaptiveAtEntryUnavailable,
@@ -351,11 +351,22 @@ impl PrototypePopulationWorkload {
         validate_uploads(&self.dataset, &self.genes, &self.scenarios)
     }
 
-    fn adaptive_at_entry_is_supported(&self, stop_vol_multiplier: f64) -> bool {
+    fn adaptive_at_entry_is_supported(&self, index: usize, stop_vol_multiplier: f64) -> bool {
+        let stop = self.genes.stop_pips[index];
+        let target = self.genes.target_pips[index];
+        let gene_reward_risk = target / stop;
+        let gene_ratio_available = stop.is_finite()
+            && stop > 0.0
+            && target.is_finite()
+            && target > 0.0
+            && gene_reward_risk.is_finite()
+            && gene_reward_risk > 0.0;
+        let legacy_fallback_available = self.dataset.settings.adaptive_rr.is_finite()
+            && self.dataset.settings.adaptive_rr > 0.0;
+
         stop_vol_multiplier.is_finite()
             && stop_vol_multiplier > 0.0
-            && self.dataset.settings.adaptive_rr.is_finite()
-            && self.dataset.settings.adaptive_rr > 0.0
+            && (gene_ratio_available || legacy_fallback_available)
             && self
                 .dataset
                 .settings
@@ -570,6 +581,26 @@ mod tests {
         assert_eq!(b.coverage().total_candidates, 2);
         assert_eq!(b.coverage().supported_candidates, 2);
         assert_eq!(b.coverage().unsupported_candidates, 0);
+    }
+
+    #[test]
+    fn a_valid_gene_ratio_does_not_require_the_legacy_adaptive_rr_fallback() {
+        let mut workload = mixed_fixed_and_adaptive_workload();
+        workload.dataset.settings.adaptive_rr = f64::NAN;
+
+        let eligible = workload.common_bc_intersection(PrototypeKind::CSparseFirstHit);
+        assert_eq!(eligible.supported_candidate_ids, vec![0, 1]);
+
+        workload.genes.stop_pips[1] = f64::NAN;
+        workload.genes.target_pips[1] = f64::NAN;
+        let missing_both = workload.common_bc_intersection(PrototypeKind::CSparseFirstHit);
+        assert_eq!(missing_both.supported_candidate_ids, vec![0]);
+        assert_eq!(
+            missing_both
+                .unsupported
+                .get(&PrototypeBcIneligibilityReason::AdaptiveAtEntryUnavailable),
+            Some(&vec![1])
+        );
     }
 
     #[test]

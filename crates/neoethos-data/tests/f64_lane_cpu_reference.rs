@@ -704,38 +704,25 @@ fn each_indicator_uses_the_first_valid_rule_its_table_row_declares() {
     let gapped = gapped_candles(3000);
     const PERIOD: i64 = 14;
 
-    /// What the gapped fixture must produce.
-    enum Want {
-        /// The warmup shifts by exactly this many bars, i.e. `first_valid`.
-        ShiftedBy(usize),
-        /// The whole column is NaN — see `natr` below.
-        AllNan,
-    }
-
-    let expected: &[(&str, Want)] = &[
+    let expected: &[(&str, usize)] = &[
         // atr.rs:197-206, willr.rs:300, wclprice.rs:176 — all three non-NaN at
         // the same index. That index is 4, where high is finite again, so the
         // series is finite and the shift is directly measurable.
-        ("atr", Want::ShiftedBy(GAP_ALL_THREE)),
-        ("willr", Want::ShiftedBy(GAP_ALL_THREE)),
-        ("wclprice", Want::ShiftedBy(GAP_ALL_THREE)),
+        ("atr", GAP_ALL_THREE),
+        ("willr", GAP_ALL_THREE),
+        ("wclprice", GAP_ALL_THREE),
         // adx.rs:201-219 — fh.max(fl).max(fc) = 3. `adx_scalar` seeds `prev_h`
         // from high[3] (NaN) but its accumulators are guarded by `>` tests that
         // a NaN fails, and `prev_h` is overwritten on the next bar, so the NaN
         // does not survive into `atr`. Finite series, measurable shift of 3 —
         // one bar EARLIER than atr on the same frame, which is the whole point.
-        ("adx", Want::ShiftedBy(GAP_MAX_OF_FIRSTS)),
-        // natr.rs:226-235 uses the SAME rule as adx and gets the same index 3,
-        // but `natr_scalar` seeds with `sum_tr = high[first] - low[first]`
-        // UNGUARDED. high[3] is NaN, so the seed is NaN, so `atr` is NaN, so
-        // every bar of the output is NaN. This is the CPU's real answer on a
-        // frame shaped like this and the kernel reproduces it exactly (same
-        // seed, same index) — so it is pinned rather than papered over. It also
-        // separates natr from atr more sharply than a shift would: on ONE frame
-        // atr is finite from bar 4 and natr is entirely NaN.
-        ("natr", Want::AllNan),
+        ("adx", GAP_MAX_OF_FIRSTS),
+        // NATR uses the same independent-firsts rule as ADX. Its TA-Lib seed
+        // begins one bar later and consumes `period` true ranges, each with a
+        // previous close, so the NaN high at `first` is not part of the seed.
+        ("natr", GAP_MAX_OF_FIRSTS),
         // adxr.rs:255-258 — close alone, index 1, two bars earlier than atr.
-        ("adxr", Want::ShiftedBy(GAP_CLOSE_ONLY)),
+        ("adxr", GAP_CLOSE_ONLY),
     ];
 
     // The three answers must actually differ, or the fixture proves nothing.
@@ -752,29 +739,14 @@ fn each_indicator_uses_the_first_valid_rule_its_table_row_declares() {
             failures.push(format!("{id}: no series on the gapped fixture"));
             continue;
         };
-        match want {
-            Want::AllNan => {
-                if nan_prefix(&b) != b.len() {
-                    failures.push(format!(
-                        "{id}: expected an entirely-NaN column on the gapped fixture (its \
-                         first-valid rule lands on a bar whose high is NaN and its seed is \
-                         unguarded), got a NaN prefix of {} out of {} bars",
-                        nan_prefix(&b),
-                        b.len()
-                    ));
-                }
-            }
-            Want::ShiftedBy(want) => {
-                let got = nan_prefix(&b) as i64 - nan_prefix(&a) as i64;
-                if got != *want as i64 {
-                    failures.push(format!(
-                        "{id}: warmup shifted by {got} bars between the clean and gapped \
-                         fixtures, so its first_valid is {got}; vector-ta's F64_KERNELS row \
-                         declares a rule worth {want}. One of the two is wrong, and the device \
-                         lane derives the index it sends to the kernel from that row."
-                    ));
-                }
-            }
+        let got = nan_prefix(&b) as i64 - nan_prefix(&a) as i64;
+        if got != *want as i64 {
+            failures.push(format!(
+                "{id}: warmup shifted by {got} bars between the clean and gapped \
+                 fixtures, so its first_valid is {got}; vector-ta's F64_KERNELS row \
+                 declares a rule worth {want}. One of the two is wrong, and the device \
+                 lane derives the index it sends to the kernel from that row."
+            ));
         }
     }
 

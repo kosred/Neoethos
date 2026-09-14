@@ -13,11 +13,9 @@
 //!
 //! ## Access pattern
 //!
-//! The module is **always compiled** (no `#[cfg(test)]` gate) so non-test
-//! callers — the `--api-test` smoke harness, the wizard's
-//! "load demo data" button, the operator's first-time-run-without-data
-//! recovery path — can pull the same sample as the unit tests do. This
-//! keeps the test-vs-production drift surface zero by construction.
+//! The module is **always compiled** (no `#[cfg(test)]` gate) because integration
+//! tests in other workspace crates consume it as an ordinary dependency. It is
+//! test support only; no operator or production-data path loads this fixture.
 //!
 //! ## Fixture source
 //!
@@ -258,6 +256,134 @@ pub fn ctrader_test_feature_frame_from_columns(
         )?],
     )?;
     FeatureFrame::from_columns(timestamps, columns, plan, provenance)
+}
+
+/// Explicit fixture seam for testing persisted preprocessing across crate
+/// boundaries. This is not market-data publication or trading evidence.
+/// `None` fits the supplied training range; `Some` replays that saved state on
+/// these fixture rows without inspecting them to estimate new parameters.
+pub fn ctrader_test_feature_frame_with_normalization(
+    raw: &FeatureFrame,
+    training_rows: std::ops::Range<usize>,
+    fitted: Option<&crate::SearchNormalizationFittedStateV1>,
+) -> Result<FeatureFrame> {
+    anyhow::ensure!(
+        raw.normalization_fitted_state().is_none(),
+        "fixture input must be raw"
+    );
+    anyhow::ensure!(
+        raw.provenance().bindings().len() == 1,
+        "single-source fixture required"
+    );
+    let columns = raw
+        .names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let cells = (0..raw.n_samples())
+                .map(|row| raw.cell(row, index))
+                .collect::<Result<Vec<_>>>()?;
+            FeatureColumnF64::new(
+                name.clone(),
+                cells.iter().map(|cell| cell.value).collect(),
+                cells.iter().map(|cell| cell.validity).collect(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalized_fixture_from_columns(
+        raw.timestamps.clone(),
+        columns,
+        crate::FeatureBuildOptions {
+            normalization_training_rows: Some(training_rows),
+            ..Default::default()
+        },
+        fitted,
+    )
+}
+
+/// Raw, explicitly unverified fixture with a recorded producer recipe. This
+/// preserves real raw backing for cross-crate lazy-fit/prefix tests; it grants
+/// no canonical publication, candidate or trading authority.
+pub fn ctrader_test_feature_frame_from_columns_with_options(
+    timestamps: Vec<i64>,
+    columns: Vec<FeatureColumnF64>,
+    options: crate::FeatureBuildOptions,
+) -> Result<FeatureFrame> {
+    Ok(
+        ctrader_test_feature_frame_from_columns(timestamps, columns)?
+            .with_feature_build_options(options),
+    )
+}
+
+/// Bounded integration fixture for persisted CPU normalization. Uses the real
+/// train-only fitter and its exact fitted-state node; the source remains the
+/// explicitly unverified embedded fixture, never a production dataset claim.
+/// Supplied column names are already the producer names (including prefixes).
+pub fn ctrader_test_normalized_feature_frame_from_columns(
+    timestamps: Vec<i64>,
+    columns: Vec<FeatureColumnF64>,
+    options: crate::FeatureBuildOptions,
+) -> Result<FeatureFrame> {
+    normalized_fixture_from_columns(timestamps, columns, options, None)
+}
+
+fn normalized_fixture_from_columns(
+    timestamps: Vec<i64>,
+    mut columns: Vec<FeatureColumnF64>,
+    options: crate::FeatureBuildOptions,
+    fitted: Option<&crate::SearchNormalizationFittedStateV1>,
+) -> Result<FeatureFrame> {
+    if let Some(state) = fitted {
+        anyhow::ensure!(
+            Some(state.training_rows()?) == options.normalization_training_rows,
+            "fixture fit scope mismatch"
+        );
+    }
+    let mut raw_columns = columns.clone();
+    for column in &mut raw_columns {
+        column.name = format!("pre-normalize:0:{}", column.name);
+    }
+    let raw = ctrader_test_feature_frame_from_columns(timestamps.clone(), raw_columns)?;
+    let (fits, _) = crate::prepare_multitimeframe_feature_columns(
+        &mut columns,
+        true,
+        options.normalization_training_rows.clone(),
+        options.drop_columns_without_normalization_training_support,
+        1,
+        &crate::FeatureBuildControl::default(),
+        fitted,
+    )?;
+    let names = columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    let state = crate::SearchNormalizationFittedStateV1::new(names.clone(), fits)?;
+    if let Some(expected) = fitted {
+        anyhow::ensure!(&state == expected, "fixture changed the saved fit");
+    }
+    let mut nodes = raw.plan().nodes().to_vec();
+    let normalization_hash =
+        crate::semantic_source_hash(&[include_bytes!("core/normalization.rs")]);
+    nodes.push(FeatureNodeV1::transform(
+        "normalization:robust-f64",
+        neoethos_feature_contracts::FeatureOperationTagV1::Normalization,
+        crate::SEARCH_NORMALIZATION_POLICY_VERSION,
+        nodes.iter().map(|node| node.id().to_owned()).collect(),
+        names
+            .iter()
+            .map(|name| FeatureOutputV1::f64(name, crate::SEARCH_NORMALIZATION_POLICY_VERSION))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        Vec::new(),
+        normalization_hash,
+        normalization_hash,
+        Some(state.fitted_state_hash()?),
+    )?);
+    let plan = FeaturePlanV1::new(nodes, names)?;
+    let provenance =
+        DatasetFeatureArtifactProvenanceV1::new(&plan, raw.provenance().bindings().to_vec())?;
+    FeatureFrame::from_columns(timestamps, columns, plan, provenance)?
+        .with_feature_build_options(options)
+        .with_normalization_fitted_state(state)
 }
 
 /// Convenience adapter for legacy test matrices. The matrix is f64-only and

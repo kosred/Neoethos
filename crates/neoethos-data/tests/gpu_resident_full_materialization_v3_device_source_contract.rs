@@ -36,9 +36,22 @@ fn fixture_only_admitted_run_and_bar_major_readback_do_not_expand_production_d2h
 
     assert_eq!(
         runtime.matches(".copy_to(").count(),
-        4,
-        "fixture D2H must stay out of the production runtime source file"
+        5,
+        "production D2H must remain limited to four control/digest reads and one compact Merkle root"
     );
+    for compact_readback in [
+        ".aggregate_control_error",
+        ".copy_to(&mut aggregate_error)?",
+        ".copy_to(&mut validity_code_error)?",
+        ".copy_to(&mut fit_digest_words)?",
+        ".copy_to(canonical_content_merkle.as_mut_slice())?",
+    ] {
+        assert!(
+            runtime.contains(compact_readback),
+            "missing classified compact production readback `{compact_readback}`"
+        );
+    }
+    assert_eq!(runtime.matches(".copy_to(&mut validity_code_error)?").count(), 2);
 }
 
 #[test]

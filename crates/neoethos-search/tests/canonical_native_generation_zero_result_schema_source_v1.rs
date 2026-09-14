@@ -123,7 +123,7 @@ fn result_source_separates_pre_v5_admission_from_post_run_sealing() {
         .collect();
     assert_eq!(
         compact_preflight_signature,
-        "request:&CanonicalNativeDiscoveryRequestV1,prepared_feature_count:usize,",
+        "request:&CanonicalNativeDiscoveryRequestV1,prepared_feature_count:usize,feature_metadata:CanonicalNativeFeatureMetadataSizeV1,",
         "high-level preflight ownership/order drifted"
     );
     assert!(preflight.contains("pub(crate) struct CanonicalNativeGenerationZeroResultPreflightV1"));
@@ -598,6 +598,7 @@ fn compact_wire_field_names_types_and_order_are_frozen_for_b_empty() {
         &[
             "symbol: String,",
             "account_currency: String,",
+            "initial_equity: f64,",
             "max_hold_bars: usize,",
             "trailing_enabled: bool,",
             "trailing_atr_multiplier: f64,",
@@ -610,6 +611,11 @@ fn compact_wire_field_names_types_and_order_are_frozen_for_b_empty() {
             "swap_long_pips_per_day: f64,",
             "swap_short_pips_per_day: f64,",
             "pnl_conversion_fee_rate: f64,",
+            "kill_zones_enabled: bool,",
+            "session_spread_pips: Option<[f64; 3]>,",
+            "risk_per_trade_min: f64,",
+            "risk_per_trade_max: f64,",
+            "high_quality_confidence: f64,",
             "smc_gate_threshold: f64,",
             "smc_weight_ob: f64,",
             "smc_weight_fvg: f64,",
@@ -682,6 +688,10 @@ fn embedded_v2_v3_and_counter_schema_censuses_are_exact_and_ordered() {
             "stage1_role: String,",
             "stage1_row_start: u64,",
             "stage1_row_end: u64,",
+            "selection_row_start: u64,",
+            "selection_row_end: u64,",
+            "validation_cpcv_enabled: bool,",
+            "validation_cpcv_max_rows: u64,",
             "migration_enabled_for_run: bool,",
             "adaptive_stops_requested_for_run: bool,",
             "adaptive_base_effective_for_stage1: bool,",
@@ -763,14 +773,35 @@ fn embedded_v2_v3_and_counter_schema_censuses_are_exact_and_ordered() {
             "content_merkle_algorithm: String,",
             "feature_content_merkle_sha256: String,",
             "normalization_fit_sha256: String,",
+            "feature_plan_canonical_bytes: Option<Vec<u8>>,",
+            "normalization_fitted_state: Option<SearchNormalizationFittedStateV1>,",
             "row_count: u64,",
             "column_count: u64,",
             "feature_execution: CanonicalFeatureExecutionReceiptV1,",
             "source_bindings: Vec<CanonicalSearchSourceBindingReceiptV1>,",
         ],
     );
+    let receipt_body = v3
+        .split_once("pub struct CanonicalGpuResidentSearchInputReceiptV3 {")
+        .unwrap()
+        .1
+        .split_once("\n}")
+        .unwrap()
+        .0;
+    let optional_attribute = "#[serde(default, skip_serializing_if = \"Option::is_none\")]";
+    let attributes: Vec<_> = receipt_body
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("#[serde("))
+        .collect();
+    assert_eq!(attributes, [optional_attribute, optional_attribute]);
+    for field in [
+        "feature_plan_canonical_bytes: Option<Vec<u8>>,",
+        "normalization_fitted_state: Option<SearchNormalizationFittedStateV1>,",
+    ] {
+        assert!(receipt_body.contains(&format!("{optional_attribute}\n    {field}")));
+    }
     for declaration in [
-        "pub struct CanonicalGpuResidentSearchInputReceiptV3 {",
         "pub struct CanonicalFeatureExecutionReceiptV1 {",
         "pub struct CanonicalSearchSourceBindingReceiptV1 {",
         "pub struct CanonicalSearchSourceSegmentReceiptV1 {",

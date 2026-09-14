@@ -3,23 +3,23 @@
 //! Prepared Data supplies exact `F`; this module derives pre-V5 persistence
 //! admission and seals the bounded, borrow-only Generation-zero artifact.
 
-#![cfg_attr(
-    any(not(test), not(feature = "gpu-cuda")),
-    expect(
-        dead_code,
-        reason = "the Chunk 3 executor is the first production consumer of this sealed 2A2 API"
-    )
-)]
-
+#[cfg(any(test, feature = "gpu-cuda"))]
 use std::fmt;
+#[cfg(feature = "gpu-cuda")]
 use std::io::{self, Write};
 
+#[cfg(any(test, feature = "gpu-cuda"))]
 use crate::canonical_native_discovery_request_v1::{
     MAX_CANONICAL_NATIVE_GEN0_CONFIGURED_POPULATION_V1,
     MAX_CANONICAL_NATIVE_GEN0_RESOLVED_POPULATION_V1, MAX_CANONICAL_NATIVE_GEN0_RESULT_BYTES_V1,
-    MAX_CANONICAL_NATIVE_GEN0_SOURCE_COUNT_V1, MAX_CANONICAL_NATIVE_GEN0_STRING_BYTES_V1,
-    MAX_CANONICAL_NATIVE_GEN0_TERMS_V1, MAX_CANONICAL_NATIVE_GEN0_VECTOR_ELEMENTS_V1,
+    MAX_CANONICAL_NATIVE_GEN0_TERMS_V1,
 };
+#[cfg(feature = "gpu-cuda")]
+use crate::canonical_native_discovery_request_v1::{
+    MAX_CANONICAL_NATIVE_GEN0_SOURCE_COUNT_V1, MAX_CANONICAL_NATIVE_GEN0_STRING_BYTES_V1,
+    MAX_CANONICAL_NATIVE_GEN0_VECTOR_ELEMENTS_V1,
+};
+#[cfg(feature = "gpu-cuda")]
 use serde::Serialize;
 #[cfg(feature = "gpu-cuda")]
 use serde::ser::SerializeSeq;
@@ -51,18 +51,27 @@ use neoethos_gpu_cuda::PopulationMetricsOnlyPlanV1;
 #[cfg(feature = "gpu-cuda")]
 use sha2::{Digest, Sha256};
 
-pub const CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_SCHEMA_V1: &str =
-    "neoethos.canonical-native-generation-zero-research-result.v1";
-pub const CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_VERSION_V1: u16 = 1;
+pub use crate::canonical_native_generation_zero_result_schema_v1::{
+    SCHEMA as CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_SCHEMA_V1,
+    VERSION as CANONICAL_NATIVE_GENERATION_ZERO_RESEARCH_RESULT_VERSION_V1,
+};
 
+#[cfg(any(test, feature = "gpu-cuda"))]
 const MIN_CANONICAL_NATIVE_GEN0_CONFIGURED_POPULATION_V1: usize = 10;
+#[cfg(any(test, feature = "gpu-cuda"))]
 const EMPTY_POPULATION_ARRAY_REPLACEMENT_BYTES_V1: u64 = 3;
+#[cfg(any(test, feature = "gpu-cuda"))]
 const GENE_JSON_UPPER_BOUND_BASE_BYTES_V1: u64 = 1_097;
+#[cfg(any(test, feature = "gpu-cuda"))]
 const GENE_JSON_UPPER_BOUND_PER_TERM_BYTES_V1: u64 = 46;
+#[cfg(any(test, feature = "gpu-cuda"))]
 const METRIC_ROW_JSON_UPPER_BOUND_BYTES_V1: u64 = 276;
+#[cfg(any(test, feature = "gpu-cuda"))]
 const METRIC_RECEIPT_LOWER_HEX_STRING_UPPER_BOUND_BYTES_V1: u64 = 66;
+#[cfg(any(test, feature = "gpu-cuda"))]
 const PER_POPULATION_JSON_UPPER_BOUND_BASE_BYTES_V1: u64 = 1_442;
 
+#[cfg(any(test, feature = "gpu-cuda"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CanonicalNativeGenerationZeroResultSizePlanErrorCodeV1 {
     InvalidInput,
@@ -71,12 +80,14 @@ pub(crate) enum CanonicalNativeGenerationZeroResultSizePlanErrorCodeV1 {
     ConfiguredPopulationExceedsCapacity,
 }
 
+#[cfg(any(test, feature = "gpu-cuda"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CanonicalNativeGenerationZeroResultSizePlanErrorV1 {
     code: CanonicalNativeGenerationZeroResultSizePlanErrorCodeV1,
     detail: String,
 }
 
+#[cfg(any(test, feature = "gpu-cuda"))]
 impl CanonicalNativeGenerationZeroResultSizePlanErrorV1 {
     fn new(
         code: CanonicalNativeGenerationZeroResultSizePlanErrorCodeV1,
@@ -88,11 +99,13 @@ impl CanonicalNativeGenerationZeroResultSizePlanErrorV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn code(&self) -> CanonicalNativeGenerationZeroResultSizePlanErrorCodeV1 {
         self.code
     }
 }
 
+#[cfg(any(test, feature = "gpu-cuda"))]
 impl fmt::Display for CanonicalNativeGenerationZeroResultSizePlanErrorV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -103,11 +116,13 @@ impl fmt::Display for CanonicalNativeGenerationZeroResultSizePlanErrorV1 {
     }
 }
 
+#[cfg(any(test, feature = "gpu-cuda"))]
 impl std::error::Error for CanonicalNativeGenerationZeroResultSizePlanErrorV1 {}
 
 /// A pure pre-V5 envelope calculation. It has no CUDA or population-sizing
 /// receipt input: exact prepared feature count plus bounded scalar facts are
 /// sufficient to derive the persistable population ceiling.
+#[cfg(any(test, feature = "gpu-cuda"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CanonicalNativeGenerationZeroResultSizePlanV1 {
     prepared_feature_count: usize,
@@ -122,6 +137,7 @@ pub(crate) struct CanonicalNativeGenerationZeroResultSizePlanV1 {
     configured_population_upper_bound_bytes: u64,
 }
 
+#[cfg(any(test, feature = "gpu-cuda"))]
 impl CanonicalNativeGenerationZeroResultSizePlanV1 {
     /// Construct from exact prepared `F` and a fixed-metadata bound produced by
     /// the future final-result sealer. The fixed bound must already include
@@ -314,14 +330,17 @@ impl CanonicalNativeGenerationZeroResultSizePlanV1 {
         self.configured_population
     }
 
+    #[cfg(feature = "gpu-cuda")]
     pub(crate) const fn fixed_metadata_upper_bound_with_empty_arrays_bytes(&self) -> u64 {
         self.fixed_metadata_upper_bound_with_empty_arrays_bytes
     }
 
+    #[cfg(test)]
     pub(crate) const fn fixed_metadata_without_empty_array_closers_bytes(&self) -> u64 {
         self.fixed_metadata_without_empty_array_closers_bytes
     }
 
+    #[cfg(test)]
     pub(crate) const fn per_population_upper_bound_bytes(&self) -> u64 {
         self.per_population_upper_bound_bytes
     }
@@ -330,6 +349,7 @@ impl CanonicalNativeGenerationZeroResultSizePlanV1 {
         self.population_cap
     }
 
+    #[cfg(test)]
     pub(crate) const fn configured_population_upper_bound_bytes(&self) -> u64 {
         self.configured_population_upper_bound_bytes
     }
@@ -358,6 +378,7 @@ impl CanonicalNativeGenerationZeroResultSizePlanV1 {
     }
 }
 
+#[cfg(any(test, feature = "gpu-cuda"))]
 fn checked_upper_bound_v1(
     fixed_metadata_without_empty_array_closers_bytes: u64,
     per_population_upper_bound_bytes: u64,
@@ -397,26 +418,40 @@ fn checked_upper_bound_v1(
 // BEGIN CANONICAL_NATIVE_GEN0_PREFLIGHT_V1
 // The fixed envelope includes exactly three arrays; the planner replaces their
 // closers through EMPTY_POPULATION_ARRAY_REPLACEMENT_BYTES_V1 before charging P.
+#[cfg(all(test, feature = "gpu-cuda"))]
 const MAX_FINITE_F64_JSON_BYTES_V1: u64 = 24;
+#[cfg(feature = "gpu-cuda")]
 const MAX_RESULT_STRING_JSON_CONTENT_BYTES_V1: u64 =
     (MAX_CANONICAL_NATIVE_GEN0_STRING_BYTES_V1 as u64) * 6;
+#[cfg(all(test, feature = "gpu-cuda"))]
 const COST_BAND_OPTION_JSON_UPPER_BOUND_BYTES_V1: u64 = 51;
+#[cfg(all(test, feature = "gpu-cuda"))]
 const ADAPTIVE_TOKEN_OPTION_JSON_UPPER_BOUND_BYTES_V1: u64 = 66;
+#[cfg(all(test, feature = "gpu-cuda"))]
 const EVIDENCE_IDENTITY_JSON_STRING_BYTES_V1: u64 = 66;
+#[cfg(all(test, feature = "gpu-cuda"))]
 const EMPTY_POPULATION_ARRAYS_COMPACT_JSON_BYTES_V1: u64 = 6;
-const RESIDENT_POPULATION_SIZING_RECEIPT_V2_FIXED_JSON_BYTES_V1: u64 = 2_616;
+#[cfg(feature = "gpu-cuda")]
+const RESIDENT_POPULATION_SIZING_RECEIPT_V2_FIXED_JSON_BYTES_V1: u64 = 2_780;
+#[cfg(feature = "gpu-cuda")]
 const RESIDENT_POPULATION_SIZING_RECEIPT_V2_JSON_UPPER_BOUND_BYTES_V1: u64 =
     RESIDENT_POPULATION_SIZING_RECEIPT_V2_FIXED_JSON_BYTES_V1
         + 18 * MAX_RESULT_STRING_JSON_CONTENT_BYTES_V1;
+#[cfg(feature = "gpu-cuda")]
 const NATIVE_V3_FIXED_JSON_UPPER_BOUND_BYTES_V1: u64 = 393_995;
+#[cfg(feature = "gpu-cuda")]
 const NATIVE_V3_SOURCE_BINDING_JSON_UPPER_BOUND_BYTES_V1: u64 = 1_966_378;
+#[cfg(feature = "gpu-cuda")]
 const NATIVE_V3_SOURCE_SEGMENT_JSON_UPPER_BOUND_BYTES_V1: u64 = 148;
-const GROUPED_FIXED_METADATA_STATIC_JSON_BYTES_V1: u64 = 791_605;
+#[cfg(feature = "gpu-cuda")]
+const GROUPED_FIXED_METADATA_STATIC_JSON_BYTES_V1: u64 = 791_916;
+#[cfg(feature = "gpu-cuda")]
 const GROUPED_FIXED_METADATA_BASE_WITH_V2_V3_JSON_BYTES_V1: u64 =
     GROUPED_FIXED_METADATA_STATIC_JSON_BYTES_V1
         + RESIDENT_POPULATION_SIZING_RECEIPT_V2_JSON_UPPER_BOUND_BYTES_V1
         + NATIVE_V3_FIXED_JSON_UPPER_BOUND_BYTES_V1;
 
+#[cfg(feature = "gpu-cuda")]
 #[derive(Debug)]
 pub(crate) enum CanonicalNativeGenerationZeroResultErrorV1 {
     InvalidEvidence(String),
@@ -425,6 +460,7 @@ pub(crate) enum CanonicalNativeGenerationZeroResultErrorV1 {
     Io(io::Error),
 }
 
+#[cfg(feature = "gpu-cuda")]
 impl fmt::Display for CanonicalNativeGenerationZeroResultErrorV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -448,8 +484,10 @@ impl fmt::Display for CanonicalNativeGenerationZeroResultErrorV1 {
     }
 }
 
+#[cfg(feature = "gpu-cuda")]
 impl std::error::Error for CanonicalNativeGenerationZeroResultErrorV1 {}
 
+#[cfg(feature = "gpu-cuda")]
 impl From<CanonicalNativeGenerationZeroResultSizePlanErrorV1>
     for CanonicalNativeGenerationZeroResultErrorV1
 {
@@ -458,15 +496,18 @@ impl From<CanonicalNativeGenerationZeroResultSizePlanErrorV1>
     }
 }
 
+#[cfg(feature = "gpu-cuda")]
 fn invalid_result_v1(detail: impl Into<String>) -> CanonicalNativeGenerationZeroResultErrorV1 {
     CanonicalNativeGenerationZeroResultErrorV1::InvalidEvidence(detail.into())
 }
 
+#[cfg(feature = "gpu-cuda")]
 #[derive(Default)]
 struct CompactJsonCountingWriterV1 {
     byte_count: u64,
 }
 
+#[cfg(feature = "gpu-cuda")]
 impl Write for CompactJsonCountingWriterV1 {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.byte_count = self
@@ -481,6 +522,7 @@ impl Write for CompactJsonCountingWriterV1 {
     }
 }
 
+#[cfg(feature = "gpu-cuda")]
 fn checked_compact_json_byte_count_v1<T: Serialize + ?Sized>(
     value: &T,
 ) -> Result<u64, CanonicalNativeGenerationZeroResultErrorV1> {
@@ -493,12 +535,14 @@ fn checked_compact_json_byte_count_v1<T: Serialize + ?Sized>(
     Ok(writer.byte_count)
 }
 
+#[cfg(feature = "gpu-cuda")]
 fn checked_compact_json_string_byte_count_v1(
     value: &str,
 ) -> Result<u64, CanonicalNativeGenerationZeroResultErrorV1> {
     checked_compact_json_byte_count_v1(value)
 }
 
+#[cfg(all(test, feature = "gpu-cuda"))]
 fn checked_gene_json_upper_bound_bytes_v1(
     term_cap: usize,
 ) -> Result<u64, CanonicalNativeGenerationZeroResultErrorV1> {
@@ -512,6 +556,7 @@ fn checked_gene_json_upper_bound_bytes_v1(
         )
 }
 
+#[cfg(all(test, feature = "gpu-cuda"))]
 fn checked_per_population_json_upper_bound_bytes_v1(
     term_cap: usize,
 ) -> Result<u64, CanonicalNativeGenerationZeroResultErrorV1> {
@@ -527,6 +572,7 @@ fn checked_per_population_json_upper_bound_bytes_v1(
         )
 }
 
+#[cfg(feature = "gpu-cuda")]
 fn validate_strategy_id_v1(
     strategy_id: &str,
 ) -> Result<(), CanonicalNativeGenerationZeroResultErrorV1> {
@@ -540,20 +586,111 @@ fn validate_strategy_id_v1(
     Ok(())
 }
 
+#[cfg(feature = "gpu-cuda")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CanonicalNativeGenerationZeroFixedMetadataShapeV1 {
     contract_compact_json_bytes: u64,
     contract_artifact_relative_path_compact_json_bytes: u64,
     source_count: usize,
     total_source_segment_count: usize,
+    feature_metadata_json_upper_bound_bytes: u64,
 }
 
+/// Persistence geometry only: no fabricated plan, fitted state or execution proof.
+#[cfg(feature = "gpu-cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CanonicalNativeFeatureMetadataSizeV1 {
+    feature_count: usize,
+    json_upper_bound_bytes: u64,
+}
+
+#[cfg(feature = "gpu-cuda")]
+impl CanonicalNativeFeatureMetadataSizeV1 {
+    pub(crate) fn checked_from_recipe_v3<'a>(
+        parent_rows: u64,
+        ordered_names: impl ExactSizeIterator<Item = &'a str>,
+        normalization_enabled: bool,
+        canonical_plan_max_bytes: usize,
+    ) -> Result<Self, CanonicalNativeGenerationZeroResultErrorV1> {
+        let feature_count = ordered_names.len();
+        if parent_rows == 0
+            || feature_count == 0
+            || feature_count > MAX_CANONICAL_NATIVE_GEN0_TERMS_V1
+            || canonical_plan_max_bytes == 0
+        {
+            return Err(invalid_result_v1(
+                "empty or oversized prepared feature metadata geometry",
+            ));
+        }
+        let overflow = || {
+            CanonicalNativeGenerationZeroResultErrorV1::ArithmeticOverflow(
+                "prepared feature metadata JSON bound",
+            )
+        };
+        let mut names_json_bytes = 0_u64;
+        for name in ordered_names {
+            if name.is_empty() || name.len() > MAX_CANONICAL_NATIVE_GEN0_STRING_BYTES_V1 {
+                return Err(invalid_result_v1(
+                    "prepared feature name exceeds result schema bounds",
+                ));
+            }
+            names_json_bytes = names_json_bytes
+                .checked_add(checked_compact_json_string_byte_count_v1(name)?)
+                .ok_or_else(overflow)?;
+        }
+        // Each canonical byte is at most three decimal digits plus a comma;
+        // the final comma is replaced by the closing bracket (nonempty array).
+        let plan = u64::try_from(canonical_plan_max_bytes).map_err(|_| overflow())?;
+        let mut bytes = plan
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_add(b",\"feature_plan_canonical_bytes\":".len() as u64))
+            .ok_or_else(overflow)?;
+        if normalization_enabled {
+            // Actual fit f64 fields serialize as exactly sixteen hex digits.
+            // Counts cannot exceed the genuine parent extent; start is zero.
+            // u32 version widths are wire bounds, not invented fit values.
+            let state_fixed = br#"{"policy_version":4294967295,"transform_semantic_version":4294967295,"column_names":[],"fits":[]}"#.len() as u64;
+            let fit_fixed = br#"{"training_rows":{"start":0,"end":0},"median":"0000000000000000","scale":"0000000000000000","valid_training_cells":0,"degenerate":false}"#.len() as u64;
+            let integer_growth = (parent_rows.to_string().len() as u64 - 1)
+                .checked_mul(2)
+                .ok_or_else(overflow)?;
+            let fit_bytes = fit_fixed.checked_add(integer_growth).ok_or_else(overflow)?;
+            let columns = u64::try_from(feature_count).map_err(|_| overflow())?;
+            let fits = fit_bytes.checked_mul(columns).ok_or_else(overflow)?;
+            let separators = (columns - 1).checked_mul(2).ok_or_else(overflow)?;
+            bytes = bytes
+                .checked_add(b",\"normalization_fitted_state\":".len() as u64)
+                .and_then(|n| n.checked_add(state_fixed))
+                .and_then(|n| n.checked_add(names_json_bytes))
+                .and_then(|n| n.checked_add(fits))
+                .and_then(|n| n.checked_add(separators))
+                .ok_or_else(overflow)?;
+        }
+        if bytes > MAX_CANONICAL_NATIVE_GEN0_RESULT_BYTES_V1 {
+            return Err(invalid_result_v1(
+                "prepared feature metadata exceeds result byte cap",
+            ));
+        }
+        Ok(Self {
+            feature_count,
+            json_upper_bound_bytes: bytes,
+        })
+    }
+
+    pub(crate) const fn json_upper_bound_bytes(&self) -> u64 {
+        self.json_upper_bound_bytes
+    }
+}
+
+#[cfg(feature = "gpu-cuda")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CanonicalNativeGenerationZeroResultPreflightV1 {
     size_plan: CanonicalNativeGenerationZeroResultSizePlanV1,
     fixed_metadata_shape: CanonicalNativeGenerationZeroFixedMetadataShapeV1,
 }
 
+#[cfg(feature = "gpu-cuda")]
 impl CanonicalNativeGenerationZeroResultPreflightV1 {
     pub(crate) const fn prepared_feature_count(&self) -> usize {
         self.size_plan.prepared_feature_count()
@@ -594,6 +731,7 @@ impl CanonicalNativeGenerationZeroResultPreflightV1 {
     }
 }
 
+#[cfg(feature = "gpu-cuda")]
 fn checked_native_v3_receipt_json_upper_bound_bytes_v1(
     source_count: usize,
     total_source_segment_count: usize,
@@ -620,6 +758,7 @@ fn checked_native_v3_receipt_json_upper_bound_bytes_v1(
         )
 }
 
+#[cfg(feature = "gpu-cuda")]
 fn checked_fixed_metadata_upper_bound_with_empty_arrays_bytes_v1(
     shape: CanonicalNativeGenerationZeroFixedMetadataShapeV1,
 ) -> Result<u64, CanonicalNativeGenerationZeroResultErrorV1> {
@@ -640,6 +779,7 @@ fn checked_fixed_metadata_upper_bound_with_empty_arrays_bytes_v1(
             bytes.checked_add(shape.contract_artifact_relative_path_compact_json_bytes)
         })
         .and_then(|bytes| bytes.checked_add(native_variable))
+        .and_then(|bytes| bytes.checked_add(shape.feature_metadata_json_upper_bound_bytes))
         .ok_or(
             CanonicalNativeGenerationZeroResultErrorV1::ArithmeticOverflow(
                 "fixed metadata JSON upper bound",
@@ -647,6 +787,7 @@ fn checked_fixed_metadata_upper_bound_with_empty_arrays_bytes_v1(
         )
 }
 
+#[cfg(feature = "gpu-cuda")]
 fn checked_preflight_from_fixed_metadata_shape_v1(
     prepared_feature_count: usize,
     raw_configured_max_indicators: usize,
@@ -670,15 +811,20 @@ fn checked_preflight_from_fixed_metadata_shape_v1(
     })
 }
 
-#[allow(dead_code)]
 #[cfg(feature = "gpu-cuda")]
 pub(crate) fn preflight_canonical_native_generation_zero_result_v1(
     request: &CanonicalNativeDiscoveryRequestV1,
     prepared_feature_count: usize,
+    feature_metadata: CanonicalNativeFeatureMetadataSizeV1,
 ) -> Result<
     CanonicalNativeGenerationZeroResultPreflightV1,
     CanonicalNativeGenerationZeroResultErrorV1,
 > {
+    if feature_metadata.feature_count != prepared_feature_count {
+        return Err(invalid_result_v1(
+            "prepared metadata feature count differs from population sizing",
+        ));
+    }
     let loaded = request.loaded_contract();
     let source_count = loaded.source_projection().bindings().len();
     let total_source_segment_count = loaded
@@ -701,6 +847,7 @@ pub(crate) fn preflight_canonical_native_generation_zero_result_v1(
                 checked_compact_json_string_byte_count_v1(loaded.relative_path())?,
             source_count,
             total_source_segment_count,
+            feature_metadata_json_upper_bound_bytes: feature_metadata.json_upper_bound_bytes(),
         },
     )
 }
@@ -715,6 +862,43 @@ enum CanonicalNativeGenerationZeroScoringObjectiveV1 {
 }
 
 // BEGIN CANONICAL_NATIVE_GEN0_SEALED_VIEW_V1
+#[cfg(feature = "gpu-cuda")]
+fn checked_actual_feature_metadata_json_bytes_v3(
+    receipt: &CanonicalGpuResidentSearchInputReceiptV3,
+) -> Result<u64, CanonicalNativeGenerationZeroResultErrorV1> {
+    let mut bytes = 0_u64;
+    if let Some(plan) = receipt.feature_plan_canonical_bytes() {
+        bytes = checked_compact_json_byte_count_v1(plan)?
+            .checked_add(b",\"feature_plan_canonical_bytes\":".len() as u64)
+            .ok_or(
+                CanonicalNativeGenerationZeroResultErrorV1::ArithmeticOverflow("actual plan JSON"),
+            )?;
+    }
+    if let Some(state) = receipt.normalization_fitted_state() {
+        bytes = bytes
+            .checked_add(checked_compact_json_byte_count_v1(state)?)
+            .and_then(|n| n.checked_add(b",\"normalization_fitted_state\":".len() as u64))
+            .ok_or(
+                CanonicalNativeGenerationZeroResultErrorV1::ArithmeticOverflow("actual fit JSON"),
+            )?;
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "gpu-cuda")]
+fn validate_actual_feature_metadata_size_v3(
+    receipt: &CanonicalGpuResidentSearchInputReceiptV3,
+    admitted_json_bytes: u64,
+) -> Result<(), CanonicalNativeGenerationZeroResultErrorV1> {
+    if checked_actual_feature_metadata_json_bytes_v3(receipt)? > admitted_json_bytes {
+        return Err(invalid_result_v1(
+            "actual feature plan/fit metadata exceeds preflight allowance",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu-cuda")]
 fn validate_native_v3_source_shape_counts_v1(
     source_count: usize,
     total_source_segment_count: usize,
@@ -791,6 +975,7 @@ fn typed_identity_sha256_v1(
 struct CanonicalNativeGenerationZeroEvaluationSnapshotV1 {
     symbol: String,
     account_currency: String,
+    initial_equity: f64,
     max_hold_bars: usize,
     trailing_enabled: bool,
     trailing_atr_multiplier: f64,
@@ -803,6 +988,11 @@ struct CanonicalNativeGenerationZeroEvaluationSnapshotV1 {
     swap_long_pips_per_day: f64,
     swap_short_pips_per_day: f64,
     pnl_conversion_fee_rate: f64,
+    kill_zones_enabled: bool,
+    session_spread_pips: Option<[f64; 3]>,
+    risk_per_trade_min: f64,
+    risk_per_trade_max: f64,
+    high_quality_confidence: f64,
     smc_gate_threshold: f64,
     smc_weight_ob: f64,
     smc_weight_fvg: f64,
@@ -831,6 +1021,11 @@ impl CanonicalNativeGenerationZeroEvaluationEvidenceV1 {
         config: &EvaluationConfig,
         mode: crate::discovery::DiscoveryMode,
     ) -> Result<Self, CanonicalNativeGenerationZeroResultErrorV1> {
+        if config.growth_goal.is_some() {
+            return Err(invalid_result_v1(
+                "goal-aware realized-balance scoring requires versioned native support; cannot encode as RiskyKellyGrowthV5",
+            ));
+        }
         if config.symbol.is_empty()
             || config.account_currency.is_empty()
             || config.symbol.len() > MAX_CANONICAL_NATIVE_GEN0_STRING_BYTES_V1
@@ -839,6 +1034,7 @@ impl CanonicalNativeGenerationZeroEvaluationEvidenceV1 {
             return Err(invalid_result_v1("evaluation string exceeds V1 limits"));
         }
         let finite = [
+            config.initial_equity,
             config.trailing_atr_multiplier,
             config.trailing_be_trigger_r,
             config.trailing_min_lock_pips,
@@ -849,6 +1045,9 @@ impl CanonicalNativeGenerationZeroEvaluationEvidenceV1 {
             config.swap_long_pips_per_day,
             config.swap_short_pips_per_day,
             config.pnl_conversion_fee_rate,
+            config.risk_per_trade_min,
+            config.risk_per_trade_max,
+            config.high_quality_confidence,
             config.smc_gate_threshold,
             config.smc_weight_ob,
             config.smc_weight_fvg,
@@ -865,6 +1064,24 @@ impl CanonicalNativeGenerationZeroEvaluationEvidenceV1 {
         if !finite.into_iter().all(f64::is_finite) {
             return Err(invalid_result_v1(
                 "evaluation evidence contains non-finite input",
+            ));
+        }
+        if let Some(session_spreads) = config.session_spread_pips
+            && !session_spreads
+                .into_iter()
+                .all(|spread| spread.is_finite() && spread >= 0.0)
+        {
+            return Err(invalid_result_v1(
+                "evaluation evidence contains invalid session spread",
+            ));
+        }
+        if config.initial_equity <= 0.0
+            || !(0.0..=1.0).contains(&config.risk_per_trade_min)
+            || !(config.risk_per_trade_min..=1.0).contains(&config.risk_per_trade_max)
+            || !(config.high_quality_confidence > 0.0 && config.high_quality_confidence <= 1.0)
+        {
+            return Err(invalid_result_v1(
+                "evaluation evidence contains invalid sizing policy",
             ));
         }
         let scoring_objective = if config.growth_objective {
@@ -885,6 +1102,7 @@ impl CanonicalNativeGenerationZeroEvaluationEvidenceV1 {
         let snapshot_v1 = CanonicalNativeGenerationZeroEvaluationSnapshotV1 {
             symbol: config.symbol.to_owned(),
             account_currency: config.account_currency.to_owned(),
+            initial_equity: config.initial_equity,
             max_hold_bars: config.max_hold_bars,
             trailing_enabled: config.trailing_enabled,
             trailing_atr_multiplier: config.trailing_atr_multiplier,
@@ -897,6 +1115,11 @@ impl CanonicalNativeGenerationZeroEvaluationEvidenceV1 {
             swap_long_pips_per_day: config.swap_long_pips_per_day,
             swap_short_pips_per_day: config.swap_short_pips_per_day,
             pnl_conversion_fee_rate: config.pnl_conversion_fee_rate,
+            kill_zones_enabled: config.kill_zones_enabled,
+            session_spread_pips: config.session_spread_pips,
+            risk_per_trade_min: config.risk_per_trade_min,
+            risk_per_trade_max: config.risk_per_trade_max,
+            high_quality_confidence: config.high_quality_confidence,
             smc_gate_threshold: config.smc_gate_threshold,
             smc_weight_ob: config.smc_weight_ob,
             smc_weight_fvg: config.smc_weight_fvg,
@@ -1166,12 +1389,10 @@ fn validate_execution_facts_v1<R: AsRef<[[u8; 32]]>>(
         && facts.sizing_resolved_population >= facts.sizing_configured_population
         && facts.sizing_resolved_population == facts.milestone_resolved_population
         && facts.sizing_resolved_population <= facts.population_cap
-        && facts.sizing_resolved_population
-            <= facts
-                .sizing_configured_population
-                .max(facts.hard_growth_cap)
+        && facts.sizing_resolved_population <= facts.hard_growth_cap
         && facts.hard_growth_cap == expected_hard_growth_cap
         && facts.max_concurrent_scenario_count > 0
+        && facts.max_concurrent_scenario_count <= facts.sizing_resolved_population
         && facts.month_capacity > 0
         && facts.sizing_stage1_row_start < facts.sizing_stage1_row_end
         && facts.sizing_stage1_row_start == facts.milestone_stage1_row_start
@@ -1696,6 +1917,7 @@ impl CanonicalNativeGenerationZeroResearchResultViewV1<'_> {
         self.milestone
     }
 
+    #[cfg(test)]
     pub(crate) const fn preflight(&self) -> &CanonicalNativeGenerationZeroResultPreflightV1 {
         &self.preflight
     }
@@ -1704,6 +1926,7 @@ impl CanonicalNativeGenerationZeroResearchResultViewV1<'_> {
         &self.evidence_identity_sha256
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn financial_input_receipt_identity_sha256(&self) -> &str {
         self.financial_execution_contract_v3.input_receipt_sha256()
     }
@@ -1997,6 +2220,12 @@ fn validate_preflight_authority_v1(
     native: &CanonicalGpuResidentSearchInputReceiptV3,
     sizing: &ResidentPopulationAutoSizingReceiptV2,
 ) -> Result<(), CanonicalNativeGenerationZeroResultErrorV1> {
+    validate_actual_feature_metadata_size_v3(
+        native,
+        preflight
+            .fixed_metadata_shape
+            .feature_metadata_json_upper_bound_bytes,
+    )?;
     let source_count = native.source_bindings().len();
     let segment_count = native
         .source_bindings()
@@ -2015,6 +2244,9 @@ fn validate_preflight_authority_v1(
             checked_compact_json_string_byte_count_v1(&request.contract_artifact_relative_path)?,
         source_count,
         total_source_segment_count: segment_count,
+        feature_metadata_json_upper_bound_bytes: preflight
+            .fixed_metadata_shape
+            .feature_metadata_json_upper_bound_bytes,
     };
     let valid = preflight.fixed_metadata_shape == actual_shape
         && preflight.prepared_feature_count() == sizing.feature_count()

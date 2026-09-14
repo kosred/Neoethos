@@ -407,7 +407,11 @@ fn snapshot_to_outcome(
 
     let top_sharpe_is = highlight_f64(snapshot, "best_sharpe");
     let top_sharpe_oos = highlight_f64(snapshot, "best_oos_sharpe");
-    let top_max_dd_pct = highlight_f64(snapshot, "best_max_dd");
+    // Discovery preserves Gene::max_drawdown as an equity fraction. The CSV
+    // explicitly promises percent, so convert once at this presentation edge.
+    let top_max_dd_pct = highlight_f64(snapshot, "best_max_dd")
+        .map(|fraction| fraction * 100.0)
+        .filter(|percent| percent.is_finite());
 
     // #213 diagnostic: when the funnel produced a non-zero candidate
     // pool but no portfolio, surface the funnel counters so an operator
@@ -474,6 +478,7 @@ fn highlight_f64(snapshot: &crate::app_services::jobs::JobSnapshot, key: &str) -
         .iter()
         .find(|(k, _)| k == key)
         .and_then(|(_, v)| v.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
 }
 
 fn build_summary(symbol: &str, outcomes: &[TfOutcome], total_elapsed: Duration) -> String {
@@ -515,24 +520,36 @@ fn build_summary(symbol: &str, outcomes: &[TfOutcome], total_elapsed: Duration) 
         ));
     }
 
-    // BEST TF by OOS sharpe (preferred when present) falling back to IS
-    // — only consider successful runs so a Timeout/Failed row with a
-    // zero sharpe can't masquerade as best. OOS is what an operator
-    // actually cares about: the GA always inflates IS, so picking on IS
-    // would crown the most overfit TF.
+    // Compare like with like. An IS-only score may not beat a measured OOS
+    // score just because the optimized training score is larger. Only use
+    // the explicitly labelled IS fallback if no successful TF has OOS data.
+    let has_oos = outcomes.iter().any(|outcome| {
+        matches!(outcome.status.as_str(), "Succeeded" | "Degraded")
+            && outcome.top_sharpe_oos.is_some_and(f64::is_finite)
+    });
+    let ranking_score = |outcome: &TfOutcome| {
+        if has_oos {
+            outcome.top_sharpe_oos
+        } else {
+            outcome.top_sharpe_is
+        }
+        .filter(|value| value.is_finite())
+    };
     let best = outcomes
         .iter()
         .filter(|o| {
-            (o.status == "Succeeded" || o.status == "Degraded")
-                && (o.top_sharpe_oos.is_some() || o.top_sharpe_is.is_some())
+            (o.status == "Succeeded" || o.status == "Degraded") && ranking_score(o).is_some()
         })
         .max_by(|a, b| {
-            let a_key = a.top_sharpe_oos.or(a.top_sharpe_is).unwrap_or(f64::MIN);
-            let b_key = b.top_sharpe_oos.or(b.top_sharpe_is).unwrap_or(f64::MIN);
-            a_key
-                .partial_cmp(&b_key)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            ranking_score(a)
+                .unwrap()
+                .total_cmp(&ranking_score(b).unwrap())
         });
+    buf.push_str(if has_oos {
+        "\nbest_tf_basis: measured OOS\n"
+    } else {
+        "\nbest_tf_basis: IS only (no measured OOS)\n"
+    });
     match best {
         Some(o) => buf.push_str(&format!(
             "\nbest_tf: {} (top_sharpe_is={:.4} top_sharpe_oos={})\n",
@@ -785,5 +802,32 @@ mod tests {
         assert!(summary.contains("best_tf: <none"));
         assert!(summary.contains("succeeded: 0"));
         assert!(summary.contains("failed: 1"));
+    }
+
+    #[test]
+    fn summary_never_compares_optimized_is_with_another_timeframes_oos() {
+        let mut snapshot = crate::app_services::jobs::JobSnapshot::new(
+            crate::app_services::jobs::JobKind::Discovery,
+        );
+        snapshot.state = JobState::Succeeded;
+        snapshot.report.highlights = vec![
+            ("best_sharpe".into(), "99.0".into()),
+            ("best_max_dd".into(), "0.125".into()),
+        ];
+        let unvalidated = snapshot_to_outcome("M5", &snapshot, 1.0);
+        assert_eq!(unvalidated.top_max_dd_pct, Some(12.5));
+        snapshot
+            .report
+            .highlights
+            .push(("best_oos_sharpe".into(), "-0.5".into()));
+        let validated = snapshot_to_outcome("H1", &snapshot, 1.0);
+        let summary = build_summary("EURUSD", &[unvalidated, validated], Duration::from_secs(2));
+        assert!(summary.contains("best_tf: H1"));
+        assert!(summary.contains("best_tf_basis: measured OOS"));
+        snapshot.report.highlights = vec![("best_oos_sharpe".into(), "NaN".into())];
+        assert_eq!(
+            snapshot_to_outcome("H1", &snapshot, 1.0).top_sharpe_oos,
+            None
+        );
     }
 }

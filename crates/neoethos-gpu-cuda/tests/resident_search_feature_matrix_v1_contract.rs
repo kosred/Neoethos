@@ -118,7 +118,7 @@ fn terminal_host_metrics_oracle_is_explicitly_fixture_only() {
     require_local_cfg_before(
         &search,
         "use crate::population::ResidentPopulationMetricsV1;",
-        "#[cfg(feature = \"cuda-device-fixtures\")]",
+        "#[cfg(all(test, feature = \"cuda-device-fixtures\"))]",
     );
     assert!(
         device_test.contains(".enqueue_resident_gene_metrics_fixture_v2(&settings)?"),

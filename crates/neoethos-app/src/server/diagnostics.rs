@@ -283,7 +283,7 @@ fn collect_system_info() -> String {
 /// the bot makes. Putting a hostname in `config.yaml` would let a snapshot
 /// claim to come from a machine it did not come from — strictly worse.
 ///
-/// Same category as the toolchain locators (`CUDA_PATH`, `VULKAN_SDK`) in
+/// Same category as the CUDA toolchain locator (`CUDA_PATH`) in
 /// `build.rs`: environment as an interface to the platform, not as a second
 /// config surface.
 fn hostname() -> anyhow::Result<String> {
@@ -303,10 +303,7 @@ fn log_dir() -> Option<PathBuf> {
 }
 
 fn resolve_creds_path() -> anyhow::Result<PathBuf> {
-    Ok(dirs::data_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve %APPDATA% / data dir"))?
-        .join("neoethos")
-        .join("broker_credentials.toml"))
+    neoethos_core::broker_config::credentials_file_path()
 }
 
 /// Redact secrets out of the TOML before it goes into the bundle.

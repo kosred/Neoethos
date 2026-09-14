@@ -6,9 +6,16 @@
 //! creates a context or stream and never materializes a host feature matrix.
 
 use crate::resident_feature_store_v3::{
-    GpuOnlyRunDeviceAdmissionV3, ResidentF64FeatureBatchV3, ResidentFeatureColumnBindingV3,
+    CompactSelectedStoreAllocationExtentV2, GpuOnlyRunDeviceAdmissionV3,
+    PreparedResidentFeatureScreeningPassV2, ResidentF64FeatureBatchV3,
+    ResidentFeatureColumnBindingV3, ResidentFeatureScreeningPassV2,
     ResidentFeatureStoreAssemblerV3, ResidentFeatureStoreCudaErrorV3,
     ResidentParentDatasetSourceV3, ResidentProducerReadyEventV3,
+    ResidentTrimPrefilterScreeningSchemaUploadV2, prepare_resident_feature_screening_pass_v2,
+};
+use crate::resident_robust_normalization_v2::ResidentRobustNormalizationPlanV2;
+use crate::resident_trim_prefilter_v1::{
+    ResidentTrimPrefilterDeviceErrorV1, ResidentTrimPrefilterInputsV1,
 };
 use cust::context::{Context, CurrentContext};
 use cust::event::{Event, EventFlags, EventStatus};
@@ -17,6 +24,7 @@ use cust::memory::{
 };
 use cust::stream::Stream;
 use cust::sys::CUstream;
+use neoethos_gpu_contracts::normalization_v3::SearchNormalizationColumnModeV3;
 use neoethos_gpu_contracts::resident_feature_store_v3::{
     ResidentFeatureProducerV3, ResidentParentDatasetLayoutV4, ResidentProducerCapabilityV3,
     ResidentWorkingSetBoundV3,
@@ -445,6 +453,89 @@ pub fn begin_resident_smc_store_v3(
     Ok((assembler, PendingResidentSmcBatchV3 { batch: Some(batch) }))
 }
 
+/// Consume the replayed SMC parent and batch into the selected-only final
+/// store. Producer batches retain their original parent ordinals; the compact
+/// assembler projects those batches through the sealed ascending map.
+pub fn begin_resident_smc_compact_store_v2(
+    run_device: GpuOnlyRunDeviceAdmissionV3,
+    parent_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    selected_global_parent_ordinals: Vec<u32>,
+    working_set: &ResidentWorkingSetBoundV3,
+    compact_extent: CompactSelectedStoreAllocationExtentV2,
+    mut materialization: ResidentSmcMaterializationV3,
+) -> Result<
+    (ResidentFeatureStoreAssemblerV3, PendingResidentSmcBatchV3),
+    ResidentFeatureStoreCudaErrorV3,
+> {
+    let parent = materialization.parent.take().ok_or_else(|| {
+        ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "opaque replayed SMC materialization lost its parent source".into(),
+        )
+    })?;
+    let batch = materialization.batch.take().ok_or_else(|| {
+        ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "opaque replayed SMC materialization lost its feature batch".into(),
+        )
+    })?;
+    let assembler = ResidentFeatureStoreAssemblerV3::new_compact_v2(
+        run_device,
+        parent_column_bindings,
+        selected_global_parent_ordinals,
+        Box::new(parent),
+        working_set,
+        compact_extent,
+    )?;
+    Ok((assembler, PendingResidentSmcBatchV3 { batch: Some(batch) }))
+}
+
+/// Consume the first-pass SMC parent into a bounded screening owner. The
+/// unfiltered feature cube is never allocated; only each producer batch is
+/// packed, normalized, scored, and retired before the next batch starts.
+#[allow(clippy::too_many_arguments)]
+pub fn begin_resident_smc_screening_pass_v2(
+    run_device: GpuOnlyRunDeviceAdmissionV3,
+    parent_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    schema: ResidentTrimPrefilterScreeningSchemaUploadV2,
+    admitted_max_live_producer_bytes: usize,
+    admitted_max_live_producer_scratch_bytes: usize,
+    admitted_pointer_table_bytes: usize,
+    mut materialization: ResidentSmcMaterializationV3,
+    parent_normalization_modes: Vec<SearchNormalizationColumnModeV3>,
+) -> Result<
+    (
+        PreparedResidentFeatureScreeningPassV2,
+        ResidentTrimPrefilterInputsV1,
+        PendingResidentSmcBatchV3,
+    ),
+    ResidentFeatureStoreCudaErrorV3,
+> {
+    let parent = materialization.parent.take().ok_or_else(|| {
+        ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "opaque screening SMC materialization lost its parent source".into(),
+        )
+    })?;
+    let batch = materialization.batch.take().ok_or_else(|| {
+        ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "opaque screening SMC materialization lost its feature batch".into(),
+        )
+    })?;
+    let (prepared, inputs) = prepare_resident_feature_screening_pass_v2(
+        run_device,
+        parent_column_bindings,
+        schema,
+        Box::new(parent),
+        admitted_max_live_producer_bytes,
+        admitted_max_live_producer_scratch_bytes,
+        admitted_pointer_table_bytes,
+        parent_normalization_modes,
+    )?;
+    Ok((
+        prepared,
+        inputs,
+        PendingResidentSmcBatchV3 { batch: Some(batch) },
+    ))
+}
+
 impl PendingResidentSmcBatchV3 {
     pub fn append_to(
         mut self,
@@ -456,6 +547,24 @@ impl PendingResidentSmcBatchV3 {
             )
         })?;
         assembler.append_batch(Box::new(batch))
+    }
+
+    pub fn score_to_screening_v2(
+        mut self,
+        screening: &mut ResidentFeatureScreeningPassV2,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> Result<(), ResidentTrimPrefilterDeviceErrorV1> {
+        let batch = self
+            .batch
+            .take()
+            .ok_or(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation)?;
+        let normalization_plan = ResidentRobustNormalizationPlanV2::preflight(
+            normalization_template.rows(),
+            batch.bindings.len(),
+            normalization_template.training_rows(),
+            normalization_template.enabled(),
+        )?;
+        screening.score_batch_v2(Box::new(batch), &normalization_plan)
     }
 }
 

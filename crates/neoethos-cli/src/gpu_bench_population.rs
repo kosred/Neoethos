@@ -10,8 +10,7 @@ use anyhow::{Context, Result};
 #[cfg(any(
     feature = "gpu-nvidia",
     feature = "gpu-b-native",
-    feature = "gpu-bench-cuda",
-    feature = "gpu-vulkan"
+    feature = "gpu-bench-cuda"
 ))]
 use neoethos_search::gpu_native::benchmark::execute_population_benchmark;
 use neoethos_search::gpu_native::benchmark::{
@@ -283,11 +282,7 @@ fn run_prototype_b(
     )
 }
 
-#[cfg(any(
-    feature = "gpu-nvidia",
-    feature = "gpu-bench-cuda",
-    feature = "gpu-vulkan"
-))]
+#[cfg(any(feature = "gpu-nvidia", feature = "gpu-bench-cuda"))]
 fn run_prototype_c(
     workload: &PrototypePopulationWorkload,
     eligibility: &neoethos_search::gpu_native::prototype_population::CommonBcEligibility,
@@ -304,11 +299,7 @@ fn run_prototype_c(
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-#[cfg(not(any(
-    feature = "gpu-nvidia",
-    feature = "gpu-bench-cuda",
-    feature = "gpu-vulkan"
-)))]
+#[cfg(not(any(feature = "gpu-nvidia", feature = "gpu-bench-cuda")))]
 fn run_prototype_c(
     _workload: &PrototypePopulationWorkload,
     _eligibility: &neoethos_search::gpu_native::prototype_population::CommonBcEligibility,
@@ -318,8 +309,8 @@ fn run_prototype_c(
     _max_events: usize,
 ) -> Result<PopulationBenchmarkOutcome> {
     anyhow::bail!(
-        "Prototype C needs a CubeCL runtime: rebuild the CLI with --features gpu-nvidia or \
-         --features gpu-vulkan. No CPU path may stand in for it."
+        "Prototype C needs the CubeCL CUDA runtime: rebuild the CLI with --features gpu-nvidia \
+         or --features gpu-bench-cuda. No CPU path may stand in for it."
     )
 }
 
@@ -597,7 +588,7 @@ mod tests {
         assert!(error.to_string().contains("gpu-b-native"), "{error}");
     }
 
-    #[cfg(not(any(feature = "gpu-nvidia", feature = "gpu-vulkan")))]
+    #[cfg(not(any(feature = "gpu-nvidia", feature = "gpu-bench-cuda")))]
     #[test]
     fn prototype_c_is_refused_without_a_cubecl_runtime_rather_than_substituted() {
         let workload = TinyPopulationFixture::new(2, 128, 4)
@@ -615,6 +606,9 @@ mod tests {
             4096,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("CubeCL runtime"), "{error}");
+        assert!(
+            error.to_string().contains("CubeCL CUDA runtime"),
+            "{error}"
+        );
     }
 }

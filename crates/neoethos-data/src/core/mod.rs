@@ -18,6 +18,14 @@ pub mod feature_registry;
 pub mod feature_run_lease;
 pub mod features;
 pub mod footprint_features;
+#[cfg(any(feature = "gpu-hip-session", feature = "gpu-hip-smc"))]
+pub mod gpu_hip_ohlcv_v1;
+#[cfg(feature = "gpu-hip-session")]
+pub mod gpu_hip_session_v1;
+#[cfg(feature = "gpu-hip-smc")]
+pub mod gpu_hip_smc_v1;
+#[cfg(feature = "gpu-hip-smc")]
+pub mod gpu_hip_feature_store_v1;
 /// vector-ta CUDA indicator lane, f64 end to end. Compiled ONLY under
 /// `gpu-cuda`, so a card-less build never sees it — the module's own docs
 /// explain the exact-architecture native cubin registry, why the lane no longer
@@ -38,7 +46,7 @@ pub(crate) mod gpu_resident_higher_timeframe_alignment_v3;
 pub(crate) mod gpu_resident_quant_v3;
 #[cfg(feature = "gpu-cuda")]
 pub(crate) mod gpu_resident_regime_v3;
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-hip-smc"))]
 pub mod gpu_resident_robust_normalization_v2;
 #[cfg(feature = "gpu-cuda")]
 pub(crate) mod gpu_resident_session_v2;
@@ -57,7 +65,6 @@ pub mod indicator_telemetry;
 pub mod indicators;
 pub mod normalization;
 pub mod pinned_canonical_series_v1;
-#[cfg(feature = "gpu-cuda")]
 pub mod pinned_source_projection_v1;
 pub mod quant_exact_math_v3;
 pub mod quant_features;

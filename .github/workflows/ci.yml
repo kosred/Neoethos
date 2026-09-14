@@ -18,7 +18,7 @@ on:
           - "false"
           - "true"
       enable_gpu:
-        description: "Enable GPU testing (NVIDIA/AMD)"
+        description: "Enable NVIDIA CUDA GPU testing"
         required: false
         default: "false"
         type: choice
@@ -160,61 +160,6 @@ jobs:
           NEOETHOS_REQUIRE_GPU: "1"
           NEOETHOS_RUN_CUDA_SEARCH_TESTS: "1"
 
-  # GPU-accelerated Linux job with AMD ROCm support
-  workspace-linux-gpu-amd:
-    name: Workspace check/test (Linux + AMD GPU)
-    runs-on: [self-hosted, linux, gpu, amd]
-    if: ${{ inputs.enable_gpu == 'true' }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check AMD GPU availability
-        run: |
-          rocm-smi
-          echo "ROCm version:"
-          hipcc --version
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake mold pkg-config \
-            libasound2-dev libudev-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libx11-dev
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          # Pinned repo nightly: use the exact project toolchain in rust-toolchain.toml,
-          # and dtolnay's action overrides rust-toolchain.toml.
-          toolchain: nightly-2026-04-07
-          components: clippy, rustfmt
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: linux-gpu-amd-ci-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: linux-gpu-amd-ci-
-
-      # No workspace `rocm` feature exists — the aggregate is gpu-rocm.
-      - name: Build CLI with AMD GPU support
-        run: cargo build -p neoethos-cli --release --features gpu-rocm
-        env:
-          ROCM_PATH: /opt/rocm
-
-      - name: GPU parity tests (CPU == GPU, ROCm)
-        run: cargo test -p neoethos-search --release --features gpu-rocm gpu_ -- --nocapture
-        env:
-          ROCM_PATH: /opt/rocm
-          NEOETHOS_REQUIRE_GPU: "1"
-
   # V0.4 audit Task #46 — extend CI beyond Linux so the cfg(windows) /
   # cfg(macos) paths get exercised on every dispatch. The codebase has
   # Windows-specific autostart code, file-system path quirks, and a
@@ -244,11 +189,6 @@ jobs:
           restore-keys: windows-workspace-ci-
       - name: Cargo check workspace without default features
         run: cargo check --workspace --all-targets --no-default-features
-      # Compile the WGPU path on every Windows dispatch even when the runner has
-      # no physical GPU. This catches WinRT/D3D12 dependency-family drift before
-      # it reaches a release or an optional self-hosted GPU parity job.
-      - name: Cargo check Windows WGPU path
-        run: cargo check -p neoethos-search --features gpu-vulkan --locked
 
   workspace-macos:
     name: Workspace check (macOS)

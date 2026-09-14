@@ -78,7 +78,10 @@ pub struct BucketSummary {
     /// Net profit per trade — the figure that says whether this bucket is worth
     /// trading at all, which a total hides when the counts differ wildly.
     pub expectancy: f64,
-    pub net_pips: f64,
+    /// Sum over observed finite pip moves only. No observations are `None`,
+    /// not zero; `pips_trades` discloses incomplete bucket coverage.
+    pub net_pips: Option<f64>,
+    pub pips_trades: usize,
 }
 
 /// How much of the journal each derived figure could actually be computed for.
@@ -337,7 +340,14 @@ fn summarise(bucket: String, group: &[&DerivedTrade]) -> BucketSummary {
     let trades = group.len();
     let wins = group.iter().filter(|t| t.net_profit > 0.0).count();
     let net_profit: f64 = group.iter().map(|t| t.net_profit).sum();
-    let net_pips: f64 = group.iter().filter_map(|t| t.pips).sum();
+    let (pips_trades, pips_sum) = group
+        .iter()
+        .filter_map(|t| t.pips)
+        .filter(|pips| pips.is_finite())
+        .fold((0usize, 0.0f64), |(count, sum), pips| {
+            (count + 1, sum + pips)
+        });
+    let net_pips = (pips_trades > 0 && pips_sum.is_finite()).then_some(pips_sum);
     BucketSummary {
         bucket,
         trades,
@@ -354,6 +364,7 @@ fn summarise(bucket: String, group: &[&DerivedTrade]) -> BucketSummary {
             0.0
         },
         net_pips,
+        pips_trades,
     }
 }
 
@@ -501,6 +512,44 @@ mod tests {
             net_profit: net,
             balance_after: None,
         }
+    }
+
+    #[test]
+    fn bucket_without_pip_evidence_is_unknown_not_zero() {
+        let analytics = analyse(&[trade(1, "BUY", 1.1, 1.101, 100.0, 0)], None);
+        let bucket = serde_json::to_value(&analytics.by_symbol[0]).unwrap();
+        assert_eq!(bucket["netPips"], serde_json::Value::Null);
+        assert_eq!(bucket["pipsTrades"], 0);
+    }
+
+    #[test]
+    fn bucket_partial_pip_sum_carries_its_observation_count() {
+        let prices = FixedPrices {
+            pip: 0.0001,
+            highs: vec![1.101],
+            lows: vec![1.1],
+        };
+        let measured = trade(1, "BUY", 1.1, 1.101, 100.0, 0);
+        let mut missing = trade(2, "BUY", 1.1, 1.099, -100.0, 0);
+        missing.exit_price = None;
+        let analytics = analyse(&[measured, missing], Some(&prices));
+        let bucket = serde_json::to_value(&analytics.by_symbol[0]).unwrap();
+        assert_eq!(bucket["trades"], 2);
+        assert_eq!(bucket["pipsTrades"], 1);
+        assert!((bucket["netPips"].as_f64().unwrap() - 10.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn bucket_measured_zero_is_distinct_from_missing_evidence() {
+        let prices = FixedPrices {
+            pip: 0.0001,
+            highs: vec![1.1],
+            lows: vec![1.1],
+        };
+        let analytics = analyse(&[trade(1, "BUY", 1.1, 1.1, 0.0, 0)], Some(&prices));
+        let bucket = serde_json::to_value(&analytics.by_symbol[0]).unwrap();
+        assert_eq!(bucket["pipsTrades"], 1);
+        assert_eq!(bucket["netPips"].as_f64(), Some(0.0));
     }
 
     /// The question the journal exists to answer: the trade was 30 pips ahead

@@ -90,35 +90,37 @@ void tradjema_batch_f32(const float* __restrict__ high,
 
 
     extern __shared__ __align__(16) unsigned char smem[];
+    // Keep one spare slot so a full window cannot alias the empty queue.
+    const int cap = length + 1;
     float* min_vals = reinterpret_cast<float*>(smem);
-    float* max_vals = min_vals + length;
-    int* min_idx = reinterpret_cast<int*>(max_vals + length);
-    int* max_idx = min_idx + length;
+    float* max_vals = min_vals + cap;
+    int* min_idx = reinterpret_cast<int*>(max_vals + cap);
+    int* max_idx = min_idx + cap;
 
     int min_head = 0, min_tail = 0;
     int max_head = 0, max_tail = 0;
 
     auto minq_push = [&](float v, int idx) {
-        int back = dec_wrap(min_tail, length);
+        int back = dec_wrap(min_tail, cap);
 
         while (min_tail != min_head && min_vals[back] > v) {
             min_tail = back;
-            back = dec_wrap(min_tail, length);
+            back = dec_wrap(min_tail, cap);
         }
         min_vals[min_tail] = v;
         min_idx[min_tail] = idx;
-        min_tail = inc_wrap(min_tail, length);
+        min_tail = inc_wrap(min_tail, cap);
     };
     auto maxq_push = [&](float v, int idx) {
-        int back = dec_wrap(max_tail, length);
+        int back = dec_wrap(max_tail, cap);
 
         while (max_tail != max_head && max_vals[back] < v) {
             max_tail = back;
-            back = dec_wrap(max_tail, length);
+            back = dec_wrap(max_tail, cap);
         }
         max_vals[max_tail] = v;
         max_idx[max_tail] = idx;
-        max_tail = inc_wrap(max_tail, length);
+        max_tail = inc_wrap(max_tail, cap);
     };
 
 
@@ -149,10 +151,10 @@ void tradjema_batch_f32(const float* __restrict__ high,
     for (int i = warm + 1; i < series_len; ++i) {
         const int lim = i - length;
         while (min_head != min_tail && min_idx[min_head] <= lim) {
-            min_head = inc_wrap(min_head, length);
+            min_head = inc_wrap(min_head, cap);
         }
         while (max_head != max_tail && max_idx[max_head] <= lim) {
-            max_head = inc_wrap(max_head, length);
+            max_head = inc_wrap(max_head, cap);
         }
 
         const float prev_close = close[i - 1];
@@ -218,33 +220,35 @@ void tradjema_many_series_one_param_time_major_f32(
 
 
     extern __shared__ __align__(16) unsigned char smem[];
+    // Keep one spare slot so a full window cannot alias the empty queue.
+    const int cap = length + 1;
     double* min_vals = reinterpret_cast<double*>(smem);
-    double* max_vals = min_vals + length;
-    int* min_idx = reinterpret_cast<int*>(max_vals + length);
-    int* max_idx = min_idx + length;
+    double* max_vals = min_vals + cap;
+    int* min_idx = reinterpret_cast<int*>(max_vals + cap);
+    int* max_idx = min_idx + cap;
 
     int min_head = 0, min_tail = 0;
     int max_head = 0, max_tail = 0;
 
     auto minq_push = [&](double v, int idx) {
-        int back = dec_wrap(min_tail, length);
+        int back = dec_wrap(min_tail, cap);
         while (min_tail != min_head && min_vals[back] > v) {
             min_tail = back;
-            back = dec_wrap(min_tail, length);
+            back = dec_wrap(min_tail, cap);
         }
         min_vals[min_tail] = v;
         min_idx[min_tail] = idx;
-        min_tail = inc_wrap(min_tail, length);
+        min_tail = inc_wrap(min_tail, cap);
     };
     auto maxq_push = [&](double v, int idx) {
-        int back = dec_wrap(max_tail, length);
+        int back = dec_wrap(max_tail, cap);
         while (max_tail != max_head && max_vals[back] < v) {
             max_tail = back;
-            back = dec_wrap(max_tail, length);
+            back = dec_wrap(max_tail, cap);
         }
         max_vals[max_tail] = v;
         max_idx[max_tail] = idx;
-        max_tail = inc_wrap(max_tail, length);
+        max_tail = inc_wrap(max_tail, cap);
     };
 
 
@@ -280,10 +284,10 @@ void tradjema_many_series_one_param_time_major_f32(
     for (int i = warm + 1; i < series_len; ++i) {
         const int lim = i - length;
         while (min_head != min_tail && min_idx[min_head] <= lim) {
-            min_head = inc_wrap(min_head, length);
+            min_head = inc_wrap(min_head, cap);
         }
         while (max_head != max_tail && max_idx[max_head] <= lim) {
-            max_head = inc_wrap(max_head, length);
+            max_head = inc_wrap(max_head, cap);
         }
 
         const double prev_close = static_cast<double>(at(close_tm, i - 1, series));
@@ -343,11 +347,10 @@ void tradjema_many_series_one_param_time_major_f32(
 //   step:  y = (src - y).mul_add(a, y)    -> sub + fma, TWO. Not
 //          `a*src + (1-a)*y`, which is four.
 //
-// THE DEQUES. Capacity is `length` exactly, as on the CPU, in per-thread local
-// arrays bounded by TRADJEMA_MAX_LENGTH. The host refuses a longer length by
-// name. The wrap-when-full behaviour of a `length`-capacity circular deque
-// holding `length` monotone entries is the CPU's, and is reproduced rather
-// than "fixed", because a fix here would be a silent divergence.
+// THE DEQUES. Capacity is `length + 1`, matching the corrected CPU queues:
+// one spare slot distinguishes a full monotone window from an empty queue.
+// Per-thread local arrays include that spare slot; the supported length
+// remains bounded by TRADJEMA_MAX_LENGTH and the host refuses longer lengths.
 // ===========================================================================
 
 #define TRADJEMA_MAX_LENGTH 512
@@ -406,12 +409,12 @@ extern "C" __global__ void neoethos_tradjema_batch_f64(
     if (warm >= n) return;
 
     const double alpha = 2.0 / ((double)length + 1.0);
-    const int cap = length;
+    const int cap = length + 1;
 
-    double min_vals[TRADJEMA_MAX_LENGTH];
-    int    min_idx [TRADJEMA_MAX_LENGTH];
-    double max_vals[TRADJEMA_MAX_LENGTH];
-    int    max_idx [TRADJEMA_MAX_LENGTH];
+    double min_vals[TRADJEMA_MAX_LENGTH + 1];
+    int    min_idx [TRADJEMA_MAX_LENGTH + 1];
+    double max_vals[TRADJEMA_MAX_LENGTH + 1];
+    int    max_idx [TRADJEMA_MAX_LENGTH + 1];
     int min_head = 0, min_tail = 0;
     int max_head = 0, max_tail = 0;
 

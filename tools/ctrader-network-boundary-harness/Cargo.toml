@@ -4,6 +4,18 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+# src/app_services/mod.rs path-compiles the real DNS/TCP/TLS/WebSocket modules;
+# cargo-machete does not traverse those source paths outside this leaf crate.
+[package.metadata.cargo-machete]
+ignored = [
+    "hickory-resolver",
+    "neoethos-core",
+    "serde",
+    "serde_json",
+    "tokio",
+    "tracing",
+]
+
 # Keep this leaf harness outside the repository workspace graph. Its purpose is
 # to compile the real cTrader transport modules without pulling neoethos-models.
 [workspace]

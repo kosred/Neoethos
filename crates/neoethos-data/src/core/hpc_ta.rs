@@ -1,4 +1,5 @@
 use super::super::Ohlcv;
+use crate::FeatureBuildControl;
 use crate::core::all_indicators::ALL_INDICATORS;
 use crate::core::feature_budget::{VocabularyBudget, admit_indicators};
 use crate::core::features::{FeatureCellValidity, FeatureColumnF64};
@@ -8,13 +9,18 @@ use crate::core::indicator_ledger::{
 };
 use crate::core::timestamps::validate_canonical_millisecond_timestamps;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use vector_ta::indicators::dispatch::{
-    IndicatorComputeOutput, IndicatorComputeRequest, IndicatorDataRef, IndicatorSeries, ParamKV,
-    ParamValue, compute_cpu,
+    IndicatorComputeOutput, IndicatorComputeRequest, IndicatorDataRef, IndicatorDispatchError,
+    IndicatorSeries, ParamKV, ParamValue, compute_cpu,
 };
 use vector_ta::indicators::registry::indicator_data_requirements;
+use vector_ta::indicators::smooth_theil_sen::{
+    SmoothTheilSenInput, SmoothTheilSenOutput, SmoothTheilSenParams, smooth_theil_sen_with_kernel,
+};
 use vector_ta::utilities::data_loader::Candles;
 use vector_ta::utilities::enums::Kernel;
 use vector_ta::utilities::helpers::detect_best_kernel;
@@ -209,7 +215,14 @@ const GPU_ONLY_PARITY_DEFERRED_INDICATORS_V3: &[&str] = &[
 /// this function never turns an unavailable GPU request into a CPU receipt.
 pub fn resolved_canonical_feature_execution_authority_v1()
 -> ResolvedCanonicalFeatureExecutionAuthorityV1 {
-    let policy = resolved_indicator_compute_policy();
+    canonical_feature_execution_authority_for_policy_v1(resolved_indicator_compute_policy())
+}
+
+/// Resolve an operation-owned policy against the current production dispatcher.
+/// This does not read or mutate process policy, or admit an unavailable GPU graph.
+pub fn canonical_feature_execution_authority_for_policy_v1(
+    policy: IndicatorComputePolicy,
+) -> ResolvedCanonicalFeatureExecutionAuthorityV1 {
     let (selected_lane, vector_ta_math_authority) = match policy {
         IndicatorComputePolicy::Auto | IndicatorComputePolicy::CpuOnly => {
             let selected_lane = match detect_best_kernel() {
@@ -384,6 +397,36 @@ impl ClassicTaRunPlan {
 
     pub fn admission_report(&self) -> ClassicTaExecutionReport {
         self.admission.execution_report(0, 0)
+    }
+
+    pub(crate) fn recorded_working_set(&self) -> Option<SweepBatch> {
+        let requested = self.admission.working_set.as_ref()?;
+        if requested.replace_base_vocabulary {
+            return Some((**requested).clone());
+        }
+        // Legacy extension-only input also admitted a hardware-selected base.
+        // Record that actual selection as its own finite space, not as a claim
+        // that the caller traversed the complete global search vocabulary.
+        let base_indicator_ids = self.admission.admitted_indicator_ids.clone();
+        let pairs = requested.pairs.clone();
+        let points = base_indicator_ids.len() + pairs.len();
+        Some(SweepBatch {
+            cursor: 0,
+            next_cursor: points,
+            planned_columns: base_indicator_ids
+                .iter()
+                .map(|id| planned_output_count(id))
+                .sum::<usize>()
+                + pairs
+                    .iter()
+                    .map(|pair| planned_output_count(pair.id))
+                    .sum::<usize>(),
+            base_indicator_ids,
+            replace_base_vocabulary: true,
+            pairs,
+            space_len: points,
+            exhausted: true,
+        })
     }
 
     #[cfg(feature = "gpu-cuda")]
@@ -583,16 +626,30 @@ pub fn compute_classic_ta_feature_columns_f64_with_run_plan(
     ohlcv: &Ohlcv,
     run_plan: &ClassicTaRunPlan,
 ) -> anyhow::Result<Vec<FeatureColumnF64>> {
+    compute_classic_ta_feature_columns_f64_with_control(
+        ohlcv,
+        run_plan,
+        &FeatureBuildControl::default(),
+    )
+}
+
+pub(crate) fn compute_classic_ta_feature_columns_f64_with_control(
+    ohlcv: &Ohlcv,
+    run_plan: &ClassicTaRunPlan,
+    control: &FeatureBuildControl,
+) -> anyhow::Result<Vec<FeatureColumnF64>> {
+    control.checkpoint()?;
     validate_classic_ta_input(ohlcv)?;
     let ClassicTaComputation {
         columns,
         report: _,
         ledger,
-    } = compute_classic_ta_columns_sized_report_with_run_plan(ohlcv, run_plan)?;
+    } = compute_classic_ta_columns_sized_report_with_control(ohlcv, run_plan, control)?;
 
     columns
         .into_iter()
         .map(|(name, values)| {
+            control.checkpoint()?;
             let indicator_id = classic_indicator_id_for_column(&name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "classic/vector-ta column `{name}` has no canonical indicator identity"
@@ -756,14 +813,38 @@ pub fn compute_classic_ta_columns_sized(
 
 /// Resolve the one budget/admission/working-set decision both execution lanes
 /// consume. Registry/table inspection only; no feature or device allocation.
-fn build_classic_ta_admission_plan(n: usize, budget_rows: usize) -> ClassicTaAdmissionPlan {
+fn build_classic_ta_admission_plan(
+    n: usize,
+    budget_rows: usize,
+    working_set: Option<std::sync::Arc<SweepBatch>>,
+) -> ClassicTaAdmissionPlan {
     let budget_rows = budget_rows.max(n);
     let budget = VocabularyBudget::for_run(budget_rows);
     let sweep_reserved = planned_sweep_columns();
-    let base_budget = budget.reserve(sweep_reserved);
     let all_ids: Vec<&'static str> = ALL_INDICATORS.to_vec();
-    let (admitted_indicator_ids, budget_deferred_indicator_ids, planned_base_columns) =
-        admit_indicators(&all_ids, &base_budget);
+    let mut base_budget = budget.reserve(sweep_reserved);
+    let (mut admitted_indicator_ids, budget_deferred_indicator_ids, planned_base_columns) =
+        match working_set.as_deref() {
+            Some(batch) if batch.replace_base_vocabulary => {
+                let mut admitted = batch.base_indicator_ids.clone();
+                admitted.sort_by_key(|id| all_indicators_rank(id));
+                admitted.dedup();
+                let deferred = all_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !admitted.contains(id))
+                    .collect::<Vec<_>>();
+                let planned = all_ids.iter().map(|id| planned_output_count(id)).sum();
+                base_budget.max_columns = admitted
+                    .iter()
+                    .map(|id| planned_output_count(id))
+                    .sum::<usize>()
+                    .max(1);
+                (admitted, deferred, planned)
+            }
+            _ => admit_indicators(&all_ids, &base_budget),
+        };
+    admitted_indicator_ids.sort_by_key(|id| all_indicators_rank(id));
     let admitted_base_columns = admitted_indicator_ids
         .iter()
         .map(|id| planned_output_count(id))
@@ -774,7 +855,6 @@ fn build_classic_ta_admission_plan(n: usize, budget_rows: usize) -> ClassicTaAdm
     // allocates Candles/device buffers so CPU and CUDA consume the same request.
     let planned_so_far = admitted_base_columns + sweep_reserved;
     let unspent = budget.max_columns.saturating_sub(planned_so_far);
-    let working_set = current_extended_sweep_working_set();
     let (
         extended_groups,
         extended_budget_deferred_indicator_ids,
@@ -782,11 +862,17 @@ fn build_classic_ta_admission_plan(n: usize, budget_rows: usize) -> ClassicTaAdm
         extended_budget_columns,
     ) = match working_set.as_deref() {
         Some(batch) => {
-            if batch.planned_columns > unspent {
+            let batch_base_columns = batch
+                .base_indicator_ids
+                .iter()
+                .map(|id| planned_output_count(id))
+                .sum::<usize>();
+            let batch_extended_columns = batch.planned_columns.saturating_sub(batch_base_columns);
+            if batch_extended_columns > unspent {
                 tracing::warn!(
                     target: "neoethos_data::hpc_ta",
                     cursor = batch.cursor,
-                    batch_columns = batch.planned_columns,
+                    batch_columns = batch_extended_columns,
                     unspent_columns = unspent,
                     max_columns = budget.max_columns,
                     "the installed streaming working set is WIDER than this machine still \
@@ -800,7 +886,7 @@ fn build_classic_ta_admission_plan(n: usize, budget_rows: usize) -> ClassicTaAdm
                 batch.grouped_by_id(),
                 Vec::new(),
                 "streaming_batch",
-                batch.planned_columns,
+                batch_extended_columns,
             )
         }
         None => {
@@ -850,7 +936,23 @@ pub fn prepare_classic_ta_run_plan(
     budget_rows: usize,
     policy: IndicatorComputePolicy,
 ) -> anyhow::Result<ClassicTaRunPlan> {
-    let admission = build_classic_ta_admission_plan(budget_rows, budget_rows);
+    prepare_classic_ta_run_plan_with_working_set(budget_rows, policy, None)
+}
+
+/// Capture one Classic/vector-ta plan for an explicit streaming working set.
+///
+/// The batch is an immutable input to the plan rather than process-global
+/// state. Independent feature builds can therefore prepare different batches
+/// concurrently without changing one another's admitted columns.
+pub(crate) fn prepare_classic_ta_run_plan_with_working_set(
+    budget_rows: usize,
+    policy: IndicatorComputePolicy,
+    working_set: Option<std::sync::Arc<SweepBatch>>,
+) -> anyhow::Result<ClassicTaRunPlan> {
+    if let Some(batch) = &working_set {
+        batch.validate()?;
+    }
+    let admission = build_classic_ta_admission_plan(budget_rows, budget_rows, working_set);
     #[cfg(feature = "gpu-cuda")]
     let mut resident_cuda_launches = None;
     if policy == IndicatorComputePolicy::GpuOnly && budget_rows > 0 {
@@ -906,7 +1008,7 @@ pub fn prepare_classic_ta_run_plan(
 pub(crate) fn prepare_classic_ta_gpu_exact_parity_run_plan_v3(
     budget_rows: usize,
 ) -> anyhow::Result<ClassicTaRunPlan> {
-    let mut admission = build_classic_ta_admission_plan(budget_rows, budget_rows);
+    let mut admission = build_classic_ta_admission_plan(budget_rows, budget_rows, None);
     anyhow::ensure!(
         admission.working_set.is_none(),
         "gpu_only_exact_parity_subset_v3 refuses an installed extended sweep working set"
@@ -1114,6 +1216,19 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
     ohlcv: &Ohlcv,
     run_plan: &ClassicTaRunPlan,
 ) -> anyhow::Result<ClassicTaComputation> {
+    compute_classic_ta_columns_sized_report_with_control(
+        ohlcv,
+        run_plan,
+        &FeatureBuildControl::default(),
+    )
+}
+
+fn compute_classic_ta_columns_sized_report_with_control(
+    ohlcv: &Ohlcv,
+    run_plan: &ClassicTaRunPlan,
+    control: &FeatureBuildControl,
+) -> anyhow::Result<ClassicTaComputation> {
+    control.checkpoint()?;
     let policy = run_plan.policy;
     if policy == IndicatorComputePolicy::GpuOnly {
         #[cfg(not(feature = "gpu-cuda"))]
@@ -1241,9 +1356,10 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
     //    Everything a worker discards is recorded in its own `IndicatorLedger`
     //    with a reason and the dispatch message. Nothing on this path is
     //    allowed to vanish.
-    let per_id: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = admitted
+    let per_id = admitted
         .par_iter()
         .map(|&id| {
+            control.checkpoint()?;
             let mut out: Vec<(String, Vec<f64>)> = Vec::new();
             let mut ledger = IndicatorLedger::new();
             dispatch_indicator_outputs(
@@ -1256,10 +1372,11 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
                 input_availability,
                 &mut out,
                 &mut ledger,
-            );
-            (out, ledger)
+                control,
+            )?;
+            Ok((out, ledger))
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let mut ledger = admission.admission_ledger();
     let mut cols: Vec<(String, Vec<f64>)> = Vec::new();
@@ -1300,7 +1417,8 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
         n,
         policy,
         &admission.historical_indicator_ids,
-    );
+        control,
+    )?;
     let sweep_actual = multi_cols.len();
     cols.extend(multi_cols);
     ledger.merge(multi_ledger);
@@ -1353,8 +1471,8 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
     //     would extend by different amounts and the cube widths would diverge.
     //
     //     STREAMING OVERRIDE (2026-08-10). When a working set is installed by
-    //     `install_extended_sweep_working_set`, the extension is EXACTLY that
-    //     batch's (indicator, period) pairs and the budget-capped prefix is not
+    //     captured in the immutable Classic run plan, the extension is EXACTLY
+    //     that batch's (indicator, period) pairs and the budget-capped prefix is not
     //     consulted. With no working set installed — the default, and every
     //     existing caller — this block is byte-identical to what it was: same
     //     plan function, same statically valid/distinct period points per id,
@@ -1385,12 +1503,20 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
     let ext_groups = &admission.extended_groups;
     let ext_mode = admission.extended_mode;
     if !ext_groups.is_empty() {
-        let ext: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = ext_groups
+        let ext = ext_groups
             .par_iter()
             .map(|(id, periods)| {
-                sweep_one_id_ledgered(&candles, *id, periods, n, Kernel::Auto, input_availability)
+                sweep_one_id_ledgered(
+                    &candles,
+                    *id,
+                    periods,
+                    n,
+                    Kernel::Auto,
+                    input_availability,
+                    control,
+                )
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         for (mut c, l) in ext {
             cols.append(&mut c);
             ledger.merge(l);
@@ -1439,6 +1565,7 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
         let mut collisions: Vec<&str> = Vec::new();
         let mut infinite_columns: Vec<(&str, usize, usize, f64)> = Vec::new();
         for (name, values) in &cols {
+            control.checkpoint()?;
             if !names.insert(name.as_str()) {
                 collisions.push(name.as_str());
             }
@@ -1523,6 +1650,7 @@ pub fn compute_classic_ta_columns_sized_report_with_run_plan(
         );
     }
 
+    control.checkpoint()?;
     let report = admission.execution_report(sweep_actual, cols.len());
 
     Ok(ClassicTaComputation {
@@ -1559,7 +1687,9 @@ fn dispatch_indicator_outputs(
     input_availability: ClassicInputAvailability,
     out: &mut Vec<(String, Vec<f64>)>,
     ledger: &mut IndicatorLedger,
-) {
+    control: &FeatureBuildControl,
+) -> anyhow::Result<()> {
+    control.checkpoint()?;
     if let Some(detail) = input_availability.missing_for(id) {
         let first = out.len();
         push_absent_columns(id, column_prefix, n, out);
@@ -1571,11 +1701,12 @@ fn dispatch_indicator_outputs(
                 format!("{detail}; no scalar kernel was launched"),
             );
         }
-        return;
+        return Ok(());
     }
 
     let outputs = output_ids_for(id);
     let excluded = expected_non_producing(id);
+    let mut shared_smooth_theil_sen = None;
 
     for out_id in outputs {
         let name = match out_id {
@@ -1593,11 +1724,17 @@ fn dispatch_indicator_outputs(
             params,
             kernel,
         };
+        control.report("indicator", &name, 0, 1)?;
         // #212: a small subset of indicator/data combinations in vector-ta
         // v0.2.9 panic instead of returning Err. Catch it per-output so one bad
         // column never tears down the frame — but COUNT it, which the previous
         // handler did only as an un-aggregated warn.
-        let computed = catch_unwind(AssertUnwindSafe(|| compute_cpu(req)));
+        let computed = catch_unwind(AssertUnwindSafe(|| {
+            compute_output_with_shared_smooth_theil_sen(req, &mut shared_smooth_theil_sen)
+        }));
+        // Outside catch_unwind/ledger classification: Stop is not a kernel
+        // failure and must never become an all-NaN placeholder feature.
+        control.report("indicator", &name, 1, 1)?;
         // ONE place decides what a discard does to the COLUMN SET.
         //
         // A capability failure (no dispatch arm, no such output, unsupported
@@ -1672,6 +1809,84 @@ fn dispatch_indicator_outputs(
             }
         }
     }
+    Ok(())
+}
+
+/// Reuse vector-ta's six-output result within ONE immutable input/parameter call.
+/// Its single-output dispatcher otherwise computes all six vectors for every
+/// requested output, then copies the selected vector into a one-row matrix.
+/// Only the default/canonical integer-length shapes used by this producer are
+/// adapted; all other inputs, parameters and outputs retain the exact dispatcher.
+/// The caller still owns per-output panic/error handling and Stop checkpoints.
+fn compute_output_with_shared_smooth_theil_sen(
+    req: IndicatorComputeRequest<'_>,
+    shared: &mut Option<SmoothTheilSenOutput>,
+) -> Result<IndicatorComputeOutput, IndicatorDispatchError> {
+    if req.indicator_id != "smooth_theil_sen" {
+        return compute_cpu(req);
+    }
+    let length = match req.params {
+        [] => None,
+        [
+            ParamKV {
+                key: "length",
+                value: ParamValue::Int(length),
+            },
+        ] if *length >= 0 => Some(*length as usize),
+        _ => return compute_cpu(req),
+    };
+    let IndicatorDataRef::Candles {
+        candles,
+        source: None,
+    } = req.data
+    else {
+        return compute_cpu(req);
+    };
+    let Some(output_id @ ("value" | "upper" | "lower" | "slope" | "intercept" | "deviation")) =
+        req.output_id
+    else {
+        return compute_cpu(req);
+    };
+    if shared.is_none() {
+        let input = SmoothTheilSenInput::from_slice(
+            &candles.close,
+            SmoothTheilSenParams {
+                length,
+                ..SmoothTheilSenParams::default()
+            },
+        );
+        *shared = Some(
+            smooth_theil_sen_with_kernel(&input, req.kernel.to_non_batch()).map_err(|error| {
+                IndicatorDispatchError::ComputeFailed {
+                    indicator: "smooth_theil_sen".to_owned(),
+                    details: error.to_string(),
+                }
+            })?,
+        );
+    }
+    let output = shared.as_mut().expect("successful full-output computation");
+    let values = match output_id {
+        "value" => &mut output.value,
+        "upper" => &mut output.upper,
+        "lower" => &mut output.lower,
+        "slope" => &mut output.slope,
+        "intercept" => &mut output.intercept,
+        "deviation" => &mut output.deviation,
+        _ => unreachable!("recognized above"),
+    };
+    // Current output lists are unique. Preserve dispatcher behavior even if a
+    // future caller requests an already-moved output a second time.
+    if values.is_empty() {
+        return compute_cpu(req);
+    }
+    Ok(IndicatorComputeOutput {
+        output_id: output_id.to_owned(),
+        series: IndicatorSeries::F64(std::mem::take(values)),
+        warmup: None,
+        rows: 1,
+        cols: candles.close.len(),
+        pattern_ids: None,
+    })
 }
 
 /// Emit the columns an indicator WOULD have produced, filled with NaN, using
@@ -1816,6 +2031,50 @@ pub fn planned_resident_columns(budget_rows: usize) -> usize {
     base_plan + sweep_reserved
 }
 
+/// One frozen hardware decision for the adaptive streaming working set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamingWorkingSetSizing {
+    pub budget_rows: usize,
+    pub available_bytes: u64,
+    pub max_columns: usize,
+    pub resident_columns: usize,
+    pub batch_columns: usize,
+    pub replace_base_vocabulary: bool,
+    pub space_len: usize,
+}
+
+/// Resolve the streaming shape from one RAM probe.
+///
+/// No fixed base prefix remains resident during a sweep. Every batch uses the
+/// complete safe width after the historical sweep for the next disjoint slice
+/// of base ids and then `(indicator, period)` points. This prevents a large host
+/// from recomputing an 800-column base cube in every extension batch, while a
+/// constrained host still covers the complete valid base space over time.
+pub fn streaming_working_set_sizing(budget_rows: usize) -> StreamingWorkingSetSizing {
+    let budget = VocabularyBudget::for_run(budget_rows);
+    streaming_working_set_sizing_from_budget(budget_rows, &budget)
+}
+
+fn streaming_working_set_sizing_from_budget(
+    budget_rows: usize,
+    budget: &VocabularyBudget,
+) -> StreamingWorkingSetSizing {
+    let sweep_reserved = planned_sweep_columns();
+    let replace_base_vocabulary = true;
+    let resident_columns = sweep_reserved.min(budget.max_columns);
+    let batch_columns = budget.max_columns.saturating_sub(resident_columns);
+    let space_len = base_working_set_indicator_ids().len() + extended_sweep_space_len();
+    StreamingWorkingSetSizing {
+        budget_rows,
+        available_bytes: budget.available_bytes,
+        max_columns: budget.max_columns,
+        resident_columns,
+        batch_columns,
+        replace_base_vocabulary,
+        space_len,
+    }
+}
+
 /// How wide one streaming batch may be on this machine: what
 /// [`VocabularyBudget`] affords at `budget_rows`, minus the resident plan.
 ///
@@ -1824,9 +2083,7 @@ pub fn planned_resident_columns(budget_rows: usize) -> usize {
 /// extension, which the caller must treat as "do not stream", not as "stream a
 /// batch of nothing".
 pub fn streaming_batch_columns(budget_rows: usize) -> usize {
-    VocabularyBudget::for_run(budget_rows)
-        .max_columns
-        .saturating_sub(planned_resident_columns(budget_rows))
+    streaming_working_set_sizing(budget_rows).batch_columns
 }
 
 /// Is this id's window drivable by the sweep, i.e. would sweeping it produce
@@ -1938,7 +2195,7 @@ pub fn extended_sweep_plan(budget_columns: usize) -> (Vec<&'static str>, Vec<&'s
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One point in the sweep space: an indicator and the window it is evaluated at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct SweepPair {
     pub id: &'static str,
     pub period: usize,
@@ -1958,7 +2215,7 @@ pub struct SweepPair {
 ///   requirement is that a batch covering the WHOLE space emits a column list
 ///   byte-identical to today's non-streaming pass. Sorting the selected pairs
 ///   back into emission order is what makes that true by construction.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SweepBatch {
     /// Cursor this batch began at, in SELECTION order. One integer — this is
     /// the whole resumable state of a streaming run.
@@ -1966,6 +2223,13 @@ pub struct SweepBatch {
     /// Cursor the next batch begins at. Always `> cursor` unless the space is
     /// exhausted or the budget admits nothing.
     pub next_cursor: usize,
+    /// Base-vocabulary ids selected for this working set. Later extension-only
+    /// batches legitimately leave this empty.
+    pub base_indicator_ids: Vec<&'static str>,
+    /// When true, `base_indicator_ids` replaces the deterministic resident
+    /// prefix instead of being appended to it. This is how a constrained host
+    /// covers the whole base registry without ever materialising it at once.
+    pub replace_base_vocabulary: bool,
     /// The batch's pairs, in EMISSION order.
     pub pairs: Vec<SweepPair>,
     /// Columns this batch plans to stage, from registry lookups only.
@@ -1979,15 +2243,132 @@ pub struct SweepBatch {
     pub exhausted: bool,
 }
 
+impl<'de> Deserialize<'de> for SweepBatch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PairWire {
+            id: String,
+            period: usize,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BatchWire {
+            cursor: usize,
+            next_cursor: usize,
+            base_indicator_ids: Vec<String>,
+            replace_base_vocabulary: bool,
+            pairs: Vec<PairWire>,
+            planned_columns: usize,
+            space_len: usize,
+            exhausted: bool,
+        }
+        let wire = BatchWire::deserialize(deserializer)?;
+        let resolve = |id: &str| -> Result<&'static str, D::Error> {
+            ALL_INDICATORS
+                .iter()
+                .copied()
+                .find(|known| *known == id)
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("unknown Classic indicator id `{id}`"))
+                })
+        };
+        let value = Self {
+            cursor: wire.cursor,
+            next_cursor: wire.next_cursor,
+            base_indicator_ids: wire
+                .base_indicator_ids
+                .iter()
+                .map(|id| resolve(id))
+                .collect::<Result<_, D::Error>>()?,
+            replace_base_vocabulary: wire.replace_base_vocabulary,
+            pairs: wire
+                .pairs
+                .iter()
+                .map(|pair| {
+                    Ok(SweepPair {
+                        id: resolve(&pair.id)?,
+                        period: pair.period,
+                    })
+                })
+                .collect::<Result<_, D::Error>>()?,
+            planned_columns: wire.planned_columns,
+            space_len: wire.space_len,
+            exhausted: wire.exhausted,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 impl SweepBatch {
+    /// Public fields are also checked at the production entry boundary: serde
+    /// is not the only way a caller can construct a working set.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.replace_base_vocabulary || self.base_indicator_ids.is_empty(),
+            "extension-only working set must not contain ignored base ids"
+        );
+        let mut previous_base = None;
+        let mut columns = 0usize;
+        for id in &self.base_indicator_ids {
+            let rank = all_indicators_rank(id);
+            anyhow::ensure!(rank != usize::MAX, "unknown Classic indicator id `{id}`");
+            anyhow::ensure!(
+                previous_base.is_none_or(|previous| previous < rank),
+                "Classic base ids must be unique and in canonical emission order"
+            );
+            previous_base = Some(rank);
+            columns = columns
+                .checked_add(planned_output_count(id))
+                .ok_or_else(|| anyhow::anyhow!("Classic column count overflow"))?;
+        }
+        let valid_pairs = extended_sweep_space().into_iter().collect::<HashSet<_>>();
+        let mut previous_pair = None;
+        for pair in &self.pairs {
+            anyhow::ensure!(
+                valid_pairs.contains(pair),
+                "invalid Classic sweep point {}@{}",
+                pair.id,
+                pair.period
+            );
+            let key = (all_indicators_rank(pair.id), pair.period);
+            anyhow::ensure!(
+                previous_pair.is_none_or(|previous| previous < key),
+                "Classic sweep points must be unique and in canonical emission order"
+            );
+            previous_pair = Some(key);
+            columns = columns
+                .checked_add(planned_output_count(pair.id))
+                .ok_or_else(|| anyhow::anyhow!("Classic column count overflow"))?;
+        }
+        anyhow::ensure!(
+            columns == self.planned_columns,
+            "Classic planned column count differs from exact selection"
+        );
+        let points = self.base_indicator_ids.len() + self.pairs.len();
+        anyhow::ensure!(
+            self.next_cursor.checked_sub(self.cursor) == Some(points),
+            "Classic working-set cursor span differs from selected points"
+        );
+        anyhow::ensure!(
+            (self.next_cursor <= self.space_len || points == 0)
+                && self.exhausted == (self.next_cursor >= self.space_len),
+            "Classic working-set exhaustion/space bounds differ"
+        );
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.pairs.is_empty()
+        self.base_indicator_ids.is_empty() && self.pairs.is_empty()
     }
 
     /// True when this batch is the entire space starting from zero — the
     /// degenerate case the parity test pins.
     pub fn covers_whole_space(&self) -> bool {
-        self.cursor == 0 && self.pairs.len() == self.space_len && self.space_len > 0
+        self.cursor == 0
+            && self.base_indicator_ids.len() + self.pairs.len() == self.space_len
+            && self.space_len > 0
     }
 
     /// The batch regrouped for dispatch: `(id, periods)` in emission order,
@@ -2054,6 +2435,140 @@ pub fn extended_sweep_space_len() -> usize {
     extended_sweep_space().len()
 }
 
+fn base_working_set_indicator_ids() -> Vec<&'static str> {
+    ALL_INDICATORS
+        .iter()
+        .copied()
+        .filter(|id| {
+            expected_non_producing(id).is_none()
+                && vector_ta::indicators::registry::get_indicator(id).is_some()
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchWorkingSetPoint {
+    Base(&'static str),
+    Extended(SweepPair),
+}
+
+fn search_working_set_space(replace_base_vocabulary: bool) -> Vec<SearchWorkingSetPoint> {
+    let mut space = Vec::new();
+    if replace_base_vocabulary {
+        space.extend(
+            base_working_set_indicator_ids()
+                .into_iter()
+                .map(SearchWorkingSetPoint::Base),
+        );
+    }
+    space.extend(
+        extended_sweep_space()
+            .into_iter()
+            .map(SearchWorkingSetPoint::Extended),
+    );
+    space
+}
+
+/// Select the next disjoint adaptive working set.
+///
+/// When `replace_base_vocabulary` is true, the first region walks every valid
+/// base indicator and replaces the old fixed prefix batch by batch. Once base
+/// coverage is complete, the same cursor continues through every valid
+/// `(indicator, period)` point. Canonical streaming freezes that mode even on a
+/// large host, so already searched base columns are not recomputed in later
+/// extension batches. The false mode remains available for legacy callers that
+/// explicitly want an extension-only working set over a resident base.
+pub fn search_working_set_batch(
+    cursor: usize,
+    budget_columns: usize,
+    replace_base_vocabulary: bool,
+) -> SweepBatch {
+    let space = search_working_set_space(replace_base_vocabulary);
+    search_working_set_batch_from_space(&space, cursor, budget_columns, replace_base_vocabulary)
+}
+
+/// A seeded permutation of the same finite search space. Seed affects only
+/// selection order; every selected batch still emits in canonical order.
+/// The exact selected IDs/periods, not this seed, are the replay recipe.
+pub fn search_working_set_batch_seeded(
+    cursor: usize,
+    budget_columns: usize,
+    replace_base_vocabulary: bool,
+    seed: u64,
+) -> SweepBatch {
+    let mut ranked = search_working_set_space(replace_base_vocabulary)
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>();
+    ranked.sort_by_cached_key(|(index, _)| {
+        let mut hash = Sha256::new();
+        hash.update(b"neoethos.classic-working-set-order.v1\0");
+        hash.update(seed.to_le_bytes());
+        hash.update((*index as u64).to_le_bytes());
+        let priority: [u8; 32] = hash.finalize().into();
+        (priority, *index)
+    });
+    let space = ranked
+        .into_iter()
+        .map(|(_, point)| point)
+        .collect::<Vec<_>>();
+    search_working_set_batch_from_space(&space, cursor, budget_columns, replace_base_vocabulary)
+}
+
+fn search_working_set_batch_from_space(
+    space: &[SearchWorkingSetPoint],
+    cursor: usize,
+    budget_columns: usize,
+    replace_base_vocabulary: bool,
+) -> SweepBatch {
+    let space_len = space.len();
+    if cursor >= space_len || budget_columns == 0 {
+        return SweepBatch {
+            cursor,
+            next_cursor: cursor,
+            base_indicator_ids: Vec::new(),
+            replace_base_vocabulary,
+            pairs: Vec::new(),
+            planned_columns: 0,
+            space_len,
+            exhausted: cursor >= space_len,
+        };
+    }
+
+    let mut base_indicator_ids = Vec::new();
+    let mut pairs = Vec::new();
+    let mut used = 0usize;
+    let mut idx = cursor;
+    while idx < space_len {
+        let point = space[idx];
+        let want = match point {
+            SearchWorkingSetPoint::Base(id) => planned_output_count(id),
+            SearchWorkingSetPoint::Extended(pair) => planned_output_count(pair.id),
+        };
+        if idx > cursor && used.saturating_add(want) > budget_columns {
+            break;
+        }
+        used = used.saturating_add(want);
+        match point {
+            SearchWorkingSetPoint::Base(id) => base_indicator_ids.push(id),
+            SearchWorkingSetPoint::Extended(pair) => pairs.push(pair),
+        }
+        idx += 1;
+    }
+    base_indicator_ids.sort_by_key(|id| all_indicators_rank(id));
+    pairs.sort_by_key(|pair| (all_indicators_rank(pair.id), pair.period));
+    SweepBatch {
+        cursor,
+        next_cursor: idx,
+        base_indicator_ids,
+        replace_base_vocabulary,
+        pairs,
+        planned_columns: used,
+        space_len,
+        exhausted: idx >= space_len,
+    }
+}
+
 /// Batch *k*: the pairs from `cursor` onward that fit `budget_columns`.
 ///
 /// `budget_columns` comes from [`VocabularyBudget`] — free RAM divided by the
@@ -2074,6 +2589,8 @@ pub fn extended_sweep_batch(cursor: usize, budget_columns: usize) -> SweepBatch 
         return SweepBatch {
             cursor,
             next_cursor: cursor,
+            base_indicator_ids: Vec::new(),
+            replace_base_vocabulary: false,
             pairs: Vec::new(),
             planned_columns: 0,
             space_len,
@@ -2101,51 +2618,13 @@ pub fn extended_sweep_batch(cursor: usize, budget_columns: usize) -> SweepBatch 
     SweepBatch {
         cursor,
         next_cursor: idx,
+        base_indicator_ids: Vec::new(),
+        replace_base_vocabulary: false,
         pairs: selected,
         planned_columns: used,
         space_len,
         exhausted: idx >= space_len,
     }
-}
-
-/// The working set installed for this process, or `None` for the historical
-/// budget-prefix behaviour.
-///
-/// A process-level seam, exactly like [`set_indicator_compute_policy`] above and
-/// for the same reason: the cube build reaches `compute_classic_ta_columns_sized`
-/// through six frames of `rayon::join` in `lib.rs`, and threading a batch
-/// parameter through all of them would touch call sites in crates this change
-/// does not own. It is not ambient state in the dangerous sense — the batch is a
-/// pure function of `(cursor, budget_columns)`, it is logged by cursor and width
-/// on every pass, and `with_extended_sweep_working_set` in `lib.rs` scopes the
-/// install so it cannot leak past the build it was made for.
-static EXTENDED_SWEEP_WORKING_SET: std::sync::RwLock<Option<std::sync::Arc<SweepBatch>>> =
-    std::sync::RwLock::new(None);
-
-/// Install (or clear) the working set. Returns the PREVIOUS value so a scoped
-/// helper can restore it — including when the build between install and restore
-/// unwinds.
-///
-/// Lock poisoning is recovered rather than propagated: a poisoned lock here
-/// means some other thread panicked while holding it, and refusing to read the
-/// working set would silently change which columns the run builds. The value is
-/// a plain `Option<Arc<_>>` with no invariant a panic could have broken.
-pub fn install_extended_sweep_working_set(
-    batch: Option<std::sync::Arc<SweepBatch>>,
-) -> Option<std::sync::Arc<SweepBatch>> {
-    let mut guard = EXTENDED_SWEEP_WORKING_SET
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    std::mem::replace(&mut *guard, batch)
-}
-
-/// The working set in force, or `None` when the pass should take the historical
-/// budget-capped prefix.
-pub fn current_extended_sweep_working_set() -> Option<std::sync::Arc<SweepBatch>> {
-    EXTENDED_SWEEP_WORKING_SET
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
 }
 
 /// CPU sweep for ONE indicator across `periods`. This is the parity reference
@@ -2171,7 +2650,9 @@ fn cpu_multi_period_columns(
         n,
         kernel,
         ClassicInputAvailability::all_present(),
-    );
+        &FeatureBuildControl::default(),
+    )
+    .expect("uncontrolled parity sweep cannot be cancelled");
     // This wrapper exists so the GPU lane's per-indicator CPU fallback and the
     // parity test keep their original signature. It must still be incapable of
     // dropping silently, so anything the sweep discarded is reported here.
@@ -2252,6 +2733,16 @@ const COUPLED_WINDOWS: &[(&str, &[(&str, i64)])] = &[
     // the window that sets the timescale, with short_period scaled to keep the
     // 25:13 ratio that IS the indicator.
     ("tsi", &[("long_period", 25), ("short_period", 13)]),
+    // Directional Imbalance Index has two independent timescales. Its
+    // up/down/bulls/bears outputs consume `period`, while upper/lower consume
+    // `length`; sweeping only `period` therefore produced five legitimate-
+    // looking but bit-identical upper/lower columns. Anchor on the larger
+    // 70-bar period and preserve the registered 10:70 tuple so every canonical
+    // output participates in the same real timescale sweep.
+    (
+        "directional_imbalance_index",
+        &[("period", 70), ("length", 10)],
+    ),
 ];
 
 /// Window-parameter keys the sweep knows how to drive directly.
@@ -2629,7 +3120,9 @@ fn cpu_multi_period_columns_ledgered(
     n: usize,
     kernel: Kernel,
     input_availability: ClassicInputAvailability,
-) -> (Vec<(String, Vec<f64>)>, IndicatorLedger) {
+    control: &FeatureBuildControl,
+) -> anyhow::Result<(Vec<(String, Vec<f64>)>, IndicatorLedger)> {
+    control.checkpoint()?;
     let mut out: Vec<(String, Vec<f64>)> = Vec::new();
     let mut ledger = IndicatorLedger::new();
     // `dispatch_indicator_outputs` needs a 'static id, which every caller has:
@@ -2644,11 +3137,19 @@ fn cpu_multi_period_columns_ledgered(
             DropReason::UnknownIndicator,
             "id is not in hpc_ta::MULTI_PERIOD_IDS, so the sweep has no plan for it",
         );
-        return (out, ledger);
+        return Ok((out, ledger));
     };
     let _ = &mut out;
     let _ = &mut ledger;
-    sweep_one_id_ledgered(candles, static_id, periods, n, kernel, input_availability)
+    sweep_one_id_ledgered(
+        candles,
+        static_id,
+        periods,
+        n,
+        kernel,
+        input_availability,
+        control,
+    )
 }
 
 /// Sweep ONE `'static` indicator id across `periods`.
@@ -2664,11 +3165,13 @@ fn sweep_one_id_ledgered(
     n: usize,
     kernel: Kernel,
     input_availability: ClassicInputAvailability,
-) -> (Vec<(String, Vec<f64>)>, IndicatorLedger) {
+    control: &FeatureBuildControl,
+) -> anyhow::Result<(Vec<(String, Vec<f64>)>, IndicatorLedger)> {
     let mut out: Vec<(String, Vec<f64>)> = Vec::new();
     let mut ledger = IndicatorLedger::new();
     let plan = period_plan(static_id);
     for &period in periods {
+        control.checkpoint()?;
         // #212: pre-flight check — if the period is larger than the data
         // length, vector-ta's `warm_prefix` exceeds the row width and the
         // kernel panics at `helpers.rs:159` instead of returning Err. Skip the
@@ -2720,9 +3223,10 @@ fn sweep_one_id_ledgered(
             input_availability,
             &mut out,
             &mut ledger,
-        );
+            control,
+        )?;
     }
-    (out, ledger)
+    Ok((out, ledger))
 }
 
 /// Pure-CPU multi-period sweep across all of [`MULTI_PERIOD_IDS`], parallel
@@ -2733,8 +3237,9 @@ fn cpu_multi_period_all(
     n: usize,
     input_availability: ClassicInputAvailability,
     indicator_ids: &[&'static str],
-) -> (Vec<(String, Vec<f64>)>, IndicatorLedger) {
-    let per_id: Vec<(Vec<(String, Vec<f64>)>, IndicatorLedger)> = indicator_ids
+    control: &FeatureBuildControl,
+) -> anyhow::Result<(Vec<(String, Vec<f64>)>, IndicatorLedger)> {
+    let per_id = indicator_ids
         .par_iter()
         .map(|&ind_id| {
             cpu_multi_period_columns_ledgered(
@@ -2744,9 +3249,10 @@ fn cpu_multi_period_all(
                 n,
                 Kernel::Auto,
                 input_availability,
+                control,
             )
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut cols = Vec::new();
     let mut ledger = IndicatorLedger::new();
     for (mut c, l) in per_id {
@@ -2755,7 +3261,7 @@ fn cpu_multi_period_all(
     }
     // ONE summary for the whole sweep rather than sixteen — but never zero.
     ledger.log_summary("multi-period-sweep", n);
-    (cols, ledger)
+    Ok((cols, ledger))
 }
 
 // --- exclusive lane selection ---------------------------------------------
@@ -2769,7 +3275,8 @@ fn compute_multi_period_columns(
     n: usize,
     policy: IndicatorComputePolicy,
     indicator_ids: &[&'static str],
-) -> (Vec<(String, Vec<f64>)>, IndicatorLedger) {
+    control: &FeatureBuildControl,
+) -> anyhow::Result<(Vec<(String, Vec<f64>)>, IndicatorLedger)> {
     use crate::core::indicator_telemetry::{IndicatorLane, IndicatorRunSummary, record};
     use std::time::Instant;
 
@@ -2786,14 +3293,15 @@ fn compute_multi_period_columns(
         n,
         ClassicInputAvailability::from_ohlcv(ohlcv),
         indicator_ids,
-    );
+        control,
+    )?;
     record(IndicatorRunSummary {
         gpu_indicators: Vec::new(),
         cpu_indicators: indicator_ids.iter().map(|id| (*id, lane.clone())).collect(),
         cpu_time: started.elapsed(),
         ..Default::default()
     });
-    (columns, ledger)
+    Ok((columns, ledger))
 }
 
 /// One series returned by `compute_single_indicator` — multi-output
@@ -2812,11 +3320,10 @@ pub struct IndicatorLine {
     pub values: Vec<f64>,
 }
 
-/// Compute a single indicator on demand — the interactive Chart
-/// screen calls this through the `/indicators` HTTP endpoint
-/// whenever the user adds an indicator to the overlay. Cheap enough
-/// to recompute on every pan; vector_ta dispatches to CPU SIMD or
-/// GPU kernels under the hood.
+/// Compute a single indicator on CPU for the server `/indicators` API.
+/// That caller computes the complete verified series before trimming its result.
+/// Desktop KLineChart overlays are computed client-side; this is not their
+/// per-pan path, and runtime depends on the indicator and full input length.
 ///
 /// `params` is a key→f64 map. Conventional keys per indicator:
 ///   * `sma`/`ema`/`rsi`/`atr`/`adx`: `period`
@@ -2825,7 +3332,7 @@ pub struct IndicatorLine {
 ///   * `stoch`: `k_period`, `k_slow`, `d_period`
 /// Unrecognised keys are silently ignored. Empty map = library defaults.
 ///
-/// Returns the row count + lines on success, anyhow error if the
+/// Returns aligned named lines on success, anyhow error if the
 /// indicator id is unknown or the kernel rejects the input.
 pub fn compute_single_indicator(
     ohlcv: &Ohlcv,
@@ -2861,12 +3368,8 @@ pub fn compute_single_indicator(
     // whether the value has a fractional part.
     let mut kv: Vec<vector_ta::indicators::dispatch::ParamKV> = Vec::with_capacity(params.len());
     for (k, v) in params {
-        // Leak the &'static str via Box::leak so the dispatch API
-        // can hold a 'static reference. Param map is tiny (≤ 5
-        // entries) and lives for the call, so the leak is bounded
-        // by the call site — acceptable trade-off for the simpler
-        // wire shape.
-        let key: &'static str = Box::leak(k.clone().into_boxed_str());
+        // ParamKV borrows the map for this call; no permanent allocation is needed.
+        let key = k.as_str();
         let value = if v.fract() == 0.0 && v.abs() <= i64::MAX as f64 {
             vector_ta::indicators::dispatch::ParamValue::Int(*v as i64)
         } else {
@@ -2894,6 +3397,7 @@ pub fn compute_single_indicator(
         .unwrap_or_else(|| vec![None]);
 
     let mut lines = Vec::with_capacity(output_ids.len());
+    let mut shared_smooth_theil_sen = None;
     for out_id in output_ids {
         let req = IndicatorComputeRequest {
             indicator_id,
@@ -2902,9 +3406,10 @@ pub fn compute_single_indicator(
             params: &kv,
             kernel: Kernel::Auto,
         };
-        let output = compute_cpu(req).map_err(|e| {
-            anyhow::anyhow!("vector_ta dispatch failed ({indicator_id}/{out_id:?}): {e:?}")
-        })?;
+        let output = compute_output_with_shared_smooth_theil_sen(req, &mut shared_smooth_theil_sen)
+            .map_err(|e| {
+                anyhow::anyhow!("vector_ta dispatch failed ({indicator_id}/{out_id:?}): {e:?}")
+            })?;
         let (values, raw_len) = flatten_indicator_series(output.series, n)?;
         if raw_len > n {
             tracing::warn!(
@@ -2993,6 +3498,358 @@ fn normalize_indicator_len(v: Vec<f64>, n: usize) -> anyhow::Result<(Vec<f64>, u
 mod streaming_advance_tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn smooth_theil_sen_shared_candles(ohlcv: &Ohlcv) -> Candles {
+        Candles::new(
+            ohlcv
+                .timestamp
+                .clone()
+                .unwrap_or_else(|| vec![0; ohlcv.len()]),
+            ohlcv.open.clone(),
+            ohlcv.high.clone(),
+            ohlcv.low.clone(),
+            ohlcv.close.clone(),
+            ohlcv
+                .volume
+                .clone()
+                .unwrap_or_else(|| vec![0.0; ohlcv.len()]),
+        )
+    }
+
+    #[test]
+    fn smooth_theil_sen_shared_outputs_preserve_production_and_chart_bits() -> anyhow::Result<()> {
+        let fixture = crate::test_fixtures::ctrader_sample_ohlcv();
+        for (length, nonfinite) in [
+            (None, false),
+            (Some(7), false),
+            (Some(21), false),
+            (Some(50), false),
+            (Some(100), false),
+            (None, true),
+        ] {
+            let mut ohlcv = fixture.clone();
+            if nonfinite {
+                ohlcv.close[0] = f64::NAN;
+                ohlcv.close[35] = f64::INFINITY;
+                ohlcv.close[70] = -0.0;
+            }
+            let candles = smooth_theil_sen_shared_candles(&ohlcv);
+            let params: Vec<_> = length
+                .map(|length| ParamKV {
+                    key: "length",
+                    value: ParamValue::Int(length),
+                })
+                .into_iter()
+                .collect();
+            let ids = output_ids_for("smooth_theil_sen");
+            assert_eq!(
+                ids,
+                [
+                    Some("value"),
+                    Some("upper"),
+                    Some("lower"),
+                    Some("slope"),
+                    Some("deviation")
+                ]
+            );
+            let started = std::time::Instant::now();
+            let expected = ids
+                .iter()
+                .map(|&output_id| {
+                    let output = compute_cpu(IndicatorComputeRequest {
+                        indicator_id: "smooth_theil_sen",
+                        output_id,
+                        data: IndicatorDataRef::Candles {
+                            candles: &candles,
+                            source: None,
+                        },
+                        params: &params,
+                        kernel: Kernel::Auto,
+                    })?;
+                    Ok(flatten_indicator_series(output.series, ohlcv.len())?.0)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let old_elapsed = started.elapsed();
+            let mut actual = Vec::new();
+            let mut ledger = IndicatorLedger::new();
+            let started = std::time::Instant::now();
+            dispatch_indicator_outputs(
+                &candles,
+                "smooth_theil_sen",
+                "smooth_theil_sen",
+                &params,
+                ohlcv.len(),
+                Kernel::Auto,
+                ClassicInputAvailability::from_ohlcv(&ohlcv),
+                &mut actual,
+                &mut ledger,
+                &FeatureBuildControl::default(),
+            )?;
+            let shared_elapsed = started.elapsed();
+            assert_eq!(ledger.produced_columns(), 5);
+            assert_eq!(ledger.dropped_columns(), 0);
+            assert_eq!(actual.len(), expected.len());
+            for ((name, values), (id, expected)) in actual.iter().zip(ids.iter().zip(&expected)) {
+                assert_eq!(name, &format!("smooth_theil_sen_{}", id.unwrap()));
+                assert_eq!(
+                    values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    classify_classic_ta_validity(name, values, &ledger),
+                    classify_classic_ta_validity(name, expected, &IndicatorLedger::new())
+                );
+            }
+            eprintln!(
+                "smooth_theil_sen shared fixture rows={} length={length:?} nonfinite={nonfinite} old_five_dispatch_us={} shared_production_us={}",
+                ohlcv.len(),
+                old_elapsed.as_micros(),
+                shared_elapsed.as_micros()
+            );
+
+            // Chart retains the sixth (intercept) line; repeatedly borrowed keys
+            // remain owned by this map, rather than leaking on every chart call.
+            let chart_params = length
+                .map(|v| ("length".to_owned(), v as f64))
+                .into_iter()
+                .collect();
+            let mut shared = None;
+            let mut remaining_ptr = None;
+            let mut chart_expected = Vec::new();
+            for output_id in ["value", "upper", "lower", "slope", "intercept", "deviation"] {
+                let req = || IndicatorComputeRequest {
+                    indicator_id: "smooth_theil_sen",
+                    output_id: Some(output_id),
+                    data: IndicatorDataRef::Candles {
+                        candles: &candles,
+                        source: None,
+                    },
+                    params: &params,
+                    kernel: Kernel::Auto,
+                };
+                let expected = compute_cpu(req())?;
+                let output = compute_output_with_shared_smooth_theil_sen(req(), &mut shared)?;
+                assert_eq!(
+                    (output.rows, output.cols, output.warmup, &output.pattern_ids),
+                    (
+                        expected.rows,
+                        expected.cols,
+                        expected.warmup,
+                        &expected.pattern_ids
+                    )
+                );
+                let actual = flatten_indicator_series(output.series, ohlcv.len())?.0;
+                let expected = flatten_indicator_series(expected.series, ohlcv.len())?.0;
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+                let cache = shared.as_ref().expect("actual shared producer ran");
+                assert!(cache.value.is_empty(), "first vector was moved, not cloned");
+                if output_id != "deviation" {
+                    if let Some(ptr) = remaining_ptr {
+                        assert_eq!(
+                            cache.deviation.as_ptr(),
+                            ptr,
+                            "remaining vector was recomputed"
+                        );
+                    }
+                    remaining_ptr = Some(cache.deviation.as_ptr());
+                }
+                chart_expected.push(actual);
+            }
+            for _ in 0..3 {
+                let lines = compute_single_indicator(&ohlcv, "smooth_theil_sen", &chart_params)?;
+                assert_eq!(lines.len(), 6);
+                for ((line, expected), id) in lines.iter().zip(&chart_expected).zip([
+                    "value",
+                    "upper",
+                    "lower",
+                    "slope",
+                    "intercept",
+                    "deviation",
+                ]) {
+                    assert_eq!(line.name, format!("smooth_theil_sen_{id}"));
+                    assert_eq!(
+                        line.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn smooth_theil_sen_shared_adapter_preserves_dispatch_errors_and_fallbacks()
+    -> anyhow::Result<()> {
+        let fixture = crate::test_fixtures::ctrader_sample_ohlcv();
+        let cases = [
+            vec![],
+            vec![ParamKV {
+                key: "length",
+                value: ParamValue::Int(200),
+            }],
+            vec![ParamKV {
+                key: "length",
+                value: ParamValue::Int(0),
+            }],
+            vec![ParamKV {
+                key: "length",
+                value: ParamValue::Int(1),
+            }],
+            vec![ParamKV {
+                key: "length",
+                value: ParamValue::Int(-1),
+            }],
+            vec![ParamKV {
+                key: "length",
+                value: ParamValue::Float(21.0),
+            }],
+            vec![ParamKV {
+                key: "length",
+                value: ParamValue::Float(21.5),
+            }],
+            vec![ParamKV {
+                key: "length",
+                value: ParamValue::Bool(true),
+            }],
+            vec![ParamKV {
+                key: "offset",
+                value: ParamValue::Int(1),
+            }],
+            vec![
+                ParamKV {
+                    key: "length",
+                    value: ParamValue::Int(7),
+                },
+                ParamKV {
+                    key: "length",
+                    value: ParamValue::Int(21),
+                },
+            ],
+        ];
+        for variant in 0..3 {
+            let mut ohlcv = fixture.clone();
+            if variant == 1 {
+                ohlcv.close.fill(f64::NAN);
+            }
+            if variant == 2 {
+                ohlcv = crate::test_fixtures::ctrader_sample_ohlcv_first(3);
+            }
+            let candles = smooth_theil_sen_shared_candles(&ohlcv);
+            for params in &cases {
+                for output_id in [Some("upper"), Some("unknown"), None] {
+                    let req = || IndicatorComputeRequest {
+                        indicator_id: "smooth_theil_sen",
+                        output_id,
+                        data: IndicatorDataRef::Candles {
+                            candles: &candles,
+                            source: None,
+                        },
+                        params,
+                        kernel: Kernel::Auto,
+                    };
+                    let mut shared = None;
+                    match (
+                        compute_cpu(req()),
+                        compute_output_with_shared_smooth_theil_sen(req(), &mut shared),
+                    ) {
+                        (Err(old), Err(new)) => {
+                            assert_eq!(format!("{old:?}"), format!("{new:?}"));
+                            assert_eq!(
+                                DropReason::from_dispatch(&old),
+                                DropReason::from_dispatch(&new)
+                            );
+                        }
+                        (Ok(old), Ok(new)) => {
+                            let old = flatten_indicator_series(old.series, ohlcv.len())?.0;
+                            let new = flatten_indicator_series(new.series, ohlcv.len())?.0;
+                            assert_eq!(
+                                old.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                new.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                            );
+                        }
+                        other => panic!("dispatcher/adapted result mismatch: {other:?}"),
+                    }
+                }
+            }
+            if variant != 0 {
+                let mut columns = Vec::new();
+                let mut ledger = IndicatorLedger::new();
+                dispatch_indicator_outputs(
+                    &candles,
+                    "smooth_theil_sen",
+                    "smooth_theil_sen",
+                    &[],
+                    ohlcv.len(),
+                    Kernel::Auto,
+                    ClassicInputAvailability::from_ohlcv(&ohlcv),
+                    &mut columns,
+                    &mut ledger,
+                    &FeatureBuildControl::default(),
+                )?;
+                assert_eq!(ledger.dropped_columns(), 5);
+                assert_eq!(ledger.produced_columns(), 0);
+                assert_eq!(columns.len(), 5);
+                assert!(
+                    columns.iter().all(|(_, values)| values.len() == ohlcv.len()
+                        && values.iter().all(|v| v.is_nan()))
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn smooth_theil_sen_shared_cancellation_keeps_per_output_boundary() -> anyhow::Result<()> {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
+        let candles = smooth_theil_sen_shared_candles(&ohlcv);
+        for (item, completed, already_published) in
+            [("value", 0, 0), ("value", 1, 0), ("upper", 0, 1)]
+        {
+            let flag = Arc::new(AtomicBool::new(false));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let writer = Arc::clone(&flag);
+            let recorded = Arc::clone(&events);
+            let control = FeatureBuildControl::new(flag).with_observer(move |event| {
+                let stop = event.item == format!("smooth_theil_sen_{item}")
+                    && event.completed == completed;
+                recorded.lock().unwrap().push(event);
+                if stop {
+                    writer.store(true, Ordering::Release);
+                }
+            });
+            let mut columns = Vec::new();
+            let mut ledger = IndicatorLedger::new();
+            let error = dispatch_indicator_outputs(
+                &candles,
+                "smooth_theil_sen",
+                "smooth_theil_sen",
+                &[],
+                ohlcv.len(),
+                Kernel::Auto,
+                ClassicInputAvailability::from_ohlcv(&ohlcv),
+                &mut columns,
+                &mut ledger,
+                &control,
+            )
+            .unwrap_err();
+            assert!(crate::FeatureBuildCancelled::matches(&error), "{error:#}");
+            assert_eq!(columns.len(), already_published);
+            assert_eq!(
+                ledger.dropped_columns(),
+                0,
+                "Stop is not a placeholder-producing failure"
+            );
+            assert_eq!(events.lock().unwrap().last().unwrap().completed, completed);
+        }
+        Ok(())
+    }
 
     /// PARITY, AND IT COMES FIRST.
     ///
@@ -3140,25 +3997,384 @@ mod streaming_advance_tests {
         }
     }
 
-    /// Install/restore is exact, so a scoped build cannot leak its working set
-    /// into the next one.
+    /// Concurrent planners own immutable, disjoint working sets; neither can
+    /// overwrite or observe the other's batch.
     #[test]
-    fn installing_a_working_set_returns_the_previous_one() {
-        let batch = std::sync::Arc::new(extended_sweep_batch(0, 8));
-        let previous = install_extended_sweep_working_set(Some(batch.clone()));
+    fn concurrent_working_set_plans_do_not_share_ambient_state() {
+        let first = std::sync::Arc::new(search_working_set_batch(0, 20, true));
+        let second = std::sync::Arc::new(search_working_set_batch(first.next_cursor, 20, true));
+        assert_ne!(first.cursor, second.cursor);
+
+        let first_expected = first.clone();
+        let second_expected = second.clone();
+        let first_plan = std::thread::spawn(move || {
+            prepare_classic_ta_run_plan_with_working_set(
+                10_000,
+                IndicatorComputePolicy::CpuOnly,
+                Some(first),
+            )
+            .expect("first independent working-set plan")
+        });
+        let second_plan = std::thread::spawn(move || {
+            prepare_classic_ta_run_plan_with_working_set(
+                10_000,
+                IndicatorComputePolicy::CpuOnly,
+                Some(second),
+            )
+            .expect("second independent working-set plan")
+        });
+
+        let first_plan = first_plan.join().expect("first planner thread");
+        let second_plan = second_plan.join().expect("second planner thread");
         assert_eq!(
-            current_extended_sweep_working_set().as_deref(),
-            Some(&*batch)
+            first_plan.admission.working_set.as_deref(),
+            Some(&*first_expected)
         );
-        let restored = install_extended_sweep_working_set(previous);
-        assert_eq!(restored.as_deref(), Some(&*batch));
-        assert!(current_extended_sweep_working_set().is_none());
+        assert_eq!(
+            second_plan.admission.working_set.as_deref(),
+            Some(&*second_expected)
+        );
+        assert_ne!(
+            first_plan.admission.admitted_indicator_ids,
+            second_plan.admission.admitted_indicator_ids
+        );
+    }
+
+    #[test]
+    fn constrained_sizing_reserves_the_whole_non_historical_width_for_rotation() {
+        let sweep = planned_sweep_columns();
+        let budget = VocabularyBudget {
+            rows: 10_000,
+            available_bytes: 1,
+            budget_bytes: 1,
+            max_columns: sweep + 40,
+            floor_binds: false,
+        };
+        let sizing = streaming_working_set_sizing_from_budget(10_000, &budget);
+        assert!(sizing.replace_base_vocabulary);
+        assert_eq!(sizing.resident_columns, sweep);
+        assert_eq!(sizing.batch_columns, 40);
+        assert_eq!(
+            sizing.space_len,
+            base_working_set_indicator_ids().len() + extended_sweep_space_len()
+        );
+    }
+
+    #[test]
+    fn generous_sizing_uses_one_large_rotating_batch_instead_of_repeating_the_base() {
+        let budget = VocabularyBudget {
+            rows: 10_000,
+            available_bytes: u64::MAX,
+            budget_bytes: u64::MAX,
+            max_columns: crate::core::feature_budget::MAX_COLUMNS_HARD_CEILING,
+            floor_binds: false,
+        };
+        let sizing = streaming_working_set_sizing_from_budget(10_000, &budget);
+        assert!(sizing.replace_base_vocabulary);
+        assert_eq!(sizing.resident_columns, planned_sweep_columns());
+        assert_eq!(
+            sizing.batch_columns,
+            sizing.max_columns - planned_sweep_columns()
+        );
+        assert_eq!(
+            sizing.space_len,
+            base_working_set_indicator_ids().len() + extended_sweep_space_len()
+        );
+    }
+
+    #[test]
+    fn constrained_working_sets_partition_base_and_extended_space_exactly_once() {
+        let expected_base = base_working_set_indicator_ids();
+        let expected_pairs = extended_sweep_space();
+        let expected_len = expected_base.len() + expected_pairs.len();
+        let mut seen_base = Vec::new();
+        let mut seen_pairs = Vec::new();
+        let mut cursor = 0usize;
+        let mut guard = 0usize;
+        while cursor < expected_len {
+            let batch = search_working_set_batch(cursor, 40, true);
+            assert!(!batch.is_empty());
+            assert!(batch.replace_base_vocabulary);
+            assert!(batch.next_cursor > cursor);
+            seen_base.extend(batch.base_indicator_ids.iter().copied());
+            seen_pairs.extend(batch.pairs.iter().copied());
+            cursor = batch.next_cursor;
+            guard += 1;
+            assert!(guard < 100_000, "adaptive working-set cursor stalled");
+        }
+        assert_eq!(cursor, expected_len);
+        assert_eq!(seen_base, expected_base);
+        assert_eq!(seen_pairs.len(), expected_pairs.len());
+        assert_eq!(
+            seen_pairs.iter().copied().collect::<HashSet<_>>(),
+            expected_pairs.iter().copied().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn seeded_working_sets_partition_the_same_space_without_repeating_a_prefix() {
+        let expected_base = base_working_set_indicator_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let expected_pairs = extended_sweep_space().into_iter().collect::<HashSet<_>>();
+        let mut orders = Vec::new();
+        for seed in [7, 19] {
+            let mut cursor = 0;
+            let mut bases = HashSet::new();
+            let mut pairs = HashSet::new();
+            let mut order = Vec::new();
+            loop {
+                let batch = search_working_set_batch_seeded(cursor, 40, true, seed);
+                assert_eq!(
+                    batch,
+                    search_working_set_batch_seeded(cursor, 40, true, seed)
+                );
+                batch.validate().unwrap();
+                assert!(!batch.is_empty());
+                for id in &batch.base_indicator_ids {
+                    assert!(bases.insert(*id));
+                }
+                for pair in &batch.pairs {
+                    assert!(pairs.insert(*pair));
+                }
+                cursor = batch.next_cursor;
+                order.push((batch.base_indicator_ids, batch.pairs));
+                if batch.exhausted {
+                    break;
+                }
+            }
+            assert_eq!(bases, expected_base);
+            assert_eq!(pairs, expected_pairs);
+            assert_eq!(cursor, expected_base.len() + expected_pairs.len());
+            orders.push(order);
+        }
+        assert_ne!(
+            orders[0], orders[1],
+            "a fresh seed must not repeat the same fixed prefix"
+        );
+    }
+
+    #[test]
+    fn recorded_working_set_validates_wire_and_runtime_inputs() {
+        let batch = search_working_set_batch_seeded(17, 40, true, 7);
+        let encoded = serde_json::to_vec(&batch).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<SweepBatch>(&encoded).unwrap(),
+            batch
+        );
+        let mut wire = serde_json::to_value(&batch).unwrap();
+        wire["base_indicator_ids"] = serde_json::json!(["not_a_registry_indicator"]);
+        assert!(serde_json::from_value::<SweepBatch>(wire).is_err());
+        let mut invalid = batch.clone();
+        invalid.base_indicator_ids.push("not_a_registry_indicator");
+        assert!(invalid.validate().is_err());
+        assert!(
+            prepare_classic_ta_run_plan_with_working_set(
+                100,
+                IndicatorComputePolicy::CpuOnly,
+                Some(std::sync::Arc::new(invalid))
+            )
+            .is_err()
+        );
+        let mut invalid = batch.clone();
+        invalid.pairs = vec![SweepPair {
+            id: "sma",
+            period: usize::MAX,
+        }];
+        assert!(invalid.validate().is_err());
+        let mut invalid = batch.clone();
+        invalid.planned_columns += 1;
+        assert!(invalid.validate().is_err());
+        let mut invalid = batch.clone();
+        invalid.next_cursor += 1;
+        assert!(invalid.validate().is_err());
+        let mut invalid = batch.clone();
+        invalid.exhausted = !invalid.exhausted;
+        assert!(invalid.validate().is_err());
+        let mut invalid = search_working_set_batch(0, 40, true);
+        invalid
+            .base_indicator_ids
+            .push(invalid.base_indicator_ids[0]);
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn recorded_working_set_is_exact_across_admission_widths_and_legacy_base_capture() {
+        let batch = search_working_set_batch_seeded(17, 40, true, 7);
+        for rows in [100, 1_000_000] {
+            let plan = prepare_classic_ta_run_plan_with_working_set(
+                rows,
+                IndicatorComputePolicy::CpuOnly,
+                Some(std::sync::Arc::new(batch.clone())),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.admission.admitted_indicator_ids,
+                batch.base_indicator_ids
+            );
+            assert_eq!(plan.admission.extended_groups, batch.grouped_by_id());
+            assert_eq!(plan.recorded_working_set(), Some(batch.clone()));
+        }
+        let legacy = extended_sweep_batch(17, 40);
+        let plan = prepare_classic_ta_run_plan_with_working_set(
+            100,
+            IndicatorComputePolicy::CpuOnly,
+            Some(std::sync::Arc::new(legacy.clone())),
+        )
+        .unwrap();
+        let recorded = plan.recorded_working_set().unwrap();
+        recorded.validate().unwrap();
+        assert!(recorded.replace_base_vocabulary);
+        assert_eq!(
+            recorded.base_indicator_ids,
+            plan.admission.admitted_indicator_ids
+        );
+        assert_eq!(recorded.pairs, legacy.pairs);
+        assert_eq!(recorded.cursor, 0);
+        assert_eq!(recorded.next_cursor, recorded.space_len);
+        let replay = prepare_classic_ta_run_plan_with_working_set(
+            1_000_000,
+            IndicatorComputePolicy::CpuOnly,
+            Some(std::sync::Arc::new(recorded.clone())),
+        )
+        .unwrap();
+        assert_eq!(replay.recorded_working_set(), Some(recorded));
+        assert_eq!(
+            replay.admission.admitted_indicator_ids,
+            plan.admission.admitted_indicator_ids
+        );
+        assert_eq!(
+            replay.admission.extended_groups,
+            plan.admission.extended_groups
+        );
+    }
+
+    #[test]
+    fn constrained_batch_replaces_the_fixed_base_prefix_in_the_real_run_plan() {
+        let batch = std::sync::Arc::new(search_working_set_batch(0, 20, true));
+        assert!(batch.replace_base_vocabulary);
+        assert!(!batch.base_indicator_ids.is_empty());
+        assert!(
+            batch.pairs.is_empty(),
+            "the first region should still be base coverage"
+        );
+        let selected = batch.base_indicator_ids.clone();
+        let report = prepare_classic_ta_run_plan_with_working_set(
+            10_000,
+            IndicatorComputePolicy::CpuOnly,
+            Some(batch),
+        )
+        .expect("working-set run plan")
+        .admission_report();
+        assert_eq!(report.admitted_indicator_ids, selected);
+        assert!(
+            selected
+                .iter()
+                .all(|id| !report.budget_deferred_indicator_ids.contains(id))
+        );
+        assert_eq!(
+            report.admitted_indicator_ids.len() + report.budget_deferred_indicator_ids.len(),
+            ALL_INDICATORS.len()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_live_m5_sizing_reports_a_consistent_adaptive_plan() {
+        const CURRENT_M5_ROWS: usize = 790_148;
+        let sizing = streaming_working_set_sizing(CURRENT_M5_ROWS);
+        eprintln!("windows_live_m5_sizing={sizing:?}");
+        assert!(sizing.available_bytes > 0);
+        assert!(sizing.max_columns >= crate::core::feature_budget::MIN_COLUMNS);
+        assert_eq!(
+            sizing.resident_columns + sizing.batch_columns,
+            sizing.max_columns
+        );
+        assert!(sizing.space_len > 0);
+        let mut cursor = 0usize;
+        let mut batches = 0usize;
+        let mut base_ids = 0usize;
+        let mut period_pairs = 0usize;
+        while cursor < sizing.space_len {
+            let batch = search_working_set_batch(
+                cursor,
+                sizing.batch_columns,
+                sizing.replace_base_vocabulary,
+            );
+            assert!(!batch.is_empty());
+            base_ids += batch.base_indicator_ids.len();
+            period_pairs += batch.pairs.len();
+            batches += 1;
+            cursor = batch.next_cursor;
+        }
+        eprintln!(
+            "windows_live_m5_working_set batches={batches} base_ids={base_ids} period_pairs={period_pairs}"
+        );
+        assert_eq!(cursor, sizing.space_len);
+        assert_eq!(base_ids + period_pairs, sizing.space_len);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_during_a_real_indicator_output_aborts_without_placeholder_columns() -> anyhow::Result<()>
+    {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
+        let run_plan = prepare_classic_ta_run_plan(ohlcv.len(), IndicatorComputePolicy::CpuOnly)?;
+        let flag = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let flag_writer = Arc::clone(&flag);
+        let completed_writer = Arc::clone(&completed);
+        let control = FeatureBuildControl::new(flag).with_observer(move |event| {
+            if event.stage == "indicator" && event.completed == 1 {
+                completed_writer.fetch_add(1, Ordering::Relaxed);
+                flag_writer.store(true, Ordering::Release);
+            }
+        });
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        let error = pool
+            .install(|| {
+                compute_classic_ta_feature_columns_f64_with_control(&ohlcv, &run_plan, &control)
+            })
+            .expect_err("Stop must not return a partial/NaN-substituted frame");
+        assert!(crate::FeatureBuildCancelled::matches(&error), "{error:#}");
+        assert!(
+            completed.load(Ordering::Relaxed) > 0,
+            "must cancel after actual kernel work"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_classic_pass_preserves_all_value_bits_and_validity() -> anyhow::Result<()> {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
+        let plan = prepare_classic_ta_run_plan(ohlcv.len(), IndicatorComputePolicy::CpuOnly)?;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        let expected =
+            pool.install(|| compute_classic_ta_feature_columns_f64_with_run_plan(&ohlcv, &plan))?;
+        let control = FeatureBuildControl::new(Arc::new(AtomicBool::new(false)));
+        let actual = pool.install(|| {
+            compute_classic_ta_feature_columns_f64_with_control(&ohlcv, &plan, &control)
+        })?;
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(expected) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.validity, b.validity);
+            assert_eq!(
+                a.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                b.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn vocabulary_floor_excludes_ids_with_no_production_output() {
@@ -3315,39 +4531,83 @@ mod tests {
     /// preserve the exact CpuOnly schema rather than running a partial CUDA
     /// sweep and reassembling host columns.
     #[test]
-    fn lane_policy_does_not_change_column_names_or_order() {
+    fn lane_policy_does_not_change_column_names_or_order() -> anyhow::Result<()> {
+        let process_authority = resolved_canonical_feature_execution_authority_v1();
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
-        let cpu = compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::CpuOnly)
-            .unwrap();
-        let auto =
-            compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::Auto).unwrap();
-        let cpu_names: Vec<&str> = cpu.iter().map(|(n, _)| n.as_str()).collect();
-        let auto_names: Vec<&str> = auto.iter().map(|(n, _)| n.as_str()).collect();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        let barrier = std::sync::Barrier::new(2);
+        let run = |policy| {
+            let control = FeatureBuildControl::default()
+                .with_indicator_compute_policy(policy)
+                .for_timeframe("M1");
+            // Synchronize outside the Rayon pool: these are independent requests,
+            // not two workers waiting on each other inside a bounded lease.
+            barrier.wait();
+            let authority = canonical_feature_execution_authority_for_policy_v1(
+                control.resolved_indicator_compute_policy(),
+            );
+            let plan = prepare_classic_ta_run_plan(ohlcv.len(), authority.policy)?;
+            assert_eq!(plan.policy(), policy);
+            let columns = pool.install(|| {
+                compute_classic_ta_feature_columns_f64_with_control(&ohlcv, &plan, &control)
+            })?;
+            Ok::<_, anyhow::Error>((authority, columns))
+        };
+        let (cpu, auto) = std::thread::scope(|scope| {
+            let cpu = scope.spawn(|| run(IndicatorComputePolicy::CpuOnly));
+            let auto = scope.spawn(|| run(IndicatorComputePolicy::Auto));
+            (
+                cpu.join().expect("CpuOnly request thread"),
+                auto.join().expect("Auto request thread"),
+            )
+        });
+        let (cpu_authority, cpu) = cpu?;
+        let (auto_authority, auto) = auto?;
+        assert_eq!(cpu_authority.policy, IndicatorComputePolicy::CpuOnly);
+        assert_eq!(auto_authority.policy, IndicatorComputePolicy::Auto);
+        assert_ne!(cpu_authority, auto_authority);
+        assert_eq!(
+            resolved_canonical_feature_execution_authority_v1(),
+            process_authority
+        );
+        let cpu_names: Vec<&str> = cpu.iter().map(|column| column.name.as_str()).collect();
+        let auto_names: Vec<&str> = auto.iter().map(|column| column.name.as_str()).collect();
         assert_eq!(
             cpu_names, auto_names,
             "the lane policy changed the feature-frame column layout — every stored artifact \
             would be invalidated"
         );
+        for (cpu, auto) in cpu.iter().zip(&auto) {
+            assert_eq!(cpu.validity, auto.validity);
+            assert_eq!(
+                cpu.values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                auto.values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(())
     }
 
     /// Strict GPU selection is a whole-graph execution boundary. It must
     /// reject the still-incomplete resident feature plan before the CPU base
     /// pass starts, never execute the old CPU -> partial CUDA -> CPU route.
     #[test]
-    fn strict_gpu_policy_rejects_the_incomplete_graph_before_work() {
+    fn strict_gpu_policy_fails_closed_before_work() {
         let ohlcv = crate::test_fixtures::ctrader_sample_ohlcv();
         let result =
             compute_classic_ta_columns_with_policy(&ohlcv, IndicatorComputePolicy::GpuOnly);
-        let error = result.expect_err("strict GPU mode must reject an incomplete resident graph");
+        let error = result.expect_err("strict GPU mode must fail closed when unavailable");
         let message = format!("{error:#}");
         eprintln!("NEOETHOS_GPU_ONLY_REJECTION={message}");
-        assert!(
-            message.contains("GpuOnly preflight rejected before any CPU or CUDA work"),
-            "unexpected strict-GPU rejection: {message}"
-        );
         #[cfg(feature = "gpu-cuda")]
         assert!(
-            message.contains("classic-TA output route(s) are incomplete")
+            message.contains("GpuOnly preflight rejected before any CPU or CUDA work")
+                && message.contains("classic-TA output route(s) are incomplete")
                 && message.contains("No CPU segment")
                 && message.contains("missing_"),
             "unexpected strict-GPU rejection: {message}"
@@ -3610,6 +4870,30 @@ mod tests {
             period_plan("alligator"),
             PeriodPlan::RegistryRatio("alligator")
         );
+        match period_plan("directional_imbalance_index") {
+            PeriodPlan::Ratio(keys) => {
+                assert_eq!(keys, &[("period", 70), ("length", 10)]);
+                let params = sweep_params(PeriodPlan::Ratio(keys), 100);
+                assert_eq!(
+                    params,
+                    vec![
+                        ParamKV {
+                            key: "period",
+                            value: ParamValue::Int(100),
+                        },
+                        ParamKV {
+                            key: "length",
+                            value: ParamValue::Int(14),
+                        },
+                    ],
+                    "DII must scale both registered timescales; otherwise upper/lower alias"
+                );
+            }
+            other => panic!(
+                "directional_imbalance_index must use its coupled 10:70 window plan, got \
+                 {other:?}"
+            ),
+        }
         // OBV declares no window. It stays as one base feature and a sweep may
         // not invent ignored parameters or compatibility aliases for it.
         assert_eq!(period_plan("obv"), PeriodPlan::NoWindow);

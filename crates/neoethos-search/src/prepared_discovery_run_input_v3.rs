@@ -7,16 +7,32 @@
 
 use std::fmt;
 
+#[path = "resident_search_terminal_adapter_v3.rs"]
+mod terminal_adapter;
+
+#[cfg(any(test, target_os = "linux"))]
+#[path = "resident_repeated_search_v3.rs"]
+mod repeated_search;
+#[cfg(any(test, target_os = "linux"))]
+pub use repeated_search::{
+    ResidentRepeatedSearchResultV3, run_prepared_canonical_trendbar_research_resident_search_v5,
+};
+
 use crate::data_selection::{
     CanonicalGpuResidentSearchArtifactScopeV3, CanonicalGpuResidentSearchInputReceiptV3,
     CanonicalSearchInput, CanonicalSearchInputReceiptV2, CanonicalSearchWindowRoleV1,
 };
+use crate::resident_population_auto_sizing_receipt_v2::ResidentPopulationAutoSizingReceiptV2;
+#[cfg(any(test, target_os = "linux"))]
+use crate::resident_population_auto_sizing_receipt_v2::evaluation_config_from_canonical_trendbar_contract_v2;
+#[cfg(any(test, target_os = "linux"))]
 use crate::resident_population_auto_sizing_receipt_v2::{
-    RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2, ResidentPopulationAutoSizingReceiptV2,
-    evaluation_config_from_canonical_trendbar_contract_v2,
-    seal_resident_population_auto_for_canonical_trendbar_research_v2,
-    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_v2,
+    RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
+    seal_resident_population_auto_for_compact_canonical_trendbar_research_with_hard_cap_v2,
 };
+#[cfg(any(test, target_os = "linux"))]
+use crate::resident_selection_scope_v2::ResidentFeatureScreeningScopeV2;
+use crate::resident_selection_scope_v2::ResidentSelectionStage1TimeScopeV2;
 use crate::strict_discovery_device_route_v1::SealedStrictDiscoveryDeviceAdmissionV1;
 use crate::strict_resident_feature_store_v3::{
     StrictResidentPopulationExecutionRunV3, bind_strict_resident_feature_store_v3_run_input,
@@ -25,7 +41,9 @@ use crate::strict_resident_feature_store_v3::{
 };
 use crate::{DiscoveryConfig, DiscoveryProgress, DiscoveryResult, PropFirmRiskRules};
 use anyhow::{Context, Result, bail, ensure};
-use neoethos_data::{PreparedGpuOnlyFeatureMaterializationV3, SealedGpuResidentFeatureStoreV3};
+use neoethos_data::SealedGpuResidentFeatureStoreV3;
+#[cfg(any(test, target_os = "linux"))]
+use neoethos_data::{AdmittedCompactSelectedStoreV2, PreparedCompactSelectedStoreV2};
 use neoethos_gpu_cuda::full_discovery_workspace_plan_v1::AdmittedNativeCudaFullDiscoveryRunV1;
 use neoethos_gpu_cuda::run_device_admission_v1::SealedCpuNoPhysicalGpuRunDeviceAdmissionV1;
 use neoethos_gpu_cuda::{
@@ -67,6 +85,10 @@ pub struct PreparedNativeCudaCanonicalDiscoveryRunInputV5 {
         crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
     evaluation_config: crate::genetic::EvaluationConfig,
     runtime_snapshot: crate::genetic::search_engine::ResidentGenerationZeroRuntimeSnapshotV1,
+    stage1_time_scope: ResidentSelectionStage1TimeScopeV2,
+    #[cfg(any(test, target_os = "linux"))]
+    screening_scope: ResidentFeatureScreeningScopeV2,
+    discovery_config: DiscoveryConfig,
 }
 
 /// Staged canonical input whose native arm owns the exact admission-bound
@@ -76,6 +98,48 @@ pub struct PreparedNativeCudaCanonicalDiscoveryRunInputV5 {
 #[derive(Debug)]
 pub struct PreparedCanonicalDiscoveryRunInputV5 {
     native: PreparedNativeCudaCanonicalDiscoveryRunInputV5,
+}
+
+/// One run-scoped authority shared by resident screening, compact population
+/// sizing and Generation-0. Preparing it once prevents the CUDA route from
+/// rebuilding cost geometry or capturing ambient runtime state after feature
+/// selection has already started.
+#[derive(Debug)]
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) struct PreparedCanonicalResidentGenerationZeroAuthoritiesV5 {
+    financial_contract:
+        crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    evaluation_config: crate::genetic::EvaluationConfig,
+    runtime_snapshot: crate::genetic::search_engine::ResidentGenerationZeroRuntimeSnapshotV1,
+    stage1_time_scope: Option<ResidentSelectionStage1TimeScopeV2>,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl PreparedCanonicalResidentGenerationZeroAuthoritiesV5 {
+    pub(crate) const fn evaluation_config(&self) -> &crate::genetic::EvaluationConfig {
+        &self.evaluation_config
+    }
+
+    pub(crate) fn bind_stage1_time_scope_v2(
+        mut self,
+        config: &DiscoveryConfig,
+        screening_scope: ResidentFeatureScreeningScopeV2,
+        prepared: &neoethos_data::PreparedGpuOnlyFeatureMaterializationV3,
+    ) -> Result<Self> {
+        ensure!(
+            self.stage1_time_scope.is_none(),
+            "resident Stage1 time scope is one-shot"
+        );
+        self.stage1_time_scope = Some(
+            ResidentSelectionStage1TimeScopeV2::from_pinned_preparation_v2(
+                screening_scope,
+                config.runtime_overrides.resolved_funnel_stage1_pct(),
+                config.runtime_overrides.stage1_window,
+                prepared,
+            )?,
+        );
+        Ok(self)
+    }
 }
 
 /// Native-CUDA Generation-0 launch evidence only. This value deliberately is
@@ -222,6 +286,23 @@ impl PreparedCanonicalDiscoveryRunInputV5 {
 
     pub const fn exact_evaluation_config_v2(&self) -> &crate::genetic::EvaluationConfig {
         &self.native.evaluation_config
+    }
+
+    /// Actual elapsed calendar span of the same end-exclusive Stage1 rows used
+    /// by the resident population receipt, not a goal or full-source horizon.
+    pub fn stage1_evaluation_span_days_v2(&self) -> f64 {
+        self.native.stage1_time_scope.evaluation_span_days()
+    }
+
+    pub const fn stage1_timestamp_bounds_ms_v2(&self) -> (i64, i64) {
+        self.native.stage1_time_scope.timestamp_bounds_ms()
+    }
+
+    /// The exact request-derived configuration used to seal this compact input,
+    /// including its resolved selected-feature width. This snapshot does not
+    /// attest that the native engine implements every configured policy.
+    pub const fn discovery_config_v5(&self) -> &DiscoveryConfig {
+        &self.native.discovery_config
     }
 
     pub fn shape(&self) -> Result<(usize, usize)> {
@@ -643,72 +724,7 @@ where
     )
 }
 
-/// Source-compatible successor to V4 for the native resident population
-/// route. Search, not the application, derives Stage1/month/runtime facts and
-/// resolves population-auto from the same admitted pre-materialization
-/// snapshot that is consumed by Data. The prepared recipe and receipt move
-/// together into the native materializer; neither can be rebuilt after Data
-/// allocation.
-pub fn prepare_staged_canonical_trendbar_research_run_input_v5<
-    NativePreflightFactory,
-    NativeFactory,
->(
-    config: &DiscoveryConfig,
-    financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
-    native_preflight_factory: NativePreflightFactory,
-    native_factory: NativeFactory,
-) -> Result<PreparedCanonicalDiscoveryRunInputV5>
-where
-    NativePreflightFactory: FnOnce(
-        &SealedNativeCudaDataPopulationPreflightFactsV1,
-    ) -> Result<PreparedGpuOnlyFeatureMaterializationV3>,
-    NativeFactory: FnOnce(
-        PreparedGpuOnlyFeatureMaterializationV3,
-        AdmittedNativeCudaDataPopulationRunV1,
-    ) -> Result<(
-        CanonicalGpuResidentSearchInputReceiptV3,
-        SealedGpuResidentFeatureStoreV3,
-    )>,
-{
-    prepare_staged_canonical_trendbar_research_run_input_with_hard_cap_v5(
-        config,
-        financial_contract,
-        RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
-        None,
-        native_preflight_factory,
-        native_factory,
-    )
-}
-
-pub(crate) fn prepare_prepared_canonical_trendbar_research_run_input_capped_v5<NativeFactory>(
-    config: &DiscoveryConfig,
-    financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
-    prepared: PreparedGpuOnlyFeatureMaterializationV3,
-    max_resolved_population: usize,
-    native_factory: NativeFactory,
-) -> Result<PreparedCanonicalDiscoveryRunInputV5>
-where
-    NativeFactory: FnOnce(
-        PreparedGpuOnlyFeatureMaterializationV3,
-        AdmittedNativeCudaDataPopulationRunV1,
-    ) -> Result<(
-        CanonicalGpuResidentSearchInputReceiptV3,
-        SealedGpuResidentFeatureStoreV3,
-    )>,
-{
-    let external_max_resolved_population = max_resolved_population;
-    let hard_growth_cap =
-        checked_v5_max_resolved_population_v1(config.population, max_resolved_population)?;
-    prepare_staged_canonical_trendbar_research_run_input_with_hard_cap_v5(
-        config,
-        financial_contract,
-        hard_growth_cap,
-        Some(external_max_resolved_population),
-        move |_native_facts| Ok(prepared),
-        native_factory,
-    )
-}
-
+#[cfg(any(test, target_os = "linux"))]
 fn checked_v5_max_resolved_population_v1(
     configured_population: usize,
     max_resolved_population: usize,
@@ -719,36 +735,18 @@ fn checked_v5_max_resolved_population_v1(
     );
     let effective_cap = max_resolved_population.min(RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2);
     ensure!(
-        configured_population <= max_resolved_population,
-        "configured V5 population {configured_population} exceeds its external hard cap {max_resolved_population}"
+        configured_population <= effective_cap,
+        "configured V5 population {configured_population} exceeds its effective native/external hard cap {effective_cap}"
     );
     Ok(effective_cap)
 }
 
-fn prepare_staged_canonical_trendbar_research_run_input_with_hard_cap_v5<
-    NativePreflightFactory,
-    NativeFactory,
->(
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn prepare_canonical_resident_generation_zero_authorities_v5(
     config: &DiscoveryConfig,
     financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
-    hard_growth_cap: usize,
-    external_resolved_population_cap: Option<usize>,
-    native_preflight_factory: NativePreflightFactory,
-    native_factory: NativeFactory,
-) -> Result<PreparedCanonicalDiscoveryRunInputV5>
-where
-    NativePreflightFactory: FnOnce(
-        &SealedNativeCudaDataPopulationPreflightFactsV1,
-    ) -> Result<PreparedGpuOnlyFeatureMaterializationV3>,
-    NativeFactory: FnOnce(
-        PreparedGpuOnlyFeatureMaterializationV3,
-        AdmittedNativeCudaDataPopulationRunV1,
-    ) -> Result<(
-        CanonicalGpuResidentSearchInputReceiptV3,
-        SealedGpuResidentFeatureStoreV3,
-    )>,
-{
-    let exact_evaluation_config =
+) -> Result<PreparedCanonicalResidentGenerationZeroAuthoritiesV5> {
+    let evaluation_config =
         evaluation_config_from_canonical_trendbar_contract_v2(config, financial_contract)
             .map_err(anyhow::Error::new)
             .context("resolve exact V5 evaluation settings from explicit financial contract")?;
@@ -772,10 +770,8 @@ where
         !config.discovery_ledger_enabled,
         "V5 Generation-0 does not yet carry the canonical discovery-ledger seed authority; disable the discovery ledger for this bounded native milestone"
     );
-    let payoff_inputs = crate::run_identity::payoff_inputs_for_config(
-        config,
-        exact_evaluation_config.pip_value_per_lot,
-    );
+    let payoff_inputs =
+        crate::run_identity::payoff_inputs_for_config(config, evaluation_config.pip_value_per_lot);
     crate::run_identity::assert_payoff_floor_reachable(
         config.target_profile.min_payoff_ratio,
         &payoff_inputs,
@@ -783,113 +779,134 @@ where
     .context(
         "V5 Generation-0 payoff floor is unreachable under fixed resident milestone geometry",
     )?;
-    let carried_financial_contract = financial_contract.clone();
-    let runtime_snapshot =
-        crate::genetic::search_engine::ResidentGenerationZeroRuntimeSnapshotV1::capture();
-    dispatch_staged_canonical_discovery_data_preparation_v4(
-        |cpu_admission| Ok(((), cpu_admission)),
-        |(), _cpu_admission| {
-            bail!(
-                "V5 requires one admitted native CUDA run; use the explicit-contract V3 CPU route when no physical GPU exists"
-            )
+    Ok(PreparedCanonicalResidentGenerationZeroAuthoritiesV5 {
+        financial_contract: financial_contract.clone(),
+        evaluation_config,
+        runtime_snapshot:
+            crate::genetic::search_engine::ResidentGenerationZeroRuntimeSnapshotV1::capture(),
+        stage1_time_scope: None,
+    })
+}
+
+/// Finish the canonical V5 input from the compact survivor recipe while
+/// retaining the original screening admission facts and same CUDA context.
+/// This is the only post-screening bridge into resident population sizing.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn prepare_compact_selected_canonical_trendbar_research_run_input_capped_v6<
+    NativeFactory,
+>(
+    config: &DiscoveryConfig,
+    authorities: PreparedCanonicalResidentGenerationZeroAuthoritiesV5,
+    screening_scope: ResidentFeatureScreeningScopeV2,
+    prepared: PreparedCompactSelectedStoreV2,
+    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
+    max_resolved_population: usize,
+    native_factory: NativeFactory,
+) -> Result<PreparedCanonicalDiscoveryRunInputV5>
+where
+    NativeFactory: FnOnce(
+        AdmittedCompactSelectedStoreV2,
+    ) -> Result<(
+        CanonicalGpuResidentSearchInputReceiptV3,
+        SealedGpuResidentFeatureStoreV3,
+    )>,
+{
+    let hard_growth_cap =
+        checked_v5_max_resolved_population_v1(config.population, max_resolved_population)?;
+    let resident_rows = usize::try_from(prepared.workspace_extent().row_count())
+        .context("compact V6 resident row count does not fit this process")?;
+    let resident_columns = usize::try_from(prepared.workspace_extent().column_count())
+        .context("compact V6 resident feature count does not fit this process")?;
+    ensure!(
+        resident_rows > 0 && resident_columns > 0,
+        "compact V6 requires a nonempty selected resident recipe"
+    );
+    ensure!(
+        screening_scope.parent_row_count()
+            == u64::try_from(resident_rows).context("compact V6 resident rows do not fit u64")?,
+        "compact V6 screening scope drifted from the resident parent"
+    );
+    let stage1_time_scope = authorities
+        .stage1_time_scope
+        .context("compact V6 is missing exact pinned Stage1 timestamp authority")?;
+    let expected_stage1 = screening_scope
+        .resolve_stage1_v2(
+            config.runtime_overrides.resolved_funnel_stage1_pct(),
+            config.runtime_overrides.stage1_window,
+        )
+        .map_err(anyhow::Error::msg)?;
+    stage1_time_scope
+        .validate_binding_v2(
+            prepared.workspace_extent().row_count(),
+            expected_stage1.stage1_row_start(),
+            expected_stage1.stage1_row_end(),
+            prepared.pinned_source_projection_v1().identity_sha256(),
+        )
+        .map_err(anyhow::Error::msg)?;
+
+    let (population_sizing_receipt, workspace_plan) =
+        seal_resident_population_auto_for_compact_canonical_trendbar_research_with_hard_cap_v2(
+            &prepared,
+            native_facts,
+            config,
+            screening_scope,
+            &authorities.financial_contract,
+            max_resolved_population,
+        )
+        .map_err(anyhow::Error::new)
+        .context("seal admission-bound compact resident population sizing receipt")?;
+    stage1_time_scope
+        .validate_binding_v2(
+            prepared.workspace_extent().row_count(),
+            u64::try_from(population_sizing_receipt.stage1_row_start())?,
+            u64::try_from(population_sizing_receipt.stage1_row_end())?,
+            prepared.pinned_source_projection_v1().identity_sha256(),
+        )
+        .map_err(anyhow::Error::msg)?;
+    ensure!(
+        population_sizing_receipt.hard_growth_cap() == hard_growth_cap,
+        "compact V6 population sizing receipt hard cap drifted from its external bound"
+    );
+    ensure!(
+        population_sizing_receipt.resolved_population() <= max_resolved_population,
+        "compact V6 resolved population exceeded its external hard cap"
+    );
+    let admitted = prepared
+        .bind_data_population_workspace_v2(workspace_plan)
+        .map_err(anyhow::Error::new)
+        .context("upgrade the same screening CUDA run to compact Data+population")?;
+    let (receipt, sealed_store) = native_factory(admitted)?;
+    let anchor = receipt
+        .validate()
+        .context("validate compact V6 native GPU-resident Search receipt")?;
+    receipt
+        .validate_against_store(&anchor, &sealed_store)
+        .context("bind compact V6 native Search receipt to its sealed Data store")?;
+    population_sizing_receipt
+        .validate_financial_authority_against_pinned_source_projection_v2(
+            &authorities.financial_contract,
+            sealed_store.pinned_source_projection_v1(),
+        )
+        .map_err(anyhow::Error::new)
+        .context("bind compact V6 financial value authority to native source rows")?;
+    let feature_names = sealed_store
+        .ordered_feature_names()
+        .map(str::to_owned)
+        .collect();
+    Ok(PreparedCanonicalDiscoveryRunInputV5 {
+        native: PreparedNativeCudaCanonicalDiscoveryRunInputV5 {
+            receipt,
+            feature_names,
+            sealed_store,
+            population_sizing_receipt,
+            financial_contract: authorities.financial_contract,
+            evaluation_config: authorities.evaluation_config,
+            runtime_snapshot: authorities.runtime_snapshot,
+            stage1_time_scope,
+            screening_scope,
+            discovery_config: config.clone(),
         },
-        native_preflight_factory,
-        |prepared, native_facts| {
-            let extent = prepared.workspace_extent();
-            let resident_rows = usize::try_from(extent.row_count())
-                .context("V5 resident parent row count does not fit this process")?;
-            let resident_columns = usize::try_from(extent.column_count())
-                .context("V5 resident feature count does not fit this process")?;
-            let timeframe_row_cap = config
-                .max_rows_by_timeframe
-                .get(&config.timeframe_label)
-                .copied()
-                .unwrap_or(0);
-            let row_cap = match (config.max_rows, timeframe_row_cap) {
-                (0, 0) => 0,
-                (0, timeframe) => timeframe,
-                (global, 0) => global,
-                (global, timeframe) => global.min(timeframe),
-            };
-            ensure!(
-                row_cap == 0 || row_cap >= resident_rows,
-                "V5 Generation-0 requires resident trim/remap before sizing: configured row cap {row_cap} would trim resident parent {resident_rows}"
-            );
-            let effective_prefilter = crate::discovery::resolve_prefilter_top_k(
-                config.runtime_overrides.prefilter_top_k,
-                resident_columns,
-                config.population,
-                config.max_indicators,
-            );
-            ensure!(
-                effective_prefilter == 0 || effective_prefilter >= resident_columns,
-                "V5 Generation-0 requires resident feature prefilter/remap before sizing: effective prefilter {effective_prefilter} would reduce {resident_columns} resident features"
-            );
-            let sizing =
-                if let Some(external_resolved_population_cap) = external_resolved_population_cap {
-                    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_v2(
-                        &prepared,
-                        native_facts,
-                        config,
-                        financial_contract,
-                        external_resolved_population_cap,
-                    )
-                } else {
-                    seal_resident_population_auto_for_canonical_trendbar_research_v2(
-                        &prepared,
-                        native_facts,
-                        config,
-                        financial_contract,
-                    )
-                };
-            let (population_sizing_receipt, workspace_plan) = sizing
-                .map_err(anyhow::Error::new)
-                .context("seal admission-bound resident population sizing receipt")?;
-            if let Some(external_resolved_population_cap) = external_resolved_population_cap {
-                ensure!(
-                    population_sizing_receipt.hard_growth_cap() == hard_growth_cap,
-                    "V5 population sizing receipt hard cap drifted from its external bound"
-                );
-                ensure!(
-                    population_sizing_receipt.resolved_population()
-                        <= external_resolved_population_cap,
-                    "V5 resolved population exceeded its external hard cap"
-                );
-            }
-            Ok(((prepared, population_sizing_receipt), workspace_plan))
-        },
-        |(prepared, population_sizing_receipt), admitted_native| {
-            let (receipt, sealed_store) = native_factory(prepared, admitted_native)?;
-            let anchor = receipt
-                .validate()
-                .context("validate V5 native GPU-resident Search receipt")?;
-            receipt
-                .validate_against_store(&anchor, &sealed_store)
-                .context("bind V5 native Search receipt to its sealed Data store")?;
-            population_sizing_receipt
-                .validate_financial_authority_against_pinned_source_projection_v2(
-                    &carried_financial_contract,
-                    sealed_store.pinned_source_projection_v1(),
-                )
-                .map_err(anyhow::Error::new)
-                .context("bind V5 financial value authority to native source rows")?;
-            let feature_names = sealed_store
-                .ordered_feature_names()
-                .map(str::to_owned)
-                .collect();
-            Ok(PreparedCanonicalDiscoveryRunInputV5 {
-                native: PreparedNativeCudaCanonicalDiscoveryRunInputV5 {
-                    receipt,
-                    feature_names,
-                    sealed_store,
-                    population_sizing_receipt,
-                    financial_contract: carried_financial_contract,
-                    evaluation_config: exact_evaluation_config,
-                    runtime_snapshot,
-                },
-            })
-        },
-    )
+    })
 }
 
 fn retain_resident_completion_until_ready_v1(
@@ -976,7 +993,21 @@ where
         financial_contract,
         evaluation_config,
         runtime_snapshot,
+        stage1_time_scope,
+        #[cfg(any(test, target_os = "linux"))]
+            screening_scope: _,
+        discovery_config: _,
     } = native;
+
+    stage1_time_scope
+        .validate_binding_v2(
+            sealed_store.contract().layout().row_count(),
+            population_sizing_receipt.stage1_row_start() as u64,
+            population_sizing_receipt.stage1_row_end() as u64,
+            sealed_store.pinned_source_projection_v1().identity_sha256(),
+        )
+        .map_err(anyhow::Error::msg)
+        .map_err(ResidentGenerationZeroStageErrorV1::GenerationZeroEvaluation)?;
 
     financial_contract
         .validate()
@@ -1159,7 +1190,7 @@ where
             )
             .context("bind native resident parent to the canonical Search receipt")?;
             let run = bind_strict_resident_feature_store_v3_run_input(native.sealed_store, &scope)?;
-            let (outcome, _consumer_completion_lease) =
+            let (outcome, consumer_completion_lease) =
                 consume_strict_resident_population_execution_run_v3(run, |run| {
                     let view = seal_gpu_native_trim_prefilter_view_identity_v3(run)?;
                     run_native_cuda_prepared_discovery_v3(
@@ -1171,6 +1202,10 @@ where
                     )
                 })
                 .context("complete native resident Search consumer before release")?;
+            let consumer_completion_lease =
+                retain_resident_completion_until_ready_v1(consumer_completion_lease)
+                    .context("await native resident Search consumer completion")?;
+            drop(consumer_completion_lease);
             outcome
         }
     }
@@ -1289,7 +1324,16 @@ where
             prepared.no_physical_gpu_admission,
         )
         .context("consume sealed physical-GPU absence into the CPU Discovery run")?;
-    let input = prepared.input.as_run_input().map_err(anyhow::Error::new)?;
+    // Preparation already bound this receipt to the research/cost contract.
+    // Rehash against that authority; a fresh receipt would silently relabel
+    // changed values and defer the mismatch until after the search completes.
+    let input = crate::data_selection::CanonicalSearchRunInputV2::new(
+        prepared.receipt,
+        prepared.input.features(),
+        prepared.input.base_frame(),
+    )
+    .map_err(anyhow::Error::new)
+    .context("revalidate prepared CPU values against their carried canonical receipt")?;
     let result = crate::discovery::run_discovery_cycle_with_prepared_cpu_admission_v3(
         &input,
         config,

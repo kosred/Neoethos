@@ -407,9 +407,6 @@ impl SymbolFinancials {
 
     /// True if the symbol allows opening NEW positions right now.
     /// `CloseOnlyMode` and the two `Disabled*` variants return false.
-    /// `dead_code` until the live risk gate consults symbol trading-mode
-    /// before opening (Phase 2-5).
-    #[allow(dead_code)]
     pub fn can_open_new_position(&self) -> bool {
         matches!(self.trading_mode, Some(TradingModeProto::Enabled))
     }
@@ -417,8 +414,6 @@ impl SymbolFinancials {
     /// True if SHORT (sell-to-open) is permitted on this symbol.
     /// Defaults to true when the broker omitted the field — matches
     /// cTrader's default behavior.
-    /// `dead_code` until the live risk gate consults it (Phase 2-5).
-    #[allow(dead_code)]
     pub fn short_selling_allowed(&self) -> bool {
         self.enable_short_selling.unwrap_or(true)
     }
@@ -855,7 +850,9 @@ struct TickDataPayload {
     ctid_trader_account_id: i64,
     #[serde(rename = "hasMore")]
     has_more: bool,
-    #[serde(rename = "tickData")]
+    // ProtoOAGetTickDataRes.tickData is repeated, not required. The JSON
+    // endpoint omits it for a complete empty window (observed 2026-09-03).
+    #[serde(rename = "tickData", default)]
     tick_data: Vec<TickPayload>,
 }
 
@@ -1178,6 +1175,9 @@ pub fn parse_tick_data_response(
         ctid_trader_account_id,
         &client_msg_id,
     )?;
+    if has_more && tick_data.is_empty() {
+        return Err(anyhow!("empty cTrader tick page cannot have hasMore=true"));
+    }
     let mut ticks = decode_ctrader_tick_deltas(
         tick_data
             .into_iter()
@@ -1191,7 +1191,8 @@ pub fn parse_tick_data_response(
         price: tick.price,
     })
     .collect::<Vec<_>>();
-    // The decoder has already proved strict newest-first wire order. Reverse
+    // The decoder has proved newest-first wire order, allowing real ticks
+    // within the same millisecond without dropping or changing any row. Reverse
     // the complete result rather than sorting/repairing malformed broker data.
     ticks.reverse();
 
@@ -1618,6 +1619,18 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
         CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     )?;
 
+    ensure_success_payload_type(
+        &auth_responses[2],
+        CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    // Account-specific symbol IDs and financials must come from the account
+    // requested above, not merely be labelled with that account afterwards.
+    ensure_ctrader_response_account_id(
+        &auth_responses[2],
+        CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE,
+        account_id,
+    )
+    .context("cTrader symbols-list response identity")?;
     let symbols = parse_symbols_list_response(&auth_responses[2])?;
     let requested_key = normalize_symbol_key(&request.symbol_name);
     let light_symbol = symbols
@@ -1671,6 +1684,16 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
         CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     )?;
 
+    ensure_success_payload_type(
+        &detail_responses[2],
+        CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    ensure_ctrader_response_account_id(
+        &detail_responses[2],
+        CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE,
+        account_id,
+    )
+    .context("cTrader symbol-by-id response identity")?;
     let mut symbol = parse_symbol_by_id_response(&detail_responses[2])?
         .into_iter()
         .find(|symbol| symbol.symbol_id == light_symbol.symbol_id)
@@ -2250,10 +2273,21 @@ mod tests {
             .as_object_mut()
             .expect("payload object")
             .remove("tickData");
+        let empty =
+            parse_tick_data_response(&missing_tick_data.to_string(), 712345, "ticks-1", &symbol)
+                .expect("omitted repeated tickData is a valid complete empty window");
+        assert!(empty.ticks.is_empty());
+        assert!(!empty.has_more);
+        missing_tick_data["payload"]["hasMore"] = serde_json::json!(true);
         assert!(
-            parse_tick_data_response(&missing_tick_data.to_string(), 712345, "ticks-1", &symbol,)
-                .is_err(),
-            "missing tickData must fail"
+            parse_tick_data_response(&missing_tick_data.to_string(), 712345, "ticks-1", &symbol)
+                .is_err()
+        );
+        missing_tick_data["payload"]["hasMore"] = serde_json::json!(false);
+        missing_tick_data["payload"]["tickData"] = serde_json::Value::Null;
+        assert!(
+            parse_tick_data_response(&missing_tick_data.to_string(), 712345, "ticks-1", &symbol)
+                .is_err()
         );
 
         let mut missing_has_more = response.clone();

@@ -189,6 +189,8 @@ mod tests {
             filled_lot_size: Some(0.10),
             filled_volume_raw_centi_units: Some(10_000),
             volume_scale_evidence: None,
+            deal_closes_position: None,
+            opening_fill_evidence: None,
             execution_price: Some(1.0987),
             gross_profit: Some(0.0),
             fee: Some(0.0),

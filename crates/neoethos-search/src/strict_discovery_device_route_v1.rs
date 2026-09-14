@@ -1,9 +1,11 @@
 //! Run-bound, fail-closed device authority for Discovery population work.
 //!
 //! Configuration strings do not prove hardware absence or select a CUDA
-//! ordinal. One real native probe either seals one exact compatible ordinal or
-//! proves that a loaded CUDA runtime enumerated exactly zero devices. Every
-//! other state is an error and cannot authorize CPU execution.
+//! ordinal. Automatic routing requires one real native probe to seal one exact
+//! compatible ordinal or prove that a loaded CUDA runtime enumerated exactly
+//! zero devices. The separate canonical ResearchOnly entrypoint may explicitly
+//! seal CPU execution against its exact contract and input receipt. Every other
+//! state is an error and cannot authorize CPU execution.
 
 #[cfg(feature = "gpu-b-native")]
 use sha2::{Digest, Sha256};
@@ -73,6 +75,7 @@ pub(crate) enum UnsealedStrictDiscoveryDeviceRouteV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StrictDiscoveryDeviceRouteErrorCodeV1 {
     NativeAdapterNotCompiled,
+    InvalidExplicitCpuResearchAuthority,
     #[cfg(any(test, feature = "gpu-b-native"))]
     CudaRuntimeUnavailable,
     #[cfg(any(test, feature = "gpu-b-native"))]
@@ -87,7 +90,6 @@ pub(crate) enum StrictDiscoveryDeviceRouteErrorCodeV1 {
     DeviceIdentityMismatch,
     #[cfg(feature = "gpu-b-native")]
     UnreadableDeviceMemory,
-    #[cfg(feature = "gpu-b-native")]
     WrongDeviceRoute,
 }
 
@@ -103,6 +105,9 @@ impl StrictDiscoveryDeviceRouteErrorV1 {
         match self.code {
             StrictDiscoveryDeviceRouteErrorCodeV1::NativeAdapterNotCompiled => {
                 "native_adapter_not_compiled"
+            }
+            StrictDiscoveryDeviceRouteErrorCodeV1::InvalidExplicitCpuResearchAuthority => {
+                "invalid_explicit_cpu_research_authority"
             }
             #[cfg(any(test, feature = "gpu-b-native"))]
             StrictDiscoveryDeviceRouteErrorCodeV1::CudaRuntimeUnavailable => {
@@ -128,7 +133,6 @@ impl StrictDiscoveryDeviceRouteErrorV1 {
             StrictDiscoveryDeviceRouteErrorCodeV1::UnreadableDeviceMemory => {
                 "unreadable_device_memory"
             }
-            #[cfg(feature = "gpu-b-native")]
             StrictDiscoveryDeviceRouteErrorCodeV1::WrongDeviceRoute => "wrong_device_route",
         }
     }
@@ -150,6 +154,14 @@ fn route_error(
         code,
         message: message.into(),
     }
+}
+
+fn is_nonzero_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().any(|byte| byte != b'0')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(any(test, feature = "gpu-b-native"))]
@@ -344,15 +356,18 @@ impl SealedNoCompatibleGpuProbeReceiptV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SealedCpuDiscoveryRouteReceiptV2 {
     _sealed: (),
-    #[cfg(feature = "gpu-b-native")]
     kind: SealedCpuDiscoveryRouteReceiptKindV2,
 }
 
-#[cfg(feature = "gpu-b-native")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SealedCpuDiscoveryRouteReceiptKindV2 {
+    ExplicitCanonicalResearch {
+        contract_identity_sha256: String,
+        input_receipt_sha256: String,
+    },
+    #[cfg(feature = "gpu-b-native")]
     LegacyCudaZero(SealedNoCompatibleGpuProbeReceiptV1),
-    #[cfg(feature = "gpu-cuda")]
+    #[cfg(all(feature = "gpu-b-native", feature = "gpu-cuda"))]
     PhysicalGpuAbsence {
         platform: neoethos_gpu_cuda::PhysicalGpuInventoryPlatformV1,
         inventory_identity_sha256: [u8; 32],
@@ -361,40 +376,49 @@ enum SealedCpuDiscoveryRouteReceiptKindV2 {
 
 impl SealedCpuDiscoveryRouteReceiptV2 {
     pub(crate) fn authority_is_nonzero_v2(&self) -> bool {
-        #[cfg(feature = "gpu-b-native")]
-        {
-            match &self.kind {
-                SealedCpuDiscoveryRouteReceiptKindV2::LegacyCudaZero(receipt) => {
-                    receipt.probe_receipt_identity_sha256().len() == 64
-                }
-                #[cfg(feature = "gpu-cuda")]
-                SealedCpuDiscoveryRouteReceiptKindV2::PhysicalGpuAbsence {
-                    platform,
-                    inventory_identity_sha256,
-                } => {
-                    let _supported_platform = platform;
-                    *inventory_identity_sha256 != [0; 32]
-                }
+        match &self.kind {
+            SealedCpuDiscoveryRouteReceiptKindV2::ExplicitCanonicalResearch {
+                contract_identity_sha256,
+                input_receipt_sha256,
+            } => {
+                is_nonzero_lower_sha256(contract_identity_sha256)
+                    && is_nonzero_lower_sha256(input_receipt_sha256)
+            }
+            #[cfg(feature = "gpu-b-native")]
+            SealedCpuDiscoveryRouteReceiptKindV2::LegacyCudaZero(receipt) => {
+                is_nonzero_lower_sha256(receipt.probe_receipt_identity_sha256())
+            }
+            #[cfg(all(feature = "gpu-b-native", feature = "gpu-cuda"))]
+            SealedCpuDiscoveryRouteReceiptKindV2::PhysicalGpuAbsence {
+                platform,
+                inventory_identity_sha256,
+            } => {
+                let _supported_platform = platform;
+                *inventory_identity_sha256 != [0; 32]
             }
         }
-        #[cfg(not(feature = "gpu-b-native"))]
-        {
-            false
-        }
+    }
+
+    fn is_explicit_canonical_research_v1(&self) -> bool {
+        matches!(
+            &self.kind,
+            SealedCpuDiscoveryRouteReceiptKindV2::ExplicitCanonicalResearch { .. }
+        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SealedStrictDiscoveryDeviceRouteV1 {
     _sealed: (),
-    #[cfg(feature = "gpu-b-native")]
     kind: SealedStrictDiscoveryDeviceRouteKindV1,
 }
 
-#[cfg(feature = "gpu-b-native")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SealedStrictDiscoveryDeviceRouteKindV1 {
+    ExplicitCpuResearch(SealedCpuDiscoveryRouteReceiptV2),
+    #[cfg(feature = "gpu-b-native")]
     NativeCuda(ExactCudaDeviceOrdinalV1),
+    #[cfg(feature = "gpu-b-native")]
     CpuNoCompatibleGpu(SealedCpuDiscoveryRouteReceiptV2),
 }
 
@@ -414,7 +438,55 @@ impl SealedStrictDiscoveryDeviceAdmissionV1 {
         self.route
     }
 
-    #[cfg(feature = "gpu-cuda")]
+    pub(crate) fn from_explicit_canonical_cpu_research_v1(
+        contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    ) -> Result<Self, StrictDiscoveryDeviceRouteErrorV1> {
+        contract.validate().map_err(|source| {
+            route_error(
+                StrictDiscoveryDeviceRouteErrorCodeV1::InvalidExplicitCpuResearchAuthority,
+                format!("invalid canonical CPU research contract: {source}"),
+            )
+        })?;
+        let contract_identity_sha256 = contract.identity_sha256().map_err(|source| {
+            route_error(
+                StrictDiscoveryDeviceRouteErrorCodeV1::InvalidExplicitCpuResearchAuthority,
+                format!("cannot bind canonical CPU research contract identity: {source}"),
+            )
+        })?;
+        let input_receipt_sha256 = contract.input_receipt_sha256().to_owned();
+        if !is_nonzero_lower_sha256(&contract_identity_sha256)
+            || !is_nonzero_lower_sha256(&input_receipt_sha256)
+        {
+            return Err(route_error(
+                StrictDiscoveryDeviceRouteErrorCodeV1::InvalidExplicitCpuResearchAuthority,
+                "canonical CPU research authority requires non-zero lowercase SHA-256 contract and input identities",
+            ));
+        }
+        Ok(Self {
+            route: SealedStrictDiscoveryDeviceRouteV1 {
+                _sealed: (),
+                kind: SealedStrictDiscoveryDeviceRouteKindV1::ExplicitCpuResearch(
+                    SealedCpuDiscoveryRouteReceiptV2 {
+                        _sealed: (),
+                        kind: SealedCpuDiscoveryRouteReceiptKindV2::ExplicitCanonicalResearch {
+                            contract_identity_sha256,
+                            input_receipt_sha256,
+                        },
+                    },
+                ),
+            },
+        })
+    }
+
+    pub(crate) fn is_explicit_canonical_cpu_research_v1(&self) -> bool {
+        matches!(
+            &self.route.kind,
+            SealedStrictDiscoveryDeviceRouteKindV1::ExplicitCpuResearch(receipt)
+                if receipt.is_explicit_canonical_research_v1()
+        )
+    }
+
+    #[cfg(all(feature = "gpu-b-native", feature = "gpu-cuda"))]
     pub(crate) fn from_no_physical_gpu_admission_v1(
         admission: neoethos_gpu_cuda::run_device_admission_v1::SealedCpuNoPhysicalGpuRunDeviceAdmissionV1,
     ) -> Result<Self, StrictDiscoveryDeviceRouteErrorV1> {
@@ -451,37 +523,64 @@ impl SealedStrictDiscoveryDeviceRouteV1 {
     pub(crate) fn population_auto_sizing_route_v1(
         &self,
     ) -> Result<crate::PopulationAutoSizingRouteV1, StrictDiscoveryDeviceRouteErrorV1> {
-        #[cfg(feature = "gpu-b-native")]
-        {
-            return Ok(match &self.kind {
-                SealedStrictDiscoveryDeviceRouteKindV1::NativeCuda(ordinal) => {
-                    crate::PopulationAutoSizingRouteV1::NativeCuda {
-                        selected_ordinal: ordinal.selected_ordinal(),
-                        pre_parent_free_memory_bytes: ordinal.pre_parent_free_memory_bytes(),
-                        cuda_device_identity_sha256: ordinal
-                            .cuda_device_identity_sha256()
-                            .to_owned(),
-                        cuda_build_manifest_sha256: ordinal.cuda_build_manifest_sha256().to_owned(),
-                        probe_receipt_identity_sha256: ordinal
-                            .probe_receipt_identity_sha256()
-                            .to_owned(),
+        match &self.kind {
+            SealedStrictDiscoveryDeviceRouteKindV1::ExplicitCpuResearch(receipt) => {
+                match &receipt.kind {
+                    SealedCpuDiscoveryRouteReceiptKindV2::ExplicitCanonicalResearch {
+                        contract_identity_sha256,
+                        input_receipt_sha256,
+                    } => Ok(crate::PopulationAutoSizingRouteV1::CpuExplicitResearch {
+                        contract_identity_sha256: contract_identity_sha256.clone(),
+                        input_receipt_sha256: input_receipt_sha256.clone(),
+                    }),
+                    #[cfg(feature = "gpu-b-native")]
+                    SealedCpuDiscoveryRouteReceiptKindV2::LegacyCudaZero(_) => Err(route_error(
+                        StrictDiscoveryDeviceRouteErrorCodeV1::InvalidExplicitCpuResearchAuthority,
+                        "explicit CPU research route carries legacy CUDA-zero authority",
+                    )),
+                    #[cfg(all(feature = "gpu-b-native", feature = "gpu-cuda"))]
+                    SealedCpuDiscoveryRouteReceiptKindV2::PhysicalGpuAbsence { .. } => {
+                        Err(route_error(
+                            StrictDiscoveryDeviceRouteErrorCodeV1::InvalidExplicitCpuResearchAuthority,
+                            "explicit CPU research route carries physical-GPU-absence authority",
+                        ))
                     }
                 }
-                SealedStrictDiscoveryDeviceRouteKindV1::CpuNoCompatibleGpu(receipt) => {
-                    let authority = match &receipt.kind {
-                        SealedCpuDiscoveryRouteReceiptKindV2::LegacyCudaZero(receipt) => {
-                            crate::PopulationAutoCpuAuthorityV1::LegacyCudaZero {
-                                probe_receipt_identity_sha256: receipt
-                                    .probe_receipt_identity_sha256()
-                                    .to_owned(),
-                            }
+            }
+            #[cfg(feature = "gpu-b-native")]
+            SealedStrictDiscoveryDeviceRouteKindV1::NativeCuda(ordinal) => {
+                Ok(crate::PopulationAutoSizingRouteV1::NativeCuda {
+                    selected_ordinal: ordinal.selected_ordinal(),
+                    pre_parent_free_memory_bytes: ordinal.pre_parent_free_memory_bytes(),
+                    cuda_device_identity_sha256: ordinal.cuda_device_identity_sha256().to_owned(),
+                    cuda_build_manifest_sha256: ordinal.cuda_build_manifest_sha256().to_owned(),
+                    probe_receipt_identity_sha256: ordinal
+                        .probe_receipt_identity_sha256()
+                        .to_owned(),
+                })
+            }
+            #[cfg(feature = "gpu-b-native")]
+            SealedStrictDiscoveryDeviceRouteKindV1::CpuNoCompatibleGpu(receipt) => {
+                let authority = match &receipt.kind {
+                    SealedCpuDiscoveryRouteReceiptKindV2::ExplicitCanonicalResearch { .. } => {
+                        return Err(route_error(
+                            StrictDiscoveryDeviceRouteErrorCodeV1::WrongDeviceRoute,
+                            "explicit canonical CPU research authority does not prove GPU absence",
+                        ));
+                    }
+                    SealedCpuDiscoveryRouteReceiptKindV2::LegacyCudaZero(receipt) => {
+                        crate::PopulationAutoCpuAuthorityV1::LegacyCudaZero {
+                            probe_receipt_identity_sha256: receipt
+                                .probe_receipt_identity_sha256()
+                                .to_owned(),
                         }
-                        #[cfg(feature = "gpu-cuda")]
-                        SealedCpuDiscoveryRouteReceiptKindV2::PhysicalGpuAbsence {
-                            platform,
-                            inventory_identity_sha256,
-                        } => {
-                            let platform = match platform {
+                    }
+                    #[cfg(feature = "gpu-cuda")]
+                    SealedCpuDiscoveryRouteReceiptKindV2::PhysicalGpuAbsence {
+                        platform,
+                        inventory_identity_sha256,
+                    } => {
+                        let platform = match platform {
                                 neoethos_gpu_cuda::PhysicalGpuInventoryPlatformV1::WindowsSetupApi => {
                                     "windows-setupapi"
                                 }
@@ -489,69 +588,47 @@ impl SealedStrictDiscoveryDeviceRouteV1 {
                                     "linux-procfs-exhaustive"
                                 }
                             };
-                            crate::PopulationAutoCpuAuthorityV1::PhysicalGpuAbsence {
-                                platform: platform.to_owned(),
-                                inventory_identity_sha256: hex_lower(inventory_identity_sha256),
-                            }
+                        crate::PopulationAutoCpuAuthorityV1::PhysicalGpuAbsence {
+                            platform: platform.to_owned(),
+                            inventory_identity_sha256: hex_lower(inventory_identity_sha256),
                         }
-                    };
-                    crate::PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { authority }
-                }
-            });
-        }
-        #[cfg(not(feature = "gpu-b-native"))]
-        {
-            let _ = self;
-            Err(route_error(
-                StrictDiscoveryDeviceRouteErrorCodeV1::NativeAdapterNotCompiled,
-                "native adapter is not compiled; no exact population-auto device route can be read",
-            ))
+                    }
+                };
+                Ok(crate::PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { authority })
+            }
         }
     }
 
     pub(crate) fn require_cpu_route_receipt_v1(
         &self,
     ) -> Result<&SealedCpuDiscoveryRouteReceiptV2, StrictDiscoveryDeviceRouteErrorV1> {
-        #[cfg(feature = "gpu-b-native")]
-        {
-            match &self.kind {
-                SealedStrictDiscoveryDeviceRouteKindV1::CpuNoCompatibleGpu(receipt) => Ok(receipt),
-                SealedStrictDiscoveryDeviceRouteKindV1::NativeCuda(_) => Err(route_error(
-                    StrictDiscoveryDeviceRouteErrorCodeV1::WrongDeviceRoute,
-                    "a compatible CUDA ordinal is sealed for this run; refusing CPU substitution",
-                )),
-            }
-        }
-        #[cfg(not(feature = "gpu-b-native"))]
-        {
-            let _ = self;
-            Err(route_error(
-                StrictDiscoveryDeviceRouteErrorCodeV1::NativeAdapterNotCompiled,
-                "native adapter is not compiled; CPU authority cannot be sealed",
-            ))
+        match &self.kind {
+            SealedStrictDiscoveryDeviceRouteKindV1::ExplicitCpuResearch(receipt) => Ok(receipt),
+            #[cfg(feature = "gpu-b-native")]
+            SealedStrictDiscoveryDeviceRouteKindV1::CpuNoCompatibleGpu(receipt) => Ok(receipt),
+            #[cfg(feature = "gpu-b-native")]
+            SealedStrictDiscoveryDeviceRouteKindV1::NativeCuda(_) => Err(route_error(
+                StrictDiscoveryDeviceRouteErrorCodeV1::WrongDeviceRoute,
+                "a compatible CUDA ordinal is sealed for this run; refusing CPU substitution",
+            )),
         }
     }
 
     pub(crate) fn require_exact_cuda_device_ordinal_v1(
         &self,
     ) -> Result<&ExactCudaDeviceOrdinalV1, StrictDiscoveryDeviceRouteErrorV1> {
-        #[cfg(feature = "gpu-b-native")]
-        {
-            match &self.kind {
-                SealedStrictDiscoveryDeviceRouteKindV1::NativeCuda(ordinal) => Ok(ordinal),
-                SealedStrictDiscoveryDeviceRouteKindV1::CpuNoCompatibleGpu(_) => Err(route_error(
-                    StrictDiscoveryDeviceRouteErrorCodeV1::WrongDeviceRoute,
-                    "the real run probe enumerated no CUDA device; native execution is unavailable",
-                )),
-            }
-        }
-        #[cfg(not(feature = "gpu-b-native"))]
-        {
-            let _ = self;
-            Err(route_error(
-                StrictDiscoveryDeviceRouteErrorCodeV1::NativeAdapterNotCompiled,
-                "native adapter is not compiled; exact CUDA authority is unavailable",
-            ))
+        match &self.kind {
+            SealedStrictDiscoveryDeviceRouteKindV1::ExplicitCpuResearch(_) => Err(route_error(
+                StrictDiscoveryDeviceRouteErrorCodeV1::WrongDeviceRoute,
+                "this run is explicitly sealed as canonical CPU research; refusing CUDA substitution",
+            )),
+            #[cfg(feature = "gpu-b-native")]
+            SealedStrictDiscoveryDeviceRouteKindV1::NativeCuda(ordinal) => Ok(ordinal),
+            #[cfg(feature = "gpu-b-native")]
+            SealedStrictDiscoveryDeviceRouteKindV1::CpuNoCompatibleGpu(_) => Err(route_error(
+                StrictDiscoveryDeviceRouteErrorCodeV1::WrongDeviceRoute,
+                "the real run probe enumerated no CUDA device; native execution is unavailable",
+            )),
         }
     }
 }
@@ -861,4 +938,103 @@ pub fn acquire_strict_discovery_device_admission_v1()
     Ok(SealedStrictDiscoveryDeviceAdmissionV1 {
         route: probe_real_strict_discovery_device_route_v1()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical_trendbar_research::{
+        CanonicalTrendbarResearchCostAssumptionsV2, CanonicalTrendbarResearchExecutionContractV3,
+    };
+    use crate::data_selection::CanonicalSearchInputReceiptV2;
+
+    fn research_contract() -> CanonicalTrendbarResearchExecutionContractV3 {
+        let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let anchor = features.provenance().bindings()[0]
+            .dataset_identity()
+            .clone();
+        let receipt = CanonicalSearchInputReceiptV2::from_feature_frame(&anchor, &features)
+            .expect("canonical test receipt");
+        let assumption_source_sha256 = "a".repeat(64);
+        CanonicalTrendbarResearchExecutionContractV3::new(
+            receipt,
+            CanonicalTrendbarResearchCostAssumptionsV2 {
+                symbol: "EURUSD",
+                account_currency: "USD",
+                assumption_source_id: "neoethos.test.explicit-cpu-route.v1",
+                assumption_source_sha256: &assumption_source_sha256,
+                pip_size: 0.0001,
+                pip_value_per_lot: 10.0,
+                full_spread_pips_assumption: 1.2,
+                slippage_pips_per_fill_assumption: 0.1,
+                commission_account_per_lot_per_fill_assumption: 3.5,
+                swap_long_pips_per_day: -0.2,
+                swap_short_pips_per_day: -0.1,
+                pnl_conversion_fee_rate: 0.0,
+            },
+        )
+        .expect("valid canonical research contract")
+    }
+
+    #[test]
+    fn explicit_cpu_research_route_binds_exact_contract_and_input_without_native_cuda() {
+        let contract = research_contract();
+        let expected_contract_identity = contract.identity_sha256().unwrap();
+        let expected_input_identity = contract.input_receipt_sha256().to_owned();
+        let admission =
+            SealedStrictDiscoveryDeviceAdmissionV1::from_explicit_canonical_cpu_research_v1(
+                &contract,
+            )
+            .expect("seal explicit canonical CPU research route");
+        assert!(admission.is_explicit_canonical_cpu_research_v1());
+
+        let route = admission.into_route_v1();
+        assert!(
+            route
+                .require_cpu_route_receipt_v1()
+                .unwrap()
+                .authority_is_nonzero_v2()
+        );
+        assert_eq!(
+            route
+                .require_exact_cuda_device_ordinal_v1()
+                .unwrap_err()
+                .code(),
+            "wrong_device_route"
+        );
+        assert_eq!(
+            route.population_auto_sizing_route_v1().unwrap(),
+            crate::PopulationAutoSizingRouteV1::CpuExplicitResearch {
+                contract_identity_sha256: expected_contract_identity,
+                input_receipt_sha256: expected_input_identity,
+            }
+        );
+    }
+
+    #[cfg(feature = "gpu-b-native")]
+    #[test]
+    fn explicit_cpu_research_authority_cannot_be_relabelled_as_gpu_absence() {
+        let contract = research_contract();
+        let explicit_route =
+            SealedStrictDiscoveryDeviceAdmissionV1::from_explicit_canonical_cpu_research_v1(
+                &contract,
+            )
+            .expect("seal explicit canonical CPU research route")
+            .into_route_v1();
+        let receipt = explicit_route
+            .require_cpu_route_receipt_v1()
+            .unwrap()
+            .clone();
+        assert!(receipt.authority_is_nonzero_v2());
+        let mismatched_route = SealedStrictDiscoveryDeviceRouteV1 {
+            _sealed: (),
+            kind: SealedStrictDiscoveryDeviceRouteKindV1::CpuNoCompatibleGpu(receipt),
+        };
+
+        let error = mismatched_route
+            .population_auto_sizing_route_v1()
+            .unwrap_err();
+        assert_eq!(error.code(), "wrong_device_route");
+        assert!(error.to_string().contains("does not prove GPU absence"));
+    }
 }

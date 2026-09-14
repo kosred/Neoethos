@@ -11,9 +11,11 @@ use neoethos_gpu_contracts::resident_feature_store_v3::{
     ResidentFeatureProducerV3, ResidentFeatureStageV3, ResidentProducerCapabilityV3,
 };
 use neoethos_gpu_cuda::resident_feature_store_v3::{
-    ResidentFeatureColumnBindingV3, ResidentFeatureStoreAssemblerV3,
+    ResidentFeatureColumnBindingV3, ResidentFeatureScreeningErrorV2,
+    ResidentFeatureScreeningPassV2, ResidentFeatureStoreAssemblerV3,
     ResidentFeatureStoreCudaErrorV3,
 };
+use neoethos_gpu_cuda::resident_robust_normalization_v2::ResidentRobustNormalizationPlanV2;
 use neoethos_gpu_cuda::resident_session_v2::{
     RESIDENT_SESSION_EXACT_MATH_AUTHORITY_V2 as NATIVE_SESSION_EXACT_MATH_AUTHORITY_V2,
     RESIDENT_SESSION_IMPLEMENTATION_ID_V2 as NATIVE_SESSION_IMPLEMENTATION_ID_V2,
@@ -281,6 +283,33 @@ impl PreparedResidentSessionRuntimeV2 {
             launch_authority,
         } = self;
         let receipt = assembler.append_resident_session_v2(bindings, launch_authority)?;
+        runtime_admission
+            .validate_native_receipt(&receipt)
+            .map_err(|error| ResidentFeatureStoreCudaErrorV3::InvalidInput(error.to_string()))?;
+        Ok((runtime_admission, receipt))
+    }
+
+    pub(crate) fn score_to_screening_v2(
+        self,
+        screening: &mut ResidentFeatureScreeningPassV2,
+        bindings: Vec<ResidentFeatureColumnBindingV3>,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> std::result::Result<
+        (
+            ResidentSessionRuntimeAdmissionV2,
+            ResidentSessionRuntimeReceiptV2,
+        ),
+        ResidentFeatureScreeningErrorV2,
+    > {
+        let Self {
+            runtime_admission,
+            launch_authority,
+        } = self;
+        let receipt = screening.score_resident_session_v2(
+            bindings,
+            launch_authority,
+            normalization_template,
+        )?;
         runtime_admission
             .validate_native_receipt(&receipt)
             .map_err(|error| ResidentFeatureStoreCudaErrorV3::InvalidInput(error.to_string()))?;

@@ -212,6 +212,8 @@ pub struct SealedNativeCudaRunDeviceAdmissionV1 {
     pub(crate) context_api_version: String,
     pub(crate) compute_capability_major: u16,
     pub(crate) compute_capability_minor: u16,
+    pub(crate) multiprocessor_count: u32,
+    pub(crate) warp_size: u32,
     pub(crate) free_memory_bytes_snapshot: u64,
     pub(crate) probe_counters: RunDeviceAcquisitionCountersV1,
     pub(crate) admission_identity_sha256: [u8; 32],
@@ -439,6 +441,8 @@ struct NativeCudaCandidateV1 {
     device_uuid: [u8; 16],
     compute_capability_major: u16,
     compute_capability_minor: u16,
+    multiprocessor_count: u32,
+    warp_size: u32,
     cuda_build_identity: SealedCudaNativeBuildIdentityV1,
 }
 
@@ -492,6 +496,12 @@ fn select_lowest_compatible_cuda_ordinal_v1(
         let minor = device
             .get_attribute(DeviceAttribute::ComputeCapabilityMinor)
             .map_err(native_identity_error_v1)?;
+        let multiprocessor_count = device
+            .get_attribute(DeviceAttribute::MultiprocessorCount)
+            .map_err(native_identity_error_v1)?;
+        let warp_size = device
+            .get_attribute(DeviceAttribute::WarpSize)
+            .map_err(native_identity_error_v1)?;
         let major = u16::try_from(major).map_err(|_| {
             DiscoveryRunDeviceAdmissionErrorV1::new(
                 DiscoveryRunDeviceAdmissionErrorCodeV1::NativeDeviceIdentityFailure,
@@ -504,6 +514,24 @@ fn select_lowest_compatible_cuda_ordinal_v1(
                 "negative or oversized CUDA compute-capability minor",
             )
         })?;
+        let multiprocessor_count = u32::try_from(multiprocessor_count)
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                DiscoveryRunDeviceAdmissionErrorV1::new(
+                    DiscoveryRunDeviceAdmissionErrorCodeV1::NativeDeviceIdentityFailure,
+                    "CUDA multiprocessor count must be positive and fit the topology ABI",
+                )
+            })?;
+        let warp_size = u32::try_from(warp_size)
+            .ok()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| {
+                DiscoveryRunDeviceAdmissionErrorV1::new(
+                    DiscoveryRunDeviceAdmissionErrorCodeV1::NativeDeviceIdentityFailure,
+                    "CUDA warp size must be positive and fit the topology ABI",
+                )
+            })?;
         let sass_target = format!("sm_{major}{minor}");
         if !build
             .sass_targets
@@ -522,6 +550,8 @@ fn select_lowest_compatible_cuda_ordinal_v1(
             device_uuid: cuda_device_uuid_v1(device)?,
             compute_capability_major: major,
             compute_capability_minor: minor,
+            multiprocessor_count,
+            warp_size,
             cuda_build_identity: build,
         });
     }
@@ -627,6 +657,8 @@ fn seal_native_cuda_run_device_admission_v1(
             context_api_version,
             compute_capability_major: candidate.compute_capability_major,
             compute_capability_minor: candidate.compute_capability_minor,
+            multiprocessor_count: candidate.multiprocessor_count,
+            warp_size: candidate.warp_size,
             free_memory_bytes_snapshot,
             probe_counters: counters,
             admission_identity_sha256,
@@ -870,6 +902,10 @@ fn hash_native_admission_v1(
     hasher.update(candidate.cuda_build_identity.manifest_sha256);
     hasher.update(candidate.cuda_build_identity.artifact_sha256);
     hasher.update(candidate.cuda_build_identity.nvcc_version.as_bytes());
+    hasher.update(candidate.compute_capability_major.to_le_bytes());
+    hasher.update(candidate.compute_capability_minor.to_le_bytes());
+    hasher.update(candidate.multiprocessor_count.to_le_bytes());
+    hasher.update(candidate.warp_size.to_le_bytes());
     hasher.update((context_handle as u64).to_le_bytes());
     hasher.update((stream_handle as u64).to_le_bytes());
     hasher.update(free_memory_bytes_snapshot.to_le_bytes());

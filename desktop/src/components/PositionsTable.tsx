@@ -30,7 +30,7 @@ export default function PositionsTable({
 }) {
   if (!live || live.length === 0) return <p className="muted">No open positions.</p>;
   const hasActions = !!(onClose || onEdit);
-  let total = 0;
+  const total = live.reduce((sum, position) => sum + position.pnlUsd, 0);
 
   return (
     <table className="tbl">
@@ -51,7 +51,6 @@ export default function PositionsTable({
       <tbody>
         {live.map((p) => {
           const cls = p.pnlUsd >= 0 ? "buy" : "sell";
-          total += p.pnlUsd;
           return (
             <tr key={p.positionId}>
               <td className={p.side.toLowerCase().includes("buy") ? "buy" : "sell"}>{p.side}</td>

@@ -13,59 +13,65 @@ import {
   type BrokerStatus,
   type AccountInfo,
   type BrokerCredentials,
+  type RiskInfo,
+  type SettingsUpdate,
+  type SettingsView,
 } from "../api";
-import { HelpPanel } from "../components/Help";
 
 export default function Settings() {
   const [status, setStatus] = useState<BrokerStatus | null>(null);
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
-  const [cfg, setCfg] = useState<any>(null);
+  const [cfg, setCfg] = useState<SettingsView | null>(null);
   const [presets, setPresets] = useState<{ id: string; displayName: string }[]>([]);
-  const [risk, setRisk] = useState<any>(null);
+  const [risk, setRisk] = useState<RiskInfo | null>(null);
   const [busy, setBusy] = useState(false);
-  const [modeBusy, setModeBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loadErrors, setLoadErrors] = useState<string[]>([]);
 
   const refresh = async () => {
-    try {
-      setStatus(await brokerStatus());
-    } catch (e) {
-      setMsg(String(e));
+    setLoading(true);
+    const [brokerResult, configResult, riskResult] = await Promise.allSettled([
+      brokerStatus(), getSettings(), riskInfo(),
+    ]);
+    const failures: string[] = [];
+    if (brokerResult.status === "fulfilled") setStatus(brokerResult.value);
+    else { setStatus(null); failures.push(`Broker status: ${brokerResult.reason}`); }
+    if (configResult.status === "fulfilled") setCfg(configResult.value);
+    else { setCfg(null); failures.push(`Settings: ${configResult.reason}`); }
+    if (riskResult.status === "fulfilled") {
+      setRisk(riskResult.value);
+      setPresets(riskResult.value.availablePresets);
+    } else {
+      setRisk(null);
+      setPresets([]);
+      failures.push(`Risk configuration: ${riskResult.reason}`);
     }
-    try {
-      setCfg(await getSettings());
-    } catch {
-      /* settings optional */
-    }
-    try {
-      // The ONE preset vocabulary: the prop-firm presets POST /risk/preset
-      // accepts (ftmo/myforexfunds/…), reported by GET /risk. The second,
-      // disjoint vocabulary (conservative/balanced/aggressive) that used to be
-      // served by GET /settings/presets had no apply path and was deleted
-      // (#115/#116) — this screen never used it.
-      setPresets((await riskInfo()).availablePresets);
-    } catch {
-      /* presets optional */
-    }
-    try {
-      setRisk(await riskInfo());
-    } catch {
-      /* risk optional */
-    }
+    setLoadErrors(failures);
+    setLoading(false);
   };
 
-  const setCompute = async (mode: "auto" | "cpu" | "gpu") => {
-    setMsg(`Compute mode → ${mode}…`);
+  const savePatch = async (patch: SettingsUpdate, label: string) => {
+    if (busy || loading || !cfg) return;
+    setBusy(true);
+    setMsg(`Saving ${label}…`);
     try {
-      await updateSettings({ computeMode: mode });
-      setCfg(await getSettings());
-      setMsg(`✓ Compute mode = ${mode}.`);
+      await updateSettings(patch);
+      setMsg(`✓ ${label} saved.`);
+      await refresh();
     } catch (e) {
-      setMsg(`Compute switch failed: ${e}`);
+      setMsg(`${label} save failed: ${e}`);
+    } finally {
+      setBusy(false);
     }
   };
+  const setCompute = (mode: "auto" | "cpu" | "gpu") => savePatch({ computeMode: mode }, `Training compute mode ${mode}`);
+  const setNews = (patch: SettingsUpdate) => savePatch(patch, "News settings");
+  const setLoop = (patch: SettingsUpdate) => savePatch(patch, "Autopilot-loop settings");
 
   const applyPreset = async (id: string) => {
+    if (busy || loading || !risk) return;
+    setBusy(true);
     setMsg(`Applying risk preset ${id}…`);
     try {
       await setRiskPreset(id);
@@ -73,96 +79,15 @@ export default function Settings() {
       setMsg(`✓ Risk preset = ${id}.`);
     } catch (e) {
       setMsg(`Preset failed: ${e}`);
-    }
-  };
-
-  const setNews = async (patch: Record<string, unknown>) => {
-    setMsg("Saving news settings…");
-    try {
-      await updateSettings(patch as any);
-      setCfg(await getSettings());
-      setMsg("✓ News settings saved to config.yaml.");
-    } catch (e) {
-      setMsg(`News save failed: ${e}`);
-    }
-  };
-
-  const setLoop = async (patch: Record<string, unknown>) => {
-    setMsg("Saving autopilot-loop settings…");
-    try {
-      await updateSettings(patch as any);
-      setCfg(await getSettings());
-      setMsg("✓ Saved to config.yaml.");
-    } catch (e) {
-      setMsg(`Save failed: ${e}`);
+    } finally {
+      setBusy(false);
     }
   };
 
   useEffect(() => {
-    refresh();
+    const timer = window.setTimeout(() => void refresh(), 0);
+    return () => window.clearTimeout(timer);
   }, []);
-
-  const setMode = async (mode: "risky" | "prop_firm") => {
-    setModeBusy(true);
-    setMsg(`Switching discovery mode to ${mode}…`);
-    try {
-      await updateSettings({ tradingMode: mode });
-      setCfg(await getSettings());
-      setMsg(
-        `✓ Discovery mode = ${mode}. ${
-          mode === "risky"
-            ? "Aggressive account-multiplication search (goal-compounding, drawdown-agnostic)."
-            : "FTMO-style robust search (prop-firm window-pass gates)."
-        } Applies to the next discovery run.`,
-      );
-    } catch (e) {
-      setMsg(`Mode switch failed: ${e}`);
-    } finally {
-      setModeBusy(false);
-    }
-  };
-
-  // Editable "search tuning" state, seeded from config whenever it (re)loads.
-  const [tune, setTune] = useState<any>({});
-  const [tuneBusy, setTuneBusy] = useState(false);
-  useEffect(() => {
-    if (!cfg) return;
-    setTune({
-      riskyStartBalance: cfg.riskyStartBalance,
-      riskyTargetBalance: cfg.riskyTargetBalance,
-      riskyHorizonDays: cfg.riskyHorizonDays,
-      prefilterTopK: cfg.prefilterTopK,
-      convergencePatience: cfg.convergencePatience,
-      stagnationPatience: cfg.stagnationPatience,
-      noveltyWeight: cfg.noveltyWeight,
-      disableSmcGate: cfg.disableSmcGate,
-    });
-  }, [cfg]);
-
-  const num = (v: any) => (v === "" || v == null ? undefined : Number(v));
-  const saveTuning = async () => {
-    setTuneBusy(true);
-    setMsg("Saving search tuning to config.yaml…");
-    try {
-      await updateSettings({
-        riskyStartBalance: num(tune.riskyStartBalance),
-        riskyTargetBalance: num(tune.riskyTargetBalance),
-        riskyHorizonDays: num(tune.riskyHorizonDays),
-        prefilterTopK: num(tune.prefilterTopK),
-        convergencePatience: num(tune.convergencePatience),
-        stagnationPatience: num(tune.stagnationPatience),
-        noveltyWeight: num(tune.noveltyWeight),
-        disableSmcGate: !!tune.disableSmcGate,
-      });
-      setCfg(await getSettings());
-      setMsg("✓ Saved to config.yaml — applies to the next Discovery run.");
-    } catch (e) {
-      setMsg(`Save failed: ${e}`);
-    } finally {
-      setTuneBusy(false);
-    }
-  };
-  const setT = (k: string, v: any) => setTune((t: any) => ({ ...t, [k]: v }));
 
   // ── cTrader API credentials (audit #119) ────────────────────────────────
   // The Dashboard banner has told the operator for months to "go to Settings
@@ -180,8 +105,10 @@ export default function Settings() {
   const [creds, setCreds] = useState<BrokerCredentials | null>(null);
   const [credForm, setCredForm] = useState({ clientId: "", clientSecret: "", accountId: "", environment: "Demo", redirectUri: "" });
   const [credsBusy, setCredsBusy] = useState(false);
+  const [credsLoading, setCredsLoading] = useState(false);
   const [showCreds, setShowCreds] = useState(false);
   const loadCreds = async () => {
+    setCredsLoading(true);
     try {
       const c = await brokerCredentials();
       setCreds(c);
@@ -195,9 +122,12 @@ export default function Settings() {
       });
     } catch (e) {
       setMsg(`Could not read broker credentials: ${e}`);
+    } finally {
+      setCredsLoading(false);
     }
   };
   const saveCreds = async () => {
+    if (credsBusy || credsLoading || !creds) return;
     setCredsBusy(true);
     setMsg("Saving cTrader credentials…");
     try {
@@ -221,7 +151,7 @@ export default function Settings() {
       const r = await reauthBroker();
       setMsg(
         `✓ ${r.message} (token ${r.accessTokenLen} chars, refresh ${r.refreshTokenPresent ? "saved" : "missing"}). ` +
-          `From now on the session auto-refreshes — no re-auth needed again.`,
+          `The app can attempt token refresh; broker access must still be verified.`,
       );
       await refresh();
     } catch (e) {
@@ -243,7 +173,7 @@ export default function Settings() {
     }
   };
 
-  const useAccount = async (a: AccountInfo) => {
+  const activateAccount = async (a: AccountInfo) => {
     setBusy(true);
     setMsg(`Switching to ${a.label}…`);
     try {
@@ -252,7 +182,7 @@ export default function Settings() {
       await loadAccounts();
       setMsg(
         `✓ Active account: ${a.label} — environment set to ${a.isLive ? "Live" : "Demo"}. ` +
-          `Balance/positions refresh on the Dashboard.`,
+          `Balance and positions refresh in Trading → Market & positions.`,
       );
     } catch (e) {
       setMsg(`Switch failed: ${e}`);
@@ -264,96 +194,10 @@ export default function Settings() {
   return (
     <div className="screen">
       <h1>Settings</h1>
-      <p className="sub">Discovery mode &amp; broker connection</p>
-
-      <HelpPanel id="settings-mode">
-        <p>The <b>discovery mode</b> decides what kind of strategies the search hunts for. Pick it here; it applies to the next Discovery / Autopilot run.</p>
-        <p><b>Prop-firm</b> = robust, FTMO-style strategies that must pass strict per-window rules (low drawdown, daily-loss limits). <b>Risky</b> = aggressive account-multiplication — it ranks by how fast it compounds toward your goal at half-Kelly and is drawdown-agnostic. Risky's internals are engine-decided; you only choose the mode + the goal.</p>
-      </HelpPanel>
-
-      <h2>Discovery mode</h2>
-      <div className="ticket">
-        <div className="seg" style={{ maxWidth: 360 }}>
-          <button
-            className={cfg?.tradingMode === "prop_firm" ? "on" : ""}
-            disabled={modeBusy}
-            onClick={() => setMode("prop_firm")}
-          >
-            🛡 Prop-firm (robust)
-          </button>
-          <button
-            className={cfg?.tradingMode === "risky" ? "on buy" : ""}
-            disabled={modeBusy}
-            onClick={() => setMode("risky")}
-          >
-            🚀 Risky (multiply)
-          </button>
-        </div>
-        {cfg && (
-          <p className="muted small" style={{ marginTop: 10 }}>
-            Active: <b>{cfg.effectiveDiscoveryMode ?? cfg.tradingMode ?? "?"}</b>
-            {cfg.tradingMode === "risky" && cfg.riskyStartBalance != null && (
-              <> · goal €{Math.round(cfg.riskyStartBalance).toLocaleString()} → €{Math.round(cfg.riskyTargetBalance).toLocaleString()} in {cfg.riskyHorizonDays} days</>
-            )}
-          </p>
-        )}
-        {/* The backend already computes and ships both values plus a
-            divergence flag (settings.rs:795-808) because models.discovery_mode
-            can override system.trading_mode — which the switch above does not
-            write. Rendering only the switch's own value is how a search runs
-            under rules the operator did not pick and the screen agrees with
-            him anyway. */}
-        {cfg?.tradingModeDivergent && (
-          <div className="banner warn" style={{ marginTop: 8 }}>
-            <b>These two disagree, and the search obeys the second one.</b> The mode switch above
-            wrote <code>system.trading_mode = {String(cfg.tradingMode)}</code>, but{" "}
-            <code>models.discovery_mode = {String(cfg.discoveryMode)}</code> overrides it, so the
-            search runs as <b>{String(cfg.effectiveDiscoveryMode)}</b>. Every candidate already
-            ranked was ranked under that. Clear <code>models.discovery_mode</code> in{" "}
-            <b>Advanced → raw config.yaml</b> to make this switch decide again.
-          </div>
-        )}
-      </div>
-
-      <h2>Risky goal</h2>
-      <p className="muted small">What the Risky search compounds toward. Only used in Risky mode; sizing/win-rate are engine-decided.</p>
-      <div className="ticket">
-        <div className="ticket-row">
-          <label>Start (€)<input type="number" min="1" step="50" value={tune.riskyStartBalance ?? ""} onChange={(e) => setT("riskyStartBalance", e.target.value)} /></label>
-          <label>Target (€)<input type="number" min="1" step="1000" value={tune.riskyTargetBalance ?? ""} onChange={(e) => setT("riskyTargetBalance", e.target.value)} /></label>
-          <label>Horizon (days)<input type="number" min="1" step="30" value={tune.riskyHorizonDays ?? ""} onChange={(e) => setT("riskyHorizonDays", e.target.value)} /></label>
-        </div>
-      </div>
-
-      <h2>Search tuning <span className="muted small">(anti-stagnation — change these if Discovery stalls / finds few strategies)</span></h2>
-      <div className="ticket">
-        <div className="ticket-row" style={{ flexWrap: "wrap", gap: 16 }}>
-          <label style={{ minWidth: 150 }}>Indicator pool
-            <input type="number" min="10" step="10" value={tune.prefilterTopK ?? ""} onChange={(e) => setT("prefilterTopK", e.target.value)} />
-            <span className="muted small">how many indicators the GA may use. Higher = more diverse strategies. <b>Raise if it stalls.</b> Auto-capped at the number of available indicators + SMC — a value above that just means "use them all".</span>
-          </label>
-          <label style={{ minWidth: 150 }}>Explore patience
-            <input type="number" min="10" step="50" value={tune.convergencePatience ?? ""} onChange={(e) => setT("convergencePatience", e.target.value)} />
-            <span className="muted small">flat generations before the GA gives up. Raise to search much longer.</span>
-          </label>
-          <label style={{ minWidth: 150 }}>Diversity kick
-            <input type="number" min="1" step="1" value={tune.stagnationPatience ?? ""} onChange={(e) => setT("stagnationPatience", e.target.value)} />
-            <span className="muted small">flat generations before heavier mutation + fresh genes kick in.</span>
-          </label>
-          <label style={{ minWidth: 150 }}>Novelty reward
-            <input type="number" min="0" max="1" step="0.05" value={tune.noveltyWeight ?? ""} onChange={(e) => setT("noveltyWeight", e.target.value)} />
-            <span className="muted small">0 = off. 0.1–0.3 rewards DIFFERENT genes → more regimes.</span>
-          </label>
-          <label style={{ flexDirection: "row", alignItems: "center", gap: 8, minWidth: 200 }}>
-            <input type="checkbox" checked={!!tune.disableSmcGate} onChange={(e) => setT("disableSmcGate", e.target.checked)} />
-            Disable SMC gate
-          </label>
-        </div>
-        <div className="btn-row">
-          <button className="primary" disabled={tuneBusy || !cfg} onClick={saveTuning}>{tuneBusy ? "Saving…" : "Save tuning"}</button>
-          <span className="muted small">Writes to config.yaml · applies to the next Discovery run.</span>
-        </div>
-      </div>
+      <p className="sub">Broker connection, training hardware and live safeguards</p>
+      <div className="btn-row"><button disabled={busy || loading || credsBusy} onClick={() => void refresh()}>{loading ? "Loading settings…" : "Refresh settings"}</button></div>
+      {loadErrors.map((error) => <div className="banner warn" role="alert" key={error}>{error}</div>)}
+      {msg && <div className="banner info" role="status">{msg}</div>}
 
       {/* This control writes system.enable_gpu_preference, which gates
           TRAINING. The discovery SEARCH device is models.prop_search_device,
@@ -367,48 +211,47 @@ export default function Settings() {
           the fix is to stop this control from claiming the other axis. */}
       <h2>Compute <span className="muted small">(training device)</span></h2>
       <p className="muted small">
-        Which hardware <b>training</b> uses. <b>auto</b> picks the best device and fits any card;
-        <b> cpu</b> keeps training on the CPU; <b>gpu</b> prefers the card.
+        Saved training-device preference. Availability, memory admission and the selected model's
+        implemented backend determine whether a job can run; this setting is not proof of GPU execution.
       </p>
       <div className="ticket">
         <div className="seg" style={{ maxWidth: 360 }}>
           {(["auto", "cpu", "gpu"] as const).map((m) => (
-            <button key={m} className={cfg?.computeMode === m ? "on" : ""} onClick={() => setCompute(m)}>{m.toUpperCase()}</button>
+            <button key={m} disabled={busy || loading || !cfg} className={cfg?.computeMode === m ? "on" : ""} onClick={() => setCompute(m)}>{m.toUpperCase()}</button>
           ))}
         </div>
         {cfg && <p className="muted small" style={{ marginTop: 8 }}>Saved: <b>{cfg.computeMode ?? "?"}</b> <span className="muted">(training)</span></p>}
         <p className="muted small">
           ⚠ This does <b>not</b> set the discovery-search device. The search reads{" "}
           <code>models.prop_search_device</code>, which overrides this value whenever it is set —
-          choosing CPU here can still give you a GPU search. The device a run actually used is
-          printed in that run's device-summary log line; the key itself is editable in{" "}
-          <b>Advanced → raw config.yaml</b>.
+          choosing CPU here can still give you a CUDA search. Set the search device beside the
+          search budget in <b>Research → Strategy search</b>; the run receipt must report what was
+          actually admitted.
         </p>
       </div>
 
-      <h2>Risk &amp; sizing</h2>
-      <p className="muted small">Position-sizing limits + drawdown guards for AUTOMATED trading (Autopilot/Risky). Pick a preset — the daily/total drawdown caps below update to that firm's rules. <b>Risk %/trade</b> is your own choice: change it in <b>Advanced</b> or the <b>Discovery</b> pre-flight.</p>
+      <h2>Live risk &amp; sizing</h2>
+      <p className="muted small">Position-sizing limits and account drawdown guards for automated trading. Search-time risk, objectives and validation windows now live in <b>Research → Strategy search</b>.</p>
       <div className="ticket">
         {presets.length > 0 && (
           <label>Preset
-            <select value={risk?.preset ?? ""} onChange={(e) => applyPreset(e.target.value)} style={{ width: 240 }}>
+            <select disabled={busy || loading || !risk} value={risk?.preset ?? ""} onChange={(e) => applyPreset(e.target.value)} style={{ width: 240 }}>
               {!presets.some((p) => p.id === risk?.preset) && <option value="">{risk?.preset ?? "(current)"}</option>}
               {presets.map((p) => <option key={p.id} value={p.id}>{p.displayName}</option>)}
             </select>
           </label>
         )}
-        {/* 💰 In risky mode this card was a lie by an order of magnitude: live
-            sizing ignores risk.risk_per_trade entirely (live_trading.rs:
-            1664-1680 substitutes the 0.30→0.50 ladder, then :1749-1770 caps
-            the first entry at max_portfolio_risk). The card said 3%. So the
-            label now names the mode it is true in, and in risky mode says what
-            actually sizes the trade. */}
+        {/* Sizing calibration belongs to selection/fitting, not the reserved
+            final test. The fixed preset fraction is not the Risky estimate. */}
         {risk && cfg?.tradingMode === "risky" && (
           <div className="banner warn" style={{ marginTop: 12 }}>
             <b>Trading mode is RISKY — the “risk / trade” number below is not what the bot risks.</b>{" "}
-            Risky live sizing ignores <code>risk.risk_per_trade</code> and uses the engine's own
-            ladder (30–50% of equity), capped by <b>Max portfolio risk</b>. The honest band is on
-            the <b>Risky Mode</b> screen. Switch to Prop-firm above for this number to bind.
+            Risky live sizing uses the selected portfolio's selection-validation calibration,
+            subject to configured risk ceilings and broker lot limits. This is not the independent
+            final OOS test. The half-Kelly estimate is a sizing heuristic, not a guarantee of
+            portfolio safety or profit. The fixed
+            <code> risk.risk_per_trade </code> preset below is not that estimate. Search-time sizing
+            is configured in <b>Research → Strategy search</b>.
           </div>
         )}
         {risk && (
@@ -416,11 +259,11 @@ export default function Settings() {
             <div className="card">
               <div className="card-label">RISK / TRADE{cfg?.tradingMode === "risky" ? " (NOT IN FORCE)" : ""}</div>
               <div className="card-value" style={cfg?.tradingMode === "risky" ? { opacity: 0.45 } : undefined}>
-                {((risk.riskPerTrade ?? 0) * 100).toFixed(2)}%
+                {risk.riskPerTrade == null ? "—" : `${(risk.riskPerTrade * 100).toFixed(2)}%`}
               </div>
             </div>
-            <div className="card"><div className="card-label">DAILY DD CAP</div><div className="card-value">{((risk.dailyDrawdownLimit ?? 0) * 100).toFixed(1)}%</div></div>
-            <div className="card"><div className="card-label">TOTAL DD CAP</div><div className="card-value">{((risk.totalDrawdownLimit ?? 0) * 100).toFixed(1)}%</div></div>
+            <div className="card"><div className="card-label">DAILY DD CAP</div><div className="card-value">{risk.dailyDrawdownLimit == null ? "—" : `${(risk.dailyDrawdownLimit * 100).toFixed(1)}%`}</div></div>
+            <div className="card"><div className="card-label">TOTAL DD CAP</div><div className="card-value">{risk.totalDrawdownLimit == null ? "—" : `${(risk.totalDrawdownLimit * 100).toFixed(1)}%`}</div></div>
             <div className="card"><div className="card-label">MAX LOT</div><div className="card-value">{risk.maxLotSize ?? "—"}</div></div>
           </div>
         )}
@@ -431,12 +274,12 @@ export default function Settings() {
             by hand, is a promise that produces a rejected order at the worst
             possible moment. */}
         <p className="muted small" style={{ marginTop: 8 }}>
-          The drawdown caps, max lot and risk-per-trade above apply to <b>automated</b> trading.{" "}
-          <b>One of them does bind manual orders:</b> with <b>Require stop-loss</b>{" "}
-          {risk ? <b className={risk.requireStopLoss ? "sell" : ""}>{risk.requireStopLoss ? "ON" : "off"}</b> : "on"}
-          , a manual order sent from <b>Positions</b> without a stop is <b>refused</b>. It is set
-          by <code>risk.require_stop_loss</code> in <b>Advanced → raw config.yaml</b> — there is
-          no switch for it on this screen or any other.
+          These preset sizing and drawdown limits apply to <b>automated</b> trading.
+          Manual orders require a stop-loss when <b>Require stop-loss</b> is ON. Current setting:{" "}
+          {risk ? <b className={risk.requireStopLoss ? "sell" : ""}>{risk.requireStopLoss ? "ON" : "off"}</b> : "(unknown)"}
+          . When OFF, new manual orders still require SL or TP unless submitted with the explicit
+          risky override. Broker order constraints still apply. Set <code>risk.require_stop_loss</code>
+          in <b>Settings → Advanced → raw config.yaml</b>.
         </p>
       </div>
 
@@ -446,7 +289,8 @@ export default function Settings() {
         <label style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
           <input
             type="checkbox"
-            checked={cfg?.autoRediscoverOnCull ?? true}
+            disabled={busy || loading || !cfg}
+            checked={cfg?.autoRediscoverOnCull ?? false}
             onChange={(e) => setLoop({ autoRediscoverOnCull: e.target.checked })}
           />
           Auto-rediscover after a cull — when a strategy is retired (blacklisted forever), automatically start a fresh Discovery on the same symbol + timeframe to refill the gap. Runs when the Discovery engine is idle.
@@ -454,6 +298,7 @@ export default function Settings() {
         <label style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 8 }}>
           <input
             type="checkbox"
+            disabled={busy || loading || !cfg}
             checked={!!cfg?.liveMlGate}
             onChange={(e) => setLoop({ liveMlGate: e.target.checked })}
           />
@@ -461,8 +306,11 @@ export default function Settings() {
             <b>Live ML gate</b> — the trained model ensemble scales each live entry's risk
             (agreement × regime × anomaly). Strategies still pick the direction; the models can
             only <b>shrink</b> size or skip a bar on a hard regime/anomaly collapse — never flip
-            a trade, never create one. Needs trained models for the engine's symbol + timeframe;
-            if none load, trading continues gene-only (logged). Takes effect on the next engine start.
+            a trade, never create one. When enabled, it requires the selected portfolio's exact
+            trained candidate and matching saved combined research with the current inference settings.
+            Missing or mismatched models refuse engine startup; there is no automatic gene-only fallback.
+            When disabled, entries use strategy genes without model gating. All other trading checks
+            still apply. Takes effect on the next engine start.
           </span>
         </label>
       </div>
@@ -472,11 +320,18 @@ export default function Settings() {
       <div className="ticket">
         <div className="ticket-row" style={{ flexWrap: "wrap", gap: 18 }}>
           <label style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-            <input type="checkbox" checked={!!cfg?.newsCalendarEnabled} onChange={(e) => setNews({ newsCalendarEnabled: e.target.checked })} />
+            <input type="checkbox" disabled={busy || loading || !cfg} checked={!!cfg?.newsCalendarEnabled} onChange={(e) => setNews({ newsCalendarEnabled: e.target.checked })} />
             Economic calendar enabled
           </label>
           <label>Behaviour
-            <select value={cfg?.newsTradingMode ?? "block_on_news"} onChange={(e) => setNews({ newsTradingMode: e.target.value })} style={{ width: 220 }}>
+            <select
+              disabled={busy || loading || !cfg}
+              value={cfg?.newsTradingMode ?? "block_on_news"}
+              onChange={(event) => setNews({
+                newsTradingMode: event.target.value as SettingsUpdate["newsTradingMode"],
+              })}
+              style={{ width: 220 }}
+            >
               <option value="block_on_news">Block on news (pause trading)</option>
               <option value="allow_always">Allow always (ignore news)</option>
               <option value="warn_only">Warn only</option>
@@ -489,8 +344,9 @@ export default function Settings() {
       <h2>Data location</h2>
       <div className="ticket">
         <p className="muted small">
-          Downloaded bars, trained models, cache and the journal all live under <code>{cfg?.dataDir ?? "—"}</code>.
-          Browse/open folders in <b>Files &amp; Storage</b>; download history + refresh broker costs in <b>Data</b>.
+          Configured historical-data directory: <code>{cfg?.dataDir ?? "—"}</code>.
+          Models, cache and logs can use separate directories. Check the resolved locations in
+          <b> Settings → Storage</b>; download history and refresh broker costs in <b>Data</b>.
         </p>
       </div>
 
@@ -498,11 +354,11 @@ export default function Settings() {
       <div className="settings-grid">
         <div className="kv">
           <span>Configured</span>
-          <b className={status?.configured ? "buy" : "sell"}>{status?.configured ? "yes" : "no"}</b>
+          <b className={status ? status.configured ? "buy" : "sell" : "muted"}>{status ? status.configured ? "yes" : "no" : "unknown"}</b>
         </div>
         <div className="kv">
           <span>Token stored</span>
-          <b className={status?.hasToken ? "buy" : "sell"}>{status?.hasToken ? "yes" : "no"}</b>
+          <b className={status ? status.hasToken ? "buy" : "sell" : "muted"}>{status ? status.hasToken ? "yes" : "no" : "unknown"}</b>
         </div>
         <div className="kv">
           <span>Environment</span>
@@ -532,7 +388,7 @@ export default function Settings() {
         The app ships with a built-in cTrader Open API application. You only need this if your
         broker revokes it, or you want to use your own — otherwise leave it alone. Get the values
         from <code>connect.spotware.com</code> → your application. The secret is stored locally and
-        is <b>never</b> shown back to you or sent anywhere but your own machine.
+        is not returned by the read API. It is used to authenticate with cTrader.
       </p>
       {showCreds && (
         <div className="ticket">
@@ -542,7 +398,7 @@ export default function Settings() {
               {" · "}leave the field blank to keep it.
             </p>
           )}
-          <div className="ticket-row" style={{ flexWrap: "wrap", gap: 14 }}>
+          <fieldset className="ticket-row" disabled={credsBusy || credsLoading || !creds} style={{ flexWrap: "wrap", gap: 14, border: 0, padding: 0, margin: 0 }}>
             <label style={{ minWidth: 260 }}>
               Client ID
               <input
@@ -599,11 +455,12 @@ export default function Settings() {
                 style={{ width: 260 }}
               />
             </label>
-          </div>
+          </fieldset>
           <div className="btn-row">
-            <button className="primary" disabled={credsBusy} onClick={saveCreds}>
+            <button className="primary" disabled={credsBusy || credsLoading || !creds} onClick={saveCreds}>
               {credsBusy ? "Saving…" : "Save credentials"}
             </button>
+            {!creds && <button disabled={credsLoading} onClick={() => void loadCreds()}>{credsLoading ? "Loading credentials…" : "Retry loading credentials"}</button>}
             <span className="muted small">
               After saving, press <b>Authenticate cTrader</b> below once — the saved credentials are
               what the OAuth flow uses.
@@ -613,9 +470,9 @@ export default function Settings() {
       )}
 
       <div className="banner info">
-        Authentication is <b>automatic</b>. You only authenticate <b>once</b> — after that the access
-        token is silently refreshed via the stored refresh token on every launch and before it
-        expires. You should never have to re-authenticate unless the broker revokes access.
+        The app can refresh access using a stored refresh token. Saved credentials do not prove an
+        active broker session; verify current market and account timestamps. Re-authentication may
+        be necessary when refresh fails or access is revoked.
       </div>
 
       <div className="btn-row">
@@ -626,8 +483,6 @@ export default function Settings() {
           List accounts
         </button>
       </div>
-
-      {msg && <div className="banner info">{msg}</div>}
 
       {accounts.length > 0 && (
         <table className="tbl">
@@ -655,7 +510,7 @@ export default function Settings() {
                   {a.enabled ? (
                     <span className="buy small">● Active</span>
                   ) : (
-                    <button disabled={busy} onClick={() => useAccount(a)}>
+                    <button disabled={busy} onClick={() => activateAccount(a)}>
                       Use
                     </button>
                   )}

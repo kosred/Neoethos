@@ -3,7 +3,8 @@ use crate::data_selection::{
     CanonicalSearchArtifactEnvelopeV2, CanonicalSearchArtifactScopeV2, CanonicalSearchWindowRoleV1,
 };
 use crate::eval::{
-    BacktestMetrics, BacktestSettings, fast_evaluate_strategy_core, simulate_trades_core,
+    BacktestMetrics, BacktestSettings, evaluate_strategy_with_confidence_and_ledger_core,
+    fast_evaluate_strategy_core, simulate_trades_with_confidence_core, validate_sizing_confidences,
 };
 use crate::genetic::Gene;
 use crate::quality::Trade;
@@ -152,9 +153,12 @@ fn validate_selection_scope(scope: &CanonicalSearchArtifactScopeV2, label: &str)
 
 fn validate_holdout_scope(scope: &CanonicalSearchArtifactScopeV2, label: &str) -> Result<()> {
     scope.validate().map_err(anyhow::Error::new)?;
-    if scope.evaluated_window().role() != CanonicalSearchWindowRoleV1::Holdout {
+    if !matches!(
+        scope.evaluated_window().role(),
+        CanonicalSearchWindowRoleV1::SelectionValidation | CanonicalSearchWindowRoleV1::Holdout
+    ) {
         bail!(
-            "{label} requires the exact stored holdout scope, found {:?}",
+            "{label} requires the exact stored selection-validation or final holdout scope, found {:?}",
             scope.evaluated_window().role()
         );
     }
@@ -496,8 +500,10 @@ pub fn read_walkforward_validation_artifact(
 
 /// Forward-test validation summary: a single backtest pass over a tail
 /// window that was withheld from both training and walk-forward CV. The
-/// summary is intentionally flat (no `splits`) because forward testing
-/// produces one unbiased OOS estimate, not a folded distribution.
+/// summary is intentionally flat (no `splits`): it represents one replay,
+/// not a folded distribution. Its exact artifact role distinguishes selection
+/// validation (which may inform selection/sizing) from an untouched final
+/// holdout; a selection-validation result is not an unbiased final estimate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardTestSummary {
@@ -662,6 +668,9 @@ pub struct ForwardTestInput<'a> {
     pub high: &'a [f64],
     pub low: &'a [f64],
     pub signals: &'a [i8],
+    /// The same threshold-margin confidence that sized the discovered gene.
+    /// May be empty only when risk-based sizing is explicitly disabled.
+    pub confidences: &'a [f64],
     pub months: &'a [i64],
     pub days: &'a [i64],
     pub timestamps: &'a [i64],
@@ -687,17 +696,16 @@ pub fn compute_forward_test_summary(input: ForwardTestInput<'_>) -> Result<Forwa
         bail!("forward-test tail length mismatch across input arrays");
     }
     let timestamps_len = input.timestamps.len();
-    if timestamps_len != 0 && timestamps_len != bars {
-        bail!("forward-test timestamps must be empty or match the tail length");
+    if timestamps_len != bars {
+        bail!("forward-test timestamps must match the complete tail length");
     }
+    validate_sizing_confidences(bars, input.confidences, input.settings)?;
     let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
         input.close,
         input.high,
         input.low,
         input.signals,
-        // Phase 1: legacy fixed-1-lot for the forward-test summary (no
-        // confidence threaded here yet) — `&[]` forces pos_lots = 1.0.
-        &[],
+        input.confidences,
         input.months,
         input.days,
         input.timestamps,
@@ -1166,9 +1174,10 @@ pub struct WalkforwardBacktestInput<'a> {
     pub high: &'a [f64],
     pub low: &'a [f64],
     pub signals: &'a [i8],
+    pub confidences: &'a [f64],
     pub months: &'a [i64],
     pub days: &'a [i64],
-    /// Real bar timestamps (ms or ns, same unit as `simulate_trades_core` expects).
+    /// Real bar timestamps in epoch milliseconds, aligned to every price row.
     /// Used for gap detection, kill-zone rules, and day/week/month boundaries.
     pub timestamps: &'a [i64],
     pub train_ratio: f64,
@@ -1240,6 +1249,7 @@ fn walkforward_risk_diagnostics(
     high: &[f64],
     low: &[f64],
     signals: &[i8],
+    confidences: &[f64],
     days: &[i64],
     timestamps: &[i64],
     settings: &BacktestSettings,
@@ -1249,19 +1259,20 @@ fn walkforward_risk_diagnostics(
     min_trading_days: usize,
     max_trades_per_day: usize,
     initial_balance: f64,
-) -> WalkforwardRiskDiagnostics {
+) -> Result<WalkforwardRiskDiagnostics> {
     if close.is_empty() || days.is_empty() {
-        return WalkforwardRiskDiagnostics::default();
+        return Ok(WalkforwardRiskDiagnostics::default());
     }
-    // Use real timestamps so the simulator applies the right gap, session and
-    // kill-zone logic — same as before this was split out.
-    let ts: &[i64] = if timestamps.len() == close.len() {
-        timestamps
-    } else {
-        days
-    };
-    let trades = simulate_trades_core(close, high, low, ts, signals, settings);
-    walkforward_risk_diagnostics_from_trades(
+    let trades = simulate_trades_with_confidence_core(
+        close,
+        high,
+        low,
+        timestamps,
+        signals,
+        confidences,
+        settings,
+    )?;
+    Ok(walkforward_risk_diagnostics_from_trades(
         &trades,
         days,
         evaluator_max_daily_dd,
@@ -1270,7 +1281,7 @@ fn walkforward_risk_diagnostics(
         min_trading_days,
         max_trades_per_day,
         initial_balance,
-    )
+    ))
 }
 
 /// The measurement, over a trade list that already exists.
@@ -1411,12 +1422,41 @@ pub fn embargoed_walkforward_backtest(
     input: WalkforwardBacktestInput<'_>,
 ) -> Result<WalkforwardSummary> {
     crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
+    embargoed_walkforward_backtest_core(input)
+}
+
+fn settings_for_walkforward_window(
+    settings: &BacktestSettings,
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+) -> Result<BacktestSettings> {
+    let mut window = settings.clone();
+    if settings.adaptive_vol_mult > 0.0 {
+        window.adaptive_base_pips = match crate::stop_target::adaptive_base_pips_series(
+            high,
+            low,
+            close,
+            settings.pip_value,
+        ) {
+            Ok(base) => Some(base.into()),
+            Err(crate::stop_target::StopDistanceError::TooShort { .. }) => None,
+            Err(error) => bail!("adaptive stop base failed for walk-forward window: {error}"),
+        };
+    }
+    Ok(window)
+}
+
+fn embargoed_walkforward_backtest_core(
+    input: WalkforwardBacktestInput<'_>,
+) -> Result<WalkforwardSummary> {
     let _scope = crate::eval_telemetry::CallerScope::enter("walkforward");
     let WalkforwardBacktestInput {
         close,
         high,
         low,
         signals,
+        confidences,
         months,
         days,
         timestamps,
@@ -1437,9 +1477,17 @@ pub fn embargoed_walkforward_backtest(
         || signals.len() != n
         || months.len() != n
         || days.len() != n
+        || timestamps.len() != n
     {
         bail!("empty data or length mismatch");
     }
+    validate_sizing_confidences(n, confidences, settings)?;
+    anyhow::ensure!(
+        initial_balance.is_finite()
+            && initial_balance > 0.0
+            && initial_balance == settings.initial_equity(),
+        "walk-forward diagnostics and trade sizing must use the same initial balance"
+    );
     if n_splits == 0 {
         bail!("n_splits must be greater than zero");
     }
@@ -1477,7 +1525,7 @@ pub fn embargoed_walkforward_backtest(
     } else {
         (0..n_splits)
             .into_par_iter()
-            .filter_map(|i| {
+            .map(|i| -> Result<Option<WalkforwardSplitResult>> {
                 let start = i * window;
                 let end = ((i + 1) * window).min(n);
 
@@ -1485,33 +1533,34 @@ pub fn embargoed_walkforward_backtest(
                 let test_start = train_end + embargo_bars;
 
                 if test_start >= end || (train_end - start) < 40 || (end - test_start) < 40 {
-                    return None;
+                    return Ok(None);
                 }
 
                 let slice_close = &close[test_start..end];
                 let slice_high = &high[test_start..end];
                 let slice_low = &low[test_start..end];
                 let slice_sig = &signals[test_start..end];
+                let slice_conf = if confidences.is_empty() {
+                    &[][..]
+                } else {
+                    &confidences[test_start..end]
+                };
                 let slice_months = &months[test_start..end];
                 let slice_days = &days[test_start..end];
-                let slice_ts = if timestamps.len() == n {
-                    &timestamps[test_start..end]
-                } else {
-                    slice_days
-                };
-
-                let metrics = fast_evaluate_strategy_core(
+                let slice_ts = &timestamps[test_start..end];
+                let window_settings =
+                    settings_for_walkforward_window(settings, slice_high, slice_low, slice_close)?;
+                let (metrics, trades) = evaluate_strategy_with_confidence_and_ledger_core(
                     slice_close,
                     slice_high,
                     slice_low,
                     slice_sig,
-                    // Phase 1: legacy fixed-1-lot for the walk-forward slice eval.
-                    &[],
+                    slice_conf,
                     slice_months,
                     slice_days,
-                    &[],
-                    settings,
-                );
+                    slice_ts,
+                    &window_settings,
+                )?;
 
                 // Map metrics [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count, consistency, max_daily_dd]
                 let net_profit = metrics[0];
@@ -1519,14 +1568,9 @@ pub fn embargoed_walkforward_backtest(
                 let win_rate = metrics[4];
                 let trade_count = metrics[8] as usize;
                 let max_daily_dd = metrics[10];
-                let risk = walkforward_risk_diagnostics(
-                    slice_close,
-                    slice_high,
-                    slice_low,
-                    slice_sig,
+                let risk = walkforward_risk_diagnostics_from_trades(
+                    &trades,
                     slice_days,
-                    slice_ts,
-                    settings,
                     max_daily_dd,
                     max_daily_loss_pct,
                     max_daily_profit_pct,
@@ -1535,7 +1579,7 @@ pub fn embargoed_walkforward_backtest(
                     initial_balance,
                 );
 
-                Some(WalkforwardSplitResult {
+                Ok(Some(WalkforwardSplitResult {
                     split: i + 1,
                     trades: trade_count,
                     pnl: net_profit,
@@ -1551,8 +1595,11 @@ pub fn embargoed_walkforward_backtest(
                     daily_returns: risk.daily_returns,
                     max_daily_dd_pct: risk.max_daily_dd_pct,
                     prop_compliant: risk.prop_compliant,
-                })
+                }))
             })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect()
     };
     // par collect preserves range order, but make the ascending-split
@@ -1640,6 +1687,8 @@ pub struct WalkforwardPopulationInput<'a> {
     /// `embargoed_walkforward_backtest`. (The GPU **metrics** half gets the
     /// gene's SL/TP separately via the metrics provider's own per-gene arrays.)
     pub gene_settings: &'a [BacktestSettings],
+    /// Full-series confidence per gene, in the same order as signals/settings.
+    pub confidences_per_gene: &'a [Vec<f64>],
     /// Pip size the adaptive-stop base series is denominated in — MUST be the
     /// same pip the GPU metrics provider resolves
     /// (`WalkforwardPopulationGenePack::adaptive_pip`), so the CPU
@@ -1681,11 +1730,10 @@ pub struct WalkforwardPopulationInput<'a> {
 /// `summarize_walkforward_splits` reducer — so the avg/any/all aggregation is
 /// byte-identical to `embargoed_walkforward_backtest`.
 ///
-/// ## Fixed-1-lot
-/// The metrics half MUST be produced with `risk_based_sizing == false` (fixed
-/// 1-lot) and empty (`&[]`) confidence, matching the single-gene WF call at
-/// validation.rs:1129-1130. The caller wires `metrics_fn` to
-/// `validation_genes_population`, which FORCES `risk_based_sizing = false`.
+/// ## One sizing policy
+/// The metrics provider and the diagnostic ledger must use the same per-gene
+/// settings and confidence series. Risk-sized discovery remains risk-sized in
+/// every validation window; fixed-lot is an explicit settings policy only.
 ///
 /// ## Split-qualification parity
 /// The window size, the 80-bar floor, and the train/embargo validity checks are
@@ -1728,14 +1776,40 @@ pub fn embargoed_walkforward_population<F>(
     // single source of truth for the per-gene signal direction, identical to
     // what the single-gene path slices.
     signals_per_gene: &[Vec<i8>],
-    // Per-window GPU metrics provider: `metrics_fn(test_start, end)` returns one
+    // Scheduling only: the caller derives this from the sealed CPU route.
+    // Native population providers retain one split in flight at a time.
+    parallel_cpu_windows: bool,
+    // Per-window metrics provider: `metrics_fn(test_start, end)` returns one
     // `[f64; 11]` row per gene (same order as `signals_per_gene`) for the
     // contiguous slice `[test_start..end]`. The caller wires this to a single
-    // GPU population launch (fixed-1-lot). Errors propagate (fail-loud).
-    mut metrics_fn: F,
+    // population launch with the same sizing policy. Errors propagate.
+    metrics_fn: F,
 ) -> Result<Vec<WalkforwardSummary>>
 where
-    F: FnMut(usize, usize) -> Result<WindowEvaluation>,
+    F: Fn(usize, usize) -> Result<WindowEvaluation> + Sync,
+{
+    embargoed_walkforward_population_with_admission(
+        input,
+        signals_per_gene,
+        parallel_cpu_windows,
+        metrics_fn,
+        crate::post_ga::post_ga_batch_width,
+        crate::post_ga::check_cancel,
+    )
+}
+
+fn embargoed_walkforward_population_with_admission<F, Admit, Cancel>(
+    input: WalkforwardPopulationInput<'_>,
+    signals_per_gene: &[Vec<i8>],
+    parallel_cpu_windows: bool,
+    metrics_fn: F,
+    mut admit: Admit,
+    check_cancel: Cancel,
+) -> Result<Vec<WalkforwardSummary>>
+where
+    F: Fn(usize, usize) -> Result<WindowEvaluation> + Sync,
+    Admit: FnMut(usize, usize) -> Result<usize>,
+    Cancel: Fn() -> Result<()> + Sync,
 {
     let WalkforwardPopulationInput {
         close,
@@ -1748,6 +1822,7 @@ where
         n_splits,
         embargo_bars,
         gene_settings,
+        confidences_per_gene,
         adaptive_pip,
         max_daily_loss_pct,
         max_daily_profit_pct,
@@ -1758,7 +1833,13 @@ where
 
     let n = close.len();
     let n_genes = signals_per_gene.len();
-    if n == 0 || high.len() != n || low.len() != n || months.len() != n || days.len() != n {
+    if n == 0
+        || high.len() != n
+        || low.len() != n
+        || months.len() != n
+        || days.len() != n
+        || timestamps.len() != n
+    {
         bail!("empty data or length mismatch");
     }
     if gene_settings.len() != n_genes {
@@ -1766,6 +1847,18 @@ where
             "walk-forward population gene_settings.len()={} != {} genes",
             gene_settings.len(),
             n_genes
+        );
+    }
+    if confidences_per_gene.len() != n_genes {
+        bail!("walk-forward population confidence count must match the gene count");
+    }
+    for (confidence, settings) in confidences_per_gene.iter().zip(gene_settings) {
+        validate_sizing_confidences(n, confidence, settings)?;
+        anyhow::ensure!(
+            initial_balance.is_finite()
+                && initial_balance > 0.0
+                && initial_balance == settings.initial_equity(),
+            "walk-forward diagnostics and trade sizing must use the same initial balance"
         );
     }
     if let Some((g, s)) = signals_per_gene
@@ -1792,8 +1885,7 @@ where
         return Ok(Vec::new());
     }
 
-    // ── Window geometry — COPIED VERBATIM from `embargoed_walkforward_backtest`
-    //    so the set of qualifying splits is byte-identical. ───────────────────
+    // Same window geometry and qualifying splits as the single-gene backtest.
     let window = (n / n_splits).max(1);
     if window < 80 {
         tracing::warn!(
@@ -1831,21 +1923,41 @@ where
         );
     }
 
-    for i in 0..n_splits {
+    // Floor division gives every split the same length. Keep the existing
+    // qualification and embargo geometry, without admitting empty windows.
+    let train_rows = ((window as f64) * train_ratio) as usize;
+    let test_offset = train_rows
+        .checked_add(embargo_bars)
+        .ok_or_else(|| anyhow::anyhow!("walk-forward embargo offset overflow"))?;
+    if test_offset >= window || train_rows < 40 || window - test_offset < 40 {
+        return Ok(per_gene_splits
+            .into_iter()
+            .map(summarize_walkforward_splits)
+            .collect());
+    }
+    let charged_window_rows =
+        if parallel_cpu_windows {
+            // One active window owns scratch for the WHOLE candidate wave, not
+            // just one gene. The shared feature/signal inputs already occupy RAM.
+            // Reuse post-GA's conservative ledger/array estimate for this product.
+            Some((window - test_offset).checked_mul(n_genes).ok_or_else(|| {
+                anyhow::anyhow!("walk-forward window allocation estimate overflow")
+            })?)
+        } else {
+            None
+        };
+
+    let evaluate_window = |i: usize| -> Result<Vec<WalkforwardSplitResult>> {
+        check_cancel()?;
         let start = i * window;
         let end = ((i + 1) * window).min(n);
 
         let train_end = start + ((window as f64) * train_ratio) as usize;
         let test_start = train_end + embargo_bars;
 
-        // SAME qualification predicate as the single-gene path.
-        if test_start >= end || (train_end - start) < 40 || (end - test_start) < 40 {
-            continue;
-        }
-
-        // ── GPU half: ONE population launch over all genes on this contiguous
-        //    slice. The caller forces fixed-1-lot / risk_based_sizing=false. ──
+        // One population launch over all genes with their actual sizing policy.
         let window = metrics_fn(test_start, end)?;
+        check_cancel()?;
         let gpu_metrics = window.metrics;
         let window_trades = window.trades;
         if gpu_metrics.len() != n_genes {
@@ -1856,23 +1968,29 @@ where
                 n_genes
             );
         }
+        if window_trades
+            .as_ref()
+            .is_some_and(|trades| trades.len() != n_genes)
+        {
+            bail!(
+                "walk-forward split {} trade provider returned the wrong gene count",
+                i + 1
+            );
+        }
 
         // Contiguous per-bar slices, shared across genes.
         let slice_close = &close[test_start..end];
         let slice_high = &high[test_start..end];
         let slice_low = &low[test_start..end];
         let slice_days = &days[test_start..end];
-        let slice_ts = if timestamps.len() == n {
-            &timestamps[test_start..end]
-        } else {
-            slice_days
-        };
+        let slice_ts = &timestamps[test_start..end];
 
         // Window-local adaptive base, indexed to the slice above — identical
         // derivation (estimator, pip, slice) to the metrics provider's. `None`
         // ⇒ window too short for the estimator ⇒ fixed-pip fallback, the same
         // policy `validation_genes_population_window` applies to this window.
-        let window_base: Option<std::sync::Arc<[f64]>> = if any_adaptive {
+        let window_base: Option<std::sync::Arc<[f64]>> = if any_adaptive && window_trades.is_none()
+        {
             match crate::stop_target::adaptive_base_pips_series(
                 slice_high,
                 slice_low,
@@ -1904,7 +2022,8 @@ where
         //    signals — IDENTICAL to the single-gene path. ────────────────────
         let split_results: Vec<WalkforwardSplitResult> = (0..n_genes)
             .into_par_iter()
-            .map(|g| {
+            .map(|g| -> Result<WalkforwardSplitResult> {
+                check_cancel()?;
                 let m = gpu_metrics[g];
                 // Metric slots read EXACTLY as the single-gene path
                 // (validation.rs:1138-1142): trade_count via `as usize`, NOT the
@@ -1917,8 +2036,13 @@ where
                 let max_daily_dd = m[10];
 
                 let slice_sig = &signals_per_gene[g][test_start..end];
+                let slice_conf = if confidences_per_gene[g].is_empty() {
+                    &[][..]
+                } else {
+                    &confidences_per_gene[g][test_start..end]
+                };
                 // Per-gene settings (the gene's own SL/TP + adaptive regime) so
-                // `simulate_trades_core` inside the diagnostics applies the SAME
+                // the account-risk simulator inside the diagnostics applies the SAME
                 // exits the metrics half ran. For an adaptive gene the base is
                 // REPLACED with this window's base: whatever the caller
                 // installed was indexed to a different slice, and the window
@@ -1953,6 +2077,7 @@ where
                             slice_high,
                             slice_low,
                             slice_sig,
+                            slice_conf,
                             slice_days,
                             slice_ts,
                             settings_ref,
@@ -1962,11 +2087,11 @@ where
                             min_trading_days,
                             max_trades_per_day,
                             initial_balance,
-                        )
+                        )?
                     }
                 };
 
-                WalkforwardSplitResult {
+                Ok(WalkforwardSplitResult {
                     split: i + 1,
                     trades: trade_count,
                     pnl: net_profit,
@@ -1982,18 +2107,51 @@ where
                     daily_returns: risk.daily_returns,
                     max_daily_dd_pct: risk.max_daily_dd_pct,
                     prop_compliant: risk.prop_compliant,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        for (g, r) in split_results.into_iter().enumerate() {
-            per_gene_splits[g].push(r);
+        Ok(split_results)
+    };
+
+    let mut next_split = 0;
+    while next_split < n_splits {
+        check_cancel()?;
+        let remaining = n_splits - next_split;
+        let width = if let Some(rows) = charged_window_rows {
+            admit(rows, remaining)?
+                .min(rayon::current_num_threads())
+                .min(remaining)
+        } else {
+            1
+        };
+        anyhow::ensure!(
+            width > 0,
+            "walk-forward window admission returned zero width"
+        );
+        let end = next_split + width;
+        // Indexed collection keeps original split order. Collect each Result
+        // rather than short-circuiting Rayon: all started work joins and the
+        // lowest split's error wins even when completions arrive out of order.
+        let completed: Vec<Result<Vec<WalkforwardSplitResult>>> = if parallel_cpu_windows {
+            (next_split..end)
+                .into_par_iter()
+                .map(&evaluate_window)
+                .collect()
+        } else {
+            vec![evaluate_window(next_split)]
+        };
+        for split in completed {
+            for (g, result) in split?.into_iter().enumerate() {
+                per_gene_splits[g].push(result);
+            }
         }
+        check_cancel()?;
+        next_split = end;
     }
 
-    // Each gene's splits are pushed in ascending split order (the `for i` loop is
-    // sequential), matching the single-gene path's post-sort invariant. Reduce
-    // through the SHARED summarizer so the aggregation is byte-identical.
+    // Reduce in the original gene/split order: neither floating-point sums nor
+    // causal bar order inside an individual backtest depend on scheduling.
     Ok(per_gene_splits
         .into_iter()
         .map(summarize_walkforward_splits)
@@ -2187,8 +2345,45 @@ mod tests {
         (selection, holdout)
     }
 
+    fn strict_validation_scope_with_role(
+        role: CanonicalSearchWindowRoleV1,
+    ) -> CanonicalSearchArtifactScopeV2 {
+        let (_, scope) = strict_validation_scopes();
+        let original = scope.evaluated_window();
+        let window = crate::data_selection::CanonicalSearchEvaluatedWindowV1::new(
+            role,
+            original.row_start(),
+            original.row_end(),
+            original.timestamp_start_ms(),
+            original.timestamp_end_ms(),
+        )
+        .expect("same exact rows and timestamps with an explicit semantic role");
+        CanonicalSearchArtifactScopeV2::new(scope.receipt().clone(), window)
+            .expect("receipt-bound validation role fixture")
+    }
+
+    #[test]
+    fn held_out_artifact_admission_rejects_all_non_validation_roles() {
+        for role in [
+            CanonicalSearchWindowRoleV1::DiscoveryInput,
+            CanonicalSearchWindowRoleV1::InSample,
+            CanonicalSearchWindowRoleV1::WalkForwardTrain,
+            CanonicalSearchWindowRoleV1::WalkForwardValidation,
+            CanonicalSearchWindowRoleV1::ForwardTest,
+            CanonicalSearchWindowRoleV1::LiveSimulation,
+            CanonicalSearchWindowRoleV1::PropFirmRisk,
+        ] {
+            let scope = strict_validation_scope_with_role(role);
+            assert!(
+                validate_holdout_scope(&scope, "test artifact").is_err(),
+                "{role:?}"
+            );
+        }
+    }
+
     fn flat_settings() -> BacktestSettings {
         BacktestSettings {
+            initial_equity_override: None,
             sl_pips: 1_000_000.0,
             tp_pips: 1_000_000.0,
             max_hold_bars: 1,
@@ -2237,6 +2432,7 @@ mod tests {
             &high,
             &low,
             &signals,
+            &[],
             &days,
             &days,
             &flat_settings(),
@@ -2246,7 +2442,8 @@ mod tests {
             3,
             1,
             100_000.0,
-        );
+        )
+        .expect("explicit fixed-lot diagnostics");
 
         assert_eq!(risk.max_consec_losses, 2);
         assert!(risk.daily_loss_breach);
@@ -2420,6 +2617,39 @@ mod tests {
     }
 
     #[test]
+    fn forward_test_artifact_cannot_swap_calibration_and_final_holdout_roles() {
+        let calibration =
+            strict_validation_scope_with_role(CanonicalSearchWindowRoleV1::SelectionValidation);
+        let final_holdout = strict_validation_scope_with_role(CanonicalSearchWindowRoleV1::Holdout);
+        let gene = strict_gene();
+        for (actual, wrong_expected) in [
+            (&calibration, &final_holdout),
+            (&final_holdout, &calibration),
+        ] {
+            let artifact = ForwardTestValidationArtifactFile::new(
+                actual.clone(),
+                STRICT_SEARCH_CONFIG_HASH,
+                &gene,
+                sample_forward_test_summary(),
+            )
+            .expect("both explicit validation roles are representable");
+            let loaded = ForwardTestValidationArtifactFile::from_json_bytes(
+                &artifact
+                    .to_json_bytes()
+                    .expect("serialize exact validation role"),
+            )
+            .expect("round-trip keeps the role");
+            loaded
+                .validate_against(actual, STRICT_SEARCH_CONFIG_HASH, &gene)
+                .expect("exact role/rows/timestamps match");
+            let error = loaded
+                .validate_against(wrong_expected, STRICT_SEARCH_CONFIG_HASH, &gene)
+                .expect_err("same rows do not permit substituting calibration and final evidence");
+            assert!(error.to_string().contains("expected role/rows/timestamps"));
+        }
+    }
+
+    #[test]
     fn forward_test_artifact_rejects_wrong_kind_and_unsupported_schema() {
         let (_, scope) = strict_validation_scopes();
         let gene = strict_gene();
@@ -2504,6 +2734,7 @@ mod tests {
             high: &high,
             low: &low,
             signals: &signals,
+            confidences: &[],
             months: &months,
             days: &days,
             timestamps: &timestamps,
@@ -2527,6 +2758,7 @@ mod tests {
             high: &bad_high,
             low: &close,
             signals: &signals,
+            confidences: &[],
             months: &months,
             days: &days,
             timestamps: &[],
@@ -2540,6 +2772,7 @@ mod tests {
             high: &[],
             low: &[],
             signals: &[],
+            confidences: &[],
             months: &[],
             days: &[],
             timestamps: &[],
@@ -2798,6 +3031,45 @@ mod tests {
     }
 
     #[test]
+    fn prop_firm_artifact_cannot_swap_calibration_and_final_holdout_roles() {
+        let calibration =
+            strict_validation_scope_with_role(CanonicalSearchWindowRoleV1::SelectionValidation);
+        let final_holdout = strict_validation_scope_with_role(CanonicalSearchWindowRoleV1::Holdout);
+        let gene = strict_gene();
+        let trades = sample_prop_firm_trades();
+        let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
+            trades: &trades,
+            initial_balance: 100_000.0,
+            rules: PropFirmRiskRules::default(),
+        });
+        for (actual, wrong_expected) in [
+            (&calibration, &final_holdout),
+            (&final_holdout, &calibration),
+        ] {
+            let artifact = PropFirmRiskValidationArtifactFile::new(
+                actual.clone(),
+                STRICT_SEARCH_CONFIG_HASH,
+                &gene,
+                summary.clone(),
+            )
+            .expect("both explicit validation roles are representable");
+            let loaded = PropFirmRiskValidationArtifactFile::from_json_bytes(
+                &artifact
+                    .to_json_bytes()
+                    .expect("serialize exact validation role"),
+            )
+            .expect("round-trip keeps the role");
+            loaded
+                .validate_against(actual, STRICT_SEARCH_CONFIG_HASH, &gene)
+                .expect("exact role/rows/timestamps match");
+            let error = loaded
+                .validate_against(wrong_expected, STRICT_SEARCH_CONFIG_HASH, &gene)
+                .expect_err("same rows do not permit substituting calibration and final evidence");
+            assert!(error.to_string().contains("expected role/rows/timestamps"));
+        }
+    }
+
+    #[test]
     fn prop_firm_risk_artifact_rejects_wrong_kind_and_unsupported_schema() {
         let (_, scope) = strict_validation_scopes();
         let gene = strict_gene();
@@ -2910,6 +3182,423 @@ mod risk_diagnostics_split_tests {
 #[cfg(test)]
 mod window_evaluation_tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    fn account_policy() -> BacktestSettings {
+        BacktestSettings {
+            initial_equity_override: Some(10_000.0),
+            pip_value: 1.0,
+            pip_value_per_lot: 100.0,
+            sl_pips: 10.0,
+            tp_pips: 20.0,
+            spread_pips: 0.0,
+            commission_per_trade: 0.0,
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
+            risk_based_sizing: true,
+            risk_per_trade_min: 0.01,
+            risk_per_trade_max: 0.02,
+            high_quality_confidence: 1.0,
+            kill_zones_enabled: true,
+            ..BacktestSettings::default()
+        }
+    }
+
+    fn with_two_cpu_workers<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+        use neoethos_core::execution::BudgetedCpuExecutor;
+        use neoethos_core::execution_budget::{CpuPermitBroker, CpuPermitRequest, WorkerLimit};
+        let width = WorkerLimit::new(2).unwrap();
+        let broker = CpuPermitBroker::new(width);
+        let executor = BudgetedCpuExecutor::new_for_broker(broker.clone(), width);
+        let lease = broker.acquire(CpuPermitRequest::local(width)).unwrap();
+        executor.execute(lease.into_transfer(), work).unwrap()
+    }
+
+    // Real fixed/adaptive ledger producers, twenty unchanged chronological
+    // windows, no production authority bypass or machine-headroom dependency.
+    fn population_windows<Before, Admit, Cancel>(
+        parallel: bool,
+        before: Before,
+        admit: Admit,
+        cancel: Cancel,
+    ) -> Result<Vec<WalkforwardSummary>>
+    where
+        Before: Fn(usize) -> Result<()> + Sync,
+        Admit: FnMut(usize, usize) -> Result<usize>,
+        Cancel: Fn() -> Result<()> + Sync,
+    {
+        use chrono::{Datelike, TimeZone};
+        let n = 20_000;
+        let first = chrono::Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+        let timestamps: Vec<_> = (0..n)
+            .map(|i| first.timestamp_millis() + i as i64 * 1_800_000)
+            .collect();
+        let days: Vec<_> = timestamps
+            .iter()
+            .map(|ts| ts.div_euclid(86_400_000))
+            .collect();
+        let months: Vec<_> = timestamps
+            .iter()
+            .map(|ts| chrono::Utc.timestamp_millis_opt(*ts).unwrap().month0() as i64)
+            .collect();
+        let close: Vec<_> = (0..n).map(|i| 100.0 + (i % 50) as f64).collect();
+        let high: Vec<_> = close.iter().map(|x| x + 1.0).collect();
+        let low: Vec<_> = close.iter().map(|x| x - 1.0).collect();
+        let signals: Vec<Vec<i8>> = (0..2)
+            .map(|g| {
+                (0..n)
+                    .map(|i| if (i + g * 5) % 50 < 25 { 1 } else { -1 })
+                    .collect()
+            })
+            .collect();
+        let confidences = vec![vec![0.75; n], vec![0.5; n]];
+        let mut adaptive = account_policy();
+        adaptive.adaptive_vol_mult = 1.0;
+        let settings = [account_policy(), adaptive];
+        embargoed_walkforward_population_with_admission(
+            WalkforwardPopulationInput {
+                close: &close,
+                high: &high,
+                low: &low,
+                months: &months,
+                days: &days,
+                timestamps: &timestamps,
+                train_ratio: 0.7,
+                n_splits: 20,
+                embargo_bars: 5,
+                gene_settings: &settings,
+                confidences_per_gene: &confidences,
+                adaptive_pip: 1.0,
+                max_daily_loss_pct: 0.1,
+                max_daily_profit_pct: 1.0,
+                min_trading_days: 1,
+                max_trades_per_day: 100,
+                initial_balance: 10_000.0,
+            },
+            &signals,
+            parallel,
+            |start, end| {
+                before(start / 1000)?;
+                let mut metrics = Vec::new();
+                let mut trades = Vec::new();
+                for g in 0..2 {
+                    let policy = settings_for_walkforward_window(
+                        &settings[g],
+                        &high[start..end],
+                        &low[start..end],
+                        &close[start..end],
+                    )?;
+                    if g == 1 {
+                        assert!(policy.adaptive_base_pips.is_some());
+                    }
+                    let (row, ledger) = evaluate_strategy_with_confidence_and_ledger_core(
+                        &close[start..end],
+                        &high[start..end],
+                        &low[start..end],
+                        &signals[g][start..end],
+                        &confidences[g][start..end],
+                        &months[start..end],
+                        &days[start..end],
+                        &timestamps[start..end],
+                        &policy,
+                    )?;
+                    metrics.push(row);
+                    trades.push(ledger);
+                }
+                Ok(WindowEvaluation {
+                    metrics,
+                    trades: Some(trades),
+                })
+            },
+            admit,
+            cancel,
+        )
+    }
+
+    #[test]
+    fn cpu_walkforward_windows_overlap_and_preserve_all_twenty_ordered_results() {
+        with_two_cpu_workers(|| {
+            let serial = population_windows(
+                false,
+                |_| Ok(()),
+                |_, _| panic!("native admission"),
+                || Ok(()),
+            )
+            .unwrap();
+            let arrivals = (Mutex::new(0usize), Condvar::new());
+            let visited = Mutex::new(Vec::new());
+            let mut admissions = Vec::new();
+            let parallel = population_windows(
+                true,
+                |split| {
+                    visited.lock().unwrap().push(split);
+                    if split < 2 {
+                        let mut count = arrivals.0.lock().unwrap();
+                        *count += 1;
+                        arrivals.1.notify_all();
+                        let (count, timeout) = arrivals
+                            .1
+                            .wait_timeout_while(count, Duration::from_secs(5), |count| *count < 2)
+                            .unwrap();
+                        assert!(
+                            !timeout.timed_out() && *count == 2,
+                            "two admitted callbacks must overlap"
+                        );
+                    }
+                    Ok(())
+                },
+                |rows, remaining| {
+                    assert_eq!(rows, 295 * 2, "charge every candidate in the window");
+                    admissions.push(remaining);
+                    // Exercise changing headroom without altering split coverage.
+                    Ok(if admissions.len() % 2 == 0 {
+                        1
+                    } else {
+                        usize::MAX
+                    })
+                },
+                || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(parallel, serial);
+            assert_eq!(
+                serde_json::to_vec(&parallel).unwrap(),
+                serde_json::to_vec(&serial).unwrap()
+            );
+            assert!(admissions.windows(2).all(|pair| pair[0] - pair[1] <= 2));
+            let mut visited = visited.into_inner().unwrap();
+            visited.sort_unstable();
+            assert_eq!(visited, (0..20).collect::<Vec<_>>());
+            assert_eq!(parallel.len(), 2);
+            for gene in parallel {
+                assert_eq!(gene.walk_forward_splits, 20);
+                assert_eq!(
+                    gene.splits.iter().map(|s| s.split).collect::<Vec<_>>(),
+                    (1..=20).collect::<Vec<_>>()
+                );
+                assert!(gene.splits.iter().any(|s| s.trades > 0));
+            }
+        });
+    }
+
+    #[test]
+    fn cpu_walkforward_window_admission_refuses_without_dropping_candidates() {
+        with_two_cpu_workers(|| {
+            let serial = population_windows(
+                false,
+                |_| Ok(()),
+                |_, _| panic!("serial provider must bypass CPU window admission"),
+                || Ok(()),
+            )
+            .unwrap();
+            let active = AtomicUsize::new(0);
+            let single = population_windows(
+                true,
+                |_| {
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |_, _| Ok(1),
+                || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(serial, single);
+            for zero_width in [true, false] {
+                let error = population_windows(
+                    true,
+                    |_| panic!("no admitted callback"),
+                    |_, _| {
+                        if zero_width {
+                            Ok(0)
+                        } else {
+                            bail!("synthetic insufficient headroom")
+                        }
+                    },
+                    || Ok(()),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains(if zero_width {
+                    "zero width"
+                } else {
+                    "insufficient headroom"
+                }));
+            }
+        });
+    }
+
+    #[test]
+    fn cpu_walkforward_window_errors_join_and_return_the_earliest_split() {
+        with_two_cpu_workers(|| {
+            let second_finished = (Mutex::new(false), Condvar::new());
+            let finished = AtomicUsize::new(0);
+            let error = population_windows(
+                true,
+                |split| {
+                    assert!(split < 2, "failure must not admit a subsequent wave");
+                    if split == 0 {
+                        let done = second_finished.0.lock().unwrap();
+                        let (done, timeout) = second_finished
+                            .1
+                            .wait_timeout_while(done, Duration::from_secs(5), |done| !*done)
+                            .unwrap();
+                        assert!(!timeout.timed_out() && *done);
+                    } else {
+                        *second_finished.0.lock().unwrap() = true;
+                        second_finished.1.notify_all();
+                    }
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    bail!("window-{split}")
+                },
+                |_, _| Ok(2),
+                || Ok(()),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "window-0");
+            assert_eq!(
+                finished.load(Ordering::SeqCst),
+                2,
+                "all admitted callbacks joined"
+            );
+        });
+    }
+
+    #[test]
+    fn cpu_walkforward_window_cancellation_joins_without_partial_success() {
+        with_two_cpu_workers(|| {
+            for already_cancelled in [true, false] {
+                let cancelled = AtomicBool::new(already_cancelled);
+                let started = AtomicUsize::new(0);
+                let mut admissions = 0;
+                let error = population_windows(
+                    true,
+                    |_| {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        cancelled.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    |_, _| {
+                        admissions += 1;
+                        Ok(2)
+                    },
+                    || {
+                        anyhow::ensure!(
+                            !cancelled.load(Ordering::SeqCst),
+                            "synthetic cancellation"
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.to_string(), "synthetic cancellation");
+                assert_eq!(admissions, usize::from(!already_cancelled));
+                assert!(started.load(Ordering::SeqCst) <= 2);
+                assert_eq!(started.load(Ordering::SeqCst) == 0, already_cancelled);
+            }
+        });
+    }
+
+    #[test]
+    fn walkforward_metrics_and_daily_returns_use_risk_sizing_and_real_friday_time() {
+        use chrono::TimeZone;
+        let first = chrono::Utc
+            .with_ymd_and_hms(2026, 9, 4, 13, 10, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let timestamps: Vec<_> = (0..160).map(|i| first + i * 300_000).collect();
+        let days: Vec<_> = timestamps
+            .iter()
+            .map(|ts| ts.div_euclid(86_400_000))
+            .collect();
+        let mut close = vec![100.0; 160];
+        close[82] = 105.0;
+        let high = close.clone();
+        let low = vec![100.0; 160];
+        let mut signals = vec![0; 160];
+        signals[80] = 1;
+        let mut confidences = vec![0.0; 160];
+        confidences[81] = 1.0;
+        let policy = account_policy();
+        let summary = embargoed_walkforward_backtest_core(WalkforwardBacktestInput {
+            close: &close,
+            high: &high,
+            low: &low,
+            signals: &signals,
+            confidences: &confidences,
+            months: &[0; 160],
+            days: &days,
+            timestamps: &timestamps,
+            train_ratio: 0.5,
+            n_splits: 1,
+            embargo_bars: 0,
+            settings: &policy,
+            max_daily_loss_pct: 0.1,
+            max_daily_profit_pct: 1.0,
+            min_trading_days: 1,
+            max_trades_per_day: 10,
+            initial_balance: 10_000.0,
+        })
+        .expect("one mathematical WF window, no production authority bypass");
+        // Signal at 19:50, entry 19:55, Friday close 20:00. The target at 120
+        // is never reached. 1% of 10k / (10 pips * 100 per lot) = 0.1 lot;
+        // the 5-pip close realizes 50, i.e. 0.5% of the same starting account.
+        assert_eq!(summary.walk_forward_splits, 1);
+        let split = &summary.splits[0];
+        assert_eq!(split.trades, 1);
+        assert!((split.pnl - 50.0).abs() < 1e-12);
+        assert!((split.daily_returns.iter().sum::<f64>() - 0.005).abs() < 1e-12);
+    }
+
+    #[test]
+    fn forward_test_retains_confidence_and_refuses_timestamp_free_account_replay() {
+        let close = [100.0, 100.0, 120.0];
+        let policy = account_policy();
+        let summary = compute_forward_test_summary(ForwardTestInput {
+            close: &close,
+            high: &close,
+            low: &[100.0; 3],
+            signals: &[1, 0, 0],
+            confidences: &[0.5, 0.0, 0.0],
+            months: &[0; 3],
+            days: &[0; 3],
+            timestamps: &[1, 2, 3],
+            settings: &policy,
+        })
+        .expect("forward test confidence is present");
+        // Half confidence means 1.5% risk (150), at 2R => 300 account money.
+        assert!((summary.metrics.net_profit - 300.0).abs() < 1e-9);
+        assert!(
+            compute_forward_test_summary(ForwardTestInput {
+                close: &close,
+                high: &close,
+                low: &[100.0; 3],
+                signals: &[1, 0, 0],
+                confidences: &[0.5; 3],
+                months: &[0; 3],
+                days: &[0; 3],
+                timestamps: &[],
+                settings: &policy,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn short_walkforward_window_does_not_reuse_the_full_series_adaptive_prefix() {
+        let mut policy = account_policy();
+        policy.adaptive_vol_mult = 1.0;
+        policy.adaptive_base_pips = Some(vec![999.0; 160].into());
+        let window =
+            settings_for_walkforward_window(&policy, &[101.0; 40], &[99.0; 40], &[100.0; 40])
+                .expect("too-short window retains the explicit fixed-stop fallback");
+        assert!(window.adaptive_base_pips.is_none());
+        assert_eq!(window.initial_equity(), 10_000.0);
+        assert!(window.risk_based_sizing);
+    }
 
     /// The two routes to the same diagnostics must agree, because the whole
     /// point of supplying trades is to stop computing them twice — not to

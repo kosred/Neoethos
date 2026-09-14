@@ -7,6 +7,7 @@
 pub mod artifacts;
 pub mod capabilities;
 pub mod dispatch;
+pub mod feature_input;
 pub mod hpo;
 pub mod install;
 pub mod prediction;

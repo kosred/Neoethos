@@ -148,6 +148,25 @@ impl StrictResidentPopulationExecutionRunV3 {
         }
         outcome
     }
+
+    /// Move the genuine Data-bound session into the resident generation chain.
+    /// Slice2 then owns the sole completion obligation; the borrowed Gen0
+    /// consumer and its completion wrapper remain unchanged.
+    pub(crate) fn into_resident_population_session_v3(
+        mut self,
+    ) -> Result<(
+        CanonicalGpuResidentSearchArtifactScopeV3,
+        ResidentPopulationSessionV3,
+    )> {
+        // Reuse the existing complete scope/session binding check before taking
+        // ownership. This callback neither launches nor changes the session.
+        self.with_resident_population_session_v3(|_| Ok(()))?;
+        let session = self
+            .session
+            .take()
+            .context("resident Search has no population session to transfer")?;
+        Ok((self.scope, session))
+    }
 }
 
 fn hex_lower(bytes: [u8; 32]) -> String {
@@ -167,6 +186,14 @@ pub(crate) fn validate_strict_resident_feature_store_v3(
     scope
         .validate()
         .context("validate canonical GPU-resident Search V3 scope")?;
+    let anchor = scope
+        .receipt()
+        .validate()
+        .context("validate canonical GPU-resident receipt anchor before store binding")?;
+    scope
+        .receipt()
+        .validate_against_store(&anchor, sealed_store)
+        .context("bind exact canonical plan and fitted state to the sealed Data store")?;
     let scope_rows = scope
         .evaluated_window()
         .row_end()
@@ -237,6 +264,11 @@ pub(crate) fn bind_resident_feature_store_v3(
     scope
         .validate()
         .context("validate canonical GPU-resident Search V3 scope")?;
+    // Data's portable metadata is no longer present in the raw import. Legacy
+    // opaque receipts remain readable, but cannot authorize a new native run.
+    if scope.receipt().feature_plan_canonical_bytes().is_none() {
+        bail!("resident V3 import requires a retained canonical feature plan");
+    }
     let scope_rows = scope
         .evaluated_window()
         .row_end()

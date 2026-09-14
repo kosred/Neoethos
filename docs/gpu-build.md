@@ -1,117 +1,149 @@
-# Building NeoEthos for full GPU support (discovery GA + ML training)
+# CUDA builds, GPU residency, and verification
 
-The code has GPU support for **both** the discovery GA (the cubecl `cubecl_eval`
-kernel in `neoethos-search`) **and** ML training (burn deep models + the
-gradient boosters). The CPU-only default build **ignores all of it** — you must
-build with the right features + the right toolchain present, or everything
-silently runs on CPU and never finishes on big data (M1 base = ~5M bars).
+CUDA is the active accelerator route. Vulkan/WGPU is retired; ROCm/HIP is not
+a connected production backend. This guide describes build capabilities and
+remaining runtime boundaries, not a claim of complete GPU readiness.
 
-This is the canonical recipe. It was hard-won — read the gotchas.
+## Hardware coverage
 
-## TL;DR — the build that puts (almost) everything on the GPU
+GeForce RTX 30, RTX 40, and RTX 50 use compute capabilities 8.6, 8.9, and 12.0,
+respectively. A native release can include all three exact targets:
+`86;89;120`. This also covers listed workstation cards with those capabilities.
+It does not promise compatibility with an unknown future architecture. See
+[NVIDIA's current GPU table](https://developer.nvidia.com/cuda/gpus).
 
-```bash
-# Prereqs (one-time, see "Prerequisites" below): NVIDIA driver + CUDA toolkit
-# (nvcc) + Boost dev + Vulkan loader. On the 2×A6000 VPS these are present.
-cd ~/Neoethos
-source $HOME/.cargo/env
-export PATH="/usr/local/cuda-12.2/bin:$HOME/.cargo/bin:$PATH"   # nvcc on PATH
-export CUDA_HOME=/usr/local/cuda-12.2
-export LD_LIBRARY_PATH="/usr/local/cuda-12.2/lib64:$PWD/target/release/deps:$PWD/target/release:${LD_LIBRARY_PATH:-}"
+The amount of work admitted must depend on the selected device's free VRAM,
+dataset shape and allocator limits, not its marketing name. Supporting an
+architecture does not imply identical model sizes, speed or numerical parity
+on every card. A matching driver is needed for execution, not for offline
+compilation with an explicit supported architecture.
 
-cargo build --release -p neoethos-cli --features "gpu-vulkan,neoethos-models/gpu-cuda"
+## Local compilation without a card
+
+Use the repository's pinned Rust toolchain, a supported host C++ compiler, and
+a compatible CUDA toolkit with `nvcc`, headers, link libraries and `cuobjdump`.
+Official [Windows installation guidance](https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html)
+also describes toolkit components; a driver installation is not required
+merely to prepare CUDA objects.
+
+The currently locked `cudarc 0.19.9` build script recognizes CUDA through 13.3.
+CUDA 13.4 can compile native NeoEthos units, but its successful version response
+is rejected by that dependency's automatic version detector. A separate 13.3
+toolkit avoids changing the dependency graph or mislabeling compiler versions.
+
+Example process-local PowerShell environment; replace the toolkit path:
+
+```powershell
+$taskCuda = 'C:\toolchains\cuda-13.3'
+$env:CUDA_PATH = $taskCuda
+$env:CUDA_HOME = $taskCuda
+$env:PATH = (Join-Path $taskCuda 'bin') + ';' + $env:PATH
+$env:CUDACXX = Join-Path $taskCuda 'bin\nvcc.exe'
+$env:CUDAOBJDUMP = Join-Path $taskCuda 'bin\cuobjdump.exe'
+$env:CUOBJDUMP = $env:CUDAOBJDUMP
+$env:NEOETHOS_CUDA_BUILD_MODE = 'cross_release_explicit'
+$env:NEOETHOS_CUDA_ARCHS = '86;89;120'
 ```
 
-This combination is deliberate (see "Why this exact feature combo"):
-- **`gpu-vulkan`** → search GA kernel on **Vulkan/wgpu** (no libtorch) **and** the
-  burn deep models on **Vulkan/wgpu** (`burn-wgpu`).
-- **`neoethos-models/gpu-cuda`** → lightgbm / catboost / candle(dqn) / cubecl
-  (neat, statistical) on **CUDA**.
+The native build policy rejects legacy `CUDA_ARCHS`, free-form flags and
+ambiguous compiler authorities. Leave `NVCC`, `NVCC_ARGS`, `CUDA_FILTER`,
+`CUDA_KERNEL_DIR`, `DOCS_RS` and other legacy CUDA overrides unset.
+The repository builder selects the conforming MSVC preprocessor explicitly.
+Do not suppress CCCL diagnostics or enable fast math to make a build pass.
 
-### What runs where with this build
-| On GPU (A6000) | On CPU |
+Compile the full default workspace first, then the independently gated CUDA
+surfaces; these commands compile tests but do not execute them:
+
+```text
+cargo test --locked --workspace --all-targets --no-run --features neoethos-trader/ml-blend,tauri/custom-protocol --jobs 2
+cargo test --locked -p neoethos-models --no-default-features --features neuro-evolution-gpu,statistical-gpu,burn-cuda-backend --lib --no-run --jobs 2
+cargo test --locked -p neoethos-search -p neoethos-gpu-cuda --features neoethos-search/gpu-cuda --all-targets --no-run --jobs 2
+```
+
+Use `--offline` when dependencies are already cached. Reuse the generated
+test executables for selected hardware-independent tests instead of rebuilding
+for every filter. Native-linked tests may still need driver DLLs just to load;
+a linked executable is not evidence of successful test execution.
+
+## Feature boundaries
+
+| Feature | Compiled surface; not automatic runtime acceptance |
 |---|---|
-| Discovery GA kernel (Vulkan/cubecl-wgpu) | xgboost / xgboost_rf / xgboost_dart (the `xgb` crate has no GPU build wired here) |
-| burn deep models: mlp, kan, tabnet, nbeats, nbeatsx_nf, tide, tide_nf, transformer, patchtst, timesnet (Vulkan/burn-wgpu) | sklears_tree |
-| lightgbm, catboost, catboost_alt (CUDA) | a few custom CPU-only: online_pa/hoeffding, meta_blender/stack, probability_calibrator, conformal_gate |
-| dqn / candle / rlkit (CUDA) | |
-| neat, statistical (cubecl) | |
+| Search `gpu-b-adapter` | Rust adapter with explicit no-CUDA stub |
+| Search `gpu-b-native` | Native CUDA archive and vector-ta cubins |
+| Search `gpu-cuda` | Native CUDA, vector-ta and CubeCL |
+| Models `neuro-evolution-gpu,statistical-gpu,burn-cuda-backend` | Evolutionary, statistical and Burn CUDA paths without tree/RL CUDA builds |
+| CLI `gpu-nvidia-full` | Broad Search/Models CUDA aggregate, including Burn explicitly |
 
-## Prerequisites
+Generated CUDA MLP configurations use `capacity_mode=auto`: actual input rows,
+full validation rows and live free VRAM determine the admitted hidden-width
+range. HPO explores `capacity_fraction` within that range instead of reusing
+the old fixed width catalogue. The effective width is saved with the model;
+loading does not resize its weights for a different card. An explicit user
+`hidden_dim` override selects fixed capacity unless auto was explicitly chosen.
+CPU configuration is unchanged. This is an MLP-specific implementation, not
+automatic scaling of every neural/tree/RL family. Its training-memory estimate
+includes optimizer/validation work and headroom, but is not a hard allocator
+reservation against competing processes.
 
-| Component | Why | Check |
-|---|---|---|
-| NVIDIA driver | the GPUs | `nvidia-smi` |
-| **CUDA toolkit (`nvcc`)** matching the runtime (e.g. 12.2) | compiles `lightgbm3/cuda`, `candle-core/cuda`, `cubecl/cuda` | `nvcc --version` — **may already be installed but off PATH** (`/usr/local/cuda-12.2/bin/nvcc`). Add it to PATH, don't reinstall. `apt-get install -y cuda-toolkit-12-2` if truly absent. |
-| **Boost dev** (`libboost-dev libboost-filesystem-dev libboost-system-dev`) | LightGBM's GPU/CUDA cmake build requires it | `ls /usr/include/boost/filesystem.hpp` |
-| Vulkan loader (`libvulkan.so`) + the GPU visible to Vulkan | `gpu-vulkan` (wgpu) backend for the GA + burn models | `vulkaninfo --summary | grep deviceName` should list the NVIDIA card |
+The admitted range also respects the training plan's memory budget. Existing
+sealed handoffs keep their original budget; mixed-device plans currently use
+the smallest detected device. Moving such a plan to a larger card does not
+automatically enlarge that authority. Replanning for the selected device is
+required before claiming that the additional VRAM is available to the trial.
 
-## Why this exact feature combo (the gotchas)
+The broad aggregate has additional native dependencies. In particular, the
+current LightGBM builder does not produce a CUDA learner on Windows. Do not
+claim all-model CUDA readiness from a Windows aggregate build. Validate the
+intended Linux deployment and each selected family separately.
 
-1. **`burn` deep models only GPU via `burn-wgpu` (= `gpu-vulkan`).** There is no
-   wired burn-CUDA/burn-tch backend in this repo (`burn_models.rs` gates the GPU
-   backend on `#[cfg(feature = "burn-wgpu-backend")]` only). So **`gpu-cuda`
-   alone leaves every deep model on CPU.** You need `gpu-vulkan` for them.
+The pinned native Discovery orchestration is currently Linux-gated. Its
+research wiring is Generation-0-only for admitted legacy objectives; current
+goal-bound Risky runs remain explicitly refused pending versioned native
+support. The production prepared-discovery entry point also refuses an
+unintegrated full native pipeline. A successful build must not remove these
+boundaries.
 
-2. **~~Keep `search` on Vulkan to avoid libtorch.~~ OBSOLETE — no crate in this
-   workspace depends on libtorch any more.** This section used to say that
-   `neoethos-search/gpu-cuda` pulls `dep:tch` (~2 GB, no auto-download) and that
-   you should therefore build `--features "gpu-vulkan,neoethos-models/gpu-cuda"`
-   instead of the bundled `gpu-cuda`. Commit `d4df966a` dropped the `dep:tch`
-   from `neoethos-search`, and batch D4 (2026-08-09) removed the `tch` feature
-   and dependency from `neoethos-models`, so the workaround now steers a CUDA
-   operator onto a Vulkan search lane for a reason that no longer exists.
-   `gpu-cuda` can be used directly for search. (`tch` / `torch-sys` survive in
-   `Cargo.lock` only as optional deps of `burn-tch`, a burn backend no feature
-   in this workspace enables — they are never built or linked.)
+## What GPU end-to-end means here
 
-3. **Drop lightgbm's OpenCL path — keep CUDA.** `neoethos-models/gpu-cuda`
-   originally pulled BOTH `lightgbm3/gpu` (OpenCL) and `lightgbm3/cuda`. The
-   OpenCL path fails to LINK (`mold: undefined symbol: clReleaseProgram`) because
-   `-lOpenCL` isn't emitted. We want CUDA anyway, so `lightgbm3/gpu` is removed
-   from the `gpu-cuda` feature in `crates/neoethos-models/Cargo.toml` (keep
-   `lightgbm3/cuda`). If you re-add OpenCL, you must also link `-lOpenCL`.
+Keep the large feature store, candidate population, indicator intermediates,
+backtest state and model tensors on the selected GPU across repeated work.
+Transfer compact control inputs and final metrics/artifacts, not entire
+matrices after every generation. Uploading a dataset once per evaluation call
+is not the same as retaining it across an entire evolutionary run.
 
-4. **Runtime env.** At RUN time (not just build) the process needs
-   `LD_LIBRARY_PATH` to include `target/release/deps` (the LightGBM `.so`
-   sidecar) and `/usr/local/cuda-12.2/lib64`. The `cli` reads
-   `enable_gpu_preference: auto` + `tree_device_preference: gpu` from
-   `config.yaml`; with a GPU build these route work to the cards (a CPU-only
-   build ignores them — that is the trap).
+Parallelize independent candidates, scenarios, folds and model work within
+measured memory/compute limits. Preserve chronological price/fill/ledger
+ordering inside each individual backtest. Large independent batches can
+occupy the GPU without violating that causality. More simultaneous streams
+are not automatically faster when memory bandwidth or registers are saturated.
 
-## Simpler alternative: `gpu-vulkan` only (no nvcc, no Boost)
+CPU orchestration, disk/network ingestion, UI and artifact persistence remain
+host responsibilities. The performance objective is to remove repeated
+host/device transfer and host computation from the heavy inner loop, not to
+claim that all operating-system work runs on a graphics card.
+[NVIDIA's optimization guidance](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html)
+prioritizes measured hotspots, data residency and sufficient parallel work.
 
-If you don't need the gradient boosters on the GPU (they are fast on a many-core
-CPU), this single feature already puts the **heavy** compute on the cards and
-needs **no CUDA toolkit / Boost / OpenCL**:
+## Acceptance on real hardware
 
-```bash
-cargo build --release -p neoethos-cli --features gpu-vulkan
-```
-→ GA kernel (Vulkan) + all burn deep models (Vulkan) on the A6000. boosters on CPU.
+Record the exact commit/source hashes, toolkit, driver, device, dataset,
+timeframe, seeds, population, candidate/fold counts, model shape and risk mode.
+Measure the same complete workload on CPU and CUDA. Account for preparation,
+transfers, kernel work, validation and artifact writing; report warm-up/JIT
+separately rather than silently excluding it.
 
-## Verifying it actually used the GPU
+Require actual kernel traces, host/device transfer bytes and time, launch gaps,
+occupancy/resource limits and peak memory. An allocated CUDA context, a
+nonzero VRAM reading, a source-contract test or a compile result is not GPU
+execution evidence. Use Nsight Systems for timeline/transfer attribution and
+Nsight Compute for kernel resource/throughput analysis.
 
-`nvidia-smi` **utilization** can read 0% even when the GPU is in use (small
-models train in milliseconds between samples). Trust **memory**: a burn model on
-the card shows **hundreds of MiB** allocated (vs ~1 MiB idle):
-```bash
-nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
-# 0, 0 %, 313 MiB   ← wgpu/Vulkan context + model on GPU 0 (PROOF)
-```
-The training log also shows `Burn training: N train, ...` (burn deep model) and,
-for the GA, the cubecl client init.
+Check trading math against independent known outcomes as well as CPU/GPU
+comparison. Preserve precision-sensitive indicators and financial arithmetic;
+do not replace them with lower precision merely to increase utilization.
+Model-family precision and tolerances need their own recorded acceptance.
 
-## Known limits / costs
-
-- **GA discovery on GPU OOMs for M1.** The signal/backtest buffer is
-  `population × series_rows × 8 B`. On a 46 GB A6000 that fits up to ~M5
-  (~800 k rows × pop 4000 ≈ 25 GB); **M1 (~5M rows × 4000 ≈ 160 GB) OOMs** →
-  run M1 *discovery* on CPU (or chunk it). M1 *training* is fine (batched).
-- **`hmm_regime` is inference-only**, not orchestrator-trainable — do NOT list
-  it in `models.ml_models` or `train` hard-fails the whole plan. The trainable
-  set is `runtime/capabilities.rs::model_capability` (returns `Some`).
-- **Per-combo full-dataset reload.** Each `train`/`discover` invocation reloads
-  the symbol's whole dataset (incl. M1's 5M bars) — ~minutes of I/O per combo.
-  This dominates wall-clock more than CPU-vs-GPU on the boosters; a future
-  optimization is to group a symbol's timeframes into one process.
+Only after this evidence can a speedup or larger supported workload be claimed.
+Hours-to-minutes is an end-to-end benchmark target, not a guarantee inferred
+from CUDA-core count.

@@ -41,10 +41,17 @@ fn main() {
 
     // CMake
     let mut cfg = Config::new(&lgbm_root);
-    let cfg = cfg
-        .profile("Release")
-        .cxxflag("-std=c++14")
-        .define("BUILD_STATIC_LIB", "ON");
+    let cfg = cfg.profile("Release").define("BUILD_STATIC_LIB", "ON");
+    if target.ends_with("-msvc") {
+        // cmake-rs supplies CMAKE_CXX_FLAGS, replacing CMake's default /EHsc.
+        // LightGBM throws C++ exceptions internally; intermediate RAII objects
+        // must be destroyed before its C API catches and translates the error.
+        // The upstream CMake project owns the C++ standard on MSVC, which
+        // ignores the GCC-style -std=c++14 flag used on the other targets.
+        cfg.cxxflag("/EHsc");
+    } else {
+        cfg.cxxflag("-std=c++14");
+    }
     #[cfg(target_os = "windows")]
     let cfg = cfg.generator("NMake Makefiles");
     #[cfg(not(feature = "openmp"))]

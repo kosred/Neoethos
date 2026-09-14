@@ -19,6 +19,11 @@
 
 use std::path::Path;
 
+pub use crate::quote_signal_replay::{
+    CanonicalSignalQuoteLaneV1, CanonicalSignalQuoteOutcomeV1,
+    replay_canonical_signal_quote_lane_v1, replay_locked_canonical_signal_portfolio_v3,
+};
+
 use anyhow::Context;
 
 use crate::contracts::{LiveBar, PortfolioEntry, StrategySource, TradeMode};
@@ -100,22 +105,19 @@ fn common_warnings(cfg: &EngineConfig) -> Vec<String> {
          no rejections, no requotes."
             .to_string(),
     );
-    // TRAILING (audit #227). Until 2026-08-10 this warning was unconditional
-    // and correct: the replay had no break-even move anywhere in the crate. It
-    // now models the same trail discovery and live read from
-    // `models.exit_policy`, so the warning fires only when the run genuinely
-    // ran without one — and an ARMED run still says which geometry it used,
-    // because "trailing on" is not one behaviour, it is four numbers.
+    // TRAILING (audit #227). Real portfolio/blend replay pins this value from
+    // the v4 live-portfolio artifact; standalone stub replay may still receive
+    // it from the caller's config. An ARMED run says which exact geometry it
+    // used, because "trailing on" is not one behaviour, it is four numbers.
     match &cfg.trailing {
         None => w.push(
             "TRAILING: no break-even move and no trailing stop in this run. If \
-             models.exit_policy.trailing_enabled is ON, or the symbol has no pip size in the \
-             metadata table, this run does NOT model the exit the live loop and the GA \
-             evaluator apply."
+             the strategy artifact enables trailing, this run does NOT model the exit the live \
+             loop and the GA evaluator apply."
                 .to_string(),
         ),
         Some(t) => w.push(format!(
-            "TRAILING: armed from models.exit_policy — break-even at +{:.2}R, stop trailed at \
+            "TRAILING: armed from the replay's pinned policy — break-even at +{:.2}R, stop trailed at \
              {:.2}x the position's own stop distance, minimum lock {:.1} pips (pip {:.5}). The \
              stop is tested BEFORE the take-profit on every later bar, so this run's payoff is \
              capped the same way the search's is.",
@@ -242,37 +244,46 @@ pub fn replay_portfolio_from_dir(
             portfolio_path.as_ref().display()
         );
     }
-    // Fail loud: we can only reproduce normalization-OFF discovery for now (the
-    // per-column normalization stats aren't persisted yet — design §6.1). Trading
-    // on mismatched features would be silently wrong.
-    if artifact.normalize_features {
-        anyhow::bail!(
-            "live portfolio '{}' was produced with feature normalization ON, but the per-column \
-             normalization stats are not persisted yet, so the trader cannot reproduce the exact \
-             feature values. Re-run discovery with feature normalization OFF (the default), or \
-             wait for the manifest-stats follow-up.",
-            artifact.symbol
-        );
-    }
-
     let data_dir = data_dir.as_ref();
+    // Reopen the immutable generations from the v2 artifact itself. A current
+    // symbol/timeframe publication is not an acceptable substitute. The loader
+    // replays the saved Search fit, when present, rather than fitting this data.
+    let exact_input = artifact.load_exact_search_input(data_dir)?;
+    let pip_size = broker_truth
+        .exact_pip_size_v1(&artifact.symbol)
+        .map_err(anyhow::Error::new)?;
+    replay_portfolio_features(
+        &artifact,
+        exact_input.features(),
+        exact_input.base_frame().ohlcv(),
+        cfg,
+        pip_size,
+    )
+}
+
+// The loaded-frame consumer is shared with bounded offline regressions. The
+// public entry point above still requires broker truth before any artifact or
+// dataset load; this private seam neither grants nor bypasses that capability.
+fn replay_portfolio_features(
+    artifact: &neoethos_search::LivePortfolioArtifact,
+    features: &neoethos_data::FeatureFrame,
+    base_ohlcv: &neoethos_data::Ohlcv,
+    cfg: EngineConfig,
+    pip_size: f64,
+) -> anyhow::Result<EngineStats> {
     let symbol = artifact.symbol.clone();
     let base_tf = artifact.base_tf.clone();
-
-    // Reopen the immutable generations from the v2 artifact itself. A current
-    // symbol/timeframe publication is not an acceptable substitute.
-    let exact_input = artifact.load_exact_search_input(data_dir)?;
-    let base_ohlcv = exact_input.base_frame().ohlcv();
+    anyhow::ensure!(
+        !artifact.genes.is_empty(),
+        "live portfolio has no genes to trade"
+    );
     if base_ohlcv.is_empty() {
         anyhow::bail!("no base bars for {symbol} {base_tf}");
     }
 
-    // Rebuild the SAME multi-TF feature cube discovery used, then project onto the
-    // genes' effective feature set (parity by reusing discovery's exact code).
-    let aligned = neoethos_search::project_features_to_effective(
-        exact_input.features(),
-        &artifact.effective_feature_names,
-    )?;
+    // Matching names alone do not prove matching numeric inputs: check the
+    // complete artifact and frozen fit/feature plan before projecting the genes.
+    let aligned = artifact.project_live_features(features)?;
 
     if aligned.n_samples() != base_ohlcv.len() {
         anyhow::bail!(
@@ -287,9 +298,11 @@ pub fn replay_portfolio_from_dir(
     // bar's own bracket (audit #226). Until 2026-08-09 this path called
     // `combine_gene_signals`, threw the genes' stops away, and replayed them
     // behind a 0.5 %-of-price synthetic stop.
-    let pip_size = broker_truth
-        .exact_pip_size_v1(&symbol)
-        .map_err(anyhow::Error::new)?;
+    let mut cfg = cfg;
+    cfg.pin_artifact_exit_policy(artifact.live_trading_policy.exit_policy(), pip_size)
+        .with_context(|| {
+            format!("live portfolio {symbol} {base_tf} carries an unusable sealed exit policy")
+        })?;
     let (directions, sl_pips, tp_pips) = crate::gene_signal::combine_gene_signals_with_brackets(
         &artifact.genes,
         &aligned,
@@ -318,7 +331,6 @@ pub fn replay_portfolio_from_dir(
     // and NOT "the signal went flat" or "the signal reversed", neither of which
     // the evaluator has.
     let eval_defaults = neoethos_search::EvaluationConfig::default();
-    let mut cfg = cfg;
     if cfg.max_hold_bars.is_none() && eval_defaults.max_hold_bars > 0 {
         cfg.max_hold_bars = Some(eval_defaults.max_hold_bars as u64);
     }
@@ -364,10 +376,9 @@ pub fn replay_portfolio_from_dir(
 ///
 /// Reachable from BOTH front-ends (CLI `trader-replay --blend …`, app
 /// `/autonomous/replay`) so they produce identical [`EngineStats`] — the parity
-/// mandate. SAFETY: on ANY ensemble load/feature-contract error, or a
-/// row-count mismatch, it falls back to the gene-only path (logged) rather than
-/// trading on mis-columned ML. `blend.mode == GenesOnly` skips the ensemble
-/// entirely — byte-identical to `replay_portfolio_from_dir`.
+/// mandate. Ensemble load/feature-contract errors and row-count mismatches
+/// return an error, never a different genes-only strategy labelled as ML.
+/// `blend.mode == GenesOnly` explicitly skips the ensemble entirely.
 #[cfg(feature = "ml-blend")]
 pub fn replay_blend_from_dir(
     data_dir: impl AsRef<Path>,
@@ -377,7 +388,7 @@ pub fn replay_blend_from_dir(
     blend: crate::blend_signal::BlendConfig,
 ) -> anyhow::Result<EngineStats> {
     let broker_truth = require_broker_real_historical_replay()?;
-    use crate::blend_signal::{BlendMode, BlendedSignalEngine, MlDecision};
+    use crate::blend_signal::BlendMode;
 
     let artifact = neoethos_search::load_live_portfolio_json(&portfolio_path)?;
     if artifact.genes.is_empty() {
@@ -386,13 +397,7 @@ pub fn replay_blend_from_dir(
             portfolio_path.as_ref().display()
         );
     }
-    if artifact.normalize_features {
-        anyhow::bail!(
-            "live portfolio '{}' was produced with feature normalization ON; the trader cannot \
-             reproduce the exact feature values. Re-run discovery with normalization OFF.",
-            artifact.symbol
-        );
-    }
+    require_replay_model_input(&artifact.symbol, artifact.normalize_features, blend.mode)?;
 
     let data_dir = data_dir.as_ref();
     let symbol = artifact.symbol.clone();
@@ -404,10 +409,7 @@ pub fn replay_blend_from_dir(
         anyhow::bail!("no base bars for {symbol} {base_tf}");
     }
 
-    let aligned = neoethos_search::project_features_to_effective(
-        exact_input.features(),
-        &artifact.effective_feature_names,
-    )?;
+    let aligned = artifact.project_live_features(exact_input.features())?;
     if aligned.n_samples() != base_ohlcv.len() {
         anyhow::bail!(
             "feature/bar length mismatch for {symbol} {base_tf}: {} feature rows vs {} bars",
@@ -421,6 +423,11 @@ pub fn replay_blend_from_dir(
     let pip_size = broker_truth
         .exact_pip_size_v1(&symbol)
         .map_err(anyhow::Error::new)?;
+    let mut cfg = cfg;
+    cfg.pin_artifact_exit_policy(artifact.live_trading_policy.exit_policy(), pip_size)
+        .with_context(|| {
+            format!("live portfolio {symbol} {base_tf} carries an unusable sealed exit policy")
+        })?;
     let (directions, sl_pips, tp_pips) = crate::gene_signal::combine_gene_signals_with_brackets(
         &artifact.genes,
         &aligned,
@@ -435,60 +442,30 @@ pub fn replay_blend_from_dir(
         .count();
     let bars = ohlcv_to_livebars(base_ohlcv, &symbol, &base_tf);
 
-    // Build the ML decisions (skipped entirely in GenesOnly). On ANY error or
-    // row mismatch, fall back to the gene-only engine — never trade on
-    // mis-columned / partial ML.
-    let signal_engine = if matches!(blend.mode, BlendMode::GenesOnly) {
-        BlendedSignalEngine::genes_only(&symbol, directions)
-    } else {
-        let installed = neoethos_core::execution_budget::installed_process_budget()
-            .context("blend replay unavailable before the process CPU budget is installed")?;
-        let inference_lease = installed.broker().acquire(
-            neoethos_core::execution_budget::CpuPermitRequest::local(
-                installed.resolved().effective_worker_limit,
-            ),
-        )?;
-        match neoethos_models::ensemble_inference::bootstrap::role_decisions_from_feature_frame(
-            models_root.as_ref(),
-            &symbol,
-            &base_tf,
-            exact_input.features(),
-            &inference_lease,
-        ) {
-            Ok(decs) if decs.len() == base_ohlcv.len() => {
-                let ml: Vec<MlDecision> = decs
-                    .into_iter()
-                    .map(|d| MlDecision {
-                        dir_probs: d.dir_probs,
-                        regime_gate: d.regime_gate,
-                        anomaly_scale: d.anomaly_scale,
-                    })
-                    .collect();
-                BlendedSignalEngine::new(&symbol, directions, ml, blend)
-            }
-            Ok(decs) => {
-                tracing::warn!(
-                    target: "neoethos_trader::blend",
-                    symbol = %symbol,
-                    base_tf = %base_tf,
-                    ml_rows = decs.len(),
-                    bar_rows = base_ohlcv.len(),
-                    "ensemble decision row count != bars; falling back to gene-only"
-                );
-                BlendedSignalEngine::genes_only(&symbol, directions)
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "neoethos_trader::blend",
-                    symbol = %symbol,
-                    base_tf = %base_tf,
-                    %error,
-                    "ensemble load/feature-contract failed; falling back to gene-only"
-                );
-                BlendedSignalEngine::genes_only(&symbol, directions)
-            }
-        }
-    };
+    // Explicit GenesOnly does not load models or acquire inference capacity.
+    // A requested ML strategy cannot silently become a genes-only backtest.
+    let signal_engine = replay_signal_engine(
+        &symbol,
+        directions,
+        artifact.normalize_features,
+        blend,
+        || {
+            let installed = neoethos_core::execution_budget::installed_process_budget()
+                .context("blend replay unavailable before the process CPU budget is installed")?;
+            let inference_lease = installed.broker().acquire(
+                neoethos_core::execution_budget::CpuPermitRequest::local(
+                    installed.resolved().effective_worker_limit,
+                ),
+            )?;
+            neoethos_models::ensemble_inference::bootstrap::role_decisions_from_feature_frame(
+                models_root.as_ref(),
+                &symbol,
+                &base_tf,
+                exact_input.features(),
+                &inference_lease,
+            )
+        },
+    )?;
 
     let signal_engine = signal_engine.with_brackets(&symbol, sl_pips, tp_pips);
 
@@ -504,7 +481,6 @@ pub fn replay_blend_from_dir(
     }]);
 
     let eval_defaults = neoethos_search::EvaluationConfig::default();
-    let mut cfg = cfg;
     if cfg.max_hold_bars.is_none() && eval_defaults.max_hold_bars > 0 {
         cfg.max_hold_bars = Some(eval_defaults.max_hold_bars as u64);
     }
@@ -517,9 +493,9 @@ pub fn replay_blend_from_dir(
     }
     if !matches!(blend.mode, BlendMode::GenesOnly) {
         warnings.push(format!(
-            "ML BLEND ACTIVE (mode {:?}, gate_floor {:.2}, veto_below {:.2}) — position size is \
-             scaled by the ensemble. The live default is GenesOnly, so this run does not \
-             describe the live sizing path.",
+            "ML BLEND ACTIVE (mode {:?}, gate_floor {:.2}, veto_below {:.2}) — the loaded \
+             ensemble gates position size; invalid model rows veto entries. This replay \
+             does not establish that the deployed live model set or sizing policy matches.",
             blend.mode, blend.gate_floor, blend.veto_below
         ));
     }
@@ -534,4 +510,412 @@ pub fn replay_blend_from_dir(
     );
     let stats = crate::replay::replay(&mut engine, &bars);
     Ok(disclose(stats, "replay_blend_from_dir", &symbol, warnings))
+}
+
+#[cfg(feature = "ml-blend")]
+fn require_replay_model_input(
+    symbol: &str,
+    search_normalized: bool,
+    mode: crate::blend_signal::BlendMode,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !search_normalized || matches!(mode, crate::blend_signal::BlendMode::GenesOnly),
+        "ML replay for {symbol} refused: Search's persisted normalization fit cannot substitute \
+         the model-specific training fit; candidate-bound model preprocessing is not yet proven. \
+         No genes-only substitution"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "ml-blend")]
+fn replay_signal_engine(
+    symbol: &str,
+    directions: Vec<crate::contracts::Direction>,
+    search_normalized: bool,
+    blend: crate::blend_signal::BlendConfig,
+    infer: impl FnOnce() -> anyhow::Result<Vec<neoethos_models::ensemble_inference::EnsembleDecision>>,
+) -> anyhow::Result<crate::blend_signal::BlendedSignalEngine> {
+    use crate::blend_signal::{BlendMode, BlendedSignalEngine, MlDecision};
+
+    require_replay_model_input(symbol, search_normalized, blend.mode)?;
+    if matches!(blend.mode, BlendMode::GenesOnly) {
+        return Ok(BlendedSignalEngine::genes_only(symbol, directions));
+    }
+    let decisions = infer().with_context(|| {
+        format!(
+            "ML replay for {symbol} refused: ensemble inference failed; no genes-only substitution"
+        )
+    })?;
+    anyhow::ensure!(
+        decisions.len() == directions.len(),
+        "ML replay for {symbol} refused: {} model rows vs {} gene rows; no genes-only substitution",
+        decisions.len(),
+        directions.len()
+    );
+    let ml = decisions
+        .into_iter()
+        .map(|decision| {
+            // Preserve explicit ineligibility even if a malformed adapter put
+            // finite payloads in a row marked invalid. The blend rejects NaN.
+            if !decision.validity.is_valid() {
+                MlDecision {
+                    dir_probs: [f64::NAN; 3],
+                    regime_gate: f64::NAN,
+                    anomaly_scale: f64::NAN,
+                }
+            } else {
+                MlDecision {
+                    dir_probs: decision.dir_probs,
+                    regime_gate: decision.regime_gate,
+                    anomaly_scale: decision.anomaly_scale,
+                }
+            }
+        })
+        .collect();
+    Ok(BlendedSignalEngine::new(symbol, directions, ml, blend))
+}
+
+#[cfg(test)]
+mod portfolio_replay_tests {
+    use super::*;
+    use neoethos_data::test_fixtures::{
+        ctrader_sample_feature_frame, ctrader_sample_ohlcv,
+        ctrader_test_feature_frame_with_normalization,
+    };
+    use neoethos_search::data_selection::{
+        CanonicalSearchArtifactScopeV2, CanonicalSearchEvaluatedWindowV1,
+        CanonicalSearchInputReceiptV2, CanonicalSearchWindowRoleV1,
+    };
+    use neoethos_search::live_portfolio::{
+        LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, LiveSizingEvidenceV1,
+        LiveTradingPolicyV1,
+    };
+
+    fn fixture_artifact(features: &neoethos_data::FeatureFrame) -> LivePortfolioArtifact {
+        const CONFIG_HASH: &str = "fnv64:0123456789abcdef";
+        let receipt = CanonicalSearchInputReceiptV2::from_feature_frame(
+            features.provenance().bindings()[0].dataset_identity(),
+            features,
+        )
+        .unwrap();
+        let ohlcv = ctrader_sample_ohlcv();
+        let timestamps = ohlcv.timestamp.as_ref().unwrap();
+        let scope = |role, start: usize, end: usize| {
+            CanonicalSearchArtifactScopeV2::new(
+                receipt.clone(),
+                CanonicalSearchEvaluatedWindowV1::new(
+                    role,
+                    start as u64,
+                    end as u64,
+                    timestamps[start],
+                    timestamps[end - 1],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        // Fixed TEST policy body, in the production identity's field order.
+        // It authenticates fixture consistency, not a real search or broker run.
+        let policy_body = concat!(
+            r#"{"kind":"neoethos.live-trading-policy-identity.v1","schema_version":1,"#,
+            r#""source_search_config_hash":"fnv64:0123456789abcdef","#,
+            r#""source_resolved_config_hash":"fnv64:fedcba9876543210","#,
+            r#""trailing_enabled":false,"trailing_be_trigger_r":1.25,"#,
+            r#""trailing_stop_multiplier":0.75,"trailing_min_lock_pips":3.0,"#,
+            r#""kill_zones_enabled":false,"baseline_spread_pips":1.5,"session_spread_pips":null}"#,
+        );
+        let mut policy_json: serde_json::Value = serde_json::from_str(policy_body).unwrap();
+        policy_json.as_object_mut().unwrap().remove("kind");
+        policy_json["identity_hash"] = serde_json::json!(format!(
+            "fnv64:{:016x}",
+            neoethos_core::utils::fnv1a64(policy_body.as_bytes())
+        ));
+        let live_trading_policy: LiveTradingPolicyV1 = serde_json::from_value(policy_json).unwrap();
+        live_trading_policy.validate().unwrap();
+
+        let gene = neoethos_search::Gene {
+            strategy_id: "frozen-replay-gene".to_owned(),
+            indices: vec![0],
+            weights: vec![1.0],
+            long_threshold: if features.normalization_fitted_state().is_some() {
+                0.1
+            } else {
+                0.00001
+            },
+            short_threshold: if features.normalization_fitted_state().is_some() {
+                -0.1
+            } else {
+                -0.00001
+            },
+            sl_pips: 6.0,
+            tp_pips: 12.0,
+            ..Default::default()
+        };
+        let forward_test = neoethos_search::validation::ForwardTestValidationArtifactFile::new(
+            scope(CanonicalSearchWindowRoleV1::SelectionValidation, 80, 90),
+            CONFIG_HASH,
+            &gene,
+            neoethos_search::validation::ForwardTestSummary {
+                bars: 10,
+                metrics: neoethos_search::eval::BacktestMetrics::from_metric_array([
+                    1.0, 1.0, 100_001.0, 0.01, 0.55, 1.5, 1.0, 0.5, 1.0, 0.8, 0.005,
+                ]),
+                span_days: 1.0,
+            },
+        )
+        .unwrap();
+        let artifact = LivePortfolioArtifact {
+            schema_version: LIVE_PORTFOLIO_SCHEMA_VERSION,
+            search_scope: scope(CanonicalSearchWindowRoleV1::InSample, 0, 80),
+            final_holdout_scope: scope(CanonicalSearchWindowRoleV1::Holdout, 90, 100),
+            search_config_hash: CONFIG_HASH.to_owned(),
+            live_trading_policy,
+            symbol: "EURUSD".to_owned(),
+            base_tf: "M1".to_owned(),
+            higher_tfs: Vec::new(),
+            effective_feature_names: vec!["close_minus_open".to_owned()],
+            normalize_features: features.normalization_fitted_state().is_some(),
+            cost_band: vec![(
+                gene.strategy_id.clone(),
+                neoethos_search::discovery::CostBandVerdict::Unmeasured,
+            )],
+            genes: vec![gene],
+            sizing_evidence: vec![LiveSizingEvidenceV1 { forward_test }],
+        };
+        artifact.validate().unwrap();
+        artifact
+    }
+
+    #[test]
+    fn raw_and_frozen_normalized_portfolios_replay_persisted_inputs_through_the_engine() {
+        let raw = ctrader_sample_feature_frame();
+        let ohlcv = ctrader_sample_ohlcv();
+        let normalized = ctrader_test_feature_frame_with_normalization(&raw, 0..80, None).unwrap();
+        let cfg = EngineConfig {
+            max_hold_bars: Some(3),
+            ..Default::default()
+        };
+        for original in [&raw, &normalized] {
+            let artifact = fixture_artifact(original);
+            let encoded = serde_json::to_vec(&artifact).unwrap();
+            let decoded: LivePortfolioArtifact = serde_json::from_slice(&encoded).unwrap();
+            decoded.validate().unwrap();
+            let replayed = match decoded.search_scope.receipt().normalization_fitted_state() {
+                Some(saved) => {
+                    ctrader_test_feature_frame_with_normalization(&raw, 0..80, Some(saved)).unwrap()
+                }
+                None => raw.clone(),
+            };
+            let expected =
+                replay_portfolio_features(&artifact, original, &ohlcv, cfg.clone(), 0.0001)
+                    .expect("original search numeric inputs reach the real replay loop");
+            let actual =
+                replay_portfolio_features(&decoded, &replayed, &ohlcv, cfg.clone(), 0.0001)
+                    .expect("persisted raw/frozen input reaches the same replay loop");
+            assert_eq!(
+                actual, expected,
+                "serialization/replay must not alter any engine statistic"
+            );
+            assert_eq!(actual.bars_processed, ohlcv.len());
+            assert_eq!(actual.signals_evaluated, ohlcv.len());
+            assert!(actual.positions_opened > 0);
+            assert!(actual.positions_closed > 0);
+            assert!(actual.equity.is_finite());
+            assert!(
+                actual
+                    .fidelity_warnings
+                    .iter()
+                    .any(|warning| warning.contains("MockExecutionAdapter"))
+            );
+            if decoded.normalize_features {
+                let error = replay_portfolio_features(&decoded, &raw, &ohlcv, cfg.clone(), 0.0001)
+                    .expect_err("raw data cannot silently replace the saved normalized features");
+                assert!(error.to_string().contains("normalization presence differs"));
+                let refitted =
+                    ctrader_test_feature_frame_with_normalization(&raw, 0..20, None).unwrap();
+                assert!(
+                    replay_portfolio_features(&decoded, &refitted, &ohlcv, cfg.clone(), 0.0001)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_legacy_portfolio_without_saved_fit_is_rejected_by_the_consumer() {
+        let raw = ctrader_sample_feature_frame();
+        let mut json = serde_json::to_value(fixture_artifact(&raw)).unwrap();
+        json["normalize_features"] = serde_json::json!(true);
+        let legacy: LivePortfolioArtifact = serde_json::from_value(json).unwrap();
+        let error = replay_portfolio_features(
+            &legacy,
+            &raw,
+            &ctrader_sample_ohlcv(),
+            EngineConfig::default(),
+            0.0001,
+        )
+        .expect_err("normalization metadata may not be omitted");
+        assert!(error.to_string().contains("without fitted parameters"));
+    }
+}
+
+#[cfg(all(test, feature = "ml-blend"))]
+mod blend_replay_tests {
+    use super::*;
+    use crate::blend_signal::{BlendConfig, BlendMode};
+    use crate::contracts::{Direction, SignalEngine, SignalSource};
+    use neoethos_data::FeatureCellValidity;
+    use neoethos_models::ensemble_inference::EnsembleDecision;
+
+    fn entry() -> PortfolioEntry {
+        PortfolioEntry {
+            symbol: "EURUSD".into(),
+            base_tf: "M5".into(),
+            higher_tfs: Vec::new(),
+            source: StrategySource::Gene { id: "test".into() },
+            mode: TradeMode::PropFirm,
+        }
+    }
+
+    fn buy() -> EnsembleDecision {
+        EnsembleDecision {
+            dir_probs: [0.05, 0.9, 0.05],
+            regime_gate: 1.0,
+            anomaly_scale: 1.0,
+            validity: FeatureCellValidity::Valid,
+        }
+    }
+
+    #[test]
+    fn explicit_genes_only_never_calls_the_inference_loader() {
+        let mut engine = replay_signal_engine(
+            "EURUSD",
+            vec![Direction::Long],
+            false,
+            BlendConfig::default(),
+            || panic!("GenesOnly must not load models or acquire inference capacity"),
+        )
+        .expect("explicit genes-only");
+        let signal = engine.evaluate(&entry(), &[]);
+        assert_eq!(signal.dir, Direction::Long);
+        assert_eq!(signal.confidence, 1.0);
+        assert_eq!(signal.source, SignalSource::Strategy);
+    }
+
+    #[test]
+    fn normalized_genes_only_works_but_model_modes_require_their_own_input_contract() {
+        for normalized in [false, true] {
+            for mode in [
+                BlendMode::GenesOnly,
+                BlendMode::MlConfirm,
+                BlendMode::MlScale,
+            ] {
+                let calls = std::cell::Cell::new(0);
+                let result = replay_signal_engine(
+                    "EURUSD",
+                    vec![Direction::Long],
+                    normalized,
+                    BlendConfig {
+                        mode,
+                        ..Default::default()
+                    },
+                    || {
+                        calls.set(calls.get() + 1);
+                        Ok(vec![buy()])
+                    },
+                );
+                if normalized && !matches!(mode, BlendMode::GenesOnly) {
+                    let error = result.err().expect("Search fit is not the model's own fit");
+                    assert!(error.to_string().contains("model-specific training fit"));
+                    assert_eq!(calls.get(), 0, "refuse before loading or running a model");
+                } else {
+                    let mut engine = result.expect("explicit supported replay mode");
+                    assert_eq!(engine.evaluate(&entry(), &[]).dir, Direction::Long);
+                    assert_eq!(
+                        calls.get(),
+                        usize::from(!matches!(mode, BlendMode::GenesOnly))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn requested_ml_cannot_become_genes_only_when_inference_fails() {
+        for mode in [BlendMode::MlConfirm, BlendMode::MlScale] {
+            let error = replay_signal_engine(
+                "EURUSD",
+                vec![Direction::Long],
+                false,
+                BlendConfig {
+                    mode,
+                    ..Default::default()
+                },
+                || anyhow::bail!("required model artifact missing"),
+            )
+            .err()
+            .expect("inference failure must be returned");
+            let detail = format!("{error:#}");
+            assert!(detail.contains("required model artifact missing"));
+            assert!(detail.contains("no genes-only substitution"));
+        }
+    }
+
+    #[test]
+    fn both_short_and_extra_prediction_tapes_are_refused() {
+        for row_count in [0, 2] {
+            let error = replay_signal_engine(
+                "EURUSD",
+                vec![Direction::Long],
+                false,
+                BlendConfig {
+                    mode: BlendMode::MlScale,
+                    ..Default::default()
+                },
+                || Ok(vec![buy(); row_count]),
+            )
+            .err()
+            .expect("one prediction per gene row is required");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{row_count} model rows vs 1 gene rows"))
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_invalidity_vetoes_even_if_its_numeric_payload_looks_valid() {
+        let mut invalid = buy();
+        invalid.validity = FeatureCellValidity::Warmup;
+        let mut engine = replay_signal_engine(
+            "EURUSD",
+            vec![Direction::Long; 3],
+            false,
+            BlendConfig {
+                mode: BlendMode::MlScale,
+                ..Default::default()
+            },
+            || {
+                Ok(vec![
+                    buy(),
+                    invalid,
+                    EnsembleDecision::invalid(FeatureCellValidity::ComputeFailure),
+                ])
+            },
+        )
+        .expect("invalid rows stay aligned")
+        .with_brackets("EURUSD", vec![12.0; 3], vec![24.0; 3]);
+        let valid = engine.evaluate(&entry(), &[]);
+        assert_eq!(valid.dir, Direction::Long);
+        assert_eq!(valid.confidence, 0.9);
+        for _ in 0..2 {
+            let signal = engine.evaluate(&entry(), &[]);
+            assert_eq!(signal.dir, Direction::Flat);
+            assert_eq!(signal.confidence, 0.0);
+            assert_eq!(signal.source, SignalSource::Blend);
+            assert_eq!(signal.sl_pips, 12.0);
+            assert_eq!(signal.tp_pips, 24.0);
+        }
+    }
 }

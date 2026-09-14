@@ -13,8 +13,65 @@ fn read(relative: &str) -> String {
         .unwrap_or_else(|error| panic!("read required source {}: {error}", path.display()))
 }
 
+fn research_sources() -> [String; 2] {
+    [
+        read("src/canonical_full_run.rs"),
+        read("../neoethos-broker-history/src/canonical_research_costs.rs"),
+    ]
+}
+
+fn research_production_source() -> String {
+    research_sources()
+        .iter()
+        .map(|source| source.split("#[cfg(test)]").next().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
-fn model_artifact_read_trait_is_compiled_only_with_the_full_gpu_run() {
+fn active_cli_consumers_use_one_shared_screening_cost_implementation() {
+    let [cli, shared] = research_sources();
+    let history_lib = read("../neoethos-broker-history/src/lib.rs");
+    assert!(history_lib.contains("pub mod canonical_research_costs;"));
+    assert!(cli.contains("use neoethos_broker_history::canonical_research_costs::{"));
+    for definition in [
+        "fn build_screening_cost_envelope_v2(",
+        "fn validate_costs(",
+        "fn validate_settings_source(",
+        "fn validate_broker_symbol_contract(",
+        "fn derive_commission_account_per_lot_per_fill_assumption(",
+        "struct ScreeningCostEnvelopeWireV2",
+    ] {
+        assert!(
+            shared.contains(definition),
+            "shared owner lacks {definition}"
+        );
+        assert!(!cli.contains(definition), "CLI duplicates {definition}");
+    }
+    let build = cli
+        .split("pub fn build_cost_assumptions(")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) fn seal_cpu_research_contract_for_input(")
+        .next()
+        .unwrap();
+    assert!(build.contains("let costs = build_screening_cost_envelope_v2("));
+    assert!(build.contains("write_json_atomic(&out, &costs)"));
+    assert_eq!(
+        cli.matches("validate_settings_source(").count(),
+        3,
+        "GPU contract, CPU contract, and receipt-bound training must retain shared source validation",
+    );
+    assert!(shared.contains("acquisition_store.open_plan(plan_receipt)?"));
+    assert!(
+        shared.contains("acquisition_store.open_matrix(data_root, plan_receipt, matrix_receipt)?")
+    );
+    assert!(shared.contains("ConfigSource::ExplicitPath"));
+    assert!(shared.contains("ConfigSource::EnvConfigFile"));
+}
+
+#[test]
+fn model_artifact_read_trait_is_compiled_only_with_gpu_training() {
     let source = read("src/canonical_full_run.rs");
     assert!(
         source.contains("#[cfg(feature = \"gpu-nvidia-full\")]\nuse std::io::Read;"),
@@ -23,58 +80,36 @@ fn model_artifact_read_trait_is_compiled_only_with_the_full_gpu_run() {
     assert_eq!(
         source.matches("use std::io::Read;").count(),
         1,
-        "canonical full run must retain one feature-gated Read import",
+        "canonical training must retain one feature-gated Read import",
     );
 }
 
 #[test]
-fn cli_exposes_one_exact_matrix_bound_full_search_and_training_command() {
+fn cli_removes_the_cpu_fallback_full_run_and_keeps_strict_native_research() {
     let main = read("src/main.rs");
     let module = read("src/canonical_full_run.rs");
 
     assert!(main.contains("mod canonical_full_run;"));
     assert!(
-        main.contains("\"canonical-full-run\" => canonical_full_run::run("),
-        "CLI does not dispatch the exact full-run command"
+        !main.contains("canonical-full-run"),
+        "obsolete CPU-fallback canonical-full-run remains exposed"
     );
-
-    for required in [
-        "--authority-root",
-        "--data-root",
-        "--plan-sha256",
-        "--matrix-sha256",
-        "--symbol",
-        "--base-timeframe",
-        "--cost-assumptions",
-        "--broker-symbol-contract",
-        "--settings-source",
-        "--models-dir",
-        "--out",
-        "--receipt-out",
-        "CanonicalTrendbarAcquisitionStoreV1",
-        "open_plan",
-        "open_matrix",
-        "pin_exact_canonical_series_v1",
-        "into_cpu_dataset_after_no_physical_gpu_v1",
-        "prepare_canonical_discovery_run_input_v3",
-        "CanonicalSearchInput::from_prepared_canonical_frame",
-        "canonical_discovery_normalization_training_rows",
-        "normalization_training_rows",
-        "CanonicalTrendbarResearchExecutionContractV3::new",
-        "run_prepared_canonical_trendbar_research_with_cpu_training_handoff_v3",
-        "research_contract: neoethos_search::CanonicalTrendbarResearchExecutionContractV3",
-        "discovery_result: neoethos_search::DiscoveryResult",
-        "train_canonical_series_with_progress",
-        "HistoricalResearchArtifactClassV1::ResearchOnly",
-        "HistoricalResearchPromotionEligibilityV1::NotPromotionEligible",
+    assert!(
+        main.contains("\"native-research\" => native_research::run(tail)"),
+        "strict canonical-native research command is not connected"
+    );
+    for obsolete in [
+        "pub fn run(",
+        "CanonicalResearchDiscoveryArtifactV1",
         "CanonicalFullRunReceiptV1",
-        "artifact_sha256",
-        "receipt_path",
-        "ensure_distinct_output_targets",
+        "FULL_RUN_REQUIRED_FLAGS",
+        "prepare_canonical_discovery_run_input_v3",
+        "into_cpu_dataset_after_no_physical_gpu_v1",
+        "run_prepared_canonical_trendbar_research_with_cpu_training_handoff_v3",
     ] {
         assert!(
-            module.contains(required),
-            "canonical full-run command is missing `{required}`"
+            !module.contains(obsolete),
+            "obsolete canonical full-run path remains through `{obsolete}`"
         );
     }
 }
@@ -114,7 +149,7 @@ fn cli_exposes_receipt_bound_training_without_replaying_discovery_or_broker_trut
 #[test]
 fn cli_builds_screening_cost_envelope_from_settings_broker_contract_and_direct_d1_bases() {
     let main = read("src/main.rs");
-    let source = read("src/canonical_full_run.rs");
+    let source = research_production_source();
 
     assert!(
         main.contains("\"canonical-cost-build\" => canonical_full_run::build_cost_assumptions("),
@@ -155,26 +190,28 @@ fn cli_builds_screening_cost_envelope_from_settings_broker_contract_and_direct_d
 }
 
 #[test]
-fn cli_rejects_every_unknown_duplicate_or_unpaired_argument_before_opening_evidence() {
+fn active_canonical_commands_reject_unknown_duplicate_or_unpaired_arguments() {
     let source = read("src/canonical_full_run.rs");
     for required in [
-        "const FULL_RUN_REQUIRED_FLAGS",
-        "validate_exact_args(args)?;",
-        "args.len() == FULL_RUN_REQUIRED_FLAGS.len() * 2",
+        "const COST_BUILD_REQUIRED_FLAGS",
+        "const CONTRACT_BUILD_REQUIRED_FLAGS",
+        "const CANONICAL_TRAIN_REQUIRED_FLAGS",
+        "validate_cost_build_args(args)?;",
+        "validate_contract_build_args(args)?;",
+        "validate_canonical_train_args(args)?;",
         "args.chunks_exact(2)",
-        "FULL_RUN_REQUIRED_FLAGS.contains(&flag)",
         "seen.insert(flag)",
         "!value.starts_with(\"--\")",
     ] {
         assert!(
             source.contains(required),
-            "strict canonical full-run argument parser is missing `{required}`"
+            "strict canonical argument parsing is missing `{required}`"
         );
     }
 }
 
 #[test]
-fn full_run_requires_the_combined_native_and_burn_nvidia_feature() {
+fn canonical_training_requires_the_combined_native_and_burn_nvidia_feature() {
     let manifest = read("Cargo.toml");
     let source = read("src/canonical_full_run.rs");
 
@@ -182,18 +219,17 @@ fn full_run_requires_the_combined_native_and_burn_nvidia_feature() {
         manifest.contains("gpu-nvidia-full = [")
             && manifest.contains("\"gpu-nvidia\"")
             && manifest.contains("\"neoethos-models/burn-cuda-backend\""),
-        "CLI has no one-feature full NVIDIA search-and-training build"
+        "CLI has no one-feature full NVIDIA training build"
     );
     assert!(
-        source.contains("cfg!(feature = \"gpu-nvidia-full\")")
-            && source.contains("canonical-full-run requires the complete NVIDIA CUDA feature"),
-        "canonical-full-run can start without the complete native + Burn CUDA surface"
+        source.contains("canonical-train requires the complete NVIDIA CUDA feature"),
+        "canonical-train can start without the complete native + Burn CUDA surface"
     );
 }
 
 #[test]
-fn cli_full_run_has_no_current_derived_quote_or_tick_path() {
-    let source = read("src/canonical_full_run.rs");
+fn canonical_evidence_commands_have_no_current_derived_quote_or_tick_path() {
+    let source = research_production_source();
     for forbidden in [
         "load_symbol_dataset(",
         "load_canonical_timeframe(",
@@ -210,14 +246,14 @@ fn cli_full_run_has_no_current_derived_quote_or_tick_path() {
     ] {
         assert!(
             !source.contains(forbidden),
-            "canonical full-run command contains forbidden path `{forbidden}`"
+            "canonical evidence commands contain forbidden path `{forbidden}`"
         );
     }
 }
 
 #[test]
-fn cli_full_run_requires_canonical_timeframes_and_exact_financial_assumption_bytes() {
-    let source = read("src/canonical_full_run.rs");
+fn canonical_commands_require_timeframes_and_exact_financial_assumption_bytes() {
+    let source = research_production_source();
     for required in [
         "CanonicalTimeframe",
         "FeatureBuildOptions",
@@ -236,7 +272,7 @@ fn cli_full_run_requires_canonical_timeframes_and_exact_financial_assumption_byt
         "ConfigSource::EnvConfigFile",
         "settings.provenance()",
         ".path()",
-        "Settings::from_yaml",
+        "let decoded: neoethos_core::Settings = serde_yaml_ng::from_slice(exact_bytes)",
         "serde_json::to_value(settings)",
         "payloadType",
         "ctidTraderAccountId",
@@ -266,18 +302,19 @@ fn cli_full_run_requires_canonical_timeframes_and_exact_financial_assumption_byt
     ] {
         assert!(
             source.contains(required),
-            "canonical full-run validation is missing `{required}`"
+            "canonical evidence validation is missing `{required}`"
         );
     }
 }
 
 #[test]
-fn cli_full_run_requires_holdout_and_locks_training_before_its_first_bar() {
+fn receipt_bound_training_recomputes_and_locks_the_deterministic_oos_boundary() {
     let source = read("src/canonical_full_run.rs");
     for required in [
         "training_oos_from_ms",
-        "canonical full run requires a holdout scope before model training",
-        "holdout_scope.evaluated_window().timestamp_start_ms()",
+        "exact_training_oos_from_ms",
+        "training_oos_from_ms == exact_training_oos_from_ms",
+        "deterministic OOS boundary of the exact canonical base generation",
         ".with_oos_lock_from_ms(training_oos_from_ms)",
         "training_label_round_trip_cost_pips",
         "contract.screening_round_trip_cost_pips()",
@@ -285,14 +322,14 @@ fn cli_full_run_requires_holdout_and_locks_training_before_its_first_bar() {
     ] {
         assert!(
             source.contains(required),
-            "canonical full-run OOS boundary is missing `{required}`"
+            "canonical receipt-bound training OOS boundary is missing `{required}`"
         );
     }
 }
 
 #[test]
 fn cli_recomputes_screening_pip_value_and_per_fill_commission_from_bound_evidence() {
-    let source = read("src/canonical_full_run.rs");
+    let source = research_production_source();
     for required in [
         "commission_symbol_price_basis",
         "CommissionSymbolPriceBasisWireV1",
@@ -309,18 +346,15 @@ fn cli_recomputes_screening_pip_value_and_per_fill_commission_from_bound_evidenc
     ] {
         assert!(
             source.contains(required),
-            "canonical full-run economic evidence is missing `{required}`"
+            "canonical economic evidence is missing `{required}`"
         );
     }
 }
 
 #[test]
 fn canonical_cost_wire_is_a_versioned_fail_closed_screening_envelope() {
-    let source = read("src/canonical_full_run.rs");
-    let production = source
-        .split("#[cfg(test)]")
-        .next()
-        .expect("canonical full-run production source");
+    let source = research_sources().join("\n");
+    let production = research_production_source();
 
     for required in [
         "const SCREENING_COST_SCHEMA_V2: &str = \"neoethos.canonical-trendbar-screening-cost-envelope.v2\";",
@@ -354,11 +388,7 @@ fn canonical_cost_wire_is_a_versioned_fail_closed_screening_envelope() {
 
 #[test]
 fn canonical_screening_envelope_refuses_invalid_assumptions_instead_of_clamping_them() {
-    let source = read("src/canonical_full_run.rs");
-    let production = source
-        .split("#[cfg(test)]")
-        .next()
-        .expect("canonical full-run production source");
+    let production = research_production_source();
 
     assert!(
         production.contains("fn require_non_negative_screening_assumption("),
@@ -401,10 +431,10 @@ fn final_evidence_hash_binds_every_completed_model_artifact_tree() {
 fn training_pipeline_errors_publish_reopenable_failure_evidence_before_returning() {
     let source = read("src/canonical_full_run.rs");
     for required in [
-        "match orchestrator.train_canonical_series_with_progress(",
+        "match orchestrator.train_canonical_series_receipt_with_progress(",
         "Err(error) =>",
         "__training_pipeline__",
-        "publish_full_run_artifact",
+        "publish_canonical_training_artifact",
         "exact evidence was written",
     ] {
         assert!(

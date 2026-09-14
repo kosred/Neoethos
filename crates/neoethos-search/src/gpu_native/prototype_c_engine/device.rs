@@ -20,10 +20,7 @@ use crate::gpu_native::prototype_b_engine::validate_population_eligibility;
 use crate::gpu_native::prototype_bc::{PrototypeKind, prototype_c_capabilities};
 use cubecl::prelude::*;
 
-#[cfg(feature = "gpu-cuda")]
 pub type PrototypeCActiveRuntime = cubecl::cuda::CudaRuntime;
-#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-pub type PrototypeCActiveRuntime = cubecl::wgpu::WgpuRuntime;
 
 /// Exit reason encoding shared with the canonical contracts.
 const C_EXIT_NONE: i32 = 0;
@@ -32,10 +29,7 @@ const C_EXIT_TARGET: i32 = 2;
 const C_EXIT_MAX_HOLD: i32 = 3;
 const C_EXIT_GAP: i32 = 4;
 
-#[cfg(feature = "gpu-cuda")]
 const PROTOTYPE_C_BACKEND_ID: u32 = 21;
-#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-const PROTOTYPE_C_BACKEND_ID: u32 = 22;
 
 // ---------------------------------------------------------------------------
 // Device kernels
@@ -236,6 +230,13 @@ fn emit_c_population_events(
         let signal_base = candidate * bars;
         let write = RuntimeCell::<i32>::new(event_offsets[candidate]);
         let multiplier = stop_vol_multipliers[candidate];
+        let reward_risk = RuntimeCell::<f64>::new(adaptive_rr);
+        if stop_pips[candidate] > 0.0 && target_pips[candidate] > 0.0 {
+            let gene_reward_risk = target_pips[candidate] / stop_pips[candidate];
+            if !gene_reward_risk.is_nan() && !gene_reward_risk.is_inf() && gene_reward_risk > 0.0 {
+                reward_risk.store(gene_reward_risk);
+            }
+        }
 
         for bar in 1..bars {
             let direction = signals[signal_base + bar - 1];
@@ -248,7 +249,7 @@ fn emit_c_population_events(
                 let target_distance = RuntimeCell::<f64>::new(target_pips[candidate]);
                 if multiplier > 0.0 && has_adaptive_base != 0 {
                     let adaptive_stop = multiplier * adaptive_base_pips[signal_bar];
-                    let adaptive_target = adaptive_rr * adaptive_stop;
+                    let adaptive_target = reward_risk.read() * adaptive_stop;
                     if adaptive_stop > 0.0 && adaptive_target > 0.0 {
                         stop_distance.store(adaptive_stop);
                         target_distance.store(adaptive_target);
@@ -1075,7 +1076,7 @@ pub fn create_prototype_c_engine(
     let residency_scope = crate::cubecl_eval::cubecl_residency_scope();
     let client = crate::cubecl_eval::create_gpu_client(device_override).map_err(|error| {
         let message = error.to_string();
-        if crate::gpu_native::prototype_a::is_known_no_adapter_error(&message) {
+        if crate::gpu_native::prototype_a::is_known_no_cuda_device_error(&message) {
             EngineError::UnsupportedCapability {
                 operation: "prototype_c_gpu_adapter",
                 detail: message,

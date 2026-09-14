@@ -132,6 +132,7 @@ pub struct SystemConfig {
     ///   - `"prop_firm"` → safety / stability: pass prop-firm challenges and
     ///     bank a steady monthly return. Drives `DiscoveryMode::PropFirm` (FTMO
     ///     window-pass gate) and the active `risk.preset` constraints.
+    ///
     /// Search/discovery + risk framing orient around this one choice. An
     /// explicit `models.discovery_mode = "strict"` is a power-user escape hatch
     /// that overrides the discovery side only. Default `"prop_firm"`.
@@ -159,7 +160,6 @@ pub struct SystemConfig {
     pub base_timeframe: String,
     pub higher_timeframes: Vec<String>,
     pub poll_interval_seconds: u64,
-    pub metrics_db_path: PathBuf,
     pub cache_dir: PathBuf,
     pub enable_gpu_preference: String,
     // agent 2026-06-05 overfitting fix: removed three dead `discovery_*` fields
@@ -174,7 +174,6 @@ pub struct SystemConfig {
     // `trailing_enabeld:` and reported it saved. The three keys are listed in
     // `load_seal::RETIRED_KEYS`, so a file that still carries them loads with
     // each one NAMED at WARN; anything not on that list is refused.
-    pub enable_gpu: bool,
     /// WARNING DERIVED FROM HARDWARE - NOT AN INPUT. See `n_jobs` above.
     /// `num_gpus: 0` in the operator's live store, on a box with a 3090, is
     /// the same frozen detector output. `#[serde(skip)]` 2026-08-10.
@@ -189,13 +188,12 @@ pub struct SystemConfig {
 
 /// Hardware / accelerator runtime knobs — the ONLY source for these settings.
 ///
-/// These replace six env vars that used to be read by
+/// These replace the live subset of env vars that used to be read by
 /// `HardwareRuntimeOverrides::from_env`: `NEOETHOS_BOT_CPU_BUDGET`,
 /// `NEOETHOS_BOT_TRAIN_PRECISION` (plus a legacy `FOREX_TRAIN_PRECISION`
-/// alias), `NEOETHOS_BOT_{CUDA,ROCM,WGPU}_PRECISIONS` and
-/// `NEOETHOS_BOT_WGPU_DEVICES`. That function was deleted on 2026-08-03 because
-/// it had zero callers — so those env vars had already stopped doing anything
-/// long before, while these doc comments went on pointing readers at them.
+/// alias), and `NEOETHOS_BOT_CUDA_PRECISIONS`. The former ROCm/WGPU variables
+/// are retired together with those inactive backends. The env constructor was
+/// deleted on 2026-08-03 because it had zero callers.
 /// Setting one and watching nothing change was the intended experience of a
 /// function nobody called.
 ///
@@ -213,12 +211,8 @@ pub struct HardwareConfig {
     pub cpu_budget: Option<usize>,
     /// Forced training precision; `None` = auto per accelerator.
     pub training_precision: Option<crate::system::TrainingPrecision>,
-    /// Per-backend precision ladders; `None` = engine defaults.
+    /// CUDA precision ladder; `None` = engine defaults.
     pub cuda_precisions: Option<Vec<crate::system::TrainingPrecision>>,
-    pub rocm_precisions: Option<Vec<crate::system::TrainingPrecision>>,
-    pub wgpu_precisions: Option<Vec<crate::system::TrainingPrecision>>,
-    /// Explicit Vulkan/WGPU device names; empty = auto-enumerate.
-    pub wgpu_device_names: Vec<String>,
 }
 
 impl Default for SystemConfig {
@@ -261,12 +255,10 @@ impl Default for SystemConfig {
                 .map(|tf| (*tf).to_string())
                 .collect(),
             poll_interval_seconds: 60,
-            metrics_db_path: PathBuf::from("metrics.sqlite"),
             cache_dir: PathBuf::from("cache"),
             enable_gpu_preference: "auto".to_string(),
             // agent 2026-06-05 overfitting fix: dead `discovery_*` fields removed
             // (see struct decl). The real row cap is `models.prop_search_max_rows`.
-            enable_gpu: false,
             num_gpus: 0,
             device: "cpu".to_string(),
             max_training_rows_per_tf: 0,
@@ -364,18 +356,16 @@ pub struct RiskConfig {
     #[serde(default)]
     pub preset: PropFirmPreset,
     pub initial_balance: f64,
-    /// WARNING UNWIRED - `RiskManager` has no production constructor; every
-    /// `RiskManager::new` in the workspace is inside its own test module. This
-    /// is RETAINED AS INTENT (it records the operator's monthly floor and is
-    /// seeded from the active preset) but no live decision reads it.
-    /// See `tests/config_has_recipient.rs::UNWIRED`.
+    /// Monthly closed-balance profit target used by the live account-wide risk
+    /// authority outside challenge mode. `0.0` disables the monthly stop.
+    /// Preset changes seed this value; the authority's sole `RiskManager`
+    /// validates and consumes the operator's persisted setting.
     pub monthly_profit_target_pct: f64,
     pub min_risk_per_trade: f64,
     pub max_risk_per_trade: f64,
     pub risk_per_trade: f64,
-    /// PER-MODE risk band. `None` (the default, and what every pre-2026-07-21
-    /// config has) falls back to the shared `min/max_risk_per_trade` above, so
-    /// existing setups are untouched.
+    /// PER-MODE risk band. `None` falls back to the shared
+    /// `min/max_risk_per_trade` above.
     ///
     /// Why this exists: Risky and Prop-firm are two *different products* that
     /// happen to share one engine — aggressive compounding vs surviving a
@@ -385,13 +375,13 @@ pub struct RiskConfig {
     /// every candidate break the firm's daily rule on its first loss, so the
     /// search could never return anything — with nothing on screen explaining
     /// why. Set these once and each mode keeps its own sizing forever.
-    #[serde(default)]
+    ///
+    /// Do not add field-level `#[serde(default)]` to these options. The
+    /// container-level default must take the values from `RiskConfig::default`;
+    /// a field-level default would instead turn an absent key into `None`.
     pub risky_min_risk_per_trade: Option<f64>,
-    #[serde(default)]
     pub risky_max_risk_per_trade: Option<f64>,
-    #[serde(default)]
     pub prop_firm_min_risk_per_trade: Option<f64>,
-    #[serde(default)]
     pub prop_firm_max_risk_per_trade: Option<f64>,
     /// Portfolio-level cap on TOTAL concurrent risk across all running live
     /// engines, as a balance fraction (e.g. 0.05 = at most ~5% of the account
@@ -418,19 +408,14 @@ pub struct RiskConfig {
     /// autopilot, which always places a bracket (the gene's, or the kernel's
     /// 20/40-pip defaults).
     pub require_stop_loss: bool,
-    /// WARNING UNWIRED - `RiskManager` has no production constructor, so
-    /// nothing reads this. Both repo YAMLs ship `challenge_mode: true` against
-    /// a `Default` of `false`: a mode that does not exist has been deliberately
-    /// armed. RETAINED AS INTENT; do not read the `true` as an active regime.
+    /// Selects the live prop-firm challenge gates in `RiskManager`. In challenge
+    /// mode total drawdown is anchored to the declared initial balance and the
+    /// configured phase profit target replaces the monthly own-money target.
     pub challenge_mode: bool,
-    /// ⚠ UNWIRED — nothing reads this field.
-    ///
-    /// The mechanism it was written for exists:
-    /// `PropFirmPhaseRiskDefaults::for_preset(preset, challenge_phase)` in
-    /// `domain/prop_firm.rs` takes exactly this string and returns per-phase
-    /// risk defaults. Its only callers are that module's own `#[cfg(test)]`
-    /// block. Wiring the two together would change live sizing, so it is NOT
-    /// done silently here — see `tests/config_has_recipient.rs::UNWIRED`.
+    /// Selects the phase-specific risk and target table consumed by the live
+    /// `RiskManager`. Accepted aliases are resolved by
+    /// `PropFirmPhaseRiskDefaults::for_preset`; unknown values fail closed when
+    /// the live manager is constructed.
     pub challenge_phase: String,
     // `prop_firm_rules: bool` DELETED 2026-08-10 (knob-second-pass D6). It was
     // literally `preset != PropFirmPreset::None` — one write from the Risk
@@ -448,25 +433,17 @@ pub struct RiskConfig {
     /// Arms live enforcement of `max_trades_per_day`. Default `false`, so
     /// today's behaviour is unchanged until the operator flips it.
     ///
-    /// When `true`, the cap binds ACCOUNT-WIDE per UTC day: one counter
-    /// (`domain::daily_entry_cap`, held in a `static` by
-    /// `live_trading.rs`) is shared by EVERY running engine — four engines do
-    /// NOT get 8 each; the account gets 8 total, which is what an operator
-    /// reading "8" expects. Every refusal logs the rule, the day's count and
-    /// the cap. The counter resets at UTC midnight and on app restart, and
-    /// `max_trades_per_day: 0` disables the cap like the other risk caps.
+    /// When `true`, the cap binds ACCOUNT-WIDE: one durable
+    /// `AccountEntryAuthority` is shared by EVERY running live engine — four
+    /// engines do NOT get 8 each; the account gets 8 total. Risky Mode uses a
+    /// UTC day, while prop-firm mode uses the firm's evidenced local day. The
+    /// count survives app restarts. Every refusal logs the rule, accounting-day
+    /// id and cap. `max_trades_per_day: 0` disables the cap like other caps.
     #[serde(default)]
     pub max_trades_per_day_enabled: bool,
-    /// ⚠ UNWIRED — nothing reads this field; setting it `false` does NOT
-    /// disable recovery mode.
-    ///
-    /// `RiskManager::update_recovery_state` (domain/risk.rs) flips
-    /// `RiskManager.recovery_mode` purely from the drawdown vs
-    /// `daily_dd_warning_pct`, consulting no operator toggle. `RiskManager`
-    /// has no production constructor at all — every `RiskManager::new` call
-    /// in the workspace is inside its own test module — so there is no live
-    /// call site to wire this into. See
-    /// `tests/config_has_recipient.rs::UNWIRED`.
+    /// Arms live drawdown-recovery behavior in `RiskManager`. When disabled,
+    /// warning-level drawdown does not activate the recovery halt or its sizing
+    /// tier; hard daily/total drawdown limits remain enforced independently.
     pub recovery_mode_enabled: bool,
     pub feature_drift_threshold: f64,
     pub high_quality_confidence: f64,
@@ -620,7 +597,9 @@ impl Default for RiskConfig {
             risky_min_risk_per_trade: None,
             risky_max_risk_per_trade: Some(0.30),
             prop_firm_min_risk_per_trade: None,
-            prop_firm_max_risk_per_trade: None,
+            // Operator decision (2026-08-10): a prop-firm entry may use at
+            // most 1% risk. `None` would fall back to the shared 3% band.
+            prop_firm_max_risk_per_trade: Some(0.01),
             // Portfolio-level concurrent-risk cap. WAS 0.0 UNTIL 2026-08-10,
             // where 0 meant "disabled" — i.e. a knob named max_ shipped meaning
             // NO CAP AT ALL, on every install, chosen by nobody. Nothing about
@@ -818,13 +797,12 @@ pub struct ModelsConfig {
     /// before dispatch instead of silently substituting the native rlkit DQN.
     pub auto_enable_rllib: bool,
     pub use_neuroevolution: bool,
-    /// ⚠ UNWIRED — nothing reads this field.
+    /// Population size of the NEAT expert's evolutionary search.
     ///
-    /// `NeatTrainer` has a `population_size`, but it is hardcoded (96 in
-    /// `NeatConfig::default`, floored at 24 in `with_config`) and never
-    /// sourced from config. Connecting this field's default of 5 to it would
-    /// collapse the NEAT population 19-fold, so it is NOT wired silently —
-    /// see `tests/config_has_recipient.rs::UNWIRED`.
+    /// The field name is retained for config compatibility, but this is the
+    /// single configured source used by the orchestrator's `neat` model plan.
+    /// The default is 96, matching the former effective NEAT default; wiring
+    /// the old stored value of 5 would have collapsed the search 19-fold.
     pub rl_population_size: usize,
     pub rl_timesteps: usize,
     pub rl_eval_episodes: usize,
@@ -856,7 +834,6 @@ pub struct ModelsConfig {
     pub evo_population: usize,
     pub evo_islands: usize,
     pub evo_sigma: f64,
-    pub prop_search_enabled: bool,
     pub prop_search_population: usize,
     /// Size the GA population from the card instead of from
     /// `prop_search_population`.
@@ -1551,7 +1528,11 @@ impl Default for DiscoveryRuntimeConfig {
             // 240, matching config.yaml. See the field docs — the previous 50
             // silently contradicted the shipped config.
             prefilter_top_k: 240,
-            prefilter_insample_frac: 0.80,
+            // Discovery already receives only the training side of the outer
+            // temporal split. Rank features on all of that admissible prefix;
+            // throwing another 20% away here buys no independent evidence and
+            // unnecessarily narrows the vocabulary available to the GA.
+            prefilter_insample_frac: 1.0,
             prefilter_min_per_timeframe: 6,
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
@@ -2338,8 +2319,8 @@ pub struct TreeRuntimeConfig {
     /// Require GPU for tree training — no silent CPU fallback. Was
     /// `NEOETHOS_BOT_GPU_ONLY`.
     pub gpu_only: bool,
-    /// Explicit GPU count; `None` = auto-detect (the standard
-    /// `*_VISIBLE_DEVICES` vars, then `nvidia-smi` / `rocm`). Was the
+    /// Explicit NVIDIA GPU count cap; `None` = auto-detect through
+    /// `nvidia-smi`, constrained by the standard CUDA visibility vars. Was the
     /// `FOREX_GPU_COUNT` rebrand remnant.
     pub gpu_count: Option<usize>,
     /// Early-stop patience override for tree-model training; `None` (the
@@ -2432,7 +2413,7 @@ impl Default for ModelsConfig {
             rllib_num_workers: 0,
             auto_enable_rllib: false,
             use_neuroevolution: true,
-            rl_population_size: 5,
+            rl_population_size: 96,
             rl_timesteps: 10_000_000,
             rl_eval_episodes: 15,
             rl_network_arch: vec![4096, 4096, 4096, 2048, 1024],
@@ -2463,14 +2444,16 @@ impl Default for ModelsConfig {
             evo_population: 32,
             evo_islands: 4,
             evo_sigma: 0.25,
-            prop_search_enabled: false,
             prop_search_population: 100,
             prop_search_population_auto: true,
             prop_search_generations: 50,
             prop_search_max_hours: 0.5, // 2026-06-05: sane default (was 8.0=absurd 8h/combo); config-overridable (VPS budget run uses 0.25)
             prop_search_max_rows: 0,
             prop_search_max_rows_by_tf: HashMap::new(),
-            prop_search_portfolio_size: 3000,
+            // A portfolio is the small set of finalists that survives the
+            // broad search, not a second copy of the whole population. Keeping
+            // thousands here multiplied every expensive post-GA validation.
+            prop_search_portfolio_size: 4,
             prop_search_max_indicators: 12,
             prop_search_checkpoint: PathBuf::from("models/strategy_evo_checkpoint.json"),
             // Task #35 (2026-08-09): `auto` so the GA population eval uses the
@@ -2485,14 +2468,11 @@ impl Default for ModelsConfig {
             // Off by default: these express one operator's target, not a
             // universal truth about what a good strategy looks like.
             prop_search_min_win_rate: 0.0,
-            // Operator decision A (2026-08-09): the search must select for
-            // payoff ratio, not trade volume. 2.0 = only strategies whose
-            // average win is at least 2x their average loss (the operator's
-            // "ideally 2RR"). Enforced at discovery.rs (`TargetProfile`); an
-            // empty portfolio at 2.0 is the honest "2RR is rare here" signal,
-            // never silently relaxed. Was 0.0 (gate off) — the single reason
-            // 16 months of runs kept selecting one-point-of-margin systems.
-            prop_search_min_payoff_ratio: 2.0,
+            // Off by default. Payoff is an exit-shape preference, not profit:
+            // the primary, non-disableable admission rule below is strictly
+            // positive cost-charged net expectancy. An operator can still ask
+            // for a particular payoff shape explicitly.
+            prop_search_min_payoff_ratio: 0.0,
             // The primary gate (2026-08-09). `0.0` = strictly positive required.
             // This is the floor the payoff ratio was standing in for and could
             // not carry: payoff 2.53 at expectancy -4.18 pips/trade passes a 2.0
@@ -3163,7 +3143,7 @@ mod load_seal {
     /// inherent fn that only this struct names. Deleting an attribute here does
     /// not fall back to a derive — it stops compiling, which is the point.
     /// `models` is the exception and is ledgered there.
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Default)]
     #[serde(default, deny_unknown_fields)]
     struct SettingsWire {
         #[serde(deserialize_with = "SystemConfig::deserialize")]
@@ -3175,18 +3155,6 @@ mod load_seal {
         news: NewsConfig,
         #[serde(deserialize_with = "AppRuntimeConfig::deserialize")]
         app_runtime: AppRuntimeConfig,
-    }
-
-    impl Default for SettingsWire {
-        fn default() -> Self {
-            Self {
-                system: SystemConfig::default(),
-                risk: RiskConfig::default(),
-                models: ModelsConfig::default(),
-                news: NewsConfig::default(),
-                app_runtime: AppRuntimeConfig::default(),
-            }
-        }
     }
 
     impl Default for Settings {
@@ -3341,6 +3309,35 @@ mod load_seal {
             kind: RetiredKind::Deleted,
             note: "no field; device selection is models.prop_search_device",
         },
+        RetiredKey {
+            path: "system.enable_gpu",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-30: the former RLlib-auto reader was retired; accelerator \
+                   policy is resolved from system.enable_gpu_preference plus the hardware probe",
+        },
+        RetiredKey {
+            path: "system.metrics_db_path",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-31: no production reader remained for the former metrics \
+                   SQLite path; metrics evidence is published through the active canonical \
+                   artifacts and logs",
+        },
+        RetiredKey {
+            path: "system.hardware.rocm_precisions",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-31: ROCm/HIP is future work and is not exposed as an active \
+                   backend until a real device-resident implementation is connected and proven",
+        },
+        RetiredKey {
+            path: "system.hardware.wgpu_precisions",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-31 with the Vulkan/WGPU runtime",
+        },
+        RetiredKey {
+            path: "system.hardware.wgpu_device_names",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-31 with Vulkan/WGPU adapter enumeration",
+        },
         // ── system.* — DERIVED, no longer an input (§4a of the knob pass) ──
         RetiredKey {
             path: "system.n_jobs",
@@ -3441,6 +3438,51 @@ mod load_seal {
             kind: RetiredKind::Derived,
             note: "hardware-derived. HardwareExecutionPlan computes the inference batch from the \
                    probe and hands it to the consumer as a parameter",
+        },
+        RetiredKey {
+            path: "models.prop_search_enabled",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-30: no production reader remained after automatic training of \
+                   an unconsumed genetic-model artifact was removed; discovery is selected by its \
+                   explicit command/request and governed by the prop_search_* runtime settings",
+        },
+        RetiredKey {
+            path: "models.prop_search_train_years",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-29: absolute-year slicing was replaced by the canonical outer \
+                   OOS holdout over whatever verified dataset the request binds",
+        },
+        RetiredKey {
+            path: "models.prop_search_val_years",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-29 with prop_search_train_years; validation is the canonical \
+                   ratio-based outer OOS holdout, not a second absolute-year window",
+        },
+        RetiredKey {
+            path: "models.discovery_runtime.genetic_expert_holdout",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-29: automatic genetic-expert training was removed because no \
+                   production loader consumed that artifact; strategy discovery owns its one \
+                   canonical outer holdout",
+        },
+        RetiredKey {
+            path: "models.data_runtime.rebuild_stale_higher_tfs",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-29: runtime timeframe synthesis was retired; every requested \
+                   timeframe must be an independently acquired, verified canonical generation",
+        },
+        // ── app_runtime.* ──
+        RetiredKey {
+            path: "app_runtime.pnl_audit_drift_fraction",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-16: the local PnL proxy/audit path was superseded by exact \
+                   broker financial truth and may not control a live financial decision",
+        },
+        RetiredKey {
+            path: "app_runtime.pnl_circuit_breaker_fraction",
+            kind: RetiredKind::Deleted,
+            note: "deleted 2026-08-16 with the local PnL proxy; live refusal must use exact broker \
+                   balance/equity/PnL evidence rather than a locally reconstructed threshold",
         },
         // ── news.* — the 2026-08-09 D3 purge and its predecessors ──
         RetiredKey {
@@ -3993,7 +4035,7 @@ mod load_seal {
             let seeds = PresetSeeds::for_preset(preset, risky_ladder);
             let name = preset.as_str();
 
-            let is_explicit = |path: &str| explicit.iter().any(|p| *p == path);
+            let is_explicit = |path: &str| explicit.contains(&path);
 
             // Six calls, one helper. Deliberately NOT a `macro_rules!` that
             // touches `self`: a macro body referring to `self` resolves at the
@@ -4122,8 +4164,9 @@ mod load_seal {
                 (
                     "models.prop_search_min_payoff_ratio",
                     "NO PAYOFF FLOOR — every candidate clears this gate",
-                    "read as a minimum, 0 is also the literal floor 'payoff >= 0'. The compiled \
-                     default is 2.0 (the 2RR mandate); a 0 here disarms it",
+                    "read as a minimum, 0 is also the literal floor 'payoff >= 0'. This is the \
+                     shipped default because payoff is an optional shape preference; strictly \
+                     positive cost-charged expectancy remains mandatory",
                 ),
                 (
                     "models.prop_search_min_expectancy_t_stat",
@@ -4156,7 +4199,7 @@ mod load_seal {
                 (
                     "models.prop_search_min_payoff_ratio",
                     self.models.prop_search_min_payoff_ratio,
-                    2.0,
+                    0.0,
                 ),
                 (
                     "models.prop_search_min_expectancy_t_stat",
@@ -4480,8 +4523,6 @@ impl Settings {
         }
     }
 
-    /// Save settings to YAML file
-
     /// The document to persist: ONLY what differs from `Settings::default()`,
     /// plus every money key, always, whatever its value.
     ///
@@ -4632,6 +4673,7 @@ impl Settings {
         Ok(out)
     }
 
+    /// Save settings to a YAML file using an atomic replacement.
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
         let yaml = serde_yaml_ng::to_string(&self.as_override_document()?)?;
         // Audit M07: atomic write (temp + fsync + rename) so a crash mid-write
@@ -4642,6 +4684,13 @@ impl Settings {
         Ok(())
     }
 }
+
+/// Profit the trail locks once it engages, in pips.
+///
+/// Shared so the backtest, the GPU kernel and live trading cannot drift apart:
+/// a live stop that protects a different amount than the strategy was scored on
+/// is the parity break that makes a backtest optimistic.
+pub const DEFAULT_TRAILING_MIN_LOCK_PIPS: f64 = 2.0;
 
 #[cfg(test)]
 mod tests {
@@ -4769,13 +4818,12 @@ mod tests {
         let sys = SystemConfig::default();
 
         let m1 = sys.resolve_higher_timeframes("M1");
-        assert_eq!(
-            m1,
-            vec![
-                "M3", "M5", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1"
-            ],
-            "M1 base → all canonical above M1"
-        );
+        let expected_m1: Vec<String> = CANONICAL_TIMEFRAMES
+            .iter()
+            .filter(|tf| **tf != "M1")
+            .map(|tf| (*tf).to_string())
+            .collect();
+        assert_eq!(m1, expected_m1, "M1 base → all canonical above M1");
         assert!(!m1.iter().any(|tf| tf == "M1"), "base itself is excluded");
 
         // base=H1: multi-resolution keeps LOWER TFs (M1..M30) as extra context
@@ -4789,7 +4837,11 @@ mod tests {
         );
         assert!(h1.contains(&"H4".to_string()), "higher TFs retained");
         assert!(!h1.iter().any(|tf| tf == "H1"), "base itself is excluded");
-        assert_eq!(h1.len(), 10, "all 11 canonical minus the base");
+        assert_eq!(
+            h1.len(),
+            CANONICAL_TIMEFRAMES.len() - 1,
+            "all canonical timeframes minus the base"
+        );
 
         // Effective-base relativity: an overridden base trims itself out even
         // when it differs from `self.base_timeframe`.
@@ -4804,8 +4856,10 @@ mod tests {
     fn resolve_higher_timeframes_multi_resolution_off_filters_strictly_above() {
         // multi_resolution OFF → higher_timeframes filtered to strictly-above
         // the base in canonical order (never a lower/equal TF).
-        let mut sys = SystemConfig::default();
-        sys.multi_resolution_enabled = false;
+        let mut sys = SystemConfig {
+            multi_resolution_enabled: false,
+            ..SystemConfig::default()
+        };
         assert_eq!(
             sys.resolve_higher_timeframes("H1"),
             vec!["H4", "H12", "D1", "W1", "MN1"],
@@ -4825,9 +4879,11 @@ mod tests {
 
     #[test]
     fn resolve_base_and_symbol_trim_preserve_config_value() {
-        let mut sys = SystemConfig::default();
-        sys.base_timeframe = "  H4 ".to_string();
-        sys.symbol = " EURUSD ".to_string();
+        let sys = SystemConfig {
+            base_timeframe: "  H4 ".to_string(),
+            symbol: " EURUSD ".to_string(),
+            ..SystemConfig::default()
+        };
         assert_eq!(sys.resolve_base_timeframe(), "H4");
         assert_eq!(sys.resolve_symbol(), "EURUSD");
     }
@@ -4839,11 +4895,16 @@ mod tests {
         let deserialized: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(deserialized.system.symbol, settings.system.symbol);
     }
-}
 
-/// Profit the trail locks once it engages, in pips.
-///
-/// Shared so the backtest, the GPU kernel and live trading cannot drift apart:
-/// a live stop that protects a different amount than the strategy was scored on
-/// is the parity break that makes a backtest optimistic.
-pub const DEFAULT_TRAILING_MIN_LOCK_PIPS: f64 = 2.0;
+    #[test]
+    fn retired_metrics_db_path_is_pruned_without_restoring_sqlite_storage() {
+        let settings: Settings = serde_yaml_ng::from_str(
+            "system:\n  metrics_db_path: metrics.sqlite\n  symbol: EURUSD\n",
+        )
+        .expect("a config from before metrics SQLite retirement must remain readable");
+
+        assert_eq!(settings.system.symbol, "EURUSD");
+        let serialized = serde_yaml_ng::to_string(&settings).expect("serialize pruned settings");
+        assert!(!serialized.contains("metrics_db_path"));
+    }
+}

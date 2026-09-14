@@ -22,6 +22,26 @@ fn eurusd_contract() -> BrokerSymbolVolumeScaleEvidenceV1 {
         .expect("valid broker symbol contract")
 }
 
+#[test]
+fn broker_volume_conversion_uses_raw_lot_size_for_fx_and_non_fx_contracts() {
+    use broker_deal_economics::broker_lots_from_wire_volume_v1;
+    for (raw, lot_size, expected) in [
+        (1_000_000, 10_000_000, 0.1),
+        (2_500, 10_000, 0.25),
+        (100, 100, 1.0),
+        (0, 10_000_000, 0.0),
+    ] {
+        assert_eq!(
+            broker_lots_from_wire_volume_v1(raw, lot_size).unwrap(),
+            expected
+        );
+    }
+    assert!(broker_lots_from_wire_volume_v1(-1, 10_000_000).is_err());
+    assert!(broker_lots_from_wire_volume_v1(1, 0).is_err());
+    assert!(broker_lots_from_wire_volume_v1(1_i64 << 53, 10_000_000).is_err());
+    assert!(broker_lots_from_wire_volume_v1(1, i64::MAX).is_err());
+}
+
 fn close_wire(
     deal_id: i64,
     filled_volume_raw_centi_units: i64,

@@ -1,7 +1,7 @@
 // Production Burn Neural Network Models
 //
 // Pure-Rust deep learning models using Burn 0.21.
-// Default backend is NdArray CPU, with an optional pure-Rust WGPU lane.
+// Default backend is NdArray CPU, with compile-selected native CUDA or ROCm lanes.
 // Replaces legacy models (deep.py, mlp.py) — no legacy, no GIL.
 //
 // Production features matching legacy:
@@ -19,15 +19,14 @@ use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::backend::{Backend, BackendTypes};
 use burn::tensor::{DType, FloatDType, TensorData};
-#[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+#[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
 use burn_ndarray::NdArray;
-#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
-use burn_wgpu::{Wgpu, WgpuDevice, graphics, init_setup};
-// Native CUDA takes priority over wgpu only when `burn-cuda-backend` is
-// explicitly enabled. That feature is separate from `gpu-cuda`; CUDA-enabled
-// Burn training runs on the selected card in f32 (no BF16 matmul hazard).
+// CUDA-enabled Burn training runs on the selected card in f32 (no BF16 matmul
+// hazard). The CPU build remains available for explicit CPU-only execution.
 #[cfg(feature = "burn-cuda-backend")]
 use burn_cuda::{Cuda, CudaDevice};
+#[cfg(feature = "burn-rocm-backend")]
+use burn_rocm::{Rocm, RocmDevice};
 
 use crate::hardware::HardwareInfo;
 use crate::runtime::capabilities::{
@@ -36,25 +35,17 @@ use crate::runtime::capabilities::{
 use anyhow::Context;
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "burn-wgpu-backend")]
-use std::collections::HashSet;
-#[cfg(feature = "burn-wgpu-backend")]
-use std::sync::{Mutex, OnceLock};
 use tracing::info;
 
 /// Backend types
 #[cfg(feature = "burn-cuda-backend")]
-pub type TrainBackend = Autodiff<Cuda<f32, i32>>;
-#[cfg(feature = "burn-cuda-backend")]
-pub type InferBackend = Cuda<f32, i32>;
-#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
-pub type TrainBackend = Autodiff<Wgpu>;
-#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
-pub type InferBackend = Wgpu;
-#[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
-pub type TrainBackend = Autodiff<NdArray>;
-#[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
-pub type InferBackend = NdArray;
+pub type SelectedBurnBackend = Cuda<f32, i32>;
+#[cfg(feature = "burn-rocm-backend")]
+pub type SelectedBurnBackend = Rocm<f32, i32>;
+#[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
+pub type SelectedBurnBackend = NdArray;
+pub type TrainBackend = Autodiff<SelectedBurnBackend>;
+pub type InferBackend = SelectedBurnBackend;
 
 /// Keeps the exact Burn CUDA stream's device and pinned-host allocator pools
 /// resident for a complete model lifecycle, then releases both pools.
@@ -102,35 +93,16 @@ impl Drop for BurnCudaResidencyScope {
     }
 }
 
-#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
-fn initialize_wgpu_runtime(device: &<InferBackend as BackendTypes>::Device, policy_key: &str) {
-    static INIT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let initialized = INIT.get_or_init(|| Mutex::new(HashSet::new()));
-    // **2026-05-25 unwrap audit**: a poisoned mutex here means an
-    // earlier wgpu init thread panicked. Recover the inner HashSet
-    // instead of cascading the panic — at worst we re-initialise a
-    // device that was already set up (idempotent), at best we mark a
-    // device as initialised that hadn't completed. Either way the
-    // operator's process keeps running.
-    let mut initialized = initialized
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let init_key = format!("{policy_key}::{device:?}");
-    if initialized.insert(init_key) {
-        init_setup::<graphics::Vulkan>(device, Default::default());
-    }
-}
-
 pub fn active_burn_backend_name() -> &'static str {
     #[cfg(feature = "burn-cuda-backend")]
     {
         "cuda"
     }
-    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+    #[cfg(feature = "burn-rocm-backend")]
     {
-        "wgpu"
+        "rocm"
     }
-    #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+    #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
     {
         "ndarray_cpu"
     }
@@ -142,9 +114,7 @@ pub fn selection_execution_backend(selection: &BurnDeviceSelection) -> &str {
 
 fn backend_name_for_type<B: Backend>() -> String {
     let backend_type = std::any::type_name::<B>().to_ascii_lowercase();
-    if backend_type.contains("wgpu") {
-        "wgpu".to_string()
-    } else if backend_type.contains("ndarray") {
+    if backend_type.contains("ndarray") {
         "ndarray_cpu".to_string()
     } else {
         active_burn_backend_name().to_string()
@@ -170,7 +140,19 @@ fn ensure_burn_cuda_backend_type<B: Backend>() -> anyhow::Result<()> {
     ))
 }
 
-#[cfg(not(feature = "burn-cuda-backend"))]
+#[cfg(feature = "burn-rocm-backend")]
+fn ensure_burn_cuda_backend_type<B: Backend>() -> anyhow::Result<()> {
+    let backend_type = std::any::type_name::<B>().to_ascii_lowercase();
+    if backend_type.contains("cubecl_hip") || backend_type.contains("hipruntime") {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Burn ROCm backend requires native HIP execution; backend type `{}` is not HIP",
+        std::any::type_name::<B>()
+    )
+}
+
+#[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
 fn ensure_burn_cuda_backend_type<B: Backend>() -> anyhow::Result<()> {
     let _ = std::marker::PhantomData::<B>;
     Ok(())
@@ -191,33 +173,28 @@ pub fn normalize_burn_device_policy(policy: &str) -> String {
     if normalized == "default" {
         return "auto".to_string();
     }
-    // Burn also accepts the `wgpu` / `wgpu:N` form because the burn-wgpu
-    // backend exists; statistical / runtime / rl callers do not, so it
-    // goes in as an `extra_prefixes` token rather than into the shared
-    // vendor list. See Batch 9 consolidation (docs/audits/research/
-    // gpu_consolidation_audit.md) for the contract.
-    crate::common::normalize_vendor_device_policy(&normalized, &["wgpu"])
+    #[cfg(feature = "burn-rocm-backend")]
+    {
+        return crate::common::normalize_rocm_device_policy(&normalized);
+    }
+    #[cfg(not(feature = "burn-rocm-backend"))]
+    crate::common::normalize_vendor_device_policy(&normalized, &[])
 }
 
-fn is_supported_burn_device_policy(normalized: &str) -> bool {
-    matches!(
-        normalized,
-        "auto"
-            | "cpu"
-            | "gpu"
-            | "cuda"
-            | "wgpu"
-            | "default"
-            | "rocm"
-            | "metal"
-            | "vulkan"
-            | "external_device"
-    ) || normalized.starts_with("cuda:")
-        || normalized.starts_with("gpu:")
-        || normalized.starts_with("wgpu:")
-        || normalized.starts_with("rocm:")
-        || normalized.starts_with("metal:")
-        || normalized.starts_with("vulkan:")
+pub(crate) fn is_supported_burn_device_policy(normalized: &str) -> bool {
+    #[cfg(feature = "burn-rocm-backend")]
+    {
+        return matches!(normalized, "auto" | "cpu" | "external_device")
+            || crate::common::parse_rocm_device_ordinal(normalized).is_ok();
+    }
+    #[cfg(not(feature = "burn-rocm-backend"))]
+    {
+        matches!(
+            normalized,
+            "auto" | "cpu" | "gpu" | "cuda" | "default" | "external_device"
+        ) || normalized.starts_with("cuda:")
+            || normalized.starts_with("gpu:")
+    }
 }
 
 fn normalize_effective_burn_device_policy(policy: &str) -> String {
@@ -247,7 +224,9 @@ pub(crate) fn validate_burn_device_selection(
         || effective == "cpu"
         || effective == "default"
         || effective == "gpu"
-        || effective.starts_with("gpu:");
+        || effective.starts_with("gpu:")
+        || (cfg!(feature = "burn-rocm-backend")
+            && crate::common::parse_rocm_device_ordinal(&effective).is_ok());
     if !effective_supported {
         return Err(anyhow::anyhow!(
             "Burn runtime effective device policy is unsupported: {}",
@@ -270,43 +249,32 @@ pub(crate) fn validate_burn_device_selection(
             "Burn CUDA backend requires native CUDA execution, got `{execution_backend}`"
         ));
     }
+    #[cfg(feature = "burn-rocm-backend")]
+    if !matches!(execution_backend.as_str(), "rocm" | "external:rocm") {
+        anyhow::bail!("Burn ROCm backend requires native HIP execution, got `{execution_backend}`");
+    }
 
     match execution_backend.as_str() {
+        "rocm" => {
+            if !cfg!(feature = "burn-rocm-backend")
+                || !effective.starts_with("rocm:")
+                || crate::common::parse_rocm_device_ordinal(&effective).is_err()
+            {
+                anyhow::bail!(
+                    "Burn runtime ROCm backend is incompatible with effective policy {effective}"
+                );
+            }
+            let ordinal = crate::common::parse_rocm_device_ordinal(&effective)?;
+            if effective != format!("rocm:{ordinal}")
+                || crate::common::parse_rocm_device_ordinal(&requested)? != ordinal
+            {
+                anyhow::bail!("Burn runtime ROCm requested/effective ordinal identity mismatch");
+            }
+        }
         "ndarray_cpu" => {
             if effective != "cpu" && effective != "external_device" {
                 return Err(anyhow::anyhow!(
                     "Burn runtime ndarray_cpu backend is incompatible with effective policy {effective}"
-                ));
-            }
-        }
-        "wgpu" => {
-            if effective != "external_device" {
-                return Err(anyhow::anyhow!(
-                    "Burn runtime generic wgpu backend requires external_device effective policy, got {effective}"
-                ));
-            }
-        }
-        "wgpu_cpu" => {
-            if effective != "cpu" && effective != "external_device" {
-                return Err(anyhow::anyhow!(
-                    "Burn runtime wgpu_cpu backend is incompatible with effective policy {effective}"
-                ));
-            }
-        }
-        "wgpu_default" => {
-            if effective != "default" && effective != "external_device" {
-                return Err(anyhow::anyhow!(
-                    "Burn runtime wgpu_default backend is incompatible with effective policy {effective}"
-                ));
-            }
-        }
-        "wgpu_discrete_gpu" | "wgpu_integrated_gpu" | "wgpu_virtual_gpu" => {
-            if effective != "external_device"
-                && effective != "gpu"
-                && !effective.starts_with("gpu:")
-            {
-                return Err(anyhow::anyhow!(
-                    "Burn runtime GPU backend {execution_backend} is incompatible with effective policy {effective}"
                 ));
             }
         }
@@ -343,48 +311,59 @@ pub(crate) fn validate_loaded_burn_device_identity(
     persisted_execution_backend: Option<&str>,
     live: &BurnDeviceSelection,
 ) -> anyhow::Result<()> {
-    #[cfg(feature = "burn-cuda-backend")]
-    {
-        let persisted_requested_policy = persisted_requested_policy.ok_or_else(|| {
-            anyhow::anyhow!(
-                "{surface} Burn CUDA artifact runtime identity is missing requested_device_policy"
-            )
-        })?;
-        let persisted_effective_policy = persisted_effective_policy.ok_or_else(|| {
-            anyhow::anyhow!(
-                "{surface} Burn CUDA artifact runtime identity is missing effective_device_policy"
-            )
-        })?;
-        let persisted_execution_backend = persisted_execution_backend.ok_or_else(|| {
-            anyhow::anyhow!(
-                "{surface} Burn CUDA artifact runtime identity is missing execution_backend"
-            )
-        })?;
-        let persisted = BurnDeviceSelection {
-            requested_policy: normalize_burn_device_policy(persisted_requested_policy),
-            effective_policy: normalize_effective_burn_device_policy(persisted_effective_policy),
-            execution_backend: persisted_execution_backend.trim().to_ascii_lowercase(),
-        };
-        validate_burn_device_selection(&persisted).context(format!(
-            "{surface} Burn CUDA artifact runtime identity is invalid"
-        ))?;
-        if persisted != *live {
-            return Err(anyhow::anyhow!(
-                "{surface} Burn CUDA artifact runtime identity drift: persisted {:?}, live {:?}",
-                persisted,
-                live
-            ));
-        }
+    let persisted_fields = [
+        persisted_requested_policy,
+        persisted_effective_policy,
+        persisted_execution_backend,
+    ];
+    let persisted_count = persisted_fields
+        .iter()
+        .filter(|field| field.is_some())
+        .count();
+
+    #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend"))]
+    if persisted_count != persisted_fields.len() {
+        return Err(anyhow::anyhow!(
+            "{surface} Burn native GPU artifact runtime identity must include requested_device_policy, effective_device_policy, and execution_backend"
+        ));
     }
-    #[cfg(not(feature = "burn-cuda-backend"))]
-    {
-        let _ = (
-            surface,
-            persisted_requested_policy,
-            persisted_effective_policy,
-            persisted_execution_backend,
-            live,
-        );
+
+    if persisted_count == 0 {
+        return Ok(());
+    }
+    if persisted_count != persisted_fields.len() {
+        return Err(anyhow::anyhow!(
+            "{surface} Burn artifact runtime identity must persist requested_device_policy, effective_device_policy, and execution_backend together"
+        ));
+    }
+
+    let (
+        Some(persisted_requested_policy),
+        Some(persisted_effective_policy),
+        Some(persisted_execution_backend),
+    ) = (
+        persisted_requested_policy,
+        persisted_effective_policy,
+        persisted_execution_backend,
+    )
+    else {
+        return Err(anyhow::anyhow!(
+            "{surface} Burn artifact runtime identity is incomplete"
+        ));
+    };
+    let persisted = BurnDeviceSelection {
+        requested_policy: normalize_burn_device_policy(persisted_requested_policy),
+        effective_policy: normalize_effective_burn_device_policy(persisted_effective_policy),
+        execution_backend: persisted_execution_backend.trim().to_ascii_lowercase(),
+    };
+    validate_burn_device_selection(&persisted)
+        .with_context(|| format!("{surface} Burn artifact runtime identity is invalid"))?;
+    if persisted != *live {
+        return Err(anyhow::anyhow!(
+            "{surface} Burn artifact runtime identity drift: persisted {:?}, live {:?}",
+            persisted,
+            live
+        ));
     }
     Ok(())
 }
@@ -419,78 +398,22 @@ fn resolve_cuda_device_policy(normalized: &str) -> anyhow::Result<(CudaDevice, S
     ))
 }
 
-#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
-fn parse_wgpu_device_selector(normalized: &str) -> Option<(WgpuDevice, String, String)> {
-    let selector = normalized
-        .strip_prefix("cuda:")
-        .or_else(|| normalized.strip_prefix("gpu:"))
-        .or_else(|| normalized.strip_prefix("wgpu:"))
-        .or_else(|| normalized.strip_prefix("rocm:"))
-        .or_else(|| normalized.strip_prefix("metal:"))
-        .or_else(|| normalized.strip_prefix("vulkan:"))?;
-
-    if let Ok(index) = selector.parse::<usize>() {
-        return Some((
-            WgpuDevice::DiscreteGpu(index),
-            format!("gpu:{index}"),
-            "wgpu_discrete_gpu".to_string(),
-        ));
-    }
-
-    let (device_class, raw_index) = selector.split_once(':')?;
-    let index = raw_index.parse::<usize>().ok()?;
-    match device_class {
-        "discrete" | "dgpu" => Some((
-            WgpuDevice::DiscreteGpu(index),
-            format!("gpu:discrete:{index}"),
-            "wgpu_discrete_gpu".to_string(),
-        )),
-        "integrated" | "igpu" => Some((
-            WgpuDevice::IntegratedGpu(index),
-            format!("gpu:integrated:{index}"),
-            "wgpu_integrated_gpu".to_string(),
-        )),
-        "virtual" | "vgpu" => Some((
-            WgpuDevice::VirtualGpu(index),
-            format!("gpu:virtual:{index}"),
-            "wgpu_virtual_gpu".to_string(),
-        )),
-        "default" => Some((
-            WgpuDevice::DefaultDevice,
-            "default".to_string(),
-            "wgpu_default".to_string(),
-        )),
-        _ => None,
-    }
-}
-
-#[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
-fn resolve_wgpu_device_policy(normalized: &str) -> (WgpuDevice, String, String) {
-    match normalized {
-        "cpu" => (WgpuDevice::Cpu, "cpu".to_string(), "wgpu_cpu".to_string()),
-        "auto" | "gpu" | "cuda" | "wgpu" | "default" | "rocm" | "metal" | "vulkan" => (
-            WgpuDevice::DefaultDevice,
-            "default".to_string(),
-            "wgpu_default".to_string(),
-        ),
-        other => {
-            if let Some(selection) = parse_wgpu_device_selector(other) {
-                selection
-            } else {
-                (
-                    WgpuDevice::DefaultDevice,
-                    "default".to_string(),
-                    "wgpu_default".to_string(),
-                )
-            }
-        }
-    }
-}
-
 pub fn resolve_infer_device(
     policy: &str,
 ) -> anyhow::Result<(<InferBackend as BackendTypes>::Device, BurnDeviceSelection)> {
     let requested_policy = normalize_burn_device_policy(policy);
+    #[cfg(feature = "burn-rocm-backend")]
+    {
+        let ordinal = crate::common::parse_rocm_device_ordinal(&requested_policy)?;
+        return Ok((
+            RocmDevice::new(ordinal),
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy: format!("rocm:{ordinal}"),
+                execution_backend: "rocm".into(),
+            },
+        ));
+    }
     #[cfg(feature = "burn-cuda-backend")]
     {
         let (device, effective_policy, execution_backend) =
@@ -504,22 +427,13 @@ pub fn resolve_infer_device(
             },
         ));
     }
-    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+    #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
     {
-        let (device, effective_policy, execution_backend) =
-            resolve_wgpu_device_policy(&requested_policy);
-        initialize_wgpu_runtime(&device, &effective_policy);
-        return Ok((
-            device,
-            BurnDeviceSelection {
-                requested_policy,
-                effective_policy,
-                execution_backend,
-            },
-        ));
-    }
-    #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
-    {
+        if !matches!(requested_policy.as_str(), "auto" | "cpu") {
+            return Err(anyhow::anyhow!(
+                "Burn ndarray CPU build cannot honor device policy `{requested_policy}`; use the native CUDA build for GPU execution"
+            ));
+        }
         Ok((
             <InferBackend as BackendTypes>::Device::default(),
             BurnDeviceSelection {
@@ -535,6 +449,18 @@ pub fn resolve_train_device(
     policy: &str,
 ) -> anyhow::Result<(<TrainBackend as BackendTypes>::Device, BurnDeviceSelection)> {
     let requested_policy = normalize_burn_device_policy(policy);
+    #[cfg(feature = "burn-rocm-backend")]
+    {
+        let ordinal = crate::common::parse_rocm_device_ordinal(&requested_policy)?;
+        return Ok((
+            RocmDevice::new(ordinal),
+            BurnDeviceSelection {
+                requested_policy,
+                effective_policy: format!("rocm:{ordinal}"),
+                execution_backend: "rocm".into(),
+            },
+        ));
+    }
     #[cfg(feature = "burn-cuda-backend")]
     {
         let (device, effective_policy, execution_backend) =
@@ -548,22 +474,13 @@ pub fn resolve_train_device(
             },
         ));
     }
-    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+    #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
     {
-        let (device, effective_policy, execution_backend) =
-            resolve_wgpu_device_policy(&requested_policy);
-        initialize_wgpu_runtime(&device, &effective_policy);
-        return Ok((
-            device,
-            BurnDeviceSelection {
-                requested_policy,
-                effective_policy,
-                execution_backend,
-            },
-        ));
-    }
-    #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
-    {
+        if !matches!(requested_policy.as_str(), "auto" | "cpu") {
+            return Err(anyhow::anyhow!(
+                "Burn ndarray CPU build cannot honor device policy `{requested_policy}`; use the native CUDA build for GPU execution"
+            ));
+        }
         Ok((
             <TrainBackend as BackendTypes>::Device::default(),
             BurnDeviceSelection {
@@ -727,6 +644,264 @@ fn time_series_split(
         .max(min_train.min(n_samples));
     let val_start = (train_end + embargo).min(n_samples);
     (0..train_end, val_start..n_samples)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BurnTrainingSplitV1 {
+    train: std::ops::Range<usize>,
+    validation: std::ops::Range<usize>,
+    external_validation_rows: Option<usize>,
+    embargo: usize,
+}
+
+impl BurnTrainingSplitV1 {
+    fn checked(rows: usize, external_validation_rows: Option<usize>) -> anyhow::Result<Self> {
+        let (train, validation, embargo) = if external_validation_rows.is_some() {
+            (0..rows, 0..0, 0)
+        } else {
+            let embargo = ((rows as f32 * 0.005).ceil() as usize).max(10);
+            let (train, validation) = time_series_split(rows, 0.15, 100, embargo);
+            (train, validation, embargo)
+        };
+        let split = Self {
+            train,
+            validation,
+            external_validation_rows,
+            embargo,
+        };
+        anyhow::ensure!(
+            !split.train.is_empty() && split.validation_rows() > 0,
+            "Burn training requires enough rows for a validation set; rows={}, train_rows={}, val_rows={}, embargo={}",
+            rows,
+            split.train.len(),
+            split.validation_rows(),
+            embargo
+        );
+        Ok(split)
+    }
+
+    fn validation_rows(&self) -> usize {
+        self.external_validation_rows
+            .unwrap_or(self.validation.len())
+    }
+}
+
+fn validate_external_validation_pair_v1(x: bool, y: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        x == y,
+        "Burn external validation features and labels must be supplied together"
+    );
+    Ok(())
+}
+
+/// Private native FP32/I32 transport admission, not a device reservation or a
+/// Search-to-Models buffer import. Only the MLP capacity path constructs it.
+#[derive(Clone, Debug)]
+pub(crate) struct BurnResidentDatasetPlanV1 {
+    split: BurnTrainingSplitV1,
+    columns: usize,
+    batch_rows: usize,
+    persistent_bytes: usize,
+    peak_bytes: usize,
+}
+
+impl BurnResidentDatasetPlanV1 {
+    #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+    pub(crate) fn checked(
+        rows: usize,
+        columns: usize,
+        external_validation_rows: Option<usize>,
+        batch_size: usize,
+        max_page_bytes: usize,
+        alignment: usize,
+    ) -> anyhow::Result<Self> {
+        let split = BurnTrainingSplitV1::checked(rows, external_validation_rows)?;
+        anyhow::ensure!(
+            columns > 0 && batch_size > 0,
+            "resident dataset dimensions must be positive"
+        );
+        anyhow::ensure!(
+            split.train.len() <= i32::MAX as usize && split.validation_rows() <= i32::MAX as usize,
+            "resident dataset row indices exceed the native I32 tensor domain"
+        );
+        let batch_rows = batch_size.min(split.train.len());
+        let matrix =
+            |height, width| resident_tensor_bytes_v1(height, width, max_page_bytes, alignment);
+        let train_x = matrix(split.train.len(), columns)?;
+        let train_y = matrix(1, split.train.len())?;
+        let val_x = matrix(split.validation_rows(), columns)?;
+        let val_y = matrix(1, split.validation_rows())?;
+        let persistent_bytes =
+            [train_x, train_y, val_x, val_y]
+                .into_iter()
+                .try_fold(0usize, |sum, value| {
+                    sum.checked_add(value)
+                        .ok_or_else(|| anyhow::anyhow!("resident dataset byte count overflow"))
+                })?;
+        // Gathered X/Y and the shared I32 row-index tensor are live together.
+        // Also retain one largest input-sized transfer/workspace allowance:
+        // CubeCL's pitched upload may stage/copy while earlier inputs are live.
+        let gather_bytes = matrix(batch_rows, columns)?
+            .checked_add(
+                matrix(1, batch_rows)?
+                    .checked_mul(2)
+                    .ok_or_else(|| anyhow::anyhow!("resident gather byte count overflow"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("resident gather byte count overflow"))?;
+        let peak_bytes = persistent_bytes
+            .checked_add(gather_bytes.max(train_x.max(val_x).max(train_y).max(val_y)))
+            .ok_or_else(|| anyhow::anyhow!("resident dataset peak byte count overflow"))?;
+        Ok(Self {
+            split,
+            columns,
+            batch_rows,
+            persistent_bytes,
+            peak_bytes,
+        })
+    }
+
+    #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+    pub(crate) fn train_rows(&self) -> usize {
+        self.split.train.len()
+    }
+    #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+    pub(crate) fn validation_rows(&self) -> usize {
+        self.split.validation_rows()
+    }
+    #[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+    pub(crate) fn batch_rows(&self) -> usize {
+        self.batch_rows
+    }
+    pub(crate) fn peak_bytes(&self) -> usize {
+        self.peak_bytes
+    }
+
+    fn validate<B: AutodiffBackend>(
+        &self,
+        split: &BurnTrainingSplitV1,
+        columns: usize,
+        batch_size: usize,
+        dtype: DType,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.split == *split
+                && self.columns == columns
+                && self.batch_rows == batch_size.min(split.train.len()),
+            "resident dataset admission no longer matches the exact training split/shape"
+        );
+        anyhow::ensure!(
+            dtype == DType::F32
+                && std::any::TypeId::of::<B::IntElem>() == std::any::TypeId::of::<i32>(),
+            "resident dataset admission requires the selected native FP32/I32 backend"
+        );
+        Ok(())
+    }
+}
+
+/// Checked CubeCL 0.10 PitchedMemoryLayoutPolicy/optimal_align calculation for
+/// a single FP32/I32 descriptor, including the final allocation alignment.
+/// Unit width is contiguous; rank-one labels/indices use height=1.
+#[cfg(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend", test))]
+pub(crate) fn resident_tensor_bytes_v1(
+    height: usize,
+    width: usize,
+    max_page: usize,
+    alignment: usize,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        height > 0 && width > 0 && alignment >= 16 && alignment.is_power_of_two(),
+        "invalid resident tensor shape or runtime alignment"
+    );
+    let width_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("resident tensor width overflow"))?;
+    let pitch_alignment = if width == 1 {
+        4
+    } else {
+        width_bytes
+            .checked_next_power_of_two()
+            .ok_or_else(|| anyhow::anyhow!("resident tensor pitch overflow"))?
+            .clamp(16, alignment)
+    };
+    let pitch = width_bytes
+        .checked_next_multiple_of(pitch_alignment)
+        .ok_or_else(|| anyhow::anyhow!("resident tensor pitch overflow"))?;
+    let physical = height
+        .checked_mul(pitch)
+        .ok_or_else(|| anyhow::anyhow!("resident tensor extent overflow"))?;
+    anyhow::ensure!(
+        physical / 4 <= u32::MAX as usize,
+        "resident tensor padded extent exceeds the native indexing bound"
+    );
+    let allocated = physical
+        .checked_next_multiple_of(alignment)
+        .ok_or_else(|| anyhow::anyhow!("resident tensor allocation overflow"))?;
+    anyhow::ensure!(
+        allocated <= max_page,
+        "resident tensor requires {allocated} bytes, exceeding the runtime page limit {max_page}"
+    );
+    Ok(allocated)
+}
+
+/// Long-lived data is on the inner backend, never an autodiff graph. Only the
+/// selected minibatch is wrapped in B and it dies with that batch's backward.
+struct BurnResidentDatasetV1<B: AutodiffBackend> {
+    train_x: Tensor<B::InnerBackend, 2>,
+    train_y: Tensor<B::InnerBackend, 1, Int>,
+    validation_x: Tensor<B::InnerBackend, 2>,
+    validation_y: Tensor<B::InnerBackend, 1, Int>,
+}
+
+impl<B: AutodiffBackend> BurnResidentDatasetV1<B> {
+    fn upload(
+        train_x: &Array2<f32>,
+        train_y: &[i64],
+        validation_x: &Array2<f32>,
+        validation_y: &[i64],
+        device: &B::Device,
+    ) -> Self {
+        Self {
+            train_x: array2_to_tensor_with_dtype::<B::InnerBackend>(train_x, device, DType::F32),
+            train_y: Tensor::from_data(
+                TensorData::new(train_y.to_vec(), [train_y.len()]),
+                (device, DType::I32),
+            ),
+            validation_x: array2_to_tensor_with_dtype::<B::InnerBackend>(
+                validation_x,
+                device,
+                DType::F32,
+            ),
+            validation_y: Tensor::from_data(
+                TensorData::new(validation_y.to_vec(), [validation_y.len()]),
+                (device, DType::I32),
+            ),
+        }
+    }
+
+    fn batch(
+        &self,
+        rows: &[usize],
+        device: &B::Device,
+    ) -> anyhow::Result<(Tensor<B, 2>, Tensor<B, 1, Int>)> {
+        anyhow::ensure!(
+            !rows.is_empty() && rows.iter().all(|&row| row < self.train_x.dims()[0]),
+            "resident minibatch contains an empty or out-of-range selection"
+        );
+        let indices = rows
+            .iter()
+            .map(|&row| {
+                i32::try_from(row).map_err(|_| anyhow::anyhow!("resident row index exceeds I32"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let indices = Tensor::<B::InnerBackend, 1, Int>::from_data(
+            TensorData::new(indices, [rows.len()]),
+            (device, DType::I32),
+        );
+        Ok((
+            Tensor::<B, 2>::from_inner(self.train_x.clone().select(0, indices.clone())),
+            Tensor::<B, 1, Int>::from_inner(self.train_y.clone().select(0, indices)),
+        ))
+    }
 }
 
 /// Early stopping tracker matching legacy EarlyStopper.
@@ -2177,12 +2352,24 @@ fn resolve_burn_training_precision_for_backend<B: Backend>(
 ) -> (BurnExecutionPrecision, Option<String>) {
     let requested = requested_burn_training_precision(requested_precision);
 
+    // ROCm's complete optimizer/fusion lifecycle has not been validated in
+    // reduced precision. Do not use NVIDIA capability probes for an AMD card,
+    // and do not imply the observed CUDA BF16 defect was reproduced on HIP.
+    if matches!(
+        selection.execution_backend.as_str(),
+        "rocm" | "external:rocm"
+    ) {
+        return (BurnExecutionPrecision::Fp32, (requested != "fp32").then(|| {
+            format!("requested precision `{requested}`; native Burn ROCm training currently admits `fp32` only; reduced-precision lifecycle is unvalidated")
+        }));
+    }
+
     let gpu_requested = selection.effective_policy == "default"
         || selection.effective_policy == "gpu"
         || selection.effective_policy.starts_with("gpu:")
         || matches!(
             selection.execution_backend.as_str(),
-            "wgpu_default" | "wgpu_discrete_gpu" | "wgpu_integrated_gpu" | "wgpu_virtual_gpu"
+            "cuda" | "cuda_default" | "cuda_discrete_gpu" | "external:cuda"
         );
     let supports_bf16 = if gpu_requested {
         let hardware = HardwareInfo::detect();
@@ -2464,6 +2651,39 @@ where
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
     M::InnerModule: BurnForward<B::InnerBackend>,
 {
+    train_model_with_transport_v1::<B, M>(
+        model,
+        x_data,
+        y_raw,
+        config,
+        device,
+        selection,
+        requested_precision,
+        external_val_x,
+        external_val_y,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn train_model_with_transport_v1<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+    requested_precision: Option<&str>,
+    external_val_x: Option<&Array2<f32>>,
+    external_val_y: Option<&[i32]>,
+    resident_plan: Option<BurnResidentDatasetPlanV1>,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+    M::InnerModule: BurnForward<B::InnerBackend>,
+{
+    validate_external_validation_pair_v1(external_val_x.is_some(), external_val_y.is_some())?;
     ensure_burn_cuda_backend_type::<B>()?;
     validate_train_config(config)?;
     validate_burn_device_selection(selection)?;
@@ -2507,13 +2727,10 @@ where
     // 2. Resolve train/val ranges. When the caller supplied an external val
     // frame, treat the entire `x_data` as training rows. Otherwise fall
     // back to the legacy index-order-aware split with embargo.
-    let (train_range, val_range, embargo) = if use_external_val {
-        (0..n_samples, 0..0, 0usize)
-    } else {
-        let embargo = ((n_samples as f32 * 0.005).ceil() as usize).max(10);
-        let (train_range, val_range) = time_series_split(n_samples, 0.15, 100, embargo);
-        (train_range, val_range, embargo)
-    };
+    let split = BurnTrainingSplitV1::checked(n_samples, external_val_x.map(|vx| vx.nrows()))?;
+    let train_range = split.train.clone();
+    let val_range = split.validation.clone();
+    let embargo = split.embargo;
     let n_train = train_range.len();
 
     let external_val_labels_mapped = if let Some(vy) = external_val_y {
@@ -2522,21 +2739,13 @@ where
         None
     };
 
-    let val_rows_for_report = if use_external_val {
-        external_val_x.map(|vx| vx.nrows()).unwrap_or(0)
-    } else {
-        val_range.len()
-    };
-    let dataset_rows_for_report = n_train + val_rows_for_report + embargo;
-
-    if n_train == 0 || val_rows_for_report == 0 {
-        return Err(anyhow::anyhow!(
-            "Burn training requires enough rows for a validation set; rows={}, train_rows={}, val_rows={}, embargo={}",
-            n_samples,
-            n_train,
-            val_rows_for_report,
-            embargo
-        ));
+    let val_rows_for_report = split.validation_rows();
+    let dataset_rows_for_report = n_train
+        .checked_add(val_rows_for_report)
+        .and_then(|rows| rows.checked_add(embargo))
+        .ok_or_else(|| anyhow::anyhow!("Burn report row count overflow"))?;
+    if let Some(plan) = &resident_plan {
+        plan.validate::<B>(&split, x_data.ncols(), config.batch_size, training_dtype)?;
     }
     info!(
         "Burn training: {} train, {} val, embargo={}, external_val={}",
@@ -2547,8 +2756,8 @@ where
     let train_labels: Vec<i64> = y_mapped[train_range.clone()].to_vec();
     let class_weights = compute_class_weights(&train_labels, config.n_classes);
 
-    // 4. Keep ndarray slices as the long-lived representation and materialize Burn tensors
-    // per batch/validation pass so we do not retain large tensor graphs across the full run.
+    // 4. All callers retain the same split. Only pre-admitted MLP runs upload
+    // inner-backend data once; other model families explicitly stay host-batched.
     let x_train_array = x_data
         .slice(ndarray::s![train_range.clone(), ..])
         .to_owned();
@@ -2566,7 +2775,22 @@ where
     } else {
         Some(y_mapped[val_range.clone()].to_vec())
     };
-    let val_is_empty = x_val_array.is_none();
+    let x_val_array = x_val_array.ok_or_else(|| {
+        anyhow::anyhow!("Burn validation features are missing after split validation")
+    })?;
+    let y_val_labels = y_val_labels.ok_or_else(|| {
+        anyhow::anyhow!("Burn validation labels are missing after split validation")
+    })?;
+    let resident_data = resident_plan.as_ref().map(|plan| {
+        info!(target: "neoethos_models::burn", transport="inner-backend-resident",
+            persistent_dataset_bytes=plan.persistent_bytes, admitted_dataset_peak_bytes=plan.peak_bytes(),
+            "Burn dataset transport: one feature/label upload per split; minibatches upload row indices");
+        BurnResidentDatasetV1::<B>::upload(&x_train_array, &train_labels, &x_val_array, &y_val_labels, device)
+    });
+    if resident_data.is_none() {
+        info!(target: "neoethos_models::burn", transport="host-batched",
+            "Burn dataset transport: resident dataset not admitted; feature/label uploads remain per batch and validation pass");
+    }
 
     // 5. Optimizer + early stopping
     // Use AdamW with 5e-4 decoupled weight decay as recommended for noisy time-series
@@ -2591,15 +2815,20 @@ where
             let end = (start + config.batch_size).min(n_train);
             let loss_val = {
                 // Tight scope keeps tensors and autograd state from lingering across batches.
-                let batch_rows = indices[start..end].to_vec();
-                let x_batch_array = x_train_array.select(ndarray::Axis(0), &batch_rows);
-                let y_batch_labels = batch_rows
-                    .iter()
-                    .map(|&idx| train_labels[idx])
-                    .collect::<Vec<_>>();
-                let x_batch =
-                    array2_to_tensor_with_dtype::<B>(&x_batch_array, device, training_dtype);
-                let y_batch = labels_to_tensor::<B>(&y_batch_labels, device);
+                let batch_rows = &indices[start..end];
+                let (x_batch, y_batch) = if let Some(data) = &resident_data {
+                    data.batch(batch_rows, device)?
+                } else {
+                    let x_batch_array = x_train_array.select(ndarray::Axis(0), batch_rows);
+                    let y_batch_labels = batch_rows
+                        .iter()
+                        .map(|&idx| train_labels[idx])
+                        .collect::<Vec<_>>();
+                    (
+                        array2_to_tensor_with_dtype::<B>(&x_batch_array, device, training_dtype),
+                        labels_to_tensor::<B>(&y_batch_labels, device),
+                    )
+                };
 
                 let logits = BurnForward::forward_pass(&model, x_batch);
                 let loss = cross_entropy_loss(logits, y_batch, &class_weights, device);
@@ -2628,39 +2857,25 @@ where
             f32::INFINITY
         };
         final_train_loss = train_epoch_loss;
-        if train_epoch_loss.is_finite() && val_is_empty && train_epoch_loss < best_loss {
-            best_loss = train_epoch_loss;
-            best_epoch = Some(epoch);
-            best_model_snapshot = Some(model.clone());
-        }
-
         // Validation on holdout (sequential, no shuffle).
-        //
-        // **2026-05-25 unwrap audit**: `val_is_empty` is computed
-        // upstream from the same `val_range.is_empty()` predicate that
-        // gates `x_val_array`/`y_val_labels` initialisation — so the
-        // `Some(_)` arms are guaranteed when this branch fires. Even
-        // so, per the no-panic doctrine we pattern-match. A future
-        // regression that decouples `val_is_empty` from the array
-        // existence will now skip the validation phase silently
-        // instead of crashing mid-epoch.
-        if !val_is_empty {
-            let (Some(x_val), Some(y_val)) = (x_val_array.as_ref(), y_val_labels.as_ref()) else {
-                tracing::warn!(
-                    target: "neoethos_models::burn",
-                    "validation phase skipped: x_val_array/y_val_labels are None despite \
-                     val_is_empty=false (upstream invariant violated)"
-                );
-                continue;
-            };
+        {
             // Burn's official validation boundary converts an autodiff module to
             // its inner backend. Running this pass on `B` would register a graph
             // with no subsequent backward call, leaving its Fusion bindings live
             // after the final epoch.
             let valid_model = model.valid();
-            let x_val =
-                array2_to_tensor_with_dtype::<B::InnerBackend>(x_val, device, training_dtype);
-            let y_val = labels_to_tensor::<B::InnerBackend>(y_val, device);
+            let (x_val, y_val) = if let Some(data) = &resident_data {
+                (data.validation_x.clone(), data.validation_y.clone())
+            } else {
+                (
+                    array2_to_tensor_with_dtype::<B::InnerBackend>(
+                        &x_val_array,
+                        device,
+                        training_dtype,
+                    ),
+                    labels_to_tensor::<B::InnerBackend>(&y_val_labels, device),
+                )
+            };
             let val_logits = BurnForward::forward_pass(&valid_model, x_val);
             let val_loss =
                 cross_entropy_loss::<B::InnerBackend>(val_logits, y_val, &class_weights, device);
@@ -2685,8 +2900,6 @@ where
                     epoch, train_epoch_loss, vl
                 );
             }
-        } else if epoch % 10 == 0 {
-            info!("Epoch {}: train={:.6}", epoch, train_epoch_loss);
         }
 
         epochs_ran = epoch + 1;
@@ -2848,6 +3061,199 @@ pub fn predict_proba_checked_on_device_with_selection<B: Backend, M: BurnForward
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_dataset_uses_the_exact_internal_or_external_split() -> anyhow::Result<()> {
+        let internal = BurnResidentDatasetPlanV1::checked(1000, 3, None, 64, 1 << 24, 256)?;
+        assert_eq!(internal.split.train, 0..840);
+        assert_eq!(internal.split.validation, 850..1000);
+        assert_eq!(internal.split.embargo, 10);
+        assert_eq!(
+            (
+                internal.train_rows(),
+                internal.validation_rows(),
+                internal.batch_rows()
+            ),
+            (840, 150, 64)
+        );
+        let external = BurnResidentDatasetPlanV1::checked(200, 3, Some(50), 17, 1 << 24, 256)?;
+        assert_eq!(external.split.train, 0..200);
+        assert_eq!(external.split.validation, 0..0);
+        assert_eq!(external.split.embargo, 0);
+        assert_eq!(external.validation_rows(), 50);
+        // Independent padded extents: Xtrain3328 + Ytrain1024 + Xval1024 + Yval256.
+        assert_eq!(external.persistent_bytes, 5632);
+        assert_eq!(external.peak_bytes(), 8960); // plus max(upload3328, gather1024)
+        assert!(BurnResidentDatasetPlanV1::checked(110, 3, None, 64, 1 << 24, 256).is_err());
+        assert!(BurnResidentDatasetPlanV1::checked(200, 3, Some(0), 64, 1 << 24, 256).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn resident_dataset_refuses_page_padding_index_and_arithmetic_overflow() -> anyhow::Result<()> {
+        assert_eq!(resident_tensor_bytes_v1(17, 3, 512, 256)?, 512);
+        assert!(resident_tensor_bytes_v1(17, 3, 300, 256).is_err()); // logical204 fits; actual512 does not
+        assert_eq!(resident_tensor_bytes_v1(17, 1, 256, 256)?, 256); // unit width is NOT row-padded
+        let padded_overflow_rows = u32::MAX as usize / 4 + 1;
+        assert!(resident_tensor_bytes_v1(padded_overflow_rows, 3, usize::MAX, 256).is_err());
+        assert!(resident_tensor_bytes_v1(1, usize::MAX, usize::MAX, 256).is_err());
+        assert!(resident_tensor_bytes_v1(1, 3, usize::MAX, 3).is_err());
+        assert!(
+            BurnResidentDatasetPlanV1::checked(
+                i32::MAX as usize + 1,
+                1,
+                Some(1),
+                1,
+                usize::MAX,
+                256
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resident_dataset_revalidates_split_shape_and_dtype_before_upload() -> anyhow::Result<()> {
+        type Host = Autodiff<burn_ndarray::NdArray<f32, i32>>;
+        let plan = BurnResidentDatasetPlanV1::checked(200, 3, Some(50), 17, 1 << 24, 256)?;
+        plan.validate::<Host>(&plan.split, 3, 17, DType::F32)?;
+        assert!(
+            plan.validate::<Host>(&plan.split, 4, 17, DType::F32)
+                .is_err()
+        );
+        assert!(
+            plan.validate::<Host>(&plan.split, 3, 18, DType::F32)
+                .is_err()
+        );
+        assert!(
+            plan.validate::<Host>(&plan.split, 3, 17, DType::BF16)
+                .is_err()
+        );
+        assert!(
+            plan.validate::<Autodiff<burn_ndarray::NdArray<f32, i64>>>(
+                &plan.split,
+                3,
+                17,
+                DType::F32
+            )
+            .is_err()
+        );
+        assert!(
+            plan.validate::<Host>(&BurnTrainingSplitV1::checked(200, None)?, 3, 17, DType::F32)
+                .is_err()
+        );
+        for (x, y) in [(true, false), (false, true)] {
+            assert!(validate_external_validation_pair_v1(x, y).is_err());
+        }
+        validate_external_validation_pair_v1(false, false)?;
+        validate_external_validation_pair_v1(true, true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resident_inner_tensor_gather_matches_seeded_host_permutations_without_gpu_claim()
+    -> anyhow::Result<()> {
+        // Exercises the actual cache/select/from_inner helper on NdArray only.
+        // Native device execution and Fusion lifetime remain separate fixtures.
+        type Host = Autodiff<burn_ndarray::NdArray<f32, i32>>;
+        let device = Default::default();
+        let x = Array2::from_shape_fn((11, 3), |(r, c)| (r * 10 + c) as f32);
+        let y = (0..11).map(|r| (r % 3) as i64).collect::<Vec<_>>();
+        let validation = Array2::from_shape_fn((2, 3), |(r, c)| (100 + r * 10 + c) as f32);
+        let cache = BurnResidentDatasetV1::<Host>::upload(&x, &y, &validation, &[2, 0], &device);
+        let mut indices = (0..11).collect::<Vec<_>>();
+        let mut rng = StdRng::seed_from_u64(42);
+        for _ in 0..3 {
+            indices.shuffle(&mut rng);
+            for rows in indices.chunks(4) {
+                let (actual_x, actual_y) = cache.batch(rows, &device)?;
+                assert_eq!(actual_y.dtype(), DType::I32);
+                assert_eq!(
+                    actual_x.inner().into_data().to_vec::<f32>()?,
+                    x.select(ndarray::Axis(0), rows)
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    actual_y.inner().into_data().to_vec::<i32>()?,
+                    rows.iter().map(|&row| y[row] as i32).collect::<Vec<_>>()
+                );
+            }
+        }
+        assert_eq!(
+            cache.validation_x.clone().into_data().to_vec::<f32>()?,
+            validation.iter().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cache.validation_y.clone().into_data().to_vec::<i32>()?,
+            vec![2, 0]
+        );
+        assert!(cache.batch(&[], &device).is_err());
+        assert!(cache.batch(&[11], &device).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "burn-rocm-backend")]
+    #[test]
+    fn burn_rocm_policy_and_artifact_identity_are_host_checked_without_fallback()
+    -> anyhow::Result<()> {
+        for (policy, ordinal) in [
+            ("auto", 0),
+            ("hip:3", 3),
+            ("gpu:7", 7),
+            ("rocm:65535", 65535),
+        ] {
+            let (device, selection) = resolve_train_device(policy)?;
+            assert_eq!(device.index, ordinal);
+            assert_eq!(selection.execution_backend, "rocm");
+            assert_eq!(selection.effective_policy, format!("rocm:{ordinal}"));
+            validate_burn_device_selection(&selection)?;
+        }
+        for policy in [
+            "cpu",
+            "cuda:0",
+            "nvidia",
+            "rocm:",
+            "rocm:-1",
+            "rocm:65536",
+            "vulkan",
+        ] {
+            assert!(resolve_train_device(policy).is_err(), "accepted {policy}");
+            assert!(resolve_infer_device(policy).is_err(), "accepted {policy}");
+        }
+        let (_, selection) = resolve_infer_device("rocm:3")?;
+        assert!(ensure_burn_cuda_backend_type::<burn_ndarray::NdArray<f32>>().is_err());
+        validate_loaded_burn_device_identity(
+            "test",
+            Some("rocm:3"),
+            Some("rocm:3"),
+            Some("rocm"),
+            &selection,
+        )?;
+        for (requested, effective, backend) in [
+            ("cpu", "rocm:3", "rocm"),
+            ("rocm:2", "rocm:3", "rocm"),
+            ("rocm:3", "rocm:03", "rocm"),
+            ("rocm:3", "gpu:3", "cuda"),
+            ("rocm:3", "cpu", "ndarray_cpu"),
+        ] {
+            assert!(
+                validate_loaded_burn_device_identity(
+                    "test",
+                    Some(requested),
+                    Some(effective),
+                    Some(backend),
+                    &selection
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_loaded_burn_device_identity("test", None, None, None, &selection).is_err()
+        );
+        Ok(())
+    }
 
     #[cfg(feature = "burn-cuda-backend")]
     #[test]
@@ -3188,6 +3594,44 @@ mod tests {
         );
     }
 
+    #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
+    #[test]
+    fn cpu_build_rejects_retired_or_drifted_loaded_artifact_identity() {
+        let live = BurnDeviceSelection {
+            requested_policy: "cpu".to_string(),
+            effective_policy: "cpu".to_string(),
+            execution_backend: "ndarray_cpu".to_string(),
+        };
+        validate_loaded_burn_device_identity(
+            "test",
+            Some("cpu"),
+            Some("cpu"),
+            Some("ndarray_cpu"),
+            &live,
+        )
+        .expect("exact CPU artifact identity must pass");
+
+        let retired_error = validate_loaded_burn_device_identity(
+            "test",
+            Some("gpu:0"),
+            Some("gpu:0"),
+            Some("wgpu_discrete_gpu"),
+            &live,
+        )
+        .expect_err("retired WGPU artifact identity must fail closed");
+        assert!(retired_error.to_string().contains("invalid"));
+
+        let drift_error = validate_loaded_burn_device_identity(
+            "test",
+            Some("cpu"),
+            Some("cpu"),
+            Some("cuda"),
+            &live,
+        )
+        .expect_err("CUDA-to-CPU artifact drift must fail closed");
+        assert!(format!("{drift_error:#}").contains("incompatible"));
+    }
+
     #[test]
     fn sparsemax_is_normalized_and_sparse() {
         // sparsemax must (a) sum to 1 per row and (b) produce EXACT zeros for the
@@ -3516,42 +3960,65 @@ mod tests {
     #[test]
     fn normalize_burn_device_policy_defaults_to_auto() {
         assert_eq!(normalize_burn_device_policy(""), "auto");
-        assert_eq!(normalize_burn_device_policy("  CUDA:2 "), "gpu:2");
-        assert_eq!(normalize_burn_device_policy("rocm:3"), "gpu:3");
-        assert_eq!(normalize_burn_device_policy("metal"), "gpu");
-        assert_eq!(normalize_burn_device_policy("vulkan:1"), "gpu:1");
-        assert_eq!(normalize_burn_device_policy("cuda"), "gpu");
-        assert_eq!(normalize_burn_device_policy("wgpu"), "gpu");
-    }
-
-    #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
-    #[test]
-    fn wgpu_policy_preserves_integrated_adapter_class() {
-        let normalized = normalize_burn_device_policy("vulkan:integrated:0");
-        let (device, effective_policy, execution_backend) = resolve_wgpu_device_policy(&normalized);
-
-        assert_eq!(device, WgpuDevice::IntegratedGpu(0));
-        assert_eq!(effective_policy, "gpu:integrated:0");
-        assert_eq!(execution_backend, "wgpu_integrated_gpu");
+        assert_eq!(
+            normalize_burn_device_policy("  CUDA:2 "),
+            if cfg!(feature = "burn-rocm-backend") {
+                "cuda:2"
+            } else {
+                "gpu:2"
+            }
+        );
+        assert_eq!(normalize_burn_device_policy("rocm:3"), "rocm:3");
+        assert_eq!(normalize_burn_device_policy("metal"), "metal");
+        assert_eq!(normalize_burn_device_policy("vulkan:1"), "vulkan:1");
+        assert_eq!(
+            normalize_burn_device_policy("cuda"),
+            if cfg!(feature = "burn-rocm-backend") {
+                "cuda"
+            } else {
+                "gpu"
+            }
+        );
+        assert_eq!(normalize_burn_device_policy("wgpu"), "wgpu");
     }
 
     #[test]
     fn supported_burn_device_policy_recognizes_expected_aliases() {
         assert!(is_supported_burn_device_policy("auto"));
         assert!(is_supported_burn_device_policy("cpu"));
-        assert!(is_supported_burn_device_policy("cuda:2"));
+        assert_eq!(
+            is_supported_burn_device_policy("cuda:2"),
+            !cfg!(feature = "burn-rocm-backend")
+        );
         assert!(is_supported_burn_device_policy("gpu:1"));
-        assert!(is_supported_burn_device_policy("metal"));
-        assert!(is_supported_burn_device_policy("rocm:2"));
         assert!(is_supported_burn_device_policy("external_device"));
+        assert!(!is_supported_burn_device_policy("wgpu"));
+        assert!(!is_supported_burn_device_policy("vulkan:1"));
+        assert!(!is_supported_burn_device_policy("metal"));
+        assert_eq!(
+            is_supported_burn_device_policy("rocm:2"),
+            cfg!(feature = "burn-rocm-backend")
+        );
+        assert_eq!(
+            is_supported_burn_device_policy("hip:0"),
+            cfg!(feature = "burn-rocm-backend")
+        );
     }
 
     #[test]
     fn burn_training_precision_fp8_request_degrades_truthfully() {
         let selection = BurnDeviceSelection {
-            requested_policy: "gpu".to_string(),
-            effective_policy: "gpu".to_string(),
-            execution_backend: "wgpu_discrete_gpu".to_string(),
+            requested_policy: if cfg!(feature = "burn-cuda-backend") {
+                "gpu:0".to_string()
+            } else {
+                "cpu".to_string()
+            },
+            effective_policy: if cfg!(feature = "burn-cuda-backend") {
+                "gpu:0".to_string()
+            } else {
+                "cpu".to_string()
+            },
+            execution_backend: active_burn_backend_name().to_string(),
         };
         let device = <TrainBackend as BackendTypes>::Device::default();
         let (precision, reason) = resolve_burn_training_precision_for_backend::<TrainBackend>(
@@ -3657,45 +4124,24 @@ mod tests {
 
     #[test]
     fn resolve_train_device_cpu_policy_reports_consistent_backend() {
+        #[cfg(feature = "burn-rocm-backend")]
+        assert!(resolve_train_device("cpu").is_err());
         #[cfg(feature = "burn-cuda-backend")]
         {
             let err = resolve_train_device("cpu")
                 .expect_err("CUDA-only Burn build must reject explicit CPU policy");
             assert!(err.to_string().contains("cannot honor explicit CPU policy"));
-            return;
         }
 
-        #[cfg(not(feature = "burn-cuda-backend"))]
+        #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
         let (_device, selection) =
             resolve_train_device("cpu").expect("CPU-capable Burn backend must resolve CPU");
-        #[cfg(not(feature = "burn-cuda-backend"))]
+        #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
         assert_eq!(selection.requested_policy, "cpu");
-        #[cfg(not(feature = "burn-cuda-backend"))]
+        #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
         assert_eq!(selection.effective_policy, "cpu");
-        #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
-        assert_eq!(selection.execution_backend, "wgpu_cpu");
-        #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+        #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
         assert_eq!(selection.execution_backend, "ndarray_cpu");
-    }
-
-    #[cfg(feature = "burn-wgpu-backend")]
-    #[test]
-    fn resolve_train_device_cuda_alias_reports_wgpu_runtime_truthfully() {
-        let (_device, selection) =
-            resolve_train_device("cuda:2").expect("wgpu CUDA alias must resolve");
-        assert_eq!(selection.requested_policy, "gpu:2");
-        assert_eq!(selection.effective_policy, "gpu:2");
-        assert_eq!(selection.execution_backend, "wgpu_discrete_gpu");
-    }
-
-    #[cfg(feature = "burn-wgpu-backend")]
-    #[test]
-    fn resolve_infer_device_default_gpu_reports_wgpu_default_backend() {
-        let (_device, selection) =
-            resolve_infer_device("gpu").expect("wgpu default GPU must resolve");
-        assert_eq!(selection.requested_policy, "gpu");
-        assert_eq!(selection.effective_policy, "default");
-        assert_eq!(selection.execution_backend, "wgpu_default");
     }
 
     #[test]
@@ -3761,7 +4207,7 @@ mod tests {
         let selection = BurnDeviceSelection {
             requested_policy: "cpu".to_string(),
             effective_policy: "cpu".to_string(),
-            execution_backend: "wgpu_discrete_gpu".to_string(),
+            execution_backend: "cuda".to_string(),
         };
 
         let err = train_model_with_report_on_device::<TrainBackend, _>(
@@ -3773,12 +4219,6 @@ mod tests {
             &selection,
         )
         .expect_err("incoherent runtime provenance must fail");
-        #[cfg(feature = "burn-cuda-backend")]
-        assert!(
-            err.to_string().contains("requires native CUDA"),
-            "unexpected error: {err}"
-        );
-        #[cfg(not(feature = "burn-cuda-backend"))]
         assert!(
             err.to_string()
                 .contains("incompatible with effective policy cpu"),
@@ -3794,19 +4234,13 @@ mod tests {
         let selection = BurnDeviceSelection {
             requested_policy: "cpu".to_string(),
             effective_policy: "cpu".to_string(),
-            execution_backend: "wgpu_discrete_gpu".to_string(),
+            execution_backend: "cuda".to_string(),
         };
 
         let err = predict_proba_on_device_with_selection::<InferBackend, _>(
             &model, &x, 16, &device, &selection,
         )
         .expect_err("incoherent runtime provenance must fail");
-        #[cfg(feature = "burn-cuda-backend")]
-        assert!(
-            err.to_string().contains("requires native CUDA"),
-            "unexpected error: {err}"
-        );
-        #[cfg(not(feature = "burn-cuda-backend"))]
         assert!(
             err.to_string()
                 .contains("incompatible with effective policy cpu"),

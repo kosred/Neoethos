@@ -1,4 +1,4 @@
-//! Test-only resident HTF-v3 CUDA parity readback.
+//! Test-only resident HTF semantic-v4 CUDA parity readback on the v3 ABI.
 //!
 //! Production has no aligned feature/validity D2H path. This fixture exercises
 //! two parent clocks in one global batch, all ten logical validity codes, the
@@ -142,7 +142,7 @@ pub fn run_resident_higher_timeframe_v3_device_fixture()
     ];
     let launch = NeoResidentHigherTimeframeLaunchV3 {
         abi_version: 3,
-        semantic_version: 3,
+        semantic_version: 4,
         feature_column_count: FEATURE_COLUMNS_V3 as u32,
         parent_segment_count: parent_segments.len() as u32,
         base_row_count: BASE_ROWS_V3 as u64,
@@ -223,7 +223,7 @@ fn resident_higher_timeframe_v3_device_route_value_and_validity_parity() {
     let calendar_a = FIXED_COLUMNS_V3 * BASE_ROWS_V3;
     assert_eq!(
         &output.validity_u8[calendar_a..calendar_a + BASE_ROWS_V3],
-        &[9, 9, 9, 9, 9, 9, 9, 0, 0, 3, 3]
+        &[9, 9, 9, 9, 9, 9, 9, 0, 0, 3, 4]
     );
     assert_eq!(
         output.values[calendar_a + 7].to_bits(),
@@ -233,6 +233,7 @@ fn resident_higher_timeframe_v3_device_route_value_and_validity_parity() {
         output.values[calendar_a + 8].to_bits(),
         2_000.0_f64.to_bits()
     );
+    assert_eq!(output.values[calendar_a + 10].to_bits(), QNAN_BITS_V3);
     assert!(
         !output.values[calendar_a..calendar_a + BASE_ROWS_V3]
             .iter()
@@ -242,16 +243,13 @@ fn resident_higher_timeframe_v3_device_route_value_and_validity_parity() {
     let calendar_b = (FIXED_COLUMNS_V3 + 1) * BASE_ROWS_V3;
     assert_eq!(
         &output.validity_u8[calendar_b..calendar_b + BASE_ROWS_V3],
-        &[9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0]
+        &[9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 4]
     );
     assert_eq!(
         output.values[calendar_b + 9].to_bits(),
         3_001.0_f64.to_bits()
     );
-    assert_eq!(
-        output.values[calendar_b + 10].to_bits(),
-        3_001.0_f64.to_bits()
-    );
+    assert_eq!(output.values[calendar_b + 10].to_bits(), QNAN_BITS_V3);
     assert!(
         !output.values[calendar_b..calendar_b + BASE_ROWS_V3]
             .iter()

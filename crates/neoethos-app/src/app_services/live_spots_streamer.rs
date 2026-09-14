@@ -16,29 +16,16 @@
 //! - **One blocking thread** holds the tungstenite socket.
 //!   `tokio::task::spawn_blocking` so the read loop doesn't
 //!   starve other tokio tasks.
-//! - **Outer reconnect loop** in the async parent waits 5 s on
-//!   error before re-entering the blocking section. cTrader
-//!   does drop streaming sessions periodically (token expiry,
-//!   network blips, planned maintenance), so this is expected
-//!   behaviour, not an exception.
-//! - **Symbol list discovered once** at startup from a hardcoded
-//!   forex-majors whitelist + lookup against `/broker/symbols`'s
-//!   underlying loader to translate names → numeric IDs. We
-//!   subscribe to all of them at once via a single
-//!   `ProtoOASubscribeSpotsReq`.
-//!
-//! ## Limitations (deferred to phase 2)
-//!
-//! - Symbol list is static at startup. When the user opens a
-//!   chart for a symbol we didn't pre-subscribe to, that chart's
-//!   "live" price won't update via this stream until a restart.
-//!   The chart's on-demand `/chart` endpoint (broker-API pull via
-//!   `broker_api::fetch_recent_chart_bars_blocking`) still serves
-//!   fresh bars in the meantime.
-//! - No heartbeat send. cTrader's docs say streaming clients
-//!   should heartbeat every ~30 s; today's flow just reads
-//!   incoming PING and replies PONG, which keeps the connection
-//!   alive in practice but isn't perfectly spec-conformant.
+//! - **Outer reconnect loop** uses capped exponential backoff with
+//!   jitter. Repeated authentication/routing failures cannot create
+//!   an indefinite one-second retry loop. Only a subscribed session
+//!   lasting at least a minute resets the retry history.
+//! - **Symbol list** comes from the saved watchlist (forex majors are
+//!   the empty-watchlist fallback), resolved against broker symbol IDs.
+//!   A watchlist edit supersedes the old stream and its pending retries.
+//! - **Application heartbeat** is sent every ten seconds, independently
+//!   of WebSocket ping/pong. Cached quotes retain their actual freshness
+//!   timestamps; a reconnect attempt does not make stale quotes current.
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -49,15 +36,61 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, connect};
 
 /// F-338 (Feature #12): monotonically-increasing "which streamer
-/// generation is current" counter. Every spawned streamer captures the
-/// value at spawn time (`my_gen`); when [`restart_streamer`] bumps it,
-/// the in-flight read loop notices `STREAM_GENERATION != my_gen` on its
+/// generation is current" counter. Every logical start reserves a new
+/// value before blocking preparation (`my_gen`); [`restart_streamer`] does this once.
+/// The in-flight read loop notices `STREAM_GENERATION != my_gen` on its
 /// next ~5 s read-timeout tick, closes its socket, and self-terminates
 /// — while a freshly-spawned streamer (carrying the new generation)
 /// takes over with the updated watchlist. This lets a Market Watch edit
 /// re-subscribe the live stream within ~5 s with no app restart.
 static STREAM_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+const MAX_RECONNECT_DELAY_MS: u64 = 60_000;
+const STABLE_SUBSCRIPTION_DURATION: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct SpotReconnectBackoff {
+    consecutive_failures: u32,
+}
+
+impl SpotReconnectBackoff {
+    fn next_delay(
+        &mut self,
+        configured_base_ms: u64,
+        subscribed_for: Option<Duration>,
+        jitter: u64,
+    ) -> Duration {
+        if subscribed_for.is_some_and(|elapsed| elapsed >= STABLE_SUBSCRIPTION_DURATION) {
+            self.consecutive_failures = 0;
+        }
+        let base_ms = configured_base_ms.clamp(1_000, MAX_RECONNECT_DELAY_MS);
+        let ceiling_ms = base_ms
+            .saturating_mul(1_u64 << self.consecutive_failures.min(6))
+            .min(MAX_RECONNECT_DELAY_MS);
+        // Equal jitter retains a meaningful minimum pause at the cap. A
+        // healthy-but-idle weekend session counts only after subscription,
+        // never from time spent waiting for connect/authentication to fail.
+        let floor_ms = (ceiling_ms / 2).max(base_ms);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        Duration::from_millis(floor_ms + jitter % (ceiling_ms - floor_ms + 1))
+    }
+}
+
+async fn wait_for_stream_retry(generation: &AtomicU64, my_gen: u64, delay: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if generation.load(Relaxed) != my_gen {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(250))).await;
+    }
+}
+
+use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE,
     CTRADER_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT_PAYLOAD_TYPE,
@@ -65,9 +98,10 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE, CTRADER_OA_MARGIN_CALL_TRIGGER_EVENT_PAYLOAD_TYPE,
     CTRADER_OA_MARGIN_CALL_UPDATE_EVENT_PAYLOAD_TYPE, CTRADER_OA_MARGIN_CHANGED_EVENT_PAYLOAD_TYPE,
     CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, CTRADER_OA_TRADER_UPDATE_EVENT_PAYLOAD_TYPE,
-    CTRADER_OA_TRAILING_SL_CHANGED_EVENT_PAYLOAD_TYPE, build_account_auth_request,
-    build_application_auth_request, build_subscribe_spots_request, ctrader_json_wss_url,
-    parse_ctrader_error_payload, parse_open_api_envelope,
+    CTRADER_OA_TRAILING_SL_CHANGED_EVENT_PAYLOAD_TYPE, CTraderOpenApiJsonMessage,
+    build_account_auth_request, build_application_auth_request, build_subscribe_spots_request,
+    ctrader_json_wss_url, expected_response_payload_type, parse_ctrader_error_payload,
+    parse_open_api_envelope,
 };
 use crate::app_services::live_spots;
 
@@ -94,9 +128,8 @@ pub struct LiveSpotsStreamerConfig {
     pub access_token: String,
     pub account_id: i64,
     /// Pre-resolved `(symbol_id, symbol_name, digits)` rows.
-    /// `digits` is the broker's price-scaling factor — we need
-    /// it to convert the raw integer bid/ask back to a floating
-    /// price before caching.
+    /// `digits` controls display rounding only. Checked financial reads retain
+    /// the original protocol sides, whose scale is always 1/100000.
     pub symbols: Vec<StreamedSymbol>,
 }
 
@@ -121,6 +154,15 @@ pub struct StreamedSymbol {
 /// ProtoOASymbolByIdReq would add a round-trip we don't need
 /// for forex majors). JPY pairs → 3 digits; everything else → 5.
 pub fn try_spawn_with_defaults_blocking() -> bool {
+    let my_gen =
+        reserve_stream_generation(&STREAM_GENERATION, live_spots::invalidate_stream_generation);
+    try_spawn_with_defaults_for_generation(my_gen)
+}
+
+fn try_spawn_with_defaults_for_generation(my_gen: u64) -> bool {
+    if STREAM_GENERATION.load(Relaxed) != my_gen {
+        return false;
+    }
     use crate::app_services::broker_api::fetch_broker_symbols_blocking;
     use crate::app_services::broker_persistence::load_broker_settings;
     use crate::app_services::secure_store::production_ctrader_token_store;
@@ -166,12 +208,12 @@ pub fn try_spawn_with_defaults_blocking() -> bool {
         return false;
     };
     let account_id: i64 = match account_row.account_id.parse() {
-        Ok(v) => v,
-        Err(_) => {
+        Ok(v) if v > 0 => v,
+        _ => {
             tracing::warn!(
                 target: "neoethos_app::live_spots_streamer",
                 account_id = %account_row.account_id,
-                "skipping spawn — account_id not numeric"
+                "skipping spawn — account_id is not a positive integer"
             );
             return false;
         }
@@ -192,6 +234,16 @@ pub fn try_spawn_with_defaults_blocking() -> bool {
             return false;
         }
     };
+
+    // The catalog resolver captures its own credentials. A settings switch
+    // between the two reads must not relabel another account/environment's IDs.
+    if bundle.account_id != account_id || bundle.environment != ct.environment.as_str() {
+        tracing::warn!(
+            target: "neoethos_app::live_spots_streamer",
+            "skipping spawn — broker symbol catalog differs from the captured account/environment"
+        );
+        return false;
+    }
 
     // F-338: subscribe to the operator's Market Watch set (config
     // `system.watchlist`); fall back to the 8 majors when it's unset.
@@ -264,8 +316,30 @@ pub fn try_spawn_with_defaults_blocking() -> bool {
         symbols: resolved,
     };
 
-    spawn(config);
-    true
+    finish_preparation_for_generation(&STREAM_GENERATION, my_gen, config, spawn_for_generation)
+}
+
+// All public logical starts supersede old loops, even if preparation then fails.
+// The injected invalidator keeps the same reservation path testable without a
+// process-global cache or a broker connection.
+fn reserve_stream_generation(generation: &AtomicU64, invalidate: impl FnOnce(u64)) -> u64 {
+    let reserved = generation.fetch_add(1, Relaxed).wrapping_add(1);
+    invalidate(reserved);
+    reserved
+}
+
+// Carry the generation reserved before blocking preparation all the way to launch.
+// A slower old catalog/config read must never adopt a newer restart's generation.
+fn finish_preparation_for_generation(
+    generation: &AtomicU64,
+    my_gen: u64,
+    config: LiveSpotsStreamerConfig,
+    launch: impl FnOnce(LiveSpotsStreamerConfig, u64) -> bool,
+) -> bool {
+    if generation.load(Relaxed) != my_gen {
+        return false;
+    }
+    launch(config, my_gen)
 }
 
 /// F-338 (Feature #12): re-subscribe the live spot stream to the
@@ -293,7 +367,7 @@ pub fn try_spawn_with_defaults_blocking() -> bool {
 /// (e.g. the `POST /watchlist` handler) must invoke it via
 /// `tokio::task::spawn_blocking`.
 pub fn restart_streamer() -> bool {
-    STREAM_GENERATION.fetch_add(1, Relaxed);
+    // The public startup helper reserves exactly once, including failed starts.
     try_spawn_with_defaults_blocking()
 }
 
@@ -301,19 +375,25 @@ pub fn restart_streamer() -> bool {
 /// immediately; the task owns its own retry loop and won't be
 /// observable to the caller.
 ///
-/// The task is fire-and-forget by design — it has no parent
-/// future to bubble errors to, and the cache stays in whatever
-/// state it was in when the connection died. The next successful
-/// reconnect refreshes it. Operators who want to know the
-/// connection state should read the `live_spots::snapshot_all()`
-/// freshness timestamps.
+/// Display rows may remain after disconnect, but their financial provenance
+/// is invalidated by the connection guard. Only fresh sides from the current
+/// authenticated connection can satisfy the checked cache read.
 pub fn spawn(config: LiveSpotsStreamerConfig) {
-    // F-338 (Feature #12): snapshot the current generation. The read
-    // loop carries this `my_gen` and self-terminates the moment
-    // `restart_streamer` bumps the global past it.
-    let my_gen = STREAM_GENERATION.load(Relaxed);
+    let my_gen =
+        reserve_stream_generation(&STREAM_GENERATION, live_spots::invalidate_stream_generation);
+    let _ = spawn_for_generation(config, my_gen);
+}
+
+fn spawn_for_generation(config: LiveSpotsStreamerConfig, my_gen: u64) -> bool {
+    if STREAM_GENERATION.load(Relaxed) != my_gen {
+        return false;
+    }
     tokio::spawn(async move {
+        let mut retry = SpotReconnectBackoff::default();
         loop {
+            if STREAM_GENERATION.load(Relaxed) != my_gen {
+                break;
+            }
             tracing::info!(
                 target: "neoethos_app::live_spots_streamer",
                 symbols = config.symbols.len(),
@@ -352,15 +432,27 @@ pub fn spawn(config: LiveSpotsStreamerConfig) {
                     ),
                 }
             }
-            let outcome = tokio::task::spawn_blocking(move || run_blocking(cfg, my_gen)).await;
+            if STREAM_GENERATION.load(Relaxed) != my_gen {
+                break;
+            }
+            let outcome = tokio::task::spawn_blocking(move || {
+                let mut subscribed_at = None;
+                let result = run_blocking(cfg, my_gen, &mut subscribed_at);
+                (
+                    result,
+                    subscribed_at.map(|started: Instant| started.elapsed()),
+                )
+            })
+            .await;
+            let subscribed_for = outcome.as_ref().ok().and_then(|(_, elapsed)| *elapsed);
             match outcome {
-                Ok(Ok(())) => {
+                Ok((Ok(()), _)) => {
                     tracing::warn!(
                         target: "neoethos_app::live_spots_streamer",
                         "spot stream ended cleanly (read loop returned Ok); will reconnect"
                     );
                 }
-                Ok(Err(err)) => {
+                Ok((Err(err), _)) => {
                     tracing::warn!(
                         target: "neoethos_app::live_spots_streamer",
                         error = %err,
@@ -388,17 +480,39 @@ pub fn spawn(config: LiveSpotsStreamerConfig) {
                 );
                 break;
             }
-            // Reconnect backoff: operator-configurable via config.yaml
-            // `app_runtime.ctrader_stream_backoff_base_ms`; floored at 1 s
-            // so a misconfigured 0-ms value can't spin-loop.
-            let backoff_ms =
-                crate::app_services::env_overrides::ctrader_stream_backoff_base_ms().max(1_000);
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            let backoff = retry.next_delay(
+                crate::app_services::env_overrides::ctrader_stream_backoff_base_ms(),
+                subscribed_for,
+                rand::random::<u64>(),
+            );
+            tracing::info!(
+                target: "neoethos_app::live_spots_streamer",
+                retry_delay_ms = backoff.as_millis() as u64,
+                consecutive_failures = retry.consecutive_failures,
+                "spot stream reconnect scheduled"
+            );
+            if !wait_for_stream_retry(&STREAM_GENERATION, my_gen, backoff).await {
+                break;
+            }
         }
     });
+    true
 }
 
-fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
+fn run_blocking(
+    config: LiveSpotsStreamerConfig,
+    my_gen: u64,
+    subscribed_at: &mut Option<Instant>,
+) -> Result<()> {
+    if STREAM_GENERATION.load(Relaxed) != my_gen {
+        return Ok(());
+    }
+    let environment = stream_environment(&config.endpoint_host)?;
+    let session =
+        live_spots::begin_session(config.account_id, environment, my_gen).ok_or_else(|| {
+            anyhow!("spot session is invalid, superseded, or the cache is unavailable")
+        })?;
+    // The guard starts before connect/auth and invalidates on every return or unwind.
     let url = ctrader_json_wss_url(&config.endpoint_host);
     crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
     let (mut socket, _) = connect(url.as_str())
@@ -424,32 +538,19 @@ fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
         ))?,
     )?;
 
-    // 3. Subscribe to all symbols in one request — cTrader's
-    //    subscribe-spots payload takes a list, so we don't need
-    //    one round-trip per symbol.
-    //
-    //    No unsubscribe-before-subscribe is needed on reconnect: every
-    //    reconnect runs a FRESH `run_blocking` that opens a brand-new
-    //    `connect()` socket (above) → a new cTrader session. Spot
-    //    subscriptions are per-session, so the dropped connection's
-    //    subscriptions die with it; there is nothing to carry over and
-    //    therefore no duplicate-subscription to guard against. Even if a
-    //    stray duplicate spot event did arrive, `live_spots::update_tick`
-    //    overwrites by `symbol_id`, so the cache stays correct.
-    let symbol_ids: Vec<i64> = config.symbols.iter().map(|s| s.symbol_id).collect();
-    send_and_await(
-        &mut socket,
-        &serde_json::to_string(&build_subscribe_spots_request(
-            config.account_id,
-            &symbol_ids,
-            true,
-            "spot-subscribe",
-        ))?,
-    )?;
+    // Resolve conversion dependencies on this same authenticated connection,
+    // before any spot subscriptions. Recomputed after every reconnect; never
+    // mutate the operator's watchlist or borrow another connection's quotes.
+    let (symbols, subscription) =
+        prepare_spot_subscription(config.account_id, &config.symbols, |request| {
+            send_and_await(&mut socket, &serde_json::to_string(request)?)
+        })?;
+    send_and_await(&mut socket, &serde_json::to_string(&subscription)?)?;
 
+    *subscribed_at = Some(Instant::now());
     tracing::info!(
         target: "neoethos_app::live_spots_streamer",
-        symbols = symbol_ids.len(),
+        symbols = symbols.len(),
         "spot stream subscribed; entering read loop"
     );
 
@@ -566,15 +667,19 @@ fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
         match envelope.payload_type {
             CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE => {
                 if let Some((symbol_id, bid, ask, ts)) =
-                    parse_spot_event_loose(&payload_text, &config.symbols)
+                    parse_spot_event_loose(&payload_text, config.account_id, &symbols)
                 {
-                    let symbol_name = config
-                        .symbols
-                        .iter()
-                        .find(|s| s.symbol_id == symbol_id)
-                        .map(|s| s.symbol_name.clone())
-                        .unwrap_or_default();
-                    live_spots::update_tick(symbol_id, symbol_name, bid, ask, ts);
+                    if let Some(symbol) = symbols.iter().find(|s| s.symbol_id == symbol_id) {
+                        live_spots::update_session_tick(
+                            &session,
+                            symbol_id,
+                            &symbol.symbol_name,
+                            symbol.digits,
+                            bid,
+                            ask,
+                            ts,
+                        );
+                    }
                 }
             }
             CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE => {
@@ -652,6 +757,110 @@ fn run_blocking(config: LiveSpotsStreamerConfig, my_gen: u64) -> Result<()> {
     }
 }
 
+fn prepare_spot_subscription(
+    account_id: i64,
+    configured: &[StreamedSymbol],
+    mut exchange: impl FnMut(&CTraderOpenApiJsonMessage) -> Result<CTraderOpenApiJsonMessage>,
+) -> Result<(Vec<StreamedSymbol>, CTraderOpenApiJsonMessage)> {
+    use crate::app_services::ctrader_account::parse_trader_response;
+    use crate::app_services::ctrader_data::parse_symbols_list_response;
+    use crate::app_services::ctrader_messages::{build_symbols_list_request, build_trader_request};
+
+    anyhow::ensure!(account_id > 0, "spot subscription account must be positive");
+    let mut checked = |request: CTraderOpenApiJsonMessage| -> Result<CTraderOpenApiJsonMessage> {
+        let response = exchange(&request)?;
+        anyhow::ensure!(
+            handshake_response_matches(
+                &response,
+                &request.client_msg_id,
+                expected_response_payload_type(request.payload_type)?,
+                Some(account_id),
+            )?,
+            "spot metadata response does not match its request"
+        );
+        Ok(response)
+    };
+    let trader = parse_trader_response(&serde_json::to_string(&checked(build_trader_request(
+        account_id,
+        "spot-trader",
+    ))?)?)?;
+    let catalog = parse_symbols_list_response(&serde_json::to_string(&checked(
+        build_symbols_list_request(account_id, false, "spot-symbols"),
+    )?)?)?;
+    anyhow::ensure!(
+        trader.account_id == account_id && catalog.account_id == account_id,
+        "spot subscription metadata belongs to another account"
+    );
+    let deposit = trader
+        .deposit_asset_id
+        .filter(|id| *id > 0)
+        .context("spot subscription trader omitted a valid depositAssetId")?;
+    let mut symbols = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut primaries = Vec::new();
+    for configured in configured {
+        anyhow::ensure!(
+            configured.symbol_id > 0 && !configured.symbol_name.trim().is_empty(),
+            "configured spot symbol identity is invalid"
+        );
+        let mut matches = catalog
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.symbol_id == configured.symbol_id);
+        let primary = matches
+            .next()
+            .context("configured spot symbol is absent from current account catalog")?;
+        anyhow::ensure!(
+            matches.next().is_none() && primary.symbol_name == configured.symbol_name,
+            "configured spot symbol identity differs from current account catalog"
+        );
+        if seen.insert(configured.symbol_id) {
+            symbols.push(configured.clone());
+            primaries.push(primary);
+        }
+    }
+    for primary in primaries {
+        match crate::app_services::broker_api::required_entry_conversion_symbol(
+            primary,
+            deposit,
+            &catalog.symbols,
+        ) {
+            Ok(Some(leg)) if seen.insert(leg.symbol_id) => symbols.push(StreamedSymbol {
+                symbol_id: leg.symbol_id,
+                symbol_name: leg.symbol_name.clone(),
+                // Light symbols have no broker digits. Keep full wire precision
+                // for these display rows, not a guessed broker pip/digits contract.
+                // Checked financial reads use the original 1/100000 sides anyway.
+                digits: 5,
+            }),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "neoethos_app::live_spots_streamer",
+                symbol = %primary.symbol_name, %error,
+                "conversion subscription unavailable for this primary; retaining display quotes, entry conversion remains refused"
+            ),
+        }
+    }
+    anyhow::ensure!(!symbols.is_empty(), "spot subscription set is empty");
+    let ids = symbols
+        .iter()
+        .map(|symbol| symbol.symbol_id)
+        .collect::<Vec<_>>();
+    let subscription = build_subscribe_spots_request(account_id, &ids, true, "spot-subscribe");
+    Ok((symbols, subscription))
+}
+
+fn stream_environment(endpoint_host: &str) -> Result<CTraderEnvironment> {
+    for environment in [CTraderEnvironment::Demo, CTraderEnvironment::Live] {
+        if endpoint_host == environment.endpoint_host() {
+            return Ok(environment);
+        }
+    }
+    Err(anyhow!(
+        "spot endpoint does not identify a supported cTrader environment"
+    ))
+}
+
 /// Set a read timeout on the underlying TCP socket so the blocking
 /// [`WebSocket::read`] returns periodically (instead of blocking until
 /// the next frame arrives), letting the heartbeat scheduler in the read
@@ -673,11 +882,28 @@ fn set_spot_read_timeout(socket: &mut CTraderSocket, dur: Duration) {
 }
 
 /// Send a single message and read replies until we see the
-/// matching response (matched by clientMsgId). Errors / closes
+/// matching response (message ID, expected type, and account). Errors / closes
 /// are propagated up so the outer reconnect loop kicks in.
-fn send_and_await(socket: &mut CTraderSocket, message_json: &str) -> Result<()> {
+fn send_and_await(
+    socket: &mut CTraderSocket,
+    message_json: &str,
+) -> Result<CTraderOpenApiJsonMessage> {
     let envelope = parse_open_api_envelope(message_json)?;
-    let expected_msg_id = envelope.client_msg_id.clone();
+    anyhow::ensure!(
+        !envelope.client_msg_id.is_empty(),
+        "spot handshake request has no message ID"
+    );
+    let expected_type = expected_response_payload_type(envelope.payload_type)?;
+    let expected_account = envelope
+        .payload
+        .get("ctidTraderAccountId")
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|account| *account > 0)
+                .ok_or_else(|| anyhow!("spot handshake request has an invalid account"))
+        })
+        .transpose()?;
 
     socket
         .send(Message::Text(message_json.to_string().into()))
@@ -721,18 +947,61 @@ fn send_and_await(socket: &mut CTraderSocket, message_json: &str) -> Result<()> 
                 continue;
             }
         };
-        if env.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-            let detail = parse_ctrader_error_payload(&env.payload)
-                .unwrap_or_else(|_| "unparseable error payload".to_string());
-            return Err(anyhow!("cTrader handshake error: {detail}"));
+        if handshake_response_matches(
+            &env,
+            &envelope.client_msg_id,
+            expected_type,
+            expected_account,
+        )? {
+            return Ok(env);
         }
-        if env.client_msg_id == expected_msg_id {
-            return Ok(());
-        }
-        // Otherwise: drop unrelated frame (e.g. an early spot
-        // event arriving before the subscribe response). The
-        // post-handshake loop will catch it on the next pass.
+        // Unrelated frames cannot complete authentication. An early spot event
+        // discarded here is not replayed or given freshness in the cache.
     }
+}
+
+fn handshake_response_matches(
+    response: &CTraderOpenApiJsonMessage,
+    expected_msg_id: &str,
+    expected_type: u32,
+    expected_account: Option<i64>,
+) -> Result<bool> {
+    if response.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+        let detail = parse_ctrader_error_payload(&response.payload)
+            .unwrap_or_else(|_| "unparseable error payload".to_owned());
+        return Err(anyhow!("cTrader handshake error: {detail}"));
+    }
+    if matches!(
+        response.payload_type,
+        CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
+            | CTRADER_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT_PAYLOAD_TYPE
+            | CTRADER_OA_CLIENT_DISCONNECT_EVENT_PAYLOAD_TYPE
+    ) {
+        return Err(anyhow!("cTrader session invalidated during spot handshake"));
+    }
+    if response.client_msg_id != expected_msg_id {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        response.payload_type == expected_type,
+        "spot handshake response type differs from the requested operation"
+    );
+    anyhow::ensure!(
+        response.payload.is_object(),
+        "spot handshake response payload is not an object"
+    );
+    if let Some(account) = expected_account {
+        anyhow::ensure!(
+            account > 0
+                && response
+                    .payload
+                    .get("ctidTraderAccountId")
+                    .and_then(serde_json::Value::as_i64)
+                    == Some(account),
+            "spot handshake response belongs to a missing, invalid, or different account"
+        );
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Deserialize)]
@@ -744,6 +1013,8 @@ struct LooseSpotEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct LooseSpotPayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    account_id: i64,
     #[serde(rename = "symbolId")]
     symbol_id: i64,
     bid: Option<u64>,
@@ -752,44 +1023,105 @@ struct LooseSpotPayload {
 }
 
 /// Lenient cTrader spot-event parser.
-/// Returns `(symbol_id, bid, ask, broker_timestamp_ms)` for any
-/// spot event whose symbol is in our subscription list. Returns
+/// Returns `(symbol_id, raw_bid, raw_ask, broker_timestamp_ms)` only for the
+/// expected account and a symbol in our subscription list. Returns
 /// `None` for events with an unknown symbol (e.g. a leftover
 /// subscription we forgot to unsub from) so we silently drop
 /// those rather than crashing the read loop.
 fn parse_spot_event_loose(
     response_json: &str,
+    expected_account_id: i64,
     known_symbols: &[StreamedSymbol],
-) -> Option<(i64, Option<f64>, Option<f64>, Option<i64>)> {
+) -> Option<(i64, Option<u64>, Option<u64>, Option<i64>)> {
     let env: LooseSpotEnvelope = serde_json::from_str(response_json).ok()?;
-    if env.payload_type != CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE {
+    if env.payload_type != CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE
+        || expected_account_id <= 0
+        || env.payload.account_id != expected_account_id
+        || env.payload.symbol_id <= 0
+        || (env.payload.bid.is_none() && env.payload.ask.is_none())
+    {
         return None;
     }
     let symbol_meta = known_symbols
         .iter()
         .find(|s| s.symbol_id == env.payload.symbol_id)?;
-    let bid = env
-        .payload
-        .bid
-        .map(|v| scale_price(v as i64, symbol_meta.digits));
-    let ask = env
-        .payload
-        .ask
-        .map(|v| scale_price(v as i64, symbol_meta.digits));
-    Some((symbol_meta.symbol_id, bid, ask, env.payload.timestamp))
-}
-
-/// Scales a cTrader integer price to a float. The math is:
-/// `raw_int / 100_000 * 10^digits`, rounded to `digits` decimals.
-fn scale_price(value: i64, digits: i32) -> f64 {
-    let raw = value as f64 / 100_000.0;
-    let factor = 10_f64.powi(digits.max(0));
-    (raw * factor).round() / factor
+    Some((
+        symbol_meta.symbol_id,
+        env.payload.bid,
+        env.payload.ask,
+        env.payload.timestamp,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_backoff_escalates_and_caps_with_bounded_jitter() {
+        let mut retry = SpotReconnectBackoff::default();
+        for ceiling in [1_000_u64, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000] {
+            let floor = (ceiling / 2).max(1_000);
+            assert_eq!(retry.next_delay(1_000, None, 0).as_millis(), floor as u128);
+        }
+        for jitter in [0, 1, 30_000, u64::MAX] {
+            let delay = retry.next_delay(1_000, None, jitter);
+            assert!((Duration::from_secs(30)..=Duration::from_secs(60)).contains(&delay));
+        }
+        retry.consecutive_failures = u32::MAX;
+        assert_eq!(
+            retry.next_delay(1_000, None, 30_000),
+            Duration::from_secs(60)
+        );
+        assert_eq!(retry.consecutive_failures, u32::MAX);
+    }
+
+    #[test]
+    fn reconnect_backoff_only_resets_after_a_stable_subscription() {
+        let mut retry = SpotReconnectBackoff {
+            consecutive_failures: 20,
+        };
+        assert_eq!(retry.next_delay(1_000, None, 0), Duration::from_secs(30));
+        assert_eq!(
+            retry.next_delay(1_000, Some(Duration::from_secs(59)), 0),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            retry.next_delay(1_000, Some(STABLE_SUBSCRIPTION_DURATION), 0),
+            Duration::from_secs(1)
+        );
+        assert_eq!(retry.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn reconnect_backoff_bounds_invalid_operator_delay_values() {
+        let mut retry = SpotReconnectBackoff::default();
+        assert_eq!(retry.next_delay(0, None, 0), Duration::from_secs(1));
+        assert_eq!(retry.next_delay(u64::MAX, None, 0), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn superseded_stream_does_not_wait_or_retry() {
+        let generation = AtomicU64::new(2);
+        assert!(!wait_for_stream_retry(&generation, 1, Duration::from_secs(60)).await);
+        assert!(wait_for_stream_retry(&generation, 2, Duration::ZERO).await);
+    }
+
+    #[tokio::test]
+    async fn watchlist_change_interrupts_a_pending_backoff() {
+        let generation = AtomicU64::new(1);
+        let waiting = wait_for_stream_retry(&generation, 1, Duration::from_secs(60));
+        let change = async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            generation.store(2, Relaxed);
+        };
+        let (should_retry, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(waiting, change)
+        })
+        .await
+        .expect("watchlist change should not wait for the full retry delay");
+        assert!(!should_retry);
+    }
 
     #[test]
     fn parse_spot_event_loose_picks_up_known_symbol() {
@@ -798,9 +1130,7 @@ mod tests {
             symbol_name: "EURUSD".to_string(),
             digits: 5,
         }];
-        // cTrader sends bid/ask scaled by 10^5: bid=108500 → 1.08500.
-        // The `scale_price` formula is `value / 100000 * 10^digits`,
-        // which at digits=5 reduces to `value / 100000`.
+        // Preserve original unsigned 1/100000 protocol units for the checked cache.
         let payload = r#"{
             "payloadType": 2131,
             "payload": {
@@ -811,10 +1141,10 @@ mod tests {
                 "timestamp": 1700000000
             }
         }"#;
-        let parsed = parse_spot_event_loose(payload, &symbols).expect("parsed");
+        let parsed = parse_spot_event_loose(payload, 42, &symbols).expect("parsed");
         assert_eq!(parsed.0, 1);
-        assert_eq!(parsed.1, Some(1.085));
-        assert_eq!(parsed.2, Some(1.0852));
+        assert_eq!(parsed.1, Some(108_500));
+        assert_eq!(parsed.2, Some(108_520));
         assert_eq!(parsed.3, Some(1_700_000_000));
     }
 
@@ -834,7 +1164,7 @@ mod tests {
                 "ask": 108520
             }
         }"#;
-        assert!(parse_spot_event_loose(payload, &symbols).is_none());
+        assert!(parse_spot_event_loose(payload, 42, &symbols).is_none());
     }
 
     #[test]
@@ -852,19 +1182,264 @@ mod tests {
                 "symbolId": 1
             }
         }"#;
-        assert!(parse_spot_event_loose(payload, &symbols).is_none());
+        assert!(parse_spot_event_loose(payload, 42, &symbols).is_none());
     }
 
     #[test]
-    fn scale_price_handles_5_digit_forex_pair() {
-        // EURUSD: raw 108500 in 5-digit form represents 1.08500
-        // The cTrader scaling is integer / 10^digits with the
-        // 100_000 normalisation. value 108500 here ≠ 1.085 with
-        // digits=5; the production stream sends value 108_500
-        // (no scaling) and 100_000 cancels out at digits=5:
-        //   108_500 / 100_000 * 10^5 = 1.085 * 100_000 = 108_500
-        // rounded /factor → 108_500 / 100_000 = 1.085
-        let p = scale_price(108_500, 5);
-        assert!((p - 1.085).abs() < 1e-6, "got {p}");
+    fn handshake_requires_matching_type_and_exact_account_before_success() {
+        let request = build_account_auth_request(42, "synthetic-test-token", "expected");
+        let expected = expected_response_payload_type(request.payload_type).unwrap();
+        let response = |payload_type, message_id: &str, account: serde_json::Value| {
+            parse_open_api_envelope(
+                &serde_json::json!({
+                    "clientMsgId": message_id,
+                    "payloadType": payload_type,
+                    "payload": {"ctidTraderAccountId": account}
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        assert!(
+            handshake_response_matches(
+                &response(expected, "expected", 42.into()),
+                "expected",
+                expected,
+                Some(42)
+            )
+            .unwrap()
+        );
+        assert!(
+            !handshake_response_matches(
+                &response(expected, "other", 42.into()),
+                "expected",
+                expected,
+                Some(42)
+            )
+            .unwrap()
+        );
+        assert!(
+            handshake_response_matches(
+                &response(CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, "expected", 42.into()),
+                "expected",
+                expected,
+                Some(42)
+            )
+            .is_err()
+        );
+        for account in [
+            serde_json::Value::Null,
+            99.into(),
+            0.into(),
+            (-1).into(),
+            "42".into(),
+            serde_json::json!(42.5),
+            serde_json::json!(u64::MAX),
+        ] {
+            assert!(
+                handshake_response_matches(
+                    &response(expected, "expected", account),
+                    "expected",
+                    expected,
+                    Some(42)
+                )
+                .is_err()
+            );
+        }
+        let missing = parse_open_api_envelope(
+            &serde_json::json!({
+                "clientMsgId":"expected", "payloadType":expected, "payload":{}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(handshake_response_matches(&missing, "expected", expected, Some(42)).is_err());
+        for message in [
+            build_application_auth_request("synthetic-client", "synthetic-secret", "application"),
+            build_subscribe_spots_request(42, &[1], true, "subscribe"),
+        ] {
+            let expected_type = expected_response_payload_type(message.payload_type).unwrap();
+            let expected_account = message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64);
+            let good = parse_open_api_envelope(&serde_json::json!({
+                "clientMsgId":message.client_msg_id, "payloadType":expected_type,
+                "payload":expected_account.map_or_else(|| serde_json::json!({}), |account| serde_json::json!({"ctidTraderAccountId":account}))
+            }).to_string()).unwrap();
+            assert!(
+                handshake_response_matches(
+                    &good,
+                    &message.client_msg_id,
+                    expected_type,
+                    expected_account
+                )
+                .unwrap()
+            );
+            if expected_account.is_some() {
+                assert!(
+                    handshake_response_matches(
+                        &response(expected_type, &message.client_msg_id, 99.into()),
+                        &message.client_msg_id,
+                        expected_type,
+                        expected_account
+                    )
+                    .is_err()
+                );
+                assert_eq!(message.payload["subscribeToSpotTimestamp"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn handshake_propagates_broker_error_and_disconnect_without_authenticating() {
+        for payload_type in [
+            CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE,
+            CTRADER_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT_PAYLOAD_TYPE,
+            CTRADER_OA_CLIENT_DISCONNECT_EVENT_PAYLOAD_TYPE,
+            CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+        ] {
+            let response = parse_open_api_envelope(
+                &serde_json::json!({
+                    "clientMsgId":"unrelated",
+                    "payloadType":payload_type,
+                    "payload":{"errorCode":"SYNTHETIC_REFUSAL","description":"test"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let error =
+                handshake_response_matches(&response, "expected", 2103, Some(42)).unwrap_err();
+            if payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                assert!(error.to_string().contains("SYNTHETIC_REFUSAL"));
+            }
+        }
+    }
+
+    #[test]
+    fn spot_parser_requires_wire_account_and_preserves_unsigned_protocol_sides() {
+        let symbols = [StreamedSymbol {
+            symbol_id: 1,
+            symbol_name: "EURUSD".to_owned(),
+            digits: 2,
+        }];
+        let mut message = serde_json::json!({
+            "payloadType":CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE,
+            "payload":{"ctidTraderAccountId":42,"symbolId":1,"bid":108521,"ask":108531,"timestamp":1000}
+        });
+        let parsed = parse_spot_event_loose(&message.to_string(), 42, &symbols).unwrap();
+        assert_eq!((parsed.1, parsed.2), (Some(108521), Some(108531)));
+        for account in [
+            serde_json::Value::Null,
+            99.into(),
+            0.into(),
+            (-1).into(),
+            "42".into(),
+            serde_json::json!(42.5),
+            serde_json::json!(u64::MAX),
+        ] {
+            message["payload"]["ctidTraderAccountId"] = account;
+            assert!(parse_spot_event_loose(&message.to_string(), 42, &symbols).is_none());
+        }
+        message["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ctidTraderAccountId");
+        assert!(parse_spot_event_loose(&message.to_string(), 42, &symbols).is_none());
+        message["payload"]["ctidTraderAccountId"] = 42.into();
+        message["payload"]["bid"] = serde_json::json!(u64::MAX);
+        message["payload"].as_object_mut().unwrap().remove("ask");
+        let unsigned = parse_spot_event_loose(&message.to_string(), 42, &symbols).unwrap();
+        assert_eq!(
+            unsigned.1,
+            Some(u64::MAX),
+            "checked cache refuses oversized raw prices; no signed wrap"
+        );
+        assert_eq!(unsigned.2, None);
+        message["payload"].as_object_mut().unwrap().remove("bid");
+        assert!(parse_spot_event_loose(&message.to_string(), 42, &symbols).is_none());
+    }
+
+    #[test]
+    fn older_preparation_finishing_last_cannot_adopt_the_newer_generation() {
+        let generation = AtomicU64::new(0);
+        let invalidations = std::cell::RefCell::new(Vec::new());
+        let launches = std::cell::RefCell::new(Vec::new());
+        let config = |name: &str| LiveSpotsStreamerConfig {
+            endpoint_host: "demo.ctraderapi.com".to_owned(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            access_token: String::new(),
+            account_id: 42,
+            symbols: vec![StreamedSymbol {
+                symbol_id: 1,
+                symbol_name: name.to_owned(),
+                digits: 5,
+            }],
+        };
+
+        // A starts and reserves generation 1 before blocking preparation.
+        let older_generation = reserve_stream_generation(&generation, |reserved| {
+            invalidations.borrow_mut().push(reserved);
+        });
+        let older_config = config("OLDER");
+        // A second logical start must reserve 2, not reuse 1; it finishes first.
+        let newer_generation = reserve_stream_generation(&generation, |reserved| {
+            invalidations.borrow_mut().push(reserved);
+        });
+        assert_eq!((older_generation, newer_generation), (1, 2));
+        assert_eq!(*invalidations.borrow(), vec![1, 2]);
+        assert!(finish_preparation_for_generation(
+            &generation,
+            newer_generation,
+            config("NEWER"),
+            |ready, captured| {
+                launches
+                    .borrow_mut()
+                    .push((ready.symbols[0].symbol_name.clone(), captured));
+                true
+            },
+        ));
+        // The actual preparation completion seam must refuse A before launch,
+        // rather than relabelling its stale config as generation 2.
+        assert!(!finish_preparation_for_generation(
+            &generation,
+            older_generation,
+            older_config,
+            |_, _| panic!("superseded preparation must never launch"),
+        ));
+        assert_eq!(*launches.borrow(), vec![("NEWER".to_owned(), 2)]);
+        assert_eq!(generation.load(Relaxed), 2);
+        // A later start also invalidates the prior generation when its launcher
+        // refuses; it cannot leave the old loop authoritative.
+        let failed_generation = reserve_stream_generation(&generation, |reserved| {
+            invalidations.borrow_mut().push(reserved);
+        });
+        assert!(!finish_preparation_for_generation(
+            &generation,
+            failed_generation,
+            config("FAILED"),
+            |_, _| false,
+        ));
+        assert_eq!(failed_generation, 3);
+        assert_eq!(*invalidations.borrow(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn stream_environment_comes_only_from_the_actual_supported_endpoint() {
+        assert_eq!(
+            stream_environment("demo.ctraderapi.com").unwrap(),
+            CTraderEnvironment::Demo
+        );
+        assert_eq!(
+            stream_environment("live.ctraderapi.com").unwrap(),
+            CTraderEnvironment::Live
+        );
+        assert!(stream_environment("demo.ctraderapi.com.attacker.invalid").is_err());
+        assert!(stream_environment("").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "live_spots_subscription_tests.rs"]
+mod subscription_tests;

@@ -421,7 +421,10 @@ impl CausalQuoteToAccountConversionV1 {
         Ok(())
     }
 
-    fn validate_causal_for(&self, fill_unix_ms: i64) -> Result<(), ExecutionEconomicsErrorV1> {
+    /// Validate the exact conversion payload and its causal age for an entry,
+    /// mark or exit. Entry sizing must not borrow the eventual exit FX rate.
+    pub fn validate_causal_for(&self, fill_unix_ms: i64) -> Result<(), ExecutionEconomicsErrorV1> {
+        self.validate()?;
         let Some(age_ms) = fill_unix_ms.checked_sub(self.conversion_observed_at_unix_ms) else {
             return Err(economics_error(
                 ExecutionEconomicsErrorCodeV1::StaleConversionEvidence,
@@ -853,6 +856,85 @@ impl QuoteValidatedExecutionEconomicsLedgerV1 {
                 format!("cannot encode execution economics V1: {error}"),
             )
         })
+    }
+
+    /// Revalidate both the money arithmetic and its independently sealed fills.
+    ///
+    /// A self-consistent JSON digest does not prove that its prices, direction,
+    /// or timestamps came from the referenced quote ledger. This check does not
+    /// confer broker authority on the separate cost, volume or FX assumptions.
+    pub fn validate_against_quote_ledger(
+        &self,
+        sealed_quote_ledger: &SealedHistoricalQuoteValidatedResearchLedgerV1,
+    ) -> Result<(), ExecutionEconomicsErrorV1> {
+        self.validate()?;
+        if sealed_quote_ledger.authority()
+            != QuoteValidatedResearchAuthorityV1::HistoricalBidAskQuotesOnly
+        {
+            return Err(economics_error(
+                ExecutionEconomicsErrorCodeV1::AuthorityMismatch,
+                "execution economics requires independently sealed historical fills",
+            ));
+        }
+        if self.quote_ledger_sha256 != sealed_quote_ledger.ledger_sha256() {
+            return Err(economics_error(
+                ExecutionEconomicsErrorCodeV1::ArtifactDigestMismatch,
+                "execution economics references a different sealed quote ledger",
+            ));
+        }
+        if self.symbol_contract.symbol_name() != sealed_quote_ledger.receipt().symbol_name() {
+            return Err(economics_error(
+                ExecutionEconomicsErrorCodeV1::SymbolMismatch,
+                "execution economics symbol differs from the sealed quote ledger",
+            ));
+        }
+        let position_index = usize::try_from(self.quote_position_index).map_err(|_| {
+            economics_error(
+                ExecutionEconomicsErrorCodeV1::MissingPosition,
+                "quote position index does not fit the process address space",
+            )
+        })?;
+        let position = sealed_quote_ledger
+            .positions()
+            .get(position_index)
+            .ok_or_else(|| {
+                economics_error(
+                    ExecutionEconomicsErrorCodeV1::MissingPosition,
+                    "execution economics position is absent from the sealed quote ledger",
+                )
+            })?;
+        let exit_reference = position.exit_reference().ok_or_else(|| {
+            economics_error(
+                ExecutionEconomicsErrorCodeV1::MissingExitFill,
+                "execution economics references a quote position without a closed exit",
+            )
+        })?;
+        let modeled_exit_price = position.modeled_exit_price().ok_or_else(|| {
+            economics_error(
+                ExecutionEconomicsErrorCodeV1::MissingExitFill,
+                "execution economics references a quote position without an exit price",
+            )
+        })?;
+        if self.direction != position.direction()
+            || self.entry_fill_timestamp_unix_ms != position.entry_reference().timestamp_unix_ms()
+            || self.exit_fill_timestamp_unix_ms != exit_reference.timestamp_unix_ms()
+        {
+            return Err(economics_error(
+                ExecutionEconomicsErrorCodeV1::ArtifactDigestMismatch,
+                "execution economics direction or fill timestamps differ from sealed replay",
+            ));
+        }
+        require_same_bits(
+            "sealed modeled entry price",
+            self.modeled_entry_price,
+            position.modeled_entry_price(),
+        )?;
+        require_same_bits(
+            "sealed modeled exit price",
+            self.modeled_exit_price,
+            modeled_exit_price,
+        )?;
+        Ok(())
     }
 
     pub const fn schema_version(&self) -> u32 {
@@ -1410,6 +1492,6 @@ pub fn build_quote_validated_execution_economics_v1(
         ledger_sha256: String::new(),
     };
     ledger.ledger_sha256 = ledger.recomputed_ledger_sha256()?;
-    ledger.validate()?;
+    ledger.validate_against_quote_ledger(sealed_quote_ledger)?;
     Ok(ledger)
 }

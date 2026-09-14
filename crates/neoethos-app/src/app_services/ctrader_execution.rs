@@ -1,28 +1,33 @@
 use crate::app_services::broker_deal_economics::BrokerSymbolVolumeScaleEvidenceV1;
+use crate::app_services::ctrader_historical_admission::{
+    CTRADER_RESPONSE_TIMEOUT, CTraderIoPhase, CTraderMonotonicClock, CTraderOperationBudget,
+    SystemCTraderMonotonicClock,
+};
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+#[cfg(test)]
+use crate::app_services::ctrader_messages::CTraderOpenApiTransport;
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE, CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE,
     CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderAmendOrderRequest, CTraderAmendPositionSltpRequest,
-    CTraderCancelOrderRequest, CTraderNewOrderRequest, CTraderOpenApiJsonMessage,
-    CTraderOpenApiTransport, build_account_auth_request, build_amend_order_request,
+    CTraderCancelOrderRequest, CTraderNewOrderRequest, CTraderOpenApiJsonMessage, CTraderOrderType,
+    ProductionCTraderBudget, ProductionCTraderSocket, arm_ctrader_socket_budget,
+    arm_ctrader_socket_with_budget, build_account_auth_request, build_amend_order_request,
     build_amend_position_sltp_request, build_application_auth_request, build_cancel_order_request,
-    build_close_position_request, build_new_order_request, expected_response_payload_type,
-    is_ctrader_auth_token_error, is_matching_open_api_response, parse_ctrader_error_payload_parts,
-    parse_open_api_envelope,
+    build_close_position_request, build_new_order_request, connect_ctrader_socket,
+    expected_response_payload_type, is_ctrader_auth_token_error, is_ctrader_socket_poll_timeout,
+    is_matching_open_api_response, parse_ctrader_error_payload_parts, parse_open_api_envelope,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::net::TcpStream;
 #[cfg(test)]
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, connect};
+use tungstenite::Message;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CTraderExecutionRequest {
@@ -67,6 +72,27 @@ pub struct CTraderExecutionRuntimeRequest {
     pub request: CTraderExecutionRequest,
 }
 
+/// Typed local recovery context, not proof of no fill or permission to resend.
+/// accepted_order_id is a request-bound broker order reference: a validated
+/// acceptance OR direct filled/partial terminal observation, not opening proof.
+#[derive(Debug, Clone)]
+pub(crate) struct CTraderUnresolvedExecution {
+    pub(crate) environment: CTraderEnvironment,
+    pub(crate) account_id: i64,
+    pub(crate) client_order_id: Option<String>,
+    pub(crate) accepted_order_id: Option<i64>,
+}
+
+impl std::fmt::Display for CTraderUnresolvedExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "immediate execution unresolved; accepted_order_id={:?}; no resend",
+            self.accepted_order_id
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CTraderExecutionOutcome {
     pub status: CTraderExecutionStatus,
@@ -97,6 +123,14 @@ pub struct CTraderExecutionOutcome {
     /// order-preparation path. Raw event parsers leave it absent; the submitting
     /// broker API binds it before returning the outcome to its caller.
     pub volume_scale_evidence: Option<BrokerSymbolVolumeScaleEvidenceV1>,
+    /// A broker deal's closePositionDetail distinguishes a closing/reducing
+    /// execution (including NETTED reductions) from an opening execution.
+    /// None means that the event carried no deal, not that no fill happened.
+    pub deal_closes_position: Option<bool>,
+    /// Exact single-fill opening-position evidence. This is absent for accepted
+    /// orders, partial/multi-fill entries, reductions and incomplete wire data.
+    /// Absence never means an order was definitely not sent or filled.
+    pub opening_fill_evidence: Option<CTraderOpeningFillEvidenceV1>,
     pub execution_price: Option<f64>,
     pub gross_profit: Option<f64>,
     pub fee: Option<f64>,
@@ -107,6 +141,63 @@ pub struct CTraderExecutionOutcome {
     pub description: Option<String>,
 }
 
+/// Mutually bound facts from one genuine opening order/position/deal event.
+/// No environment, currency, lot size, admission or historical completeness is
+/// inferred here. The submitting API supplies its captured volume-scale scope.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderOpeningFillEvidenceV1 {
+    account_id: i64,
+    order_id: i64,
+    position_id: i64,
+    deal_id: i64,
+    symbol_id: i64,
+    trade_side: String,
+    filled_volume_raw_centi_units: i64,
+    position_open_timestamp_ms: i64,
+    execution_timestamp_ms: i64,
+    entry_price: f64,
+}
+
+impl CTraderOpeningFillEvidenceV1 {
+    pub const fn account_id(&self) -> i64 {
+        self.account_id
+    }
+
+    pub const fn order_id(&self) -> i64 {
+        self.order_id
+    }
+
+    pub const fn position_id(&self) -> i64 {
+        self.position_id
+    }
+
+    pub const fn deal_id(&self) -> i64 {
+        self.deal_id
+    }
+
+    pub const fn symbol_id(&self) -> i64 {
+        self.symbol_id
+    }
+
+    pub fn trade_side(&self) -> &str {
+        &self.trade_side
+    }
+
+    pub const fn filled_volume_raw_centi_units(&self) -> i64 {
+        self.filled_volume_raw_centi_units
+    }
+    pub const fn position_open_timestamp_ms(&self) -> i64 {
+        self.position_open_timestamp_ms
+    }
+    pub const fn execution_timestamp_ms(&self) -> i64 {
+        self.execution_timestamp_ms
+    }
+
+    pub const fn entry_price(&self) -> f64 {
+        self.entry_price
+    }
+}
+
 pub trait CTraderExecutionBackend: Send + Sync {
     fn execute(&self, request: &CTraderExecutionRuntimeRequest) -> Result<CTraderExecutionOutcome>;
 }
@@ -114,9 +205,9 @@ pub trait CTraderExecutionBackend: Send + Sync {
 #[derive(Clone, Default)]
 pub struct ProductionCTraderExecutionBackend;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct CTraderExecutionSession {
-    socket: Option<tungstenite::WebSocket<MaybeTlsStream<TcpStream>>>,
+    socket: Option<ProductionCTraderSocket>,
     auth_key: Option<String>,
     recent_submissions: HashMap<String, CachedExecutionOutcome>,
 }
@@ -159,6 +250,16 @@ struct ExecutionOrderPayload {
     order_type: i32,
     #[serde(rename = "executionPrice")]
     execution_price: Option<f64>,
+    #[serde(rename = "orderStatus")]
+    order_status: Option<i32>,
+    #[serde(rename = "clientOrderId")]
+    client_order_id: Option<String>,
+    #[serde(rename = "executedVolume")]
+    executed_volume: Option<i64>,
+    #[serde(rename = "closingOrder")]
+    closing_order: Option<bool>,
+    #[serde(rename = "positionId")]
+    position_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +269,8 @@ struct ExecutionPositionPayload {
     #[serde(rename = "tradeData")]
     trade_data: ExecutionTradeDataPayload,
     price: Option<f64>,
+    #[serde(rename = "positionStatus")]
+    position_status: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +307,8 @@ struct ExecutionDealPayload {
     money_digits: Option<u32>,
     #[serde(rename = "closePositionDetail")]
     close_position_detail: Option<ExecutionClosePositionDetailPayload>,
+    #[serde(rename = "dealStatus")]
+    deal_status: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,6 +457,267 @@ impl CTraderExecutionStatus {
     }
 }
 
+/// Immediate orders alone wait past acceptance. Pending orders retain their
+/// existing acceptance response; their eventual execution may be hours later.
+fn immediate_order(request: &CTraderExecutionRuntimeRequest) -> Option<&CTraderNewOrderRequest> {
+    match &request.request {
+        CTraderExecutionRequest::NewOrder(order)
+            if matches!(
+                order.order_type,
+                CTraderOrderType::Market | CTraderOrderType::MarketRange
+            ) =>
+        {
+            Some(order)
+        }
+        _ => None,
+    }
+}
+
+fn immediate_execution_timeout(configured_seconds: u64) -> Duration {
+    // A disabled legacy per-read timeout must not disable this absolute wait.
+    Duration::from_secs(if configured_seconds == 0 {
+        30
+    } else {
+        configured_seconds.min(30)
+    })
+}
+
+fn cacheable_execution_outcome(
+    request: &CTraderExecutionRuntimeRequest,
+    outcome: &CTraderExecutionOutcome,
+) -> bool {
+    immediate_order(request).is_none() || outcome.status == CTraderExecutionStatus::Filled
+}
+
+/// Narrow injectable I/O seam: the production implementation uses the existing
+/// DeadlineIo socket, which enforces the budget beneath TLS/fragmented frames.
+trait ImmediateExecutionIo {
+    fn send_frame(&mut self, frame: Message) -> std::result::Result<(), tungstenite::Error>;
+    fn read_frame(&mut self) -> std::result::Result<Message, tungstenite::Error>;
+}
+
+impl ImmediateExecutionIo for ProductionCTraderSocket {
+    fn send_frame(&mut self, frame: Message) -> std::result::Result<(), tungstenite::Error> {
+        self.send(frame)
+    }
+
+    fn read_frame(&mut self) -> std::result::Result<Message, tungstenite::Error> {
+        self.read()
+    }
+}
+
+/// Collect one immediate order under one immutable budget and exactly one send.
+/// Only the accepted broker order id is retained, not an unbounded event tape.
+/// Partial/multi-fill, timeout and non-filled terminal states remain unresolved:
+/// this collector does not implement durable intent/history recovery.
+fn collect_immediate_execution<C: CTraderMonotonicClock>(
+    request: &CTraderExecutionRuntimeRequest,
+    message: &CTraderOpenApiJsonMessage,
+    budget: &CTraderOperationBudget<C>,
+    io: &mut impl ImmediateExecutionIo,
+) -> Result<String> {
+    let order =
+        immediate_order(request).context("terminal collection requires an immediate order")?;
+    anyhow::ensure!(
+        order.account_id > 0
+            && request.account_id.parse::<i64>()? == order.account_id
+            && order.symbol_id > 0
+            && order.volume > 0
+            && !message.client_msg_id.is_empty()
+            && *message == request.request.to_message(&message.client_msg_id),
+        "immediate execution request identity is invalid"
+    );
+    let serialized = serde_json::to_string(message)?;
+    let mut accepted_order_id = None;
+    let mut accepted_position_id = None;
+    let mut unrelated_execution_seen = false;
+    let collected = (|| -> Result<String> {
+        budget.check_io(CTraderIoPhase::RequestWrite)?;
+        // A send error may already have reached the broker. Never resend this frame.
+        io.send_frame(Message::Text(serialized.into()))?;
+        budget.check_io(CTraderIoPhase::RequestWrite)?;
+        loop {
+            budget.check_io(CTraderIoPhase::ResponseRead)?;
+            let frame = match io.read_frame() {
+                Ok(frame) => frame,
+                Err(error) if is_ctrader_socket_poll_timeout(&error) => {
+                    budget.check_io(CTraderIoPhase::ResponseRead)?;
+                    continue;
+                }
+                Err(error) => return Err(anyhow!(error).context("immediate response read failed")),
+            };
+            // Buffered or just-completed frames cannot win after the deadline.
+            budget.check_io(CTraderIoPhase::ResponseRead)?;
+            let text = match frame {
+                Message::Text(text) => text.to_string(),
+                Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
+                    .context("invalid UTF-8 execution frame; outcome unresolved")?,
+                Message::Ping(payload) => {
+                    budget.check_io(CTraderIoPhase::RequestWrite)?;
+                    io.send_frame(Message::Pong(payload))?;
+                    budget.check_io(CTraderIoPhase::RequestWrite)?;
+                    continue;
+                }
+                Message::Pong(_) | Message::Frame(_) => continue,
+                Message::Close(_) => anyhow::bail!(
+                    "execution socket closed; accepted_order_id={accepted_order_id:?}; outcome unresolved; no resend"
+                ),
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let envelope = parse_open_api_envelope(&text)?;
+            let correlated = envelope.client_msg_id == message.client_msg_id;
+            let same_account = envelope
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(Value::as_i64)
+                == Some(order.account_id);
+            let response_order_id = envelope
+                .payload
+                .get("order")
+                .and_then(|item| item.get("orderId"))
+                .or_else(|| envelope.payload.get("orderId"))
+                .and_then(Value::as_i64);
+            let known_order = same_account
+                && accepted_order_id.is_some()
+                && response_order_id == accepted_order_id;
+            // A missing clientMsgId can describe an unsolicited follow-up only
+            // after this request's actual account/order pair has been established.
+            let owned_followup = known_order && envelope.client_msg_id.is_empty();
+            if !correlated && !owned_followup {
+                if known_order && !envelope.client_msg_id.is_empty() {
+                    anyhow::bail!(
+                        "known execution order has conflicting clientMsgId; outcome unresolved"
+                    );
+                }
+                if matches!(
+                    envelope.payload_type,
+                    CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE
+                        | CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE
+                ) && !unrelated_execution_seen
+                {
+                    // Manual/other-order pushes are legitimate, but are not this
+                    // collector's evidence. No durability/recovery claim is made.
+                    tracing::debug!(target: "neoethos_app::ctrader",
+                    "unrelated execution observed during terminal wait; not owned or persisted by this collector");
+                    unrelated_execution_seen = true;
+                }
+                continue;
+            }
+            if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                // Preserve original broker error code/description in the existing
+                // execute_authenticated_once parser, not a missing-order error.
+                return Ok(text);
+            }
+            if envelope.payload_type == CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE {
+                let error: OrderErrorEnvelope = serde_json::from_str(&text)?;
+                anyhow::ensure!(
+                    error.payload.ctid_trader_account_id == order.account_id
+                        && accepted_order_id.is_none_or(|id| error.payload.order_id == Some(id)),
+                    "order error account/order mismatch"
+                );
+                return Ok(text);
+            }
+            anyhow::ensure!(
+                envelope.payload_type == CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE,
+                "correlated immediate response has unexpected payload type"
+            );
+            let execution: ExecutionEnvelope = serde_json::from_str(&text)?;
+            let payload = &execution.payload;
+            anyhow::ensure!(
+                payload.ctid_trader_account_id == order.account_id,
+                "immediate execution account mismatch"
+            );
+            validate_execution_payload_links(payload)?;
+            // Rejection may omit order details. It is still an error, not evidence
+            // allowing automatic retry or release of an ambiguous reservation.
+            if payload.execution_type == 7 && payload.order.is_none() && accepted_order_id.is_none()
+            {
+                return Ok(text);
+            }
+            let observed = payload
+                .order
+                .as_ref()
+                .context("immediate execution missing order evidence")?;
+            anyhow::ensure!(
+                observed.trade_data.symbol_id == order.symbol_id
+                    && trade_side_label(observed.trade_data.trade_side) == order.trade_side.label()
+                    && order_type_label(observed.order_type) == order.order_type.label()
+                    && observed.trade_data.volume == order.volume
+                    && accepted_order_id.is_none_or(|id| observed.order_id == id)
+                    && accepted_position_id.is_none_or(|id| observed.position_id.or_else(|| {
+                        payload
+                            .position
+                            .as_ref()
+                            .map(|position| position.position_id)
+                    }) == Some(id))
+                    && order
+                        .position_id
+                        .is_none_or(|id| observed.position_id == Some(id)),
+                "immediate execution order identity differs from the request/acceptance"
+            );
+            if let Some(client_order_id) = observed.client_order_id.as_deref() {
+                anyhow::ensure!(
+                    order.client_order_id.as_deref() == Some(client_order_id),
+                    "immediate execution root clientOrderId mismatch"
+                );
+            }
+            // Identity is now bound to this request, including direct fills that
+            // had no earlier Accepted event. Keep the reference even if parsing
+            // financial/opening evidence below fails; it is not ownership proof.
+            accepted_order_id = Some(observed.order_id);
+            match payload.execution_type {
+                2 => {
+                    anyhow::ensure!(
+                        observed.order_status == Some(1)
+                            && observed.executed_volume.is_none_or(|volume| volume == 0)
+                            && payload.deal.is_none(),
+                        "acceptance contains unexpected execution progress; outcome unresolved"
+                    );
+                    accepted_position_id = observed.position_id.or_else(|| {
+                        payload
+                            .position
+                            .as_ref()
+                            .map(|position| position.position_id)
+                    });
+                }
+                3 => {
+                    anyhow::ensure!(
+                        observed.order_status == Some(2),
+                        "filled execution does not contain a filled order"
+                    );
+                    // Preserve the known order on failures in the same required
+                    // parser/validator used by the outer backend. The successful
+                    // response still follows that unchanged outer path.
+                    let outcome = parse_execution_outcome(&text)?;
+                    validate_execution_outcome(request, &outcome)?;
+                    // NETTED/multi-fill facts cannot mint single-opening proof.
+                    return Ok(text);
+                }
+                7 => return Ok(text),
+                other => anyhow::bail!(
+                    "immediate execution requires reconciliation: execution_type={other}, order_id={}, executed_volume={:?}, deal_id={:?}; no resend",
+                    observed.order_id,
+                    observed.executed_volume,
+                    payload.deal.as_ref().map(|deal| deal.deal_id)
+                ),
+            }
+        }
+    })();
+    collected
+        .and_then(|text| {
+            budget.check_io(CTraderIoPhase::ResponseRead)?;
+            Ok(text)
+        })
+        .with_context(|| CTraderUnresolvedExecution {
+            environment: request.environment,
+            account_id: order.account_id,
+            client_order_id: order.client_order_id.clone(),
+            accepted_order_id,
+        })
+}
+
 impl ProductionCTraderExecutionBackend {
     fn session() -> &'static Mutex<CTraderExecutionSession> {
         EXECUTION_SESSION.get_or_init(|| Mutex::new(CTraderExecutionSession::default()))
@@ -366,19 +732,12 @@ impl ProductionCTraderExecutionBackend {
             request.access_token
         )
     }
-
-    /// Derive the wire `clientMsgId` for a request from `(phase, fingerprint)`.
+    /// Derive a stable wire correlation id from the logical request identity.
     ///
-    /// **2026-06-10 idempotency fix:** the attempt number is deliberately NOT
-    /// part of the hash. cTrader (per the Spotware Open API guidance) treats the
-    /// `clientMsgId` as the de-duplication key; if a retry of the SAME order
-    /// carried a different id, a request that actually reached the broker but
-    /// whose response we lost (network timeout → socket reset → retry) would
-    /// execute a SECOND time. A stable id lets the broker collapse the retry
-    /// onto the original. Correlation is still unambiguous because every attempt
-    /// runs on a freshly re-authed socket, so there is only ever one in-flight
-    /// request per socket. The `attempt` counter is retained by the caller for
-    /// backoff/logging only.
+    /// ProtoMessage documents clientMsgId as an echoed request identifier, not
+    /// a broker idempotency guarantee. Keep it stable for traceability, but do
+    /// not resend an execution after a send/read failure. Authentication-only
+    /// attempts may still retry before any execution submission begins.
     fn client_msg_id_for(phase: &str, fingerprint: &str) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -411,13 +770,10 @@ impl ProductionCTraderExecutionBackend {
         fingerprint: String,
         outcome: CTraderExecutionOutcome,
     ) {
-        // **2026-06-10 idempotency fix:** cache ALL terminal broker outcomes,
-        // including `Failed` (a parsed broker REJECTION — execution_type 7/8).
-        // Previously Failed was dropped, so an accidental immediate re-submit of
-        // the same order (operator double-click) bypassed the 30s dedup window
-        // and hit the broker again. Transient network I/O failures never reach
-        // here — they are returned from the `Err` arm of send_message_and_wait,
-        // not parsed into an outcome — so genuine transient errors stay retryable.
+        // Store validated outcomes for the same bounded logical request.
+        // Errors (including parsed rejections) never reach this cache. A failed
+        // submission is not automatically resent; callers retain unresolved
+        // operation state instead of assuming that an error means no fill.
         session.recent_submissions.insert(
             fingerprint,
             CachedExecutionOutcome {
@@ -442,24 +798,25 @@ impl ProductionCTraderExecutionBackend {
     }
 
     fn read_matching_response(
-        socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+        socket: &mut ProductionCTraderSocket,
         request: &CTraderOpenApiJsonMessage,
         expected_payload_type: u32,
+        budget: &ProductionCTraderBudget,
     ) -> Result<String> {
         loop {
-            match socket
-                .read()
-                .context("failed to read cTrader open api response")?
-            {
+            budget.check_io(CTraderIoPhase::ResponseRead)?;
+            let frame = match socket.read() {
+                Ok(frame) => frame,
+                Err(error) if is_ctrader_socket_poll_timeout(&error) => continue,
+                Err(error) => {
+                    return Err(anyhow!(error).context("failed to read cTrader open api response"));
+                }
+            };
+            budget.check_io(CTraderIoPhase::ResponseRead)?;
+            match frame {
                 Message::Text(text) => {
-                    // 2026-06-10: a frame that is empty or unparseable is NOT a
-                    // reason to abort the whole request. Doing so dropped the
-                    // session and forced a full re-auth + order RETRY (the
-                    // double-submit path). A stray heartbeat / keep-alive / out-
-                    // of-band push between our send and the matching response is
-                    // expected — skip it and keep reading. The 30s socket read
-                    // timeout bounds this loop, so a genuinely silent broker
-                    // still surfaces as a timeout error, not a hang.
+                    // Unrelated protocol traffic cannot renew the absolute
+                    // deadline enforced both here and below TLS by DeadlineIo.
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -509,16 +866,22 @@ impl ProductionCTraderExecutionBackend {
     }
 
     fn send_message_and_wait(
-        socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+        socket: &mut ProductionCTraderSocket,
         message: &CTraderOpenApiJsonMessage,
     ) -> Result<String> {
         let expected_payload_type = expected_response_payload_type(message.payload_type)?;
         let serialized = serde_json::to_string(message)
             .context("failed to serialize cTrader open api message")?;
+        let budget = arm_ctrader_socket_budget(
+            socket,
+            CTRADER_RESPONSE_TIMEOUT,
+            None,
+            CTraderIoPhase::ResponseRead,
+        )?;
         socket
             .send(Message::Text(serialized.into()))
             .context("failed to send cTrader open api message")?;
-        Self::read_matching_response(socket, message, expected_payload_type)
+        Self::read_matching_response(socket, message, expected_payload_type, &budget)
     }
 
     fn ensure_authenticated(
@@ -531,38 +894,7 @@ impl ProductionCTraderExecutionBackend {
         }
 
         session.socket = None;
-        let url = crate::app_services::ctrader_messages::ctrader_json_wss_url(
-            request.environment.endpoint_host(),
-        );
-        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
-        let (socket, _) = connect(url.as_str())
-            .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
-        // M10: cap the underlying TCP read at 30s so a broker stall or a
-        // mismatched payload cannot wedge the trading loop forever. The loop
-        // in `read_matching_response` previously blocked indefinitely; with a
-        // timeout the I/O error bubbles up, the caller drops the session,
-        // and the next `execute_via_session` retry re-authenticates.
-        // Override via `NEOETHOS_BOT_CTRADER_READ_TIMEOUT_SECS` (0 disables).
-        // F-CORE3 closure (2026-05-25): routed through the canonical
-        // `env_overrides::ctrader_read_timeout_secs` getter so the var
-        // is grep-able from one place + clamped consistently.
-        let read_timeout_secs: u64 =
-            crate::app_services::env_overrides::ctrader_read_timeout_secs();
-        if read_timeout_secs > 0 {
-            let timeout = std::time::Duration::from_secs(read_timeout_secs);
-            let apply_result = match socket.get_ref() {
-                MaybeTlsStream::Plain(stream) => stream.set_read_timeout(Some(timeout)),
-                MaybeTlsStream::Rustls(stream) => stream.get_ref().set_read_timeout(Some(timeout)),
-                _ => Ok(()), // unknown TLS variant — not critical
-            };
-            if let Err(err) = apply_result {
-                tracing::warn!(
-                    target: "neoethos_app::ctrader",
-                    error = ?err,
-                    "failed to apply cTrader socket read timeout"
-                );
-            }
-        }
+        let socket = connect_ctrader_socket(request.environment.endpoint_host(), None)?;
         session.socket = Some(socket);
         session.auth_key = Some(auth_key);
 
@@ -617,13 +949,52 @@ impl ProductionCTraderExecutionBackend {
         Ok(())
     }
 
+    fn execution_cache_fingerprint(request: &CTraderExecutionRuntimeRequest) -> String {
+        // A broker account/position id is scoped to its server environment.
+        // Logical NewOrder intent identity is the stable clientOrderId included
+        // by idempotency_fingerprint; equal parameters alone are not a new id.
+        format!(
+            "{}|runtime_account={}|{}",
+            request.environment.endpoint_host(),
+            request.account_id,
+            request.request.idempotency_fingerprint()
+        )
+    }
+
+    /// Submit exactly once after authentication. A callback may fail after the
+    /// broker received the request; neither an error nor an echoed clientMsgId
+    /// proves the absence of execution. The caller must retain unresolved state.
+    fn execute_authenticated_once(
+        request: &CTraderExecutionRuntimeRequest,
+        send: impl FnOnce() -> Result<String>,
+    ) -> Result<CTraderExecutionOutcome> {
+        let response = send().context(
+            "cTrader execution send/response failed after submission began; outcome unresolved; automatic resend refused",
+        )?;
+        let response_envelope = parse_open_api_envelope(&response)
+            .context("failed to inspect cTrader execution response")?;
+        if response_envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+            let (error_code, error_message) =
+                parse_ctrader_error_payload_parts(&response_envelope.payload)?;
+            // Preserve the existing token diagnostic. It does not authorize
+            // resubmitting an operation whose execution outcome is unresolved.
+            if is_ctrader_auth_token_error(&error_code) {
+                return Err(anyhow!("{CTRADER_TOKEN_EXPIRED_SENTINEL}: {error_message}"));
+            }
+            return Err(anyhow!(error_message));
+        }
+        let outcome = parse_execution_outcome(&response)?;
+        validate_execution_outcome(request, &outcome)?;
+        Ok(outcome)
+    }
+
     fn execute_via_session(
         request: &CTraderExecutionRuntimeRequest,
     ) -> Result<CTraderExecutionOutcome> {
         let mut session = Self::session()
             .lock()
             .map_err(|_| anyhow!("cTrader execution session lock poisoned"))?;
-        let fingerprint = request.request.idempotency_fingerprint();
+        let fingerprint = Self::execution_cache_fingerprint(request);
         if let Some(cached) = Self::maybe_cached_outcome(&session, &fingerprint) {
             return Ok(cached);
         }
@@ -641,9 +1012,8 @@ impl ProductionCTraderExecutionBackend {
                 continue;
             }
 
-            // Stable across retries (see client_msg_id_for): a retry of an order
-            // that already reached the broker collapses onto the original by id
-            // instead of executing a second time.
+            // Only authentication retries above. Once submission begins, both
+            // a transport error and an unusable response are potentially filled.
             let order_message = request
                 .request
                 .to_message(&Self::client_msg_id_for("execute", &fingerprint));
@@ -651,35 +1021,40 @@ impl ProductionCTraderExecutionBackend {
                 .socket
                 .as_mut()
                 .context("cTrader execution socket missing after auth")?;
-            match Self::send_message_and_wait(socket, &order_message) {
-                Ok(response) => {
-                    let response_envelope = parse_open_api_envelope(&response)
-                        .context("failed to inspect cTrader execution response")?;
-                    if response_envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-                        let (error_code, error_message) =
-                            parse_ctrader_error_payload_parts(&response_envelope.payload)?;
+            match Self::execute_authenticated_once(request, || {
+                if immediate_order(request).is_some() {
+                    let budget = CTraderOperationBudget::new(
+                        SystemCTraderMonotonicClock,
+                        immediate_execution_timeout(
+                            crate::app_services::env_overrides::ctrader_read_timeout_secs(),
+                        ),
+                        None,
+                    )?;
+                    arm_ctrader_socket_with_budget(
+                        socket,
+                        budget.clone(),
+                        CTraderIoPhase::ResponseRead,
+                    )?;
+                    collect_immediate_execution(request, &order_message, &budget, socket)
+                } else {
+                    Self::send_message_and_wait(socket, &order_message)
+                }
+            }) {
+                Ok(outcome) => {
+                    if !cacheable_execution_outcome(request, &outcome) {
                         session.socket = None;
                         session.auth_key = None;
-                        // D11: tag token-failure errors with the sentinel so
-                        // the caller knows to force-refresh the OAuth bundle
-                        // before retrying. Other errors (insufficient margin,
-                        // invalid stop, etc.) bubble up unchanged.
-                        if is_ctrader_auth_token_error(&error_code) {
-                            return Err(anyhow!(
-                                "{CTRADER_TOKEN_EXPIRED_SENTINEL}: {error_message}"
-                            ));
-                        }
-                        return Err(anyhow!(error_message));
+                        anyhow::bail!(
+                            "immediate execution is not terminal; outcome unresolved; no resend"
+                        );
                     }
-                    let outcome = parse_execution_outcome(&response)?;
-                    validate_execution_outcome(request, &outcome)?;
                     Self::store_cached_outcome(&mut session, fingerprint.clone(), outcome.clone());
                     return Ok(outcome);
                 }
                 Err(err) => {
                     session.socket = None;
                     session.auth_key = None;
-                    last_error = Some(err);
+                    return Err(err);
                 }
             }
         }
@@ -687,7 +1062,7 @@ impl ProductionCTraderExecutionBackend {
         Err(last_error.unwrap_or_else(|| anyhow!("cTrader execution failed")))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn execute_with_transport<T: CTraderOpenApiTransport>(
         transport: &T,
         request: &CTraderExecutionRuntimeRequest,
@@ -717,7 +1092,9 @@ impl ProductionCTraderExecutionBackend {
             CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
         )?;
         ensure_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
-        parse_execution_outcome(&responses[2])
+        let outcome = parse_execution_outcome(&responses[2])?;
+        validate_execution_outcome(request, &outcome)?;
+        Ok(outcome)
     }
 }
 
@@ -805,14 +1182,12 @@ impl CTraderExecutionBackend for StubCTraderExecutionBackend {
     }
 }
 
-/// Maximum number of attempts (initial + retries) for a single
-/// `execute_via_session` call. Tunable via `NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS`
-/// (clamped to `[1, 5]`; default 3). The default is deliberately small —
-/// retry safety relies on the broker deduping by `clientOrderId`.
+/// Maximum authentication attempts before an execution is submitted.
+/// Tunable via NEOETHOS_BOT_CTRADER_MAX_ATTEMPTS (clamped to [1, 5];
+/// default 3). No execution send/read/parse failure is automatically retried.
 ///
-/// **F-CORE3 closure (2026-05-25)**: thin shim over the canonical
-/// `env_overrides::ctrader_max_attempts` typed getter. Kept as a
-/// local function so existing call-sites don't need to re-import.
+/// Thin shim over the canonical env_overrides getter; unchanged configuration
+/// controls only the definitely-pre-submission authentication retry loop.
 fn ctrader_max_attempts() -> u32 {
     crate::app_services::env_overrides::ctrader_max_attempts()
 }
@@ -834,6 +1209,7 @@ fn ctrader_backoff_sleep(attempt: u32) {
     crate::app_services::backoff::backoff_sleep(attempt, ctrader_backoff_base_ms());
 }
 
+#[cfg(test)]
 fn ensure_payload_type(response_json: &str, expected_payload_type: u32) -> Result<()> {
     let envelope: Value =
         serde_json::from_str(response_json).context("failed to parse cTrader JSON envelope")?;
@@ -874,6 +1250,131 @@ fn parse_execution_outcome(response_json: &str) -> Result<CTraderExecutionOutcom
     }
 }
 
+fn validate_execution_payload_links(payload: &ExecutionPayload) -> Result<()> {
+    anyhow::ensure!(
+        payload.ctid_trader_account_id > 0,
+        "execution account id must be positive"
+    );
+    if let Some(order) = &payload.order {
+        anyhow::ensure!(
+            order.order_id > 0
+                && order.trade_data.symbol_id > 0
+                && matches!(order.trade_data.trade_side, 1 | 2)
+                && order.position_id.is_none_or(|id| id > 0),
+            "execution order identity is invalid"
+        );
+    }
+    if let Some(position) = &payload.position {
+        anyhow::ensure!(
+            position.position_id > 0
+                && position.trade_data.symbol_id > 0
+                && matches!(position.trade_data.trade_side, 1 | 2),
+            "execution position identity is invalid"
+        );
+    }
+    if let Some(deal) = &payload.deal {
+        anyhow::ensure!(
+            deal.deal_id > 0
+                && deal.order_id > 0
+                && deal.position_id > 0
+                && deal.symbol_id > 0
+                && matches!(deal.trade_side, 1 | 2),
+            "execution deal identity is invalid"
+        );
+        if let Some(order) = &payload.order {
+            anyhow::ensure!(
+                order.order_id == deal.order_id
+                    && order.trade_data.symbol_id == deal.symbol_id
+                    && order.trade_data.trade_side == deal.trade_side
+                    && order.position_id.is_none_or(|id| id == deal.position_id),
+                "execution order/deal identity mismatch"
+            );
+        }
+        if let Some(position) = &payload.position {
+            anyhow::ensure!(
+                position.position_id == deal.position_id
+                    && position.trade_data.symbol_id == deal.symbol_id,
+                "execution position/deal identity mismatch"
+            );
+            // A close/reduction has the opposite side from the original
+            // position. Do not impose an opening-side rule on closing deals.
+            if deal.close_position_detail.is_none()
+                && payload
+                    .order
+                    .as_ref()
+                    .is_some_and(|order| order.closing_order == Some(false))
+            {
+                anyhow::ensure!(
+                    position.trade_data.trade_side == deal.trade_side,
+                    "opening execution position/deal side mismatch"
+                );
+            }
+        }
+    }
+    if let (Some(order), Some(position)) = (&payload.order, &payload.position) {
+        anyhow::ensure!(
+            order.trade_data.symbol_id == position.trade_data.symbol_id
+                && order
+                    .position_id
+                    .is_none_or(|id| id == position.position_id),
+            "execution order/position identity mismatch"
+        );
+    }
+    Ok(())
+}
+
+fn opening_fill_evidence(
+    payload: &ExecutionPayload,
+    status: CTraderExecutionStatus,
+) -> Option<CTraderOpeningFillEvidenceV1> {
+    let order = payload.order.as_ref()?;
+    let position = payload.position.as_ref()?;
+    let deal = payload.deal.as_ref()?;
+    // This is intentionally a single, complete opening fill. A larger existing
+    // NETTED position, a multi-fill order, or a reduction requires recovery of
+    // the real lifecycle; none can be reconstructed from the requested lots.
+    if status != CTraderExecutionStatus::Filled
+        || order.order_status != Some(2)
+        || position.position_status != Some(1)
+        || deal.deal_status != Some(2)
+        || order.closing_order == Some(true)
+        || deal.close_position_detail.is_some()
+        || position.trade_data.trade_side != deal.trade_side
+        || deal.filled_volume <= 0
+        || deal.filled_volume > crate::app_services::broker_deal_economics::MAX_EXACT_BROKER_VOLUME
+        || order.executed_volume != Some(deal.filled_volume)
+        || order.trade_data.volume != deal.filled_volume
+        || position.trade_data.volume != deal.filled_volume
+    {
+        return None;
+    }
+    let position_open_timestamp_ms = position.trade_data.open_timestamp?;
+    let entry_price = position.price?;
+    let execution_price = deal.execution_price?;
+    if position_open_timestamp_ms <= 0
+        || deal.execution_timestamp < position_open_timestamp_ms
+        || !entry_price.is_finite()
+        || entry_price <= 0.0
+        || !execution_price.is_finite()
+        || execution_price <= 0.0
+        || entry_price.to_bits() != execution_price.to_bits()
+    {
+        return None;
+    }
+    Some(CTraderOpeningFillEvidenceV1 {
+        account_id: payload.ctid_trader_account_id,
+        order_id: order.order_id,
+        position_id: position.position_id,
+        deal_id: deal.deal_id,
+        symbol_id: deal.symbol_id,
+        trade_side: trade_side_label(deal.trade_side),
+        filled_volume_raw_centi_units: deal.filled_volume,
+        position_open_timestamp_ms,
+        execution_timestamp_ms: deal.execution_timestamp,
+        entry_price,
+    })
+}
+
 fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome> {
     let envelope: ExecutionEnvelope =
         serde_json::from_str(response_json).context("failed to parse cTrader execution event")?;
@@ -885,6 +1386,13 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
     }
 
     let status = CTraderExecutionStatus::from_proto(envelope.payload.execution_type)?;
+    validate_execution_payload_links(&envelope.payload)?;
+    let opening_fill_evidence = opening_fill_evidence(&envelope.payload, status);
+    let deal_closes_position = envelope
+        .payload
+        .deal
+        .as_ref()
+        .map(|deal| deal.close_position_detail.is_some());
     let order = envelope.payload.order;
     let position = envelope.payload.position;
     let deal = envelope.payload.deal;
@@ -984,6 +1492,8 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
             .map(|item| volume_to_units(item.filled_volume)),
         filled_volume_raw_centi_units: deal.as_ref().map(|item| item.filled_volume),
         volume_scale_evidence: None,
+        deal_closes_position,
+        opening_fill_evidence,
         execution_price: deal
             .as_ref()
             .and_then(|item| item.execution_price)
@@ -1035,6 +1545,8 @@ fn parse_order_error_event(response_json: &str) -> Result<CTraderExecutionOutcom
         filled_lot_size: None,
         filled_volume_raw_centi_units: None,
         volume_scale_evidence: None,
+        deal_closes_position: None,
+        opening_fill_evidence: None,
         execution_price: None,
         gross_profit: None,
         fee: None,
@@ -1126,8 +1638,46 @@ fn validate_execution_outcome(
         );
     }
 
+    // A transport-level `Ok` is not enough: the execution type must describe
+    // the operation we sent. In particular, cTrader documents a successful
+    // `ProtoOAAmendPositionSLTPReq` as `ORDER_REPLACED`. Treating an unrelated
+    // `ORDER_ACCEPTED`, `ORDER_FILLED`, or `ORDER_CANCELLED` event as a
+    // confirmed protection amend lets the live loop advance its local stop
+    // while the broker still holds the previous one.
+    let status_matches_request = match &request.request {
+        CTraderExecutionRequest::NewOrder(_) => matches!(
+            outcome.status,
+            CTraderExecutionStatus::Accepted
+                | CTraderExecutionStatus::Filled
+                | CTraderExecutionStatus::PartialFill
+        ),
+        CTraderExecutionRequest::CancelOrder(_) => {
+            matches!(outcome.status, CTraderExecutionStatus::Cancelled)
+        }
+        CTraderExecutionRequest::ClosePosition(_) => matches!(
+            outcome.status,
+            // Cancellation confirms neither an executed close nor a flat
+            // position. Explicitly allowed partial fills remain outcomes;
+            // the caller must reconcile the broker's remaining position.
+            CTraderExecutionStatus::Filled | CTraderExecutionStatus::PartialFill
+        ),
+        CTraderExecutionRequest::AmendPositionSltp(_) | CTraderExecutionRequest::AmendOrder(_) => {
+            matches!(outcome.status, CTraderExecutionStatus::Replaced)
+        }
+    };
+    if !status_matches_request {
+        anyhow::bail!(
+            "cTrader execution status {:?} does not confirm requested operation {}",
+            outcome.status,
+            request_action_label(&request.request)
+        );
+    }
+
     match &request.request {
         CTraderExecutionRequest::NewOrder(inner) => {
+            if outcome.trade_side.as_deref() != Some(inner.trade_side.label()) {
+                anyhow::bail!("cTrader new-order response trade side differs from the request");
+            }
             if outcome.symbol_id != Some(inner.symbol_id) {
                 anyhow::bail!(
                     "cTrader new-order response symbol mismatch: expected {}, got {:?}",

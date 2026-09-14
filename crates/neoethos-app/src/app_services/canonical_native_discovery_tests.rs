@@ -21,6 +21,7 @@ fn native_lane_source_cannot_enter_legacy_discovery_or_training() {
 
 #[tokio::test]
 async fn awaiting_terminal_waits_until_the_worker_owned_lease_is_released() {
+    let _isolation = crate::PROCESS_EXECUTION_TEST_LOCK.lock().await;
     let lease = try_acquire_process_execution_lease_v1(ProcessExecutionKindV1::NativeResearch)
         .expect("native lease");
     let lease_token = lease.token();
@@ -58,6 +59,10 @@ fn failure_stage_and_code_names_are_stable_not_debug_strings() {
         "exact_source_pin"
     );
     assert_eq!(
+        stage_name_v1(CanonicalNativeDiscoveryExecutionStageV1::ResidentFeatureScreening),
+        "resident_feature_screening"
+    );
+    assert_eq!(
         code_name_v1(CanonicalNativeDiscoveryExecutionErrorCodeV1::ExactGenerationConflict),
         "exact_generation_conflict"
     );
@@ -92,7 +97,7 @@ async fn native_status_is_nested_and_cancellation_stays_active_until_terminal() 
     );
     assert!(observed_token.is_cancelled());
 
-    let Json(dto) = system_status::engines(State(state.clone())).await;
+    let Json(dto) = system_status::engines(State(state.clone())).await.unwrap();
     let value = serde_json::to_value(dto).expect("serialize status DTO");
     assert_eq!(
         value["canonicalNativeResearch"]["state"],
@@ -117,7 +122,7 @@ async fn native_status_is_nested_and_cancellation_stays_active_until_terminal() 
             71, terminal,
         ))
         .await;
-    let Json(dto) = system_status::engines(State(state)).await;
+    let Json(dto) = system_status::engines(State(state)).await.unwrap();
     let value = serde_json::to_value(dto).expect("serialize terminal status DTO");
     assert_eq!(
         value["canonicalNativeResearch"]["state"],

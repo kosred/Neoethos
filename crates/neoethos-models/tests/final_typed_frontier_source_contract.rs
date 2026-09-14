@@ -62,6 +62,7 @@ fn swarm_training_consumes_only_exact_quant_close_with_caller_lease() {
             "extract_series_from_frame",
             "preferred_columns",
             "fallback swarm source column",
+            ".feature_column(",
         ],
     );
     assert_present(
@@ -70,10 +71,17 @@ fn swarm_training_consumes_only_exact_quant_close_with_caller_lease() {
         &[
             "FeatureFrame",
             "CpuLease",
-            "quant_close",
-            "feature_column",
+            "const SWARM_PRICE_COLUMN: &str = \"quant_close\"",
+            "frame.model_base_feature_name(SWARM_PRICE_COLUMN)?",
+            "frame.raw_model_column(&column_name)?",
+            "column.len() == frame.timestamps.len()",
+            "validity.is_valid()",
+            "value.is_finite() && value > 0.0 && value <= f32::MAX as f64",
+            "narrowed.is_finite() && narrowed > 0.0",
             "frame.timestamps",
             "lease.scope",
+            "exact_training_series_from_frame(frame)?",
+            "self.fit_series(&values, &timestamps, unique_id)",
         ],
     );
 }

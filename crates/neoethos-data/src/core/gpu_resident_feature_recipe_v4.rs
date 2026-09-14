@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 use super::features::FeatureProfile;
 use super::gpu_resident_robust_normalization_v2::SealedCanonicalRobustNormalizationSplitV2;
+use super::normalization::{SEARCH_NORMALIZATION_POLICY_VERSION, SearchNormalizationFittedStateV1};
 use super::pinned_canonical_series_v1::{
     MaterializedPinnedResidentCanonicalSourcesV1, PinnedResidentCanonicalSourceDescriptorV1,
 };
@@ -736,7 +737,7 @@ impl PreparedResidentFeatureMaterializationV4 {
 }
 
 /// Move-only inputs required to construct the final FeaturePlan after runtime
-/// normalization has produced and validated its fitted-state digest.
+/// normalization has produced and validated its actual portable fitted state.
 #[derive(Debug)]
 pub(crate) struct ResidentFeatureIdentityTemplateV4 {
     sources: MaterializedPinnedResidentCanonicalSourcesV1,
@@ -810,14 +811,210 @@ impl ResidentFeatureIdentityTemplateV4 {
         &self.sources
     }
 
+    /// Consume the parent identity template into an ascending selected-route
+    /// projection. Compact ordinals receive new receipts that bind both the
+    /// original parent ordinal/receipt and the selected position, so a compact
+    /// store can never impersonate the unfiltered schema.
+    pub(crate) fn project_selected_routes_v2(
+        mut self,
+        parent_routes: &[ResidentFeatureRouteV3],
+        selected_global_parent_ordinals: &[u32],
+        capabilities: &ResidentProducerCapabilityManifestV3,
+    ) -> AnyResult<(Self, Vec<ResidentFeatureRouteV3>)> {
+        ensure!(
+            !selected_global_parent_ordinals.is_empty() && self.routes.len() == parent_routes.len(),
+            "compact feature identity requires a nonempty map over the exact parent schema"
+        );
+        let mut parent_templates = self.routes.into_iter().map(Some).collect::<Vec<_>>();
+        let mut projected_templates = Vec::with_capacity(selected_global_parent_ordinals.len());
+        let mut projected_routes = Vec::with_capacity(selected_global_parent_ordinals.len());
+        let mut previous_parent = None;
+        for (compact_index, &parent_ordinal) in selected_global_parent_ordinals.iter().enumerate() {
+            let parent_index = usize::try_from(parent_ordinal)
+                .context("selected parent feature ordinal does not fit this process")?;
+            ensure!(
+                parent_index < parent_routes.len()
+                    && previous_parent.is_none_or(|previous| parent_index > previous),
+                "selected parent feature ordinals must be strictly ascending and in range"
+            );
+            previous_parent = Some(parent_index);
+            let parent_route = &parent_routes[parent_index];
+            ensure!(
+                parent_route.ordinal() == u64::from(parent_ordinal),
+                "selected parent ordinal disagrees with the sealed parent route"
+            );
+            let mut template = parent_templates[parent_index]
+                .take()
+                .context("selected parent route was duplicated")?;
+            let parameter_tuple_sha256 =
+                derive_parameter_tuple_sha256_v4(&template.typed_parameters)?;
+            ensure!(
+                template.producer == parent_route.producer()
+                    && template.feature_name == parent_route.feature_name()
+                    && template.route_receipt_sha256 == parent_route.route_receipt_sha256()
+                    && parameter_tuple_sha256 == parent_route.canonical_parameter_tuple_sha256(),
+                "selected route template disagrees with the sealed parent route"
+            );
+            let compact_ordinal = u64::try_from(compact_index)
+                .context("compact feature ordinal does not fit the V3 contract")?;
+            let projected_receipt = derive_projected_route_receipt_sha256_v2(
+                compact_ordinal,
+                u64::from(parent_ordinal),
+                parent_route.route_receipt_sha256(),
+                &template,
+                parameter_tuple_sha256,
+            )?;
+            let projected_route_id = derive_route_id_v4(
+                compact_ordinal,
+                template.producer,
+                &template.feature_name,
+                projected_receipt,
+            );
+            template.route_node_id = projected_route_id.clone();
+            template.route_receipt_sha256 = projected_receipt;
+            projected_routes.push(ResidentFeatureRouteV3::new(
+                compact_ordinal,
+                parent_route.feature_name().to_owned(),
+                parent_route.producer(),
+                parent_route.indicator_id().map(str::to_owned),
+                parent_route.output_id().map(str::to_owned),
+                parent_route.stage(),
+                parent_route.swept_period(),
+                parameter_tuple_sha256,
+                projected_route_id,
+                projected_receipt,
+            )?);
+            projected_templates.push(template);
+        }
+        self.routes = projected_templates;
+        self.feature_plan_schema_sha256 = derive_feature_plan_schema_sha256_v4(
+            &self.routes,
+            &projected_routes,
+            capabilities,
+            self.normalization_enabled,
+        )?;
+        self.route_plan_sha256 = derive_route_plan_sha256_v4(&projected_routes)?;
+        Ok((self, projected_routes))
+    }
+
+    pub(crate) const fn normalization_enabled_v3(&self) -> bool {
+        self.normalization_enabled
+    }
+
+    /// Checked encoded-byte bound, not a provisional FeaturePlan or fit.
+    /// Hash contents and fitted numbers cannot affect their fixed wire widths.
+    pub(crate) fn canonical_feature_plan_max_bytes_v3(&self) -> AnyResult<usize> {
+        let source_ids = self
+            .sources
+            .all_sources()
+            .map(|source| source.binding().source_node_id())
+            .collect::<Vec<_>>();
+        let base_id = self.sources.base().binding().source_node_id();
+        let mut nodes = Vec::new();
+        for source in self.sources.all_sources() {
+            let binding = source.binding();
+            let token = binding.dataset_identity().to_path_component();
+            let mut outputs = ["open", "high", "low", "close"]
+                .map(|field| format!("physical:{token}:{field}"))
+                .to_vec();
+            if source.frame().ohlcv().volume.is_some() {
+                outputs.push(format!("physical:{token}:volume"));
+            }
+            let source_bytes = wire_sum_v4([
+                wire_blob_bytes_v4(binding.dataset_identity().canonical_bytes().len())?,
+                wire_text_bytes_v4("neoethos.ohlcv.f64-ms.v1")?,
+            ])?;
+            nodes.push(wire_node_bytes_v4(
+                binding.source_node_id(),
+                source_bytes,
+                &[],
+                &outputs.iter().map(String::as_str).collect::<Vec<_>>(),
+                &[],
+                false,
+            )?);
+        }
+        for route in &self.routes {
+            let output = if self.normalization_enabled {
+                format!("pre-normalize:{}", route.feature_name)
+            } else {
+                route.feature_name.clone()
+            };
+            let inputs = if route.producer == ResidentFeatureProducerV3::HigherTimeframeAlignment {
+                source_ids.clone()
+            } else {
+                vec![base_id]
+            };
+            let params = route
+                .typed_parameters
+                .iter()
+                .map(wire_parameter_bytes_v4)
+                .collect::<AnyResult<Vec<_>>>()?;
+            nodes.push(wire_node_bytes_v4(
+                &route.route_node_id,
+                0,
+                &inputs,
+                &[&output],
+                &params,
+                false,
+            )?);
+        }
+        let names = self
+            .routes
+            .iter()
+            .map(|route| route.feature_name.as_str())
+            .collect::<Vec<_>>();
+        if self.normalization_enabled {
+            let inputs = self
+                .routes
+                .iter()
+                .map(|route| route.route_node_id.as_str())
+                .collect::<Vec<_>>();
+            let params = [
+                wire_sum_v4([
+                    wire_text_bytes_v4("pre_fit_feature_plan_schema_sha256")?,
+                    1,
+                    32,
+                ])?,
+                wire_sum_v4([wire_text_bytes_v4("native_fit_transport_sha256")?, 1, 32])?,
+                wire_sum_v4([wire_text_bytes_v4("transform_semantic_version")?, 1, 8])?,
+            ];
+            nodes.push(wire_node_bytes_v4(
+                "normalization:robust-f64",
+                0,
+                &inputs,
+                &names,
+                &params,
+                true,
+            )?);
+        }
+        wire_plan_bytes_v4(&nodes, &names)
+    }
+
     pub(crate) fn finalize_after_normalization_v4(
         self,
         normalization_fit_sha256: [u8; 32],
+        normalization_fitted_state: Option<&SearchNormalizationFittedStateV1>,
     ) -> AnyResult<FinalizedResidentFeatureIdentityV4> {
+        let canonical_byte_bound = self.canonical_feature_plan_max_bytes_v3()?;
         ensure!(
             normalization_fit_sha256 != [0; 32],
             "runtime normalization fit digest is zero"
         );
+        ensure!(
+            self.normalization_enabled == normalization_fitted_state.is_some(),
+            "resident normalization mode differs from its completed portable fit"
+        );
+        if let Some(fitted) = normalization_fitted_state {
+            fitted.validate()?;
+            ensure!(
+                fitted
+                    .column_names()
+                    .iter()
+                    .map(String::as_str)
+                    .eq(self.routes.iter().map(|route| route.feature_name.as_str())),
+                "resident portable fit differs from the exact ordered feature recipe"
+            );
+        }
         let mut nodes = Vec::new();
         let mut bindings = Vec::new();
         let mut source_node_ids = Vec::new();
@@ -891,29 +1088,38 @@ impl ResidentFeatureIdentityTemplateV4 {
             route_node_ids.push(route.route_node_id);
             final_outputs.push(route.feature_name);
         }
-        if self.normalization_enabled {
+        if let Some(fitted) = normalization_fitted_state {
             let semantic_source_hash = derive_route_semantic_source_sha256_v4(
-                "neoethos.data.resident-robust-normalization.v2",
+                "neoethos.data.resident-search-normalization.policy-v3",
                 &self.normalization_exact_math_authority,
                 self.feature_plan_schema_sha256,
             )?;
             let outputs = final_outputs
                 .iter()
-                .map(|name| FeatureOutputV1::f64(name.clone(), 2))
+                .map(|name| FeatureOutputV1::f64(name.clone(), SEARCH_NORMALIZATION_POLICY_VERSION))
                 .collect::<Result<Vec<_>, _>>()?;
             nodes.push(FeatureNodeV1::transform(
-                "normalization:resident-robust-f64-v2",
+                "normalization:robust-f64",
                 FeatureOperationTagV1::Normalization,
-                2,
+                SEARCH_NORMALIZATION_POLICY_VERSION,
                 route_node_ids,
                 outputs,
-                vec![FeatureParameterV1::hash(
-                    "pre_fit_feature_plan_schema_sha256",
-                    self.feature_plan_schema_sha256,
-                )?],
+                vec![
+                    FeatureParameterV1::hash(
+                        "pre_fit_feature_plan_schema_sha256",
+                        self.feature_plan_schema_sha256,
+                    )?,
+                    // The native digest verifies the six-word transport; it
+                    // does not include names and is not the portable fit hash.
+                    FeatureParameterV1::hash(
+                        "native_fit_transport_sha256",
+                        normalization_fit_sha256,
+                    )?,
+                    FeatureParameterV1::u64("transform_semantic_version", 2)?,
+                ],
                 self.normalization_implementation_sha256,
                 semantic_source_hash,
-                Some(normalization_fit_sha256),
+                Some(fitted.fitted_state_hash()?),
             )?);
         } else {
             ensure!(
@@ -922,6 +1128,13 @@ impl ResidentFeatureIdentityTemplateV4 {
             );
         }
         let feature_plan = FeaturePlanV1::new(nodes, final_outputs)?;
+        ensure!(
+            feature_plan.canonical_bytes().len() <= canonical_byte_bound,
+            "canonical resident FeaturePlan exceeded its pre-materialization wire bound"
+        );
+        if let Some(fitted) = normalization_fitted_state {
+            fitted.validate_plan(&feature_plan)?;
+        }
         let source_provenance = DatasetFeatureArtifactProvenanceV1::new(&feature_plan, bindings)?;
         Ok(FinalizedResidentFeatureIdentityV4 {
             feature_plan,
@@ -956,6 +1169,92 @@ impl FinalizedResidentFeatureIdentityV4 {
 
 fn canonical_disabled_normalization_fit_sha256_v4() -> [u8; 32] {
     resident_robust_normalization_disabled_fit_sha256_v2()
+}
+
+// Mirror only widths in feature-contracts identity.rs::encode_feature_plan:
+// domain+u16 version; u32 lengths/counts; one-byte tags; u32 semantics;
+// two mandatory SHA256s and one optional SHA256. Never construct fake fits.
+// Independent tests below compare these counts with that actual encoder.
+fn wire_sum_v4(parts: impl IntoIterator<Item = usize>) -> AnyResult<usize> {
+    parts.into_iter().try_fold(0usize, |sum, part| {
+        sum.checked_add(part)
+            .context("canonical FeaturePlan byte-bound overflow")
+    })
+}
+
+fn wire_count_v4(count: usize) -> AnyResult<usize> {
+    u32::try_from(count).context("canonical FeaturePlan count exceeds its u32 wire")?;
+    Ok(4)
+}
+
+fn wire_blob_bytes_v4(bytes: usize) -> AnyResult<usize> {
+    wire_sum_v4([wire_count_v4(bytes)?, bytes])
+}
+
+fn wire_text_bytes_v4(text: &str) -> AnyResult<usize> {
+    wire_blob_bytes_v4(text.len())
+}
+
+fn wire_parameter_bytes_v4(parameter: &ResidentCanonicalParameterV4) -> AnyResult<usize> {
+    let value = match &parameter.value {
+        ResidentCanonicalParameterValueV4::Bool(_) => 1,
+        ResidentCanonicalParameterValueV4::U64(_)
+        | ResidentCanonicalParameterValueV4::I64(_)
+        | ResidentCanonicalParameterValueV4::F64Bits(_) => 8,
+        ResidentCanonicalParameterValueV4::Text(value) => wire_text_bytes_v4(value)?,
+        ResidentCanonicalParameterValueV4::Hash(_) => 32,
+    };
+    wire_sum_v4([wire_text_bytes_v4(&parameter.name)?, 1, value])
+}
+
+fn wire_node_bytes_v4(
+    id: &str,
+    source_payload: usize,
+    inputs: &[&str],
+    outputs: &[&str],
+    parameter_bytes: &[usize],
+    fitted: bool,
+) -> AnyResult<usize> {
+    let inputs_bytes = inputs
+        .iter()
+        .map(|v| wire_text_bytes_v4(v))
+        .collect::<AnyResult<Vec<_>>>()?;
+    let outputs_bytes = outputs
+        .iter()
+        .map(|v| wire_sum_v4([wire_text_bytes_v4(v)?, 1, 4]))
+        .collect::<AnyResult<Vec<_>>>()?;
+    wire_sum_v4([
+        wire_text_bytes_v4(id)?,
+        1,
+        4,
+        1,
+        source_payload,
+        wire_count_v4(inputs.len())?,
+        wire_sum_v4(inputs_bytes)?,
+        wire_count_v4(outputs.len())?,
+        wire_sum_v4(outputs_bytes)?,
+        wire_count_v4(parameter_bytes.len())?,
+        wire_sum_v4(parameter_bytes.iter().copied())?,
+        32,
+        32,
+        1,
+        if fitted { 32 } else { 0 },
+    ])
+}
+
+fn wire_plan_bytes_v4(node_bytes: &[usize], names: &[&str]) -> AnyResult<usize> {
+    let outputs = names
+        .iter()
+        .map(|name| wire_text_bytes_v4(name))
+        .collect::<AnyResult<Vec<_>>>()?;
+    wire_sum_v4([
+        b"neoethos.feature-plan.identity\0".len(),
+        2,
+        wire_count_v4(node_bytes.len())?,
+        wire_sum_v4(node_bytes.iter().copied())?,
+        wire_count_v4(names.len())?,
+        wire_sum_v4(outputs)?,
+    ])
 }
 
 #[derive(Debug, Default)]
@@ -1358,6 +1657,41 @@ fn derive_route_receipt_sha256_v4(
     Ok(hasher.finalize().into())
 }
 
+fn derive_projected_route_receipt_sha256_v2(
+    compact_ordinal: u64,
+    parent_ordinal: u64,
+    parent_route_receipt_sha256: [u8; 32],
+    template: &ResidentFeaturePlanRouteTemplateV4,
+    parameter_hash: [u8; 32],
+) -> Result<[u8; 32], ResidentFeatureRecipeErrorV4> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"neoethos.data.resident-feature-projected-route-receipt.v2\0");
+    hasher.update(RESIDENT_FEATURE_SCHEMA_VERSION_V4.to_le_bytes());
+    hasher.update(compact_ordinal.to_le_bytes());
+    hasher.update(parent_ordinal.to_le_bytes());
+    hasher.update(parent_route_receipt_sha256);
+    hasher.update([template.producer as u8]);
+    hasher.update(template.semantic_version.to_le_bytes());
+    update_bytes(
+        &mut hasher,
+        template.route_domain.as_bytes(),
+        "projected route domain",
+    )?;
+    update_bytes(
+        &mut hasher,
+        template.feature_name.as_bytes(),
+        "projected feature name",
+    )?;
+    hasher.update(parameter_hash);
+    hasher.update(template.implementation_sha256);
+    update_bytes(
+        &mut hasher,
+        template.exact_math_authority.as_bytes(),
+        "projected exact math authority",
+    )?;
+    Ok(hasher.finalize().into())
+}
+
 fn stage_tag(stage: ResidentFeatureStageV3) -> u8 {
     match stage {
         ResidentFeatureStageV3::Base => 0,
@@ -1410,6 +1744,150 @@ fn update_usize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_plan_wire_bound_matches_real_encoder_for_both_modes_and_all_parameters()
+    -> AnyResult<()> {
+        use neoethos_dataset_contracts::{BarTimestampConvention, CanonicalDatasetIdentity};
+        // Synthetic metadata exercises only the real canonical encoder. It is
+        // not a fitted state, source lease, GPU receipt or admission.
+        let dataset = CanonicalDatasetIdentity::external(
+            "wire-test",
+            "EURUSD",
+            CanonicalTimeframe::M1,
+            BarTimestampConvention::BarOpen,
+        )?;
+        let parameter_values = [
+            ResidentCanonicalParameterValueV4::Bool(true),
+            ResidentCanonicalParameterValueV4::U64(u64::MAX),
+            ResidentCanonicalParameterValueV4::I64(i64::MIN),
+            ResidentCanonicalParameterValueV4::F64Bits((-1.5_f64).to_bits()),
+            ResidentCanonicalParameterValueV4::Text("UTF8-Ω".to_owned()),
+            ResidentCanonicalParameterValueV4::Hash([7; 32]),
+        ];
+        let params = parameter_values
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                ResidentCanonicalParameterV4::from_typed_value(format!("p{i}"), value)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for enabled in [false, true] {
+            let raw_name = if enabled {
+                "pre-normalize:feature_Ω"
+            } else {
+                "feature_Ω"
+            };
+            let mut nodes = vec![
+                FeatureNodeV1::source(
+                    "source",
+                    dataset.clone(),
+                    "schema",
+                    1,
+                    vec![FeatureOutputV1::f64("physical:close", 1)?],
+                    [1; 32],
+                )?,
+                FeatureNodeV1::transform(
+                    "route",
+                    FeatureOperationTagV1::Indicator,
+                    1,
+                    vec!["source".into()],
+                    vec![FeatureOutputV1::f64(raw_name, 1)?],
+                    params
+                        .clone()
+                        .into_iter()
+                        .map(ResidentCanonicalParameterV4::into_feature_parameter_v1)
+                        .collect::<AnyResult<Vec<_>>>()?,
+                    [2; 32],
+                    [3; 32],
+                    None,
+                )?,
+            ];
+            let source_payload = wire_sum_v4([
+                wire_blob_bytes_v4(dataset.canonical_bytes().len())?,
+                wire_text_bytes_v4("schema")?,
+            ])?;
+            let mut sizes = vec![
+                wire_node_bytes_v4(
+                    "source",
+                    source_payload,
+                    &[],
+                    &["physical:close"],
+                    &[],
+                    false,
+                )?,
+                wire_node_bytes_v4(
+                    "route",
+                    0,
+                    &["source"],
+                    &[raw_name],
+                    &params
+                        .iter()
+                        .map(wire_parameter_bytes_v4)
+                        .collect::<AnyResult<Vec<_>>>()?,
+                    false,
+                )?,
+            ];
+            if enabled {
+                let norm = [
+                    ResidentCanonicalParameterV4::from_typed_value(
+                        "pre_fit_feature_plan_schema_sha256",
+                        ResidentCanonicalParameterValueV4::Hash([4; 32]),
+                    )?,
+                    ResidentCanonicalParameterV4::from_typed_value(
+                        "native_fit_transport_sha256",
+                        ResidentCanonicalParameterValueV4::Hash([5; 32]),
+                    )?,
+                    ResidentCanonicalParameterV4::from_typed_value(
+                        "transform_semantic_version",
+                        ResidentCanonicalParameterValueV4::U64(2),
+                    )?,
+                ];
+                sizes.push(wire_node_bytes_v4(
+                    "normalization:robust-f64",
+                    0,
+                    &["route"],
+                    &["feature_Ω"],
+                    &norm
+                        .iter()
+                        .map(wire_parameter_bytes_v4)
+                        .collect::<AnyResult<Vec<_>>>()?,
+                    true,
+                )?);
+                nodes.push(FeatureNodeV1::transform(
+                    "normalization:robust-f64",
+                    FeatureOperationTagV1::Normalization,
+                    3,
+                    vec!["route".into()],
+                    vec![FeatureOutputV1::f64("feature_Ω", 3)?],
+                    norm.into_iter()
+                        .map(ResidentCanonicalParameterV4::into_feature_parameter_v1)
+                        .collect::<AnyResult<Vec<_>>>()?,
+                    [6; 32],
+                    [7; 32],
+                    Some([8; 32]),
+                )?);
+            }
+            let encoded = FeaturePlanV1::new(nodes, vec!["feature_Ω".into()])?;
+            let counted = wire_plan_bytes_v4(&sizes, &["feature_Ω"])?;
+            assert_eq!(
+                counted,
+                encoded.canonical_bytes().len(),
+                "enabled={enabled}"
+            );
+            assert!(counted.checked_sub(1).unwrap() < encoded.canonical_bytes().len());
+            assert_eq!(
+                FeaturePlanV1::from_canonical_bytes(encoded.canonical_bytes())?,
+                encoded
+            );
+        }
+        assert!(wire_sum_v4([usize::MAX, 1]).is_err());
+        assert!(wire_blob_bytes_v4(usize::MAX).is_err());
+        if let Some(too_many) = (u32::MAX as usize).checked_add(1) {
+            assert!(wire_count_v4(too_many).is_err());
+        }
+        Ok(())
+    }
 
     fn capability(producer: ResidentFeatureProducerV3) -> ResidentProducerCapabilityV3 {
         ResidentProducerCapabilityV3::new(

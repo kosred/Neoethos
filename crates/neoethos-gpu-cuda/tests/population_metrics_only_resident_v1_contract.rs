@@ -22,6 +22,30 @@ fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .0
 }
 
+fn braced_item<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing source item {signature:?}"));
+    let open = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("missing opening brace for {signature:?}"));
+    let mut depth = 0_u32;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("missing closing brace for {signature:?}");
+}
+
 fn require_all(source: &str, required: &[&str]) {
     for token in required {
         assert!(
@@ -143,7 +167,7 @@ fn rust_handle_is_must_use_opaque_lifetime_bound_and_has_no_host_boundary() {
             "#[must_use = \"resident GPU metrics must be consumed by the next device stage\"]",
             "pub struct ResidentPopulationMetricsV1<'session>",
             "session: &'session mut PopulationSession",
-            "receipt: RawResidentPopulationMetricsHandleV1",
+            "receipt: Box<RawResidentPopulationMetricsHandleV1>",
             "pub fn enqueue_metrics_only_v1(",
             "Result<ResidentPopulationMetricsV1<'_>, CudaPopulationError>",
             "PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(",
@@ -159,7 +183,10 @@ fn rust_handle_is_must_use_opaque_lifetime_bound_and_has_no_host_boundary() {
         !handle.contains("pub "),
         "resident metric/event handle exposes caller-constructible fields"
     );
-    let handle_impl = section(&rust, "impl ResidentPopulationMetricsV1<'_> {", "}");
+    let handle_impl = braced_item(
+        &rust,
+        "impl<'session> ResidentPopulationMetricsV1<'session> {",
+    );
     for forbidden in [
         "event_id(",
         "raw_pointer",
@@ -222,7 +249,7 @@ fn strict_workspace_allocates_only_two_month_arrays_and_metric_rows() {
 }
 
 #[test]
-fn strict_workspace_mode_is_immutable_and_receipt_charges_actual_residency() {
+fn strict_workspace_mode_stays_immutable_while_exact_extent_may_be_rebuilt() {
     let header = read("native/neoethos_gpu_cuda.h");
     require_all(
         &header,
@@ -253,8 +280,9 @@ fn strict_workspace_mode_is_immutable_and_receipt_charges_actual_residency() {
             "session->workspace_mode == PopulationWorkspaceModeV1::CompatibilityDeviceParityOnly",
             "return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;",
             "session->workspace_mode = PopulationWorkspaceModeV1::StrictMetricsOnly;",
-            "session->workspace_scenarios != scenario_count",
-            "return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;",
+            "session->workspace_scenarios == scenario_count",
+            "session->month_capacity == month_capacity",
+            "session->release_workspace();",
             "session->outcomes != nullptr",
             "session->accepted_trade_total != nullptr",
         ],
@@ -296,10 +324,9 @@ fn strict_workspace_mode_is_immutable_and_receipt_charges_actual_residency() {
 #[test]
 fn strict_enqueue_records_same_stream_event_with_null_diagnostics_and_zero_d2h() {
     let cuda = read("native/prototype_b_population.cu");
-    let enqueue = section(
+    let enqueue = braced_item(
         &cuda,
         "neoethos_gpu_cuda_population_b_enqueue_metrics_only_v1(",
-        "neoethos_gpu_cuda_population_b_evaluate(",
     );
     require_all(
         enqueue,
@@ -474,7 +501,7 @@ fn dropped_unconsumed_handle_poison_blocks_reuse_and_leaks_native_owner_fail_clo
         "pub fn read_diagnostics_for(",
         "pub fn read_diagnostics(",
     ] {
-        let body = section(&rust, method, "\n    }");
+        let body = braced_item(&rust, method);
         assert!(
             body.contains("self.require_strict_idle_v1("),
             "session path {method:?} can be reused after strict resident work"
@@ -515,22 +542,29 @@ fn dropped_unconsumed_handle_poison_blocks_reuse_and_leaks_native_owner_fail_clo
             "NEO_POPULATION_STATUS_STRICT_RESIDENT_IN_FLIGHT",
         ],
     );
-    let (_, native_drop) = cuda
-        .split_once("neoethos_gpu_cuda_population_destroy(")
-        .expect("native destroy boundary");
+    let native_drop = braced_item(
+        &cuda,
+        "neoethos_gpu_cuda_population_destroy_terminal_checked_v2(",
+    );
+    let compatibility_drop = braced_item(&cuda, "neoethos_gpu_cuda_population_destroy(");
     require_all(
         native_drop,
         &[
             "strict_population_work_blocks_host_boundary_v1(session)",
-            "return;",
-            "session->release();",
+            "session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;",
+            "session->release_terminal_checked_v2()",
+            "delete session;",
         ],
+    );
+    require_all(
+        compatibility_drop,
+        &["neoethos_gpu_cuda_population_destroy_terminal_checked_v2(session)"],
     );
     assert!(
         native_drop
             .find("strict_population_work_blocks_host_boundary_v1(session)")
             .unwrap()
-            < native_drop.find("session->release();").unwrap(),
+            < native_drop.find("session->release_terminal_checked_v2()").unwrap(),
         "native destroy releases strict resident storage before the leak-only guard"
     );
 }
@@ -549,7 +583,7 @@ fn enqueue_state_is_recorded_before_receipt_validation_and_ambiguous_failures_po
             "strict_enqueue_failure_is_known_prelaunch_v1(status)",
             "self.strict_resident_state = StrictResidentSessionStateV1::Poisoned;",
             "self.strict_resident_state = StrictResidentSessionStateV1::InFlight;",
-            "validate_exact_resident_receipt_v1(&receipt, plan)",
+            "validate_exact_resident_receipt_v1(receipt.as_ref(), plan)",
             "consumed: false",
         ],
     );
@@ -560,7 +594,7 @@ fn enqueue_state_is_recorded_before_receipt_validation_and_ambiguous_failures_po
         .find("self.strict_resident_state = StrictResidentSessionStateV1::InFlight;")
         .unwrap();
     let validate = enqueue
-        .find("validate_exact_resident_receipt_v1(&receipt, plan)")
+        .find("validate_exact_resident_receipt_v1(receipt.as_ref(), plan)")
         .unwrap();
     assert!(
         call < in_flight && in_flight < validate,
@@ -592,202 +626,132 @@ fn enqueue_state_is_recorded_before_receipt_validation_and_ambiguous_failures_po
 }
 
 #[test]
-fn retained_capacity_and_active_extent_are_distinct_checked_authorities() {
+fn resident_search_uses_one_exact_full_population_extent_and_has_no_orphan_chunk_abi() {
     let rust = read("src/population.rs");
-    require_all(
-        &rust,
-        &[
-            "pub struct PopulationMetricsOnlyPlanV2 {",
-            "retained_scenario_capacity: u64",
-            "active_scenario_count: u64",
-            "checked_from_full_workspace_plan_v2(",
-            "full_plan.retained_scenario_capacity_v2()",
-            "active_scenario_count == 0",
-            "active_scenario_count > retained_scenario_capacity",
-            "retained_scenario_capacity.checked_mul(POPULATION_METRIC_ROW_BYTES_V1)",
-            "retained_scenario_capacity.checked_mul(month_capacity)",
-            "pub const fn retained_scenario_capacity(self) -> u64",
-            "pub const fn active_scenario_count(self) -> u64",
-        ],
-    );
-    let plan = section(&rust, "pub struct PopulationMetricsOnlyPlanV2 {", "}");
-    assert!(
-        !plan.contains("pub "),
-        "active/capacity extents must come from the opaque full workspace plan, not caller fields"
-    );
-
-    require_all(
-        &rust,
-        &[
-            "struct RawResidentPopulationMetricsHandleV2 {",
-            "active_scenario_count: u64",
-            "retained_scenario_capacity: u64",
-            "receipt.active_scenario_count == plan.active_scenario_count()",
-            "receipt.retained_scenario_capacity == plan.retained_scenario_capacity()",
-            "receipt.metric_rows_bytes == plan.retained_metric_rows_bytes()",
-            "receipt.total_device_bytes == plan.retained_total_device_bytes()",
-        ],
-    );
-    assert!(
-        !rust.contains(
-            "receipt.scenario_count == plan.scenario_count()\n        && receipt.scenario_count"
-        ),
-        "one receipt count must never stand for both logical work and retained allocation"
-    );
-
+    let search = read("src/resident_search_v2.rs");
+    let scoring = read("src/resident_scoring_v2.rs");
     let header = read("native/neoethos_gpu_cuda.h");
-    let receipt = section(
-        &header,
-        "struct NeoPopulationResidentMetricsHandleV2 {",
-        "};",
-    );
+    let cuda = read("native/prototype_b_population.cu");
+
+    let owned_enqueue = braced_item(&rust, "pub(crate) fn enqueue_resident_gene_metrics_owned_v2(");
     require_all(
-        receipt,
+        owned_enqueue,
         &[
-            "std::uint64_t active_scenario_count;",
-            "std::uint64_t retained_scenario_capacity;",
-            "std::uint64_t metric_rows_bytes;",
-            "std::uint64_t total_device_bytes;",
+            "retained_evaluation_capacity != logical_population_count",
+            "self.scenario_count as u64 != logical_population_count",
+            "self.population as u64 != logical_population_count",
+            "one immutable full-population chunk",
+            "PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(",
         ],
     );
+    let scoring_seal = braced_item(&scoring, "pub(crate) fn seal_resident_scoring_plan_v2(");
+    require_all(
+        scoring_seal,
+        &[
+            "generation.retained_evaluation_capacity_v1()",
+            "generation.logical_population_count_v1()",
+            "generation/scoring semantics or full-population capacity differ",
+        ],
+    );
+    require_all(
+        &search,
+        &[
+            "enqueue_full_population_scored_generation_advance_v2(",
+            "Native consumes one full-population device chunk",
+        ],
+    );
+
+    let combined = format!("{rust}\n{header}\n{cuda}");
+    for orphan in [
+        "PopulationMetricsOnlyPlanV2",
+        "RawResidentPopulationMetricsHandleV2",
+        "NeoPopulationResidentMetricsHandleV2",
+        "ensure_metrics_only_workspace_v2",
+        "enqueue_population_evaluation_v2",
+        "neoethos_gpu_cuda_population_b_enqueue_metrics_only_v2",
+        "ResidentScenarioCapacityV1",
+        "bind_resident_scenario_window_v1",
+    ] {
+        assert!(
+            !combined.contains(orphan),
+            "superseded, unimplemented chunk ABI `{orphan}` survived beside the full-population path"
+        );
+    }
 }
 
 #[test]
-fn smaller_chunks_reuse_retained_workspace_and_launch_only_the_active_extent() {
+fn exact_metrics_workspace_reuses_equal_extent_and_rebuilds_changed_extent_without_padding() {
     let cuda = read("native/prototype_b_population.cu");
-    let workspace = section(
-        &cuda,
-        "std::int32_t ensure_metrics_only_workspace_v2(",
-        "std::int32_t enqueue_population_evaluation_v2(",
-    );
+    let workspace = braced_item(&cuda, "std::int32_t ensure_metrics_only_workspace_v1(");
     require_all(
         workspace,
         &[
-            "retained_scenario_capacity",
-            "active_scenario_count",
-            "active_scenario_count <= 0",
-            "active_scenario_count > retained_scenario_capacity",
-            "session->retained_scenario_capacity != retained_scenario_capacity",
-            "NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH",
-            "session->active_scenario_count = active_scenario_count;",
-            "device_alloc(&session->monthly_pnls, retained_scenarios * months)",
-            "device_alloc(&session->month_start_equities, retained_scenarios * months)",
-            "device_alloc(&session->metric_rows, retained_scenarios)",
+            "session->workspace_scenarios == scenario_count",
+            "session->month_capacity == month_capacity",
+            "session->release_workspace();",
+            "device_alloc(&session->monthly_pnls, scenarios * months)",
+            "device_alloc(&session->month_start_equities, scenarios * months)",
+            "device_alloc(&session->metric_rows, scenarios)",
+            "session->workspace_scenarios = scenario_count;",
         ],
     );
-    let reuse = section(
-        workspace,
-        "if (session->metric_rows != nullptr) {",
-        "return NEO_POPULATION_STATUS_OK;",
-    );
-    for forbidden in [
-        "release_workspace",
-        "device_alloc",
-        "cudaFree",
-        "cudaDeviceSynchronize",
-        "cudaStreamSynchronize",
-    ] {
-        assert!(
-            !reuse.contains(forbidden),
-            "a smaller active chunk mutates retained storage through {forbidden:?}"
-        );
-    }
-
-    let enqueue = section(
-        &cuda,
-        "std::int32_t enqueue_population_evaluation_v2(",
-        "neoethos_gpu_cuda_population_b_enqueue_metrics_only_v2(",
-    );
-    require_all(
-        enqueue,
-        &[
-            "scenario_view.count = active_scenario_count;",
-            "choose_reduce_block(active_scenario_count, session->sm_count)",
-            "active_scenario_count + reduce_block - 1",
-            "metrics_only_byte_plan_v2(session->retained_scenario_capacity",
-            "resident_metrics->active_scenario_count =",
-            "resident_metrics->retained_scenario_capacity =",
-        ],
-    );
+    let equal_extent = workspace
+        .find("session->workspace_scenarios == scenario_count")
+        .expect("exact retained extent check");
+    let rebuild = workspace
+        .find("session->release_workspace();")
+        .expect("changed-extent rebuild");
+    let allocation = workspace
+        .find("device_alloc(&session->monthly_pnls, scenarios * months)")
+        .expect("exact metrics allocation");
+    assert!(equal_extent < rebuild && rebuild < allocation);
     for forbidden in [
         "pad_scenarios",
         "padded_scenario_count",
         "repeat_last_scenario",
         "clone_final_scenario",
+        "cudaDeviceSynchronize",
+        "cudaStreamSynchronize",
     ] {
         assert!(
-            !enqueue.contains(forbidden),
-            "final chunks must not fake retained capacity through {forbidden:?}"
+            !workspace.contains(forbidden),
+            "exact V1 workspace introduced `{forbidden}`"
         );
     }
 }
 
 #[test]
-fn strict_chunk_rebinding_requires_resident_scenario_capacity_not_host_reupload() {
+fn resident_scenarios_are_uploaded_once_before_each_full_population_generation() {
     let rust = read("src/population.rs");
-    let upload = section(
-        &rust,
-        "pub fn upload_scenarios(",
-        "pub fn enqueue_metrics_only_v1(",
-    );
-    require_all(upload, &["Compatibility/DeviceParityOnly"]);
-
+    let search = read("src/resident_search_v2.rs");
+    let upload = braced_item(&rust, "pub(crate) fn upload_resident_scenarios_v2(");
     require_all(
-        &rust,
+        upload,
         &[
-            "pub struct ResidentScenarioCapacityV1<'run>",
-            "pub fn bind_resident_scenario_window_v1(",
-            "scenario_capacity: ResidentScenarioCapacityV1<'run>",
-            "active_scenario_count: NonZeroUsize",
-            "active_scenario_count.get() <= scenario_capacity.retained_capacity()",
-            "pub fn enqueue_metrics_only_active_v2(",
-            "self.resident_scenario_capacity.as_ref()",
+            "self.genes_uploaded || self.scenarios_uploaded",
+            "one fresh generation-owned session",
+            "scenario.base_candidate_id",
+            "neoethos_gpu_cuda_population_upload_resident_scenarios_v2(",
+            "self.population = population;",
+            "self.scenario_count = scenarios.len();",
         ],
     );
-    let bind = section(
-        &rust,
-        "pub fn bind_resident_scenario_window_v1(",
-        "pub fn enqueue_metrics_only_active_v2(",
-    );
-    for forbidden in [
-        "neoethos_gpu_cuda_population_upload_scenarios",
-        "cudaMemcpy",
-        "to_vec(",
-        "Vec<ScenarioDescriptor>",
-        "synchronize",
-        "wait(",
-    ] {
-        assert!(
-            !bind.contains(forbidden),
-            "strict chunk rebinding crosses the resident boundary through {forbidden:?}"
-        );
-    }
-
-    let cuda = read("native/prototype_b_population.cu");
-    let strict_bind = section(
-        &cuda,
-        "neoethos_gpu_cuda_population_bind_resident_scenario_window_v1(",
-        "neoethos_gpu_cuda_population_b_enqueue_metrics_only_v2(",
-    );
+    let search_upload = braced_item(&search, "pub(crate) fn upload_resident_scenarios_v2(");
     require_all(
-        strict_bind,
+        search_upload,
         &[
-            "active_scenario_count > session->retained_scenario_capacity",
-            "session->active_scenario_count = active_scenario_count;",
-            "cudaStreamWaitEvent(session->stream",
+            ".upload_resident_scenarios_v2(",
+            "self.view.logical_population_count",
+            "self.view.expected_generation_index",
+            "self.view.plan_identity_sha256",
         ],
     );
-    for forbidden in [
-        "release_scenarios",
-        "device_alloc",
-        "cudaFree",
-        "cudaMemcpy",
-        "cudaEventSynchronize",
-        "cudaStreamSynchronize",
-    ] {
-        assert!(
-            !strict_bind.contains(forbidden),
-            "resident scenario window is rebound with allocation/host transfer via {forbidden:?}"
-        );
-    }
+    let advance = braced_item(
+        &search,
+        "pub(crate) fn advance_one_full_population_generation_v2(",
+    );
+    assert!(
+        !advance.contains("upload_resident_scenarios_v2"),
+        "generation advance reuploads the immutable full-population scenario set"
+    );
 }

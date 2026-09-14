@@ -87,6 +87,10 @@ path = "tests/native_cuda_build_harness.rs"
 harness = false
 
 [[test]]
+name = "natr_nvi_talib_authority_source_contract"
+path = "tests/natr_nvi_talib_authority_source_contract.rs"
+
+[[test]]
 name = "cci_cycle_classic_v9"
 path = "tests/cci_cycle_classic_v9.rs"
 

@@ -137,12 +137,10 @@ struct Args {
     /// `data/broker_symbols/<env>/` (overridable via
     /// `--bootstrap-output`). One-shot, ~30-90 s for 830 symbols.
     ///
-    /// Why: the GA cost model has been operating on synthetic
-    /// $7/lot commission + 1.5-pip spread fallbacks because no code
-    /// path ever populated `SymbolMetadata.commission_per_lot` from
-    /// the broker. This bootstrap is the foundation for Phase D.2
-    /// (delete the synthetic fallbacks; metadata reads from this
-    /// catalog).
+    /// Why: the Search cost model requires the broker's typed commission,
+    /// swap, volume and symbol contracts. Synthetic commission/spread
+    /// fallbacks are rejected; this capture supplies the metadata boundary
+    /// used by canonical research contracts.
     #[arg(long, default_value_t = false)]
     bootstrap_broker_catalog: bool,
 
@@ -188,18 +186,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     startup_trace.record(StartupEvent::ImportSignalPreflightCompleted)?;
     let raw_args: Vec<String> = std::env::args().collect();
     let args = Args::parse_from(&raw_args);
-    // #101 follow-up + #179: the help dialog must fire BEFORE the
-    // config-load step below, otherwise an orphaned double-click whose
-    // CWD lacks `config.yaml` exits silently with `windows_subsystem =
-    // "windows"`. Skipped in debug builds / non-Windows (the helper
-    // handles both internally).
-    //
-    // 2026-08-09 (dead-code purge D2): this used to be gated on
-    // `!args.launched_by_flutter`, a CLI flag no spawner ever passed. Both
-    // that flag and the older `NEOETHOS_LAUNCHED_BY_FLUTTER` env fallback are
-    // gone. The call is now unconditional, which is exactly what it already
-    // was at runtime — nothing set either signal after Flutter died 2026-06-22.
-    show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
+    // Preserve the no-argument double-click help before config loading, but
+    // never open its synchronous Windows release modal for an explicit CLI
+    // invocation. Headless/server/diagnostic/capture processes cannot wait for
+    // an operator to dismiss a dialog before their first log or work stage.
+    if should_show_orphan_help_dialog(&raw_args) {
+        show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
+    }
 
     let settings = Settings::from_yaml(&args.config)?;
     startup_trace.record(StartupEvent::ConfigurationLoaded)?;
@@ -269,6 +262,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     );
     managed_runtime.block_on(async_main(args, settings))
+}
+
+fn should_show_orphan_help_dialog(raw_args: &[String]) -> bool {
+    raw_args.len() == 1
 }
 
 fn build_managed_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
@@ -474,7 +471,7 @@ async fn async_main(args: Args, settings: Settings) -> Result<(), Box<dyn std::e
             args.auto_discovery,
             args.auto_training,
         )?;
-        run_headless_loop(runtime, headless_state, intent).await;
+        run_headless_loop(runtime, headless_state, intent).await?;
         return Ok(());
     }
 
@@ -587,16 +584,10 @@ async fn run_headless_loop(
     runtime: AppRuntimeConfig,
     state: server::state::AppApiState,
     intent: app_services::entrypoints::HeadlessExecutionPipelineIntentV1,
-) {
+) -> anyhow::Result<()> {
     info!("Loading configuration from: {}", runtime.config_path);
     let mut headless_execution =
-        match app_services::entrypoints::run_headless_execution_pipeline_v1(state, intent) {
-            Ok(handle) => handle,
-            Err(error) => {
-                error!(error = %error, "Headless execution was not admitted");
-                None
-            }
-        };
+        app_services::entrypoints::run_headless_execution_pipeline_v1(state, intent)?;
 
     let mode = if runtime.start_local {
         "LOCAL"
@@ -621,6 +612,11 @@ async fn run_headless_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                if headless_execution.as_ref().is_some_and(|handle| handle.is_finished()) {
+                    if let Some(handle) = headless_execution.take() {
+                        return report_headless_terminal(handle.await_terminal().await);
+                    }
+                }
                 info!(
                     "Headless keep-alive: Cores={} Mode={} Discovery={} Training={}",
                     num_cpus::get(),
@@ -630,22 +626,45 @@ async fn run_headless_loop(
                 );
             }
             signal = tokio::signal::ctrl_c() => {
-                if let Err(error) = signal {
-                    error!(error = %error, "Headless shutdown signal listener failed");
-                }
-                break;
+                // Even a failed signal listener must not abandon an owned worker.
+                let terminal_result = if let Some(handle) = headless_execution.take() {
+                    handle.cancel();
+                    report_headless_terminal(handle.await_terminal().await)
+                } else {
+                    Ok(())
+                };
+                signal?;
+                return terminal_result;
             }
         }
     }
+}
 
-    if let Some(headless_execution) = headless_execution.take() {
-        headless_execution.cancel();
-        let terminal = headless_execution.await_terminal().await;
-        info!(
-            ?terminal,
-            "Headless execution reached its real terminal state"
-        );
-    }
+fn report_headless_terminal(
+    terminal: app_services::entrypoints::HeadlessExecutionTerminalV1,
+) -> anyhow::Result<()> {
+    info!(
+        ?terminal,
+        "Headless execution reached its real terminal state"
+    );
+    headless_terminal_result(
+        terminal.state(),
+        terminal.completed_kind(),
+        terminal.summary(),
+    )
+}
+
+fn headless_terminal_result(
+    state: app_services::entrypoints::HeadlessExecutionTerminalStateV1,
+    completed_kind: Option<&str>,
+    summary: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        state == app_services::entrypoints::HeadlessExecutionTerminalStateV1::Succeeded,
+        "headless {:?} ended {state:?}: {summary}",
+        completed_kind.unwrap_or("unknown phase")
+    );
+    Ok(())
 }
 
 pub(crate) fn app_record(
@@ -689,6 +708,52 @@ mod tests {
     use super::{AppRuntimeConfig, app_record};
     use neoethos_core::Settings;
     use std::path::PathBuf;
+
+    #[test]
+    fn only_a_no_argument_launch_can_show_the_orphan_help_dialog() {
+        use clap::Parser;
+
+        let bare = vec!["neoethos-app".to_owned()];
+        super::Args::try_parse_from(&bare).unwrap();
+        assert!(super::should_show_orphan_help_dialog(&bare));
+        assert!(!super::should_show_orphan_help_dialog(&[]));
+        for arguments in [
+            vec!["--headless", "--auto-discovery", "--auto-training"],
+            vec!["--server"],
+            vec!["--startup-diagnostics"],
+            vec!["--parent-pid", "7"],
+            vec!["--capture-symbols", "EURUSD"],
+            vec!["--config", "isolated-profile.yaml"],
+            vec!["--local"],
+        ] {
+            let raw_args = std::iter::once("neoethos-app")
+                .chain(arguments)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            super::Args::try_parse_from(&raw_args).unwrap();
+            assert!(
+                !super::should_show_orphan_help_dialog(&raw_args),
+                "{raw_args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_auto_pipeline_only_reports_success_for_a_succeeded_worker() {
+        use crate::app_services::entrypoints::HeadlessExecutionTerminalStateV1 as State;
+
+        assert!(
+            super::headless_terminal_result(State::Succeeded, Some("Training"), "done").is_ok()
+        );
+        for state in [State::Failed, State::Cancelled, State::WorkerPanicked] {
+            let error = super::headless_terminal_result(state, Some("Training"), "exact reason")
+                .unwrap_err();
+            let detail = error.to_string();
+            assert!(detail.contains("Training"));
+            assert!(detail.contains(&format!("{state:?}")));
+            assert!(detail.contains("exact reason"));
+        }
+    }
 
     #[test]
     fn app_runtime_config_uses_settings_data_dir() {

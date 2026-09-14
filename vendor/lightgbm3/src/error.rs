@@ -6,9 +6,6 @@ use std::{
     fmt::{self, Debug, Display},
 };
 
-#[cfg(feature = "polars")]
-use polars::prelude::*;
-
 /// Convenience return type for most operations which can return an `LightGBM`.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -49,15 +46,6 @@ impl error::Error for Error {}
 impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "LightGBM error: {}", &self.desc)
-    }
-}
-
-#[cfg(feature = "polars")]
-impl From<PolarsError> for Error {
-    fn from(pe: PolarsError) -> Self {
-        Self {
-            desc: pe.to_string(),
-        }
     }
 }
 

@@ -154,6 +154,7 @@ fn assert_gate_precedes(
     source_name: &str,
     source: &str,
     scope_marker: &str,
+    gate_marker: &str,
     arithmetic_marker: &str,
 ) {
     let scope = source
@@ -161,7 +162,7 @@ fn assert_gate_precedes(
         .unwrap_or_else(|| panic!("{source_name} is missing scope marker {scope_marker:?}"));
     let scoped = &source[scope..];
     let gate = scoped
-        .find("current_broker_financial_truth_capability_v1")
+        .find(gate_marker)
         .unwrap_or_else(|| panic!("{source_name} has no broker-truth gate after {scope_marker:?}"));
     let arithmetic = scoped.find(arithmetic_marker).unwrap_or_else(|| {
         panic!("{source_name} is missing arithmetic marker {arithmetic_marker:?}")
@@ -229,12 +230,12 @@ fn every_externally_reachable_search_finance_path_is_checked() {
     let models = include_str!("../../neoethos-models/src/training_orchestrator.rs");
     let benchmark = include_str!("../src/gpu_native/benchmark.rs");
     let population_oracle = include_str!("../src/gpu_native/prototype_population_oracle.rs");
+    let historical_authority = include_str!("../src/historical_evaluation_authority.rs");
     let autoresearch_runner = include_str!("../../neoethos-autoresearch/src/runner.rs");
 
     for raw_api in [
         "fast_evaluate_strategy_core",
         "simulate_trades_core",
-        "validation_backtest_population",
         "validation_backtest_population_cpu",
     ] {
         assert!(
@@ -247,37 +248,50 @@ fn every_externally_reachable_search_finance_path_is_checked() {
         "backend.rs",
         backend,
         "pub fn evaluate_population_core_with_backend_and_audit(",
+        "require_historical_evaluation_authority_v1()",
         "backend.validate()",
     );
     assert_gate_precedes(
         "validation.rs",
         validation,
         "pub fn embargoed_walkforward_backtest(",
+        "require_historical_evaluation_authority_v1()",
         "let n = close.len()",
     );
     assert_gate_precedes(
         "training_orchestrator.rs",
         models,
         "fn derive_labels(&self, ohlcv: &Ohlcv, symbol: &str)",
+        "current_broker_financial_truth_capability_v1()",
         "let n = ohlcv.close.len()",
     );
     assert_gate_precedes(
         "benchmark.rs",
         benchmark,
         "pub fn execute_population_benchmark<E>(",
+        "current_broker_financial_truth_capability_v1()",
         "let coverage_summary = eligibility.coverage()",
     );
     assert_gate_precedes(
         "prototype_population_oracle.rs",
         population_oracle,
         "pub fn evaluate_population_oracle(",
+        "require_historical_evaluation_authority_v1()",
         "evaluate_population_oracle_unchecked_test_oracle(workload)",
     );
     assert_gate_precedes(
         "neoethos-autoresearch/runner.rs",
         autoresearch_runner,
         "pub fn run_with_executor(",
+        "current_broker_financial_truth_capability_v1()",
         "let started = Instant::now()",
+    );
+    assert_gate_precedes(
+        "historical_evaluation_authority.rs",
+        historical_authority,
+        "pub(crate) fn require_historical_evaluation_authority_v1()",
+        "current_broker_financial_truth_capability_v1()",
+        "Ok(HistoricalEvaluationAuthorityV1::BrokerFinancialTruth)",
     );
     for raw_api in [
         "population_settings",
@@ -367,6 +381,7 @@ fn legacy_default_pip_size_is_not_an_external_finance_bypass() {
         "discovery.rs",
         discovery,
         "pub fn try_evaluation_config(",
+        "current_broker_financial_truth_capability_v1()",
         "self.evaluation_config(price_hint)",
     );
     assert!(

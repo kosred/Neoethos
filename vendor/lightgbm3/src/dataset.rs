@@ -7,9 +7,6 @@ use lightgbm3_sys::{
 use std::os::raw::c_void;
 use std::{self, ffi::CString};
 
-#[cfg(feature = "polars")]
-use polars::{datatypes::DataType::Float32, prelude::*};
-
 use crate::{Error, Result};
 
 // a way of implementing sealed traits until they
@@ -379,122 +376,6 @@ impl Dataset {
         Ok(Self::new(handle))
     }
 
-    /// Create a new `Dataset` from a polars DataFrame.
-    ///
-    /// Note: the feature ```dataframe``` is required for this method
-    ///
-    /// Example
-    ///
-    #[cfg_attr(
-        feature = "polars",
-        doc = r##"
-    use lightgbm3::Dataset;
-    use polars::prelude::*;
-    use polars::df;
-
-    let df: DataFrame = df![
-            "feature_1" => [1.0, 0.7, 0.9, 0.2, 0.1],
-            "feature_2" => [0.1, 0.4, 0.8, 0.2, 0.7],
-            "feature_3" => [0.2, 0.5, 0.5, 0.1, 0.1],
-            "feature_4" => [0.1, 0.1, 0.1, 0.7, 0.9],
-            "label" => [0.0, 0.0, 0.0, 1.0, 1.0]
-        ].unwrap();
-    let dataset = Dataset::from_dataframe(df, "label").unwrap();
-    "##
-    )]
-    #[cfg(feature = "polars")]
-    pub fn from_dataframe(mut dataframe: DataFrame, label_column: &str) -> Result<Self> {
-        let (m, n) = dataframe.shape();
-        if m == 0 {
-            return Err(Error::new("DataFrame is empty"));
-        }
-        if n < 1 {
-            return Err(Error::new(
-                "DataFrame should contain at least 1 feature column and 1 label column",
-            ));
-        }
-
-        // Take label from the dataframe:
-        let label_series = dataframe.select_columns([label_column])?[0].cast(&Float32)?;
-        if label_series.null_count() != 0 {
-            return Err(Error::new(
-                "Can't create a dataset with null values in label array",
-            ));
-        }
-        let _ = dataframe.drop_in_place(label_column)?;
-
-        let mut label_values = Vec::with_capacity(m);
-        let label_values_ca = label_series.f32()?;
-        label_values.extend(label_values_ca.into_no_null_iter());
-
-        let mut feature_values = Vec::with_capacity(m * (n - 1));
-        for series in dataframe.get_columns().iter() {
-            if series.null_count() != 0 {
-                return Err(Error::new(
-                    "Can't create a dataset with null values in feature array",
-                ));
-            }
-
-            let series = series.cast(&Float32)?;
-            let ca = series.f32()?;
-            feature_values.extend(ca.into_no_null_iter());
-        }
-        Self::from_slice(&feature_values, &label_values, (n - 1) as i32, false)
-    }
-
-    /// Create a new `Dataset` from a polars DataFrame with a reference dataset.
-    ///
-    /// When creating a validation dataset, pass the training dataset as reference
-    /// to ensure consistent bin mappers. This is required for early stopping.
-    #[cfg(feature = "polars")]
-    pub fn from_dataframe_with_reference(
-        mut dataframe: DataFrame,
-        label_column: &str,
-        reference: Option<&Dataset>,
-    ) -> Result<Self> {
-        let (m, n) = dataframe.shape();
-        if m == 0 {
-            return Err(Error::new("DataFrame is empty"));
-        }
-        if n < 1 {
-            return Err(Error::new(
-                "DataFrame should contain at least 1 feature column and 1 label column",
-            ));
-        }
-
-        let label_series = dataframe.select_columns([label_column])?[0].cast(&Float32)?;
-        if label_series.null_count() != 0 {
-            return Err(Error::new(
-                "Can't create a dataset with null values in label array",
-            ));
-        }
-        let _ = dataframe.drop_in_place(label_column)?;
-
-        let mut label_values = Vec::with_capacity(m);
-        let label_values_ca = label_series.f32()?;
-        label_values.extend(label_values_ca.into_no_null_iter());
-
-        let mut feature_values = Vec::with_capacity(m * (n - 1));
-        for series in dataframe.get_columns().iter() {
-            if series.null_count() != 0 {
-                return Err(Error::new(
-                    "Can't create a dataset with null values in feature array",
-                ));
-            }
-
-            let series = series.cast(&Float32)?;
-            let ca = series.f32()?;
-            feature_values.extend(ca.into_no_null_iter());
-        }
-        Self::from_slice_with_reference(
-            &feature_values,
-            &label_values,
-            (n - 1) as i32,
-            false,
-            reference,
-        )
-    }
-
     /// Get the size of Dataset as `(n_rows, n_features)` tuple
     pub fn size(&self) -> Result<(i32, i32)> {
         let mut n_rows = 0_i32;
@@ -600,23 +481,6 @@ mod tests {
     #[test]
     fn read_file() {
         assert!(read_train_file().is_ok());
-    }
-
-    #[cfg(feature = "polars")]
-    #[test]
-    fn from_dataframe() {
-        use polars::df;
-        let df: DataFrame = df![
-            "feature_1" => [1.0, 0.7, 0.9, 0.2, 0.1],
-            "feature_2" => [0.1, 0.4, 0.8, 0.2, 0.7],
-            "feature_3" => [0.2, 0.5, 0.5, 0.1, 0.1],
-            "feature_4" => [0.1, 0.1, 0.1, 0.7, 0.9],
-            "label" => [0.0, 0.0, 0.0, 1.0, 1.0]
-        ]
-        .unwrap();
-
-        let df_dataset = Dataset::from_dataframe(df, "label");
-        assert!(df_dataset.is_ok());
     }
 
     #[test]

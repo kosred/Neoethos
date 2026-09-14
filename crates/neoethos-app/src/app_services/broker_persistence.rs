@@ -7,7 +7,9 @@
 //!
 //! # Lookup order (highest priority first)
 //!
-//! 1. `$NEOETHOS_BROKER_CREDENTIALS_PATH` runtime env var (tests / CI).
+//! 1. `$NEOETHOS_BROKER_CREDENTIALS_PATH` selects an isolated credentials and
+//!    OAuth profile. It never scans/heals default credential files. Invalid
+//!    explicit paths fail closed rather than selecting the operator's profile.
 //! 2. `<dirs::config_dir>/neoethos/broker_credentials.toml` — `%APPDATA%` on
 //!    Windows, `$XDG_CONFIG_HOME` on Linux, `~/Library/Application Support` on
 //!    macOS.
@@ -32,17 +34,36 @@ use anyhow::Result;
 /// Never panics. Returns settings with cTrader credentials populated from
 /// the highest-priority source that has a non-empty `client_id`.
 pub fn load_broker_settings() -> BrokerSettingsState {
-    // #141: Detect + heal credentials drift before we read. If the
-    // user re-authenticated from a different CWD, they end up with
-    // two files (e.g. `%APPDATA%\neoethos\broker_credentials.toml`
-    // AND `<cwd>/.local/neoethos/broker_credentials.toml`) that
-    // contain DIFFERENT `account_id` rows. The load path picks the
-    // first one that exists, which is non-deterministic across
-    // launches if the CWD changes. Healing here renames the stale
-    // copies to `*.bak.<timestamp>` so subsequent loads are
-    // canonical.
-    let _ = heal_credentials_drift();
-    let mut settings = load_from_filesystem();
+    load_for_profile(
+        neoethos_core::broker_config::credentials_profile_path(),
+        || {
+            // #141: Detect + heal credentials drift before we read. If the
+            // user re-authenticated from a different CWD, they end up with
+            // two files (e.g. `%APPDATA%\neoethos\broker_credentials.toml`
+            // AND `<cwd>/.local/neoethos/broker_credentials.toml`) that
+            // contain DIFFERENT `account_id` rows. The load path picks the
+            // first one that exists, which is non-deterministic across
+            // launches if the CWD changes. Healing here renames the stale
+            // copies to `*.bak.<timestamp>` so subsequent loads are
+            // canonical.
+            let _ = heal_credentials_drift();
+            load_from_filesystem()
+        },
+    )
+}
+
+fn load_for_profile(
+    profile: Result<Option<std::path::PathBuf>>,
+    load_default: impl FnOnce() -> BrokerSettingsState,
+) -> BrokerSettingsState {
+    let mut settings = match profile {
+        Ok(Some(path)) => load_from_path(&path),
+        Ok(None) => load_default(),
+        Err(error) => {
+            tracing::error!(%error, "invalid broker credentials profile; default credentials are not consulted");
+            return BrokerSettingsState::default();
+        }
+    };
     apply_embedded_fallback(&mut settings);
     settings
 }
@@ -58,6 +79,10 @@ pub fn load_broker_settings() -> BrokerSettingsState {
 /// so subsequent reads see the cleaned-up disk state.
 fn heal_credentials_drift() -> Result<()> {
     let candidates = neoethos_core::broker_config::candidate_credentials_paths()?;
+    heal_credentials_drift_candidates(candidates)
+}
+
+fn heal_credentials_drift_candidates(candidates: Vec<std::path::PathBuf>) -> Result<()> {
     let existing: Vec<_> = candidates.iter().filter(|p| p.is_file()).cloned().collect();
     if existing.len() < 2 {
         return Ok(()); // nothing to heal
@@ -106,11 +131,22 @@ fn heal_credentials_drift() -> Result<()> {
     Ok(())
 }
 
-/// Filesystem portion of the load (levels 1–3). Delegates the bytes-
-/// and-TOML work to `neoethos-core` and logs at the app layer for
-/// observability parity with the prior implementation.
+/// Default filesystem portion only (levels 2–3); explicit profiles are already
+/// resolved before this function is reachable.
+fn default_credentials_file_path() -> Result<std::path::PathBuf> {
+    // The explicit profile was already captured by the caller. Do not read the
+    // process environment again while selecting the default profile's file.
+    let candidates = neoethos_core::broker_config::candidate_credentials_paths()?;
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .or_else(|| candidates.first())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no default broker credentials path could be resolved"))
+}
+
 fn load_from_filesystem() -> BrokerSettingsState {
-    let path = match neoethos_core::broker_config::credentials_file_path() {
+    let path = match default_credentials_file_path() {
         Ok(p) => p,
         Err(err) => {
             tracing::warn!(error = %err, "broker credentials path resolution failed");
@@ -118,7 +154,11 @@ fn load_from_filesystem() -> BrokerSettingsState {
         }
     };
 
-    match neoethos_core::broker_config::load_from_disk(&path) {
+    load_from_path(&path)
+}
+
+fn load_from_path(path: &std::path::Path) -> BrokerSettingsState {
+    match neoethos_core::broker_config::load_from_disk(path) {
         Ok(Some(s)) => {
             tracing::info!(
                 path = %path.display(),
@@ -186,7 +226,10 @@ fn apply_embedded_fallback(settings: &mut BrokerSettingsState) {
 /// writer in `neoethos-core` always stamps the current schema version
 /// regardless of what the in-memory value carries.
 pub fn save_broker_settings(settings: &BrokerSettingsState) -> Result<()> {
-    let path = neoethos_core::broker_config::credentials_file_path()?;
+    let path = match neoethos_core::broker_config::credentials_profile_path()? {
+        Some(path) => path,
+        None => default_credentials_file_path()?,
+    };
     neoethos_core::broker_config::save_to_disk(&path, settings)?;
     tracing::info!(path = %path.display(), "saved broker credentials to disk");
     Ok(())
@@ -260,6 +303,33 @@ mod tests {
                 }],
             },
         }
+    }
+
+    #[test]
+    fn explicit_profile_loader_never_enumerates_or_heals_default_paths() {
+        let dir = tempdir_or_skip();
+        let path = dir.join("isolated.toml");
+        let no_default = || panic!("explicit profile must not enter the default loader/healer");
+        let missing = load_for_profile(Ok(Some(path.clone())), no_default);
+        assert!(missing.ctrader.accounts.is_empty());
+        neoethos_core::broker_config::save_to_disk(&path, &populated_settings()).unwrap();
+        let loaded = load_for_profile(Ok(Some(path.clone())), no_default);
+        assert_eq!(loaded.ctrader.client_id, "client-123");
+        assert_eq!(loaded.ctrader.accounts[0].account_id, "ctr-001");
+        fs::write(&path, "[malformed").unwrap();
+        let malformed = load_for_profile(Ok(Some(path)), no_default);
+        assert!(malformed.ctrader.accounts.is_empty());
+    }
+
+    #[test]
+    fn invalid_profile_loader_never_falls_back_but_absent_profile_keeps_defaults() {
+        let invalid = load_for_profile(Err(anyhow::anyhow!("invalid explicit profile")), || {
+            panic!("invalid profile must not enter the default loader/healer")
+        });
+        assert_eq!(invalid, BrokerSettingsState::default());
+        let loaded = load_for_profile(Ok(None), populated_settings);
+        assert_eq!(loaded.ctrader.client_id, "client-123");
+        assert_eq!(loaded.ctrader.accounts[0].account_id, "ctr-001");
     }
 
     #[test]
@@ -427,30 +497,16 @@ mod tests {
 
     #[test]
     fn heal_credentials_drift_renames_stale_copy() {
-        // Build a temp tree that mimics the candidate paths the
-        // production code computes: one under config_dir, one
-        // under .local. Force the env override to point at the
-        // canonical one so the production `load_broker_settings`
-        // still uses our temp tree end-to-end. The healing logic
-        // doesn't consult the env override (it walks
-        // `candidate_credentials_paths`), so to test it we point
-        // env::current_dir at a temp tree with a .local stub.
+        // Exercise the actual production healer with owned candidate files.
+        // Never enumerate the operator's directories or mutate process CWD.
         use std::time::Duration;
 
         let dir = tempdir_or_skip();
-        // Set up .local/neoethos/broker_credentials.toml inside
-        // the temp tree, and pretend the current dir IS this temp
-        // tree so `candidate_credentials_paths` picks it up.
         let local_dir = dir.join(".local").join("neoethos");
         fs::create_dir_all(&local_dir).expect("local dir");
         let local_file = local_dir.join("broker_credentials.toml");
         fs::write(&local_file, "[ctrader]\nclient_id = \"OLDER\"\n").expect("local file");
 
-        // dirs::config_dir() can't be redirected from a test, so
-        // instead of testing the actual prod paths we test the
-        // function's BEHAVIOUR: when given >=2 existing candidates
-        // it backs up all but the newest. We invoke the function
-        // body inline against a temp-rooted candidate list.
         let canonical_file = dir.join("canonical_creds.toml");
         fs::write(&canonical_file, "[ctrader]\nclient_id = \"NEWER\"\n").expect("canonical");
         // Force canonical's mtime to be NEWER than local's.
@@ -461,30 +517,29 @@ mod tests {
         fs::write(&canonical_file, "[ctrader]\nclient_id = \"NEWER\"\n")
             .expect("canonical retouched");
 
-        // Inline the heal logic against our two paths so we don't
-        // have to redirect `candidate_credentials_paths`. This
-        // tests the same code path; the only difference is the
-        // path source.
-        let existing = vec![local_file.clone(), canonical_file.clone()];
-        let mut with_mtime: Vec<_> = existing
-            .into_iter()
-            .filter_map(|p| {
-                fs::metadata(&p)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .map(|t| (p, t))
-            })
-            .collect();
-        with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
-        // canonical_file should be first (newest).
+        heal_credentials_drift_candidates(vec![local_file.clone(), canonical_file.clone()])
+            .expect("actual healer");
+        assert!(!local_file.exists());
         assert_eq!(
-            with_mtime.first().map(|(p, _)| p.clone()),
-            Some(canonical_file.clone())
+            fs::read_to_string(&canonical_file).unwrap(),
+            "[ctrader]\nclient_id = \"NEWER\"\n"
         );
-        // Sanity: the local file should be the stale one we'd back up.
+        let backups: Vec<_> = fs::read_dir(&local_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert!(
+            backups[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("broker_credentials.toml.bak.")
+        );
         assert_eq!(
-            with_mtime.get(1).map(|(p, _)| p.clone()),
-            Some(local_file.clone())
+            fs::read_to_string(&backups[0]).unwrap(),
+            "[ctrader]\nclient_id = \"OLDER\"\n"
         );
     }
 

@@ -1,4 +1,4 @@
-//! RED-only contract for bounded quote acquisition at the two finalist replay seams.
+//! Source contracts for bounded quote acquisition and reviewed replay consumers.
 //!
 //! Canonical cTrader trendbars remain the sole feature/search/training dataset.
 //! Historical Bid/Ask ticks may be captured only for the already-locked outer
@@ -118,6 +118,126 @@ fn public_surface_is_versioned_one_shot_and_error_typed() {
             "acquire_finalist_quote_replay_v1",
         ],
     );
+}
+
+#[test]
+fn captured_finalist_has_an_independently_reviewed_quote_replay_consumer() {
+    let source = production_source();
+    let single = function_body(&source, "pub fn replay_reviewed_decision_v1(");
+    require_tokens(single, &["self.replay_reviewed_decision_sequence_v1("]);
+    let replay = function_body(&source, "pub fn replay_reviewed_decision_sequence_v1(");
+    let open = function_body(&source, "pub fn open_reviewed_quote_snapshot_v1(");
+    require_tokens(
+        replay,
+        &[
+            "reviewed: ReviewedBrokerFinancialTruthEvidenceV2",
+            "self.replay_binding.clone()",
+            "self.replay_policy.clone()",
+            "QuoteValidatedResearchReplayPlanV1::validate_ordered_sequence(&plans)",
+            "self.open_reviewed_quote_snapshot_v1(store, reviewed)",
+            "replay_sealed_quote_validated_decision_sequence_v1(&plans, &evidence)",
+        ],
+    );
+    assert!(
+        replay.find("QuoteValidatedResearchReplayPlanV1::validate_ordered_sequence(&plans)")
+            < replay.find("self.open_reviewed_quote_snapshot_v1(store, reviewed)")
+    );
+    require_tokens(
+        open,
+        &[
+            "validate_reviewed_broker_financial_truth_authority_v2(",
+            "&self.acquisition_link_receipt",
+            "into_sealed_historical_bid_ask_quote_replay_evidence_v2(",
+            "&self.replay_binding",
+        ],
+    );
+    assert!(
+        open.find("validate_reviewed_broker_financial_truth_authority_v2(")
+            < open.find("into_sealed_historical_bid_ask_quote_replay_evidence_v2(")
+    );
+    assert!(
+        replay.find("self.open_reviewed_quote_snapshot_v1(store, reviewed)")
+            < replay.find("replay_sealed_quote_validated_decision_sequence_v1(")
+    );
+    for forbidden in [
+        "ReviewedBrokerFinancialTruthEvidenceV2::checked_new",
+        "current_broker_financial_truth",
+        "capture_production_broker_financial_truth_v2",
+        "open_sealed_historical_bid_ask_quote_replay_evidence_v1",
+    ] {
+        assert!(
+            !replay.contains(forbidden) && !single.contains(forbidden) && !open.contains(forbidden),
+            "replay fabricates review or recaptures evidence: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn canonical_signals_reuse_the_position_engine_and_the_single_reviewed_snapshot() {
+    let source = production_source();
+    let replay = function_body(&source, "pub fn replay_reviewed_signal_lane_v1(");
+    require_tokens(
+        replay,
+        &[
+            "lane.validate(&self.replay_binding, &self.replay_policy)",
+            "self.open_reviewed_quote_snapshot_v1(store, reviewed)",
+            "neoethos_trader::data_replay::replay_canonical_signal_quote_lane_v1(",
+            "&self.replay_binding",
+            "&self.replay_policy",
+            "&evidence",
+        ],
+    );
+    assert!(replay.find("lane.validate(") < replay.find("self.open_reviewed_quote_snapshot_v1("));
+    let driver = read_repository("crates/neoethos-trader/src/quote_signal_replay.rs");
+    require_tokens(
+        &driver,
+        &[
+            "DecisionEngine::new(DecisionConfig::gene_parity(lane.pip_size))",
+            "trailing.next_stop_price(",
+            "preview_sealed_quote_validated_research_entry_v1(",
+            "replay_sealed_quote_validated_research_v1(",
+            "ClosedCanonicalBarTimeExitV1::new(",
+            "entry.bid_extrema_before(end)",
+        ],
+    );
+    let position = read_repository("crates/neoethos-trader/src/position.rs");
+    require_tokens(&position, &["next_stop_price("]);
+    let locked = function_body(
+        &driver,
+        "pub fn replay_locked_canonical_signal_portfolio_v3(",
+    );
+    require_tokens(
+        locked,
+        &[
+            "cpu.require_current_pool()",
+            "locked.validate_replay_binding(binding, policy)?",
+            "evidence.validate_replay_context_v1(binding, policy)?",
+            "QuoteBars::Canonical",
+            ".par_iter()",
+            "confidences: Some(&locked.ordered_confidences()[index])",
+            "locked.entry_eligible(index, row)",
+            "locked.entry_stop_target_pips(index, row)",
+            "entry_eligibility: Some(&eligible)",
+            "entry_brackets: Some(&brackets)",
+        ],
+    );
+    for forbidden in ["Vec<LiveBar>", "Position::new("] {
+        assert!(
+            !driver.contains(forbidden),
+            "replay rebuilt owned historical bars or a fake position"
+        );
+    }
+    for forbidden in [
+        "MockExecutionAdapter",
+        "EngineStats",
+        "current_broker_financial_truth_capability_v1",
+        "signals_for_gene",
+    ] {
+        assert!(
+            !driver.contains(forbidden),
+            "signal replay has an unrelated fallback or duplicate signal path: {forbidden}"
+        );
+    }
 }
 
 #[test]

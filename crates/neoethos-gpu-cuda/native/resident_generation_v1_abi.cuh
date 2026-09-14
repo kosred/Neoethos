@@ -9,7 +9,12 @@
 
 namespace neoethos::resident_generation_v1 {
 
+#if defined(__HIP_PLATFORM_AMD__)
+// Distinct HIP wire protocol; NVIDIA retains its original ABI value.
+constexpr std::uint32_t NEO_RESIDENT_GENERATION_ABI_V1 = 0x00010001u;
+#else
 constexpr std::uint32_t NEO_RESIDENT_GENERATION_ABI_V1 = 1;
+#endif
 constexpr std::uint32_t NEO_RESIDENT_PARENT_RANK_WEIGHTED_V1 = 1;
 constexpr std::uint32_t NEO_RESIDENT_SURVIVOR_RANK_WEIGHTED_V1 = 1;
 
@@ -50,16 +55,32 @@ enum class NeoResidentPhiloxOperatorV1 : std::uint32_t {
 /// mint it; callers outside gpu-cuda never receive a CUDA stream or event.
 struct NeoResidentGenerationPopulationSessionImportV1 {
   std::uint32_t abi_version;
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint32_t selected_hip_ordinal;
+#else
   std::uint32_t selected_cuda_ordinal;
+#endif
   cudaStream_t admitted_run_stream;
   cudaEvent_t resident_parent_ready_event;
   cudaEvent_t generation_ready_event;
   void* population_lifetime_owner;
   std::uint64_t full_discovery_reserve_bytes;
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_device_identity_sha256[32];
+#else
   std::uint8_t cuda_device_identity_sha256[32];
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_lease_identity_sha256[32];
+#else
   std::uint8_t primary_context_identity_sha256[32];
+#endif
   std::uint8_t run_stream_identity_sha256[32];
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_build_manifest_sha256[32];
+#else
   std::uint8_t cuda_build_manifest_sha256[32];
+#endif
   std::uint8_t resident_input_content_sha256[32];
 };
 
@@ -115,7 +136,11 @@ struct NeoResidentGenerationPlanV1 {
   std::uint8_t scoring_semantics_sha256[32];
   std::uint8_t novelty_semantics_sha256[32];
   std::uint8_t scenario_order_semantics_sha256[32];
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_build_manifest_sha256[32];
+#else
   std::uint8_t cuda_build_manifest_sha256[32];
+#endif
   std::uint8_t rng_mapping_sha256[32];
   std::uint8_t plan_identity_sha256[32];
 };

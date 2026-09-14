@@ -1,6 +1,8 @@
 use crate::app_services::ctrader_auth::CTraderTokenBundle;
 use anyhow::{Context, Result, anyhow};
 use keyring::Entry;
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -111,7 +113,9 @@ impl SecretStoreBackend for MemorySecretStoreBackend {
 #[derive(Clone)]
 pub struct CTraderSecureStore<B: SecretStoreBackend = KeyringSecretStoreBackend> {
     service: String,
-    user: String,
+    // Invalid explicit profiles carry their error to every fallible operation,
+    // without ever constructing or consulting the default keyring entry.
+    user: std::result::Result<String, String>,
     backend: B,
 }
 
@@ -119,23 +123,25 @@ impl<B: SecretStoreBackend> CTraderSecureStore<B> {
     pub fn new(service: impl Into<String>, user: impl Into<String>, backend: B) -> Self {
         Self {
             service: service.into(),
-            user: user.into(),
+            user: Ok(user.into()),
             backend,
         }
     }
 
     pub fn save_token_bundle(&self, bundle: &CTraderTokenBundle) -> Result<()> {
+        let user = self.user()?;
         let secret =
             serde_json::to_string(bundle).context("failed to serialize cTrader token bundle")?;
         self.backend
-            .set_secret(&self.service, &self.user, &secret)
+            .set_secret(&self.service, user, &secret)
             .context("failed to persist cTrader token bundle")
     }
 
     pub fn load_token_bundle(&self) -> Result<Option<CTraderTokenBundle>> {
+        let user = self.user()?;
         let Some(secret) = self
             .backend
-            .get_secret(&self.service, &self.user)
+            .get_secret(&self.service, user)
             .context("failed to load cTrader token bundle")?
         else {
             return Ok(None);
@@ -148,7 +154,7 @@ impl<B: SecretStoreBackend> CTraderSecureStore<B> {
         if let Some(bundle) = self.load_token_bundle()? {
             return Ok(Some(bundle));
         }
-        if self.service != CTRADER_TOKEN_STORE_SERVICE || self.user != CTRADER_TOKEN_STORE_USER {
+        if self.service != CTRADER_TOKEN_STORE_SERVICE || self.user()? != CTRADER_TOKEN_STORE_USER {
             return Ok(None);
         }
 
@@ -169,18 +175,50 @@ impl<B: SecretStoreBackend> CTraderSecureStore<B> {
     }
 
     pub fn clear_token_bundle(&self) -> Result<()> {
+        let user = self.user()?;
         self.backend
-            .delete_secret(&self.service, &self.user)
+            .delete_secret(&self.service, user)
             .context("failed to clear cTrader token bundle")
+    }
+
+    fn user(&self) -> Result<&str> {
+        self.user.as_deref().map_err(|error| anyhow!("{error}"))
     }
 }
 
+/// An explicit credentials file is a separate OAuth profile, not an alias for
+/// the operator's default login. Existing overrides therefore require their own
+/// authorization; neither default nor legacy tokens are silently imported.
 pub fn production_ctrader_token_store() -> CTraderSecureStore<KeyringSecretStoreBackend> {
-    CTraderSecureStore::new(
-        CTRADER_TOKEN_STORE_SERVICE,
-        CTRADER_TOKEN_STORE_USER,
+    token_store_for_profile(
+        neoethos_core::broker_config::credentials_profile_path(),
         KeyringSecretStoreBackend,
     )
+}
+
+fn token_store_for_profile<B: SecretStoreBackend>(
+    profile: Result<Option<PathBuf>>,
+    backend: B,
+) -> CTraderSecureStore<B> {
+    let user = profile
+        .and_then(|profile| match profile {
+            None => Ok(CTRADER_TOKEN_STORE_USER.to_string()),
+            Some(path) => {
+                let path = path
+                    .to_str()
+                    .context("resolved broker credentials profile path is not Unicode")?;
+                let mut hash = Sha256::new();
+                hash.update(b"neoethos.ctrader.credentials-profile.v1\0");
+                hash.update(path.as_bytes());
+                Ok(format!("ctrader.profile.v1.{:x}", hash.finalize()))
+            }
+        })
+        .map_err(|error| format!("invalid broker credentials profile: {error:#}"));
+    CTraderSecureStore {
+        service: CTRADER_TOKEN_STORE_SERVICE.to_string(),
+        user,
+        backend,
+    }
 }
 
 fn decode_token_bundle(secret: &str) -> Result<CTraderTokenBundle> {
@@ -245,6 +283,129 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct ProfileSpy {
+        memory: MemorySecretStoreBackend,
+        calls: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl SecretStoreBackend for ProfileSpy {
+        fn set_secret(&self, service: &str, user: &str, secret: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(("set".into(), user.into()));
+            self.memory.set_secret(service, user, secret)
+        }
+
+        fn get_secret(&self, service: &str, user: &str) -> Result<Option<String>> {
+            self.calls.lock().unwrap().push(("get".into(), user.into()));
+            self.memory.get_secret(service, user)
+        }
+
+        fn delete_secret(&self, service: &str, user: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("delete".into(), user.into()));
+            self.memory.delete_secret(service, user)
+        }
+    }
+
+    fn profile_bundle() -> CTraderTokenBundle {
+        CTraderTokenBundle {
+            access_token: "profile-access".into(),
+            refresh_token: "profile-refresh".into(),
+            token_type: "bearer".into(),
+            expires_in: 3600,
+            scope: "trading".into(),
+            created_at_unix: 1_774_147_200,
+        }
+    }
+
+    #[test]
+    fn explicit_profiles_never_read_migrate_or_clear_default_tokens() {
+        let backend = ProfileSpy::default();
+        // Invalid payloads also make any unintended legacy/default decoding fail.
+        backend.memory.seed(
+            CTRADER_TOKEN_STORE_SERVICE,
+            CTRADER_TOKEN_STORE_USER,
+            "operator-token".into(),
+        );
+        backend.memory.seed(
+            LEGACY_CTRADER_TOKEN_STORE_SERVICE,
+            LEGACY_CTRADER_TOKEN_STORE_USER,
+            "legacy-token".into(),
+        );
+        let original = backend.memory.entries.lock().unwrap().clone();
+        let a = token_store_for_profile(
+            Ok(Some(
+                std::path::absolute("profile-a/credentials.toml").unwrap(),
+            )),
+            backend.clone(),
+        );
+        let b = token_store_for_profile(
+            Ok(Some(
+                std::path::absolute("profile-b/credentials.toml").unwrap(),
+            )),
+            backend.clone(),
+        );
+        assert_ne!(a.user().unwrap(), b.user().unwrap());
+        assert_eq!(a.load_token_bundle_with_legacy_fallback().unwrap(), None);
+        a.save_token_bundle(&profile_bundle()).unwrap();
+        assert_eq!(
+            a.load_token_bundle_with_legacy_fallback().unwrap(),
+            Some(profile_bundle())
+        );
+        assert_eq!(b.load_token_bundle_with_legacy_fallback().unwrap(), None);
+        b.clear_token_bundle().unwrap();
+        assert_eq!(a.load_token_bundle().unwrap(), Some(profile_bundle()));
+        a.clear_token_bundle().unwrap();
+        assert_eq!(*backend.memory.entries.lock().unwrap(), original);
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 7);
+        assert!(
+            calls
+                .iter()
+                .all(|(_, user)| user.starts_with("ctrader.profile.v1."))
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_profile_has_zero_secret_backend_access() {
+        for reason in ["empty", "not Unicode", "cannot resolve absolute path"] {
+            let backend = ProfileSpy::default();
+            let store = token_store_for_profile(Err(anyhow!("{reason}")), backend.clone());
+            assert!(store.load_token_bundle().is_err());
+            assert!(store.load_token_bundle_with_legacy_fallback().is_err());
+            assert!(store.save_token_bundle(&profile_bundle()).is_err());
+            assert!(store.clear_token_bundle().is_err());
+            assert!(backend.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn explicit_profile_namespace_does_not_change_when_file_is_created() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "neoethos-token-profile-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("credentials.toml");
+        let before =
+            token_store_for_profile(Ok(Some(path.clone())), MemorySecretStoreBackend::default());
+        std::fs::write(&path, "[ctrader]\n").unwrap();
+        let after =
+            token_store_for_profile(Ok(Some(path.clone())), MemorySecretStoreBackend::default());
+        assert_eq!(before.user().unwrap(), after.user().unwrap());
+        let default = token_store_for_profile(Ok(None), MemorySecretStoreBackend::default());
+        assert_eq!(default.user().unwrap(), CTRADER_TOKEN_STORE_USER);
+        assert_ne!(before.user().unwrap(), default.user().unwrap());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn production_ctrader_token_store_identity_is_not_test_scoped() {

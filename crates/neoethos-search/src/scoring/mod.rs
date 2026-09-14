@@ -101,8 +101,8 @@ pub use ingredients::{
 };
 
 pub use named::{
-    SCORING_VERSION_CURRENT, ScoringVersion, archive_score, ga_fitness, ga_fitness_growth,
-    quality_score, window_score,
+    RiskyGrowthGoal, SCORING_VERSION_CURRENT, ScoringVersion, archive_score, ga_fitness,
+    ga_fitness_goal, ga_fitness_growth, quality_score, window_score,
 };
 
 #[cfg(test)]
@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn scoring_version_is_five_after_negative_weights_and_growth_objective() {
+    fn scoring_version_is_six_after_run_bound_goal_pace_objective() {
         // 2026-06-06: 2→3 — CONSISTENT-monthly-return GA (dominant reward =
         // monthly_target_hit_rate in metrics[7]; total-net demoted).
         // 2026-07-02: 3→4 — STEADY-INCOME worst-period penalty: ga_fitness now
@@ -146,6 +146,6 @@ mod tests {
         // ga_fitness_growth (Kelly log-growth) objective instead of the
         // prop-firm consistency formula. Artifacts from earlier versions are
         // tagged and NOT directly comparable.
-        assert_eq!(SCORING_VERSION_CURRENT.0, 5);
+        assert_eq!(SCORING_VERSION_CURRENT.0, 6);
     }
 }

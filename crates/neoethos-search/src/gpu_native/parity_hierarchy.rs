@@ -27,6 +27,7 @@ pub struct FloatTolerance {
 }
 
 impl FloatTolerance {
+    /// Compare the original bits, including signed zero and NaN payloads.
     pub const EXACT: Self = Self {
         absolute: 0.0,
         relative: 0.0,
@@ -45,11 +46,13 @@ impl FloatTolerance {
         max_ulps: 16,
     };
 
+    /// Identical bits match, including identical NaNs. Different non-finite
+    /// representations never match; numeric tolerances apply only to finite values.
     pub fn matches_f64(self, expected: f64, actual: f64) -> bool {
         if expected.to_bits() == actual.to_bits() {
             return true;
         }
-        if !expected.is_finite() || !actual.is_finite() {
+        if self == Self::EXACT || !expected.is_finite() || !actual.is_finite() {
             return false;
         }
         let delta = (expected - actual).abs();
@@ -64,6 +67,14 @@ impl FloatTolerance {
     }
 
     pub fn matches_f32(self, expected: f32, actual: f32) -> bool {
+        // Check original f32 bits before widening, which may quiet a signaling
+        // NaN. Do not let the f32 ULP fallback cross a non-finite boundary.
+        if expected.to_bits() == actual.to_bits() {
+            return true;
+        }
+        if self == Self::EXACT || !expected.is_finite() || !actual.is_finite() {
+            return false;
+        }
         self.matches_f64(expected as f64, actual as f64)
             || ulp_distance_f32(expected, actual) as u64 <= self.max_ulps
     }
@@ -596,6 +607,115 @@ fn ordered_f64(value: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_policy_compares_original_bits_in_both_widths() {
+        let exact = FloatTolerance::EXACT;
+        for (left, right) in [(0.0, -0.0), (1.0, f64::from_bits(1.0_f64.to_bits() + 1))] {
+            assert!(!exact.matches_f64(left, right));
+            assert!(!exact.matches_f64(right, left));
+        }
+        for (left, right) in [(0.0, -0.0), (1.0, f32::from_bits(1.0_f32.to_bits() + 1))] {
+            assert!(!exact.matches_f32(left, right));
+            assert!(!exact.matches_f32(right, left));
+        }
+        for value in [0.0, -0.0, 1.0, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(exact.matches_f64(value, value));
+        }
+        for value in [0.0, -0.0, 1.0, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(exact.matches_f32(value, value));
+        }
+    }
+
+    #[test]
+    fn nonexact_policy_preserves_signed_zero_and_declared_finite_tolerances() {
+        let f64_policy = FloatTolerance::CANONICAL_F64;
+        let f32_policy = FloatTolerance::CANONICAL_F32;
+        assert!(f64_policy.matches_f64(0.0, -0.0));
+        assert!(f32_policy.matches_f32(0.0, -0.0));
+        assert!(f64_policy.matches_f64(1.0, 1.0 + 1.0e-12));
+        assert!(f32_policy.matches_f32(1.0, 1.0 + 5.0e-7));
+        let ulp_only = FloatTolerance {
+            absolute: 0.0,
+            relative: 0.0,
+            max_ulps: 1,
+        };
+        assert!(ulp_only.matches_f64(1.0, f64::from_bits(1.0_f64.to_bits() + 1)));
+        assert!(!ulp_only.matches_f64(1.0, f64::from_bits(1.0_f64.to_bits() + 2)));
+        assert!(ulp_only.matches_f32(1.0, f32::from_bits(1.0_f32.to_bits() + 1)));
+        assert!(!ulp_only.matches_f32(1.0, f32::from_bits(1.0_f32.to_bits() + 2)));
+    }
+
+    #[test]
+    fn nan_equality_requires_identical_original_bits() {
+        for policy in [FloatTolerance::EXACT, FloatTolerance::CANONICAL_F64] {
+            for bits in [
+                0x7ff0_0000_0000_0001,
+                0x7ff8_0000_0000_0042,
+                0xfff8_0000_0000_0042,
+            ] {
+                let value = f64::from_bits(bits);
+                assert!(value.is_nan());
+                assert!(policy.matches_f64(value, value));
+                assert!(!policy.matches_f64(value, f64::from_bits(bits + 1)));
+                assert!(!policy.matches_f64(value, f64::INFINITY));
+                assert!(!policy.matches_f64(value, 0.0));
+            }
+        }
+        for policy in [FloatTolerance::EXACT, FloatTolerance::CANONICAL_F32] {
+            for bits in [0x7f80_0001, 0x7fc0_0042, 0xffc0_0042] {
+                let value = f32::from_bits(bits);
+                assert!(value.is_nan());
+                assert!(policy.matches_f32(value, value));
+                assert!(!policy.matches_f32(value, f32::from_bits(bits + 1)));
+                assert!(!policy.matches_f32(value, f32::INFINITY));
+                assert!(!policy.matches_f32(value, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn ulp_tolerance_cannot_bypass_nonfinite_guards() {
+        assert_eq!(ulp_distance_f32(f32::MAX, f32::INFINITY), 1);
+        for policy in [FloatTolerance::EXACT, FloatTolerance::CANONICAL_F32] {
+            for (finite, infinite) in [(f32::MAX, f32::INFINITY), (-f32::MAX, f32::NEG_INFINITY)] {
+                assert!(!policy.matches_f32(finite, infinite));
+                assert!(!policy.matches_f32(infinite, finite));
+            }
+        }
+        for policy in [FloatTolerance::EXACT, FloatTolerance::CANONICAL_F64] {
+            for (finite, infinite) in [(f64::MAX, f64::INFINITY), (-f64::MAX, f64::NEG_INFINITY)] {
+                assert!(!policy.matches_f64(finite, infinite));
+                assert!(!policy.matches_f64(infinite, finite));
+            }
+        }
+    }
+
+    #[test]
+    fn exact_trace_reports_signed_zero_mismatch() {
+        let reference = ParityTrace {
+            scores_before_threshold: vec![0.0],
+            ..ParityTrace::default()
+        };
+        let candidate = ParityTrace {
+            scores_before_threshold: vec![-0.0],
+            ..ParityTrace::default()
+        };
+        let report = compare_traces(
+            "reference",
+            "candidate",
+            &reference,
+            &candidate,
+            ParityPolicy {
+                score: FloatTolerance::EXACT,
+                ..ParityPolicy::default()
+            },
+        );
+        assert_eq!(
+            report.first_divergence.unwrap().level,
+            ParityLevel::ScoreBeforeThreshold
+        );
+    }
 
     #[test]
     fn reports_first_causal_divergence() {

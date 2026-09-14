@@ -2,7 +2,7 @@
 
 #include "resident_scoring_novelty_v1_abi.cuh"
 
-#include <cuda_runtime_api.h>
+#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -17,6 +17,34 @@ struct NeoResidentScoringPopulationSourceV2;
 // Native-only composition seam. None of these declarations is part of the
 // public C ABI or the Rust FFI surface.
 namespace neoethos::resident_scoring_novelty_v2_internal {
+
+enum class ResidentMetricStatusV2 : std::uint32_t {
+  Finite = 0,
+  EconomicMonthlyEquityReject = 1,
+  Fault = 2,
+};
+
+#if defined(__CUDACC__)
+// Valid only behind current sealed producer semantics. This is not a generic
+// non-finite exception: NaN/+infinity and every other non-finite slot fault.
+__device__ inline ResidentMetricStatusV2 classify_resident_metrics_v2(
+    const double* values) {
+  const double negative_infinity =
+      -__longlong_as_double(static_cast<long long>(0x7ff0000000000000ULL));
+  for (int metric = 0; metric < 11; ++metric) {
+    if (!isfinite(values[metric]) &&
+        !(metric == 1 && values[metric] == negative_infinity)) {
+      return ResidentMetricStatusV2::Fault;
+    }
+  }
+  if (values[1] == negative_infinity) {
+    return values[3] >= 1.0
+               ? ResidentMetricStatusV2::EconomicMonthlyEquityReject
+               : ResidentMetricStatusV2::Fault;
+  }
+  return ResidentMetricStatusV2::Finite;
+}
+#endif
 
 using resident_scoring_novelty_v1::NeoResidentScoringNoveltyDeviceSealV1;
 using resident_scoring_novelty_v1::NeoResidentScoringNoveltyMetricRowV1;
@@ -34,7 +62,8 @@ struct ResidentScoringArenaAccessV2 {
   std::uint64_t same_stream_enqueue_count;
 };
 
-/// Same-stream, device-resident output of canonical finite objective scoring.
+/// Same-stream, device-resident output of checked canonical objective scoring
+/// (finite fitness or authenticated economic rejection, never arithmetic fault).
 /// It deliberately carries no completion event or host-readable receipt.
 struct ResidentScoringFiniteObjectiveRowsV2 {
   NeoResidentScoringNoveltyRunV1* scoring_owner;
@@ -51,8 +80,16 @@ struct ResidentScoringFiniteObjectiveRowsV2 {
   std::uint8_t novelty_semantics_sha256[32];
   std::uint8_t scenario_order_semantics_sha256[32];
   std::uint8_t rank_semantics_sha256[32];
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_build_manifest_sha256[32];
+#else
   std::uint8_t cuda_build_manifest_sha256[32];
+#endif
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint8_t hip_math_flags_sha256[32];
+#else
   std::uint8_t cuda_math_flags_sha256[32];
+#endif
 };
 
 /// Allocation-free validation/query for the one Slice2 ScoringArchiveArena.
@@ -82,7 +119,7 @@ std::int32_t borrow_resident_scoring_archive_arena_v2(
     const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
     ResidentScoringArenaAccessV2* access);
 
-/// Enqueues canonical finite objective scoring, ordered objective keys, and a
+/// Enqueues checked canonical objective scoring, ordered objective keys, and a
 /// device seal behind the already-established same-stream parent dependency.
 /// There is no wait, current-population novelty, host transfer, event
 /// record/query, or synchronization in this helper.

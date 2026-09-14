@@ -37,6 +37,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         cost_band_pips,
         swap_long_pips_per_day,
         swap_short_pips_per_day,
+        pnl_conversion_fee_rate,
         kill_zones_enabled,
         population,
         population_auto,
@@ -64,6 +65,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         initial_balance,
         risk_per_trade_min,
         risk_per_trade_max,
+        high_quality_confidence,
         risky_risk_band,
         prop_firm_risk_band,
         max_regime_loss_pct,
@@ -100,6 +102,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
     encoder.option_f64_pair("cost_band_pips", cost_band_pips)?;
     encoder.f64("swap_long_pips_per_day", *swap_long_pips_per_day)?;
     encoder.f64("swap_short_pips_per_day", *swap_short_pips_per_day)?;
+    encoder.f64("pnl_conversion_fee_rate", *pnl_conversion_fee_rate)?;
     encoder.boolean("kill_zones_enabled", *kill_zones_enabled)?;
     encoder.usize("population", *population)?;
     encoder.boolean("population_auto", *population_auto)?;
@@ -127,6 +130,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
     encoder.f64("initial_balance", *initial_balance)?;
     encoder.f64("risk_per_trade_min", *risk_per_trade_min)?;
     encoder.f64("risk_per_trade_max", *risk_per_trade_max)?;
+    encoder.f64("high_quality_confidence", *high_quality_confidence)?;
     encoder.option_f64_pair("risky_risk_band", risky_risk_band)?;
     encoder.option_f64_pair("prop_firm_risk_band", prop_firm_risk_band)?;
     encoder.f64("max_regime_loss_pct", *max_regime_loss_pct)?;
@@ -531,5 +535,70 @@ const fn discovery_mode_wire_v1(mode: DiscoveryMode) -> u8 {
         DiscoveryMode::Strict => 1,
         DiscoveryMode::PropFirm => 2,
         DiscoveryMode::Risky => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resident_run_config_identity_binds_mode_risk_goal_and_search_budget() {
+        let baseline = DiscoveryConfig::default();
+        let expected = canonical_discovery_config_digest_v1(&baseline).unwrap();
+        for field in 0..7 {
+            let mut changed = baseline.clone();
+            match field {
+                0 => {
+                    changed.mode = if baseline.mode == DiscoveryMode::Risky {
+                        DiscoveryMode::PropFirm
+                    } else {
+                        DiscoveryMode::Risky
+                    }
+                }
+                1 => {
+                    changed.risk_per_trade_max =
+                        f64::from_bits(baseline.risk_per_trade_max.to_bits() ^ 1)
+                }
+                2 => changed.risky_target_balance += 1.0,
+                3 => changed.generations += 1,
+                4 => changed.max_hours += 0.25,
+                5 => changed.population += 1,
+                _ => {
+                    changed.require_walkforward_for_export =
+                        !baseline.require_walkforward_for_export
+                }
+            }
+            assert_ne!(
+                expected,
+                canonical_discovery_config_digest_v1(&changed).unwrap(),
+                "field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_identity_sorts_maps_but_preserves_ordered_features_and_exact_float_bits() {
+        let mut first = DiscoveryConfig::default();
+        let mut second = first.clone();
+        first.max_rows_by_timeframe = [("M5".to_owned(), 100), ("M30".to_owned(), 200)].into();
+        second.max_rows_by_timeframe = [("M30".to_owned(), 200), ("M5".to_owned(), 100)].into();
+        assert_eq!(
+            canonical_discovery_config_digest_v1(&first),
+            canonical_discovery_config_digest_v1(&second)
+        );
+        first.higher_timeframes = vec!["H1".to_owned(), "H4".to_owned()];
+        second.higher_timeframes = vec!["H4".to_owned(), "H1".to_owned()];
+        assert_ne!(
+            canonical_discovery_config_digest_v1(&first),
+            canonical_discovery_config_digest_v1(&second)
+        );
+        second = first.clone();
+        first.swap_long_pips_per_day = 0.0;
+        second.swap_long_pips_per_day = -0.0;
+        assert_ne!(
+            canonical_discovery_config_digest_v1(&first),
+            canonical_discovery_config_digest_v1(&second)
+        );
     }
 }

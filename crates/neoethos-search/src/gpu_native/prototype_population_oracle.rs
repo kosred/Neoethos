@@ -4,11 +4,21 @@
 //! first-hit, cost and metric rules without calling Prototype A or the full
 //! population evaluator. It is an untimed validation reference: production
 //! benchmark paths must prepare these results before entering their timed loop.
+//! This is host-only reference math, not device acceptance evidence. Its
+//! protective exits are active from the first post-entry bar, irrespective of
+//! the legacy minimum-hold field; device kernels require separate verification.
+//! Conversion fees follow the versioned research price-gross debit assumption,
+//! not broker settlement or an assertion of matching device fee arithmetic.
 
-use crate::eval::{BacktestSettings, current_backtest_runtime_overrides};
+use crate::eval::{
+    BacktestSettings, completed_month_return_sharpe_v1, current_backtest_runtime_overrides,
+};
 use crate::gpu_native::prototype_bc::PrototypeKind;
 use crate::gpu_native::prototype_population::{
     PrototypeBcIneligibilityReason, PrototypePopulationWorkload,
+};
+use neoethos_core::research_conversion_fee::{
+    ResearchPnlConversionFeePolicyV1, validate_conversion_fee_rate_v1,
 };
 use neoethos_gpu_contracts::device::{
     NeoPopulationCounters, NeoPopulationEvent, NeoPopulationMetricRow, NeoPopulationOutcome,
@@ -48,11 +58,9 @@ fn outcome_bar_probes() -> usize {
 fn outcome_schedule_slots_for_probe(
     events: &[NeoPopulationEvent],
     bars: usize,
-    min_hold_bars: usize,
     max_hold_bars: usize,
 ) -> usize {
-    build_outcome_schedules(events, 0..events.len(), bars, min_hold_bars, max_hold_bars)
-        .allocated_slots()
+    build_outcome_schedules(events, 0..events.len(), bars, max_hold_bars).allocated_slots()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -531,13 +539,7 @@ fn resolve_population_outcomes_unchecked(
     // Ordered active-price indexes make event updates O(log E), for total
     // O(P*B + E log E) time and O(B + P + E) resolver memory.
     for range in candidate_ranges {
-        let schedules = build_outcome_schedules(
-            events,
-            range,
-            bars,
-            settings.min_hold_bars,
-            settings.max_hold_bars,
-        );
+        let schedules = build_outcome_schedules(events, range, bars, settings.max_hold_bars);
         let mut gap_cursor = 0;
         let mut level_cursor = 0;
         let mut max_hold_cursor = 0;
@@ -654,7 +656,6 @@ fn build_outcome_schedules(
     events: &[NeoPopulationEvent],
     range: Range<usize>,
     bars: usize,
-    min_hold_bars: usize,
     max_hold_bars: usize,
 ) -> OutcomeSchedules {
     let event_count = range.len();
@@ -682,7 +683,9 @@ fn build_outcome_schedules(
                 event_index,
             });
         }
-        let level_activation = entry_bar.saturating_add(min_hold_bars.max(1));
+        // Protection starts on the first bar after the causal close fill.
+        // Minimum hold cannot defer a stop/target that is already in force.
+        let level_activation = entry_bar.saturating_add(1);
         if level_activation <= last_bar {
             schedules.level_activations.push(ScheduledOutcomeEvent {
                 bar: level_activation,
@@ -690,7 +693,7 @@ fn build_outcome_schedules(
             });
         }
         if max_hold_bars > 0 {
-            let max_hold_exit = entry_bar.saturating_add(max_hold_bars.max(min_hold_bars));
+            let max_hold_exit = entry_bar.saturating_add(max_hold_bars);
             if max_hold_exit <= last_bar {
                 schedules.max_hold_exits.push(ScheduledOutcomeEvent {
                     bar: max_hold_exit,
@@ -842,7 +845,7 @@ fn emit_population_events_with_signals(
             };
             let last_bar = if settings.max_hold_bars > 0 {
                 entry_bar
-                    .saturating_add(settings.max_hold_bars.max(settings.min_hold_bars))
+                    .saturating_add(settings.max_hold_bars)
                     .min(last_dataset_bar)
             } else {
                 last_dataset_bar
@@ -1322,20 +1325,19 @@ fn reduce_candidate(
                     );
                     open_position = None;
                 }
-                // A regular SL/TP/max-hold exit occurs inside the open-position
-                // branch, so canonical evaluation cannot re-enter on this bar.
-                while events
-                    .get(event_cursor)
-                    .is_some_and(|event| event.entry_bar as usize == bar)
-                {
-                    event_cursor += 1;
-                    event_cursor_advances += 1;
-                }
-                continue;
             }
-            // Gap handling precedes the open/flat branch in the canonical
-            // evaluator. Once it closes the position, the same bar is flat and
-            // may consume the prior bar's signal below.
+            // An occupied bar cannot also accept an entry. In particular, a
+            // forced gap close must not reuse the signal from before the gap.
+            // Consume potential events even when the position just closed so
+            // the cursor remains monotonic without counting them as trades.
+            while events
+                .get(event_cursor)
+                .is_some_and(|event| event.entry_bar as usize == bar)
+            {
+                event_cursor += 1;
+                event_cursor_advances += 1;
+            }
+            continue;
         }
 
         if events
@@ -1363,6 +1365,9 @@ fn reduce_candidate(
             } else {
                 1.0
             };
+            if !lots.is_finite() || lots <= 0.0 {
+                continue;
+            }
             open_position = Some(OpenPosition {
                 event,
                 outcome,
@@ -1396,21 +1401,22 @@ fn reduce_candidate(
     } else {
         0.0
     };
-    let month_returns = completed_month_pnls(&monthly_pnls, month_ptr, month_capacity);
-    let (monthly_mean, monthly_std) = neoethos_core::utils::mean_std(&month_returns);
+    let completed_pnls = completed_month_pnls(&monthly_pnls, month_ptr, month_capacity);
+    let sharpe = completed_month_return_sharpe_v1(
+        &completed_pnls,
+        &month_start_equities[..completed_pnls.len()],
+    );
+    // Keep the custom consistency score's existing money-PnL definition,
+    // while Sharpe uses each completed month's own percentage return.
+    let (monthly_mean, monthly_std) = neoethos_core::utils::mean_std(&completed_pnls);
     let (monthly_mean, monthly_std) = if monthly_mean.is_finite() && monthly_std.is_finite() {
         (monthly_mean, monthly_std)
     } else {
         (0.0, 0.0)
     };
-    let sharpe = if monthly_std > 0.0 {
-        (monthly_mean / monthly_std) * 3.4641
-    } else {
-        0.0
-    };
     let consistency = if monthly_std > 0.0 {
         (monthly_mean / monthly_std).clamp(0.0, 1.0)
-    } else if monthly_mean > 0.0 && month_returns.len() < 2 {
+    } else if monthly_mean > 0.0 && completed_pnls.len() < 2 {
         1.0
     } else {
         0.0
@@ -1428,7 +1434,7 @@ fn reduce_candidate(
             scenario_id,
             values: [
                 sanitize(net_profit),
-                sanitize(sharpe),
+                sharpe,
                 sanitize(peak_equity),
                 sanitize(max_drawdown),
                 sanitize(win_rate),
@@ -1471,7 +1477,10 @@ fn realize_position(
     } else {
         (position.entry_price - exit_price) / pip * settings.pip_value_per_lot
     };
-    let gross_scaled = price_pnl * position.lots
+    // Entry spread is already in entry_price. The remaining exit half-spread
+    // belongs to realized price gross; commission and swap do not.
+    let price_gross_scaled = price_pnl * position.lots - half_spread_cost * position.lots;
+    let pnl_after_costs_scaled = price_pnl * position.lots
         - (settings.commission_per_trade + half_spread_cost) * position.lots;
     let entry_bar = position.event.entry_bar as usize;
     let entry_timestamp = workload
@@ -1487,7 +1496,8 @@ fn realize_position(
         .copied()
         .unwrap_or(0);
     let pnl = apply_carry_and_conversion(
-        gross_scaled,
+        pnl_after_costs_scaled,
+        price_gross_scaled,
         position.lots,
         position.event.direction,
         entry_timestamp,
@@ -1584,7 +1594,12 @@ fn entry_stop_target_pips(
         if let Some(base) = &settings.adaptive_base_pips {
             if let Some(&distance) = base.get(signal_bar) {
                 let stop = multiplier * distance;
-                let target = settings.adaptive_rr * stop;
+                let reward_risk = crate::stop_target::effective_adaptive_reward_risk(
+                    workload.genes.stop_pips[gene_index],
+                    workload.genes.target_pips[gene_index],
+                    settings.adaptive_rr,
+                );
+                let target = reward_risk * stop;
                 if stop.is_finite() && stop > 0.0 && target.is_finite() && target > 0.0 {
                     return (stop, target);
                 }
@@ -1612,8 +1627,18 @@ fn risk_based_position_lots(
         };
     let risk = settings.risk_per_trade_min
         + (settings.risk_per_trade_max - settings.risk_per_trade_min) * confidence_scale;
-    let denominator = stop_pips.max(1.0) * settings.pip_value_per_lot;
-    let lots = if equity > 0.0 && denominator.abs() > 1.0e-12 && denominator.is_finite() {
+    // Independent expression of the actual cash risk, including sub-pip
+    // stops. A fictitious one-pip denominator understates position exposure.
+    let denominator = stop_pips * settings.pip_value_per_lot;
+    let lots = if equity.is_finite()
+        && equity > 0.0
+        && stop_pips.is_finite()
+        && stop_pips > 0.0
+        && settings.pip_value_per_lot.is_finite()
+        && settings.pip_value_per_lot > 0.0
+        && denominator.is_finite()
+        && denominator > 0.0
+    {
         risk * equity / denominator
     } else {
         0.0
@@ -1626,7 +1651,8 @@ fn risk_based_position_lots(
 }
 
 fn apply_carry_and_conversion(
-    gross_pnl_scaled: f64,
+    pnl_after_costs_scaled: f64,
+    price_gross_scaled: f64,
     lots: f64,
     direction: i32,
     entry_timestamp: i64,
@@ -1644,15 +1670,22 @@ fn apply_carry_and_conversion(
         settings.swap_short_pips_per_day
     };
     let with_carry =
-        gross_pnl_scaled + swap_pips * overnight_days * settings.pip_value_per_lot * lots;
-    if settings.pnl_conversion_fee_rate.is_finite()
-        && settings.pnl_conversion_fee_rate > 0.0
-        && settings.pnl_conversion_fee_rate < 1.0
-    {
-        with_carry * (1.0 - settings.pnl_conversion_fee_rate)
-    } else {
-        with_carry
+        pnl_after_costs_scaled + swap_pips * overnight_days * settings.pip_value_per_lot * lots;
+    let rate = settings.pnl_conversion_fee_rate;
+    validate_conversion_fee_rate_v1(rate).expect("invalid research conversion fee rate");
+    if rate == 0.0 {
+        // Preserve the original fee-zero arithmetic, including its exact bits.
+        return with_carry;
     }
+    let fee = ResearchPnlConversionFeePolicyV1::AbsoluteRealizedPriceGrossDebitV1
+        .debit(price_gross_scaled, rate)
+        .expect("invalid research conversion fee gross");
+    let net = with_carry - fee;
+    assert!(
+        net.is_finite(),
+        "research conversion fee produced non-finite net PnL"
+    );
+    net
 }
 
 fn is_gap_exit(
@@ -1984,13 +2017,87 @@ mod tests {
             }
         }
 
-        assert!(actual.metrics[0].values[0] > 4_000.0);
-        assert!(actual.metrics[1].values[0] < 0.0);
+        // Independent cash arithmetic: long gross 5000-100=4900, commission
+        // 10, swap -200, fee 49; short gross -1000-100=-1100, commission 10,
+        // swap -100, fee 11. A loss pays a debit, never a fee rebate.
+        assert_eq!(actual.metrics[0].values[0], 4_641.0);
+        assert_eq!(actual.metrics[1].values[0], -1_221.0);
         assert_eq!(actual.metrics[2].values[0], 0.0);
         assert_eq!(actual.metrics[2].values[2], 100_000.0);
         assert_eq!(actual.metrics[2].values[8], 0.0);
         assert!(actual.metrics[0].values[10] > 0.0);
         assert!(actual.metrics[1].values[10] > actual.metrics[0].values[10]);
+    }
+
+    #[test]
+    fn oracle_fee_debits_price_gross_independently_of_commission_swap_and_lot_scale() {
+        let mut settings = canonical_cost_fixture().dataset.settings.to_settings();
+        settings.swap_short_pips_per_day = 0.5;
+        let entry = 1_700_000_000_000_i64;
+        // Per lot: commission 10; two-day carry -200 long / +100 short.
+        // At 1%, positive/negative gross 100 both pay 1; zero gross pays 0.
+        // Explicit cash expectations do not call the CPU evaluator or fee helper.
+        let cases = [
+            (100.0, POPULATION_DIRECTION_LONG, -111.0_f64),
+            (100.0, POPULATION_DIRECTION_SHORT, 189.0),
+            (-100.0, POPULATION_DIRECTION_LONG, -311.0),
+            (-100.0, POPULATION_DIRECTION_SHORT, -11.0),
+            (0.0, POPULATION_DIRECTION_LONG, -210.0),
+            (0.0, POPULATION_DIRECTION_SHORT, 90.0),
+        ];
+        for lots in [0.25, 1.0, 2.5] {
+            for (price_gross_per_lot, direction, expected_per_lot) in cases {
+                let price_gross = price_gross_per_lot * lots;
+                let actual = apply_carry_and_conversion(
+                    price_gross - 10.0 * lots,
+                    price_gross,
+                    lots,
+                    direction,
+                    entry,
+                    entry + 2 * 86_400_000,
+                    &settings,
+                );
+                assert_eq!(
+                    actual.to_bits(),
+                    (expected_per_lot * lots).to_bits(),
+                    "gross={price_gross_per_lot}, direction={direction}, lots={lots}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_zero_fee_preserves_the_original_carry_arithmetic_bits() {
+        let mut settings = canonical_cost_fixture().dataset.settings.to_settings();
+        let entry = 1_700_000_000_000_i64;
+        let elapsed = 97_531_127_i64;
+        let overnight_days = elapsed as f64 / 86_400_000.0;
+        for rate in [0.0, -0.0] {
+            settings.pnl_conversion_fee_rate = rate;
+            for lots in [0.25, 1.0, 2.5] {
+                for pnl_after_costs in [-12.375, 0.0, 13.125] {
+                    for direction in [POPULATION_DIRECTION_LONG, POPULATION_DIRECTION_SHORT] {
+                        let swap = if direction == POPULATION_DIRECTION_LONG {
+                            settings.swap_long_pips_per_day
+                        } else {
+                            settings.swap_short_pips_per_day
+                        };
+                        let original = pnl_after_costs
+                            + swap * overnight_days * settings.pip_value_per_lot * lots;
+                        let actual = apply_carry_and_conversion(
+                            pnl_after_costs,
+                            f64::NAN, // Fee-zero must not inspect or operate on this basis.
+                            lots,
+                            direction,
+                            entry,
+                            entry + elapsed,
+                            &settings,
+                        );
+                        assert_eq!(actual.to_bits(), original.to_bits());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2033,6 +2140,32 @@ mod tests {
     }
 
     #[test]
+    fn oracle_monthly_sharpe_matches_hand_calculated_percentage_returns() {
+        let mut workload = daily_drawdown_fixture();
+        workload.dataset.close = vec![100.0, 100.0, 1_100.0, 100.0, 1_100.0, 1_100.0];
+        workload.dataset.high = workload.dataset.close.clone();
+        workload.dataset.low = workload.dataset.close.clone();
+        workload.dataset.months = vec![0, 0, 0, 1, 1, 2];
+        workload.dataset.settings.max_hold_bars = 1;
+
+        let actual = evaluate_population_oracle(&workload).unwrap().metrics[0];
+        let cpu = full_cpu_metrics(&workload)[0];
+        assert_eq!(actual.values[0], 2_000.0);
+        assert_eq!(actual.values[8], 2.0);
+        // Two equal cash profits have DIFFERENT period returns after the first
+        // profit changes the second month's capital. The independent sample
+        // variance below must not collapse to the zero of raw-money PnL.
+        let first: f64 = 1_000.0 / 100_000.0;
+        let second = 1_000.0 / 101_000.0;
+        let mean = (first + second) / 2.0;
+        let sample_std =
+            ((first - mean) * (first - mean) + (second - mean) * (second - mean)).sqrt();
+        let expected = mean / sample_std * 3.4641;
+        assert!((actual.values[1] - expected).abs() < 1e-10);
+        assert!((cpu[1] - expected).abs() < 1e-10);
+    }
+
+    #[test]
     fn population_settings_capture_runtime_equity_capacity_and_cost_flags() {
         let workload = canonical_cost_fixture();
         let settings = population_settings(&workload).unwrap();
@@ -2046,14 +2179,17 @@ mod tests {
     }
 
     #[test]
-    fn gap_exit_allows_canonical_same_bar_reentry() {
+    fn gap_exit_does_not_accept_a_same_bar_reentry() {
         let workload = gap_reentry_fixture();
 
         let expected = full_cpu_metrics(&workload);
         let actual = evaluate_population_oracle(&workload).unwrap();
 
         assert_eq!(actual.counters.event_count, 3);
-        assert_eq!(actual.counters.accepted_trade_count, 3);
+        assert_eq!(actual.counters.accepted_trade_count, 2);
+        // Flat close: gross -100 entry spread -100 exit spread, commission
+        // 10, two-day long swap -200, and 2 conversion-fee debit.
+        assert_eq!(actual.metrics[0].values[0], -412.0);
         for (slot, (oracle, cpu)) in actual.metrics[0]
             .values
             .iter()
@@ -2125,7 +2261,7 @@ mod tests {
         assert_eq!(ranges, vec![0..2, 2..3, 3..3]);
         assert_eq!(event_cursor_advances, events.len());
         assert_eq!(actual.counters.event_count, 3);
-        assert_eq!(actual.counters.accepted_trade_count, 3);
+        assert_eq!(actual.counters.accepted_trade_count, 2);
         assert_eq!(actual.metrics[0].values[8], 1.0);
         assert_eq!(actual.metrics[1].values[8], 1.0);
         assert_eq!(actual.metrics[2].values[8], 0.0);
@@ -2197,7 +2333,7 @@ mod tests {
             },
         ];
 
-        let allocated_slots = outcome_schedule_slots_for_probe(&events, bars, 0, 0);
+        let allocated_slots = outcome_schedule_slots_for_probe(&events, bars, 0);
         assert!(
             allocated_slots <= events.len().saturating_mul(3),
             "sparse schedules allocated {allocated_slots} slots for {} events at {bars} bars",
@@ -2375,13 +2511,13 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_entry_levels_match_full_cpu_and_ignore_fixed_fallback_values() {
+    fn adaptive_entry_levels_match_full_cpu_and_use_the_gene_reward_risk() {
         let mut workload = canonical_cost_fixture();
         workload.dataset.settings.adaptive_base_pips = Some(vec![10.0; BARS]);
-        workload.dataset.settings.adaptive_rr = 5.0;
+        workload.dataset.settings.adaptive_rr = 9.0;
         workload.genes.stop_vol_multipliers[0] = 1.0;
-        workload.genes.stop_pips[0] = 999.0;
-        workload.genes.target_pips[0] = 999.0;
+        workload.genes.stop_pips[0] = 10.0;
+        workload.genes.target_pips[0] = 50.0;
 
         let expected = full_cpu_metrics(&workload);
         let actual = evaluate_population_oracle(&workload).unwrap();
@@ -2402,20 +2538,24 @@ mod tests {
     }
 
     #[test]
-    fn minimum_hold_extends_an_earlier_max_hold_boundary() {
+    fn minimum_hold_cannot_extend_an_earlier_max_hold_boundary() {
         let mut workload = canonical_cost_fixture();
         workload.dataset.settings.max_hold_bars = 1;
         workload.dataset.settings.min_hold_bars = 2;
+        workload.dataset.high[2] = 100.0; // No price barrier before the deadline.
 
         let expected = full_cpu_metrics(&workload);
         let actual = evaluate_population_oracle(&workload).unwrap();
 
-        assert_eq!(actual.events[0].last_bar, 3);
-        assert_eq!(actual.outcomes[0].exit_bar, 3);
+        assert_eq!(actual.events[0].last_bar, 2);
+        assert_eq!(actual.outcomes[0].exit_bar, 2);
         assert_eq!(
             actual.outcomes[0].exit_reason,
             neoethos_gpu_contracts::POPULATION_EXIT_MAX_HOLD
         );
+        // Long: price gross -100-100=-200, commission 10, two-day swap
+        // -200, and abs(-200)*1%=2 fee debit. This is not a CPU copy.
+        assert_eq!(actual.metrics[0].values[0], -412.0);
         for (slot, (oracle, cpu)) in actual.metrics[0]
             .values
             .iter()
@@ -2426,6 +2566,76 @@ mod tests {
                 (oracle - cpu).abs() <= 1.0e-10,
                 "min/max-hold metric slot {slot}: oracle={oracle}, cpu={cpu}"
             );
+        }
+    }
+
+    #[test]
+    fn minimum_hold_never_defers_stop_or_target_at_the_maximum_deadline() {
+        let mut workload = canonical_cost_fixture();
+        workload.dataset.settings.max_hold_bars = 1;
+        workload.dataset.settings.min_hold_bars = 10;
+        let expected = full_cpu_metrics(&workload);
+        let actual = evaluate_population_oracle(&workload).unwrap();
+        assert_eq!(actual.outcomes[0].exit_bar, 2);
+        assert_eq!(actual.outcomes[0].exit_reason, POPULATION_EXIT_TARGET);
+        assert_eq!(actual.outcomes[1].exit_bar, 2);
+        assert_eq!(actual.outcomes[1].exit_reason, POPULATION_EXIT_STOP);
+        // Long: 4900-10-200-49; short: -1100-10-100-11. Fee basis is
+        // realized price gross, never commission or carry.
+        for (index, cash) in [4_641.0, -1_221.0].into_iter().enumerate() {
+            assert_eq!(actual.events[index].last_bar, 2);
+            assert_eq!(actual.metrics[index].values[8], 1.0);
+            assert!((actual.metrics[index].values[0] - cash).abs() <= 1.0e-8);
+            for (slot, (oracle, cpu)) in actual.metrics[index]
+                .values
+                .iter()
+                .zip(&expected[index])
+                .enumerate()
+            {
+                assert!(
+                    (oracle - cpu).abs() <= 1.0e-10,
+                    "protected candidate {index} metric slot {slot}: oracle={oracle}, cpu={cpu}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_sizes_subpip_stops_by_actual_cash_risk_and_skips_zero_exposure() {
+        for risk in [0.0, 0.01] {
+            let mut workload = canonical_cost_fixture();
+            workload.dataset.settings.spread_pips = 0.0;
+            workload.dataset.settings.commission_per_trade = 0.0;
+            workload.dataset.settings.swap_long_pips_per_day = 0.0;
+            workload.dataset.settings.swap_short_pips_per_day = 0.0;
+            workload.dataset.settings.pnl_conversion_fee_rate = 0.0;
+            workload.dataset.settings.risk_based_sizing = true;
+            workload.dataset.settings.risk_per_trade_min = risk;
+            workload.dataset.settings.risk_per_trade_max = risk;
+            workload.dataset.high[2] = 101.0;
+            workload.dataset.low[2] = 99.0;
+            workload.genes.stop_pips.fill(0.25);
+            workload.genes.target_pips.fill(0.5);
+            let expected = full_cpu_metrics(&workload);
+            let actual = evaluate_population_oracle(&workload).unwrap();
+            let traded = u64::from(risk > 0.0);
+            assert_eq!(actual.counters.accepted_trade_count, 2 * traded);
+            for index in 0..2 {
+                // At 1% risk: 1000 cash / (0.25 pips * 100 per pip) = 40 lots.
+                assert!((actual.metrics[index].values[0] + risk * 100_000.0).abs() <= 1.0e-8);
+                assert_eq!(actual.metrics[index].values[8], traded as f64);
+                for (slot, (oracle, cpu)) in actual.metrics[index]
+                    .values
+                    .iter()
+                    .zip(&expected[index])
+                    .enumerate()
+                {
+                    assert!(
+                        (oracle - cpu).abs() <= 1.0e-10,
+                        "risk {risk} candidate {index} metric slot {slot}: oracle={oracle}, cpu={cpu}"
+                    );
+                }
+            }
         }
     }
 

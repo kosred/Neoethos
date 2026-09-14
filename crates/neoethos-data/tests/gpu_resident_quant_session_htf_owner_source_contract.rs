@@ -118,7 +118,7 @@ fn htf_owner_retains_opaque_parents_and_binds_causal_alignment_per_route() {
     let source =
         read("crates/neoethos-data/src/core/gpu_resident_higher_timeframe_alignment_v3.rs");
     for required in [
-        "HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION_V3: u32 = 3",
+        "HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION_V3: u32 = 4",
         "RetainedResidentHigherTimeframeParentV3<P>",
         "parent: P",
         "selected_parent_order",
@@ -126,7 +126,7 @@ fn htf_owner_retains_opaque_parents_and_binds_causal_alignment_per_route() {
         "ResidentFeatureProducerV3::HigherTimeframeAlignment",
         "ResidentFeatureStageV3::HigherTimeframeAligned",
         "fixed_open_plus_period_v1",
-        "next_direct_bar_open_v1",
+        "next_direct_bar_open_observed_span_expiry_v1",
         "availability_lag_ms",
         "max_age_ms",
         "retained_parent_device_bytes",

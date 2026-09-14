@@ -434,27 +434,29 @@ fn assembler_appends_one_exact_monotonic_batch_and_retires_it_before_the_next() 
     assert!(!runtime.contains("Vec<Box<dyn ResidentF64FeatureBatchV3>>"));
     assert!(!runtime.contains("feature_sources:"));
     assert!(!runtime.contains("release_is_non_synchronizing"));
+    let assembler_impl = runtime
+        .split_once("impl ResidentFeatureStoreAssemblerV3 {")
+        .expect("resident assembler implementation")
+        .1;
+    let append = braced_item(assembler_impl, "fn append_batch_with_external_live_bytes(");
     before(
-        &runtime,
-        "append_batch",
+        append,
+        "fn append_batch_with_external_live_bytes(",
         "ResidentAppendTransactionV3::new(batch)",
     );
     before(
-        &runtime,
+        append,
         "ResidentAppendTransactionV3::new(batch)",
         "if self.pending_batch.is_some()",
     );
     before(
-        &runtime,
+        append,
         "expected_column_bindings",
         "transaction.ready_event().record",
     );
-    before(
-        &runtime,
-        "pending.batch_ready_event.query",
-        "pending.release",
-    );
-    before(&runtime, "try_retire_completed_batch", "pub fn seal(");
+    let retire = braced_item(assembler_impl, "pub fn try_retire_completed_batch(");
+    before(retire, "pending.batch_ready_event.query", "pending.release");
+    before(assembler_impl, "try_retire_completed_batch", "pub fn seal(");
     assert!(runtime.contains("return Ok(false);"));
     assert_eq!(
         runtime
@@ -502,13 +504,27 @@ fn resident_peak_is_one_final_store_plus_u4_and_max_live_batch_never_all_sources
     assert!(!contracts.contains("permanent_view_indices_bytes"));
     assert!(contracts.contains("active_view_indices_bytes = 0"));
     assert!(contracts.contains("lazy_view_indices_capacity_bytes = 0"));
-    assert_eq!(
-        runtime
-            .matches("StreamOrderedDeviceBufferV3::<f64>::uninitialized_async(")
-            .count(),
-        1,
-        "strict production owns exactly one full final f64 allocation"
-    );
+    let assembler_impl = runtime
+        .split_once("impl ResidentFeatureStoreAssemblerV3 {")
+        .expect("resident assembler implementation")
+        .1;
+    for constructor in [
+        braced_item(assembler_impl, "pub fn new("),
+        braced_item(assembler_impl, "pub fn new_compact_v2("),
+    ] {
+        assert_eq!(
+            constructor
+                .matches("StreamOrderedDeviceBufferV3::<f64>::uninitialized_async(")
+                .count(),
+            1,
+            "each mutually exclusive final-store constructor owns exactly one f64 allocation"
+        );
+        before(
+            constructor,
+            "let (observed_free_bytes, _) = mem_get_info()?",
+            "StreamOrderedDeviceBufferV3::<f64>::uninitialized_async(",
+        );
+    }
     assert!(!runtime.contains("canonical_feature_major_values"));
     assert!(!runtime.contains("all_producer_sources"));
     assert!(runtime.contains("let merkle_scratch_level_bytes ="));
@@ -542,11 +558,6 @@ fn resident_peak_is_one_final_store_plus_u4_and_max_live_batch_never_all_sources
     before(
         &runtime,
         "let (observed_free_bytes, _) = mem_get_info()?",
-        "StreamOrderedDeviceBufferV3::<f64>::uninitialized_async(",
-    );
-    before(
-        &runtime,
-        "let (observed_free_bytes, _) = mem_get_info()?",
         "pub fn append_batch",
     );
 }
@@ -576,9 +587,25 @@ fn u4_pack_is_lossless_word_padded_zeroed_once_and_checks_every_producer_code() 
         runtime
             .matches("neoethos_resident_initialize_validity_u4_v3(")
             .count(),
-        2,
-        "one declaration plus one initialization call is required"
+        7,
+        "one declaration, two final-store initializers, and two bounded-screening initializer labels/calls are required"
     );
+    let assembler_impl = runtime
+        .split_once("impl ResidentFeatureStoreAssemblerV3 {")
+        .expect("resident assembler implementation")
+        .1;
+    for constructor in [
+        braced_item(assembler_impl, "pub fn new("),
+        braced_item(assembler_impl, "pub fn new_compact_v2("),
+    ] {
+        assert_eq!(
+            constructor
+                .matches("neoethos_resident_initialize_validity_u4_v3(")
+                .count(),
+            1,
+            "each final-store constructor must initialize its packed validity exactly once"
+        );
+    }
     assert!(runtime.contains("let mut validity_code_error = [0_u32; 1]"));
     assert!(runtime.contains(".copy_to(&mut validity_code_error)"));
     assert!(runtime.contains("InvalidProducerValidityCode"));
@@ -802,10 +829,10 @@ fn cupqc_is_optional_and_portable_in_tree_v3_is_mandatory() {
 fn strict_data_staged_entrypoints_own_the_entire_resident_materialization_sequence() {
     let source = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
     let library = read("crates/neoethos-data/src/lib.rs");
-    let staged_materializer = source
-        .split_once("fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(")
-        .expect("strict staged Data V3 materializer")
-        .1;
+    let staged_materializer = braced_item(
+        &source,
+        "fn materialize_prepared_gpu_only_feature_store_on_run_device_v3(",
+    );
     for token in [
         "pub fn prepare_gpu_only_feature_materialization_v3(",
         "pub fn materialize_gpu_only_feature_store_v3(",
@@ -818,7 +845,7 @@ fn strict_data_staged_entrypoints_own_the_entire_resident_materialization_sequen
         "admitted_run.into_gpu_only_run_device_admission_v3()",
         "bind_gpu_only_run_device_v3(preflight, run_device)?",
         "producers.take_smc_materialization()?",
-        "admission.begin_materialization(smc_materialization)?",
+        "admission.begin_materialization(execution.smc_materialization)?",
         "pending_smc_batch.append_to(&mut assembler)?",
         "assembler.try_retire_completed_batch()?",
         "let owner = assembler.seal()?",
@@ -836,10 +863,10 @@ fn strict_data_staged_entrypoints_own_the_entire_resident_materialization_sequen
         ),
         (
             "admitted_run.into_gpu_only_run_device_admission_v3()",
-            "admission.begin_materialization(smc_materialization)?",
+            "admission.begin_materialization(execution.smc_materialization)?",
         ),
         (
-            "admission.begin_materialization(smc_materialization)?",
+            "admission.begin_materialization(execution.smc_materialization)?",
             "pending_smc_batch.append_to(&mut assembler)?",
         ),
         (
@@ -851,7 +878,12 @@ fn strict_data_staged_entrypoints_own_the_entire_resident_materialization_sequen
             "seal_gpu_resident_feature_store_v3(",
         ),
     ] {
-        let ordering_source = if left == "let owner = assembler.seal()?" {
+        let ordering_source = if matches!(
+            left,
+            "admission.begin_materialization(execution.smc_materialization)?"
+                | "pending_smc_batch.append_to(&mut assembler)?"
+                | "let owner = assembler.seal()?"
+        ) {
             staged_materializer
         } else {
             &source
@@ -940,6 +972,8 @@ fn two_pass_continuation_seals_selection_before_any_final_store_allocation() {
         "pub struct PreparedGpuOnlyFeatureTwoPassContinuationV2",
         "pub struct ScoredGpuOnlyFeatureTwoPassContinuationV2",
         "pub struct SealedResidentSelectedMapReceiptV2",
+        "pub struct PreparedCompactSelectedStoreV2",
+        "pub struct AdmittedCompactSelectedStoreV2",
         "pub fn begin_prepared_gpu_only_feature_two_pass_v2(",
         "pub fn stream_score_batches_v2(",
         "pub fn seal_selected_map_v2(",
@@ -989,17 +1023,25 @@ fn two_pass_continuation_seals_selection_before_any_final_store_allocation() {
         "selected-map seal must return the typed sealed receipt"
     );
 
+    let prepare_signature =
+        function_signature(&source, "pub fn prepare_compact_selected_store_v2(");
+    require_by_value_type(
+        prepare_signature,
+        "SealedResidentSelectedMapReceiptV2",
+        "compact preparation",
+    );
+    assert!(
+        prepare_signature.contains("PreparedCompactSelectedStoreV2"),
+        "compact preparation must return the population-plan binding continuation"
+    );
     let compact_signature =
         function_signature(&source, "pub fn materialize_compact_selected_store_v2(");
     require_by_value_type(
         compact_signature,
-        "SealedResidentSelectedMapReceiptV2",
+        "AdmittedCompactSelectedStoreV2",
         "compact materialization",
     );
-    assert!(
-        compact_signature.contains("SealedGpuResidentFeatureStoreV3"),
-        "compact materialization must return the sealed resident store"
-    );
+    assert!(compact_signature.contains("SealedGpuResidentFeatureStoreV3"));
 
     for pre_seal_stage in [
         "pub fn begin_prepared_gpu_only_feature_two_pass_v2(",
@@ -1023,24 +1065,35 @@ fn two_pass_continuation_seals_selection_before_any_final_store_allocation() {
         "PreparedGpuOnlyFeatureTwoPassContinuationV2",
         "ScoredGpuOnlyFeatureTwoPassContinuationV2",
         "SealedResidentSelectedMapReceiptV2",
+        "PreparedCompactSelectedStoreV2",
+        "AdmittedCompactSelectedStoreV2",
     ] {
         require_move_only_type(&source, continuation);
     }
 }
 
 #[test]
-fn compact_public_path_consumes_only_the_sealed_selected_extent() {
+fn compact_public_path_consumes_only_the_admitted_selected_extent() {
     let source = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
+    let prepare_signature =
+        function_signature(&source, "pub fn prepare_compact_selected_store_v2(");
+    require_by_value_type(
+        prepare_signature,
+        "SealedResidentSelectedMapReceiptV2",
+        "compact selected-map preparation",
+    );
     let compact_signature =
         function_signature(&source, "pub fn materialize_compact_selected_store_v2(");
     require_by_value_type(
         compact_signature,
-        "SealedResidentSelectedMapReceiptV2",
+        "AdmittedCompactSelectedStoreV2",
         "compact resident materialization",
     );
     for forbidden_type in [
         "PreparedGpuOnlyFeatureTwoPassContinuationV2",
         "ScoredGpuOnlyFeatureTwoPassContinuationV2",
+        "SealedResidentSelectedMapReceiptV2",
+        "PreparedCompactSelectedStoreV2",
     ] {
         assert!(
             !compact_signature.contains(forbidden_type),
@@ -1063,15 +1116,64 @@ fn compact_public_path_consumes_only_the_sealed_selected_extent() {
     assert!(extent_signature.contains("CompactSelectedStoreAllocationExtentV2"));
     let extent_binding =
         let_binding_for_call(compact_body, "compact_selected_store_allocation_extent_v2(");
+    let inner_call =
+        parenthesized_call(compact_body, "materialize_compact_selected_store_inner_v2(");
+    assert!(
+        inner_call.contains(extent_binding)
+            && !inner_call.contains(&format!("&{extent_binding}"))
+            && !inner_call.contains(&format!("{extent_binding}.clone()")),
+        "compact public entry must move the sizing helper's typed extent into its private continuation"
+    );
+
+    let compact_inner = braced_item(&source, "fn materialize_compact_selected_store_inner_v2(");
+    require_by_value_type(
+        compact_inner,
+        "CompactSelectedStoreAllocationExtentV2",
+        "compact private continuation",
+    );
+    let inner_extent =
+        exact_parameter_binding(compact_inner, "CompactSelectedStoreAllocationExtentV2");
+    let admission_call = parenthesized_call(compact_inner, ".begin_compact_materialization_v2(");
+    assert!(
+        admission_call.contains(inner_extent)
+            && !admission_call.contains(&format!("&{inner_extent}"))
+            && !admission_call.contains(&format!("{inner_extent}.clone()")),
+        "compact private continuation must move the sealed extent into the Data admission"
+    );
+
+    let data_admission = braced_item(&source, "fn begin_compact_materialization_v2(");
+    require_by_value_type(
+        data_admission,
+        "CompactSelectedStoreAllocationExtentV2",
+        "compact Data admission",
+    );
+    let data_extent =
+        exact_parameter_binding(data_admission, "CompactSelectedStoreAllocationExtentV2");
+    let smc_call = parenthesized_call(data_admission, "begin_resident_smc_compact_store_v2(");
+    assert!(
+        smc_call.contains(data_extent)
+            && !smc_call.contains(&format!("&{data_extent}"))
+            && !smc_call.contains(&format!("{data_extent}.clone()")),
+        "compact Data admission must move the extent through the opaque SMC parent boundary"
+    );
+
+    let smc_source = read("crates/neoethos-gpu-cuda/src/resident_smc_v3.rs");
+    let smc_compact = braced_item(&smc_source, "pub fn begin_resident_smc_compact_store_v2(");
+    require_by_value_type(
+        smc_compact,
+        "CompactSelectedStoreAllocationExtentV2",
+        "compact SMC boundary",
+    );
+    let smc_extent = exact_parameter_binding(smc_compact, "CompactSelectedStoreAllocationExtentV2");
     let allocator_call = parenthesized_call(
-        compact_body,
+        smc_compact,
         "ResidentFeatureStoreAssemblerV3::new_compact_v2(",
     );
     assert!(
-        allocator_call.contains(extent_binding)
-            && !allocator_call.contains(&format!("&{extent_binding}"))
-            && !allocator_call.contains(&format!("{extent_binding}.clone()")),
-        "compact materialization must move the sizing helper's typed extent into the allocator"
+        allocator_call.contains(smc_extent)
+            && !allocator_call.contains(&format!("&{smc_extent}"))
+            && !allocator_call.contains(&format!("{smc_extent}.clone()")),
+        "opaque SMC boundary must move the typed extent into the compact allocator"
     );
 
     let allocator_source = read("crates/neoethos-gpu-cuda/src/resident_feature_store_v3.rs");

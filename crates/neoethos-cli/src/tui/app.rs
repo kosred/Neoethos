@@ -103,6 +103,13 @@ impl PendingAction {
 
 pub struct AppShared {
     pub data_root: PathBuf,
+    pub cache_root: PathBuf,
+    pub funnel_selected_path: Option<PathBuf>,
+    pub funnel_scroll: u16,
+    /// Read-only Symbols inventory offset; import fields retain Up/Down.
+    pub symbols_scroll: u16,
+    /// Actual wrapped inventory viewport from the most recent Symbols draw.
+    pub symbols_viewport: Rect,
     pub build_version: &'static str,
     pub started_at: Instant,
     /// Last refresh time for the dataset inventory. Pages can compare
@@ -146,20 +153,25 @@ pub struct AppShared {
 }
 
 impl AppShared {
-    fn new(data_root: PathBuf) -> Self {
+    fn new(data_root: PathBuf, cache_root: PathBuf) -> Self {
         let root_str = data_root.display().to_string();
         let chart_state = crate::tui::pages::chart::ChartState::new(&data_root);
         Self {
             data_root,
+            cache_root: cache_root.clone(),
+            funnel_selected_path: None,
+            funnel_scroll: 0,
+            symbols_scroll: 0,
+            symbols_viewport: Rect::default(),
             build_version: env!("CARGO_PKG_VERSION"),
             started_at: Instant::now(),
             last_refresh: Instant::now(),
             status: "Ready".to_string(),
             jobs: JobManager::new(),
             hits: Vec::new(),
-            discover_form: make_discover_form(&root_str),
+            discover_form: make_discover_form(&root_str).with_cache_defaults(&cache_root),
             native_research_form: crate::tui::pages::native_research::make_form(),
-            train_form: make_train_form(&root_str),
+            train_form: make_train_form(&root_str).with_cache_defaults(&cache_root),
             chart_state,
             config_form: crate::tui::pages::config_view::make_config_form(),
             import_form: FormState::new(vec![
@@ -228,10 +240,10 @@ pub struct App {
 }
 
 impl App {
-    fn new(data_root: PathBuf) -> Self {
+    fn new(data_root: PathBuf, cache_root: PathBuf) -> Self {
         Self {
             current: Page::Dashboard,
-            shared: AppShared::new(data_root),
+            shared: AppShared::new(data_root, cache_root),
             quit: false,
             show_help: false,
         }
@@ -240,18 +252,40 @@ impl App {
     fn next_page(&mut self) {
         let pages = Page::ALL;
         let idx = pages.iter().position(|p| *p == self.current).unwrap_or(0);
-        self.current = pages[(idx + 1) % pages.len()];
-        self.shared.status = format!("Switched to {}", self.current.label());
+        self.switch_page(pages[(idx + 1) % pages.len()]);
     }
 
     fn prev_page(&mut self) {
         let pages = Page::ALL;
         let idx = pages.iter().position(|p| *p == self.current).unwrap_or(0);
-        self.current = pages[(idx + pages.len() - 1) % pages.len()];
-        self.shared.status = format!("Switched to {}", self.current.label());
+        self.switch_page(pages[(idx + pages.len() - 1) % pages.len()]);
+    }
+
+    fn switch_page(&mut self, page: Page) {
+        if page == self.current {
+            return;
+        }
+        // Leaving a page cancels an uncommitted edit. Otherwise a hidden
+        // form can keep swallowing the global keyboard on the new page.
+        for form in [
+            &mut self.shared.discover_form,
+            &mut self.shared.native_research_form,
+            &mut self.shared.train_form,
+            &mut self.shared.config_form,
+            &mut self.shared.import_form,
+        ] {
+            form.stop_editing(false);
+        }
+        self.current = page;
+        self.shared.status = format!("Switched to {}", page.label());
     }
 
     fn handle_mouse(&mut self, ev: MouseEvent) {
+        // Overlay hit targets belong to the obscured page. Do not let mouse
+        // clicks bypass the keyboard's confirmation/help modal handling.
+        if self.shared.pending_confirmation.is_some() || self.show_help {
+            return;
+        }
         // We only care about left-button DOWN events — drags and scroll
         // wheel are no-ops for now. Hit-test against published click
         // targets and dispatch the matching action.
@@ -264,15 +298,14 @@ impl App {
         };
         match action {
             HitAction::GoToPage(p) => {
-                self.current = p;
-                self.shared.status = format!("Switched to {}", p.label());
+                self.switch_page(p);
             }
             HitAction::Activate => {
                 self.current.activate(&mut self.shared);
             }
             HitAction::FocusField { page, index } => {
                 if page != self.current {
-                    self.current = page;
+                    self.switch_page(page);
                 }
                 let form = match page {
                     Page::Discover => &mut self.shared.discover_form,
@@ -350,17 +383,17 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Tab => self.next_page(),
             KeyCode::BackTab => self.prev_page(),
-            KeyCode::Char('1') => self.current = Page::Dashboard,
-            KeyCode::Char('2') => self.current = Page::Discover,
-            KeyCode::Char('3') => self.current = Page::Strategies,
-            KeyCode::Char('4') => self.current = Page::Symbols,
-            KeyCode::Char('5') => self.current = Page::Train,
-            KeyCode::Char('6') => self.current = Page::Funnel,
-            KeyCode::Char('7') => self.current = Page::AutoLoop,
-            KeyCode::Char('8') => self.current = Page::Config,
-            KeyCode::Char('9') => self.current = Page::Logs,
-            KeyCode::Char('0') => self.current = Page::Chart,
-            KeyCode::Char('n') | KeyCode::Char('N') => self.current = Page::NativeResearch,
+            KeyCode::Char('1') => self.switch_page(Page::Dashboard),
+            KeyCode::Char('2') => self.switch_page(Page::Discover),
+            KeyCode::Char('3') => self.switch_page(Page::Strategies),
+            KeyCode::Char('4') => self.switch_page(Page::Symbols),
+            KeyCode::Char('5') => self.switch_page(Page::Train),
+            KeyCode::Char('6') => self.switch_page(Page::Funnel),
+            KeyCode::Char('7') => self.switch_page(Page::AutoLoop),
+            KeyCode::Char('8') => self.switch_page(Page::Config),
+            KeyCode::Char('9') => self.switch_page(Page::Logs),
+            KeyCode::Char('0') => self.switch_page(Page::Chart),
+            KeyCode::Char('n') | KeyCode::Char('N') => self.switch_page(Page::NativeResearch),
             // Refresh: re-stamp last_refresh so the next render's
             // dataset summary is recomputed from disk and the status
             // bar shows "Refreshed Xs ago". The help text on every
@@ -380,38 +413,58 @@ impl App {
     }
 }
 
-/// Run the TUI until the user quits. Returns when the user presses
-/// `q` / `Esc` / `Ctrl-C`.
-pub fn run_tui(data_root: Option<PathBuf>) -> Result<()> {
-    let data_root = data_root.unwrap_or_else(|| PathBuf::from("data"));
+/// Restore each terminal component independently: one failed command must
+/// not prevent raw mode, alternate screen, mouse or cursor cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalCleanup {
+    RawMode,
+    AlternateScreen,
+    MouseCapture,
+    Cursor,
+}
 
-    // Terminal setup.
+fn restore_terminal_using(mut restore: impl FnMut(TerminalCleanup) -> io::Result<()>) {
+    for action in [
+        TerminalCleanup::RawMode,
+        TerminalCleanup::AlternateScreen,
+        TerminalCleanup::MouseCapture,
+        TerminalCleanup::Cursor,
+    ] {
+        let _ = restore(action);
+    }
+}
+
+fn restore_terminal() {
+    let mut stdout = io::stdout();
+    restore_terminal_using(|action| match action {
+        TerminalCleanup::RawMode => disable_raw_mode(),
+        TerminalCleanup::AlternateScreen => execute!(stdout, LeaveAlternateScreen),
+        TerminalCleanup::MouseCapture => execute!(stdout, DisableMouseCapture),
+        TerminalCleanup::Cursor => execute!(stdout, crossterm::cursor::Show),
+    });
+}
+
+struct TerminalRestore<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for TerminalRestore<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+/// Run the TUI with the already loaded process configuration.
+/// The guard covers setup errors, normal exit and panic unwinding, not kill/abort.
+pub fn run_tui(data_root: PathBuf, cache_root: PathBuf) -> Result<()> {
     enable_raw_mode().context("enable raw terminal mode")?;
+    let _restore = TerminalRestore(restore_terminal);
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("init terminal backend")?;
-    // DOCUMENTED-DEFAULT: best-effort clear; failure here would also break
-    // the subsequent draw loop and surface there.
     terminal.clear().ok();
 
-    let mut app = App::new(data_root);
-    let res = event_loop(&mut terminal, &mut app);
-
-    // Terminal teardown — always runs, even if event_loop bailed. These
-    // are documented best-effort cleanups: at this point the program is
-    // exiting, so the only thing we could do with an error is print it,
-    // which would corrupt the now-restored terminal. Leave silent.
-    disable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-    )
-    .ok();
-    terminal.show_cursor().ok();
-
-    res
+    let mut app = App::new(data_root, cache_root);
+    event_loop(&mut terminal, &mut app)
 }
 
 fn event_loop<B: ratatui::backend::Backend>(
@@ -530,7 +583,7 @@ fn render_confirm_overlay(area: Rect, buf: &mut ratatui::buffer::Buffer, label: 
 /// Centered keyboard-help overlay: every page's keys at a glance, so the user
 /// never has to guess. Toggled with `?`, dismissed by any key.
 fn render_help_overlay(area: Rect, buf: &mut ratatui::buffer::Buffer) {
-    let w = ((area.width as f32 * 0.72) as u16).clamp(40, area.width);
+    let w = ((area.width as f32 * 0.72) as u16).max(40).min(area.width);
     let h = (Page::ALL.len() as u16 + 6).min(area.height);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
@@ -590,6 +643,34 @@ fn render_top_bar(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &mut App) 
         .style(theme::panel_block_style());
     let inner = block.inner(area);
     block.render(area, buf);
+
+    let tabs_width = Page::ALL
+        .iter()
+        .map(|page| page.label().chars().count() + 2)
+        .sum::<usize>()
+        + Page::ALL.len().saturating_sub(1) * 3;
+    if usize::from(inner.width) < tabs_width + 56 {
+        // All tabs cannot fit: show the actual page first, never a clipped
+        // prefix of unrelated pages. Keyboard navigation remains unchanged.
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", app.current.label()),
+                    theme::nav_active_style(),
+                ),
+                Span::styled(
+                    format!(" · NeoEthos TUI · {}", utc_clock()),
+                    theme::muted_style(),
+                ),
+            ]),
+            Line::styled(
+                "Tab/Shift-Tab pages · 1-0 jump · ? help",
+                theme::caption_style(),
+            ),
+        ])
+        .render(inner, buf);
+        return;
+    }
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -725,4 +806,374 @@ fn utc_clock() -> String {
         (day % 3600) / 60,
         day % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_without_datasets() -> App {
+        App::new(
+            std::env::temp_dir().join(format!("neoethos-tui-no-datasets-{}", std::process::id())),
+            std::env::temp_dir().join(format!("neoethos-tui-no-cache-{}", std::process::id())),
+        )
+    }
+
+    #[test]
+    fn configured_data_and_cache_reach_tui_forms_without_reloading_settings() {
+        let data = std::env::temp_dir().join("tui-configured-data");
+        let cache = std::env::temp_dir().join("tui-configured-cache");
+        let app = App::new(data.clone(), cache.clone());
+        assert_eq!(app.shared.data_root, data);
+        assert_eq!(app.shared.cache_root, cache);
+        assert_eq!(
+            app.shared.discover_form.value_for("Data root"),
+            Some(data.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            app.shared.discover_form.value_for("Out dir"),
+            Some(cache.join("discovery").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            app.shared.train_form.value_for("Models dir"),
+            Some(cache.join("models").to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn compact_header_keeps_every_active_page_visible_and_never_publishes_hidden_hits() {
+        let mut app = app_without_datasets();
+        for width in [20, 40, 80, 160, 300] {
+            for page in Page::ALL {
+                app.switch_page(*page);
+                app.shared.hits.clear();
+                let area = Rect::new(0, 0, width, 3);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                render_top_bar(area, &mut buffer, &mut app);
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains(page.label()), "{width}: {page:?}: {text}");
+                assert!(app.shared.hits.iter().all(|hit| {
+                    hit.rect.x >= area.x
+                        && hit.rect.right() <= area.right()
+                        && hit.rect.y >= area.y
+                        && hit.rect.bottom() <= area.bottom()
+                }));
+            }
+        }
+        for width in [0, 1] {
+            let area = Rect::new(0, 0, width, 0);
+            render_top_bar(area, &mut ratatui::buffer::Buffer::empty(area), &mut app);
+        }
+    }
+
+    #[test]
+    fn symbols_scroll_keys_do_not_steal_import_field_navigation_or_editing() {
+        let mut app = app_without_datasets();
+        app.switch_page(Page::Symbols);
+        let area = Rect::new(0, 0, 80, 24);
+        render(area, &mut ratatui::buffer::Buffer::empty(area), &mut app);
+        assert_eq!(app.shared.symbols_viewport.height, 9);
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.shared.symbols_scroll, 8);
+        assert_eq!(app.shared.import_form.focused, 0);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.shared.import_form.focused, 1);
+        assert_eq!(app.shared.symbols_scroll, 8);
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.shared.import_form.focused, 0);
+        app.handle_key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(app.shared.symbols_scroll, 0);
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.shared.symbols_scroll, 0);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.shared.import_form.editing);
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.shared.symbols_scroll, 0);
+        assert!(app.shared.import_form.editing);
+        assert!(app.shared.pending_confirmation.is_none());
+        assert!(!app.shared.jobs.has_running("import"));
+    }
+
+    #[test]
+    fn symbols_actual_page_keys_cover_every_wrapped_row_in_both_directions() {
+        use crate::tui::pages::symbols::tests::paging_fixture_rows;
+
+        for (width, height, expected_rows) in [(80, 24, 9), (40, 24, 9), (40, 19, 4), (20, 16, 1)] {
+            let mut app = app_without_datasets();
+            app.switch_page(Page::Symbols);
+            let area = Rect::new(0, 0, width, height);
+            render(area, &mut ratatui::buffer::Buffer::empty(area), &mut app);
+            let viewport = app.shared.symbols_viewport;
+            assert_eq!(viewport.height, expected_rows);
+            let reference = paging_fixture_rows(viewport.width, None, 0);
+            let full_text = reference.concat();
+            for index in 0..9 {
+                assert!(full_text.contains(&format!("EURUSD TF{index}")));
+            }
+            assert!(reference.len() > usize::from(viewport.height));
+            for direction in [KeyCode::PageDown, KeyCode::PageUp] {
+                let mut seen = vec![false; reference.len()];
+                loop {
+                    // Use the production frame layout and actual App -> Page
+                    // key dispatcher. Only the metadata source is synthetic.
+                    render(area, &mut ratatui::buffer::Buffer::empty(area), &mut app);
+                    assert_eq!(app.shared.symbols_viewport, viewport);
+                    let offset = usize::from(app.shared.symbols_scroll);
+                    let visible = paging_fixture_rows(
+                        viewport.width,
+                        Some(viewport.height),
+                        app.shared.symbols_scroll,
+                    );
+                    for (row, actual) in visible.iter().enumerate() {
+                        if let Some(expected) = reference.get(offset + row) {
+                            assert_eq!(actual, expected, "{width}x{height}: row {}", offset + row);
+                            seen[offset + row] = true;
+                        }
+                    }
+                    if (direction == KeyCode::PageDown
+                        && offset + usize::from(viewport.height) >= reference.len())
+                        || (direction == KeyCode::PageUp && offset == 0)
+                    {
+                        break;
+                    }
+                    let previous = app.shared.symbols_scroll;
+                    app.handle_key(direction, KeyModifiers::NONE);
+                    let next = app.shared.symbols_scroll;
+                    assert_ne!(next, previous, "paging must make progress");
+                    let step = next.abs_diff(previous);
+                    assert!(step <= viewport.height, "paging skipped a wrapped row");
+                    if viewport.height > 1 {
+                        assert!(step < viewport.height, "pages must overlap");
+                    }
+                }
+                assert!(
+                    seen.iter().all(|row| *row),
+                    "{width}x{height}: {direction:?} left gaps"
+                );
+            }
+            app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+            app.handle_key(KeyCode::Home, KeyModifiers::NONE);
+            assert_eq!(app.shared.symbols_scroll, 0);
+            assert!(app.shared.pending_confirmation.is_none());
+            assert!(!app.shared.jobs.has_running("import"));
+        }
+    }
+
+    #[test]
+    fn symbols_resize_republishes_page_step_and_empty_viewports_do_not_scroll() {
+        let mut app = app_without_datasets();
+        app.switch_page(Page::Symbols);
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(
+            app.shared.symbols_scroll, 0,
+            "no viewport has been rendered"
+        );
+        for (width, height, expected_step) in [
+            (80, 24, 8),
+            (40, 19, 3),
+            (20, 16, 1),
+            (40, 15, 0),
+            (0, 24, 0),
+            (0, 0, 0),
+        ] {
+            let area = Rect::new(0, 0, width, height);
+            render(area, &mut ratatui::buffer::Buffer::empty(area), &mut app);
+            let previous = app.shared.symbols_scroll;
+            app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+            assert_eq!(app.shared.symbols_scroll, previous + expected_step);
+            app.handle_key(KeyCode::PageUp, KeyModifiers::NONE);
+            assert_eq!(app.shared.symbols_scroll, previous);
+        }
+    }
+
+    #[test]
+    fn terminal_guard_restores_once_on_return_error_and_unwind() {
+        use std::cell::Cell;
+        for outcome in 0..3 {
+            let calls = Cell::new(0);
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let _guard = TerminalRestore(|| calls.set(calls.get() + 1));
+                    match outcome {
+                        0 => Ok(()),
+                        1 => anyhow::bail!("simulated terminal setup error"),
+                        _ => panic!("simulated event-loop unwind"),
+                    }
+                }));
+            assert_eq!(calls.get(), 1);
+            match outcome {
+                0 => assert!(result.unwrap().is_ok()),
+                1 => assert!(result.unwrap().is_err()),
+                _ => assert!(result.is_err()),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_restore_attempts_every_action_even_when_one_fails() {
+        for failure in 0..4 {
+            let mut seen = Vec::new();
+            restore_terminal_using(|action| {
+                seen.push(action);
+                if seen.len() - 1 == failure {
+                    Err(io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(
+                seen,
+                vec![
+                    TerminalCleanup::RawMode,
+                    TerminalCleanup::AlternateScreen,
+                    TerminalCleanup::MouseCapture,
+                    TerminalCleanup::Cursor
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn funnel_selection_and_scroll_are_explicit_and_preserve_selected_path() {
+        let root = std::env::temp_dir().join(format!(
+            "neoethos-tui-funnel-navigation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let a = root.join("a_funnel.json");
+        let b = root.join("b_funnel.json");
+        for path in [&a, &b] {
+            std::fs::write(path, br#"{"stages":[]}"#).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
+                .unwrap();
+        }
+        let mut app = App::new(root.join("no-data"), root.clone());
+        app.shared.funnel_selected_path = Some(a.clone());
+        assert!(crate::tui::pages::funnel::handle_key(
+            KeyCode::PageDown,
+            &mut app.shared
+        ));
+        assert_eq!(app.shared.funnel_scroll, 10);
+        assert!(crate::tui::pages::funnel::handle_key(
+            KeyCode::Down,
+            &mut app.shared
+        ));
+        assert_eq!(app.shared.funnel_selected_path, Some(b.clone()));
+        assert_eq!(app.shared.funnel_scroll, 0);
+        assert!(crate::tui::pages::funnel::handle_key(
+            KeyCode::PageUp,
+            &mut app.shared
+        ));
+        assert_eq!(app.shared.funnel_scroll, 0);
+        std::fs::remove_file(&b).unwrap();
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        crate::tui::pages::funnel::draw(area, &mut buffer, &app.shared);
+        assert_eq!(
+            app.shared.funnel_selected_path,
+            Some(b),
+            "draw must not silently select another report"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn click() -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_page_change_cancels_edit_and_does_not_lock_global_keys() {
+        let mut app = app_without_datasets();
+        app.switch_page(Page::Discover);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.quit, "typing in a field is not a quit action");
+        assert_eq!(app.shared.discover_form.fields[0].value, "q");
+        app.shared.hits.push(Hit {
+            rect: Rect::new(0, 0, 10, 3),
+            action: HitAction::GoToPage(Page::Train),
+        });
+        app.handle_mouse(click());
+        assert_eq!(app.current, Page::Train);
+        assert!(!app.shared.discover_form.editing);
+        assert_eq!(app.shared.discover_form.fields[0].value, "");
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn overlays_block_mouse_actions_on_the_underlying_page() {
+        let mut app = app_without_datasets();
+        app.shared.hits.push(Hit {
+            rect: Rect::new(0, 0, 10, 3),
+            action: HitAction::GoToPage(Page::Train),
+        });
+        app.shared.pending_confirmation = Some(PendingAction::DiscoverStop);
+        app.handle_mouse(click());
+        assert_eq!(app.current, Page::Dashboard);
+        assert!(app.shared.pending_confirmation.is_some());
+        app.shared.pending_confirmation = None;
+        app.show_help = true;
+        app.handle_mouse(click());
+        assert_eq!(app.current, Page::Dashboard);
+    }
+
+    #[test]
+    fn help_renders_without_panicking_in_narrow_or_empty_terminals() {
+        for width in [0, 1, 20, 39, 40, 80, 160] {
+            for height in [0, 1, 3, 24] {
+                let area = Rect::new(0, 0, width, height);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                render_help_overlay(area, &mut buffer);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_discovery_and_empty_training_never_spawn_jobs() {
+        let mut app = app_without_datasets();
+        app.switch_page(Page::Discover);
+        app.shared
+            .discover_form
+            .fields
+            .iter_mut()
+            .find(|field| field.label == "Population")
+            .unwrap()
+            .value = "bad".to_string();
+        app.handle_key(KeyCode::Char('l'), KeyModifiers::NONE);
+        assert!(
+            app.shared
+                .discover_form
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("Population")
+        );
+        assert!(app.shared.jobs.latest_for("discover").is_none());
+        app.switch_page(Page::Train);
+        app.handle_key(KeyCode::Char('l'), KeyModifiers::NONE);
+        assert!(
+            app.shared
+                .train_form
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("Symbol is required")
+        );
+        assert!(app.shared.jobs.latest_for("train").is_none());
+    }
 }

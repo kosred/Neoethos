@@ -1,4 +1,4 @@
-#![cfg(any(feature = "cuda", feature = "resident-search-slice2-compile-contract"))]
+#![cfg(feature = "cuda")]
 
 use std::fs;
 use std::path::PathBuf;
@@ -85,10 +85,10 @@ fn validate_slice2_scoring_archive_cub_scratch_query(source: &str) -> Result<(),
             "auto* rank_values = static_cast<std::uint64_t*>(nullptr);",
             1_usize,
         ),
-        ("cub::DeviceReduce::Min(", 1_usize),
-        ("cub::DeviceReduce::Max(", 1_usize),
-        ("cub::DeviceRadixSort::SortPairs(", 2_usize),
-        ("cub::DeviceRadixSort::SortPairsDescending(", 1_usize),
+        ("neoethos_parallel_primitives_v1::DeviceReduce::Min(", 1_usize),
+        ("neoethos_parallel_primitives_v1::DeviceReduce::Max(", 1_usize),
+        ("neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(", 2_usize),
+        ("neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(", 1_usize),
         (
             "nullptr, candidate, rank_keys, rank_keys, rank_values, rank_values,\n      count, 0, 64, stream);",
             3_usize,
@@ -235,6 +235,7 @@ fn b_novelty_is_sealed_to_positive_zero_and_the_wrong_kernel_is_not_production()
             "ResidentScoringObjectiveV2",
             "PropFirmV4",
             "RiskyGrowthV5",
+            "RiskyGrowthGoalV6",
             "RESIDENT_NOVELTY_DISABLED_SEMANTICS_V2",
             "novelty_weight.to_bits() != 0_u64",
             "InvalidNoveltyWeight",
@@ -276,6 +277,8 @@ fn b_novelty_is_sealed_to_positive_zero_and_the_wrong_kernel_is_not_production()
             "candidate_ordered_mean_jaccard_kernel_v1",
             "cub::DeviceReduce::Min",
             "cub::DeviceReduce::Max",
+            "neoethos_parallel_primitives_v1::DeviceReduce::Min",
+            "neoethos_parallel_primitives_v1::DeviceReduce::Max",
             "normalized_novelty",
         ],
     );
@@ -286,6 +289,73 @@ fn b_novelty_is_sealed_to_positive_zero_and_the_wrong_kernel_is_not_production()
         2,
         "legacy all-current novelty may remain defined and used by V1 only"
     );
+}
+
+#[test]
+fn b_goal_v6_extends_only_plan_abi_and_binds_exact_context_without_legacy_defaults() {
+    let rust = read_required("src/resident_scoring_v2.rs");
+    let header = read_required("native/resident_scoring_novelty_v1_abi.cuh");
+    let cuda = read_required("native/resident_scoring_novelty_v1.cu");
+    require_all(
+        &rust,
+        &[
+            "const SCORING_PLAN_ABI_V2: u32 = 2",
+            "const SCORING_VERSION_V1: u32 = 5",
+            "const _: [(); 472] = [(); std::mem::size_of::<RawResidentScoringPlanV2>()]",
+        ],
+    );
+    require_all(
+        &header,
+        &[
+            "NEO_RESIDENT_SCORING_PLAN_ABI_V2 = 2",
+            "NEO_RESIDENT_SCORING_NOVELTY_ABI_V1 = 1",
+            "NEO_RESIDENT_SCORING_VERSION_V1 = 5",
+            "NEO_RESIDENT_SCORING_RISKY_GROWTH_GOAL_V6 = 3",
+            "sizeof(NeoResidentScoringNoveltyPlanV1) == 472",
+        ],
+    );
+    let context = braced_item(&rust, "fn scoring_goal_bits_v2(");
+    require_all(
+        context,
+        &[
+            "RiskyGrowthGoalV6, Some(context)",
+            "context.initial_equity.is_finite()",
+            "context.span_days.is_finite()",
+            "None,",
+            "Ok([0; 5])",
+            "goal context must be present exactly for the V6 goal objective",
+        ],
+    );
+    let plan_hash = braced_item(&rust, "fn hash_scoring_plan_v2(");
+    let native_validate = braced_item(&cuda, "bool validate_plan_v1(");
+    for field in [
+        "initial_equity_bits",
+        "span_days_bits",
+        "goal_start_balance_bits",
+        "goal_target_balance_bits",
+        "goal_horizon_days_bits",
+    ] {
+        assert!(plan_hash.contains(&format!("raw.{field}.to_le_bytes()")));
+        assert!(native_validate.contains(&format!("plan->{field}")));
+        assert!(native_validate.contains(&format!("plan->{field} != 0ull")));
+    }
+    require_all(
+        native_validate,
+        &["plan->scoring_version != 6u", "target <= start"],
+    );
+    for kernel in [
+        "__global__ void seal_scoring_novelty_content_kernel_v1(",
+        "__global__ void seal_finite_objective_content_kernel_v2(",
+    ] {
+        require_all(
+            braced_item(&cuda, kernel),
+            &[
+                "seal->abi_version = NEO_RESIDENT_SCORING_NOVELTY_ABI_V1",
+                "plan.scoring_objective == NEO_RESIDENT_SCORING_RISKY_GROWTH_GOAL_V6",
+                "plan.plan_identity_sha256[identity_index]",
+            ],
+        );
+    }
 }
 
 #[test]
@@ -325,7 +395,7 @@ fn c_generation_and_scoring_allocations_are_sealed_before_the_first_kernel() {
         ],
     );
 
-    let begin = braced_item(&search, "fn begin_resident_search_sealed_v2(");
+    let begin = braced_item(&search, "fn begin_resident_search_sealed_impl_v3(");
     require_in_order(
         begin,
         &[
@@ -347,14 +417,14 @@ fn c_generation_and_scoring_allocations_are_sealed_before_the_first_kernel() {
 
     let query = braced_item(
         &population_cuda,
-        "neoethos_gpu_cuda_population_query_resident_search_combined_v2(",
+        "neoethos_gpu_cuda_population_query_resident_search_combined_adaptive_v3(",
     );
     require_in_order(
         query,
         &[
             "runtime_facts_equal_v2",
             "cudaMemGetInfo",
-            "calculate_resident_generation_allocation_v2",
+            "calculate_resident_generation_allocation_v3",
             "calculate_resident_scoring_allocation_v2",
             "generation.total_device_bytes + scoring.total_device_bytes",
             "allocator_context_reserve_bytes",
@@ -378,7 +448,7 @@ fn c_generation_and_scoring_allocations_are_sealed_before_the_first_kernel() {
     );
     let create_generation = braced_item(
         &generation_cuda,
-        "extern \"C\" std::int32_t create_resident_generation_run_from_import_v1(",
+        "extern \"C\" std::int32_t create_resident_generation_run_from_import_v3(",
     );
     require_all(
         create_generation,
@@ -391,7 +461,7 @@ fn c_generation_and_scoring_allocations_are_sealed_before_the_first_kernel() {
     );
     let calculate_generation = braced_item(
         &generation_cuda,
-        "extern \"C\" std::int32_t calculate_resident_generation_allocation_v2(",
+        "extern \"C\" std::int32_t calculate_resident_generation_allocation_v3(",
     );
     forbid_all(
         calculate_scoring,
@@ -412,17 +482,14 @@ fn c_generation_and_scoring_allocations_are_sealed_before_the_first_kernel() {
         ],
     );
 
-    let combined_create = braced_item(
-        &population_cuda,
-        "neoethos_gpu_cuda_population_create_resident_search_combined_v2(",
-    );
+    let combined_create = braced_item(&population_cuda, "create_resident_search_combined_impl_v3(");
     require_in_order(
         combined_create,
         &[
             "The combined receipt is already sealed here",
             "cudaEventCreateWithFlags",
             "cudaHostAlloc",
-            "create_resident_generation_run_from_import_v1",
+            "create_resident_generation_run_from_import_v3",
             "bind_resident_search_terminal_receipt_v2",
             "create_unbound_resident_scoring_run_v2",
         ],
@@ -447,7 +514,129 @@ fn c_generation_and_scoring_allocations_are_sealed_before_the_first_kernel() {
 }
 
 #[test]
-fn d_metric_receipt_is_move_consumed_as_one_full_device_chunk() {
+fn c_adaptive_policy_is_charged_and_rechecked_before_combined_allocation() {
+    let population_cuda = read_required("native/prototype_b_population.cu");
+    let header = read_required("native/resident_search_generation_v2_abi.cuh");
+    for stem in ["combined", "slice2"] {
+        for operation in ["query", "create"] {
+            let name = format!(
+                "neoethos_gpu_cuda_population_{operation}_resident_search_{stem}_adaptive_v3("
+            );
+            assert_eq!(header.matches(&name).count(), 1);
+            let body = braced_item(&population_cuda, &name);
+            require_all(body, &["generation_plan", "adaptive_policy"]);
+            forbid_all(body, &["cudaMalloc", "cudaHostAlloc", "cudaEventCreate"]);
+        }
+    }
+    let query = braced_item(
+        &population_cuda,
+        "neoethos_gpu_cuda_population_query_resident_search_combined_adaptive_v3(",
+    );
+    require_in_order(
+        query,
+        &[
+            "cudaMemGetInfo",
+            "calculate_resident_generation_allocation_v3(",
+            "generation_plan, adaptive_policy, session->stream, same_context_free",
+            "generation.total_device_bytes + scoring.total_device_bytes",
+            "admission->generation = generation",
+        ],
+    );
+    assert_eq!(query.matches("cudaMemGetInfo").count(), 1);
+    let create = braced_item(&population_cuda, "create_resident_search_combined_impl_v3(");
+    require_in_order(
+        create,
+        &[
+            "calculate_resident_generation_allocation_v3(",
+            "generation_plan, adaptive_policy, session->stream",
+            "admission->same_context_free_bytes",
+            "admission->full_discovery_reserve_bytes, &expected_generation",
+            "std::memcmp(&expected_generation, &admission->generation",
+            "return NEO_POPULATION_STATUS_INVALID_ARGUMENT",
+            "cudaEventCreateWithFlags",
+            "cudaHostAlloc",
+            "create_resident_generation_run_from_import_v3(",
+            "&generation_import, generation_plan, adaptive_policy, &admission->generation",
+        ],
+    );
+    forbid_all(create, &["cudaMemGetInfo", "configure_resident_generation_adaptive_inputs_v3"]);
+    for name in [
+        "neoethos_gpu_cuda_population_query_resident_search_combined_v2(",
+        "neoethos_gpu_cuda_population_query_resident_search_slice2_v3(",
+        "neoethos_gpu_cuda_population_create_resident_search_combined_v2(",
+        "neoethos_gpu_cuda_population_create_resident_search_slice2_v3(",
+    ] {
+        let legacy = braced_item(&population_cuda, name);
+        require_all(legacy, &["opaque_session, generation_plan, nullptr, scoring_plan"]);
+        forbid_all(legacy, &["cudaMemGetInfo", "cudaMalloc", "cudaHostAlloc"]);
+    }
+}
+
+#[test]
+fn c_resident_survivor_birth_generation_cannot_exceed_evaluated_generation() {
+    let source = read_required("native/prototype_b_population.cu");
+    let validator = braced_item(&source, "bool resident_gene_view_is_valid_v2(");
+    require_all(
+        validator,
+        &[
+            "seal->generation_index != genes.expected_generation_index_v2",
+            "seal->store_epoch != genes.expected_store_epoch_v2",
+            "scalar.generation > seal->generation_index",
+            "scalar.term_count > seal->max_terms_per_gene",
+            "!isfinite(weights[base + term])",
+        ],
+    );
+    forbid_all(validator, &["scalar.generation !=", "scalar.generation ="]);
+}
+
+#[test]
+fn c_canonical_base_chunks_preserve_full_population_and_one_global_scoring_source() {
+    let source = read_required("native/prototype_b_population.cu");
+    let header = read_required("native/neoethos_gpu_cuda.h");
+    let symbol = "neoethos_gpu_cuda_population_upload_resident_base_scenarios_v3(";
+    assert_eq!(header.matches(symbol).count(), 1);
+    let upload = braced_item(&source, symbol);
+    require_in_order(upload, &[
+        "scenarios->count != planned_population", "retained_capacity > planned_population",
+        "session->resident_retained_evaluation_capacity_v3", "ordinal < scenarios->count",
+        "descriptor.base_candidate_id != ordinal", "descriptor.scenario_id != ordinal",
+        "descriptor.rng_counter != 0", "descriptor.window_offset != 0",
+        "descriptor.window_len !=", "descriptor.scenario_type != kScenarioBase",
+        "descriptor.spread_ticks != kNoTickOverride", "descriptor.slippage_ticks != 0",
+        "descriptor.commission_micros != kNoMicroOverride", "descriptor.perturbation_offset != 0",
+        "descriptor.perturbation_count != 0", "descriptor.reserved != 0",
+        "static_cast<std::size_t>(retained_capacity)",
+        "neoethos_gpu_cuda_population_upload_resident_scenarios_v2(",
+        "resident_canonical_base_scenarios_v3 = true",
+    ]);
+    let enqueue = braced_item(&source, "std::int32_t enqueue_population_evaluation_v1(");
+    require_in_order(enqueue, &[
+        "ensure_metrics_only_workspace_v1(session, scenario_count, month_capacity, bars)",
+        "begin_resident_generation_metrics_v3(", "population_gap_flags_kernel<<<",
+        "logical_offset < population", "remaining < capacity ? remaining : capacity",
+        "resident_base_scenario_ids_kernel_v3<<<", "active_scenarios.count =",
+        "population_reduce_kernel<<<active_blocks", "append_resident_generation_metrics_v3(",
+        "logical_offset += active_count", "session->resident_metrics_view_v3 = *resident_genes_v2",
+        "cudaEventRecord(session->event", "resident_metrics->scenario_count =",
+    ]);
+    let chunks = braced_item(enqueue, "for (std::uint64_t logical_offset = 0;");
+    forbid_all(chunks, &[
+        "cudaMalloc", "device_alloc", "cudaMemcpyHostToDevice", "cudaMemcpyDeviceToHost",
+        "cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize",
+        "upload_resident_scenarios", "score_and_rank", "bind_and_seal_resident_scoring",
+        "session->population =", "session->workspace_scenarios =",
+    ]);
+    let export = braced_item(&source, "neoethos_gpu_cuda_population_export_resident_scoring_source_v2(");
+    require_all(export, &[
+        "resident_metrics->scenario_count != static_cast<std::uint64_t>(session->workspace_scenarios)",
+        "export_resident_generation_metrics_v3(", "? retained_rows : session->metric_rows",
+        "? retained_scenario_ids :", "source->logical_population_count = expected_population",
+        "PopulationStrictExecutionStateV1::Poisoned",
+    ]);
+}
+
+#[test]
+fn d_metric_receipt_is_move_consumed_as_one_complete_resident_population() {
     let population = read_required("src/population.rs");
     let search = read_required("src/resident_search_v2.rs");
     let private_header = read_required("native/resident_search_generation_v2_abi.cuh");
@@ -480,7 +669,11 @@ fn d_metric_receipt_is_move_consumed_as_one_full_device_chunk() {
         &[
             "self",
             "ResidentSearchPopulationCompletionLeaseV2",
-            "retained_evaluation_capacity != logical_population_count",
+            "retained_evaluation_capacity == 0",
+            "retained_evaluation_capacity > logical_population_count",
+            "self.scenario_count as u64 != retained_evaluation_capacity",
+            "self.population as u64 != logical_population_count",
+            "self.expected_scenario_identities.len() as u64 != logical_population_count",
             "enqueue_resident_gene_metrics_v2",
             "Box::new(RawResidentPopulationMetricsHandleV1::default())",
             "export_resident_scoring_source_v2",
@@ -628,10 +821,22 @@ fn e_nonfinite_scoring_fault_precedes_rank_consumers_and_conditional_commit() {
     require_in_order(
         score_kernel,
         &[
-            "all_metric_values_finite_v1",
+            "classify_resident_metrics_v2(row.values)",
+            "metric_status == ResidentMetricStatusV2::Fault",
             "atomicExch(device_fault_word",
+            "metric_status == ResidentMetricStatusV2::EconomicMonthlyEquityReject",
+            "if (!checked_economic_rejection_v2)",
+            "atomicExch(device_fault_word",
+            "fitness_scores[candidate] = -INFINITY",
+            "if (!isfinite(relative_net))",
+            "atomicExch(device_fault_word",
+            "if (relative_net <= -1.0)",
+            "if (!checked_economic_rejection_v2)",
+            "atomicExch(device_fault_word",
+            "fitness_scores[candidate] = -INFINITY",
             "score_prop_firm_ga_fitness_v4",
             "score_risky_ga_fitness_growth_v5",
+            "score_risky_ga_fitness_goal_v6",
             "!isfinite(score)",
             "atomicExch(device_fault_word",
         ],
@@ -785,9 +990,9 @@ fn f_rank_semantics_are_versioned_score_gene_then_original_ordinal() {
         rank,
         &[
             "build_gene_identity_rank_keys_kernel_v1",
-            "cub::DeviceRadixSort::SortPairs(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
             "gather_resident_decision_rank_keys_kernel_v1",
-            "cub::DeviceRadixSort::SortPairsDescending(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(",
         ],
     );
     let identity_keys = braced_item(
@@ -1045,7 +1250,36 @@ fn i_real_rtx_oracle_covers_math_fault_order_and_exactly_one_advance() {
             "drop(pending)",
         ],
     );
-    assert_under_900_lines("src/resident_search_generation_v2_device_tests.rs", &device);
+    let goal_test = braced_item(
+        &device,
+        "fn resident_search_goal_v6_scores_contexts_and_faults_on_real_cuda()",
+    );
+    require_all(
+        goal_test,
+        &[
+            "NEOETHOS_REQUIRE_GPU",
+            "ResidentScoringObjectiveV2::RiskyGrowthGoalV6",
+            "initial_equity: 10_000.0",
+            "span_days: 90.0",
+            "target_balance: 1_000_000.0",
+            "horizon_days: 90.0",
+            "set_scoring_metric_mode_fixture_v2(3)",
+            "advance_one_full_population_generation_v2",
+            "assert_score_oracle",
+            "assert_full_generation_oracle",
+            "set_scoring_metric_fault_fixture_v2(6, f64::NAN)",
+            "receipt.generation_index(), 0",
+        ],
+    );
+    // Bound shared oracle helpers and each independent device test separately;
+    // adding V6 must neither duplicate the oracle nor discard legacy coverage.
+    let helpers = device
+        .split_once("#[test]")
+        .expect("device test boundary")
+        .0;
+    assert_under_900_lines("shared device oracle helpers", helpers);
+    assert_under_900_lines("legacy V4/V5 device oracle", test);
+    assert_under_900_lines("goal V6 device oracle", goal_test);
 }
 
 #[test]
@@ -1231,7 +1465,7 @@ fn l_runtime_identity_is_cuda_authoritative_and_bound_through_scoring() {
     );
     let create = braced_item(
         &generation,
-        "extern \"C\" std::int32_t create_resident_generation_run_from_import_v1(",
+        "extern \"C\" std::int32_t create_resident_generation_run_from_import_v3(",
     );
     require_all(
         create,
@@ -1510,11 +1744,11 @@ fn p_every_unconditional_cub_input_has_a_total_deterministic_fault_producer() {
         rank,
         &[
             "build_gene_identity_rank_keys_kernel_v1",
-            "cub::DeviceRadixSort::SortPairs(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
             "gather_resident_decision_rank_keys_kernel_v1",
-            "cub::DeviceRadixSort::SortPairsDescending(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(",
             "select_rank_weighted_survivors_kernel_v1",
-            "cub::DeviceRadixSort::SortKeys(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortKeys(",
         ],
     );
     let gene_hash = braced_item(&generation_cuda, "std::int32_t launch_device_gene_hash_v1(");
@@ -1522,10 +1756,10 @@ fn p_every_unconditional_cub_input_has_a_total_deterministic_fault_producer() {
         gene_hash,
         &[
             "gene_hash_kernel_v1",
-            "cub::DeviceRadixSort::SortPairs(",
-            "cub::DeviceRunLengthEncode::Encode(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
+            "neoethos_parallel_primitives_v1::DeviceRunLengthEncode::Encode(",
             "verify_sorted_gene_dedup_kernel_v1",
-            "cub::DeviceSelect::Flagged(",
+            "neoethos_parallel_primitives_v1::DeviceSelect::Flagged(",
         ],
     );
 }
@@ -1533,10 +1767,7 @@ fn p_every_unconditional_cub_input_has_a_total_deterministic_fault_producer() {
 #[test]
 fn q_combined_create_is_transactional_and_unwinds_every_known_stage() {
     let population_cuda = read_required("native/prototype_b_population.cu");
-    let combined = braced_item(
-        &population_cuda,
-        "neoethos_gpu_cuda_population_create_resident_search_combined_v2(",
-    );
+    let combined = braced_item(&population_cuda, "create_resident_search_combined_impl_v3(");
     require_all(
         combined,
         &[
@@ -1642,7 +1873,6 @@ fn s_start_failure_and_terminal_cleanup_retain_exact_lifecycle_authority() {
     let generation_cuda = read_required("native/resident_generation_v1.cu");
     let scoring_cuda = read_required("native/resident_scoring_novelty_v1.cu");
     let population_cuda = read_required("native/prototype_b_population.cu");
-    let generation_rust = read_required("src/resident_generation_v1.rs");
     let population_rust = read_required("src/population.rs");
     let search_rust = read_required("src/resident_search_v2.rs");
     let feature_rust = read_required("src/resident_feature_store_v3.rs");
@@ -1650,7 +1880,7 @@ fn s_start_failure_and_terminal_cleanup_retain_exact_lifecycle_authority() {
 
     let generation_create = braced_item(
         &generation_cuda,
-        "extern \"C\" std::int32_t create_resident_generation_run_from_import_v1(",
+        "extern \"C\" std::int32_t create_resident_generation_run_from_import_v3(",
     );
     require_all(
         generation_create,
@@ -1682,23 +1912,7 @@ fn s_start_failure_and_terminal_cleanup_retain_exact_lifecycle_authority() {
         1,
         "scoring creator may publish its owner only on the success path"
     );
-    let generation_bind = braced_item(
-        &generation_rust,
-        "pub(crate) fn bind_population_session_import_v1(",
-    );
-    require_in_order(
-        generation_bind,
-        &["if status != STATUS_OK_V1", "native_error_v1("],
-    );
-    forbid_all(
-        generation_bind,
-        &["ffi_enqueue_resident_generation_release_v1(native)"],
-    );
-
-    let combined = braced_item(
-        &population_cuda,
-        "neoethos_gpu_cuda_population_create_resident_search_combined_v2(",
-    );
+    let combined = braced_item(&population_cuda, "create_resident_search_combined_impl_v3(");
     require_all(
         combined,
         &[
@@ -1712,7 +1926,7 @@ fn s_start_failure_and_terminal_cleanup_retain_exact_lifecycle_authority() {
         ],
     );
 
-    let begin = braced_item(&search_rust, "fn begin_resident_search_sealed_v2(");
+    let begin = braced_item(&search_rust, "fn begin_resident_search_sealed_impl_v3(");
     require_in_order(
         begin,
         &[
@@ -1801,7 +2015,6 @@ fn t_stream_ordered_allocation_identity_is_one_way_retired_on_every_outcome() {
     let scoring_cuda = read_required("native/resident_scoring_novelty_v1.cu");
     let population_cuda = read_required("native/prototype_b_population.cu");
     let population_rust = read_required("src/population.rs");
-    let generation_rust = read_required("src/resident_generation_v1.rs");
     let scoring_rust = read_required("src/resident_scoring_v2.rs");
     let search_rust = read_required("src/resident_search_v2.rs");
 
@@ -1869,7 +2082,7 @@ fn t_stream_ordered_allocation_identity_is_one_way_retired_on_every_outcome() {
     );
     let generation_create = braced_item(
         &generation_cuda,
-        "extern \"C\" std::int32_t create_resident_generation_run_from_import_v1(",
+        "extern \"C\" std::int32_t create_resident_generation_run_from_import_v3(",
     );
     require_in_order(
         generation_create,
@@ -1965,10 +2178,7 @@ fn t_stream_ordered_allocation_identity_is_one_way_retired_on_every_outcome() {
     );
     forbid_all(scoring_release, &["cudaFreeAsync(run->allocation_base"]);
 
-    let combined = braced_item(
-        &population_cuda,
-        "neoethos_gpu_cuda_population_create_resident_search_combined_v2(",
-    );
+    let combined = braced_item(&population_cuda, "create_resident_search_combined_impl_v3(");
     require_all(
         combined,
         &[
@@ -2024,7 +2234,7 @@ fn t_stream_ordered_allocation_identity_is_one_way_retired_on_every_outcome() {
         standalone_scoring,
         &["enqueue_resident_scoring_release_v2(*run)"],
     );
-    for source in [&population_rust, &generation_rust, &scoring_rust] {
+    for source in [&population_rust, &scoring_rust] {
         require_all(
             source,
             &[
@@ -2033,18 +2243,7 @@ fn t_stream_ordered_allocation_identity_is_one_way_retired_on_every_outcome() {
             ],
         );
     }
-    let generation_bind = braced_item(
-        &generation_rust,
-        "pub(crate) fn bind_population_session_import_v1(",
-    );
-    forbid_all(
-        generation_bind,
-        &[
-            "ffi_enqueue_resident_generation_release_v1(native)",
-            "enqueue_resident_generation_release_v1_after_failed_create",
-        ],
-    );
-    let search_begin = braced_item(&search_rust, "fn begin_resident_search_sealed_v2(");
+    let search_begin = braced_item(&search_rust, "fn begin_resident_search_sealed_impl_v3(");
     require_in_order(
         search_begin,
         &[
@@ -2281,15 +2480,15 @@ fn u_slice2_combined_cub_scratch_query_covers_reduce_and_all_three_rank_passes()
     for occurrence in 0..2 {
         mutants.push(replace_nth(
             query,
-            "cub::DeviceRadixSort::SortPairs(",
-            "cub::DeviceRadixSort::SortKeys(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortKeys(",
             occurrence,
         ));
     }
     mutants.push(replace_nth(
         query,
-        "cub::DeviceRadixSort::SortPairsDescending(",
-        "cub::DeviceRadixSort::SortPairs(",
+        "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(",
+        "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
         0,
     ));
     for occurrence in 1..4 {

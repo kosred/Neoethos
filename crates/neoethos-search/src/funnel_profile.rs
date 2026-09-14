@@ -5,25 +5,117 @@
 //! It captures the full rejection funnel so "no strategies" is debuggable
 //! without re-running.
 //!
-//! Stages (in spec order):
+//! Stages follow evaluation order. Portfolio capacity is downstream of WF;
+//! planned evaluations, capacity exclusions and real failures are not synonyms.
+//! Stages:
 //!   1.  data_loaded
 //!   2.  rows_after_trimming
 //!   3.  features_built
 //!   4.  features_after_prefilter
 //!   5.  stage1_candidates_generated
 //!   6.  profitable_archive_size
-//!   7.  full_is_evaluated
+//!   7.  validation_candidates_admitted
 //!   8.  passed_base_filter
 //!   9.  nonzero_signals
 //!   10. passed_min_trades
-//!   11. passed_quality
-//!   12. passed_prop_firm_window
-//!   13. passed_correlation
+//!   11. full_is_evaluated
+//!   12. passed_quality
+//!   13. passed_prop_firm_window
 //!   14. passed_walkforward
-//!   15. passed_cpcv
-//!   16. export_ready
+//!   15. passed_selection_calibration
+//!   16. passed_correlation
+//!   17. portfolio_selected
+//!   18. portfolio_after_robustness
+//!   19. passed_cpcv
+//!   20. export_ready
 
 use serde::{Deserialize, Serialize};
+
+/// Compact research diagnostics for a window explicitly USED FOR SELECTION.
+/// This is not an untouched final test or a portfolio/deployment authority.
+/// The existing result carries the receipt once; each trial links to the full
+/// genome in `DiscoveryResult::candidates` by both index and exact identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionCalibrationCohort {
+    pub scope: crate::data_selection::CanonicalSearchArtifactScopeRefV1,
+    pub search_config_hash: String,
+    pub trials: Vec<SelectionCalibrationTrial>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionCalibrationTrial {
+    pub candidate_archive_index: usize,
+    pub strategy_identity: crate::validation::ValidationStrategyIdentityV2,
+    /// Null means invalid/non-finite metrics, with the reason retained below.
+    /// Ordinary losing but finite replays keep their complete measured summary.
+    pub summary: Option<crate::validation::ForwardTestSummary>,
+    /// Passed the existing numerical sizing gate, not final validation.
+    pub profitable_for_selection: bool,
+    pub rejection_reason: Option<String>,
+}
+
+/// Actual candidate coverage, separate from planned GA evaluation slots and
+/// from portfolio capacity. Absent on legacy profiles rather than invented.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryCandidateCensus {
+    pub ga_returned_candidates: usize,
+    pub validation_candidate_limit: usize,
+    pub validation_candidates_admitted: usize,
+    pub validation_candidates_capped: usize,
+    pub quality_evaluated: usize,
+    pub walkforward_tested: usize,
+    pub walkforward_passed: usize,
+    pub walkforward_failed: usize,
+    /// Admitted candidates without a completed non-empty WF result. Includes
+    /// earlier quality/window exclusions, but NOT the separately counted cap.
+    pub walkforward_not_tested: usize,
+    pub correlation_tested: usize,
+    pub rejected_by_correlation: usize,
+    pub portfolio_capacity_not_selected: usize,
+    /// Actual removals after portfolio selection, not WF/correlation failures.
+    /// Absent before that transition and in older profiles means unobserved.
+    /// A skipped screen or the retained-all policy removes nothing; this is not
+    /// a claim that the retained genes passed the robustness tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robustness_removed: Option<usize>,
+    pub portfolio_selected: usize,
+}
+
+impl DiscoveryCandidateCensus {
+    pub fn counters(&self) -> Vec<(&'static str, usize)> {
+        let mut counters = vec![
+            ("ga_returned_candidates", self.ga_returned_candidates),
+            (
+                "validation_candidate_limit",
+                self.validation_candidate_limit,
+            ),
+            (
+                "validation_candidates_admitted",
+                self.validation_candidates_admitted,
+            ),
+            (
+                "validation_candidates_capped",
+                self.validation_candidates_capped,
+            ),
+            ("quality_evaluated", self.quality_evaluated),
+            ("walkforward_tested", self.walkforward_tested),
+            ("walkforward_passed", self.walkforward_passed),
+            ("walkforward_failed", self.walkforward_failed),
+            ("walkforward_not_tested", self.walkforward_not_tested),
+            ("correlation_tested", self.correlation_tested),
+            ("rejected_by_correlation", self.rejected_by_correlation),
+            (
+                "portfolio_capacity_not_selected",
+                self.portfolio_capacity_not_selected,
+            ),
+            ("portfolio_selected", self.portfolio_selected),
+        ];
+        if let Some(removed) = self.robustness_removed {
+            counters.push(("robustness_removed", removed));
+        }
+        counters
+    }
+}
 
 /// How many named reject reasons one stage may keep.
 ///
@@ -97,6 +189,10 @@ impl FunnelStage {
 /// Persistent funnel profile written next to the portfolio JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FunnelProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_census: Option<DiscoveryCandidateCensus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_calibration_cohort: Option<SelectionCalibrationCohort>,
     pub symbol: String,
     pub timeframe: String,
     pub started_at: String,
@@ -107,7 +203,7 @@ pub struct FunnelProfile {
     /// when constructed via `FunnelProfile::new` (caller must set this).
     #[serde(default)]
     pub mode: String,
-    /// Each canonical pipeline stage (16 total per spec). Stages
+    /// Each canonical pipeline stage. Stages
     /// the run didn't reach get count_in/out=0.
     pub stages: Vec<FunnelStage>,
     /// Bottleneck = the stage with the highest `rejected` count.
@@ -121,6 +217,11 @@ pub struct FunnelProfile {
     #[serde(skip)]
     population_execution_run_receipt_v2:
         Option<crate::population_execution_run_receipt_v2::ExactPopulationExecutionRunReceiptV2>,
+    /// Exact live execution policy resolved from the immutable search
+    /// authority. This is an in-memory carrier only: the dedicated
+    /// `live_portfolio` artifact persists and validates it explicitly.
+    #[serde(skip)]
+    live_trading_policy_v1: Option<crate::live_portfolio::LiveTradingPolicyV1>,
     /// When the previous stage finished, so each stage can report its own cost.
     /// Not persisted — it only has meaning during the run that set it.
     #[serde(skip)]
@@ -130,6 +231,8 @@ pub struct FunnelProfile {
 impl FunnelProfile {
     pub fn new(symbol: impl Into<String>, timeframe: impl Into<String>) -> Self {
         Self {
+            candidate_census: None,
+            selection_calibration_cohort: None,
             symbol: symbol.into(),
             timeframe: timeframe.into(),
             started_at: now_iso8601(),
@@ -140,8 +243,28 @@ impl FunnelProfile {
             bottleneck_rejected: 0,
             outcome: "pending".to_string(),
             population_execution_run_receipt_v2: None,
+            live_trading_policy_v1: None,
             last_mark: Some(std::time::Instant::now()),
         }
+    }
+
+    pub(crate) fn attach_live_trading_policy_v1(
+        &mut self,
+        policy: crate::live_portfolio::LiveTradingPolicyV1,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.live_trading_policy_v1.is_none(),
+            "live trading policy v1 is already attached"
+        );
+        policy.validate()?;
+        self.live_trading_policy_v1 = Some(policy);
+        Ok(())
+    }
+
+    pub(crate) const fn live_trading_policy_v1(
+        &self,
+    ) -> Option<&crate::live_portfolio::LiveTradingPolicyV1> {
+        self.live_trading_policy_v1.as_ref()
     }
 
     pub(crate) fn attach_population_execution_run_receipt_v2(
@@ -267,14 +390,18 @@ fn canonical_empty_stages() -> Vec<FunnelStage> {
         FunnelStage::new("features_after_prefilter"),
         FunnelStage::new("stage1_candidates_generated"),
         FunnelStage::new("profitable_archive_size"),
-        FunnelStage::new("full_is_evaluated"),
+        FunnelStage::new("validation_candidates_admitted"),
         FunnelStage::new("passed_base_filter"),
         FunnelStage::new("nonzero_signals"),
         FunnelStage::new("passed_min_trades"),
+        FunnelStage::new("full_is_evaluated"),
         FunnelStage::new("passed_quality"),
         FunnelStage::new("passed_prop_firm_window"),
-        FunnelStage::new("passed_correlation"),
         FunnelStage::new("passed_walkforward"),
+        FunnelStage::new("passed_selection_calibration"),
+        FunnelStage::new("passed_correlation"),
+        FunnelStage::new("portfolio_selected"),
+        FunnelStage::new("portfolio_after_robustness"),
         FunnelStage::new("passed_cpcv"),
         FunnelStage::new("export_ready"),
     ]
@@ -295,6 +422,90 @@ fn now_iso8601() -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn legacy_profile_has_unknown_candidate_coverage_and_new_census_roundtrips() {
+        let mut profile = FunnelProfile::new("EURUSD", "M5");
+        let legacy = serde_json::to_string(&profile).unwrap();
+        assert!(!legacy.contains("candidate_census"));
+        assert!(
+            serde_json::from_str::<FunnelProfile>(&legacy)
+                .unwrap()
+                .candidate_census
+                .is_none()
+        );
+        let census = DiscoveryCandidateCensus {
+            validation_candidates_admitted: 200,
+            walkforward_tested: 20,
+            walkforward_passed: 5,
+            walkforward_failed: 15,
+            walkforward_not_tested: 180,
+            robustness_removed: Some(1),
+            ..Default::default()
+        };
+        profile.candidate_census = Some(census.clone());
+        let restored: FunnelProfile =
+            serde_json::from_str(&serde_json::to_string(&profile).unwrap()).unwrap();
+        assert_eq!(restored.candidate_census, Some(census));
+        let names = profile
+            .stages
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().position(|n| *n == "passed_walkforward")
+                < names.iter().position(|n| *n == "passed_correlation")
+        );
+        assert!(
+            names.iter().position(|n| *n == "portfolio_selected")
+                < names
+                    .iter()
+                    .position(|n| *n == "portfolio_after_robustness")
+        );
+        assert!(
+            names
+                .iter()
+                .position(|n| *n == "portfolio_after_robustness")
+                < names.iter().position(|n| *n == "passed_cpcv")
+        );
+    }
+
+    #[test]
+    fn original_thirteen_counter_census_still_deserializes() {
+        let original = r#"{
+            "ga_returned_candidates":10,
+            "validation_candidate_limit":8,
+            "validation_candidates_admitted":8,
+            "validation_candidates_capped":2,
+            "quality_evaluated":6,
+            "walkforward_tested":5,
+            "walkforward_passed":4,
+            "walkforward_failed":1,
+            "walkforward_not_tested":3,
+            "correlation_tested":4,
+            "rejected_by_correlation":1,
+            "portfolio_capacity_not_selected":0,
+            "portfolio_selected":3
+        }"#;
+        let census: DiscoveryCandidateCensus = serde_json::from_str(original).unwrap();
+        assert_eq!(census.robustness_removed, None);
+        assert_eq!(census.quality_evaluated, 6);
+        assert_eq!(census.portfolio_selected, 3);
+        assert_eq!(census.counters().len(), 13);
+        assert!(
+            !serde_json::to_string(&census)
+                .unwrap()
+                .contains("robustness_removed")
+        );
+        let observed = DiscoveryCandidateCensus {
+            robustness_removed: Some(0),
+            ..census
+        };
+        assert!(observed.counters().contains(&("robustness_removed", 0)));
+        let restored: DiscoveryCandidateCensus =
+            serde_json::from_str(&serde_json::to_string(&observed).unwrap()).unwrap();
+        assert_eq!(restored.robustness_removed, Some(0));
+    }
 
     #[test]
     fn funnel_path_appends_suffix() {

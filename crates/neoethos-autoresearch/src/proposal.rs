@@ -214,15 +214,15 @@ pub enum ProposalRefused {
     Objective(ObjectiveError),
     /// A higher lane whose candle outlives the label horizon.
     LaneHorizon { detail: String },
-    /// The configured payoff floor sits above what this configuration's own
-    /// resolved geometry can produce. Refused **before** a bar is read: the
-    /// answer was fixed before the run started.
+    /// Historical journal variant only. Geometry is not a realized-payoff ceiling.
     PayoffFloorUnreachable {
         configured_floor: f64,
         enforced_ceiling: f64,
         binding: String,
         detail: String,
     },
+    /// Invalid numerical inputs; no fabricated or non-finite diagnostic payload.
+    InvalidPayoffInputs { detail: String },
     /// The produced config differs from the reference on the money path or on
     /// the validation geometry. Refused, never clamped.
     MoneyPath { violations: Vec<MoneyPathViolation> },
@@ -249,6 +249,7 @@ impl std::fmt::Display for ProposalRefused {
             Self::Space(e) => write!(f, "{e}"),
             Self::Objective(e) => write!(f, "{e}"),
             Self::LaneHorizon { detail } => write!(f, "{detail}"),
+            Self::InvalidPayoffInputs { detail } => write!(f, "invalid payoff inputs: {detail}"),
             Self::PayoffFloorUnreachable {
                 configured_floor,
                 enforced_ceiling,
@@ -256,9 +257,8 @@ impl std::fmt::Display for ProposalRefused {
                 detail,
             } => write!(
                 f,
-                "payoff floor {configured_floor:.2} exceeds this configuration's enforced ceiling \
-                 {enforced_ceiling:.2} (binding: {binding}); the run's answer would be fixed \
-                 before a bar was read. {detail}"
+                "historical payoff refusal: floor {configured_floor:.2}, legacy ceiling \
+                 {enforced_ceiling:.2} (binding: {binding}). This ceiling is no longer enforced. {detail}"
             ),
             Self::MoneyPath { violations } => write!(
                 f,
@@ -298,6 +298,7 @@ impl ProposalRefused {
             Self::Objective(_) => "objective",
             Self::LaneHorizon { .. } => "lane_horizon",
             Self::PayoffFloorUnreachable { .. } => "payoff_floor_unreachable",
+            Self::InvalidPayoffInputs { .. } => "invalid_payoff_inputs",
             Self::MoneyPath { .. } => "money_path",
             Self::AppliedValueMismatch { .. } => "applied_value_mismatch",
             Self::Duplicate { .. } => "duplicate",
@@ -308,10 +309,9 @@ impl ProposalRefused {
 
 /// A proposal turned into something the runner can execute.
 ///
-/// It carries the resolved `DiscoveryConfig` **and** the `PayoffCeiling` that
-/// proves the configuration's own floor is reachable. There is no constructor
-/// that omits the ceiling, so an unchecked configuration cannot reach the
-/// runner: the type is the gate.
+/// It carries the resolved `DiscoveryConfig` and a validated geometry diagnostic.
+/// Neither that diagnostic nor a historical measurement proves realized payoff;
+/// the configured target must be assessed using actual trades and OOS evidence.
 #[derive(Debug, Clone)]
 pub struct ProposedRunSpec {
     pub proposal: Proposal,
@@ -362,7 +362,7 @@ impl Proposal {
     }
 
     /// The full run spec: the config, the streaming plan, the cursor policy and
-    /// the payoff ceiling that proves the proposal's own floor is reachable.
+    /// the validated payoff-geometry diagnostic.
     pub fn resolve_spec(&self, base: &DiscoveryConfig) -> anyhow::Result<ProposedRunSpec> {
         let pip_value_per_lot = base.try_evaluation_config(None)?.pip_value_per_lot;
         let inputs =
@@ -442,23 +442,14 @@ pub fn materialise(
 
     money_path_audit(&reference, &cfg)
         .map_err(|violations| ProposalRefused::MoneyPath { violations })?;
-    verify_applied(proposal, &cfg)?;
+    let streaming_plan = proposal.axis_a.streaming_plan();
+    let cursor_policy = proposal.axis_a.cursor_policy();
+    verify_applied(proposal, &cfg, &streaming_plan, cursor_policy)?;
 
-    // THE CONFIG-IDENTITY GATE. A floor above what this configuration's own
-    // geometry can produce is a run whose answer is fixed before a bar is read.
+    // Validate numerical domains. Realized payoff is judged after execution.
     let configured_floor = proposal.refusals().value(RefusalDim::PayoffFloor);
     let ceiling = assert_payoff_floor_reachable(configured_floor, payoff_inputs).map_err(|e| {
-        // The ceiling itself is still computable; report the numbers, not just
-        // the refusal, so the census can say WHICH term bound it.
-        let (enforced, binding) =
-            match neoethos_search::run_identity::max_achievable_payoff(payoff_inputs) {
-                Ok(c) => (c.enforced_ceiling, format!("{:?}", c.binding)),
-                Err(_) => (f64::NAN, "uncomputable".to_string()),
-            };
-        ProposalRefused::PayoffFloorUnreachable {
-            configured_floor,
-            enforced_ceiling: enforced,
-            binding,
+        ProposalRefused::InvalidPayoffInputs {
             detail: e.to_string(),
         }
     })?;
@@ -486,7 +477,12 @@ pub fn materialise(
 /// Prove, field by field, that the resolved config carries what the proposal
 /// declared. Anything downstream that overwrote a proposed value shows up here
 /// as a refusal instead of as a sweep whose label and content disagree.
-fn verify_applied(proposal: &Proposal, cfg: &DiscoveryConfig) -> Result<(), ProposalRefused> {
+fn verify_applied(
+    proposal: &Proposal,
+    cfg: &DiscoveryConfig,
+    streaming_plan: &StreamingPlan,
+    cursor_policy: CursorPolicy,
+) -> Result<(), ProposalRefused> {
     macro_rules! want {
         ($field:literal, $expected:expr, $actual:expr) => {
             if $expected != $actual {
@@ -525,6 +521,21 @@ fn verify_applied(proposal: &Proposal, cfg: &DiscoveryConfig) -> Result<(), Prop
     let (psize, corr) = a.portfolio_shape();
     want!("portfolio_size", psize, cfg.portfolio_size);
     want!("corr_threshold", corr, cfg.corr_threshold);
+    want!(
+        "streaming_plan.max_batches",
+        a.streaming_plan().max_batches,
+        streaming_plan.max_batches
+    );
+    want!(
+        "streaming_plan.enabled",
+        a.streaming_plan().enabled,
+        streaming_plan.enabled
+    );
+    want!(
+        "streaming_plan.start_cursor",
+        a.cursor_policy(),
+        cursor_policy
+    );
 
     let r = proposal.refusals();
     want!(
@@ -694,6 +705,8 @@ pub struct ProposerCensus {
     /// Cells whose replicate budget was already spent.
     pub cell_replicates_exhausted: usize,
     pub payoff_floor_unreachable: usize,
+    #[serde(default)]
+    pub invalid_payoff_inputs: usize,
     pub lane_horizon_refused: usize,
     pub money_path_refused: usize,
     pub applied_value_mismatch: usize,
@@ -723,6 +736,7 @@ impl ProposerCensus {
             ProposalRefused::Objective(_) => self.objective_refused += 1,
             ProposalRefused::LaneHorizon { .. } => self.lane_horizon_refused += 1,
             ProposalRefused::PayoffFloorUnreachable { .. } => self.payoff_floor_unreachable += 1,
+            ProposalRefused::InvalidPayoffInputs { .. } => self.invalid_payoff_inputs += 1,
             ProposalRefused::MoneyPath { .. } => self.money_path_refused += 1,
             ProposalRefused::AppliedValueMismatch { .. } => self.applied_value_mismatch += 1,
             ProposalRefused::Duplicate { .. } => self.duplicates_refused += 1,
@@ -744,6 +758,7 @@ impl ProposerCensus {
         self.duplicates_refused += other.duplicates_refused;
         self.cell_replicates_exhausted += other.cell_replicates_exhausted;
         self.payoff_floor_unreachable += other.payoff_floor_unreachable;
+        self.invalid_payoff_inputs += other.invalid_payoff_inputs;
         self.lane_horizon_refused += other.lane_horizon_refused;
         self.money_path_refused += other.money_path_refused;
         self.applied_value_mismatch += other.applied_value_mismatch;
@@ -766,6 +781,7 @@ impl ProposerCensus {
         self.duplicates_refused
             + self.cell_replicates_exhausted
             + self.payoff_floor_unreachable
+            + self.invalid_payoff_inputs
             + self.lane_horizon_refused
             + self.money_path_refused
             + self.applied_value_mismatch
@@ -833,8 +849,7 @@ mod tests {
         .unwrap()
     }
 
-    /// The shipped exit geometry: the trail arms at 1R and gives back 1R, so it
-    /// is in the regime the 1.08 measurement covers.
+    /// Historical exit geometry, useful as a regression fixture, not a payoff cap.
     fn shipped_inputs() -> PayoffCeilingInputs {
         PayoffCeilingInputs {
             sl_min_pips: 6.0,
@@ -853,22 +868,37 @@ mod tests {
     }
 
     #[test]
-    fn a_payoff_floor_above_the_measured_trailing_ceiling_is_refused_before_a_bar_is_read() {
-        // level 2 of the payoff-floor dimension is 2.0; the trail caps the
-        // enforced ceiling at MEASURED_TRAILING_PAYOFF_CEILING = 1.08.
+    fn a_payoff_target_above_the_historical_measurement_is_preserved() {
         let p = proposal([0; FACTOR_COUNT], [0, 0, 2, 0]);
         let inputs = shipped_inputs();
-        let ceiling = neoethos_search::run_identity::max_achievable_payoff(&inputs).unwrap();
+        let base = DiscoveryConfig {
+            mode: neoethos_search::discovery::DiscoveryMode::Risky,
+            ..DiscoveryConfig::default()
+        };
+        let spec = materialise(&base, &p, &inputs).expect("valid payoff target must reach Search");
+        assert_eq!(spec.config.target_profile.min_payoff_ratio, 2.0);
+    }
+
+    #[test]
+    fn invalid_payoff_inputs_are_typed_serializable_refusals() {
+        let p = proposal([0; FACTOR_COUNT], [0; 4]);
+        let mut inputs = shipped_inputs();
+        inputs.sl_min_pips = f64::NAN;
+        let base = DiscoveryConfig {
+            mode: neoethos_search::discovery::DiscoveryMode::Risky,
+            ..DiscoveryConfig::default()
+        };
+        let err = materialise(&base, &p, &inputs).unwrap_err();
         assert!(
-            ceiling.enforced_ceiling < 2.0,
-            "test fixture no longer exercises the gate"
+            matches!(err, ProposalRefused::InvalidPayoffInputs { .. }),
+            "{err}"
         );
-        let err =
-            assert_payoff_floor_reachable(p.refusals().value(RefusalDim::PayoffFloor), &inputs)
-                .unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("payoff"));
-        // …and a floor at or below the ceiling is accepted.
-        assert!(assert_payoff_floor_reachable(0.0, &inputs).is_ok());
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(serde_json::from_str::<ProposalRefused>(&json).unwrap(), err);
+        let mut census = ProposerCensus::default();
+        census.record_refusal(&err, &p.describe());
+        assert_eq!(census.invalid_payoff_inputs, 1);
+        assert_eq!(census.total_refused(), 1);
     }
 
     #[test]
@@ -979,5 +1009,38 @@ mod tests {
                 d.label()
             );
         }
+    }
+
+    #[test]
+    fn every_field_declared_by_an_axis_a_factor_is_verified() {
+        let source = include_str!("proposal.rs");
+        let checked = source
+            .match_indices("want!(")
+            .filter_map(|(index, _)| {
+                let rest = source[index + "want!(".len()..].trim_start();
+                let rest = rest.strip_prefix('"')?;
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            checked.len() >= 12,
+            "the want! scan found too few fields to prove coverage: {checked:?}"
+        );
+
+        let unverified = FactorId::ALL
+            .into_iter()
+            .flat_map(|factor| {
+                factor
+                    .writes()
+                    .iter()
+                    .filter(|field| !checked.contains(field))
+                    .map(move |field| format!("{} writes `{field}`", factor.label()))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            unverified.is_empty(),
+            "axis-A fields missing from verify_applied:\n{}",
+            unverified.join("\n")
+        );
     }
 }

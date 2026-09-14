@@ -4,6 +4,26 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+# src/app_services/mod.rs path-compiles the real app transport/auth modules;
+# cargo-machete scans only files physically under this crate and misses their
+# direct dependency uses.
+[package.metadata.cargo-machete]
+ignored = [
+    "base64",
+    "hickory-resolver",
+    "keyring",
+    "open",
+    "rand",
+    "reqwest",
+    "rustls",
+    "serde",
+    "serde_json",
+    "serde_repr",
+    "tokio",
+    "tracing",
+    "tungstenite",
+]
+
 # This diagnostic compiles the real cTrader transport/history/auth modules
 # without pulling neoethos-app's models, search UI, or Tauri graph.
 [workspace]

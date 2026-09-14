@@ -123,20 +123,16 @@ fn burn_cuda_capability_registry_reports_the_compiled_backend() {
     );
     assert!(
         supports.contains("supports_nvidia_cuda_for_model")
-            && supports.contains("feature = \"burn-wgpu-backend\""),
-        "generic GPU capability must combine delegated CUDA support with Burn WGPU"
+            && !supports.contains("feature = \"burn-wgpu-backend\""),
+        "generic GPU capability must retain the exact CUDA authority"
     );
     assert!(
-        prefers.contains("feature = \"burn-wgpu-backend\"")
+        !prefers.contains("feature = \"burn-wgpu-backend\"")
             && prefers.contains("feature = \"burn-cuda-backend\""),
-        "Burn preference must include both compiled GPU backends"
+        "Burn preference must include only the compiled CUDA backend"
     );
 
-    for (name, body) in [
-        ("CUDA support", cuda_supports),
-        ("generic support", supports),
-        ("preference", prefers),
-    ] {
+    for (name, body) in [("CUDA support", cuda_supports), ("preference", prefers)] {
         assert!(
             body.contains("\"sac\" =>") && body.contains("ModelFamily::Deep | ModelFamily::Exit"),
             "Burn {name} capability must cover SAC, Deep, and Exit surfaces"
@@ -203,7 +199,7 @@ fn burn_cuda_feature_is_fail_closed_against_cpu_backends_and_artifact_drift() {
         "ensure_burn_cuda_backend_type::<B>()?;",
         "validate_loaded_burn_device_identity(",
         "Burn CUDA backend requires native CUDA execution",
-        "Burn CUDA artifact runtime identity",
+        "Burn native GPU artifact runtime identity",
     ] {
         assert!(
             BURN_MODELS.contains(required),

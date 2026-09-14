@@ -9,12 +9,11 @@ import {
   serverSymbols,
   spreadStats,
   stopActiveDataFetch,
-  type BrokerSymbol,
-  type SpreadStats,
 } from "../api";
 import { usePoll } from "../hooks";
-import { useSymbolOptions, useTimeframeOptions, invalidateSymbolCache } from "../components/Select";
+import { invalidateSymbolCache, useSymbolOptions, useTimeframeOptions } from "../components/selectOptions";
 import { HelpPanel, HelpStep } from "../components/Help";
+import { DataImportPanel } from "../components/DataImportPanel";
 import {
   brokerFetchSelectionKey,
   dataBatchResultText,
@@ -25,6 +24,9 @@ import {
   type DataFetchStopOutcome,
 } from "../apiContracts";
 import { CANONICAL_BROKER_TIMEFRAMES } from "../timeframes";
+import { useBrokerUi } from "../brokerUiContext";
+import type { BrokerUiAccess } from "../brokerUi";
+import BrokerUnavailable from "../components/BrokerUnavailable";
 
 const TF_SPEED: string[] = [...CANONICAL_BROKER_TIMEFRAMES].reverse();
 const tfRank = (t: string) => {
@@ -62,17 +64,19 @@ function Chips({
 }
 
 export default function Data() {
-  const { data, error, reload } = usePoll(dataBootstrap, 0);
+  const { access } = useBrokerUi();
+  const brokerAccessRef = useRef<BrokerUiAccess | null>(access);
+  useEffect(() => {
+    brokerAccessRef.current = access;
+    return () => { brokerAccessRef.current = null; };
+  }, [access]);
+  const { data, error, loading, reload } = usePoll(dataBootstrap, 0);
   const localSyms = useSymbolOptions();
   const tfOpts = useTimeframeOptions();
   // The FULL broker symbol universe (dozens — forex/metals/indices), so NEW
   // pairs can be downloaded, not just the ones that already have local data.
-  const [brokerSyms, setBrokerSyms] = useState<BrokerSymbol[]>([]);
-  useEffect(() => {
-    serverSymbols()
-      .then((u) => setBrokerSyms(u.symbols))
-      .catch(() => {}); // broker offline → fall back to local list below
-  }, []);
+  const { data: brokerUniverse, error: brokerError, reload: reloadBroker } = usePoll(serverSymbols, 0, access.key, access.requestsEnabled);
+  const brokerSyms = brokerUniverse?.symbols ?? [];
   // Grouped by asset class; local-only symbols (imported files etc.) that the
   // broker list doesn't carry get their own group so nothing disappears.
   const localSet = new Set(localSyms.map((s) => s.toUpperCase()));
@@ -103,15 +107,19 @@ export default function Data() {
   const stopRequested = useRef(false);
   const {
     data: fetchStatus,
+    error: fetchStatusError,
     reload: reloadFetchStatus,
-  } = usePoll(dataFetchStatus, busy ? 250 : 0, [busy]);
+  } = usePoll(dataFetchStatus, busy ? 250 : 2000);
   const [costBusy, setCostBusy] = useState(false);
   const [costMsg, setCostMsg] = useState("");
+  const [costKey, setCostKey] = useState("");
 
   const toggle = (set: React.Dispatch<React.SetStateAction<string[]>>) => (v: string) =>
     set((c) => (c.includes(v) ? c.filter((x) => x !== v) : [...c, v]));
 
   const refreshCosts = async () => {
+    if (!access.requestsEnabled || costBusy) return;
+    setCostKey(access.key);
     setCostBusy(true);
     setCostMsg("Fetching real per-symbol costs from the broker… (can take a minute)");
     try {
@@ -124,6 +132,8 @@ export default function Data() {
   };
 
   const fetchAll = async () => {
+    if (!access.requestsEnabled || busy || !data || error || fetchStatusError || !fetchStatus || fetchStatus.active) return;
+    const batchBrokerKey = access.key;
     const fromMs = Date.parse(from);
     if (Number.isNaN(fromMs)) {
       setMsg("Invalid 'from' date.");
@@ -143,6 +153,11 @@ export default function Data() {
     const fails: string[] = [];
     for (const { s, t } of combos) {
       if (stopRequested.current) break;
+      const currentBroker = brokerAccessRef.current;
+      if (!currentBroker?.requestsEnabled || currentBroker.key !== batchBrokerKey) {
+        fails.push("Batch stopped before the next request: broker setup/account changed or this view closed. Already-dispatched work is not cancelled by this check.");
+        break;
+      }
       setMsg(`Downloading ${done + failed + 1}/${combos.length}: ${s} ${t}…`);
       const symbol = s.toUpperCase();
       const timeframe = t.toUpperCase();
@@ -237,12 +252,16 @@ export default function Data() {
       <HelpPanel id="data">
         <p>This screen manages the <b>price history</b> the engine searches and trains on. Everything is stored locally under your data folder (see <b>Files &amp; Storage</b>).</p>
         <HelpStep n={1}><b>Download bars:</b> the symbol list shows the broker's <b>full universe</b> (forex, metals, indices — grouped by class), so you can bring in <b>brand-new pairs</b>, not just refresh existing ones (✓ marks pairs with canonical data). Tick Symbols + Timeframes, pick a <b>From</b> date, press <b>Fetch</b>. Every timeframe is downloaded directly and published as its own canonical Vortex generation.</HelpStep>
-        <HelpStep n={2}><b>Broker costs:</b> press <b>Refresh broker costs</b> once so backtests use your account's real commission/swap/spread instead of a generic table.</HelpStep>
+        <HelpStep n={2}><b>Broker costs:</b> <b>Refresh broker costs</b> captures the current symbol catalog and rebuilds local cost metadata. This is not synchronized historical bid/ask, conversion or fill evidence, and does not authorize a backtest or live run by itself.</HelpStep>
         <HelpStep n={3}><b>Local symbols:</b> the chips at the bottom show what data you already have — available in every dropdown across the app.</HelpStep>
         <p className="muted small">Discovery requires direct data for its base and every selected higher timeframe. Download or import each one explicitly; missing data fails visibly.</p>
       </HelpPanel>
 
+      <BrokerUnavailable />
       {error && <div className="banner warn">{error}</div>}
+      {brokerError && <div className="banner warn" role="alert">Broker symbol catalog unavailable; only known local symbols are shown. {brokerError} <button onClick={() => void reloadBroker()}>Retry catalog</button></div>}
+      {fetchStatusError && <div className="banner warn" role="alert">Download state is unknown: {fetchStatusError}</div>}
+      <div className="btn-row"><button disabled={loading || busy} onClick={() => void reload()}>{loading ? "Reading inventory…" : "Refresh inventory"}</button></div>
 
       {data && (
         <div className="cards">
@@ -263,7 +282,9 @@ export default function Data() {
             identity that a broker refresh must advance. Its current generation and manifest binding
             are read from this inventory at the moment Fetch is pressed.
           </p>
+          <div className="table-scroll data-inventory" role="region" aria-label="Canonical dataset inventory" tabIndex={0}>
           <table className="tbl">
+            <colgroup><col style={{ width: "9%" }} /><col style={{ width: "6%" }} /><col style={{ width: "28%" }} /><col style={{ width: "31%" }} /><col style={{ width: "13%" }} /><col style={{ width: "13%" }} /></colgroup>
             <thead>
               <tr><th>Symbol</th><th>TF</th><th>Current generation</th><th>Exact identity</th><th>Verification</th><th>Broker refresh</th></tr>
             </thead>
@@ -280,7 +301,7 @@ export default function Data() {
                     <td>{entry.symbol ?? "missing"}</td>
                     <td>{entry.timeframe ?? "missing"}</td>
                     <td><code>{entry.generation}</code></td>
-                    <td><code style={{ overflowWrap: "anywhere" }}>{entry.datasetIdentity}</code></td>
+                    <td><code>{entry.datasetIdentity}</code></td>
                     <td>{entry.verification}</td>
                     <td>
                       {multipleBrokerIdentities && selectionKey !== null ? (
@@ -303,6 +324,7 @@ export default function Data() {
               })}
             </tbody>
           </table>
+          </div>
         </>
       )}
 
@@ -319,16 +341,19 @@ export default function Data() {
         </div>
       )}
 
+      <DataImportPanel onImported={reload} />
+
       <h2>Download bars</h2>
       <div className="ticket">
         <label className="picker-label">
-          Symbols <span className="muted">({selSyms.length || "none"} selected · {symOpts.length} available{brokerSyms.length ? " from broker" : " — broker offline, local only"} · ✓ = has local data)</span>
+          Symbols <span className="muted">({selSyms.length || "none"} selected · {symOpts.length} available{brokerSyms.length ? " from broker" : !access.requestsEnabled ? " — local only; broker setup unavailable" : brokerError ? " — broker catalog unavailable, local only" : !brokerUniverse ? " — loading broker catalog" : " — no broker symbols returned"} · ✓ = has local data)</span>
           <div className="picker-actions">
             <button type="button" className="link" onClick={() => setSelSyms(symOpts)}>all</button>
             <button type="button" className="link" onClick={() => setSelSyms(localSyms)}>with data</button>
             <button type="button" className="link" onClick={() => setSelSyms([])}>none</button>
           </div>
         </label>
+        <div className="data-symbol-picker" role="region" aria-label="Download symbol selection" tabIndex={0}>
         {groups.map(([cls, list]) => (
           <div key={cls} style={{ marginTop: 6 }}>
             <div className="muted small" style={{ marginBottom: 2 }}>
@@ -338,6 +363,7 @@ export default function Data() {
             <Chips opts={list} sel={selSyms} onToggle={toggle(setSelSyms)} local={localSet} />
           </div>
         ))}
+        </div>
 
         <label className="picker-label" style={{ marginTop: 12 }}>
           Timeframes <span className="muted">({selTfs.length || "none"})</span>
@@ -351,14 +377,14 @@ export default function Data() {
 
         <div className="ticket-row" style={{ marginTop: 12, alignItems: "flex-end" }}>
           <label>From<input type="date" value={from} onChange={(e) => setFrom(e.target.value)} style={{ width: 150 }} /></label>
-          <button className="primary" disabled={busy || nCombos === 0} onClick={fetchAll}>
+          <button className="primary" disabled={!access.requestsEnabled || busy || nCombos === 0 || !data || Boolean(error) || !fetchStatus || Boolean(fetchStatusError) || fetchStatus.active} onClick={fetchAll}>
             {busy ? "Downloading…" : `Fetch ${nCombos || ""} from broker`}
           </button>
           {fetchStatus?.active && (
             <button
               type="button"
               className="danger"
-              disabled={fetchStatus.phase !== "capturing"}
+              disabled={fetchStatus.phase !== "capturing" || Boolean(fetchStatusError)}
               onClick={stopFetch}
             >
               {fetchStatus.phase === "publication_in_progress"
@@ -373,19 +399,19 @@ export default function Data() {
         {msg && <div className="banner info">{msg}</div>}
       </div>
 
-      <h2>Broker costs (for accurate backtests)</h2>
+      <h2>Broker cost metadata</h2>
       <div className="ticket">
         <p className="muted small">
-          Pull this account's real per-lot commission, swap and spread from cTrader and rebuild the
-          cost model. Without it, discovery uses a static table that may not match your broker — making
-          backtests over-optimistic vs live.
+          Capture the current cTrader symbol catalog and rebuild local commission, swap and spread
+          metadata. This refresh does not supply synchronized historical quotes, conversion legs or
+          reconciled fills. Research and live execution must still verify their exact cost evidence.
         </p>
         <div className="btn-row">
-          <button className="primary" disabled={costBusy} onClick={refreshCosts}>
+          <button className="primary" disabled={!access.requestsEnabled || costBusy} onClick={refreshCosts}>
             {costBusy ? "Refreshing…" : "Refresh broker costs"}
           </button>
         </div>
-        {costMsg && <div className="banner info">{costMsg}</div>}
+        {costMsg && costKey === access.key && <div className="banner info">{costMsg}</div>}
       </div>
 
       <SpreadStatsPanel />
@@ -402,22 +428,20 @@ export default function Data() {
   );
 }
 
-/** The broker's REAL spread by UTC hour, recorded from the live tick stream.
- *  Shows why a flat backtest spread is optimistic and what value to set. */
+/** Observed tick-spread diagnostics, not historical execution-cost authority. */
 function SpreadStatsPanel() {
-  const [stats, setStats] = useState<SpreadStats | null>(null);
-  useEffect(() => {
-    spreadStats().then(setStats).catch(() => {});
-  }, []);
+  const { data: stats, error, loading, reload } = usePoll(spreadStats, 60000);
+  if (error) return <div className="banner warn" role="alert">Recorded spread statistics unavailable: {error} <button onClick={() => void reload()}>Retry</button></div>;
+  if (!stats) return <p className="muted" role="status">{loading ? "Loading recorded spread statistics…" : "Recorded spread statistics unavailable."}</p>;
   const symbols = Object.entries(stats?.symbols ?? {}).filter(([, v]) => v.hourly?.some((h) => h.samples > 0));
   if (symbols.length === 0) {
     return (
       <>
         <h2>Real spread by hour (recorded)</h2>
         <p className="muted small">
-          Recording started — the app samples your broker's live bid/ask once a minute and builds a
-          per-hour spread profile here (used to sanity-check the backtest's cost assumption). Come
-          back after a few hours of the app running with the tick stream live.
+          No spread samples were returned. This alone does not prove the recorder or broker stream
+          is running. Confirm current bid/ask and their timestamps in Automation → Supervisor.
+          Recorded spread profiles are diagnostics, not historical cost authority for a backtest.
         </p>
       </>
     );
@@ -427,8 +451,9 @@ function SpreadStatsPanel() {
       <h2>Real spread by hour (recorded from your broker)</h2>
       <p className="muted small">
         Mean pips per UTC hour · red = ≥2× the tightest hour (times a flat backtest spread underprices).
-        Use this to set an honest <code>backtest_spread_pips</code>.
+        These observations are diagnostics, not synchronized historical execution costs.
       </p>
+      <div className="table-scroll" role="region" aria-label="Recorded spread by UTC hour" tabIndex={0}>
       <table className="tbl" style={{ fontSize: 11 }}>
         <thead>
           <tr>
@@ -453,6 +478,7 @@ function SpreadStatsPanel() {
           })}
         </tbody>
       </table>
+      </div>
     </>
   );
 }

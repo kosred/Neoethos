@@ -305,27 +305,11 @@ pub struct ParentReference {
     pub axis_a: SearchConfigDelta,
 }
 
-/// Whether a refusal level can be searched at all.
-///
-/// The only dimension that can be structurally unreachable is the payoff floor:
-/// `assert_payoff_floor_reachable` refuses a run whose floor sits above what its
-/// own resolved exit geometry can produce, and under the shipped trail that
-/// ceiling is the **measured 1.08** — so the 2.0 level would be refused at S3 on
-/// every single draw. Pre-excluding it here (and naming it in the space report)
-/// spends the sweep's 100 slots on searches that can run, instead of burning a
-/// third of them on a refusal that was decided before the draw.
-///
-/// `None` = no ceiling has been measured yet, so nothing is pre-excluded and an
-/// unreachable floor is refused and counted at S3 instead. Never silently
-/// lowered: a clamped floor is a configuration nobody chose.
-pub fn refusal_level_reachable(dim: RefusalDim, level: u8, payoff_ceiling: Option<f64>) -> bool {
-    match (dim, payoff_ceiling) {
-        (RefusalDim::PayoffFloor, Some(ceiling)) => {
-            let v = dim.values()[level as usize];
-            v <= 0.0 || v <= ceiling
-        }
-        _ => true,
-    }
+/// Validate the declared level. A geometry diagnostic or historical payoff
+/// measurement cannot exclude an otherwise valid target before actual trading.
+/// The last argument is retained for API compatibility, not used for admission.
+pub fn refusal_level_reachable(dim: RefusalDim, level: u8, _payoff_ceiling: Option<f64>) -> bool {
+    (level as usize) < dim.arity()
 }
 
 /// The proposer. Owns proposal and validation, and nothing that a crash could
@@ -346,8 +330,7 @@ pub struct Proposer {
     keys: HashMap<ProposalKey, SweepId>,
     /// The B0 control's one draw, ever.
     b0_drawn: usize,
-    /// The enforced payoff ceiling this configuration's own geometry produces,
-    /// measured once the ATR scale is installed.
+    /// Full-TP/full-SL geometry diagnostic, never a target admission limit.
     payoff_ceiling: Option<f64>,
     census: ProposerCensus,
 }
@@ -487,27 +470,7 @@ impl Proposer {
         }
         cells = cells.saturating_mul(self.drawable_variants.len().max(1) as u128);
         for d in RefusalDim::ALL {
-            let mut reachable = 0usize;
-            for l in 0..d.arity() as u8 {
-                if refusal_level_reachable(d, l, self.payoff_ceiling) {
-                    reachable += 1;
-                } else {
-                    excluded.push(crate::space::ExcludedLevel::unreachable(
-                        "B",
-                        d.label(),
-                        d.level_label(l),
-                        format!(
-                            "a payoff floor of {} sits above the enforced ceiling {:.2} that this \
-                             configuration's own exit geometry can produce, so \
-                             assert_payoff_floor_reachable would refuse every draw carrying it \
-                             before a bar was read",
-                            d.level_label(l),
-                            self.payoff_ceiling.unwrap_or(f64::NAN)
-                        ),
-                    ));
-                }
-            }
-            cells = cells.saturating_mul(reachable.max(1) as u128);
+            cells = cells.saturating_mul(d.arity() as u128);
         }
         SpaceReport {
             factors,
@@ -544,9 +507,6 @@ impl Proposer {
         }
         for d in RefusalDim::ALL {
             for l in 0..d.arity() as u8 {
-                if !refusal_level_reachable(d, l, self.payoff_ceiling) {
-                    continue;
-                }
                 if session.coverage.get(d.label(), &d.level_label(l)).sweeps < 1 {
                     return false;
                 }
@@ -609,26 +569,27 @@ impl Proposer {
     ///
     /// S1 PROPOSE, S2 GUARD and S3 STAMP all happen here, in that order:
     /// sample → trust region → constraint repair → dedupe → materialise →
-    /// money-path audit → payoff-ceiling gate → stamp.
+    /// money-path audit → numerical-input validation → stamp.
     pub fn draw_sweep(&mut self, sweep: SweepId, session: &Session) -> Result<DrawnSweep> {
-        // The payoff-ceiling inputs are the run's own resolved SL/TP band,
-        // trailing geometry and round-trip cost. They read the ATR scale the
-        // runner installed; without one the band is the absolute pip literal and
-        // the gate is measuring a different search than the one about to run.
+        // Resolve and validate numerical inputs once before sampling. Realized
+        // payoff targets remain drawable regardless of this geometry diagnostic.
         let inputs = payoff_inputs_for_config(&self.base_config, self.pip_value_per_lot);
         if inputs.atr_pips.is_none() {
             tracing::warn!(
                 target: "neoethos_autoresearch::proposer",
                 sl_min_pips = inputs.sl_min_pips,
                 tp_max_pips = inputs.tp_max_pips,
-                "no ATR scale is installed, so the payoff ceiling is being computed against the \
-                 ABSOLUTE pip band. Install the per-run scale before drawing, or the S3 gate \
-                 judges a band this dataset will not search."
+                "no ATR scale is installed: the payoff geometry diagnostic uses the absolute \
+                 pip band; it does not exclude realized-payoff targets."
             );
         }
-        self.payoff_ceiling = neoethos_search::run_identity::max_achievable_payoff(&inputs)
-            .ok()
-            .map(|c| c.enforced_ceiling);
+        self.payoff_ceiling = Some(
+            neoethos_search::run_identity::assert_payoff_floor_reachable(
+                self.base_config.target_profile.min_payoff_ratio,
+                &inputs,
+            )?
+            .enforced_ceiling,
+        );
 
         let parent = self.parent_of(session);
         let mut rng = ChaCha20Rng::seed_from_u64(mix(self.session_seed, sweep.0));
@@ -713,6 +674,7 @@ impl Proposer {
                 match self.stamp(&candidate, &inputs) {
                     Ok(config_hash) => candidate.config_hash = config_hash,
                     Err(reason) => {
+                        let detail = reason.to_string();
                         out.census.record_refusal(&reason, &candidate.describe());
                         out.refused.push(RefusedDraw {
                             slot,
@@ -720,6 +682,13 @@ impl Proposer {
                             reason,
                         });
                         attempt += 1;
+                        if attempt >= PROPOSER_RETRIES {
+                            self.census.absorb(&out.census);
+                            bail!(
+                                "cannot materialise or stamp proposal slot {slot} after \
+                                 {attempt} attempts; last refusal: {detail}"
+                            );
+                        }
                         continue;
                     }
                 }
@@ -856,7 +825,7 @@ impl Proposer {
         owed
     }
 
-    /// S3: materialise, audit, gate on the payoff ceiling, and stamp.
+    /// S3: materialise, audit, validate numerical inputs, and stamp.
     fn stamp(
         &self,
         proposal: &Proposal,
@@ -1089,9 +1058,7 @@ impl Proposer {
         // ── the refusal vector ─────────────────────────────────────────────
         let mut refusal_levels = [0u8; 4];
         for d in RefusalDim::ALL {
-            let available: Vec<u8> = (0..d.arity() as u8)
-                .filter(|l| refusal_level_reachable(d, *l, self.payoff_ceiling))
-                .collect();
+            let available: Vec<u8> = (0..d.arity() as u8).collect();
             refusal_levels[d.index()] = if force_uniform {
                 available[rng.random_range(0..available.len())]
             } else {
@@ -1577,16 +1544,51 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_payoff_floor_is_excluded_and_named() {
-        assert!(refusal_level_reachable(RD::PayoffFloor, 0, Some(1.08)));
-        assert!(refusal_level_reachable(RD::PayoffFloor, 1, Some(1.08)));
-        // level 2 is the 2.0 floor; the shipped trail caps the enforced ceiling
-        // at the MEASURED 1.08.
-        assert!(!refusal_level_reachable(RD::PayoffFloor, 2, Some(1.08)));
-        // With no measurement, nothing is pre-excluded — S3 refuses and counts.
-        assert!(refusal_level_reachable(RD::PayoffFloor, 2, None));
-        // No other dimension is ever pre-excluded by a payoff ceiling.
-        assert!(refusal_level_reachable(RD::WinRateFloor, 2, Some(0.0)));
+    fn historical_payoff_measurements_do_not_exclude_targets() {
+        for cap in [None, Some(1.08), Some(0.0)] {
+            for dim in RD::ALL {
+                for level in 0..dim.arity() as u8 {
+                    assert!(refusal_level_reachable(dim, level, cap));
+                }
+                assert!(!refusal_level_reachable(dim, dim.arity() as u8, cap));
+            }
+        }
+        let mut proposer = test_proposer();
+        let before = proposer.space_report().drawable_cells;
+        proposer.payoff_ceiling = Some(1.08);
+        assert_eq!(proposer.space_report().drawable_cells, before);
+        let mut rng = ChaCha20Rng::seed_from_u64(19);
+        let mut census = ProposerCensus::default();
+        let session = Session::default();
+        let mut drawn = [false; 3];
+        for slot in 0..100 {
+            let proposal = proposer
+                .draw_one(&session, &mut rng, slot, true, None, None, &mut census)
+                .unwrap();
+            drawn[proposal.refusals().level(RD::PayoffFloor) as usize] = true;
+        }
+        assert!(
+            drawn.into_iter().all(|seen| seen),
+            "all payoff levels must remain drawable"
+        );
+    }
+
+    #[test]
+    fn persistent_stamp_refusals_terminate_instead_of_looping_forever() {
+        let mut proposer = test_proposer();
+        // Pass the numerical-input preflight so this exercises the retry branch.
+        proposer.base_config.evaluation_spread_pips = 1.0;
+        proposer.base_config.evaluation_commission_per_trade = 0.0;
+        // A non-finite frozen value cannot survive the money-path audit.
+        proposer.base_config.risky_start_balance = f64::NAN;
+        let err = proposer
+            .draw_sweep(SweepId(1), &Session::default())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot materialise or stamp"),
+            "{err}"
+        );
+        assert_eq!(proposer.census.total_refused(), PROPOSER_RETRIES);
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub mod broker_truth_capture;
 pub mod broker_truth_ctrader;
 mod broker_truth_vortex;
 pub mod bulk_cli;
+pub mod canonical_research_costs;
 pub mod cli;
 mod historical_series_acquisition_v1;
 mod historical_series_runner_v1;
@@ -55,6 +56,7 @@ mod production_broker_truth_v2;
 mod reviewed_sync_ingress_v2;
 mod service;
 pub mod symbol_contract_cli;
+pub mod tick_archive;
 
 pub use production_broker_truth_v2::{
     PRODUCTION_BROKER_TRUTH_DEAL_MAX_ROWS_V2, PRODUCTION_BROKER_TRUTH_RETURN_PROTECTION_ORDERS_V2,

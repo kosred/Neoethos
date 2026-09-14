@@ -103,7 +103,7 @@ fn model_cubecl_calls_share_an_exact_stream_and_ordinal_lifecycle() {
 fn direct_model_kernels_self_clean_and_evolution_hot_loops_keep_residency() {
     for (source, signature) in [
         (NEAT_GPU, "fn try_population_scores_cuda("),
-        (CRFMNES_GPU, "fn try_selection_losses_cuda("),
+        (CRFMNES_GPU, "pub(crate) fn new("),
         (LINEAR_GPU, "fn try_fit_linear_softmax_cuda("),
         (LINEAR_GPU, "fn try_predict_linear_softmax_cuda("),
     ] {
@@ -139,5 +139,22 @@ fn direct_model_kernels_self_clean_and_evolution_hot_loops_keep_residency() {
     assert!(
         crfmnes_scope < crfmnes_loop,
         "CR-FM-NES must enter residency before its island/generation loops"
+    );
+    assert!(
+        crfmnes
+            .find("CrfmnesCudaSession::new(")
+            .expect("CR-FM-NES needs run-owned datasets")
+            < crfmnes_loop,
+        "CR-FM-NES must upload its datasets before all optimizer callbacks"
+    );
+    assert!(
+        crfmnes[crfmnes_loop..].contains("session.selection_losses(candidates)")
+            && !crfmnes[crfmnes_loop..].contains("CrfmnesCudaSession::new("),
+        "optimizer callbacks must reuse the resident session rather than upload datasets"
+    );
+    let one_shot = function_body(CRFMNES_GPU, "fn try_selection_losses_cuda(");
+    assert!(
+        one_shot.contains("CrfmnesCudaSession::new(")
+            && one_shot.contains(".selection_losses(candidates)")
     );
 }

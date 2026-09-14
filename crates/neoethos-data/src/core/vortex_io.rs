@@ -295,6 +295,19 @@ pub fn write_vortex_chunks_fallible_limited(
     chunks: impl IntoIterator<Item = Result<ArrayRef>>,
     max_file_bytes: u64,
 ) -> Result<VortexWriteStats> {
+    write_vortex_chunks_fallible_guarded(path, chunks, max_file_bytes, |_| Ok(()))
+}
+
+/// Run-scoped guard checked at the actual byte sink, including footer writes.
+/// Returning an error unwinds the writer before its staged file is removed.
+/// Use ErrorKind::Other for cooperative Stop: Interrupted may be retried by
+/// Write::write_all and would turn cancellation into an endless retry loop.
+pub(crate) fn write_vortex_chunks_fallible_guarded(
+    path: impl AsRef<Path>,
+    chunks: impl IntoIterator<Item = Result<ArrayRef>>,
+    max_file_bytes: u64,
+    before_write: impl Fn(usize) -> std::io::Result<()> + Sync,
+) -> Result<VortexWriteStats> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -318,13 +331,14 @@ pub fn write_vortex_chunks_fallible_limited(
         .write(true)
         .open(&tmp_path)
         .with_context(|| format!("failed to create staged Vortex file {}", tmp_path.display()))?;
-    let mut file = BoundedFileWriter::new(file, max_file_bytes);
+    let mut file = BoundedFileWriter::new(file, max_file_bytes, &before_write);
     let mut writer = vortex_session()
         .write_options()
         .blocking(&*VORTEX_RUNTIME)
         .writer(&mut file, dtype.clone());
     let mut max_buffered_bytes = 0_u64;
     for chunk in std::iter::once(Ok(first)).chain(chunks) {
+        before_write(0)?;
         let chunk = chunk.context("source reader failed before producing a Vortex chunk")?;
         if chunk.dtype() != &dtype {
             anyhow::bail!(
@@ -344,6 +358,7 @@ pub fn write_vortex_chunks_fallible_limited(
             );
         }
     }
+    before_write(0)?;
     let summary = writer
         .finish()
         .with_context(|| format!("failed to finish Vortex file {}", path.display()))?;
@@ -357,24 +372,31 @@ pub fn write_vortex_chunks_fallible_limited(
         max_buffered_bytes,
     };
     drop(file);
+    before_write(0)?;
     atomic_replace_file(&tmp_path, path)?;
     sync_parent_directory(path)?;
     guard.commit();
     Ok(stats)
 }
 
-struct BoundedFileWriter {
+struct BoundedFileWriter<'a> {
     inner: fs::File,
     max_file_bytes: u64,
     position: u64,
+    before_write: &'a (dyn Fn(usize) -> std::io::Result<()> + Sync),
 }
 
-impl BoundedFileWriter {
-    const fn new(inner: fs::File, max_file_bytes: u64) -> Self {
+impl<'a> BoundedFileWriter<'a> {
+    fn new(
+        inner: fs::File,
+        max_file_bytes: u64,
+        before_write: &'a (dyn Fn(usize) -> std::io::Result<()> + Sync),
+    ) -> Self {
         Self {
             inner,
             max_file_bytes,
             position: 0,
+            before_write,
         }
     }
 
@@ -383,6 +405,7 @@ impl BoundedFileWriter {
     }
 
     fn require_end(&self, write_bytes: usize) -> std::io::Result<()> {
+        (self.before_write)(write_bytes)?;
         let write_bytes = u64::try_from(write_bytes).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -405,7 +428,7 @@ impl BoundedFileWriter {
     }
 }
 
-impl Write for BoundedFileWriter {
+impl Write for BoundedFileWriter<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.require_end(buffer.len())?;
         let written = self.inner.write(buffer)?;
@@ -421,7 +444,7 @@ impl Write for BoundedFileWriter {
     }
 }
 
-impl Seek for BoundedFileWriter {
+impl Seek for BoundedFileWriter<'_> {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
         let next = self.inner.seek(position)?;
         if next > self.max_file_bytes {

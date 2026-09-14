@@ -17,18 +17,11 @@ fn normalized(source: &str) -> String {
 }
 
 #[test]
-fn cubecl_only_device_override_is_not_compiled_with_the_native_adapter() {
+fn retired_cubecl_device_override_is_removed() {
     let eval = normalized(&read("src/eval.rs"));
     assert!(
-        eval.contains(
-            "#[cfg(not(feature=\"gpu-b-adapter\"))]letdevice_override=eval_gpu_devices().first().copied();"
-        ),
-        "the CubeCL-only device override must be cfg-scoped at its declaration"
-    );
-    assert_eq!(
-        eval.matches("letdevice_override=").count(),
-        1,
-        "the release route must not grow a second device-selection value"
+        !eval.contains("letdevice_override="),
+        "the detached CubeCL device override must not survive the run-bound route migration"
     );
 }
 
@@ -60,7 +53,6 @@ fn host_v1_execution_run_has_no_resident_v3_shape_or_session_state() {
     let evidence = normalized(&read("src/population_execution_evidence_v1.rs"));
     for token in [
         "resident_feature_store_session_v3",
-        "parent_row_count",
         "parent_feature_count",
         "ResidentPopulationSessionV3",
     ] {
@@ -72,15 +64,10 @@ fn host_v1_execution_run_has_no_resident_v3_shape_or_session_state() {
 }
 
 #[test]
-fn prototype_b_card_presence_helper_follows_its_gpu_only_caller() {
+fn retired_prototype_b_card_presence_helper_is_removed() {
     let eval = normalized(&read("src/eval.rs"));
     assert!(
-        eval.contains("#[cfg(feature=\"gpu\")]#[inline]fnprototype_b_card_present()->bool{"),
-        "the card-presence helper must compile only with its sole caller in the generic GPU block"
-    );
-    assert_eq!(
-        eval.matches("prototype_b_card_present()").count(),
-        2,
-        "the helper must have exactly one definition and one production caller"
+        !eval.contains("prototype_b_card_present()"),
+        "card presence must come from the sealed run probe, not a detached helper"
     );
 }

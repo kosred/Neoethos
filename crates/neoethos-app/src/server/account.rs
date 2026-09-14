@@ -1,23 +1,8 @@
 //! `/account/snapshot` — current account balance + open positions.
 //!
-//! Wire shape mirrors the `AccountSnapshot` class in
-//! `experiments/forex-flutter-ui/lib/api/backend_client.dart`. Field
-//! names use serde-rename-style camelCase so the Flutter side can
-//! deserialize without a custom mapper — see
-//! `serde(rename_all = "camelCase")` on each struct.
-//!
-//! ## Behaviour when broker is offline
-//!
-//! Phase 1 server fills the cache with a deterministic seed at boot
-//! (see `state::AppApiState::with_seed_account`). Once the live
-//! broker session lands, the seed gets overwritten the moment the
-//! first cTrader account-info message arrives. Either way the route
-//! returns 200 — Flutter doesn't need to special-case "no data yet".
-//!
-//! If the cache is truly empty (no seed AND no live data — only
-//! happens if the bootstrap code is wrong) we return `503 Service
-//! Unavailable` so the Flutter side can render a meaningful error
-//! state instead of an empty json blob.
+//! Production starts without an account snapshot. A successful broker
+//! refresh publishes camelCase data; a missing or failed refresh returns 503
+//! with the recorded cause. Test-only seeded accounts are never startup data.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -32,7 +17,8 @@ use tokio_stream::wrappers::BroadcastStream;
 
 #[cfg(test)]
 use super::state::PositionPayload;
-use super::state::{AccountSnapshotPayload, AppApiState};
+use super::state::{AccountRefreshFailure, AccountSnapshotPayload, AppApiState};
+use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 
 /// Wire DTO. `serde(rename_all = "camelCase")` keeps the JSON keys
 /// matching the Dart field names without us having to maintain two
@@ -40,6 +26,10 @@ use super::state::{AccountSnapshotPayload, AppApiState};
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountSnapshotDto {
+    /// Identity from the completed broker response/request scope, never reloaded settings.
+    /// A string preserves all i64 account IDs when consumed by JavaScript.
+    pub source_account_id: String,
+    pub source_environment: &'static str,
     pub balance: f64,
     pub equity: f64,
     pub free_margin: f64,
@@ -107,6 +97,11 @@ impl From<crate::server::state::PositionPayload> for PositionDto {
 impl From<AccountSnapshotPayload> for AccountSnapshotDto {
     fn from(p: AccountSnapshotPayload) -> Self {
         Self {
+            source_account_id: p.source_account_id.to_string(),
+            source_environment: match p.source_environment {
+                crate::app_services::ctrader_live_auth::CTraderEnvironment::Demo => "Demo",
+                crate::app_services::ctrader_live_auth::CTraderEnvironment::Live => "Live",
+            },
             balance: p.balance,
             equity: p.equity,
             free_margin: p.free_margin,
@@ -143,11 +138,25 @@ pub async fn stream(
     State(state): State<AppApiState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let receiver = state.subscribe_account();
-    let stream = BroadcastStream::new(receiver).filter_map(|res| async move {
-        let payload = res.ok()?;
-        let dto = AccountSnapshotDto::from(payload);
-        let json = serde_json::to_string(&dto).ok()?;
-        Some(Ok(Event::default().event("account").data(json)))
+    let stream = BroadcastStream::new(receiver).filter_map(move |res| {
+        let state = state.clone();
+        async move {
+            let payload = res.ok()?;
+            // A queued event can outlive an account switch or a newer refresh.
+            let (current, failure) =
+                observation_with_scope(&state, super::bridge::current_execution_account_scope)
+                    .await;
+            let current = current?;
+            if failure.is_some()
+                || payload.source_account_id != current.source_account_id
+                || payload.source_environment != current.source_environment
+                || payload.fetched_at_unix_ms != current.fetched_at_unix_ms
+            {
+                return None;
+            }
+            let json = serde_json::to_string(&AccountSnapshotDto::from(payload)).ok()?;
+            Some(Ok(Event::default().event("account").data(json)))
+        }
     });
     Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -169,32 +178,72 @@ pub async fn stream(
 /// "force refresh" button in the UI without any extra plumbing.
 pub async fn refresh(State(state): State<AppApiState>) -> Response {
     state.trigger_account_refresh();
-    // Give the bridge a couple of polling iterations to react before
-    // returning the (likely refreshed) snapshot. This is generous
-    // enough that the bridge's refresh-once round trip + cache write
-    // typically completes within the wait.
+    // Allow the triggered request to begin. This delay does not certify a new
+    // response: the returned snapshot retains its actual fetch timestamp.
     tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-    match state.account().await {
-        Some(payload) => Json(AccountSnapshotDto::from(payload)).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "broker session not ready",
-                "code": "broker_not_ready",
-            })),
-        )
-            .into_response(),
-    }
+    snapshot(State(state)).await
 }
 
 pub async fn snapshot(State(state): State<AppApiState>) -> Response {
-    match state.account().await {
+    snapshot_with_scope(state, super::bridge::current_execution_account_scope).await
+}
+
+/// Shared monitoring read for HTTP, SSE and Supervisor. The resolver is run on
+/// the blocking pool under the cache lock, not against a test-specific profile.
+pub(crate) async fn observation_with_scope(
+    state: &AppApiState,
+    resolve_scope: impl FnOnce() -> anyhow::Result<(i64, CTraderEnvironment)> + Send + 'static,
+) -> (
+    Option<AccountSnapshotPayload>,
+    Option<AccountRefreshFailure>,
+) {
+    let state = state.clone();
+    match tokio::task::spawn_blocking(move || state.current_account_observation(resolve_scope))
+        .await
+    {
+        Ok(Ok(observation)) => observation,
+        result => {
+            let detail = match result {
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "Account observation worker failed".to_owned(),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            (
+                None,
+                Some(AccountRefreshFailure {
+                    code: "account_scope_unavailable".to_owned(),
+                    detail,
+                    observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                }),
+            )
+        }
+    }
+}
+
+async fn snapshot_with_scope(
+    state: AppApiState,
+    resolve_scope: impl FnOnce() -> anyhow::Result<(i64, CTraderEnvironment)> + Send + 'static,
+) -> Response {
+    let (account, failure) = observation_with_scope(&state, resolve_scope).await;
+    if let Some(failure) = failure {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Account snapshot refresh failed; account values and positions are not confirmed current.",
+                "code": failure.code,
+                "detail": failure.detail,
+                "observedAtUnixMs": failure.observed_at_unix_ms,
+                "lastSnapshotAtUnixMs": account.as_ref().map(|value| value.fetched_at_unix_ms),
+            })),
+        ).into_response();
+    }
+    match account {
         Some(payload) => Json(AccountSnapshotDto::from(payload)).into_response(),
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "broker session not ready",
-                "code": "broker_not_ready",
+                "error": "Waiting for the first verified account snapshot; positions are unknown.",
+                "code": "account_snapshot_pending",
             })),
         )
             .into_response(),
@@ -210,6 +259,8 @@ mod tests {
 
     fn seeded_state() -> AppApiState {
         AppApiState::new().with_seed_account(AccountSnapshotPayload {
+            source_account_id: 42,
+            source_environment: crate::app_services::ctrader_live_auth::CTraderEnvironment::Demo,
             balance: 10_000.0,
             equity: 10_125.5,
             free_margin: 9_750.0,
@@ -235,7 +286,14 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_returns_seeded_account_as_camel_case_json() {
-        let app = super::super::router(seeded_state());
+        let app = axum::Router::new()
+            .route(
+                "/account/snapshot",
+                axum::routing::get(|State(state): State<AppApiState>| async move {
+                    snapshot_with_scope(state, || Ok((42, CTraderEnvironment::Demo))).await
+                }),
+            )
+            .with_state(seeded_state());
         let response = app
             .oneshot(
                 Request::builder()
@@ -259,6 +317,34 @@ mod tests {
         assert!(text.contains("\"pnlPips\""));
         assert!(text.contains("\"pnlUsd\""));
         assert!(text.contains("EURUSD"));
+        let wire: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(wire["sourceAccountId"], "42");
+        assert_eq!(wire["sourceEnvironment"], "Demo");
+    }
+
+    #[tokio::test]
+    async fn snapshot_dto_retains_exact_source_identity_for_late_updates_without_relabelling() {
+        use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+        let state = seeded_state();
+        let mut old = state.account().await.unwrap();
+        old.source_account_id = 9_007_199_254_740_993;
+        old.source_environment = CTraderEnvironment::Live;
+        old.balance = 125.25;
+        let mut current = old.clone();
+        current.source_account_id = 99;
+        current.source_environment = CTraderEnvironment::Demo;
+        current.balance = 750.50;
+        for (payload, account_id, environment, balance) in [
+            (current, "99", "Demo", 750.50),
+            // The late old request must remain labelled old, even after a newer snapshot.
+            (old, "9007199254740993", "Live", 125.25),
+        ] {
+            let wire = serde_json::to_value(AccountSnapshotDto::from(payload)).unwrap();
+            assert_eq!(wire["sourceAccountId"], account_id);
+            assert_eq!(wire["sourceEnvironment"], environment);
+            assert_eq!(wire["balance"], balance);
+            assert_eq!(wire["positions"][0]["symbol"], "EURUSD");
+        }
     }
 
     #[tokio::test]
@@ -274,5 +360,59 @@ mod tests {
             .await
             .expect("router responds");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_financial_truth_failure_is_not_misreported_as_broker_auth_failure() {
+        let state = seeded_state();
+        let saved = state.account().await.expect("seeded account");
+        state
+            .set_account_failure(&anyhow::Error::new(
+                neoethos_core::BrokerFinancialTruthErrorV1::unavailable_for(
+                    neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl,
+                ),
+            ))
+            .await;
+        let response =
+            snapshot_with_scope(state.clone(), || Ok((42, CTraderEnvironment::Demo))).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["code"],
+            neoethos_core::BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1
+        );
+        assert!(
+            payload["detail"]
+                .as_str()
+                .unwrap()
+                .contains("broker_position_unrealized_pnl")
+        );
+        assert!(
+            payload.get("balance").is_none(),
+            "stale values are not a successful refresh"
+        );
+        state.set_account(saved).await;
+        assert_eq!(
+            snapshot_with_scope(state.clone(), || Ok((42, CTraderEnvironment::Demo)))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(state.account_observation().await.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_never_returns_a_previous_account_or_environment() {
+        for scope in [
+            (99, CTraderEnvironment::Demo),
+            (42, CTraderEnvironment::Live),
+        ] {
+            let response = snapshot_with_scope(seeded_state(), move || Ok(scope)).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(value.get("balance").is_none());
+        }
     }
 }

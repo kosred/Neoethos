@@ -21,6 +21,7 @@ const XGBOOST_DRIVER_API: &str =
 #[test]
 fn exact_cuda_architecture_parser_is_plural_sorted_native_only_and_fail_closed() {
     let _production_resolver = cuda_build_arch::resolve_exact_cuda_architectures;
+    let _tool_bound_resolver = cuda_build_arch::resolve_exact_cuda_architectures_for_tools;
 
     let parsed = cuda_build_arch::parse_exact_cuda_architectures("sm_89, 8.6;86")
         .expect_err("normalized duplicate architectures must be rejected");
@@ -252,8 +253,11 @@ fn cuda_tree_builders_consume_one_host_auto_or_typed_cross_release_contract() {
         "LightGBM source changes must not be ignored merely because OUT_DIR already exists"
     );
     assert!(
-        LIGHTGBM_CMAKE.contains("if(DEFINED NEOETHOS_EXACT_CUDA_ARCHITECTURES)"),
-        "LightGBM CMake must honor the exact builder-provided architecture set"
+        LIGHTGBM_CMAKE.contains(
+            "if(NOT DEFINED NEOETHOS_EXACT_CUDA_ARCHITECTURES OR \
+             NEOETHOS_EXACT_CUDA_ARCHITECTURES STREQUAL \"\")"
+        ),
+        "LightGBM CMake must fail closed without the exact builder-provided architecture set"
     );
     assert!(
         LIGHTGBM_CMAKE.contains("set(CUDA_ARCHS \"${NEOETHOS_EXACT_CUDA_ARCHITECTURES}\")"),

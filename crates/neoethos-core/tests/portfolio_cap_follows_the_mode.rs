@@ -162,3 +162,32 @@ fn the_shipped_default_carries_a_real_ceiling() {
         d.risk.daily_drawdown_limit
     );
 }
+
+/// A missing per-mode risk key must inherit the compiled `RiskConfig` default.
+/// Field-level Serde defaults on these `Option<f64>` values used to replace the
+/// struct default with `None`, which made the prop-firm ceiling fall back to the
+/// shared 3% band.
+#[test]
+fn absent_risk_bands_inherit_the_compiled_defaults() {
+    let defaults = Settings::default();
+    let loaded = load("system:\n  trading_mode: prop_firm\nrisk:\n  preset: ftmo\n");
+
+    assert_eq!(
+        loaded.risk.risky_min_risk_per_trade,
+        defaults.risk.risky_min_risk_per_trade
+    );
+    assert_eq!(
+        loaded.risk.risky_max_risk_per_trade,
+        defaults.risk.risky_max_risk_per_trade
+    );
+    assert_eq!(
+        loaded.risk.prop_firm_min_risk_per_trade,
+        defaults.risk.prop_firm_min_risk_per_trade
+    );
+    assert_eq!(
+        loaded.risk.prop_firm_max_risk_per_trade,
+        defaults.risk.prop_firm_max_risk_per_trade
+    );
+    assert_eq!(loaded.risk.prop_firm_max_risk_per_trade, Some(0.01));
+    assert_eq!(loaded.risk.risky_max_risk_per_trade, Some(0.30));
+}

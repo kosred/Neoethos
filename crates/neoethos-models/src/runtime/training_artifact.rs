@@ -109,10 +109,7 @@ fn build_training_profile_provenance(
 
     let provenance = ArtifactProvenance::new(
         artifact_kind,
-        stable_json_hash(&serde_json::json!({
-            "feature_columns": feature_columns,
-            "feature_count": payload.frame.n_features(),
-        }))?,
+        model_feature_schema_hash(&feature_columns)?,
         training_dataset_fingerprint(payload)?,
         stable_json_hash(&serde_json::json!({
             "symbols": [profile.symbol.as_str()],
@@ -126,12 +123,18 @@ fn build_training_profile_provenance(
             "base_timeframe": profile.base_timeframe.as_str(),
             "dataset_rows": profile.dataset_rows,
         }))?,
-        stable_json_hash(&serde_json::json!({
-            "multi_resolution_enabled": profile.multi_resolution_enabled,
-            "base_features_prefixed": profile.base_features_prefixed,
-            "base_signal_filter_enabled": profile.base_signal_filter_enabled,
-            "feature_columns": &feature_columns,
-        }))?,
+        model_feature_availability_hash(
+            profile,
+            &feature_columns,
+            &payload.frame.plan_identity().to_hex(),
+            payload
+                .frame
+                .normalization_fitted_state()
+                .map(|fit| fit.fitted_state_hash())
+                .transpose()?
+                .as_ref(),
+            payload.frame.feature_build_options(),
+        )?,
         stable_json_hash(&serde_json::json!({
             "label_horizon_bars": profile.label_horizon_bars,
             "effective_label_horizon_bars": profile.effective_label_horizon_bars,
@@ -197,6 +200,33 @@ fn build_training_profile_provenance(
     Ok(provenance)
 }
 
+pub(crate) fn model_feature_schema_hash(columns: &[String]) -> Result<String> {
+    stable_json_hash(&serde_json::json!({
+        "feature_columns": columns,
+        "feature_count": columns.len(),
+    }))
+}
+
+/// Shared by the actual producer and loader; preserve the existing on-disk
+/// hash recipe exactly, including selected column order and the complete fit.
+pub(crate) fn model_feature_availability_hash(
+    profile: &TrainingRuntimeProfile,
+    columns: &[String],
+    plan_identity: &str,
+    fit_hash: Option<&[u8; 32]>,
+    options: Option<&neoethos_data::FeatureBuildOptions>,
+) -> Result<String> {
+    stable_json_hash(&serde_json::json!({
+        "multi_resolution_enabled": profile.multi_resolution_enabled,
+        "base_features_prefixed": profile.base_features_prefixed,
+        "base_signal_filter_enabled": profile.base_signal_filter_enabled,
+        "feature_columns": columns,
+        "feature_plan_identity": plan_identity,
+        "fitted_normalization_hash": fit_hash,
+        "producer_recipe": options,
+    }))
+}
+
 fn sorted_training_params(params: &HashMap<String, String>) -> BTreeMap<String, String> {
     params
         .iter()
@@ -231,20 +261,36 @@ fn training_dataset_fingerprint(payload: &TrainingPayload) -> Result<String> {
     for source_row in payload.source_row_indices.iter() {
         hash = fnv1a64_update(hash, &(*source_row as u64).to_le_bytes());
     }
-    let dense = payload
-        .frame
-        .to_dense_samples_major()
-        .context("materialize f64+validity payload for artifact fingerprint")?;
-    for value in dense.values.iter() {
-        hash = fnv1a64_update(hash, &value.to_le_bytes());
-    }
-    for validity in dense.validity.iter() {
-        hash = fnv1a64_update(hash, &[validity.code()]);
-    }
+    hash = hash_training_frame_cells(hash, &payload.frame)?;
     for label in payload.labels.iter() {
         hash = fnv1a64_update(hash, &label.to_le_bytes());
     }
     Ok(format!("fnv64:{hash:016x}"))
+}
+
+/// Preserve the original samples-major values-then-validity byte stream without
+/// materializing another full training matrix for every model sidecar. The two
+/// bounded passes are intentional: interleaving validity would change identity.
+fn hash_training_frame_cells(mut hash: u64, frame: &neoethos_data::FeatureFrame) -> Result<u64> {
+    let rows_per_batch = (65_536 / frame.n_features().max(1)).max(1);
+    for validity_pass in [false, true] {
+        for start in (0..frame.n_samples()).step_by(rows_per_batch) {
+            let end = start.saturating_add(rows_per_batch).min(frame.n_samples());
+            let dense = frame
+                .dense_window(start, end)
+                .context("read bounded f64+validity batch for artifact fingerprint")?;
+            if validity_pass {
+                for validity in &dense.validity {
+                    hash = fnv1a64_update(hash, &[validity.code()]);
+                }
+            } else {
+                for value in &dense.values {
+                    hash = fnv1a64_update(hash, &value.to_le_bytes());
+                }
+            }
+        }
+    }
+    Ok(hash)
 }
 
 fn training_runtime_backend_label(
@@ -269,7 +315,8 @@ fn resolve_training_runtime_backend_label(
         ModelFamily::Tree => "tree_cpu",
         ModelFamily::Deep | ModelFamily::Exit => match active_burn_backend_name() {
             "cuda" => "burn_cuda",
-            "wgpu" => "wgpu",
+            "rocm" if capability_family == ModelFamily::Deep => "burn_rocm",
+            "rocm" => "unavailable_rocm_lifecycle",
             _ => "burn_cpu",
         },
         ModelFamily::Forecasting
@@ -294,10 +341,18 @@ fn resolve_training_runtime_backend_label(
             "tree_gpu".to_string()
         }
         ModelFamily::Deep | ModelFamily::Exit if raw_backend == "cpu" => "burn_cpu".to_string(),
-        ModelFamily::Deep | ModelFamily::Exit
-            if matches!(raw_backend, "wgpu" | "vulkan" | "metal" | "dx12" | "rocm") =>
+        ModelFamily::Deep
+            if cfg!(feature = "burn-rocm-backend") && matches!(raw_backend, "rocm" | "hip") =>
         {
-            "wgpu".to_string()
+            "burn_rocm".to_string()
+        }
+        ModelFamily::Deep | ModelFamily::Exit
+            if matches!(
+                raw_backend,
+                "wgpu" | "vulkan" | "metal" | "dx12" | "rocm" | "hip"
+            ) =>
+        {
+            "unavailable_retired_gpu_backend".to_string()
         }
         _ => raw_backend.to_string(),
     }
@@ -327,8 +382,8 @@ fn training_device_assignment(
 fn default_training_device_for_backend(backend_kind: BackendKind) -> &'static str {
     match backend_kind {
         BackendKind::NativeCuda | BackendKind::CudaKernel => "cuda:0",
+        BackendKind::NativeRocm => "rocm:0",
         BackendKind::NativeTreeGpu => "gpu:0",
-        BackendKind::BurnWgpu => "wgpu:0",
         BackendKind::NativeCpu
         | BackendKind::BurnCpu
         | BackendKind::NativeTreeCpu
@@ -389,6 +444,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_training_fingerprint_preserves_dense_bytes_for_raw_fitted_and_selected_views() {
+        use neoethos_data::{FeatureBuildControl, FeatureCellValidity, FeatureColumnF64};
+        let raw = std::sync::Arc::new(
+            neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+                neoethos_data::test_fixtures::canonical_test_timestamps(22_000),
+                (0..3)
+                    .map(|column| {
+                        FeatureColumnF64::new(
+                            format!("f{column}"),
+                            (0..22_000)
+                                .map(|row| row as f64 * 0.25 + column as f64)
+                                .collect(),
+                            vec![FeatureCellValidity::Valid; 22_000],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let fit = raw
+            .fit_normalization(0..11_000, true, &FeatureBuildControl::default())
+            .unwrap();
+        let normalized = raw.with_fitted_normalization(&fit).unwrap();
+        let selected = normalized.select_rows(&[0, 7, 300, 21_999]).unwrap();
+        for frame in [&*raw, &normalized, &selected] {
+            let seed = fnv1a64(b"same-prefix");
+            let dense = frame.to_dense_samples_major().unwrap();
+            let mut expected = seed;
+            for value in &dense.values {
+                expected = fnv1a64_update(expected, &value.to_le_bytes());
+            }
+            for validity in &dense.validity {
+                expected = fnv1a64_update(expected, &[validity.code()]);
+            }
+            assert_eq!(hash_training_frame_cells(seed, frame).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn deep_auto_backend_records_the_compiled_burn_runtime() {
         let label = resolve_training_runtime_backend_label(ModelFamily::Deep, "auto");
 
@@ -401,16 +496,19 @@ mod tests {
             );
         }
 
-        #[cfg(all(feature = "burn-wgpu-backend", not(feature = "burn-cuda-backend")))]
+        #[cfg(feature = "burn-rocm-backend")]
         {
-            assert_eq!(label, "wgpu");
+            assert_eq!(label, "burn_rocm");
             assert_eq!(
                 runtime_backend_kind_from_label(Some(&label)),
-                Some(BackendKind::BurnWgpu)
+                Some(BackendKind::NativeRocm)
+            );
+            assert_eq!(
+                default_training_device_for_backend(BackendKind::NativeRocm),
+                "rocm:0"
             );
         }
-
-        #[cfg(not(any(feature = "burn-wgpu-backend", feature = "burn-cuda-backend")))]
+        #[cfg(not(any(feature = "burn-cuda-backend", feature = "burn-rocm-backend")))]
         {
             assert_eq!(label, "burn_cpu");
             assert_eq!(

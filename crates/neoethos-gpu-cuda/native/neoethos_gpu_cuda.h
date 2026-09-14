@@ -632,6 +632,13 @@ std::int32_t neoethos_gpu_cuda_population_upload_resident_scenarios_v2(
     NeoCudaPopulationSession* session,
     const NeoPopulationScenarioView* scenarios,
     std::uint64_t planned_population);
+/// Validate all P ordered base descriptors, retaining only C admitted scenario
+/// slots. Their IDs are rewritten on device per chunk; genes stay resident.
+std::int32_t neoethos_gpu_cuda_population_upload_resident_base_scenarios_v3(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationScenarioView* scenarios,
+    std::uint64_t planned_population,
+    std::uint64_t retained_capacity);
 std::int32_t neoethos_gpu_cuda_population_create_resident_generation_run_v2(
     NeoCudaPopulationSession* session,
     const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1* plan,

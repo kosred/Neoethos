@@ -218,6 +218,7 @@ fn request_evidence_from_request_v1(
 
 fn fixed_shape_from_request_v1(
     request: &CanonicalNativeDiscoveryRequestV1,
+    feature_metadata: CanonicalNativeFeatureMetadataSizeV1,
 ) -> CanonicalNativeGenerationZeroFixedMetadataShapeV1 {
     let loaded = request.loaded_contract();
     let bindings = loaded.source_projection().bindings();
@@ -233,6 +234,7 @@ fn fixed_shape_from_request_v1(
             checked_compact_json_string_byte_count_v1(loaded.relative_path()).unwrap(),
         source_count: bindings.len(),
         total_source_segment_count,
+        feature_metadata_json_upper_bound_bytes: feature_metadata.json_upper_bound_bytes(),
     }
 }
 
@@ -414,7 +416,37 @@ fn high_level_preflight_and_sealer_match_private_oracles_and_reject_forged_autho
     let fixture = high_level_fixture_v1();
     let request = &fixture.request;
     let prepared_feature_count = fixture.sizing_receipt_v2.feature_count();
-    let shape = fixed_shape_from_request_v1(request);
+    // This legacy host codec fixture has no materialized plan or fitted state.
+    // The synthetic names and byte budget exercise sizing only; they do not
+    // manufacture a production recipe, source authority, or device evidence.
+    assert!(
+        fixture
+            .native_receipt_v3
+            .feature_plan_canonical_bytes()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .native_receipt_v3
+            .normalization_fitted_state()
+            .is_none()
+    );
+    assert_eq!(
+        checked_actual_feature_metadata_json_bytes_v3(&fixture.native_receipt_v3).unwrap(),
+        0
+    );
+    let host_only_names: Vec<_> = (0..prepared_feature_count)
+        .map(|index| format!("host-codec-column-{index}"))
+        .collect();
+    let host_only_plan_byte_budget = 17;
+    let feature_metadata = CanonicalNativeFeatureMetadataSizeV1::checked_from_recipe_v3(
+        fixture.native_receipt_v3.row_count(),
+        host_only_names.iter().map(String::as_str),
+        false,
+        host_only_plan_byte_budget,
+    )
+    .unwrap();
+    let shape = fixed_shape_from_request_v1(request, feature_metadata);
     assert!(shape.source_count > 1);
     assert!(shape.total_source_segment_count > shape.source_count);
 
@@ -425,10 +457,43 @@ fn high_level_preflight_and_sealer_match_private_oracles_and_reject_forged_autho
         shape,
     )
     .unwrap();
-    let high_level_preflight =
-        preflight_canonical_native_generation_zero_result_v1(request, prepared_feature_count)
-            .unwrap();
+    let high_level_preflight = preflight_canonical_native_generation_zero_result_v1(
+        request,
+        prepared_feature_count,
+        feature_metadata,
+    )
+    .unwrap();
     assert_preflight_matches_oracle_v1(&high_level_preflight, &oracle_preflight);
+    let without_feature_metadata = checked_preflight_from_fixed_metadata_shape_v1(
+        prepared_feature_count,
+        request.config().max_indicators,
+        request.config().population,
+        CanonicalNativeGenerationZeroFixedMetadataShapeV1 {
+            feature_metadata_json_upper_bound_bytes: 0,
+            ..shape
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        high_level_preflight.fixed_metadata_upper_bound_with_empty_arrays_bytes()
+            - without_feature_metadata.fixed_metadata_upper_bound_with_empty_arrays_bytes(),
+        feature_metadata.json_upper_bound_bytes(),
+        "high-level preflight must charge the complete typed metadata allowance"
+    );
+    assert_eq!(
+        feature_metadata.json_upper_bound_bytes(),
+        u64::try_from(4 * host_only_plan_byte_budget + 1).unwrap()
+            + b",\"feature_plan_canonical_bytes\":".len() as u64
+    );
+    assert!(
+        preflight_canonical_native_generation_zero_result_v1(
+            request,
+            prepared_feature_count + 1,
+            feature_metadata,
+        )
+        .is_err(),
+        "high-level preflight accepted a metadata/population feature-count mismatch"
+    );
 
     let evaluation_evidence =
         CanonicalNativeGenerationZeroEvaluationEvidenceV1::checked_from_evaluation_config_v1(
@@ -542,8 +607,12 @@ fn high_level_preflight_and_sealer_match_private_oracles_and_reject_forged_autho
     }
 
     let fresh_preflight = || {
-        preflight_canonical_native_generation_zero_result_v1(request, prepared_feature_count)
-            .unwrap()
+        preflight_canonical_native_generation_zero_result_v1(
+            request,
+            prepared_feature_count,
+            feature_metadata,
+        )
+        .unwrap()
     };
     let mut forged_contract_value = serde_json::to_value(&fixture.financial_contract).unwrap();
     forged_contract_value["input_receipt_sha256"] = serde_json::json!("9".repeat(64));

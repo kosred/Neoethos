@@ -293,7 +293,8 @@ const EMD_ID: &str = "emd";
 const EMD_OUTPUT_IDS: [&str; 3] = ["upperband", "middleband", "lowerband"];
 const EMD_PARAMETER_KEYS: [&str; 3] = ["period", "delta", "fraction"];
 const EMD_TREND_ID: &str = "emd_trend";
-const EMD_TREND_OUTPUT_IDS: [&str; 4] = ["direction", "average", "upper", "lower"];
+const EMD_TREND_DEVICE_OUTPUT_IDS: [&str; 4] = ["direction", "average", "upper", "lower"];
+const EMD_TREND_OUTPUT_IDS: [&str; 3] = ["direction", "upper", "lower"];
 const EMD_TREND_PARAMETER_KEYS: [&str; 4] = ["source", "avg_type", "length", "mult"];
 const ERI_ID: &str = "eri";
 const ERI_OUTPUT_IDS: [&str; 2] = ["bull", "bear"];
@@ -4873,10 +4874,10 @@ fn resolve_didi_index_parameters(
     Ok((tuple[0], tuple[1], tuple[2]))
 }
 
-/// Resolve Directional Imbalance Index's canonical fixed length and exact
-/// admitted period. The registry is the sole output/parameter authority; the
-/// typed CUDA launch consumes every base/sweep tuple rather than replaying one
-/// primary output under six labels.
+/// Resolve Directional Imbalance Index's canonical coupled 10:70 timescale and
+/// exact admitted sweep tuple. The registry is the sole output/parameter
+/// authority; the typed CUDA launch consumes every base/sweep tuple rather than
+/// replaying one primary output under six labels.
 fn resolve_directional_imbalance_index_parameters(
     parameters: &ClassicCudaParameters,
 ) -> std::result::Result<(usize, usize), String> {
@@ -4969,22 +4970,38 @@ fn resolve_directional_imbalance_index_parameters(
                      resolved anchor, found {anchor}"
                 ));
             }
-            let override_keys = overrides.iter().map(|(key, _)| *key).collect::<Vec<_>>();
-            if override_keys != ["period"] {
+            let expected_overrides =
+                classic_cuda_sweep_params(DIRECTIONAL_IMBALANCE_INDEX_ID, *period)?;
+            if overrides != &expected_overrides {
                 return Err(format!(
-                    "{DIRECTIONAL_IMBALANCE_INDEX_ID}: canonical sweep must override exactly \
-                     [\"period\"], found {override_keys:?}"
+                    "{DIRECTIONAL_IMBALANCE_INDEX_ID}: canonical coupled sweep for period \
+                     {period} requires exact overrides {expected_overrides:?}, found \
+                     {overrides:?}"
                 ));
             }
-            let resolved_period =
-                positive_usize_parameter(DIRECTIONAL_IMBALANCE_INDEX_ID, "period", overrides[0].1)?;
-            if resolved_period != *period {
-                return Err(format!(
-                    "{DIRECTIONAL_IMBALANCE_INDEX_ID}: swept period {period} != exact override \
-                     {resolved_period}"
-                ));
-            }
-            [10, resolved_period]
+            let override_value = |key: &str| {
+                overrides
+                    .iter()
+                    .find_map(|(candidate, value)| (*candidate == key).then_some(*value))
+                    .ok_or_else(|| {
+                        format!(
+                            "{DIRECTIONAL_IMBALANCE_INDEX_ID}: canonical coupled sweep omitted \
+                             `{key}` after exact override validation"
+                        )
+                    })
+            };
+            [
+                positive_usize_parameter(
+                    DIRECTIONAL_IMBALANCE_INDEX_ID,
+                    "length",
+                    override_value("length")?,
+                )?,
+                positive_usize_parameter(
+                    DIRECTIONAL_IMBALANCE_INDEX_ID,
+                    "period",
+                    override_value("period")?,
+                )?,
+            ]
         }
         ClassicCudaParameters::Swept { anchor, .. } => {
             return Err(format!(
@@ -6689,10 +6706,10 @@ fn resolve_emd_trend_parameters(
         .iter()
         .map(|output| output.id)
         .collect::<Vec<_>>();
-    if declared_outputs != EMD_TREND_OUTPUT_IDS {
+    if declared_outputs != EMD_TREND_DEVICE_OUTPUT_IDS {
         return Err(format!(
             "{EMD_TREND_ID}: exact four-output CUDA ABI {:?} != registry {declared_outputs:?}",
-            EMD_TREND_OUTPUT_IDS
+            EMD_TREND_DEVICE_OUTPUT_IDS
         ));
     }
     let planned_outputs = output_ids_for(EMD_TREND_ID);
@@ -17028,10 +17045,10 @@ pub(crate) fn execute_gpu_only_classic_plan(
                         .map(|named_output| named_output.output_id)
                         .collect::<Vec<_>>();
                     ensure!(
-                        returned_output_ids == EMD_TREND_OUTPUT_IDS,
-                        "{EMD_TREND_ID}: production CUDA contract {:?} != {:?}",
+                        returned_output_ids == EMD_TREND_DEVICE_OUTPUT_IDS,
+                        "{EMD_TREND_ID}: device CUDA contract {:?} != {:?}",
                         returned_output_ids,
-                        EMD_TREND_OUTPUT_IDS
+                        EMD_TREND_DEVICE_OUTPUT_IDS
                     );
                     pending.push(PendingClassicColumn::NamedResident {
                         routes: routes.into(),
@@ -20367,8 +20384,9 @@ mod tests {
     }
 
     #[test]
-    fn directional_imbalance_index_period_sweep_forms_thirty_canonical_columns_in_five_launches() {
+    fn directional_imbalance_index_ratio_sweep_forms_thirty_distinct_canonical_columns() {
         let periods = vec![7, 21, 50, 100, 200];
+        let expected_lengths = [1, 3, 7, 14, 29];
         let plan = build_exact_classic_cuda_plan(
             1_000,
             &[],
@@ -20383,7 +20401,9 @@ mod tests {
         );
         let launches = preflight_exact_classic_cuda_plan(&plan).unwrap();
         assert_eq!(launches.len(), periods.len());
-        for (launch, expected_period) in launches.iter().zip(periods) {
+        for ((launch, expected_period), expected_length) in
+            launches.iter().zip(periods).zip(expected_lengths)
+        {
             let ResolvedClassicCudaLaunch::DirectionalImbalanceIndex {
                 routes,
                 length,
@@ -20392,7 +20412,7 @@ mod tests {
             else {
                 panic!("every period must remain one typed six-output launch");
             };
-            assert_eq!((*length, *period), (10, expected_period));
+            assert_eq!((*length, *period), (expected_length, expected_period));
             assert_eq!(
                 routes.each_ref().map(|route| route.output_id),
                 DIRECTIONAL_IMBALANCE_INDEX_OUTPUT_IDS
@@ -20406,12 +20426,15 @@ mod tests {
                     && route.node.parameters
                         == ClassicCudaParameters::Swept {
                             period: expected_period,
-                            overrides: vec![("period", expected_period as i64)],
+                            overrides: vec![
+                                ("period", expected_period as i64),
+                                ("length", expected_length as i64),
+                            ],
                             anchor: ClassicCudaAnchor::Resolved(expected_period),
                         }
                     && route.route
                         == ClassicCudaResolvedRoute::DirectionalImbalanceIndex {
-                            length: 10,
+                            length: expected_length,
                             period: expected_period,
                         }
             }));
@@ -21628,9 +21651,9 @@ mod tests {
     }
 
     #[test]
-    fn emd_trend_default_forms_one_exact_length_twenty_eight_quad_launch() {
+    fn emd_trend_default_forms_one_exact_length_twenty_eight_triple_launch() {
         const ID: &str = "emd_trend";
-        const OUTPUT_IDS: [&str; 4] = ["direction", "average", "upper", "lower"];
+        const OUTPUT_IDS: [&str; 3] = ["direction", "upper", "lower"];
         assert_eq!(
             output_ids_for(ID),
             OUTPUT_IDS.map(Some),
@@ -21655,12 +21678,7 @@ mod tests {
             routes
                 .each_ref()
                 .map(|route| route.node.column_name.as_str()),
-            [
-                "emd_trend_direction",
-                "emd_trend_average",
-                "emd_trend_upper",
-                "emd_trend_lower",
-            ]
+            ["emd_trend_direction", "emd_trend_upper", "emd_trend_lower",]
         );
         assert!(routes.iter().all(|route| {
             route.node.stage == ClassicCudaStage::Base
@@ -21678,16 +21696,16 @@ mod tests {
     }
 
     #[test]
-    fn emd_trend_length_sweeps_form_five_exact_quad_launches() {
+    fn emd_trend_length_sweeps_form_five_exact_triple_launches() {
         const ID: &str = "emd_trend";
-        const OUTPUT_IDS: [&str; 4] = ["direction", "average", "upper", "lower"];
+        const OUTPUT_IDS: [&str; 3] = ["direction", "upper", "lower"];
         let lengths = vec![7, 21, 50, 100, 200];
         let plan =
             build_exact_classic_cuda_plan(2_000, &[], &[], &[(ID, lengths.clone())]).unwrap();
         assert_eq!(
             plan.nodes.len(),
             lengths.len() * OUTPUT_IDS.len(),
-            "EMD Trend must retain all twenty admitted length-sweep receipts"
+            "EMD Trend must retain all fifteen distinct length-sweep receipts"
         );
         let launches = preflight_exact_classic_cuda_plan(&plan).unwrap();
         assert_eq!(launches.len(), lengths.len());
@@ -21698,7 +21716,7 @@ mod tests {
                 mult_bits,
             } = launch
             else {
-                panic!("every admitted EMD Trend length must remain one typed quad launch");
+                panic!("every admitted EMD Trend length must remain one typed triple launch");
             };
             assert_eq!((*length, *mult_bits), (expected_length, 1.0_f64.to_bits()));
             assert_eq!(routes.each_ref().map(|route| route.output_id), OUTPUT_IDS);

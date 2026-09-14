@@ -1,8 +1,7 @@
 //! Schema versioning for every operator-facing persisted contract.
 //!
-//! Phase D4. Establishes a uniform versioning pattern that the
-//! Flutter rewrite (and any future client) can rely on when
-//! reading on-disk artifacts the Rust backend wrote.
+//! Establishes a uniform versioning pattern that every current or future
+//! client can rely on when reading on-disk artifacts the Rust backend wrote.
 //!
 //! ## The pattern
 //!
@@ -35,20 +34,12 @@
 //! - `neoethos_core::symbol_metadata::SymbolMetadataTable`
 //!   (`symbol_metadata.json`)
 //!
-//! ## What's NOT covered (deferred follow-ups)
+//! ## What's NOT covered
 //!
-//! - `WizardStateFile` (`wizard_state.json`) — already has a
-//!   `version: u32` field but it's a re-run counter, not a schema
-//!   version. A small re-rename in a follow-up commit
-//!   disambiguates without breaking compat.
 //! - `config.yaml` — YAML rather than JSON/TOML; the existing
 //!   `#[serde(default)]` on every field gives ad-hoc forward
 //!   compat. Adding strict versioning to YAML is its own
 //!   conversation with the operator.
-//! - SQLite-backed contracts (`alpha_strategies`,
-//!   `live_metrics`, `cycle_metrics`) — these get a SQLite
-//!   `schema_version` row in a meta table when D4.x lands; SQL
-//!   migrations are a different beast from struct migrations.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -156,10 +147,9 @@ pub trait HasSchemaVersion {
     fn schema_version(&self) -> SchemaVersion;
 }
 
-/// Validate that a loaded value's schema_version is within the
-/// readable range. Caller should run this AFTER deserialisation
-/// + AFTER any migrations, to enforce the post-migration version
-/// is the current one.
+/// Validate that a loaded value's schema version is within the readable range.
+/// Callers run this after deserialisation and after any migrations so the
+/// post-migration version is guaranteed to be current.
 pub fn check_schema_version_readable<T: HasSchemaVersion>(
     value: &T,
     contract: &'static str,

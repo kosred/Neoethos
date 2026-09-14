@@ -38,9 +38,13 @@ use crate::resident_session_v2::{
     ResidentSessionLaunchAuthorityV2, ResidentSessionRuntimeReceiptV2, launch_resident_session_v2,
 };
 use crate::resident_trim_prefilter_v1::{
-    RESIDENT_TRIM_PREFILTER_CUDA_MATH_FLAGS_V1, ResidentTrimPrefilterFullDiscoveryAdmissionV1,
+    RESIDENT_TRIM_PREFILTER_CUDA_MATH_FLAGS_V1, ResidentTrimPrefilterDeviceErrorV1,
+    ResidentTrimPrefilterDeviceRunV1, ResidentTrimPrefilterFullDiscoveryAdmissionV1,
     ResidentTrimPrefilterImportIdentityV1, ResidentTrimPrefilterInputsV1,
-    ResidentTrimPrefilterParentImportV1, SealedResidentColumnClassificationV1,
+    ResidentTrimPrefilterParentImportV1, ResidentTrimPrefilterScoreBatchDeviceViewV2,
+    SCREENING_IMPORT_ABI_VERSION_V2, SealedResidentColumnClassificationV1,
+    enqueue_exact_cpcv_fold_descriptors_v1, enqueue_first_passage_labels_v1,
+    enqueue_invalidate_device_seal_if_insufficient_decisions_v1, enqueue_score_batch_v2,
 };
 use crate::{NeoPopulationSettings, ScenarioDescriptor};
 use cust::context::{Context, CurrentContext};
@@ -55,6 +59,7 @@ use cust::sys::{
     CUcontext, CUevent, CUresult, CUstream, cuEventCreate, cuEventDestroy_v2, cuEventQuery,
     cuEventRecord, cuEventSynchronize, cuStreamGetCtx, cuStreamSynchronize, cuStreamWaitEvent,
 };
+use neoethos_gpu_contracts::normalization_v3::SearchNormalizationColumnModeV3;
 use neoethos_gpu_contracts::resident_feature_store_v3::{
     CudaPrimaryContextBuildIdentityV3, PORTABLE_CUDA_SHA256_AUTHORITY_V3,
     ResidentFeatureProducerV3, ResidentFeatureRouteV3, ResidentParentDatasetLayoutV4,
@@ -128,6 +133,11 @@ unsafe extern "C" {
         logical_bytes: usize,
         allocated_bytes: usize,
         validity_code_error: *mut u32,
+        stream: CUstream,
+    ) -> i32;
+    fn neoethos_resident_accumulate_control_error_u32_v3(
+        source_error: *const u32,
+        aggregate_error: *mut u32,
         stream: CUstream,
     ) -> i32;
     fn neoethos_resident_pack_batch_to_bar_major_f64_u4_v3(
@@ -344,6 +354,47 @@ impl ResidentTrimPrefilterSchemaUploadV1 {
     }
 }
 
+/// Metadata-only screening identity. The hashes bind the immutable parent
+/// recipe and source projection before feature values exist; none is presented
+/// as a final compact content, normalization-fit, or FeaturePlan digest.
+#[derive(Debug)]
+pub struct ResidentTrimPrefilterScreeningSchemaUploadV2 {
+    inner: ResidentTrimPrefilterSchemaUploadV1,
+}
+
+impl ResidentTrimPrefilterScreeningSchemaUploadV2 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        canonical_search_input_receipt_sha256: [u8; SHA256_BYTES],
+        parent_recipe_identity_sha256: [u8; SHA256_BYTES],
+        normalization_semantics_sha256: [u8; SHA256_BYTES],
+        parent_feature_schema_sha256: [u8; SHA256_BYTES],
+        source_projection_sha256: [u8; SHA256_BYTES],
+        ordered_feature_schema_sha256: [u8; SHA256_BYTES],
+        column_classification_content_sha256: [u8; SHA256_BYTES],
+        column_class_flags: Vec<u8>,
+        timeframe_group_ids: Vec<u32>,
+        template_force_keep_flags: Vec<u8>,
+        timeframe_group_count: u64,
+    ) -> Result<Self, ResidentFeatureStoreCudaErrorV3> {
+        Ok(Self {
+            inner: ResidentTrimPrefilterSchemaUploadV1::new(
+                canonical_search_input_receipt_sha256,
+                parent_recipe_identity_sha256,
+                normalization_semantics_sha256,
+                parent_feature_schema_sha256,
+                source_projection_sha256,
+                ordered_feature_schema_sha256,
+                column_classification_content_sha256,
+                column_class_flags,
+                timeframe_group_ids,
+                template_force_keep_flags,
+                timeframe_group_count,
+            )?,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct PendingResidentTrimSchemaUploadV1 {
     host_column_class_flags: Option<LockedBuffer<u8>>,
@@ -442,9 +493,8 @@ struct ResidentTrimSchemaLifetimeV1 {
     ready_event: OwnedCudaEventV3,
 }
 
-#[derive(Debug)]
 struct ResidentTrimAdmissionLifetimeV1 {
-    _owner: Arc<ResidentFeatureStoreOwnerV3>,
+    _owner: Box<dyn std::any::Any + Send>,
     ready_event: OwnedCudaEventV3,
 }
 
@@ -454,12 +504,16 @@ struct ResidentTrimAdmissionLifetimeV1 {
 /// from an ordinal, low-level receipt, or caller capability flag.
 #[derive(Debug)]
 pub struct GpuOnlyRunDeviceAdmissionV3 {
+    source_admission_identity_sha256: [u8; SHA256_BYTES],
+    native_preflight_facts_identity_sha256: [u8; SHA256_BYTES],
     admission_identity_sha256: [u8; SHA256_BYTES],
     workspace_plan_identity_sha256: [u8; SHA256_BYTES],
     device_identity: CudaPrimaryContextBuildIdentityV3,
     device_uuid: [u8; 16],
     compute_capability_major: u16,
     compute_capability_minor: u16,
+    multiprocessor_count: u32,
+    warp_size: u32,
     run_stream: Arc<Stream>,
     primary_context: Arc<Context>,
     phase_one_free_bytes_snapshot: u64,
@@ -472,11 +526,14 @@ pub struct GpuOnlyRunDeviceAdmissionV3 {
 #[derive(Debug)]
 pub(crate) struct GpuOnlyRunDeviceAdmissionRequestV3 {
     pub(crate) source_admission_identity_sha256: [u8; SHA256_BYTES],
+    pub(crate) native_preflight_facts_identity_sha256: [u8; SHA256_BYTES],
     pub(crate) workspace_plan_identity_sha256: [u8; SHA256_BYTES],
     pub(crate) selected_device_ordinal: u32,
     pub(crate) device_uuid: [u8; 16],
     pub(crate) compute_capability_major: u16,
     pub(crate) compute_capability_minor: u16,
+    pub(crate) multiprocessor_count: u32,
+    pub(crate) warp_size: u32,
     pub(crate) run_stream: Arc<Stream>,
     pub(crate) primary_context: Arc<Context>,
     pub(crate) driver_version: String,
@@ -493,6 +550,14 @@ pub(crate) struct GpuOnlyRunDeviceAdmissionRequestV3 {
 }
 
 impl GpuOnlyRunDeviceAdmissionV3 {
+    pub const fn source_admission_identity_sha256(&self) -> [u8; SHA256_BYTES] {
+        self.source_admission_identity_sha256
+    }
+
+    pub const fn native_preflight_facts_identity_sha256(&self) -> [u8; SHA256_BYTES] {
+        self.native_preflight_facts_identity_sha256
+    }
+
     pub const fn admission_identity_sha256(&self) -> [u8; SHA256_BYTES] {
         self.admission_identity_sha256
     }
@@ -527,6 +592,14 @@ impl GpuOnlyRunDeviceAdmissionV3 {
         self.phase_one_free_bytes_snapshot
     }
 
+    pub const fn multiprocessor_count(&self) -> u32 {
+        self.multiprocessor_count
+    }
+
+    pub const fn warp_size(&self) -> u32 {
+        self.warp_size
+    }
+
     pub const fn allocator_context_reserve_bytes(&self) -> u64 {
         self.allocator_context_reserve_bytes
     }
@@ -543,15 +616,65 @@ impl GpuOnlyRunDeviceAdmissionV3 {
             0,
         )
     }
+
+    pub(crate) fn reseal_for_data_population_v2(
+        self,
+        workspace_plan_identity_sha256: [u8; SHA256_BYTES],
+        native_preflight_facts_identity_sha256: [u8; SHA256_BYTES],
+        vector_ta_build_sha256: [u8; SHA256_BYTES],
+        exact_math_authority: String,
+        data_population_limits: SealedDataPopulationExecutionLimitsV1,
+    ) -> Result<Self, ResidentFeatureStoreCudaErrorV3> {
+        if native_preflight_facts_identity_sha256 != self.native_preflight_facts_identity_sha256
+            || workspace_plan_identity_sha256
+                != data_population_limits.workspace_plan_identity_sha256()
+            || vector_ta_build_sha256 != self.device_identity.vector_ta_build_sha256()
+            || exact_math_authority != self.device_identity.exact_math_authority()
+            || self.data_population_limits.is_some()
+            || self.full_discovery_trim_admission.is_none()
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "screening run cannot be resealed for the requested Data+population plan".into(),
+            ));
+        }
+        let request = GpuOnlyRunDeviceAdmissionRequestV3 {
+            source_admission_identity_sha256: self.source_admission_identity_sha256,
+            native_preflight_facts_identity_sha256,
+            workspace_plan_identity_sha256,
+            selected_device_ordinal: self.device_identity.ordinal(),
+            device_uuid: self.device_identity.device_uuid(),
+            compute_capability_major: self.device_identity.compute_capability_major(),
+            compute_capability_minor: self.device_identity.compute_capability_minor(),
+            multiprocessor_count: self.multiprocessor_count,
+            warp_size: self.warp_size,
+            run_stream: self.run_stream,
+            primary_context: self.primary_context,
+            driver_version: self.device_identity.driver_version().to_owned(),
+            context_api_version: self.device_identity.runtime_version().to_owned(),
+            nvcc_version: self.device_identity.nvcc_version().to_owned(),
+            native_sass_target: self.device_identity.native_sass_target().to_owned(),
+            vector_ta_build_sha256,
+            gpu_cuda_build_sha256: self.device_identity.gpu_cuda_build_sha256(),
+            exact_math_authority,
+            phase_one_free_bytes_snapshot: self.phase_one_free_bytes_snapshot,
+            allocator_context_reserve_bytes: self.allocator_context_reserve_bytes,
+            data_population_limits: Some(data_population_limits),
+            full_discovery_trim_admission: None,
+        };
+        seal_gpu_only_run_device_admission_v3(request)
+    }
 }
 
 pub(crate) fn seal_gpu_only_run_device_admission_v3(
     request: GpuOnlyRunDeviceAdmissionRequestV3,
 ) -> Result<GpuOnlyRunDeviceAdmissionV3, ResidentFeatureStoreCudaErrorV3> {
     if request.source_admission_identity_sha256 == [0; SHA256_BYTES]
+        || request.native_preflight_facts_identity_sha256 == [0; SHA256_BYTES]
         || request.workspace_plan_identity_sha256 == [0; SHA256_BYTES]
         || request.phase_one_free_bytes_snapshot == 0
         || request.allocator_context_reserve_bytes == 0
+        || request.multiprocessor_count == 0
+        || request.warp_size == 0
         || request.driver_version.trim().is_empty()
         || request.context_api_version.trim().is_empty()
         || request.nvcc_version.trim().is_empty()
@@ -619,12 +742,16 @@ pub(crate) fn seal_gpu_only_run_device_admission_v3(
         request.exact_math_authority,
     )?;
     Ok(GpuOnlyRunDeviceAdmissionV3 {
+        source_admission_identity_sha256: request.source_admission_identity_sha256,
+        native_preflight_facts_identity_sha256: request.native_preflight_facts_identity_sha256,
         admission_identity_sha256,
         workspace_plan_identity_sha256: request.workspace_plan_identity_sha256,
         device_identity,
         device_uuid: request.device_uuid,
         compute_capability_major: request.compute_capability_major,
         compute_capability_minor: request.compute_capability_minor,
+        multiprocessor_count: request.multiprocessor_count,
+        warp_size: request.warp_size,
         run_stream: request.run_stream,
         primary_context: request.primary_context,
         phase_one_free_bytes_snapshot: request.phase_one_free_bytes_snapshot,
@@ -641,11 +768,14 @@ fn hash_gpu_only_run_device_admission_v3(
     let mut hasher = Sha256::new();
     hasher.update(b"neoethos.gpu-only-run-device-admission.v3");
     hasher.update(request.source_admission_identity_sha256);
+    hasher.update(request.native_preflight_facts_identity_sha256);
     hasher.update(request.workspace_plan_identity_sha256);
     hasher.update(request.selected_device_ordinal.to_le_bytes());
     hasher.update(request.device_uuid);
     hasher.update(request.compute_capability_major.to_le_bytes());
     hasher.update(request.compute_capability_minor.to_le_bytes());
+    hasher.update(request.multiprocessor_count.to_le_bytes());
+    hasher.update(request.warp_size.to_le_bytes());
     hasher.update((request.primary_context.as_raw() as usize as u64).to_le_bytes());
     hasher.update((request.run_stream.as_inner() as usize as u64).to_le_bytes());
     hasher.update(request.driver_version.as_bytes());
@@ -704,6 +834,83 @@ fn trim_identity_sha256_v1(domain: &[u8], parts: &[&[u8]]) -> [u8; SHA256_BYTES]
         hasher.update(part);
     }
     hasher.finalize().into()
+}
+
+struct ResidentTrimRuntimeIdentityV1 {
+    admission_identity_sha256: [u8; SHA256_BYTES],
+    workspace_plan_identity_sha256: [u8; SHA256_BYTES],
+    selected_cuda_ordinal: u32,
+    cuda_device_identity_sha256: [u8; SHA256_BYTES],
+    primary_context_identity_sha256: [u8; SHA256_BYTES],
+    run_stream_identity_sha256: [u8; SHA256_BYTES],
+    cuda_build_manifest_sha256: [u8; SHA256_BYTES],
+    cuda_math_flags_sha256: [u8; SHA256_BYTES],
+    phase_one_free_bytes_snapshot: u64,
+    allocator_context_reserve_bytes: u64,
+    required_workspace_bytes: u64,
+    trim_prefilter_reserved_bytes: u64,
+    full_discovery_reserve_bytes: u64,
+}
+
+fn derive_resident_trim_runtime_identity_v1(
+    admitted: &GpuOnlyRunDeviceAdmissionV3,
+) -> Result<ResidentTrimRuntimeIdentityV1, ResidentFeatureStoreCudaErrorV3> {
+    let full_trim = admitted.full_discovery_trim_admission().ok_or_else(|| {
+        ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "resident screening has no sealed full-Discovery trim admission".into(),
+        )
+    })?;
+    let admission_identity_sha256 = admitted.admission_identity_sha256();
+    let workspace_plan_identity_sha256 = admitted.workspace_plan_identity_sha256();
+    let selected_cuda_ordinal = admitted.device_identity().ordinal();
+    let ordinal_bytes = selected_cuda_ordinal.to_le_bytes();
+    let compute_major_bytes = admitted.compute_capability_major.to_le_bytes();
+    let compute_minor_bytes = admitted.compute_capability_minor.to_le_bytes();
+    let cuda_device_identity_sha256 = trim_identity_sha256_v1(
+        b"neoethos.resident-trim-device-identity.v1",
+        &[
+            &admission_identity_sha256,
+            &admitted.device_uuid,
+            &ordinal_bytes,
+            &compute_major_bytes,
+            &compute_minor_bytes,
+        ],
+    );
+    let primary_context_identity_sha256 =
+        admitted.device_identity().primary_context_process_token();
+    let run_stream_identity_sha256 = admitted.run_stream_process_token_v3();
+    let vector_ta_build_sha256 = admitted.device_identity().vector_ta_build_sha256();
+    let cuda_build_manifest_sha256 = trim_identity_sha256_v1(
+        b"neoethos.resident-trim-build-manifest.v1",
+        &[
+            &admission_identity_sha256,
+            &workspace_plan_identity_sha256,
+            &vector_ta_build_sha256,
+            admitted.device_identity().native_sass_target().as_bytes(),
+            admitted.device_identity().nvcc_version().as_bytes(),
+        ],
+    );
+    let mut math_hasher = Sha256::new();
+    math_hasher.update(b"neoethos.resident-trim-cuda-math-flags.v1");
+    for flag in RESIDENT_TRIM_PREFILTER_CUDA_MATH_FLAGS_V1 {
+        math_hasher.update((flag.len() as u64).to_le_bytes());
+        math_hasher.update(flag.as_bytes());
+    }
+    Ok(ResidentTrimRuntimeIdentityV1 {
+        admission_identity_sha256,
+        workspace_plan_identity_sha256,
+        selected_cuda_ordinal,
+        cuda_device_identity_sha256,
+        primary_context_identity_sha256,
+        run_stream_identity_sha256,
+        cuda_build_manifest_sha256,
+        cuda_math_flags_sha256: math_hasher.finalize().into(),
+        phase_one_free_bytes_snapshot: admitted.phase_one_free_bytes_snapshot(),
+        allocator_context_reserve_bytes: admitted.allocator_context_reserve_bytes(),
+        required_workspace_bytes: full_trim.required_workspace_bytes(),
+        trim_prefilter_reserved_bytes: full_trim.trim_prefilter_reserved_bytes(),
+        full_discovery_reserve_bytes: full_trim.full_discovery_reserve_bytes(),
+    })
 }
 
 fn ordered_feature_schema_sha256_v1(
@@ -765,6 +972,50 @@ fn compact_device_buffer_from_slice_async<T: DeviceCopy>(
         return Err(error.into());
     }
     Ok((locked_source, destination))
+}
+
+fn upload_resident_trim_schema_v1(
+    schema: ResidentTrimPrefilterSchemaUploadV1,
+    context: &Arc<Context>,
+    stream: &Arc<Stream>,
+) -> Result<(ResidentTrimSchemaLifetimeV1, u64), ResidentFeatureStoreCudaErrorV3> {
+    let retained_schema_bytes = schema
+        .column_class_flags
+        .len()
+        .checked_add(
+            schema
+                .timeframe_group_ids
+                .len()
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                    "resident trim timeframe metadata bytes",
+                ))?,
+        )
+        .and_then(|bytes| bytes.checked_add(schema.template_force_keep_flags.len()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+            "resident trim schema metadata bytes",
+        ))?;
+    let schema_ready_event = OwnedCudaEventV3::new()?;
+    let mut upload = PendingResidentTrimSchemaUploadV1::new(schema_ready_event);
+    let (host_column_class_flags, column_class_flags) =
+        compact_device_buffer_from_slice_async(&schema.column_class_flags, context, stream)?;
+    upload.host_column_class_flags = Some(host_column_class_flags);
+    upload.column_class_flags = Some(column_class_flags);
+    let (host_timeframe_group_ids, timeframe_group_ids) =
+        compact_device_buffer_from_slice_async(&schema.timeframe_group_ids, context, stream)?;
+    upload.host_timeframe_group_ids = Some(host_timeframe_group_ids);
+    upload.timeframe_group_ids = Some(timeframe_group_ids);
+    let (host_template_force_keep_flags, template_force_keep_flags) =
+        compact_device_buffer_from_slice_async(&schema.template_force_keep_flags, context, stream)?;
+    upload.host_template_force_keep_flags = Some(host_template_force_keep_flags);
+    upload.template_force_keep_flags = Some(template_force_keep_flags);
+    upload
+        .ready_event
+        .as_ref()
+        .expect("armed trim schema upload retains its ready event")
+        .record(stream)?;
+    Ok((upload.into_lifetime(), retained_schema_bytes))
 }
 
 #[derive(Debug)]
@@ -1021,6 +1272,70 @@ impl ResidentFeatureColumnBindingV3 {
     }
 }
 
+/// Move-only allocation authority for the final projected resident store.
+/// The unfiltered parent width is accepted only while this value is sealed;
+/// it is deliberately not retained and therefore cannot size an allocation.
+#[must_use = "the compact selected extent must be moved into the resident allocator"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompactSelectedStoreAllocationExtentV2 {
+    rows: usize,
+    selected_columns: usize,
+    cells: usize,
+}
+
+impl CompactSelectedStoreAllocationExtentV2 {
+    pub fn seal_compact_v2(
+        rows: usize,
+        parent_column_count: usize,
+        selected_columns: usize,
+    ) -> Result<Self, ResidentFeatureStoreCudaErrorV3> {
+        if rows == 0
+            || parent_column_count == 0
+            || selected_columns == 0
+            || selected_columns > parent_column_count
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "compact resident extent requires nonempty rows and a selected width bounded by the parent schema"
+                    .into(),
+            ));
+        }
+        let cells = rows.checked_mul(selected_columns).ok_or(
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                "compact selected resident feature cells",
+            ),
+        )?;
+        Ok(Self {
+            rows,
+            selected_columns,
+            cells,
+        })
+    }
+
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub const fn selected_columns(&self) -> usize {
+        self.selected_columns
+    }
+
+    pub const fn cells(&self) -> usize {
+        self.cells
+    }
+
+    pub const fn row_count(&self) -> usize {
+        self.rows
+    }
+
+    pub const fn column_count(&self) -> usize {
+        self.selected_columns
+    }
+
+    pub const fn cell_count(&self) -> usize {
+        self.cells
+    }
+}
+
 /// One already-resident producer batch. Implementors are internal ownership
 /// authorities, not caller-provided capability booleans.
 ///
@@ -1202,6 +1517,12 @@ impl ResidentAppendTransactionV3 {
                 .expect("successful append retains ready event"),
         }
     }
+
+    fn disarm_without_pack(mut self) -> Box<dyn ResidentF64FeatureBatchV3> {
+        self.batch
+            .take()
+            .expect("validated empty compact intersection retains producer batch")
+    }
 }
 
 impl Drop for ResidentAppendTransactionV3 {
@@ -1251,6 +1572,1309 @@ impl PendingResidentFeatureBatchV3 {
         batch_release?;
         Ok(())
     }
+}
+
+#[derive(Debug)]
+struct ResidentFeatureScreeningRuntimeOwnerV2 {
+    placeholder_values: StreamOrderedDeviceBufferV3<f64>,
+    placeholder_validity_u4: StreamOrderedDeviceBufferV3<u8>,
+    aggregate_control_error: StreamOrderedDeviceBufferV3<u32>,
+    parent_source: Box<dyn ResidentParentDatasetSourceV3>,
+    run_device: GpuOnlyRunDeviceAdmissionV3,
+}
+
+// SAFETY: all device mutation is enqueued on the one immutable admitted
+// stream. Rust exposes only shared runtime references while the unique
+// screening pass owns the native enqueue authority.
+unsafe impl Sync for ResidentFeatureScreeningRuntimeOwnerV2 {}
+
+#[derive(Debug)]
+struct PendingResidentFeatureScreeningBatchV2 {
+    source: Option<PendingResidentFeatureBatchV3>,
+    bar_major_values: Option<StreamOrderedDeviceBufferV3<f64>>,
+    bar_major_validity_u4: Option<StreamOrderedDeviceBufferV3<u8>>,
+    local_control_error: Option<StreamOrderedDeviceBufferV3<u32>>,
+    normalization_scratch_bits: Option<StreamOrderedDeviceBufferV3<u64>>,
+    normalization_fit_words: Option<StreamOrderedDeviceBufferV3<u64>>,
+    host_global_parent_ordinals: Option<LockedBuffer<u32>>,
+    global_parent_ordinals: Option<StreamOrderedDeviceBufferV3<u32>>,
+    score_completion_event: Option<OwnedCudaEventV3>,
+}
+
+impl PendingResidentFeatureScreeningBatchV2 {
+    fn completion_is_ready(&self) -> Result<bool, ResidentFeatureStoreCudaErrorV3> {
+        self.score_completion_event
+            .as_ref()
+            .ok_or_else(|| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "screening batch lost its score-completion event".into(),
+                )
+            })?
+            .query()
+    }
+
+    fn release(mut self, stream: &Stream) -> Result<(), ResidentFeatureStoreCudaErrorV3> {
+        let source = self.source.take().ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "screening batch lost its producer lifetime".into(),
+            )
+        })?;
+        source.release(stream, true)?;
+        drop(self.bar_major_values.take());
+        drop(self.bar_major_validity_u4.take());
+        drop(self.local_control_error.take());
+        drop(self.normalization_scratch_bits.take());
+        drop(self.normalization_fit_words.take());
+        drop(self.host_global_parent_ordinals.take());
+        drop(self.global_parent_ordinals.take());
+        drop(self.score_completion_event.take());
+        Ok(())
+    }
+}
+
+impl Drop for PendingResidentFeatureScreeningBatchV2 {
+    fn drop(&mut self) {
+        // A normal destructor is allowed only after the score-completion event
+        // has proved that native code no longer retains any batch address.
+        if let Some(owner) = self.source.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.bar_major_values.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.bar_major_validity_u4.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.local_control_error.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.normalization_scratch_bits.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.normalization_fit_words.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.host_global_parent_ordinals.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.global_parent_ordinals.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.score_completion_event.take() {
+            std::mem::forget(owner);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResidentFeatureScreeningBatchConstructionV2 {
+    source: Option<ResidentAppendTransactionV3>,
+    bar_major_values: Option<StreamOrderedDeviceBufferV3<f64>>,
+    bar_major_validity_u4: Option<StreamOrderedDeviceBufferV3<u8>>,
+    local_control_error: Option<StreamOrderedDeviceBufferV3<u32>>,
+    normalization_scratch_bits: Option<StreamOrderedDeviceBufferV3<u64>>,
+    normalization_fit_words: Option<StreamOrderedDeviceBufferV3<u64>>,
+    host_global_parent_ordinals: Option<LockedBuffer<u32>>,
+    global_parent_ordinals: Option<StreamOrderedDeviceBufferV3<u32>>,
+    score_completion_event: Option<OwnedCudaEventV3>,
+}
+
+impl ResidentFeatureScreeningBatchConstructionV2 {
+    fn new(batch: Box<dyn ResidentF64FeatureBatchV3>) -> Self {
+        Self {
+            source: Some(ResidentAppendTransactionV3::new(batch)),
+            bar_major_values: None,
+            bar_major_validity_u4: None,
+            local_control_error: None,
+            normalization_scratch_bits: None,
+            normalization_fit_words: None,
+            host_global_parent_ordinals: None,
+            global_parent_ordinals: None,
+            score_completion_event: None,
+        }
+    }
+
+    fn source(&self) -> &ResidentAppendTransactionV3 {
+        self.source
+            .as_ref()
+            .expect("armed screening transaction retains its producer source")
+    }
+
+    fn source_mut(&mut self) -> &mut ResidentAppendTransactionV3 {
+        self.source
+            .as_mut()
+            .expect("armed screening transaction retains its producer source")
+    }
+
+    fn disarm(mut self) -> PendingResidentFeatureScreeningBatchV2 {
+        PendingResidentFeatureScreeningBatchV2 {
+            source: Some(
+                self.source
+                    .take()
+                    .expect("successful screening retains its producer transaction")
+                    .disarm(),
+            ),
+            bar_major_values: self.bar_major_values.take(),
+            bar_major_validity_u4: self.bar_major_validity_u4.take(),
+            local_control_error: self.local_control_error.take(),
+            normalization_scratch_bits: self.normalization_scratch_bits.take(),
+            normalization_fit_words: self.normalization_fit_words.take(),
+            host_global_parent_ordinals: self.host_global_parent_ordinals.take(),
+            global_parent_ordinals: self.global_parent_ordinals.take(),
+            score_completion_event: self.score_completion_event.take(),
+        }
+    }
+}
+
+impl Drop for ResidentFeatureScreeningBatchConstructionV2 {
+    fn drop(&mut self) {
+        // ResidentAppendTransactionV3 already leaks its own possibly-retained
+        // async inputs. Retain every additional screening address as well when
+        // a CUDA enqueue fails before a terminal completion event is recorded.
+        drop(self.source.take());
+        if let Some(owner) = self.bar_major_values.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.bar_major_validity_u4.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.local_control_error.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.normalization_scratch_bits.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.normalization_fit_words.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.host_global_parent_ordinals.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.global_parent_ordinals.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.score_completion_event.take() {
+            std::mem::forget(owner);
+        }
+    }
+}
+
+/// Move-only pre-native-screening owner. Search receives only the opaque trim
+/// inputs; Data retains the same process-local runtime through an Arc so the
+/// producer replay can continue after the native label/fold stages are bound.
+#[must_use = "the prepared screening pass must bind one native trim run"]
+pub struct PreparedResidentFeatureScreeningPassV2 {
+    runtime: Arc<ResidentFeatureScreeningRuntimeOwnerV2>,
+    parent_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    parent_normalization_modes: Vec<SearchNormalizationColumnModeV3>,
+    admitted_max_live_producer_bytes: usize,
+    admitted_max_live_producer_scratch_bytes: usize,
+    admitted_pointer_table_bytes: usize,
+}
+
+impl std::fmt::Debug for PreparedResidentFeatureScreeningPassV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedResidentFeatureScreeningPassV2")
+            .field("parent_column_count", &self.parent_column_bindings.len())
+            .field(
+                "admitted_max_live_producer_bytes",
+                &self.admitted_max_live_producer_bytes,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Same-stream bounded producer scorer. It never allocates the unfiltered
+/// resident feature cube: at most one producer batch, its normalization
+/// scratch, pointer table, and one aggregate control-error word are live.
+#[must_use = "the screening pass must score the complete parent recipe"]
+pub struct ResidentFeatureScreeningPassV2 {
+    runtime: Arc<ResidentFeatureScreeningRuntimeOwnerV2>,
+    parent_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    parent_normalization_modes: Vec<SearchNormalizationColumnModeV3>,
+    next_parent_column: usize,
+    native_run: Option<ResidentTrimPrefilterDeviceRunV1>,
+    pending_batch: Option<PendingResidentFeatureScreeningBatchV2>,
+    admitted_max_live_producer_bytes: usize,
+    admitted_max_live_producer_scratch_bytes: usize,
+    admitted_pointer_table_bytes: usize,
+}
+
+impl std::fmt::Debug for ResidentFeatureScreeningPassV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResidentFeatureScreeningPassV2")
+            .field("parent_column_count", &self.parent_column_bindings.len())
+            .field("next_parent_column", &self.next_parent_column)
+            .field("has_pending_batch", &self.pending_batch.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[must_use = "the screening runtime must be recovered after the bounded selected-map read"]
+pub struct ResidentFeatureScreeningRunRecoveryV2 {
+    runtime: Arc<ResidentFeatureScreeningRuntimeOwnerV2>,
+}
+
+struct ResidentFeatureScreeningRecoveryGuardV2 {
+    placeholder_values: Option<StreamOrderedDeviceBufferV3<f64>>,
+    placeholder_validity_u4: Option<StreamOrderedDeviceBufferV3<u8>>,
+    aggregate_control_error: Option<StreamOrderedDeviceBufferV3<u32>>,
+    parent_source: Option<Box<dyn ResidentParentDatasetSourceV3>>,
+    run_device: Option<GpuOnlyRunDeviceAdmissionV3>,
+}
+
+impl Drop for ResidentFeatureScreeningRecoveryGuardV2 {
+    fn drop(&mut self) {
+        // Recovery is the first point at which the Arc topology is known to be
+        // unique. Any failure before the parent is released and every queued
+        // address is retired has an ambiguous CUDA lifetime, so retain rather
+        // than invoke ordinary destructors.
+        if let Some(owner) = self.placeholder_values.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.placeholder_validity_u4.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.aggregate_control_error.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.parent_source.take() {
+            std::mem::forget(owner);
+        }
+        if let Some(owner) = self.run_device.take() {
+            std::mem::forget(owner);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ResidentFeatureScreeningErrorV2 {
+    Runtime(ResidentFeatureStoreCudaErrorV3),
+    Trim(ResidentTrimPrefilterDeviceErrorV1),
+    ClassicTa(ResidentClassicTaExecutorErrorV3),
+}
+
+impl From<ResidentFeatureStoreCudaErrorV3> for ResidentFeatureScreeningErrorV2 {
+    fn from(error: ResidentFeatureStoreCudaErrorV3) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+impl From<ResidentTrimPrefilterDeviceErrorV1> for ResidentFeatureScreeningErrorV2 {
+    fn from(error: ResidentTrimPrefilterDeviceErrorV1) -> Self {
+        Self::Trim(error)
+    }
+}
+
+impl From<ResidentClassicTaExecutorErrorV3> for ResidentFeatureScreeningErrorV2 {
+    fn from(error: ResidentClassicTaExecutorErrorV3) -> Self {
+        Self::ClassicTa(error)
+    }
+}
+
+impl std::fmt::Debug for ResidentFeatureScreeningRunRecoveryV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResidentFeatureScreeningRunRecoveryV2")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedResidentFeatureScreeningPassV2 {
+    pub fn bind_native_run_v2(
+        self,
+        mut native_run: ResidentTrimPrefilterDeviceRunV1,
+    ) -> Result<ResidentFeatureScreeningPassV2, ResidentTrimPrefilterDeviceErrorV1> {
+        let run_device = &self.runtime.run_device;
+        if native_run.selected_cuda_ordinal() != run_device.device_identity().ordinal()
+            || native_run.primary_context_identity_sha256()
+                != run_device.device_identity().primary_context_process_token()
+            || native_run.run_stream_identity_sha256() != run_device.run_stream_process_token_v3()
+        {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::IdentityMismatch(
+                "screening native run",
+            ));
+        }
+        enqueue_first_passage_labels_v1(&mut native_run)?;
+        enqueue_invalidate_device_seal_if_insufficient_decisions_v1(&mut native_run)?;
+        enqueue_exact_cpcv_fold_descriptors_v1(&mut native_run)?;
+        Ok(ResidentFeatureScreeningPassV2 {
+            runtime: self.runtime,
+            parent_column_bindings: self.parent_column_bindings,
+            parent_normalization_modes: self.parent_normalization_modes,
+            next_parent_column: 0,
+            native_run: Some(native_run),
+            pending_batch: None,
+            admitted_max_live_producer_bytes: self.admitted_max_live_producer_bytes,
+            admitted_max_live_producer_scratch_bytes: self.admitted_max_live_producer_scratch_bytes,
+            admitted_pointer_table_bytes: self.admitted_pointer_table_bytes,
+        })
+    }
+}
+
+fn screening_batch_normalization_plan_v2(
+    template: &ResidentRobustNormalizationPlanV2,
+    columns: usize,
+) -> Result<ResidentRobustNormalizationPlanV2, ResidentFeatureStoreCudaErrorV3> {
+    ResidentRobustNormalizationPlanV2::preflight(
+        template.rows(),
+        columns,
+        template.training_rows(),
+        template.enabled(),
+    )
+}
+
+impl ResidentFeatureScreeningPassV2 {
+    pub fn score_batch_v2(
+        &mut self,
+        batch: Box<dyn ResidentF64FeatureBatchV3>,
+        normalization_plan: &ResidentRobustNormalizationPlanV2,
+    ) -> Result<(), ResidentTrimPrefilterDeviceErrorV1> {
+        if self.pending_batch.is_some() {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation);
+        }
+        let run_device = &self.runtime.run_device;
+        let context = run_device.primary_context_for_resident_producer_v3();
+        let stream = run_device.run_stream_for_resident_producer_v3();
+        let device_ordinal = run_device.device_identity().ordinal();
+        CurrentContext::set_current(context.as_ref())?;
+        let mut construction = ResidentFeatureScreeningBatchConstructionV2::new(batch);
+        let source = construction.source().batch();
+        if source.device_ordinal() != device_ordinal || source.rows() != normalization_plan.rows() {
+            return Err(ResidentFeatureStoreCudaErrorV3::DeviceMismatch.into());
+        }
+        if source.producer_context().as_raw() != context.as_raw() {
+            return Err(ResidentFeatureStoreCudaErrorV3::PrimaryContextMismatch.into());
+        }
+        if source.producer_stream().as_inner() != stream.as_inner() {
+            return Err(ResidentFeatureStoreCudaErrorV3::ProducerStreamMismatch.into());
+        }
+        let batch_columns = source.column_bindings().len();
+        let source_end = self.next_parent_column.checked_add(batch_columns).ok_or(
+            ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("screening parent column end"),
+        )?;
+        let expected_bindings = self
+            .parent_column_bindings
+            .get(self.next_parent_column..source_end)
+            .ok_or(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                "screening producer schema extent",
+            ))?;
+        if batch_columns == 0
+            || source.column_bindings() != expected_bindings
+            || normalization_plan.columns() != batch_columns
+        {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                "screening producer schema or normalization width",
+            ));
+        }
+        // The schema was checked above against the retained full parent recipe.
+        // Never attach the template's first columns to a later producer batch.
+        let actual_modes = self
+            .parent_normalization_modes
+            .get(self.next_parent_column..source_end)
+            .ok_or(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                "screening normalization policy extent",
+            ))?;
+        if normalization_plan
+            .column_modes_v3()
+            .is_some_and(|modes| modes != actual_modes)
+        {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                "screening normalization policy differs from the retained recipe",
+            ));
+        }
+        let mut bound_modes = Vec::new();
+        bound_modes
+            .try_reserve_exact(actual_modes.len())
+            .map_err(|_| {
+                ResidentTrimPrefilterDeviceErrorV1::InvalidPlan("screening policy allocation")
+            })?;
+        bound_modes.extend_from_slice(actual_modes);
+        let bound_plan = ResidentRobustNormalizationPlanV2::preflight(
+            normalization_plan.rows(),
+            batch_columns,
+            normalization_plan.training_rows(),
+            normalization_plan.enabled(),
+        )?
+        .with_column_modes_v3(bound_modes)?;
+        let normalization_plan = &bound_plan;
+        let live_device_bytes = source.retained_device_bytes();
+        if live_device_bytes > self.admitted_max_live_producer_bytes
+            || source.retained_scratch_bytes() > self.admitted_max_live_producer_scratch_bytes
+        {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                "screening producer exceeds admitted peak",
+            ));
+        }
+        validate_batch_extents(source, normalization_plan.rows())?;
+
+        let mut pointer_tables = Vec::with_capacity(batch_columns.checked_mul(4).ok_or(
+            ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                "screening pointer-table entries",
+            ),
+        )?);
+        pointer_tables.extend(
+            (0..batch_columns).map(|column| source.value_buffer(column).as_device_ptr().as_raw()),
+        );
+        for column in 0..batch_columns {
+            pointer_tables.push(u64::try_from(source.value_offset(column)).map_err(|_| {
+                ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                    "screening source value offset",
+                )
+            })?);
+        }
+        pointer_tables.extend(
+            (0..batch_columns)
+                .map(|column| source.validity_buffer(column).as_device_ptr().as_raw()),
+        );
+        for column in 0..batch_columns {
+            pointer_tables.push(u64::try_from(source.validity_offset(column)).map_err(|_| {
+                ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                    "screening source validity offset",
+                )
+            })?);
+        }
+        let pointer_table_bytes = pointer_tables
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                "screening pointer-table bytes",
+            ))?;
+        if pointer_table_bytes > self.admitted_pointer_table_bytes {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                "screening pointer-table admission",
+            ));
+        }
+        source.producer_ready_event().wait_before_read(
+            context.as_ref(),
+            stream.as_ref(),
+            device_ordinal,
+        )?;
+        let (host_pointer_tables, device_pointer_tables) =
+            compact_device_buffer_from_slice_async(&pointer_tables, context, stream)?;
+        construction
+            .source_mut()
+            .install_pointer_tables(host_pointer_tables, device_pointer_tables);
+
+        let rows = normalization_plan.rows();
+        let cells = rows.checked_mul(batch_columns).ok_or(
+            ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("screening batch cells"),
+        )?;
+        let packed_validity_logical_bytes = cells.div_ceil(2);
+        let packed_validity_allocated_bytes = packed_validity_logical_bytes
+            .checked_add(VALIDITY_ATOMIC_ALIGNMENT_BYTES - 1)
+            .ok_or(ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                "screening validity alignment",
+            ))?
+            / VALIDITY_ATOMIC_ALIGNMENT_BYTES
+            * VALIDITY_ATOMIC_ALIGNMENT_BYTES;
+        if normalization_plan.packed_validity_logical_bytes() != packed_validity_logical_bytes
+            || normalization_plan.packed_validity_allocated_bytes()
+                != packed_validity_allocated_bytes
+        {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                "screening packed-validity normalization extent",
+            ));
+        }
+        construction.bar_major_values =
+            Some(StreamOrderedDeviceBufferV3::<f64>::uninitialized_async(
+                cells,
+                Arc::clone(context),
+                Arc::clone(stream),
+            )?);
+        construction.bar_major_validity_u4 =
+            Some(StreamOrderedDeviceBufferV3::<u8>::uninitialized_async(
+                packed_validity_allocated_bytes,
+                Arc::clone(context),
+                Arc::clone(stream),
+            )?);
+        construction.local_control_error =
+            Some(StreamOrderedDeviceBufferV3::<u32>::uninitialized_async(
+                1,
+                Arc::clone(context),
+                Arc::clone(stream),
+            )?);
+        native_result(
+            "neoethos_resident_initialize_validity_u4_v3(screening)",
+            unsafe {
+                neoethos_resident_initialize_validity_u4_v3(
+                    construction
+                        .bar_major_validity_u4
+                        .as_mut()
+                        .expect("screening validity allocation")
+                        .as_device_ptr()
+                        .as_mut_ptr(),
+                    packed_validity_logical_bytes,
+                    packed_validity_allocated_bytes,
+                    construction
+                        .local_control_error
+                        .as_mut()
+                        .expect("screening local error allocation")
+                        .as_device_ptr()
+                        .as_mut_ptr(),
+                    stream.as_inner(),
+                )
+            },
+        )?;
+
+        let pointer_base = construction.source().pointer_tables().as_device_ptr();
+        let table_offset = |multiple: usize| -> Result<isize, ResidentTrimPrefilterDeviceErrorV1> {
+            isize::try_from(batch_columns.checked_mul(multiple).ok_or(
+                ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                    "screening pointer-table offset",
+                ),
+            )?)
+            .map_err(|_| {
+                ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                    "screening pointer-table offset ABI",
+                )
+            })
+        };
+        let source_offsets = unsafe { pointer_base.offset(table_offset(1)?) };
+        let source_validity_addresses = unsafe { pointer_base.offset(table_offset(2)?) };
+        let source_validity_offsets = unsafe { pointer_base.offset(table_offset(3)?) };
+        native_result(
+            "neoethos_resident_pack_batch_to_bar_major_f64_u4_v3(screening)",
+            unsafe {
+                neoethos_resident_pack_batch_to_bar_major_f64_u4_v3(
+                    pointer_base.as_ptr(),
+                    source_offsets.as_ptr(),
+                    source_validity_addresses.as_ptr(),
+                    source_validity_offsets.as_ptr(),
+                    rows,
+                    batch_columns,
+                    batch_columns,
+                    0,
+                    construction
+                        .bar_major_values
+                        .as_mut()
+                        .expect("screening values allocation")
+                        .as_device_ptr()
+                        .as_mut_ptr(),
+                    construction
+                        .bar_major_validity_u4
+                        .as_mut()
+                        .expect("screening validity allocation")
+                        .as_device_ptr()
+                        .as_mut_ptr(),
+                    construction
+                        .local_control_error
+                        .as_mut()
+                        .expect("screening local error allocation")
+                        .as_device_ptr()
+                        .as_mut_ptr(),
+                    stream.as_inner(),
+                )
+            },
+        )?;
+
+        if normalization_plan.enabled() {
+            construction.normalization_scratch_bits =
+                Some(StreamOrderedDeviceBufferV3::<u64>::uninitialized_async(
+                    normalization_plan.normalization_scratch_slots(),
+                    Arc::clone(context),
+                    Arc::clone(stream),
+                )?);
+            construction.normalization_fit_words =
+                Some(StreamOrderedDeviceBufferV3::<u64>::uninitialized_async(
+                    normalization_plan.fit_metadata_words(),
+                    Arc::clone(context),
+                    Arc::clone(stream),
+                )?);
+            let runtime_receipt = launch_resident_robust_normalization_v2(
+                normalization_plan,
+                construction
+                    .bar_major_values
+                    .as_mut()
+                    .expect("screening values allocation"),
+                construction
+                    .bar_major_validity_u4
+                    .as_mut()
+                    .expect("screening validity allocation"),
+                construction
+                    .normalization_scratch_bits
+                    .as_mut()
+                    .expect("screening normalization scratch"),
+                construction
+                    .normalization_fit_words
+                    .as_mut()
+                    .expect("screening normalization fit"),
+                construction
+                    .local_control_error
+                    .as_mut()
+                    .expect("screening local error allocation"),
+                stream.as_ref(),
+            )?;
+            if runtime_receipt.feature_value_d2h_bytes() != 0 {
+                return Err(ResidentTrimPrefilterDeviceErrorV1::InvalidPlan(
+                    "screening normalization feature readback",
+                ));
+            }
+        }
+        native_result(
+            "neoethos_resident_accumulate_control_error_u32_v3",
+            unsafe {
+                neoethos_resident_accumulate_control_error_u32_v3(
+                    construction
+                        .local_control_error
+                        .as_ref()
+                        .expect("screening local error allocation")
+                        .as_device_ptr()
+                        .as_ptr(),
+                    self.runtime
+                        .aggregate_control_error
+                        .as_device_ptr()
+                        .as_mut_ptr(),
+                    stream.as_inner(),
+                )
+            },
+        )?;
+
+        let global_parent_ordinals = expected_bindings
+            .iter()
+            .map(|binding| {
+                u32::try_from(binding.ordinal).map_err(|_| {
+                    ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                        "screening global parent ordinal",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (host_global_parent_ordinals, device_global_parent_ordinals) =
+            compact_device_buffer_from_slice_async(&global_parent_ordinals, context, stream)?;
+        construction.host_global_parent_ordinals = Some(host_global_parent_ordinals);
+        construction.global_parent_ordinals = Some(device_global_parent_ordinals);
+        construction
+            .source_mut()
+            .install_ready_event(OwnedCudaEventV3::new()?);
+        construction
+            .source()
+            .ready_event()
+            .record(stream.as_ref())?;
+        construction.score_completion_event = Some(OwnedCudaEventV3::new()?);
+
+        let batch_ready_event =
+            NonNull::new(construction.source().ready_event().raw().cast::<c_void>())
+                .expect("owned screening batch event is non-null");
+        let score_view = ResidentTrimPrefilterScoreBatchDeviceViewV2 {
+            batch_values_bar_major: NonNull::new(
+                construction
+                    .bar_major_values
+                    .as_ref()
+                    .expect("screening values allocation")
+                    .as_device_ptr()
+                    .as_ptr()
+                    .cast_mut(),
+            )
+            .expect("nonempty screening values are non-null"),
+            batch_validity_u4: NonNull::new(
+                construction
+                    .bar_major_validity_u4
+                    .as_ref()
+                    .expect("screening validity allocation")
+                    .as_device_ptr()
+                    .as_ptr()
+                    .cast_mut(),
+            )
+            .expect("nonempty screening validity is non-null"),
+            batch_row_count: u64::try_from(rows).map_err(|_| {
+                ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("screening batch rows")
+            })?,
+            batch_column_count: u64::try_from(batch_columns).map_err(|_| {
+                ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("screening batch columns")
+            })?,
+            local_batch_stride: u64::try_from(batch_columns).map_err(|_| {
+                ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow("screening batch stride")
+            })?,
+            global_parent_column_start: u64::try_from(self.next_parent_column).map_err(|_| {
+                ResidentTrimPrefilterDeviceErrorV1::ArithmeticOverflow(
+                    "screening global parent start",
+                )
+            })?,
+            global_parent_ordinals_device: NonNull::new(
+                construction
+                    .global_parent_ordinals
+                    .as_ref()
+                    .expect("screening global ordinal allocation")
+                    .as_device_ptr()
+                    .as_ptr()
+                    .cast_mut(),
+            )
+            .expect("nonempty screening global ordinals are non-null"),
+            batch_ready_event,
+        };
+        enqueue_score_batch_v2(
+            self.native_run
+                .as_mut()
+                .ok_or(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation)?,
+            score_view,
+        )?;
+        construction
+            .score_completion_event
+            .as_ref()
+            .expect("screening score completion event")
+            .record(stream.as_ref())?;
+        self.next_parent_column = source_end;
+        self.pending_batch = Some(construction.disarm());
+        Ok(())
+    }
+
+    pub fn score_resident_classic_ta_recipe_v2(
+        &mut self,
+        recipe: ResidentClassicTaRecipeV3,
+        admitted_global_bindings: Vec<ResidentFeatureColumnBindingV3>,
+        pre_device_memory_receipt_v4: ResidentClassicTaPreDeviceMemoryReceiptV4,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> Result<(), ResidentFeatureScreeningErrorV2> {
+        let runtime = Arc::clone(&self.runtime);
+        let mut executor = ResidentClassicTaExecutorV3::new_v4(
+            &runtime.run_device,
+            runtime.parent_source.as_ref(),
+            recipe,
+            admitted_global_bindings,
+            pre_device_memory_receipt_v4,
+        )?;
+        while let Some(batch) = executor.next_pending_batch_v3()? {
+            let plan = screening_batch_normalization_plan_v2(
+                normalization_template,
+                batch.column_bindings().len(),
+            )?;
+            self.score_batch_v2(Box::new(batch), &plan)?;
+            while !self.try_retire_completed_batch_v2()? {
+                std::thread::yield_now();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn score_resident_footprint_v2(
+        &mut self,
+        bindings: Vec<ResidentFeatureColumnBindingV3>,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> Result<ResidentFootprintRuntimeReceiptV2, ResidentFeatureScreeningErrorV2> {
+        let runtime = Arc::clone(&self.runtime);
+        let batch = launch_resident_footprint_v2(
+            &runtime.run_device,
+            runtime.parent_source.as_ref(),
+            bindings,
+        )?;
+        let receipt = batch.receipt().clone();
+        let plan = screening_batch_normalization_plan_v2(
+            normalization_template,
+            batch.column_bindings().len(),
+        )?;
+        self.score_batch_v2(Box::new(batch), &plan)?;
+        Ok(receipt)
+    }
+
+    pub fn score_resident_regime_v3(
+        &mut self,
+        bindings: Vec<ResidentFeatureColumnBindingV3>,
+        scale_anchor: f64,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> Result<ResidentRegimeRuntimeReceiptV3, ResidentFeatureScreeningErrorV2> {
+        let runtime = Arc::clone(&self.runtime);
+        let batch = launch_resident_regime_v3(
+            &runtime.run_device,
+            runtime.parent_source.as_ref(),
+            bindings,
+            scale_anchor,
+        )?;
+        let receipt = batch.receipt().clone();
+        let plan = screening_batch_normalization_plan_v2(
+            normalization_template,
+            batch.column_bindings().len(),
+        )?;
+        self.score_batch_v2(Box::new(batch), &plan)?;
+        Ok(receipt)
+    }
+
+    pub fn score_resident_quant_v3(
+        &mut self,
+        bindings: Vec<ResidentFeatureColumnBindingV3>,
+        launch_authority: ResidentQuantLaunchAuthorityV3,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> Result<ResidentQuantRuntimeReceiptV3, ResidentFeatureScreeningErrorV2> {
+        let runtime = Arc::clone(&self.runtime);
+        let batch = launch_resident_quant_v3(
+            &runtime.run_device,
+            runtime.parent_source.as_ref(),
+            bindings,
+            launch_authority,
+        )?;
+        let receipt = batch.receipt().clone();
+        let plan = screening_batch_normalization_plan_v2(
+            normalization_template,
+            batch.column_bindings().len(),
+        )?;
+        self.score_batch_v2(Box::new(batch), &plan)?;
+        Ok(receipt)
+    }
+
+    pub fn score_resident_higher_timeframe_alignment_v3(
+        &mut self,
+        parents: Vec<ResidentHigherTimeframeDirectParentV3>,
+        admitted_global_bindings: Vec<ResidentFeatureColumnBindingV3>,
+        launch_authority: ResidentHigherTimeframeLaunchAuthorityV3,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> Result<ResidentHigherTimeframeRuntimeReceiptV3, ResidentFeatureScreeningErrorV2> {
+        let runtime = Arc::clone(&self.runtime);
+        let mut executor = ResidentHigherTimeframeExecutorV3::new(
+            &runtime.run_device,
+            runtime.parent_source.as_ref(),
+            parents,
+            admitted_global_bindings,
+            launch_authority,
+        )?;
+        while let Some(batch) = executor.next_pending_batch_v3()? {
+            let plan = screening_batch_normalization_plan_v2(
+                normalization_template,
+                batch.column_bindings().len(),
+            )?;
+            self.score_batch_v2(Box::new(batch), &plan)?;
+            while !self.try_retire_completed_batch_v2()? {
+                std::thread::yield_now();
+            }
+        }
+        Ok(executor.finish_v3()?)
+    }
+
+    pub fn score_resident_session_v2(
+        &mut self,
+        bindings: Vec<ResidentFeatureColumnBindingV3>,
+        launch_authority: ResidentSessionLaunchAuthorityV2,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> Result<ResidentSessionRuntimeReceiptV2, ResidentFeatureScreeningErrorV2> {
+        let runtime = Arc::clone(&self.runtime);
+        let batch = launch_resident_session_v2(
+            &runtime.run_device,
+            runtime.parent_source.as_ref(),
+            bindings,
+            launch_authority,
+        )?;
+        let receipt = batch.receipt().clone();
+        let plan = screening_batch_normalization_plan_v2(
+            normalization_template,
+            batch.column_bindings().len(),
+        )?;
+        self.score_batch_v2(Box::new(batch), &plan)?;
+        Ok(receipt)
+    }
+
+    pub fn try_retire_completed_batch_v2(
+        &mut self,
+    ) -> Result<bool, ResidentTrimPrefilterDeviceErrorV1> {
+        let Some(pending) = self.pending_batch.as_ref() else {
+            return Ok(false);
+        };
+        if !pending.completion_is_ready()? {
+            return Ok(false);
+        }
+        let stream = self
+            .runtime
+            .run_device
+            .run_stream_for_resident_producer_v3();
+        let pending = self
+            .pending_batch
+            .take()
+            .expect("event-proven screening batch remains owned");
+        pending.release(stream.as_ref())?;
+        Ok(true)
+    }
+
+    pub fn finish_score_stream_v2(
+        mut self,
+    ) -> Result<
+        (
+            ResidentTrimPrefilterDeviceRunV1,
+            ResidentFeatureScreeningRunRecoveryV2,
+        ),
+        ResidentTrimPrefilterDeviceErrorV1,
+    > {
+        if self.pending_batch.is_some()
+            || self.next_parent_column != self.parent_column_bindings.len()
+        {
+            return Err(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation);
+        }
+        let run_device = &self.runtime.run_device;
+        CurrentContext::set_current(
+            run_device
+                .primary_context_for_resident_producer_v3()
+                .as_ref(),
+        )?;
+        let mut aggregate_error = [0_u32; 1];
+        self.runtime
+            .aggregate_control_error
+            .copy_to(&mut aggregate_error)?;
+        if aggregate_error[0] != 0 {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidProducerValidityCode.into());
+        }
+        let native_run = self
+            .native_run
+            .take()
+            .ok_or(ResidentTrimPrefilterDeviceErrorV1::RunStateViolation)?;
+        Ok((
+            native_run,
+            ResidentFeatureScreeningRunRecoveryV2 {
+                runtime: Arc::clone(&self.runtime),
+            },
+        ))
+    }
+}
+
+impl ResidentFeatureScreeningRunRecoveryV2 {
+    pub fn recover_run_device_v2(
+        self,
+    ) -> Result<GpuOnlyRunDeviceAdmissionV3, ResidentFeatureStoreCudaErrorV3> {
+        let runtime = Arc::try_unwrap(self.runtime).map_err(|runtime| {
+            std::mem::forget(runtime);
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "screening runtime still has a live native owner after selected-map read".into(),
+            )
+        })?;
+        let ResidentFeatureScreeningRuntimeOwnerV2 {
+            placeholder_values,
+            placeholder_validity_u4,
+            aggregate_control_error,
+            parent_source,
+            run_device,
+        } = runtime;
+        let mut guard = ResidentFeatureScreeningRecoveryGuardV2 {
+            placeholder_values: Some(placeholder_values),
+            placeholder_validity_u4: Some(placeholder_validity_u4),
+            aggregate_control_error: Some(aggregate_control_error),
+            parent_source: Some(parent_source),
+            run_device: Some(run_device),
+        };
+        let admitted = guard
+            .run_device
+            .as_ref()
+            .expect("screening recovery retains its run device");
+        CurrentContext::set_current(admitted.primary_context_for_resident_producer_v3().as_ref())?;
+        let stream = Arc::clone(admitted.run_stream_for_resident_producer_v3());
+        guard
+            .parent_source
+            .as_ref()
+            .expect("screening recovery retains its parent")
+            .producer_ready_event()
+            .wait_before_read(
+                admitted.primary_context_for_resident_producer_v3().as_ref(),
+                stream.as_ref(),
+                admitted.device_identity().ordinal(),
+            )?;
+        guard
+            .parent_source
+            .take()
+            .expect("validated screening parent")
+            .enqueue_nonblocking_release(stream.as_ref())?;
+        drop(guard.placeholder_values.take());
+        drop(guard.placeholder_validity_u4.take());
+        drop(guard.aggregate_control_error.take());
+        Ok(guard
+            .run_device
+            .take()
+            .expect("validated screening run device"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_resident_feature_screening_pass_v2(
+    run_device: GpuOnlyRunDeviceAdmissionV3,
+    parent_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    schema: ResidentTrimPrefilterScreeningSchemaUploadV2,
+    parent_source: Box<dyn ResidentParentDatasetSourceV3>,
+    admitted_max_live_producer_bytes: usize,
+    admitted_max_live_producer_scratch_bytes: usize,
+    admitted_pointer_table_bytes: usize,
+    parent_normalization_modes: Vec<SearchNormalizationColumnModeV3>,
+) -> Result<
+    (
+        PreparedResidentFeatureScreeningPassV2,
+        ResidentTrimPrefilterInputsV1,
+    ),
+    ResidentFeatureStoreCudaErrorV3,
+> {
+    validate_expected_bindings(&parent_column_bindings)?;
+    if parent_normalization_modes.len() != parent_column_bindings.len() {
+        return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "screening modes must cover the complete ordered parent recipe".into(),
+        ));
+    }
+    let mut construction = ResidentAssemblerConstructionGuardV3::new(run_device, parent_source);
+    let context = Arc::clone(&construction.context);
+    let stream = Arc::clone(&construction.producer_stream);
+    let device_ordinal = construction.device_ordinal;
+    CurrentContext::set_current(context.as_ref())?;
+    let expected_ordinal = i32::try_from(device_ordinal).map_err(|_| {
+        ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("screening CUDA ordinal ABI")
+    })?;
+    if CurrentContext::get_device()?.as_raw() != expected_ordinal
+        || stream_context(stream.as_ref())? != context.as_raw()
+        || construction.parent_source().device_ordinal() != device_ordinal
+        || construction.parent_source().producer_context().as_raw() != context.as_raw()
+        || construction.parent_source().producer_stream().as_inner() != stream.as_inner()
+        || construction.parent_source().rows() == 0
+    {
+        return Err(ResidentFeatureStoreCudaErrorV3::PrimaryContextMismatch);
+    }
+    validate_parent_extents(
+        construction.parent_source(),
+        construction.parent_source().rows(),
+    )?;
+    let schema = schema.inner;
+    if schema.column_class_flags.len() != parent_column_bindings.len()
+        || schema.timeframe_group_ids.len() != parent_column_bindings.len()
+        || schema.template_force_keep_flags.len() != parent_column_bindings.len()
+        || ordered_feature_schema_sha256_v1(&parent_column_bindings)
+            != schema.ordered_feature_schema_sha256
+        || admitted_max_live_producer_bytes == 0
+        || admitted_pointer_table_bytes == 0
+    {
+        return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "screening schema, producer peak, or pointer-table admission is incomplete".into(),
+        ));
+    }
+    let runtime_identity = derive_resident_trim_runtime_identity_v1(
+        construction
+            .run_device
+            .as_ref()
+            .expect("screening construction retains run-device"),
+    )?;
+
+    construction.search_bar_major_values =
+        Some(StreamOrderedDeviceBufferV3::<f64>::uninitialized_async(
+            1,
+            Arc::clone(&context),
+            Arc::clone(&stream),
+        )?);
+    construction.search_bar_major_validity_u4 =
+        Some(StreamOrderedDeviceBufferV3::<u8>::uninitialized_async(
+            VALIDITY_ATOMIC_ALIGNMENT_BYTES,
+            Arc::clone(&context),
+            Arc::clone(&stream),
+        )?);
+    construction.validity_code_error =
+        Some(StreamOrderedDeviceBufferV3::<u32>::uninitialized_async(
+            1,
+            Arc::clone(&context),
+            Arc::clone(&stream),
+        )?);
+    native_result(
+        "neoethos_resident_initialize_validity_u4_v3(screening aggregate)",
+        unsafe {
+            neoethos_resident_initialize_validity_u4_v3(
+                construction
+                    .search_bar_major_validity_u4
+                    .as_mut()
+                    .expect("screening placeholder validity")
+                    .as_device_ptr()
+                    .as_mut_ptr(),
+                VALIDITY_ATOMIC_ALIGNMENT_BYTES,
+                VALIDITY_ATOMIC_ALIGNMENT_BYTES,
+                construction
+                    .validity_code_error
+                    .as_mut()
+                    .expect("screening aggregate error")
+                    .as_device_ptr()
+                    .as_mut_ptr(),
+                stream.as_inner(),
+            )
+        },
+    )?;
+    let (run_device, parent_source, placeholder_values, placeholder_validity_u4, aggregate_error) =
+        construction.disarm();
+    let parent_row_count = u64::try_from(parent_source.rows()).map_err(|_| {
+        ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("screening parent rows")
+    })?;
+    let parent_column_count = u64::try_from(parent_column_bindings.len()).map_err(|_| {
+        ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("screening parent columns")
+    })?;
+    let parent_ready_event = NonNull::new(
+        parent_source
+            .producer_ready_event()
+            .event
+            .raw()
+            .cast::<c_void>(),
+    )
+    .ok_or_else(|| {
+        ResidentFeatureStoreCudaErrorV3::InvalidInput("screening parent-ready event is null".into())
+    })?;
+    let close = NonNull::new(parent_source.close().as_device_ptr().as_ptr().cast_mut())
+        .ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput("screening close is null".into())
+        })?;
+    let high = NonNull::new(parent_source.high().as_device_ptr().as_ptr().cast_mut()).ok_or_else(
+        || ResidentFeatureStoreCudaErrorV3::InvalidInput("screening high is null".into()),
+    )?;
+    let low =
+        NonNull::new(parent_source.low().as_device_ptr().as_ptr().cast_mut()).ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput("screening low is null".into())
+        })?;
+    let indicators_bar_major = NonNull::new(placeholder_values.as_device_ptr().as_ptr().cast_mut())
+        .expect("one-element screening placeholder is non-null");
+    let indicators_validity_u4 =
+        NonNull::new(placeholder_validity_u4.as_device_ptr().as_ptr().cast_mut())
+            .expect("four-byte screening placeholder is non-null");
+    let admitted_run_stream =
+        NonNull::new(stream.as_inner().cast::<c_void>()).ok_or_else(|| {
+            ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "screening admitted stream is null".into(),
+            )
+        })?;
+    let runtime = Arc::new(ResidentFeatureScreeningRuntimeOwnerV2 {
+        placeholder_values,
+        placeholder_validity_u4,
+        aggregate_control_error: aggregate_error,
+        parent_source,
+        run_device,
+    });
+
+    let canonical_search_input_receipt_sha256 = schema.canonical_search_input_receipt_sha256;
+    let canonical_content_merkle_sha256 = schema.canonical_content_merkle_sha256;
+    let normalization_fit_sha256 = schema.normalization_fit_sha256;
+    let feature_plan_sha256 = schema.feature_plan_sha256;
+    let source_provenance_sha256 = schema.source_provenance_sha256;
+    let ordered_feature_schema_sha256 = schema.ordered_feature_schema_sha256;
+    let column_classification_content_sha256 = schema.column_classification_content_sha256;
+    let timeframe_group_count = schema.timeframe_group_count;
+    let (schema_lifetime, retained_schema_bytes) =
+        upload_resident_trim_schema_v1(schema, &context, &stream)?;
+    if retained_schema_bytes > runtime_identity.trim_prefilter_reserved_bytes {
+        return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+            "screening schema metadata exceeds its admitted trim slice".into(),
+        ));
+    }
+    let schema_ready_event = NonNull::new(schema_lifetime.ready_event.raw().cast::<c_void>())
+        .expect("owned screening schema event is non-null");
+    let column_class_flags_device = NonNull::new(
+        schema_lifetime
+            .column_class_flags
+            .as_device_ptr()
+            .as_ptr()
+            .cast_mut(),
+    )
+    .expect("screening class allocation is non-null");
+    let timeframe_group_ids_device = NonNull::new(
+        schema_lifetime
+            .timeframe_group_ids
+            .as_device_ptr()
+            .as_ptr()
+            .cast_mut(),
+    )
+    .expect("screening timeframe allocation is non-null");
+    let template_force_keep_flags_device = NonNull::new(
+        schema_lifetime
+            .template_force_keep_flags
+            .as_device_ptr()
+            .as_ptr()
+            .cast_mut(),
+    )
+    .expect("screening template allocation is non-null");
+    let trim_prefilter_ready_event = OwnedCudaEventV3::new()?;
+    let trim_prefilter_ready_event_raw =
+        NonNull::new(trim_prefilter_ready_event.raw().cast::<c_void>())
+            .expect("owned screening trim event is non-null");
+    let admission_lifetime = ResidentTrimAdmissionLifetimeV1 {
+        _owner: Box::new(Arc::clone(&runtime)),
+        ready_event: trim_prefilter_ready_event,
+    };
+    debug_assert_eq!(
+        admission_lifetime.ready_event.raw().cast::<c_void>(),
+        trim_prefilter_ready_event_raw.as_ptr()
+    );
+    let parent_import = ResidentTrimPrefilterParentImportV1 {
+        owner: Some(Box::new(Arc::clone(&runtime))),
+        import_abi_version: SCREENING_IMPORT_ABI_VERSION_V2,
+        selected_cuda_ordinal: runtime_identity.selected_cuda_ordinal,
+        parent_row_count,
+        parent_column_count,
+        packed_validity_bytes: u64::try_from(VALIDITY_ATOMIC_ALIGNMENT_BYTES).expect("u64"),
+        admitted_run_stream,
+        parent_ready_event,
+        indicators_bar_major,
+        indicators_validity_u4,
+        close,
+        high,
+        low,
+        canonical_search_input_receipt_sha256,
+        canonical_content_merkle_sha256,
+        normalization_fit_sha256,
+        feature_plan_sha256,
+        source_provenance_sha256,
+        cuda_device_identity_sha256: runtime_identity.cuda_device_identity_sha256,
+        primary_context_identity_sha256: runtime_identity.primary_context_identity_sha256,
+        run_stream_identity_sha256: runtime_identity.run_stream_identity_sha256,
+        cuda_build_manifest_sha256: runtime_identity.cuda_build_manifest_sha256,
+        cuda_math_flags_sha256: runtime_identity.cuda_math_flags_sha256,
+    };
+    let sealed_schema = SealedResidentColumnClassificationV1 {
+        owner: Some(Box::new(schema_lifetime)),
+        selected_cuda_ordinal: runtime_identity.selected_cuda_ordinal,
+        parent_column_count,
+        retained_device_bytes: retained_schema_bytes,
+        timeframe_group_count,
+        schema_ready_event,
+        column_class_flags_device,
+        timeframe_group_ids_device,
+        template_force_keep_flags_device,
+        ordered_feature_schema_sha256,
+        column_classification_content_sha256,
+        primary_context_identity_sha256: runtime_identity.primary_context_identity_sha256,
+        run_stream_identity_sha256: runtime_identity.run_stream_identity_sha256,
+        cuda_build_manifest_sha256: runtime_identity.cuda_build_manifest_sha256,
+    };
+    let full_admission = ResidentTrimPrefilterFullDiscoveryAdmissionV1 {
+        owner: Some(Box::new(admission_lifetime)),
+        selected_cuda_ordinal: runtime_identity.selected_cuda_ordinal,
+        trim_prefilter_ready_event: trim_prefilter_ready_event_raw,
+        trim_prefilter_reserved_bytes: runtime_identity.trim_prefilter_reserved_bytes,
+        full_discovery_reserve_bytes: runtime_identity.full_discovery_reserve_bytes,
+        primary_context_identity_sha256: runtime_identity.primary_context_identity_sha256,
+        run_stream_identity_sha256: runtime_identity.run_stream_identity_sha256,
+        cuda_build_manifest_sha256: runtime_identity.cuda_build_manifest_sha256,
+    };
+    let identity = ResidentTrimPrefilterImportIdentityV1 {
+        admission_identity_sha256: runtime_identity.admission_identity_sha256,
+        workspace_plan_identity_sha256: runtime_identity.workspace_plan_identity_sha256,
+        canonical_search_input_receipt_sha256,
+        canonical_content_merkle_sha256,
+        normalization_fit_sha256,
+        feature_plan_sha256,
+        source_provenance_sha256,
+        ordered_feature_schema_sha256,
+        column_classification_content_sha256,
+        selected_cuda_ordinal: runtime_identity.selected_cuda_ordinal,
+        parent_row_count,
+        parent_column_count,
+        cuda_device_identity_sha256: runtime_identity.cuda_device_identity_sha256,
+        primary_context_identity_sha256: runtime_identity.primary_context_identity_sha256,
+        run_stream_identity_sha256: runtime_identity.run_stream_identity_sha256,
+        cuda_build_manifest_sha256: runtime_identity.cuda_build_manifest_sha256,
+        cuda_math_flags_sha256: runtime_identity.cuda_math_flags_sha256,
+        phase_one_free_bytes_snapshot: runtime_identity.phase_one_free_bytes_snapshot,
+        allocator_context_reserve_bytes: runtime_identity.allocator_context_reserve_bytes,
+        required_workspace_bytes: runtime_identity.required_workspace_bytes,
+        trim_prefilter_reserved_bytes: runtime_identity.trim_prefilter_reserved_bytes,
+        full_discovery_reserve_bytes: runtime_identity.full_discovery_reserve_bytes,
+    };
+    Ok((
+        PreparedResidentFeatureScreeningPassV2 {
+            runtime,
+            parent_column_bindings,
+            parent_normalization_modes,
+            admitted_max_live_producer_bytes,
+            admitted_max_live_producer_scratch_bytes,
+            admitted_pointer_table_bytes,
+        },
+        ResidentTrimPrefilterInputsV1 {
+            parent_import,
+            sealed_schema,
+            full_admission,
+            identity,
+        },
+    ))
 }
 
 #[derive(Debug)]
@@ -1455,6 +3079,8 @@ pub struct ResidentFeatureStoreAssemblerV3 {
     producer_stream: Arc<Stream>,
     device_ordinal: u32,
     expected_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+    parent_column_bindings_v2: Option<Vec<ResidentFeatureColumnBindingV3>>,
+    selected_global_parent_ordinals_v2: Option<Vec<usize>>,
     parent_source: Option<Box<dyn ResidentParentDatasetSourceV3>>,
     search_bar_major_values: Option<StreamOrderedDeviceBufferV3<f64>>,
     search_bar_major_validity_u4: Option<StreamOrderedDeviceBufferV3<u8>>,
@@ -1464,6 +3090,7 @@ pub struct ResidentFeatureStoreAssemblerV3 {
     cells: usize,
     packed_validity_logical_bytes: usize,
     packed_validity_allocated_bytes: usize,
+    next_parent_column_v2: usize,
     next_destination_column: usize,
     pending_batch: Option<PendingResidentFeatureBatchV3>,
     producer_batch_count: usize,
@@ -1708,6 +3335,8 @@ impl ResidentFeatureStoreAssemblerV3 {
             producer_stream,
             device_ordinal,
             expected_column_bindings,
+            parent_column_bindings_v2: None,
+            selected_global_parent_ordinals_v2: None,
             parent_source: Some(parent_source),
             search_bar_major_values: Some(search_bar_major_values),
             search_bar_major_validity_u4: Some(search_bar_major_validity_u4),
@@ -1717,6 +3346,289 @@ impl ResidentFeatureStoreAssemblerV3 {
             cells,
             packed_validity_logical_bytes,
             packed_validity_allocated_bytes,
+            next_parent_column_v2: 0,
+            next_destination_column: 0,
+            pending_batch: None,
+            producer_batch_count: 0,
+            value_layout_launch_count: 0,
+            validity_boundary_launch_count: 0,
+            max_live_producer_bytes: 0,
+            max_live_producer_scratch_bytes: 0,
+            max_live_pointer_table_bytes: 0,
+            max_live_runtime_metadata_bytes: 0,
+            footprint_runtime_receipt_v2: None,
+            regime_runtime_receipt_v3: None,
+            session_runtime_receipt_v2: None,
+            higher_timeframe_runtime_receipt_v3: None,
+            robust_normalization_fit_metadata_v2: None,
+            robust_normalization_ready_event_v2: None,
+            robust_normalization_runtime_receipt_v2: None,
+            validity_error_readback_count: 0,
+            validity_error_d2h_bytes: 0,
+            schema_name_offset_count: schema_name_offsets.len(),
+            schema_name_bytes: schema_name_bytes.len(),
+            admitted_max_live_producer_bytes,
+            admitted_max_live_producer_scratch_bytes,
+            admitted_pointer_and_schema_metadata_bytes,
+            admitted_normalization_scratch_bytes,
+            admitted_fit_metadata_bytes,
+            pre_materialization_free_bytes_snapshot: working_set.device_free_bytes_snapshot(),
+            post_parent_free_bytes_snapshot: observed_free_bytes,
+            retained_parent_dataset_bytes,
+            remaining_peak_after_parent_bytes,
+            allocator_context_reserve_bytes: working_set.allocator_context_reserve_bytes(),
+            reserve_policy_id: working_set.reserve_policy_id().to_owned(),
+        })
+    }
+
+    /// Allocate the final bar-major store strictly from a sealed selected
+    /// extent. The complete parent schema is retained only to validate replayed
+    /// producer batches; it never participates in value/validity sizing.
+    pub fn new_compact_v2(
+        run_device: GpuOnlyRunDeviceAdmissionV3,
+        parent_column_bindings: Vec<ResidentFeatureColumnBindingV3>,
+        selected_global_parent_ordinals: Vec<u32>,
+        parent_source: Box<dyn ResidentParentDatasetSourceV3>,
+        working_set: &ResidentWorkingSetBoundV3,
+        compact_extent: CompactSelectedStoreAllocationExtentV2,
+    ) -> Result<Self, ResidentFeatureStoreCudaErrorV3> {
+        if run_device.phase_one_free_bytes_snapshot() != working_set.device_free_bytes_snapshot()
+            || run_device.allocator_context_reserve_bytes()
+                != working_set.allocator_context_reserve_bytes()
+            || run_device.reserve_policy_id() != working_set.reserve_policy_id()
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "compact working-set evidence does not belong to the moved run-device admission"
+                    .into(),
+            ));
+        }
+        validate_expected_bindings(&parent_column_bindings)?;
+        let source_width = parent_column_bindings.len();
+        if selected_global_parent_ordinals.len() != compact_extent.selected_columns() {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "sealed selected-map width differs from the compact allocation extent".into(),
+            ));
+        }
+        let mut selected_ordinals = Vec::with_capacity(selected_global_parent_ordinals.len());
+        let mut compact_bindings = Vec::with_capacity(selected_global_parent_ordinals.len());
+        let mut previous = None;
+        for (compact_ordinal, selected) in selected_global_parent_ordinals.into_iter().enumerate() {
+            let selected = usize::try_from(selected).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                    "selected global parent ordinal",
+                )
+            })?;
+            if selected >= source_width || previous.is_some_and(|value| selected <= value) {
+                return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "sealed selected-map ordinals must be strictly ascending and inside the parent schema"
+                        .into(),
+                ));
+            }
+            previous = Some(selected);
+            selected_ordinals.push(selected);
+            let mut binding = parent_column_bindings[selected].clone();
+            binding.ordinal = compact_ordinal;
+            compact_bindings.push(binding);
+        }
+        validate_expected_bindings(&compact_bindings)?;
+
+        let mut construction = ResidentAssemblerConstructionGuardV3::new(run_device, parent_source);
+        let context = Arc::clone(&construction.context);
+        let producer_stream = Arc::clone(&construction.producer_stream);
+        let device_ordinal = construction.device_ordinal;
+        CurrentContext::set_current(context.as_ref())?;
+        let expected_ordinal = i32::try_from(device_ordinal).map_err(|_| {
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("CUDA device ordinal ABI")
+        })?;
+        if CurrentContext::get_device()?.as_raw() != expected_ordinal {
+            return Err(ResidentFeatureStoreCudaErrorV3::DeviceMismatch);
+        }
+        if working_set.reserve_policy_id() != RESIDENT_ALLOCATOR_CONTEXT_RESERVE_POLICY_V3 {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "allocator/context reserve policy is not the runtime-owned exact V3 authority"
+                    .into(),
+            ));
+        }
+        let resident_parent = construction.parent_source();
+        if stream_context(&producer_stream)? != context.as_raw()
+            || resident_parent.producer_context().as_raw() != context.as_raw()
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::PrimaryContextMismatch);
+        }
+        if resident_parent.producer_stream().as_inner() != producer_stream.as_inner() {
+            return Err(ResidentFeatureStoreCudaErrorV3::ProducerStreamMismatch);
+        }
+        resident_parent.producer_ready_event().wait_before_read(
+            context.as_ref(),
+            producer_stream.as_ref(),
+            device_ordinal,
+        )?;
+        if resident_parent.rows() != compact_extent.rows()
+            || resident_parent.device_ordinal() != device_ordinal
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::DeviceMismatch);
+        }
+        validate_parent_extents(resident_parent, compact_extent.rows())?;
+        let retained_parent_dataset_bytes = u64::try_from(resident_parent.retained_device_bytes())
+            .map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("retained parent dataset bytes")
+            })?;
+        let parent_layout = resident_parent.parent_dataset_layout();
+        let parent_layout_bytes = parent_layout
+            .ohlcv_bytes()
+            .checked_add(parent_layout.clock_bytes())
+            .and_then(|bytes| bytes.checked_add(parent_layout.smc_bytes()))
+            .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                "resident parent layout bytes",
+            ))?;
+        if u64::try_from(compact_extent.rows()).ok() != Some(working_set.row_count())
+            || u64::try_from(compact_extent.selected_columns()).ok()
+                != Some(working_set.column_count())
+            || parent_layout.row_count() != working_set.row_count()
+            || parent_layout_bytes != working_set.parent_dataset_bytes()
+            || retained_parent_dataset_bytes != working_set.parent_dataset_bytes()
+            || working_set.full_feature_major_staging_bytes() != 0
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "compact runtime extents do not match the sealed working set".into(),
+            ));
+        }
+        let (observed_free_bytes, _) = mem_get_info()?;
+        let observed_free_bytes = u64::try_from(observed_free_bytes).map_err(|_| {
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("same-context free-memory snapshot")
+        })?;
+        let observed_available = observed_free_bytes
+            .checked_sub(working_set.allocator_context_reserve_bytes())
+            .ok_or(ResidentFeatureStoreCudaErrorV3::RuntimeFreeMemoryChanged {
+                required_bytes: working_set.remaining_peak_after_parent_bytes(),
+                observed_available_bytes: 0,
+            })?;
+        let remaining_peak_after_parent_bytes = working_set.remaining_peak_after_parent_bytes();
+        if remaining_peak_after_parent_bytes > observed_available {
+            return Err(ResidentFeatureStoreCudaErrorV3::RuntimeFreeMemoryChanged {
+                required_bytes: remaining_peak_after_parent_bytes,
+                observed_available_bytes: observed_available,
+            });
+        }
+        if compact_extent.cells()
+            != compact_extent
+                .rows()
+                .checked_mul(compact_extent.selected_columns())
+                .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                    "compact resident feature cells",
+                ))?
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "compact selected allocation authority is internally inconsistent".into(),
+            ));
+        }
+        let packed_validity_logical_bytes = compact_extent.cells().div_ceil(2);
+        let packed_validity_allocated_bytes = packed_validity_logical_bytes
+            .checked_add(VALIDITY_ATOMIC_ALIGNMENT_BYTES - 1)
+            .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                "compact packed validity alignment",
+            ))?
+            / VALIDITY_ATOMIC_ALIGNMENT_BYTES
+            * VALIDITY_ATOMIC_ALIGNMENT_BYTES;
+        if u64::try_from(packed_validity_logical_bytes).ok()
+            != Some(working_set.packed_validity_logical_bytes())
+            || u64::try_from(packed_validity_allocated_bytes).ok()
+                != Some(working_set.packed_validity_allocated_bytes())
+        {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "compact packed-validity extent drifted from admission".into(),
+            ));
+        }
+        let (schema_name_offsets, schema_name_bytes) = encode_names(&compact_bindings)?;
+        let admitted_max_live_producer_bytes =
+            usize::try_from(working_set.max_live_producer_bytes()).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("max live producer bytes")
+            })?;
+        let admitted_max_live_producer_scratch_bytes =
+            usize::try_from(working_set.max_live_producer_scratch_bytes()).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                    "max live producer scratch bytes",
+                )
+            })?;
+        let admitted_pointer_and_schema_metadata_bytes =
+            usize::try_from(working_set.pointer_and_schema_metadata_bytes()).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                    "pointer and schema metadata bytes",
+                )
+            })?;
+        let admitted_normalization_scratch_bytes =
+            usize::try_from(working_set.normalization_scratch_bytes()).map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("normalization scratch bytes")
+            })?;
+        let admitted_fit_metadata_bytes = usize::try_from(working_set.fit_metadata_bytes())
+            .map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                    "normalization fit metadata bytes",
+                )
+            })?;
+
+        let search_bar_major_values = StreamOrderedDeviceBufferV3::<f64>::uninitialized_async(
+            compact_extent.cells(),
+            Arc::clone(&context),
+            Arc::clone(&producer_stream),
+        )?;
+        construction.search_bar_major_values = Some(search_bar_major_values);
+        let search_bar_major_validity_u4 = StreamOrderedDeviceBufferV3::<u8>::uninitialized_async(
+            packed_validity_allocated_bytes,
+            Arc::clone(&context),
+            Arc::clone(&producer_stream),
+        )?;
+        construction.search_bar_major_validity_u4 = Some(search_bar_major_validity_u4);
+        let validity_code_error = StreamOrderedDeviceBufferV3::<u32>::uninitialized_async(
+            1,
+            Arc::clone(&context),
+            Arc::clone(&producer_stream),
+        )?;
+        construction.validity_code_error = Some(validity_code_error);
+        native_result("neoethos_resident_initialize_validity_u4_v3", unsafe {
+            neoethos_resident_initialize_validity_u4_v3(
+                construction
+                    .search_bar_major_validity_u4
+                    .as_mut()
+                    .expect("constructor retains compact validity")
+                    .as_device_ptr()
+                    .as_mut_ptr(),
+                packed_validity_logical_bytes,
+                packed_validity_allocated_bytes,
+                construction
+                    .validity_code_error
+                    .as_mut()
+                    .expect("constructor retains validity error flag")
+                    .as_device_ptr()
+                    .as_mut_ptr(),
+                producer_stream.as_inner(),
+            )
+        })?;
+        let (
+            run_device,
+            parent_source,
+            search_bar_major_values,
+            search_bar_major_validity_u4,
+            validity_code_error,
+        ) = construction.disarm();
+        Ok(Self {
+            run_device: Some(run_device),
+            context,
+            producer_stream,
+            device_ordinal,
+            expected_column_bindings: compact_bindings,
+            parent_column_bindings_v2: Some(parent_column_bindings),
+            selected_global_parent_ordinals_v2: Some(selected_ordinals),
+            parent_source: Some(parent_source),
+            search_bar_major_values: Some(search_bar_major_values),
+            search_bar_major_validity_u4: Some(search_bar_major_validity_u4),
+            validity_code_error: Some(validity_code_error),
+            rows: compact_extent.rows(),
+            total_columns: compact_extent.selected_columns(),
+            cells: compact_extent.cells(),
+            packed_validity_logical_bytes,
+            packed_validity_allocated_bytes,
+            next_parent_column_v2: 0,
             next_destination_column: 0,
             pending_batch: None,
             producer_batch_count: 0,
@@ -1788,23 +3700,54 @@ impl ResidentFeatureStoreAssemblerV3 {
                 "resident producer batch has no columns".into(),
             ));
         }
-        let destination_end = self
-            .next_destination_column
-            .checked_add(batch_columns)
-            .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
-                "monotonic destination column end",
-            ))?;
-        let expected_column_bindings = self
-            .expected_column_bindings
-            .get(self.next_destination_column..destination_end)
+        let compact_projection = self.parent_column_bindings_v2.is_some();
+        let source_start = if compact_projection {
+            self.next_parent_column_v2
+        } else {
+            self.next_destination_column
+        };
+        let source_end = source_start.checked_add(batch_columns).ok_or(
+            ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                "monotonic producer source column end",
+            ),
+        )?;
+        let admitted_source_bindings = self
+            .parent_column_bindings_v2
+            .as_ref()
+            .unwrap_or(&self.expected_column_bindings);
+        let expected_source_bindings = admitted_source_bindings
+            .get(source_start..source_end)
             .ok_or_else(|| {
                 ResidentFeatureStoreCudaErrorV3::InvalidInput(
                     "producer batch exceeds the admitted ordered schema".into(),
                 )
             })?;
-        if batch.column_bindings() != expected_column_bindings {
+        if batch.column_bindings() != expected_source_bindings {
             return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
                 "producer batch schema/name/route receipt differs from admission".into(),
+            ));
+        }
+        let selected_local_columns =
+            if let Some(selected) = self.selected_global_parent_ordinals_v2.as_ref() {
+                selected
+                    .iter()
+                    .copied()
+                    .filter(|ordinal| *ordinal >= source_start && *ordinal < source_end)
+                    .map(|ordinal| ordinal - source_start)
+                    .collect::<Vec<_>>()
+            } else {
+                (0..batch_columns).collect::<Vec<_>>()
+            };
+        let packed_batch_columns = selected_local_columns.len();
+        let destination_end = self
+            .next_destination_column
+            .checked_add(packed_batch_columns)
+            .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
+                "monotonic compact destination column end",
+            ))?;
+        if destination_end > self.total_columns {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "projected producer batch exceeds the compact destination schema".into(),
             ));
         }
         let live_device_bytes = batch
@@ -1821,18 +3764,33 @@ impl ResidentFeatureStoreAssemblerV3 {
             ));
         }
         validate_batch_extents(batch, self.rows)?;
-        let mut pointer_tables = Vec::with_capacity(batch_columns.checked_mul(4).ok_or(
+        let retained_scratch_bytes = batch.retained_scratch_bytes();
+        if selected_local_columns.is_empty() {
+            batch.producer_ready_event().wait_before_read(
+                self.context.as_ref(),
+                self.producer_stream.as_ref(),
+                self.device_ordinal,
+            )?;
+            let batch = transaction.disarm_without_pack();
+            batch.enqueue_nonblocking_release(&self.producer_stream)?;
+            self.next_parent_column_v2 = source_end;
+            self.max_live_producer_bytes = self.max_live_producer_bytes.max(live_device_bytes);
+            self.max_live_producer_scratch_bytes = self
+                .max_live_producer_scratch_bytes
+                .max(retained_scratch_bytes);
+            return Ok(());
+        }
+        let mut pointer_tables = Vec::with_capacity(packed_batch_columns.checked_mul(4).ok_or(
             ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("combined pointer-table entries"),
         )?);
         pointer_tables.extend(
-            batch
-                .column_bindings()
+            selected_local_columns
                 .iter()
-                .enumerate()
-                .map(|(column, _)| batch.value_buffer(column).as_device_ptr().as_raw()),
+                .map(|&column| batch.value_buffer(column).as_device_ptr().as_raw()),
         );
-        let source_offsets = (0..batch_columns)
-            .map(|column| {
+        let source_offsets = selected_local_columns
+            .iter()
+            .map(|&column| {
                 u64::try_from(batch.value_offset(column)).map_err(|_| {
                     ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("source value offset ABI")
                 })
@@ -1840,14 +3798,13 @@ impl ResidentFeatureStoreAssemblerV3 {
             .collect::<Result<Vec<_>, _>>()?;
         pointer_tables.extend(source_offsets);
         pointer_tables.extend(
-            batch
-                .column_bindings()
+            selected_local_columns
                 .iter()
-                .enumerate()
-                .map(|(column, _)| batch.validity_buffer(column).as_device_ptr().as_raw()),
+                .map(|&column| batch.validity_buffer(column).as_device_ptr().as_raw()),
         );
-        let source_validity_offsets = (0..batch_columns)
-            .map(|column| {
+        let source_validity_offsets = selected_local_columns
+            .iter()
+            .map(|&column| {
                 u64::try_from(batch.validity_offset(column)).map_err(|_| {
                     ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
                         "source validity offset ABI",
@@ -1856,7 +3813,6 @@ impl ResidentFeatureStoreAssemblerV3 {
             })
             .collect::<Result<Vec<_>, _>>()?;
         pointer_tables.extend(source_validity_offsets);
-        let retained_scratch_bytes = batch.retained_scratch_bytes();
         let runtime_pointer_table_bytes = pointer_tables
             .len()
             .checked_mul(std::mem::size_of::<u64>())
@@ -1874,7 +3830,7 @@ impl ResidentFeatureStoreAssemblerV3 {
             ));
         }
         let pointer_table_offset = |multiple: usize| {
-            let entries = batch_columns.checked_mul(multiple).ok_or(
+            let entries = packed_batch_columns.checked_mul(multiple).ok_or(
                 ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow("pointer-table offset"),
             )?;
             isize::try_from(entries).map_err(|_| {
@@ -1902,7 +3858,7 @@ impl ResidentFeatureStoreAssemblerV3 {
         transaction.install_ready_event(OwnedCudaEventV3::new()?);
         let pointer_base = transaction.pointer_tables().as_device_ptr();
         // SAFETY: the allocation contains exactly four contiguous tables of
-        // batch_columns u64 entries, proven by the checked capacity above.
+        // packed_batch_columns u64 entries, proven by the checked capacity above.
         let source_offsets = unsafe { pointer_base.offset(source_offset_entries) };
         let source_validity_addresses = unsafe { pointer_base.offset(validity_address_entries) };
         let source_validity_offsets = unsafe { pointer_base.offset(validity_offset_entries) };
@@ -1928,7 +3884,7 @@ impl ResidentFeatureStoreAssemblerV3 {
                     source_validity_addresses.as_ptr(),
                     source_validity_offsets.as_ptr(),
                     self.rows,
-                    batch_columns,
+                    packed_batch_columns,
                     self.total_columns,
                     self.next_destination_column,
                     values.as_device_ptr().as_mut_ptr(),
@@ -1939,6 +3895,7 @@ impl ResidentFeatureStoreAssemblerV3 {
             },
         )?;
         transaction.ready_event().record(&self.producer_stream)?;
+        self.next_parent_column_v2 = source_end;
         self.next_destination_column = destination_end;
         self.producer_batch_count += 1;
         self.value_layout_launch_count += 1;
@@ -2187,7 +4144,7 @@ impl ResidentFeatureStoreAssemblerV3 {
         Ok(true)
     }
 
-    /// Post-pack/pre-SHA runtime seam for semantic-v2 robust normalization.
+    /// Post-pack/pre-SHA runtime seam for Search normalization policy-v3.
     /// The low-level plan is descriptive only: Data's move-only component
     /// receipt remains the sole authority that can seal the resulting store.
     pub fn apply_resident_robust_normalization_v2(
@@ -2196,6 +4153,10 @@ impl ResidentFeatureStoreAssemblerV3 {
     ) -> Result<ResidentRobustNormalizationRuntimeReceiptV2, ResidentFeatureStoreCudaErrorV3> {
         if self.pending_batch.is_some()
             || self.next_destination_column != self.total_columns
+            || self
+                .parent_column_bindings_v2
+                .as_ref()
+                .is_some_and(|bindings| self.next_parent_column_v2 != bindings.len())
             || self.robust_normalization_runtime_receipt_v2.is_some()
         {
             return Err(ResidentFeatureStoreCudaErrorV3::ProducerBatchPending);
@@ -2306,9 +4267,22 @@ impl ResidentFeatureStoreAssemblerV3 {
         {
             destination.copy_from_slice(&word.to_ne_bytes());
         }
+        // Only the bounded six-word fits cross the host boundary, after the
+        // same completed event and semantic verdict. Feature cells stay resident.
+        let mut host_fit_words = Vec::new();
+        host_fit_words
+            .try_reserve_exact(plan.fit_metadata_words())
+            .map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "normalization fit-word host allocation failed".into(),
+                )
+            })?;
+        host_fit_words.resize(plan.fit_metadata_words(), 0);
+        fit_metadata_words.copy_to(&mut host_fit_words)?;
         const ROBUST_NORMALIZATION_READY_RECORD_SEQUENCE_V2: u64 = 1;
         let receipt = pending_receipt.seal_after_ready_event_v2(
             fit_metadata_sha256,
+            host_fit_words,
             admission_identity_sha256,
             primary_context_process_token,
             producer_stream_process_token,
@@ -2331,8 +4305,12 @@ impl ResidentFeatureStoreAssemblerV3 {
         mut self,
     ) -> Result<Arc<ResidentFeatureStoreOwnerV3>, ResidentFeatureStoreCudaErrorV3> {
         let all_columns_filled = self.next_destination_column == self.total_columns;
+        let full_recipe_replayed = self
+            .parent_column_bindings_v2
+            .as_ref()
+            .is_none_or(|bindings| self.next_parent_column_v2 == bindings.len());
         let all_producer_events_retired = self.pending_batch.is_none();
-        if !all_columns_filled || !all_producer_events_retired {
+        if !all_columns_filled || !full_recipe_replayed || !all_producer_events_retired {
             return Err(ResidentFeatureStoreCudaErrorV3::ProducerBatchPending);
         }
         if self.producer_batch_count == 0
@@ -2667,6 +4645,24 @@ fn runtime_pointer_and_schema_metadata_bytes_v3(
         .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
             "runtime pointer and schema metadata bytes",
         ))
+}
+
+fn checked_compact_control_plane_d2h_bytes_v3(
+    validity_error_bytes: usize,
+    canonical_root_bytes: usize,
+    fit_digest_bytes: usize,
+    fit_words_bytes: usize,
+) -> Option<usize> {
+    // Normalization reuses the pack validity word. Its four-byte verdict is
+    // already counted in validity_error_bytes and must not be added twice.
+    [
+        validity_error_bytes,
+        canonical_root_bytes,
+        fit_digest_bytes,
+        fit_words_bytes,
+    ]
+    .into_iter()
+    .try_fold(0_usize, usize::checked_add)
 }
 
 #[derive(Debug)]
@@ -3037,12 +5033,17 @@ impl ResidentFeatureStoreOwnerV3 {
             validity_error_d2h_bytes: self.validity_error_d2h_bytes,
             canonical_root_readback_count: 1,
             canonical_root_d2h_bytes: SHA256_BYTES,
-            compact_control_plane_d2h_bytes: self.validity_error_d2h_bytes
-                + SHA256_BYTES
-                + self
-                    .robust_normalization_runtime_receipt_v2
+            compact_control_plane_d2h_bytes: checked_compact_control_plane_d2h_bytes_v3(
+                self.validity_error_d2h_bytes,
+                SHA256_BYTES,
+                self.robust_normalization_runtime_receipt_v2
                     .as_ref()
                     .map_or(0, |receipt| receipt.fit_digest_d2h_bytes()),
+                self.robust_normalization_runtime_receipt_v2
+                    .as_ref()
+                    .map_or(0, |receipt| receipt.fit_words_d2h_bytes()),
+            )
+            .expect("sealed compact readback bytes fit the validated address space"),
             pre_materialization_free_bytes_snapshot: self.pre_materialization_free_bytes_snapshot,
             post_parent_free_bytes_snapshot: self.post_parent_free_bytes_snapshot,
             retained_parent_dataset_bytes: self.retained_parent_dataset_bytes,
@@ -3365,28 +5366,14 @@ impl ResidentFeatureStoreImportV3 {
                 "resident trim packed-validity bytes",
             )
         })?;
-        let retained_schema_bytes = schema
-            .column_class_flags
-            .len()
-            .checked_add(
-                schema
-                    .timeframe_group_ids
-                    .len()
-                    .checked_mul(std::mem::size_of::<u32>())
-                    .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
-                        "resident trim timeframe metadata bytes",
-                    ))?,
-            )
-            .and_then(|bytes| bytes.checked_add(schema.template_force_keep_flags.len()))
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(ResidentFeatureStoreCudaErrorV3::ArithmeticOverflow(
-                "resident trim schema metadata bytes",
-            ))?;
-        if retained_schema_bytes > full_trim.trim_prefilter_reserved_bytes() {
-            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
-                "resident trim schema metadata exceeds its sealed workspace slice".into(),
-            ));
-        }
+        let canonical_search_input_receipt_sha256 = schema.canonical_search_input_receipt_sha256;
+        let canonical_content_merkle_sha256 = schema.canonical_content_merkle_sha256;
+        let schema_normalization_fit_sha256 = schema.normalization_fit_sha256;
+        let feature_plan_sha256 = schema.feature_plan_sha256;
+        let source_provenance_sha256 = schema.source_provenance_sha256;
+        let ordered_feature_schema_sha256 = schema.ordered_feature_schema_sha256;
+        let column_classification_content_sha256 = schema.column_classification_content_sha256;
+        let timeframe_group_count = schema.timeframe_group_count;
 
         let admitted_run_stream = NonNull::new(consumer_stream.as_inner().cast::<c_void>())
             .ok_or_else(|| {
@@ -3474,41 +5461,14 @@ impl ResidentFeatureStoreImportV3 {
         }
         let cuda_math_flags_sha256 = math_hasher.finalize().into();
 
-        // Both events are created before the first schema H2D. Once a copy is
-        // attempted, every failure path below deliberately retires its pointer
-        // identities through PendingResidentTrimSchemaUploadV1::drop.
         let trim_prefilter_ready_event = OwnedCudaEventV3::new()?;
-        let schema_ready_event = OwnedCudaEventV3::new()?;
-        let mut upload = PendingResidentTrimSchemaUploadV1::new(schema_ready_event);
-        let (host_column_class_flags, column_class_flags) = compact_device_buffer_from_slice_async(
-            &schema.column_class_flags,
-            consumer_context,
-            consumer_stream,
-        )?;
-        upload.host_column_class_flags = Some(host_column_class_flags);
-        upload.column_class_flags = Some(column_class_flags);
-        let (host_timeframe_group_ids, timeframe_group_ids) =
-            compact_device_buffer_from_slice_async(
-                &schema.timeframe_group_ids,
-                consumer_context,
-                consumer_stream,
-            )?;
-        upload.host_timeframe_group_ids = Some(host_timeframe_group_ids);
-        upload.timeframe_group_ids = Some(timeframe_group_ids);
-        let (host_template_force_keep_flags, template_force_keep_flags) =
-            compact_device_buffer_from_slice_async(
-                &schema.template_force_keep_flags,
-                consumer_context,
-                consumer_stream,
-            )?;
-        upload.host_template_force_keep_flags = Some(host_template_force_keep_flags);
-        upload.template_force_keep_flags = Some(template_force_keep_flags);
-        upload
-            .ready_event
-            .as_ref()
-            .expect("armed trim schema upload retains its ready event")
-            .record(consumer_stream)?;
-        let schema_lifetime = upload.into_lifetime();
+        let (schema_lifetime, retained_schema_bytes) =
+            upload_resident_trim_schema_v1(schema, consumer_context, consumer_stream)?;
+        if retained_schema_bytes > full_trim.trim_prefilter_reserved_bytes() {
+            return Err(ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                "resident trim schema metadata exceeds its sealed workspace slice".into(),
+            ));
+        }
         let schema_ready_event = NonNull::new(schema_lifetime.ready_event.raw().cast::<c_void>())
             .expect("owned CUDA event is non-null");
         let column_class_flags_device = NonNull::new(
@@ -3539,7 +5499,7 @@ impl ResidentFeatureStoreImportV3 {
             NonNull::new(trim_prefilter_ready_event.raw().cast::<c_void>())
                 .expect("owned CUDA event is non-null");
         let admission_lifetime = ResidentTrimAdmissionLifetimeV1 {
-            _owner: Arc::clone(owner),
+            _owner: Box::new(Arc::clone(owner)),
             ready_event: trim_prefilter_ready_event,
         };
         debug_assert_eq!(
@@ -3560,6 +5520,7 @@ impl ResidentFeatureStoreImportV3 {
         };
         let parent_import = ResidentTrimPrefilterParentImportV1 {
             owner: Some(Box::new(retained_import)),
+            import_abi_version: 1,
             selected_cuda_ordinal,
             parent_row_count,
             parent_column_count,
@@ -3571,11 +5532,11 @@ impl ResidentFeatureStoreImportV3 {
             close,
             high,
             low,
-            canonical_search_input_receipt_sha256: schema.canonical_search_input_receipt_sha256,
-            canonical_content_merkle_sha256: schema.canonical_content_merkle_sha256,
-            normalization_fit_sha256: schema.normalization_fit_sha256,
-            feature_plan_sha256: schema.feature_plan_sha256,
-            source_provenance_sha256: schema.source_provenance_sha256,
+            canonical_search_input_receipt_sha256,
+            canonical_content_merkle_sha256,
+            normalization_fit_sha256: schema_normalization_fit_sha256,
+            feature_plan_sha256,
+            source_provenance_sha256,
             cuda_device_identity_sha256,
             primary_context_identity_sha256,
             run_stream_identity_sha256,
@@ -3587,13 +5548,13 @@ impl ResidentFeatureStoreImportV3 {
             selected_cuda_ordinal,
             parent_column_count,
             retained_device_bytes: retained_schema_bytes,
-            timeframe_group_count: schema.timeframe_group_count,
+            timeframe_group_count,
             schema_ready_event,
             column_class_flags_device,
             timeframe_group_ids_device,
             template_force_keep_flags_device,
-            ordered_feature_schema_sha256: schema.ordered_feature_schema_sha256,
-            column_classification_content_sha256: schema.column_classification_content_sha256,
+            ordered_feature_schema_sha256,
+            column_classification_content_sha256,
             primary_context_identity_sha256,
             run_stream_identity_sha256,
             cuda_build_manifest_sha256,
@@ -3611,13 +5572,13 @@ impl ResidentFeatureStoreImportV3 {
         let identity = ResidentTrimPrefilterImportIdentityV1 {
             admission_identity_sha256,
             workspace_plan_identity_sha256,
-            canonical_search_input_receipt_sha256: schema.canonical_search_input_receipt_sha256,
-            canonical_content_merkle_sha256: schema.canonical_content_merkle_sha256,
-            normalization_fit_sha256: schema.normalization_fit_sha256,
-            feature_plan_sha256: schema.feature_plan_sha256,
-            source_provenance_sha256: schema.source_provenance_sha256,
-            ordered_feature_schema_sha256: schema.ordered_feature_schema_sha256,
-            column_classification_content_sha256: schema.column_classification_content_sha256,
+            canonical_search_input_receipt_sha256,
+            canonical_content_merkle_sha256,
+            normalization_fit_sha256: schema_normalization_fit_sha256,
+            feature_plan_sha256,
+            source_provenance_sha256,
+            ordered_feature_schema_sha256,
+            column_classification_content_sha256,
             selected_cuda_ordinal,
             parent_row_count,
             parent_column_count,
@@ -4129,7 +6090,7 @@ impl ResidentPopulationSessionV3 {
             .map_err(Into::into)
     }
 
-    /// Bind a full/contiguous view and produce its canonical adaptive-stop base
+    /// Bind a full/contiguous/ordered view and produce its canonical adaptive-stop base
     /// directly from the resident parent on the admitted stream. The host view
     /// must contain no adaptive slice; its exact row extent is charged against
     /// the sealed adaptive capacity as if all output rows were already live.
@@ -4154,9 +6115,16 @@ impl ResidentPopulationSessionV3 {
                     "resident adaptive view rows do not fit the stage authority".into(),
                 )
             })?;
+            let ordered_rows = u64::try_from(view.ordered_index_values().map_or(0, <[u64]>::len))
+                .map_err(|_| {
+                ResidentFeatureStoreCudaErrorV3::InvalidInput(
+                    "resident adaptive ordered-view rows do not fit the stage authority".into(),
+                )
+            })?;
             if limits.parent_row_count() != parent_rows
                 || limits.feature_count() != feature_count
                 || view_rows > limits.parent_row_count()
+                || ordered_rows > limits.max_ordered_index_count()
                 || view_rows > limits.max_adaptive_row_count()
                 || request.parent_row_count() != parent_rows
                 || request.view_row_count() != view_rows
@@ -4450,5 +6418,45 @@ impl Drop for ResidentFeatureStoreAssemblerV3 {
             // stream/context and implicitly wait on an early/error path.
             std::mem::forget(run_device);
         }
+    }
+}
+
+#[cfg(test)]
+mod compact_readback_tests {
+    use super::checked_compact_control_plane_d2h_bytes_v3;
+
+    #[test]
+    fn compact_readback_counts_actual_fit_words_and_one_shared_verdict() {
+        assert_eq!(
+            checked_compact_control_plane_d2h_bytes_v3(4, 32, 0, 0),
+            Some(36)
+        );
+        for columns in [1, 64, 65, 69] {
+            let fit_words_bytes = 48 * columns;
+            let actual = checked_compact_control_plane_d2h_bytes_v3(4, 32, 32, fit_words_bytes);
+            assert_eq!(actual, Some(68 + fit_words_bytes));
+            assert_ne!(actual, Some(68), "pre-fix fit-word omission must fail");
+            assert_ne!(
+                actual,
+                Some(72 + fit_words_bytes),
+                "shared verdict must not be counted twice"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_readback_total_rejects_overflow_in_every_component() {
+        for position in 0..4 {
+            let mut bytes = [1_usize; 4];
+            bytes[position] = usize::MAX;
+            assert_eq!(
+                checked_compact_control_plane_d2h_bytes_v3(bytes[0], bytes[1], bytes[2], bytes[3]),
+                None
+            );
+        }
+        assert_eq!(
+            checked_compact_control_plane_d2h_bytes_v3(4, 32, 32, usize::MAX - 68),
+            Some(usize::MAX)
+        );
     }
 }

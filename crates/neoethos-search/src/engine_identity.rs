@@ -65,16 +65,9 @@ impl PopulationEvalEngine {
 ///
 /// The distinction is the whole point. The strict backend dispatcher selects
 /// Prototype B only when `runtime_available() && device_count() > 0`; it never
-/// relies on the CubeCL entrypoint to intercept or substitute engines. So:
-///
-/// * on a `gpu-vulkan` / `gpu-rocm` build prototype B is not compiled in at all
-///   and CubeCL *is* the production engine — nothing is wrong;
-/// * on a `gpu-cuda` build prototype B is compiled in, and it failing the
-///   runtime probe means the run is about to be evaluated by a different
-///   engine than the one this build exists to use.
-///
-/// Conflating those two either breaks the Vulkan build or keeps the silent
-/// substitution, so they are separate variants.
+/// relies on the CubeCL entrypoint to intercept or substitute engines. On a
+/// `gpu-cuda` build, failure of the runtime probe means the run cannot execute
+/// the engine that build exists to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrototypeBReadiness {
     /// This binary contains no native CUDA population engine.
@@ -114,27 +107,12 @@ pub fn prototype_b_readiness() -> PrototypeBReadiness {
 /// The accelerator families this binary actually contains a population engine
 /// for.
 ///
-/// `EvaluationBackend::accelerator_hint` is parsed and carried but no dispatch
-/// arm reads it, so `cuda_required` and `vulkan_required` are today the same
-/// instruction. That is the same defect shape as the prototype-B one — an arm
-/// believing it named an engine — and this is what makes it checkable.
+/// CUDA is the only active accelerator family. Future ROCm/HIP support must add
+/// a real engine before it can extend this inventory.
 pub fn compiled_accelerators() -> Vec<AcceleratorHint> {
     let mut compiled = Vec::new();
     if cfg!(feature = "gpu-cuda") || cfg!(feature = "gpu-b-native") {
         compiled.push(AcceleratorHint::Cuda);
-    }
-    if cfg!(feature = "gpu-vulkan") {
-        // cubecl/wgpu picks its own adapter backend at runtime, so a wgpu build
-        // can legitimately satisfy any of these.
-        compiled.extend([
-            AcceleratorHint::Wgpu,
-            AcceleratorHint::Vulkan,
-            AcceleratorHint::Dx12,
-            AcceleratorHint::Metal,
-        ]);
-    }
-    if cfg!(feature = "gpu-rocm") {
-        compiled.push(AcceleratorHint::Rocm);
     }
     compiled
 }
@@ -246,10 +224,6 @@ mod tests {
             accelerator_hint_is_compiled(AcceleratorHint::Cuda),
             cfg!(feature = "gpu-cuda") || cfg!(feature = "gpu-b-native")
         );
-        assert_eq!(
-            accelerator_hint_is_compiled(AcceleratorHint::Rocm),
-            cfg!(feature = "gpu-rocm")
-        );
     }
 
     /// The defect, pinned: a `gpu-cuda` build whose card vanished used to fall
@@ -303,15 +277,11 @@ mod tests {
     /// runtime probe, and today nothing reads the hint at all.
     #[test]
     fn a_hint_this_build_cannot_honour_is_refused_before_any_kernel_runs() {
-        let uncompilable = [
-            AcceleratorHint::Cuda,
-            AcceleratorHint::Rocm,
-            AcceleratorHint::Vulkan,
-        ]
-        .into_iter()
-        .find(|hint| !accelerator_hint_is_compiled(*hint));
+        let uncompilable = [AcceleratorHint::Cuda]
+            .into_iter()
+            .find(|hint| !accelerator_hint_is_compiled(*hint));
         let Some(hint) = uncompilable else {
-            // A build that contains every engine has nothing to refuse.
+            // A CUDA build contains the only supported accelerator.
             return;
         };
         let backend = crate::backend::EvaluationBackend {

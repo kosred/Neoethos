@@ -1,17 +1,29 @@
 #[cfg(feature = "gpu")]
-use crate::cubecl_eval::{
-    cuda_eval_backtest_kernel_enabled, cuda_eval_signal_kernel_enabled,
-    integrated_gpu_eval_disabled, try_evaluate_population_cuda,
-};
+use crate::cubecl_eval::{cuda_eval_backtest_kernel_enabled, cuda_eval_signal_kernel_enabled};
 use crate::quality::Trade;
 use ndarray::ArrayView2;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 // `use std::env` removed 2026-08-10 with the last production env read in this
 // file.
-use std::sync::{Once, OnceLock};
+use std::sync::OnceLock;
+
+#[cfg(test)]
+#[path = "cpu_execution_ledger_tests.rs"]
+mod cpu_execution_ledger_tests;
+
+#[cfg(test)]
+#[path = "eval_diagnostic_tests.rs"]
+mod eval_diagnostic_tests;
 
 pub type SmcRow = [i8; 11];
+
+#[path = "netted_bar_research.rs"]
+mod netted_bar_research;
+pub use netted_bar_research::{
+    BarReplayLotGridV1, NettedBarDecisionTapeV1, NettedBarResearchResultV1,
+    PreparedNettedCanonicalBarResearchV1, TerminalBarPositionV1,
+};
 
 pub struct PopulationEvalInputs<'a> {
     pub close: &'a [f64],
@@ -40,36 +52,8 @@ pub struct PopulationEvalInputs<'a> {
     pub settings: &'a BacktestSettings,
 }
 
-static RAYON_INIT: Once = Once::new();
-
 fn require_historical_evaluation_authority() -> anyhow::Result<()> {
     crate::historical_evaluation_authority::require_historical_evaluation_authority_v1().map(|_| ())
-}
-
-fn init_rayon() {
-    RAYON_INIT.call_once(|| {
-        // F-695 closure (2026-05-25 — F-CORE3): resolved through the
-        // typed `BacktestRuntimeOverrides::rayon_threads` boundary so
-        // the env vars (`NEOETHOS_BOT_RUST_THREADS` /
-        // `RAYON_NUM_THREADS`) are read once at process startup.
-        let threads = current_backtest_runtime_overrides().rayon_threads;
-        if let Some(n) = threads {
-            // `build_global` errors if the global pool was already built
-            // (e.g. another crate touched rayon first); that's expected
-            // and harmless for the rest of the run.
-            if let Err(err) = rayon::ThreadPoolBuilder::new()
-                .num_threads(n)
-                .build_global()
-            {
-                tracing::debug!(
-                    target: "neoethos_search::eval",
-                    requested_threads = n,
-                    error = %err,
-                    "rayon global pool already initialised; thread count not overridden"
-                );
-            }
-        }
-    });
 }
 
 fn mean_std(values: &[f64]) -> (f64, f64) {
@@ -159,6 +143,30 @@ fn sanitize_sharpe_v1(sharpe: f64) -> f64 {
         sharpe
     } else {
         0.0
+    }
+}
+
+fn report_non_finite_candidate_metrics_v1(
+    trade_count: usize,
+    non_finite_metrics: &[&str],
+    sharpe: f64,
+) {
+    if non_finite_metrics == ["sharpe"] && sharpe == INVALID_MONTHLY_RETURN_SHARPE_V1 {
+        tracing::warn!(
+            target: "neoethos_search::eval",
+            trade_count,
+            non_finite_metrics = ?non_finite_metrics,
+            reason = "invalid_completed_month_return",
+            "candidate rejected: completed-month percentage returns have invalid input shape, month-start equity, or non-finite arithmetic; preserving the negative-infinity Sharpe sentinel"
+        );
+    } else {
+        tracing::warn!(
+            target: "neoethos_search::eval",
+            trade_count,
+            non_finite_metrics = ?non_finite_metrics,
+            reason = "non_finite_evaluation_metrics",
+            "candidate produced non-finite evaluation metrics; inspect the named metrics and their inputs before attributing a financial-data or arithmetic cause"
+        );
     }
 }
 
@@ -254,9 +262,15 @@ fn utc_hour_of_day(timestamp_ms: i64) -> u32 {
 
 #[derive(Debug, Clone)]
 pub struct BacktestSettings {
+    /// Immutable account balance for this evaluation run. Standalone legacy
+    /// callers may omit it and use the configured runtime default.
+    pub initial_equity_override: Option<f64>,
     pub sl_pips: f64,
     pub tp_pips: f64,
     pub max_hold_bars: usize,
+    /// Legacy strategy/config field retained for compatibility. The CPU
+    /// bracket-only evaluators have no discretionary signal exit to delay:
+    /// SL, TP, an active trail and the maximum holding deadline always apply.
     pub min_hold_bars: usize,
     pub max_trades_per_day: usize,
     pub gap_threshold_ms: i64,
@@ -303,9 +317,10 @@ pub struct BacktestSettings {
     /// missing-broker-data path.
     pub swap_long_pips_per_day: f64,
     pub swap_short_pips_per_day: f64,
-    /// **Phase C (2026-05-28)** — `pnl_net = pnl_gross × (1 −
-    /// pnl_conversion_fee_rate)` applied once per closed trade.
-    /// Fraction (0.005 = 0.5 %), default 0.0.
+    /// Effective research conversion-fee fraction (0.005 = 0.5%). Zero when
+    /// quote and account currencies match. The explicit V1 research policy
+    /// debits abs(realized price gross) * rate, excluding commission and swap;
+    /// it does not estimate a broker's exact settlement rounding.
     pub pnl_conversion_fee_rate: f64,
 
     // ── Risk-based, confidence-scaled position sizing (Phase 1, 2026-06-05) ──
@@ -338,10 +353,12 @@ pub struct BacktestSettings {
     /// `adaptive_base_pips` is the per-BAR base stop distance in pips (the
     /// dataset's vol/tail distance at vol_mult = 1), shared across the whole
     /// population as a single `Arc`. When it is `Some` AND `adaptive_vol_mult >
-    /// 0`, a trade opened at bar i takes `sl = adaptive_vol_mult * base[i]`,
-    /// `tp = adaptive_rr * sl` — so the stop scales with the volatility at entry
-    /// (tight in calm markets, wider when choppy) while the reward stays a fixed
-    /// multiple of the risk; risk-based sizing uses the same per-entry SL so a
+    /// 0`, a trade opened at bar i takes `sl = adaptive_vol_mult * base[i]` and
+    /// applies the gene's evolved `tp_pips / sl_pips` reward:risk ratio. The
+    /// `adaptive_rr` scalar is only a legacy fallback for an invalid stored pair.
+    /// Thus the stop scales with volatility at entry (tight in calm markets,
+    /// wider when choppy) without collapsing every gene to the same exit;
+    /// risk-based sizing uses the same per-entry SL so a
     /// wider stop sizes a smaller position at constant risk. `adaptive_vol_mult`
     /// is set PER GENE (the gene's searchable `stop_vol_mult`) so the base series
     /// is computed once per combo and each gene just scales it — no per-gene
@@ -456,6 +473,7 @@ impl Default for BacktestSettings {
         // production financial entry points fail at the broker-truth boundary
         // before any caller can turn these fields into trades or metrics.
         Self {
+            initial_equity_override: None,
             sl_pips: 20.0,
             tp_pips: 40.0,
             max_hold_bars: 0,
@@ -526,14 +544,13 @@ pub struct BacktestRuntimeOverrides {
     /// Maximum number of monthly PnL buckets retained for consistency math.
     /// Must be non-zero.
     pub month_capacity: usize,
-    /// Explicit rayon thread-pool size override. `None` → use rayon's
-    /// default (one worker per logical core). `Some(n)` pins the global
-    /// pool to `n` threads.
+    /// Legacy Rayon width cap retained in the sealed runtime record. Production
+    /// startup folds it into the immutable process execution budget; it never
+    /// creates or mutates Rayon's process-global pool.
     ///
-    /// **F-695 closure (2026-05-25 — F-CORE3)**: previously read inline
-    /// inside `init_rayon` via `env::var("NEOETHOS_BOT_RUST_THREADS")` +
-    /// `env::var("RAYON_NUM_THREADS")`. Now consolidated to this typed
-    /// boundary installed from `Settings` at process startup.
+    /// **F-695 closure (2026-05-25 — F-CORE3)**: the retired environment
+    /// controls were first consolidated here. The lease-bound executor is now
+    /// the only authority that turns the resolved cap into worker threads.
     pub rayon_threads: Option<usize>,
 }
 
@@ -610,25 +627,9 @@ pub fn install_backtest_runtime_overrides_from_settings(s: &neoethos_core::Setti
     let _ = BACKTEST_RUNTIME_OVERRIDES.set(resolved);
 }
 
-/// #265 — TWO starting balances, and this is the one the search ranks on.
-///
-/// `risk.initial_balance` is the operator's account. `models.backtest_runtime
-/// .initial_equity` is the denominator every percentage this search reports is
-/// computed against — net return %, max drawdown %, max daily loss %, and the
-/// slot-7 `monthly_target_hit_rate` bar of "4% of the month's starting equity".
-/// The shipped defaults are 10 000 and 100 000, so out of the box the search
-/// ranks candidates by percentages of a balance ten times the account, and
-/// nothing said so.
-///
-/// This does NOT reconcile them, deliberately. They are not obviously one
-/// concept — a funded prop-firm challenge really is a different balance from
-/// the operator's own account — and silently substituting one for the other
-/// would move every ranked percentage without anybody choosing it. What it does
-/// is make the disagreement impossible to run past unnoticed: both numbers, the
-/// ratio, and the list of metrics that depend on it, once per process, at the
-/// single point every production binary passes through before any evaluation.
-///
-/// Making them agree is a one-line config edit; the operator makes it.
+/// Announce a distinct standalone default without falsely describing it as the
+/// Discovery account: Discovery snapshots `risk.initial_balance` into its own
+/// immutable evaluation settings and uses it for sizing and validation alike.
 fn report_equity_denominator_disagreement(s: &neoethos_core::Settings, initial_equity: f64) {
     let account = s.risk.initial_balance;
     if !account.is_finite() || account <= 0.0 {
@@ -636,26 +637,20 @@ fn report_equity_denominator_disagreement(s: &neoethos_core::Settings, initial_e
             target: "neoethos_search::cost_model",
             configured_account_balance = account,
             search_initial_equity = initial_equity,
-            "risk.initial_balance is not a usable balance, so it cannot be compared with the \
-             search's equity denominator. Every percentage this run ranks on is computed \
-             against models.backtest_runtime.initial_equity"
+            "risk.initial_balance is not usable; Discovery must reject this account balance"
         );
         return;
     }
     if (account - initial_equity).abs() <= f64::EPSILON * account.abs().max(1.0) {
         return;
     }
-    tracing::warn!(
+    tracing::info!(
         target: "neoethos_search::cost_model",
         account_balance = account,
         search_initial_equity = initial_equity,
         ratio = initial_equity / account,
-        "TWO STARTING BALANCES (#265). risk.initial_balance is your account; \
-         models.backtest_runtime.initial_equity is what THIS SEARCH divides by. Net return %, \
-         max drawdown %, max daily loss % and the slot-7 monthly-target hit rate (>=4% of the \
-         month's starting equity) are all measured against the SECOND number, so a candidate \
-         ranked here is ranked against a balance that is not the one you trade. Set them equal \
-         in config.yaml if that is not what you want — nothing here changes either value"
+        "standalone backtest default differs from the account; Discovery snapshots \
+         risk.initial_balance for both Search sizing and account-risk validation"
     );
 }
 
@@ -670,7 +665,8 @@ pub fn current_backtest_runtime_overrides() -> BacktestRuntimeOverrides {
 
 impl BacktestSettings {
     pub fn initial_equity(&self) -> f64 {
-        current_backtest_runtime_overrides().initial_equity
+        self.initial_equity_override
+            .unwrap_or_else(|| current_backtest_runtime_overrides().initial_equity)
     }
 
     pub fn month_capacity(&self) -> usize {
@@ -711,10 +707,9 @@ fn report_month_capacity_overflow(month_capacity: usize, month_ptr: i64) {
     });
 }
 
-/// **Phase C.2 (2026-05-28)** — apply broker-supplied carry costs to a
-/// closed-trade gross PnL.
-///
-/// `gross_pnl` is the price-derived PnL after commission + half-spread.
+/// Apply signed carry and the versioned research conversion-fee debit.
+/// `pnl_after_costs` retains the existing spread/commission arithmetic.
+/// `price_gross` includes executable-side spread but excludes commission/swap.
 /// `in_pos` is +1 for long, −1 for short. `entry_ts_ms` / `exit_ts_ms`
 /// are millisecond timestamps; pass 0 when timestamps are unavailable
 /// and the swap charge should be skipped (back-compat with pre-Phase-C
@@ -724,15 +719,16 @@ fn report_month_capacity_overflow(month_capacity: usize, month_ptr: i64) {
 ///   overnight_days = max(exit_ts − entry_ts, 0) / 86_400_000  (fractional)
 ///   swap_pips_per_day = swap_long if long else swap_short
 ///     ↑ broker sign convention: positive = credit, negative = charge
-///   pnl_with_carry = gross_pnl + swap_pips_per_day × overnight_days
+///   pnl_with_carry = pnl_after_costs + swap_pips_per_day × overnight_days
 ///                      × pip_value_per_lot
-///   net_pnl = pnl_with_carry × (1 − pnl_conversion_fee_rate)
+///   net_pnl = pnl_with_carry - abs(price_gross) × effective_conversion_fee_rate
 ///
 /// With both swap fields = 0.0 and conversion fee = 0.0 this is the
 /// identity, matching the pre-Phase-C kernel exactly.
 #[inline]
 fn apply_carry_and_fee(
-    gross_pnl: f64,
+    pnl_after_costs: f64,
+    price_gross: f64,
     in_pos: i8,
     entry_ts_ms: i64,
     exit_ts_ms: i64,
@@ -749,29 +745,41 @@ fn apply_carry_and_fee(
         settings.swap_short_pips_per_day
     };
     let swap_credit = swap_pips_per_day * overnight_days * settings.pip_value_per_lot;
-    let pnl_with_carry = gross_pnl + swap_credit;
-    let conv_fee = settings.pnl_conversion_fee_rate;
-    if conv_fee.is_finite() && conv_fee > 0.0 && conv_fee < 1.0 {
-        pnl_with_carry * (1.0 - conv_fee)
-    } else {
-        pnl_with_carry
-    }
+    let pnl_with_carry = pnl_after_costs + swap_credit;
+    debit_research_conversion_fee(
+        pnl_with_carry,
+        price_gross,
+        settings.pnl_conversion_fee_rate,
+    )
 }
 
-/// Risk-based-sizing-aware wrapper around [`apply_carry_and_fee`].
-///
-/// `gross_pnl` is the price-derived PnL after commission + half-spread,
-/// ALREADY scaled by `pos_lots`. The overnight SWAP term inside
-/// [`apply_carry_and_fee`] uses `pip_value_per_lot` and therefore must ALSO
-/// scale with position size; this wrapper scales the swap by `pos_lots` so
-/// the whole trade is sized consistently. The conversion fee is a
-/// multiplicative fraction and is applied once at the end (unchanged).
-///
-/// With `pos_lots == 1.0` this is identical to `apply_carry_and_fee`, so the
-/// legacy fixed-1-lot path is byte-for-byte preserved.
+#[inline]
+fn debit_research_conversion_fee(pnl_with_carry: f64, price_gross: f64, rate: f64) -> f64 {
+    use neoethos_core::research_conversion_fee::{
+        ResearchPnlConversionFeePolicyV1, validate_conversion_fee_rate_v1,
+    };
+    validate_conversion_fee_rate_v1(rate).expect("invalid research conversion fee rate");
+    if rate == 0.0 {
+        // Do not subtract even +0: preserve every bit of the fee-zero path.
+        return pnl_with_carry;
+    }
+    let fee = ResearchPnlConversionFeePolicyV1::AbsoluteRealizedPriceGrossDebitV1
+        .debit(price_gross, rate)
+        .expect("invalid research conversion fee gross");
+    let net = pnl_with_carry - fee;
+    assert!(
+        net.is_finite(),
+        "research conversion fee produced non-finite net PnL"
+    );
+    net
+}
+
+/// Both PnL inputs are already scaled by entry-captured lots. Scale only the
+/// per-lot swap here; never multiply the conversion fee by lots a second time.
 #[inline]
 fn apply_carry_and_fee_scaled(
-    gross_pnl_scaled: f64,
+    pnl_after_costs_scaled: f64,
+    price_gross_scaled: f64,
     pos_lots: f64,
     in_pos: i8,
     entry_ts_ms: i64,
@@ -780,7 +788,14 @@ fn apply_carry_and_fee_scaled(
 ) -> f64 {
     if pos_lots == 1.0 {
         // Exact legacy path — no extra arithmetic, no rounding drift.
-        return apply_carry_and_fee(gross_pnl_scaled, in_pos, entry_ts_ms, exit_ts_ms, settings);
+        return apply_carry_and_fee(
+            pnl_after_costs_scaled,
+            price_gross_scaled,
+            in_pos,
+            entry_ts_ms,
+            exit_ts_ms,
+            settings,
+        );
     }
     let overnight_days = if exit_ts_ms > entry_ts_ms && entry_ts_ms > 0 {
         (exit_ts_ms - entry_ts_ms) as f64 / 86_400_000.0
@@ -794,34 +809,34 @@ fn apply_carry_and_fee_scaled(
     };
     // Swap term scales with size (it is a per-lot cash flow).
     let swap_credit = swap_pips_per_day * overnight_days * settings.pip_value_per_lot * pos_lots;
-    let pnl_with_carry = gross_pnl_scaled + swap_credit;
-    let conv_fee = settings.pnl_conversion_fee_rate;
-    if conv_fee.is_finite() && conv_fee > 0.0 && conv_fee < 1.0 {
-        pnl_with_carry * (1.0 - conv_fee)
-    } else {
-        pnl_with_carry
-    }
+    let pnl_with_carry = pnl_after_costs_scaled + swap_credit;
+    debit_research_conversion_fee(
+        pnl_with_carry,
+        price_gross_scaled,
+        settings.pnl_conversion_fee_rate,
+    )
 }
 
 /// Per-ENTRY `(sl_pips, tp_pips)` for the position opening at bar `i`. When the
 /// gene's `adaptive_vol_mult > 0` and a base vol-distance series is present, the
-/// stop scales with volatility at `i` (`sl = mult * base[i]`, `tp = rr * sl`);
-/// otherwise the scalar fixed `sl_pips`/`tp_pips`. Returning the scalar on the
-/// off/degenerate path keeps the fixed-pip backtest byte-identical.
+/// stop scales with volatility at `i` (`sl = mult * base[i]`) while the target
+/// keeps the gene's evolved `tp_pips / sl_pips` ratio;
+/// otherwise the scalar fixed `sl_pips`/`tp_pips`. An unavailable cell in an
+/// enabled adaptive series means no entry, not permission to trade fixed pips.
 #[inline]
-fn entry_sl_tp_pips(settings: &BacktestSettings, i: usize) -> (f64, f64) {
-    if settings.adaptive_vol_mult > 0.0 {
-        if let Some(base) = &settings.adaptive_base_pips {
-            if let Some(&d) = base.get(i) {
-                let sl = settings.adaptive_vol_mult * d;
-                let tp = settings.adaptive_rr * sl;
-                if sl.is_finite() && sl > 0.0 && tp.is_finite() && tp > 0.0 {
-                    return (sl, tp);
-                }
-            }
-        }
-    }
-    (settings.sl_pips, settings.tp_pips)
+fn entry_sl_tp_pips(settings: &BacktestSettings, i: usize) -> Option<(f64, f64)> {
+    crate::stop_target::resolve_entry_stop_target_pips(
+        settings.sl_pips,
+        settings.tp_pips,
+        settings.adaptive_vol_mult,
+        settings
+            .adaptive_base_pips
+            .as_ref()
+            .and_then(|base| base.get(i))
+            .copied(),
+        settings.adaptive_base_pips.is_some(),
+        settings.adaptive_rr,
+    )
 }
 
 /// Risk-based, confidence-scaled lot size for a single trade entry.
@@ -835,7 +850,7 @@ fn entry_sl_tp_pips(settings: &BacktestSettings, i: usize) -> (f64, f64) {
 ///   conf     = confidence at the entry signal bar, clamped [0,1]
 ///   risk_pct = risk_min + (risk_max - risk_min)
 ///              * min(conf / high_quality_confidence, 1.0)
-///   eff_sl   = max(sl_pips, 1.0)                  // guard tiny/zero SL
+///   eff_sl   = sl_pips                           // actual, positive entry stop
 ///   pos_lots = if equity > 0 {
 ///                  (risk_pct * equity) / (eff_sl * pip_value_per_lot)
 ///              } else { 0.0 }
@@ -863,13 +878,20 @@ fn risk_based_pos_lots(
         1.0
     };
     let risk_pct = risk_min + (risk_max - risk_min) * conf_scale;
-    // Guard a tiny/zero SL so the divisor can't blow the lot size up. `eff_sl_pips`
-    // is the position's ENTRY stop (adaptive per-entry when enabled, else the
-    // scalar `sl_pips`) so a wider stop sizes a smaller position at constant risk.
-    let eff_sl = eff_sl_pips.max(1.0);
+    // Size against the actual ENTRY stop, including legitimate sub-pip stops.
+    // The lot cap below limits exposure; changing the risk denominator to a
+    // fictitious one-pip stop makes the reported risk disagree with the trade.
     let pip_value_per_lot = settings.pip_value_per_lot;
-    let denom = eff_sl * pip_value_per_lot;
-    let pos_lots = if equity > 0.0 && denom.abs() > 1e-12 && denom.is_finite() {
+    let denom = eff_sl_pips * pip_value_per_lot;
+    let pos_lots = if equity.is_finite()
+        && equity > 0.0
+        && eff_sl_pips.is_finite()
+        && eff_sl_pips > 0.0
+        && pip_value_per_lot.is_finite()
+        && pip_value_per_lot > 0.0
+        && denom.is_finite()
+        && denom > 0.0
+    {
         (risk_pct * equity) / denom
     } else {
         0.0
@@ -879,6 +901,78 @@ fn risk_based_pos_lots(
     } else {
         0.0
     }
+}
+
+/// One protective-exit policy for CPU fitness and the detailed trade ledger.
+/// Existing protection is checked before this bar can ratchet the trail, and
+/// SL wins an ambiguous OHLC bar that crosses both SL and TP. A minimum hold
+/// must never suppress protection or extend the maximum holding deadline.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn protective_exit_price(
+    side: i8,
+    entry_px: f64,
+    sl_pips: f64,
+    tp_pips: f64,
+    trail_px: &mut f64,
+    hi: f64,
+    lo: f64,
+    close: f64,
+    bars_held: usize,
+    pip: f64,
+    settings: &BacktestSettings,
+) -> Option<f64> {
+    if side == 1 {
+        let mut sl = entry_px - (sl_pips * pip);
+        let tp = entry_px + (tp_pips * pip);
+        // Only PRIOR bars may have moved the stop protecting this bar.
+        // Zero is the existing unset sentinel for both position directions.
+        if settings.trailing_enabled && *trail_px > 0.0 && *trail_px > sl {
+            sl = *trail_px;
+        }
+        if lo <= sl {
+            return Some(sl);
+        }
+        if hi >= tp {
+            return Some(tp);
+        }
+        if settings.trailing_enabled {
+            let mv = hi - entry_px;
+            if mv >= (settings.trailing_be_trigger_r * sl_pips * pip) {
+                let locked = entry_px + settings.trailing_min_lock_pips * pip;
+                let candidate =
+                    (hi - (settings.trailing_atr_multiplier * sl_pips * pip)).max(locked);
+                if *trail_px == 0.0 || candidate > *trail_px {
+                    *trail_px = candidate;
+                }
+            }
+        }
+    } else {
+        let mut sl = entry_px + (sl_pips * pip);
+        let tp = entry_px - (tp_pips * pip);
+        if settings.trailing_enabled && *trail_px > 0.0 && *trail_px < sl {
+            sl = *trail_px;
+        }
+        if hi >= sl {
+            return Some(sl);
+        }
+        if lo <= tp {
+            return Some(tp);
+        }
+        if settings.trailing_enabled {
+            let mv = entry_px - lo;
+            if mv >= (settings.trailing_be_trigger_r * sl_pips * pip) {
+                let locked = entry_px - settings.trailing_min_lock_pips * pip;
+                let candidate =
+                    (lo + (settings.trailing_atr_multiplier * sl_pips * pip)).min(locked);
+                if *trail_px == 0.0 || candidate < *trail_px {
+                    *trail_px = candidate;
+                }
+            }
+        }
+    }
+    // Timeout is a close-of-bar exit, after the intrabar protective barriers.
+    (settings.max_hold_bars > 0 && bars_held >= settings.max_hold_bars).then_some(close)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -893,7 +987,43 @@ pub(crate) fn fast_evaluate_strategy_core(
     timestamps: &[i64],
     settings: &BacktestSettings,
 ) -> [f64; 11] {
+    evaluate_strategy_with_ledger_core::<false>(
+        close,
+        high,
+        low,
+        signals,
+        confidences,
+        month_idx,
+        day_idx,
+        timestamps,
+        settings,
+        &mut Vec::new(),
+        None,
+    )
+}
+
+/// The CPU fitness and detailed ledger share the same position lifecycle.
+/// `RECORD_TRADES = false` removes ledger/excursion recording at compile time;
+/// population search does not allocate a trade history for each candidate.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    signals: &[i8],
+    confidences: &[f64],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    timestamps: &[i64],
+    settings: &BacktestSettings,
+    trades: &mut Vec<Trade>,
+    mut netted: Option<&mut netted_bar_research::NettedBarCoreState<'_>>,
+) -> [f64; 11] {
     // Reports itself on first call — see `eval_telemetry`.
+    neoethos_core::research_conversion_fee::validate_conversion_fee_rate_v1(
+        settings.pnl_conversion_fee_rate,
+    )
+    .expect("invalid research conversion fee rate");
     struct TelemetryGuard(&'static str, usize, std::time::Instant);
     impl Drop for TelemetryGuard {
         fn drop(&mut self) {
@@ -901,7 +1031,11 @@ pub(crate) fn fast_evaluate_strategy_core(
         }
     }
     let _telemetry = TelemetryGuard(
-        "eval::fast_evaluate_strategy_core",
+        if RECORD_TRADES {
+            "eval::simulate_trades_core"
+        } else {
+            "eval::fast_evaluate_strategy_core"
+        },
         1,
         std::time::Instant::now(),
     );
@@ -925,7 +1059,10 @@ pub(crate) fn fast_evaluate_strategy_core(
     let mut pos_tp_pips: f64 = settings.tp_pips;
 
     let initial_equity = settings.initial_equity();
-    let month_capacity = settings.month_capacity();
+    let month_capacity = netted
+        .as_ref()
+        .map(|state| state.month_capacity)
+        .unwrap_or_else(|| settings.month_capacity());
 
     let mut equity = initial_equity;
     let mut peak_equity = initial_equity;
@@ -956,6 +1093,8 @@ pub(crate) fn fast_evaluate_strategy_core(
     let mut entry_px = 0.0;
     let mut entry_idx = -1i64;
     let mut trail_px = 0.0;
+    let mut mfe_money = 0.0_f64;
+    let mut mae_money = 0.0_f64;
 
     let pip = if settings.pip_value.abs() < 1e-12 {
         1e-12
@@ -969,16 +1108,19 @@ pub(crate) fn fast_evaluate_strategy_core(
     let session_profile = settings.session_spread_profile.filter(|_| use_timestamps);
 
     for i in 1..n {
+        let timestamp = timestamps.get(i).copied().unwrap_or(0);
+        let (session_close, session_block_entry) =
+            weekend_session_policy(timestamp, settings.kill_zones_enabled && use_timestamps);
         // Per-bar spread cost. When `session_spread_profile` is unset
         // these collapse to the loop-invariant scalar, which the
         // optimiser is free to hoist; the explicit per-bar form keeps
         // the code uniform whether the profile is on or off.
         let (half_spread_px, half_spread_cost) = match session_profile {
-            Some(profile) => {
+            Some(profile) if timestamp > 0 => {
                 let s = profile.spread_pips_at(timestamps[i]);
                 (s * 0.5 * pip, s * 0.5 * settings.pip_value_per_lot)
             }
-            None => (scalar_half_spread_px, scalar_half_spread_cost),
+            _ => (scalar_half_spread_px, scalar_half_spread_cost),
         };
         let m_val = *month_idx.get(i).unwrap_or(&last_month);
         if m_val != last_month {
@@ -1023,6 +1165,18 @@ pub(crate) fn fast_evaluate_strategy_core(
             day_trade_count = 0;
         }
 
+        if RECORD_TRADES && in_pos != 0 {
+            // Retain the existing bar-resolution excursion convention. This is
+            // not tick-resolved evidence about the ordering of intrabar prices.
+            let (favorable, adverse) = if in_pos == 1 {
+                (high[i] - entry_px, entry_px - low[i])
+            } else {
+                (entry_px - low[i], high[i] - entry_px)
+            };
+            mfe_money = mfe_money.max(favorable / pip * settings.pip_value_per_lot * pos_lots);
+            mae_money = mae_money.max(adverse / pip * settings.pip_value_per_lot * pos_lots);
+        }
+
         // Gap detection: force-exit open position when market gap exceeds threshold
         if in_pos != 0 && use_timestamps && settings.gap_threshold_ms > 0 {
             let ts_prev = timestamps[i - 1];
@@ -1036,16 +1190,11 @@ pub(crate) fn fast_evaluate_strategy_core(
                 } else {
                     (entry_px - close[i]) / pip * settings.pip_value_per_lot
                 };
+                let price_gross = pnl * pos_lots - half_spread_cost * pos_lots;
                 let pnl =
                     pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
-                // Phase C.2: apply broker swap + conversion fee. The swap
-                // term inside also scales with size; pass a per-lot-scaled
-                // pnl AND scale the returned delta so the swap (which uses
-                // pip_value_per_lot) is sized too — simplest: divide by
-                // pos_lots in, multiply by pos_lots out is equivalent to
-                // scaling the gross pnl AND the swap. We instead scale the
-                // swap by feeding the helper the already-scaled pnl and
-                // multiplying the *carry delta* by pos_lots below.
+                // Preserve old cost/swap arithmetic when fee is zero, but carry
+                // the commission-free price gross separately for a nonzero fee.
                 let entry_ts_ms = if use_timestamps && entry_idx >= 0 {
                     timestamps.get(entry_idx as usize).copied().unwrap_or(0)
                 } else {
@@ -1058,12 +1207,25 @@ pub(crate) fn fast_evaluate_strategy_core(
                 };
                 let pnl = apply_carry_and_fee_scaled(
                     pnl,
+                    price_gross,
                     pos_lots,
                     in_pos,
                     entry_ts_ms,
                     exit_ts_ms,
                     settings,
                 );
+                if RECORD_TRADES {
+                    record_closed_cpu_trade(
+                        trades,
+                        entry_ts_ms,
+                        exit_ts_ms,
+                        pnl,
+                        initial_equity,
+                        pos_sl_pips * settings.pip_value_per_lot * pos_lots,
+                        mfe_money,
+                        mae_money,
+                    );
+                }
                 equity += pnl;
                 current_month_pnl += pnl;
                 trade_count += 1;
@@ -1092,6 +1254,9 @@ pub(crate) fn fast_evaluate_strategy_core(
                 if current_dd > max_dd {
                     max_dd = current_dd;
                 }
+                // This close consumed the bar. The pre-gap signal must not
+                // reopen a position at the same close after forced liquidation.
+                continue;
             }
         }
 
@@ -1138,101 +1303,32 @@ pub(crate) fn fast_evaluate_strategy_core(
                 max_dd = current_dd;
             }
 
-            let mut pnl = 0.0;
-            let mut exit = false;
-
-            // Minimum holding period: skip exit checks until min_hold_bars elapsed
-            let bars_held = i as i64 - entry_idx;
-            let past_min_hold =
-                settings.min_hold_bars == 0 || bars_held >= settings.min_hold_bars as i64;
-
-            if past_min_hold {
-                if in_pos == 1 {
-                    let mut sl = entry_px - (pos_sl_pips * pip);
-                    let tp = entry_px + (pos_tp_pips * pip);
-                    // Apply the trail locked in by PRIOR bars. NO intra-bar look-ahead:
-                    // this bar's high must NOT move the stop that this bar's low is then
-                    // checked against (the old order optimistically avoided losses → the
-                    // GA reward-hacked it into fake never-lose genes, PF~100 / ~0% DD).
-                    // `trail_px == 0.0` is the unset sentinel — only apply once set.
-                    if settings.trailing_enabled && trail_px > 0.0 && trail_px > sl {
-                        sl = trail_px;
-                    }
-                    if lo <= sl {
-                        pnl = (sl - entry_px) / pip * settings.pip_value_per_lot;
-                        exit = true;
-                    } else if hi >= tp {
-                        pnl = (tp - entry_px) / pip * settings.pip_value_per_lot;
-                        exit = true;
-                    }
-                    // Only AFTER the exit check: ratchet the trail up from THIS bar's high
-                    // so it protects FUTURE bars (a bar's own high can't save its own low).
-                    if !exit && settings.trailing_enabled {
-                        let mv = hi - entry_px;
-                        if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                            // Floor the trail at entry plus the locked profit. The
-                            // multiplier is a fraction of the gene's own stop, so
-                            // without this the amount protected varies per gene and
-                            // is often below the cost of the trade.
-                            let locked = entry_px + settings.trailing_min_lock_pips * pip;
-                            let candidate = (hi
-                                - (settings.trailing_atr_multiplier * pos_sl_pips * pip))
-                                .max(locked);
-                            if trail_px == 0.0 || candidate > trail_px {
-                                trail_px = candidate;
-                            }
-                        }
-                    }
+            let exit_px = protective_exit_price(
+                in_pos,
+                entry_px,
+                pos_sl_pips,
+                pos_tp_pips,
+                &mut trail_px,
+                hi,
+                lo,
+                close[i],
+                i - entry_idx as usize,
+                pip,
+                settings,
+            )
+            .or_else(|| session_close.then_some(close[i]));
+            if let Some(exit_px) = exit_px {
+                let pnl = if in_pos == 1 {
+                    (exit_px - entry_px) / pip * settings.pip_value_per_lot
                 } else {
-                    let mut sl = entry_px + (pos_sl_pips * pip);
-                    let tp = entry_px - (pos_tp_pips * pip);
-                    // Short: apply the trail from PRIOR bars only (no intra-bar look-ahead,
-                    // see the long branch). Until +trigger `trail_px` is 0.0 (unset) and the
-                    // original `entry_px + sl_pips` stop holds.
-                    if settings.trailing_enabled && trail_px > 0.0 && trail_px < sl {
-                        sl = trail_px;
-                    }
-                    if hi >= sl {
-                        pnl = (entry_px - sl) / pip * settings.pip_value_per_lot;
-                        exit = true;
-                    } else if lo <= tp {
-                        pnl = (entry_px - tp) / pip * settings.pip_value_per_lot;
-                        exit = true;
-                    }
-                    // Only AFTER the exit check: ratchet the trail down from THIS bar's low.
-                    if !exit && settings.trailing_enabled {
-                        let mv = entry_px - lo;
-                        if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                            // Mirror of the long floor: never closer to entry than
-                            // the locked profit.
-                            let locked = entry_px - settings.trailing_min_lock_pips * pip;
-                            let candidate = (lo
-                                + (settings.trailing_atr_multiplier * pos_sl_pips * pip))
-                                .min(locked);
-                            if trail_px == 0.0 || candidate < trail_px {
-                                trail_px = candidate;
-                            }
-                        }
-                    }
-                }
-
-                if !exit && settings.max_hold_bars > 0 && bars_held >= settings.max_hold_bars as i64
-                {
-                    pnl = if in_pos == 1 {
-                        (close[i] - entry_px) / pip * settings.pip_value_per_lot
-                    } else {
-                        (entry_px - close[i]) / pip * settings.pip_value_per_lot
-                    };
-                    exit = true;
-                }
-            }
-
-            if exit {
+                    (entry_px - exit_px) / pip * settings.pip_value_per_lot
+                };
                 // Risk-based sizing: the price-derived `pnl` (set in the
-                // SL/TP/max-hold branches above) and the commission +
+                // shared protective-exit policy above) and the commission +
                 // half-spread cost both scale by the entry-captured
                 // `pos_lots`. (Half-spread was already paid at entry via the
                 // adjusted entry_px; this is the exit-side half + commission.)
+                let price_gross = pnl * pos_lots - half_spread_cost * pos_lots;
                 let pnl =
                     pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
                 // Phase C.2: apply broker swap + conversion fee (size-aware).
@@ -1248,12 +1344,25 @@ pub(crate) fn fast_evaluate_strategy_core(
                 };
                 let pnl = apply_carry_and_fee_scaled(
                     pnl,
+                    price_gross,
                     pos_lots,
                     in_pos,
                     entry_ts_ms,
                     exit_ts_ms,
                     settings,
                 );
+                if RECORD_TRADES {
+                    record_closed_cpu_trade(
+                        trades,
+                        entry_ts_ms,
+                        exit_ts_ms,
+                        pnl,
+                        initial_equity,
+                        pos_sl_pips * settings.pip_value_per_lot * pos_lots,
+                        mfe_money,
+                        mae_money,
+                    );
+                }
                 equity += pnl;
                 current_month_pnl += pnl;
                 trade_count += 1;
@@ -1292,10 +1401,51 @@ pub(crate) fn fast_evaluate_strategy_core(
             // the trade was peeking at the very bar it was supposed to
             // execute on. This 1-bar shift removes that intra-bar look-ahead.
             let s = signals[i - 1];
-            if s != 0 {
+            if s != 0 && !session_block_entry {
                 // max_trades_per_day gate
                 if settings.max_trades_per_day > 0 && day_trade_count >= settings.max_trades_per_day
                 {
+                    continue;
+                }
+                let (entry_sl, entry_tp, size_multiplier) = if let Some(state) = netted.as_ref() {
+                    (
+                        state.tape.sl_pips[i - 1],
+                        state.tape.tp_pips[i - 1],
+                        state.tape.ml_multipliers[i - 1],
+                    )
+                } else {
+                    let Some((sl, tp)) = entry_sl_tp_pips(settings, i - 1) else {
+                        continue;
+                    };
+                    (sl, tp, 1.0)
+                };
+                if size_multiplier == 0.0 {
+                    continue;
+                }
+                let mut entry_lots = if use_risk_sizing {
+                    let conf = confidences.get(i - 1).copied().unwrap_or(1.0);
+                    risk_based_pos_lots(conf, equity, entry_sl, settings)
+                } else {
+                    1.0
+                };
+                if let Some(state) = netted.as_deref_mut() {
+                    // ML shrinks the already confidence-sized risk ONCE. A
+                    // broker-quantity refusal must occur before lane occupancy.
+                    entry_lots *= size_multiplier;
+                    if entry_lots <= 0.0 {
+                        continue;
+                    }
+                    if let Some(grid) = state.lot_grid {
+                        match grid.normalize_down(entry_lots) {
+                            Some(lots) => entry_lots = lots,
+                            None => {
+                                state.below_min_entries += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if entry_lots <= 0.0 {
                     continue;
                 }
                 in_pos = s;
@@ -1303,6 +1453,8 @@ pub(crate) fn fast_evaluate_strategy_core(
                 entry_px = close[i] + (s as f64) * half_spread_px;
                 entry_idx = i as i64;
                 trail_px = 0.0;
+                mfe_money = 0.0;
+                mae_money = 0.0;
                 day_trade_count += 1;
 
                 // Risk-based, confidence-scaled position sizing (Phase 1).
@@ -1318,16 +1470,37 @@ pub(crate) fn fast_evaluate_strategy_core(
                 // and confidence come from, matching live's "signal + bracket from
                 // one closed bar". Held for the trade's life. The fixed path
                 // returns the scalar sl_pips/tp_pips (byte-identical).
-                let (entry_sl, entry_tp) = entry_sl_tp_pips(settings, i - 1);
                 pos_sl_pips = entry_sl;
                 pos_tp_pips = entry_tp;
-                if use_risk_sizing {
-                    let conf = confidences.get(i - 1).copied().unwrap_or(1.0) as f64;
-                    pos_lots = risk_based_pos_lots(conf, equity, pos_sl_pips, settings);
-                } else {
-                    pos_lots = 1.0;
-                }
+                pos_lots = entry_lots;
             }
+        }
+    }
+
+    if let Some(state) = netted.as_deref_mut() {
+        state.ending_realized_balance = equity;
+        if in_pos != 0 {
+            let last = n - 1;
+            let gross = f64::from(in_pos) * (close[last] - entry_px) / pip
+                * settings.pip_value_per_lot
+                * pos_lots;
+            // A mark is not a fill. The canonical core charges its complete
+            // round-trip commission on closure; report pending costs separately.
+            state.terminal_open = Some(TerminalBarPositionV1 {
+                direction: in_pos,
+                entry_bar_index: entry_idx as usize,
+                entry_timestamp_ms: timestamps.get(entry_idx as usize).copied().unwrap_or(0),
+                modeled_entry_price: entry_px,
+                lots: pos_lots,
+                stop_pips: pos_sl_pips,
+                target_pips: pos_tp_pips,
+                active_trailing_stop_price: (trail_px > 0.0).then_some(trail_px),
+                mark_timestamp_ms: timestamps.get(last).copied().unwrap_or(0),
+                mark_close_price: close[last],
+                gross_unrealized_account: gross,
+                pending_round_trip_commission_account: settings.commission_per_trade * pos_lots,
+                marked_equity_before_pending_costs: equity + gross,
+            });
         }
     }
 
@@ -1423,18 +1596,10 @@ pub(crate) fn fast_evaluate_strategy_core(
     // Final NaN/inf scrub. A single non-finite slot would poison sorting in
     // the GA (any comparison with NaN returns Equal via partial_cmp fallback).
     //
-    // **F-316 (2026-05-29)**: emit a `tracing::warn` whenever a metric
-    // arrives non-finite — historically the closure silently mapped NaN
-    // to 0, which made "broker has no financials for this symbol"
-    // (NaN cost model output → NaN PnL → 0 sanitised) look identical to
-    // "real strategy with zero PnL". The warn fires with the candidate's
-    // trade count + the per-metric NaN mask so the operator can see in
-    // the discovery log when an entire symbol's cost data is missing
-    // (typically: broker catalog incomplete, fix via Data Bootstrap or
-    // re-auth). The sanitised return value is unchanged — sortability
-    // matters more than failing the candidate, and the upstream
-    // `infer_market_cost_profile` will already have logged the root
-    // cause separately.
+    // Report the metric mask without guessing its cause. In particular, the
+    // known negative-infinity Sharpe marker rejects invalid completed-month
+    // returns even when every financial input and every other metric is finite.
+    // The existing scrub, sentinel and downstream fitness guards are unchanged.
     let inputs = [
         ("net_profit", net_profit),
         ("sharpe", sharpe),
@@ -1452,12 +1617,10 @@ pub(crate) fn fast_evaluate_strategy_core(
         .map(|(name, _)| *name)
         .collect();
     if !nan_names.is_empty() {
-        tracing::warn!(
-            target: "neoethos_search::eval",
-            trade_count,
-            non_finite_metrics = ?nan_names,
-            "candidate emitted non-finite cost-model metrics — likely broker financials missing for the symbol; check `infer_market_cost_profile` log lines above"
-        );
+        if let Some(state) = netted.as_deref_mut() {
+            state.nonfinite_metrics = true;
+        }
+        report_non_finite_candidate_metrics_v1(trade_count, &nan_names, sharpe);
     }
     let sanitize = |v: f64| if v.is_finite() { v } else { 0.0 };
     [
@@ -1484,6 +1647,9 @@ fn finalize_daily_drawdown_segment(day_peak: f64, day_low: f64, max_daily_dd: &m
     }
 }
 
+/// Explicit fixed-lot historical ledger for per-lot economic/timing screens.
+/// Account-risk validation must use [`simulate_trades_with_confidence_core`]
+/// instead: discarding confidence changes the sized strategy being evaluated.
 pub(crate) fn simulate_trades_core(
     close: &[f64],
     high: &[f64],
@@ -1492,285 +1658,191 @@ pub(crate) fn simulate_trades_core(
     signals: &[i8],
     settings: &BacktestSettings,
 ) -> Vec<Trade> {
-    // Reports itself on first call — see `eval_telemetry`.
-    struct TelemetryGuard(&'static str, usize, std::time::Instant);
-    impl Drop for TelemetryGuard {
-        fn drop(&mut self) {
-            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
-        }
-    }
-    let _telemetry = TelemetryGuard("eval::simulate_trades_core", 1, std::time::Instant::now());
     let n = close
         .len()
         .min(high.len())
         .min(low.len())
         .min(timestamps.len())
         .min(signals.len());
-    if n == 0 {
-        return Vec::new();
-    }
-
-    let initial_balance = settings.initial_equity();
-    let pip = if settings.pip_value.abs() < 1e-12 {
-        1e-12
-    } else {
-        settings.pip_value
-    };
-    let scalar_half_spread_px = settings.spread_pips * 0.5 * pip;
-    let scalar_half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
-    let session_profile = settings.session_spread_profile;
-
+    let days = timestamps[..n]
+        .iter()
+        .map(|ts| ts.div_euclid(86_400_000))
+        .collect::<Vec<_>>();
     let mut trades = Vec::new();
-    let mut in_pos = 0i8;
-    let mut entry_px = 0.0;
-    let mut entry_idx = 0usize;
-    let mut trail_px = 0.0;
-    // Per-entry SL/TP in pips (adaptive-per-entry when enabled, else the scalar).
-    // Captured at entry, held for the trade's life. See `entry_sl_tp_pips`.
-    let mut pos_sl_pips: f64 = settings.sl_pips;
-    let mut pos_tp_pips: f64 = settings.tp_pips;
-    // Per-trade excursions (operator 2026-06-06): MFE/MAE tracked while a position
-    // is open, reset at entry, emitted in each Trade record.
-    let mut mfe_money = 0.0_f64;
-    let mut mae_money = 0.0_f64;
-    let mut last_day_key = -1i64;
-    let mut day_trade_count = 0usize;
-
-    for i in 1..n {
-        // DOCUMENTED-DEFAULT: `n` above is the min length of `timestamps`
-        // and the price slices, so `get(i)` is guaranteed Some(_). The
-        // `unwrap_or_default()` is defence-in-depth only.
-        let ts = timestamps.get(i).copied().unwrap_or_default();
-
-        let (half_spread_px, half_spread_cost) = match session_profile {
-            Some(profile) if ts > 0 => {
-                let s = profile.spread_pips_at(ts);
-                (s * 0.5 * pip, s * 0.5 * settings.pip_value_per_lot)
-            }
-            _ => (scalar_half_spread_px, scalar_half_spread_cost),
-        };
-
-        // Day rollover for max_trades_per_day tracking
-        let day_key = if ts > 0 { ts / 86_400_000 } else { -1 };
-        if day_key != last_day_key {
-            last_day_key = day_key;
-            day_trade_count = 0;
-        }
-
-        if in_pos != 0 {
-            // Per-trade MFE/MAE tracking (operator 2026-06-06): update from this
-            // bar's high/low BEFORE any exit, so we capture the full excursion.
-            {
-                let (fav, adv) = if in_pos == 1 {
-                    (high[i] - entry_px, entry_px - low[i])
-                } else {
-                    (entry_px - low[i], high[i] - entry_px)
-                };
-                let fav_money = (fav / pip) * settings.pip_value_per_lot;
-                let adv_money = (adv / pip) * settings.pip_value_per_lot;
-                if fav_money > mfe_money {
-                    mfe_money = fav_money;
-                }
-                if adv_money > mae_money {
-                    mae_money = adv_money;
-                }
-            }
-            // Gap detection: force-exit on large market gap
-            if settings.gap_threshold_ms > 0 && i > 0 {
-                let ts_prev = timestamps[i - 1];
-                if ts > ts_prev && (ts - ts_prev) >= settings.gap_threshold_ms {
-                    let pnl = if in_pos == 1 {
-                        (close[i] - entry_px) / pip * settings.pip_value_per_lot
-                    } else {
-                        (entry_px - close[i]) / pip * settings.pip_value_per_lot
-                    };
-                    let pnl = pnl - settings.commission_per_trade - half_spread_cost;
-                    let entry_time = timestamps.get(entry_idx).copied().unwrap_or_default();
-                    let exit_time = ts;
-                    // Phase C.2: apply broker swap + conversion fee.
-                    let pnl = apply_carry_and_fee(pnl, in_pos, entry_time, exit_time, settings);
-                    let duration_hours = if exit_time >= entry_time {
-                        Some((exit_time - entry_time) as f64 / 3_600_000.0)
-                    } else {
-                        None
-                    };
-                    trades.push(Trade {
-                        entry_time,
-                        exit_time: Some(exit_time),
-                        pnl,
-                        pnl_pct: Some(pnl / initial_balance),
-                        duration_hours,
-                        mfe: mfe_money,
-                        mae: mae_money,
-                        r_multiple: pnl / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
-                    });
-                    in_pos = 0;
-                    continue;
-                }
-            }
-
-            let lo = low[i];
-            let hi = high[i];
-            let mut pnl = 0.0;
-            let mut exit = false;
-
-            // Session-Aware Trading: force exit before weekend
-            if ts > 0 && settings.kill_zones_enabled {
-                let sec_in_day = (ts / 1000) % 86400;
-                let hour = sec_in_day / 3600;
-                let days_since_epoch = ts / 86_400_000;
-                let weekday = (days_since_epoch + 4) % 7; // 0=Sun, 1=Mon, 5=Fri
-
-                if weekday == 5 && hour >= 20 {
-                    exit = true;
-                    pnl = if in_pos == 1 {
-                        (close[i] - entry_px) / pip * settings.pip_value_per_lot
-                    } else {
-                        (entry_px - close[i]) / pip * settings.pip_value_per_lot
-                    };
-                }
-            }
-
-            let bars_held = i as i64 - entry_idx as i64;
-            let past_min_hold =
-                settings.min_hold_bars == 0 || bars_held >= settings.min_hold_bars as i64;
-
-            if in_pos == 1 && !exit && past_min_hold {
-                let mut sl = entry_px - (pos_sl_pips * pip);
-                let tp = entry_px + (pos_tp_pips * pip);
-                // Apply only the trail locked in by PRIOR bars — NO intra-bar look-ahead
-                // (this bar's high must not move the stop its own low is checked against).
-                if settings.trailing_enabled && trail_px > 0.0 && trail_px > sl {
-                    sl = trail_px;
-                }
-                if lo <= sl {
-                    pnl = (sl - entry_px) / pip * settings.pip_value_per_lot;
-                    exit = true;
-                } else if hi >= tp {
-                    pnl = (tp - entry_px) / pip * settings.pip_value_per_lot;
-                    exit = true;
-                }
-                // AFTER the exit check: ratchet the trail up from THIS bar's high (next bar).
-                if !exit && settings.trailing_enabled {
-                    let mv = hi - entry_px;
-                    if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                        let locked = entry_px + settings.trailing_min_lock_pips * pip;
-                        let candidate = (hi
-                            - (settings.trailing_atr_multiplier * pos_sl_pips * pip))
-                            .max(locked);
-                        if trail_px == 0.0 || candidate > trail_px {
-                            trail_px = candidate;
-                        }
-                    }
-                }
-            } else if in_pos == -1 && !exit && past_min_hold {
-                let mut sl = entry_px + (pos_sl_pips * pip);
-                let tp = entry_px - (pos_tp_pips * pip);
-                if settings.trailing_enabled && trail_px > 0.0 && trail_px < sl {
-                    sl = trail_px;
-                }
-                if hi >= sl {
-                    pnl = (entry_px - sl) / pip * settings.pip_value_per_lot;
-                    exit = true;
-                } else if lo <= tp {
-                    pnl = (entry_px - tp) / pip * settings.pip_value_per_lot;
-                    exit = true;
-                }
-                // AFTER the exit check: ratchet the trail down from THIS bar's low (next bar).
-                if !exit && settings.trailing_enabled {
-                    let mv = entry_px - lo;
-                    if mv >= (settings.trailing_be_trigger_r * pos_sl_pips * pip) {
-                        let locked = entry_px - settings.trailing_min_lock_pips * pip;
-                        let candidate = (lo
-                            + (settings.trailing_atr_multiplier * pos_sl_pips * pip))
-                            .min(locked);
-                        if trail_px == 0.0 || candidate < trail_px {
-                            trail_px = candidate;
-                        }
-                    }
-                }
-            }
-
-            if !exit
-                && past_min_hold
-                && settings.max_hold_bars > 0
-                && (i - entry_idx) >= settings.max_hold_bars
-            {
-                pnl = if in_pos == 1 {
-                    (close[i] - entry_px) / pip * settings.pip_value_per_lot
-                } else {
-                    (entry_px - close[i]) / pip * settings.pip_value_per_lot
-                };
-                exit = true;
-            }
-
-            if exit {
-                pnl -= settings.commission_per_trade + half_spread_cost;
-                let entry_time = timestamps.get(entry_idx).copied().unwrap_or_default();
-                let exit_time = timestamps.get(i).copied().unwrap_or(entry_time);
-                // Phase C.2: apply broker swap + conversion fee.
-                let pnl = apply_carry_and_fee(pnl, in_pos, entry_time, exit_time, settings);
-                let duration_hours = if exit_time >= entry_time {
-                    Some((exit_time - entry_time) as f64 / 3_600_000.0)
-                } else {
-                    None
-                };
-                trades.push(Trade {
-                    entry_time,
-                    exit_time: Some(exit_time),
-                    pnl,
-                    pnl_pct: Some(pnl / initial_balance),
-                    duration_hours,
-                    mfe: mfe_money,
-                    mae: mae_money,
-                    r_multiple: pnl / (pos_sl_pips * settings.pip_value_per_lot).max(1e-9),
-                });
-                in_pos = 0;
-            }
-        } else if signals[i - 1] != 0 {
-            // Causal: act on the PRIOR bar's signal at THIS bar's close.
-            // Same intra-bar look-ahead fix as `fast_evaluate_strategy_core`.
-            // Kill zones: block entries
-            let mut block_entry = false;
-            if ts > 0 && settings.kill_zones_enabled {
-                let sec_in_day = (ts / 1000) % 86400;
-                let hour = sec_in_day / 3600;
-                let min = (sec_in_day % 3600) / 60;
-                let days_since_epoch = ts / 86_400_000;
-                let weekday = (days_since_epoch + 4) % 7;
-
-                let is_friday_kill = weekday == 5 && hour >= 20;
-                let is_monday_kill = weekday == 1 && hour == 0 && min < 30;
-                if is_friday_kill || is_monday_kill {
-                    block_entry = true;
-                }
-            }
-
-            // max_trades_per_day gate
-            if settings.max_trades_per_day > 0 && day_trade_count >= settings.max_trades_per_day {
-                block_entry = true;
-            }
-
-            if !block_entry {
-                let s = signals[i - 1];
-                // Adaptive stops: capture the ENTRY SL/TP from the signal bar
-                // (i-1), held for the trade's life; fixed path returns the scalar.
-                let (entry_sl, entry_tp) = entry_sl_tp_pips(settings, i - 1);
-                pos_sl_pips = entry_sl;
-                pos_tp_pips = entry_tp;
-                in_pos = s;
-                // Bug #1 fix: half-spread at entry
-                entry_px = close[i] + (s as f64) * half_spread_px;
-                entry_idx = i;
-                trail_px = 0.0;
-                mfe_money = 0.0;
-                mae_money = 0.0;
-                day_trade_count += 1;
-            }
-        }
-    }
-
+    evaluate_strategy_with_ledger_core::<true>(
+        &close[..n],
+        &high[..n],
+        &low[..n],
+        &signals[..n],
+        &[],
+        &[],
+        &days,
+        &timestamps[..n],
+        settings,
+        &mut trades,
+        None,
+    );
     trades
+}
+
+/// Validate the confidence lane before an account-risk replay. An omitted or
+/// short lane must never silently turn risk sizing into one-lot or max-risk
+/// sizing. Zero confidence is a valid threshold crossing at the minimum risk.
+pub(crate) fn validate_sizing_confidences(
+    bars: usize,
+    confidences: &[f64],
+    settings: &BacktestSettings,
+) -> anyhow::Result<()> {
+    neoethos_core::research_conversion_fee::validate_conversion_fee_rate_v1(
+        settings.pnl_conversion_fee_rate,
+    )
+    .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        settings.initial_equity().is_finite() && settings.initial_equity() > 0.0,
+        "account-risk replay initial equity must be finite and positive"
+    );
+    if (!confidences.is_empty() || settings.risk_based_sizing) && confidences.len() != bars {
+        anyhow::bail!(
+            "account-risk replay confidence length {} must match {bars} bars (risk_based_sizing={})",
+            confidences.len(),
+            settings.risk_based_sizing
+        );
+    }
+    if confidences
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        anyhow::bail!("account-risk replay confidences must be finite fractions in [0, 1]");
+    }
+    if settings.risk_based_sizing
+        && (!settings.risk_per_trade_min.is_finite()
+            || !settings.risk_per_trade_max.is_finite()
+            || settings.risk_per_trade_min < 0.0
+            || settings.risk_per_trade_max < settings.risk_per_trade_min
+            || settings.risk_per_trade_max > 1.0
+            || !settings.high_quality_confidence.is_finite()
+            || !(0.0..=1.0).contains(&settings.high_quality_confidence)
+            || settings.high_quality_confidence == 0.0)
+    {
+        anyhow::bail!(
+            "account-risk replay requires ordered finite risk fractions and a positive confidence normalizer"
+        );
+    }
+    Ok(())
+}
+
+/// One replay returns both the metrics and the actual entry-sized trades.
+/// Consumers cannot accidentally combine risk-sized metrics with a fixed-lot
+/// ledger, and walk-forward does not have to simulate every window twice.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    signals: &[i8],
+    confidences: &[f64],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    timestamps: &[i64],
+    settings: &BacktestSettings,
+) -> anyhow::Result<([f64; 11], Vec<Trade>)> {
+    let bars = close.len();
+    if high.len() != bars
+        || low.len() != bars
+        || signals.len() != bars
+        || timestamps.len() != bars
+        || day_idx.len() != bars
+        || (!month_idx.is_empty() && month_idx.len() != bars)
+    {
+        anyhow::bail!(
+            "account-risk replay length mismatch across OHLC, signals, calendar and timestamp arrays"
+        );
+    }
+    validate_sizing_confidences(bars, confidences, settings)?;
+    let mut trades = Vec::new();
+    let metrics = evaluate_strategy_with_ledger_core::<true>(
+        close,
+        high,
+        low,
+        signals,
+        confidences,
+        month_idx,
+        day_idx,
+        timestamps,
+        settings,
+        &mut trades,
+        None,
+    );
+    Ok((metrics, trades))
+}
+
+/// Account-risk ledger using the same prior-bar confidence, captured entry
+/// lots, compounding, stops and costs as CPU population fitness. Fixed-lot
+/// settings are supported explicitly; an enabled risk policy requires the
+/// complete confidence series rather than an implicit one-lot fallback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_trades_with_confidence_core(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    timestamps: &[i64],
+    signals: &[i8],
+    confidences: &[f64],
+    settings: &BacktestSettings,
+) -> anyhow::Result<Vec<Trade>> {
+    let days = timestamps
+        .iter()
+        .map(|ts| ts.div_euclid(86_400_000))
+        .collect::<Vec<_>>();
+    evaluate_strategy_with_confidence_and_ledger_core(
+        close,
+        high,
+        low,
+        signals,
+        confidences,
+        &[],
+        &days,
+        timestamps,
+        settings,
+    )
+    .map(|(_, trades)| trades)
+}
+
+/// Configured weekend policy, not a universal assumption about FX sessions.
+/// Intrabar SL/TP/trailing barriers always precede a close-of-bar session exit.
+fn weekend_session_policy(timestamp_ms: i64, enabled: bool) -> (bool, bool) {
+    if !enabled || timestamp_ms <= 0 {
+        return (false, false);
+    }
+    let minutes = timestamp_ms.div_euclid(60_000).rem_euclid(1_440);
+    let weekday = (timestamp_ms.div_euclid(86_400_000) + 4).rem_euclid(7);
+    let friday = weekday == 5 && minutes >= 20 * 60;
+    let monday = weekday == 1 && minutes < 30;
+    (friday, friday || monday)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_closed_cpu_trade(
+    trades: &mut Vec<Trade>,
+    entry_time: i64,
+    exit_time: i64,
+    pnl: f64,
+    initial_balance: f64,
+    initial_risk: f64,
+    mfe: f64,
+    mae: f64,
+) {
+    trades.push(Trade {
+        entry_time,
+        exit_time: Some(exit_time),
+        pnl,
+        pnl_pct: Some(pnl / initial_balance),
+        duration_hours: (exit_time >= entry_time)
+            .then_some((exit_time - entry_time) as f64 / 3_600_000.0),
+        mfe,
+        mae,
+        r_multiple: pnl / initial_risk.max(1e-9),
+    });
 }
 
 /// Public broker-real trade simulation boundary. The raw OHLC/cost simulator
@@ -1804,7 +1876,7 @@ pub fn simulate_trades_broker_real(
 /// and emitted only for bars that survive SMC gating (i.e. where the final
 /// signal is non-zero), so it aligns exactly with the signals slice.
 #[allow(clippy::too_many_arguments)]
-fn synthesize_signals_and_confidence_cpu(
+pub(crate) fn synthesize_signals_and_confidence_cpu(
     indicators: ArrayView2<'_, f64>,
     gene_offsets: &[i32],
     gene_indices: &[i32],
@@ -1904,24 +1976,10 @@ fn synthesize_signals_and_confidence_cpu(
     (signals, confidences)
 }
 
-/// GPU device ids the scheduler pinned for THIS process.
-///
-/// 2026-08-10: always empty. This used to parse the plural
-/// `NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICES` / `..._CUDA_DEVICES` ("0,1,2,3").
-/// Its own doc admitted the scheduler deliberately never set it because the
-/// CubeCL multi-device path is unstable — an experimental manual override on
-/// an unstable path, reachable only by export, recorded nowhere. The supported
-/// multi-GPU route is the per-lane `device_override` argument, which is what
-/// every caller already passes.
-#[cfg(feature = "gpu")]
-fn eval_gpu_devices() -> Vec<usize> {
-    Vec::new()
-}
-
 /// The largest population worth submitting to [`validation_backtest_population`]
 /// in ONE call, derived from the card's free memory — or `None` when no card
-/// will take the work (no device, kernels disabled, integrated-only, or the
-/// build has no native engine).
+/// will take the work (no device, kernels disabled, or the build has no native
+/// engine).
 ///
 /// This is the batching/search separation made callable. A SUBMISSION size is
 /// free to change: genes are independent, chunk boundaries do not appear in any
@@ -1936,10 +1994,7 @@ pub fn gpu_submission_ceiling(bars: usize, feature_count: usize) -> Option<usize
     // Same gate as the dispatch path below: when the gate is closed every
     // population runs on the CPU, where chunk size only bounds host memory —
     // report None so callers keep their conservative constants.
-    if !cuda_eval_signal_kernel_enabled()
-        || !cuda_eval_backtest_kernel_enabled()
-        || integrated_gpu_eval_disabled()
-    {
+    if !cuda_eval_signal_kernel_enabled() || !cuda_eval_backtest_kernel_enabled() {
         return None;
     }
     #[cfg(feature = "gpu-b-adapter")]
@@ -1981,11 +2036,8 @@ pub fn gpu_submission_ceiling(_bars: usize, _feature_count: usize) -> Option<usi
 ///
 /// The field is documented as optional: an empty slice means every gene uses
 /// its fixed stops. The CPU walk honours that with `.get(g).unwrap_or(0.0)`,
-/// but the GPU dispatch slices it per batch and panics on an empty input. That
-/// panic is caught and retried on the CPU, so the violation surfaced as a
-/// *silent fallback* — a GPU-required run quietly producing CPU numbers, and a
-/// CPU/GPU parity test comparing the CPU against itself and passing. Both lanes
-/// must see identical input, so normalise once at every entry point.
+/// while the CUDA dispatch slices it per batch. Both lanes must see identical
+/// input, so normalise once at every entry point.
 pub(crate) fn normalized_stop_vol_mult(stop_vol_mult: &[f64], n_genes: usize) -> Option<Vec<f64>> {
     stop_vol_mult.is_empty().then(|| vec![0.0; n_genes])
 }
@@ -2043,23 +2095,6 @@ mod native_population_outcome_contract_tests {
     }
 }
 
-/// Is a usable CUDA card + the native f64 prototype-B lane present? The ONLY
-/// true hardware check. False on builds without prototype B (Vulkan/ROCm/CPU),
-/// so the GPU-mandatory guards below compile to nothing there and those builds
-/// keep their existing CPU behaviour.
-#[cfg(feature = "gpu")]
-#[inline]
-fn prototype_b_card_present() -> bool {
-    #[cfg(feature = "gpu-b-adapter")]
-    {
-        crate::gpu_native::prototype_b_population_eval::prototype_b_available()
-    }
-    #[cfg(not(feature = "gpu-b-adapter"))]
-    {
-        false
-    }
-}
-
 /// Production route for the native CUDA engine.
 ///
 /// `gpu-b-adapter` type-checks this control flow against the honest no-device
@@ -2071,7 +2106,7 @@ fn prototype_b_card_present() -> bool {
 #[cfg(feature = "gpu-b-adapter")]
 fn evaluate_population_b_when_available(
     inputs: &PopulationEvalInputs<'_>,
-    evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
     lane: &'static str,
 ) -> Result<Option<Vec<[f64; 11]>>, String> {
     let expected = inputs.long_thr.len();
@@ -2079,11 +2114,6 @@ fn evaluate_population_b_when_available(
         return Ok(Some(Vec::new()));
     }
 
-    let evidence = evidence.ok_or_else(|| {
-        format!(
-            "Prototype B native {lane} requires sealed exact population evidence; refusing detached caller buffers"
-        )
-    })?;
     if evidence.require_cpu_route_receipt_v1().is_ok() {
         return Ok(None);
     }
@@ -2153,8 +2183,7 @@ fn evaluate_population_core_unchecked(
     })?;
     let cpu_route = evidence.require_cpu_route_receipt_v1().is_ok();
     #[cfg(feature = "gpu-b-adapter")]
-    if let Some(rows) =
-        evaluate_population_b_when_available(&inputs, Some(evidence), "population_eval")?
+    if let Some(rows) = evaluate_population_b_when_available(&inputs, evidence, "population_eval")?
     {
         return Ok(rows);
     }
@@ -2186,14 +2215,13 @@ fn evaluate_population_core_unchecked(
         weights,
         settings,
     } = inputs;
-    init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
     let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
     let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
 
-    // Per-gene CPU evaluation (signal synthesis + SL/TP backtest). Shared by
-    // the full-CPU path and the CPU lane of the CPU+GPU hybrid below.
+    // Per-gene CPU evaluation (signal synthesis + SL/TP backtest), reachable
+    // only under the sealed exact-zero-device CPU receipt.
     let eval_gene_cpu = |g: usize| -> [f64; 11] {
         let (signals, confidences) = synthesize_signals_and_confidence_cpu(
             indicators,
@@ -2230,152 +2258,6 @@ fn evaluate_population_core_unchecked(
         )
     };
 
-    // ── Where the population is evaluated ─────────────────────────────────
-    //
-    // A card is present or it is not. There is no third state, and in
-    // particular no per-gene split between the two: that split existed here
-    // until 2026-07-29 and its real effect was to produce a state nobody
-    // designed — a run that put *nothing* on the card while looking exactly
-    // like a healthy one, only slower. A EURUSD M3 discovery spent 10 h 24 m of
-    // its 10 h 44 m on CPU cores that way, and the decision point logged
-    // nothing at all, so it took sampling `nvidia-smi` to notice.
-    //
-    // So: GPU present → the whole population goes to the GPU, and a failure is
-    // returned as an error rather than quietly recomputed on the CPU. No GPU →
-    // the CPU path below. Both outcomes are logged, because "it ran on the
-    // card" has to be a record rather than an inference.
-    #[cfg(feature = "gpu")]
-    {
-        // Phase 2 (2026-06-06): GPU lane ENABLED — the cubecl kernel now ports
-        // confidence-scaled risk-based sizing + slot-7 monthly_target_hit_rate,
-        // verified CPU==GPU within tolerance by `gpu_population_eval_matches_cpu`
-        // on a real RTX A6000 (Vulkan). Was `false` while the kernel was
-        // fixed-1-lot (would have corrupted fitness).
-        const PHASE1_GPU_SIZING_PORTED: bool = true;
-        // Adaptive per-entry stops are now ported to the cubecl backtest kernel
-        // (base series + per-gene multiplier uploaded, per-entry capture, proven
-        // bit-parity with the CPU by the `..._adaptive_stops` parity test), so
-        // adaptive genes run on the GPU lane exactly like fixed ones — the old
-        // adaptive→CPU fail-safe is no longer needed.
-        // Report each condition separately, once. Two runs of over an hour each
-        // ended with the card at 0 % and no message explaining why, because a
-        // collapsed `&&` chain says nothing about which term was false. Naming
-        // them individually turns "the GPU did not run" into "this specific
-        // condition was false", which is the difference between a diagnosis and
-        // another hour of guessing.
-        {
-            static LOGGED: std::sync::Once = std::sync::Once::new();
-            LOGGED.call_once(|| {
-                tracing::info!(
-                    target: "neoethos_search::eval",
-                    sizing_ported = PHASE1_GPU_SIZING_PORTED,
-                    signal_kernel = cuda_eval_signal_kernel_enabled(),
-                    backtest_kernel = cuda_eval_backtest_kernel_enabled(),
-                    integrated_gpu_disabled = integrated_gpu_eval_disabled(),
-                    n_genes,
-                    n_samples,
-                    "population evaluation lane gate"
-                );
-            });
-        }
-        if !cpu_route
-            && PHASE1_GPU_SIZING_PORTED
-            && cuda_eval_signal_kernel_enabled()
-            && cuda_eval_backtest_kernel_enabled()
-            // An integrated / shared-memory GPU is a net loss for this eval
-            // (kernel ~0.09 ms but ~1 s per-call upload/readback over the shared
-            // bus) — skip the GPU lane and run pure-CPU. Override with
-            // NEOETHOS_BOT_SEARCH_USE_IGPU=1. See `integrated_gpu_eval_disabled`.
-            && !integrated_gpu_eval_disabled()
-            // A card is present: send even small (<4-gene) elite/tail batches to
-            // the GPU (a small launch is cheap and correct) instead of the
-            // silent CPU tail below. The >=4 floor stays for card-less builds.
-            && (n_genes >= 4 || prototype_b_card_present())
-        {
-            let devices = eval_gpu_devices();
-
-            // ── The whole population goes to the card ─────────────────────────
-            //
-            // A 2026-07-28 EURUSD M3 discovery measured the case for this
-            // directly: the GA spent 10 h 24 m on 128 CPU cores, while the
-            // validation tail — 15 walk-forward splits plus 28 CPCV combinations
-            // over the full series, not a lighter workload — took about 20
-            // minutes on the card at 100 % utilisation. The GA is ~97 % of the
-            // runtime and never touched the GPU, because the split below decides
-            // per-gene shares instead of sending the population to the device.
-            //
-            // Splitting also hid the problem for hours: a run that puts nothing
-            // on the card looks identical to a healthy one, only slower, and the
-            // decision point logged nothing. Hence the log line on both
-            // outcomes — "it ran on the GPU" must be a record, not an inference.
-            // Name the lane so the launches below file under the GA rather than
-            // merging with the validation tail's. The two call the shared
-            // prototype-B adapter with byte-identical argument lists — the very
-            // property that let a kernel speed-up be credited to the wrong one
-            // of them — so the caller has to say which it is.
-            let _lane = crate::eval_telemetry::LaneScope::enter("population_eval");
-            let started = std::time::Instant::now();
-            match try_evaluate_population_cuda(
-                close,
-                high,
-                low,
-                indicators,
-                gene_offsets,
-                gene_indices,
-                gene_weights,
-                long_thr,
-                short_thr,
-                month_idx,
-                day_idx,
-                timestamps,
-                sl_pips,
-                tp_pips,
-                stop_vol_mult,
-                smc_data,
-                gene_smc_flags,
-                gate_threshold,
-                weights,
-                settings,
-                devices.first().copied(),
-            ) {
-                Ok(rows) if rows.len() == n_genes => {
-                    // INFO, not DEBUG: the app installs its own subscriber, so a
-                    // debug line here is invisible no matter what RUST_LOG says —
-                    // which defeated the entire point of logging the decision.
-                    // Logged once per process; the GA calls this every generation.
-                    static LOGGED: std::sync::Once = std::sync::Once::new();
-                    LOGGED.call_once(|| {
-                        tracing::info!(
-                            target: "neoethos_search::eval",
-                            n_genes,
-                            n_samples,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            "population evaluated on the GPU (whole population, no CPU lane)"
-                        );
-                    });
-                    crate::eval_telemetry::record_device(
-                        "population_eval",
-                        crate::eval_telemetry::Device::Gpu,
-                        started.elapsed(),
-                    );
-                    return Ok(rows);
-                }
-                Ok(rows) => {
-                    return Err(format!(
-                        "GPU returned {} metric rows for {n_genes} candidates. Refusing to                          substitute CPU results: silent substitution is exactly what made a                          run that never touched the card look identical to a healthy one.",
-                        rows.len()
-                    ));
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "GPU population evaluation failed on device {:?}: {error}. Refusing to                          fall back to the CPU — a card is present, so this is a fault to fix,                          not to work around.",
-                        devices.first()
-                    ));
-                }
-            }
-        }
-    }
-
     // The only legal CPU branch is the exact-zero-device route sealed before
     // this evaluation. Backend configuration cannot grant or block it.
     evidence
@@ -2405,41 +2287,17 @@ fn evaluate_population_core_unchecked(
 pub(crate) fn evaluate_population_core_test_oracle(
     inputs: PopulationEvalInputs<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
-    evaluate_population_core_unchecked(inputs, None)
+    Ok(validation_backtest_population_cpu(inputs))
 }
 
-/// AREA 2 / Stage A (2026-06-09) — shared GPU-try + CPU-fallback entry for the
-/// **validation tail** (the post-search Monte-Carlo / re-evaluation screens that
-/// today run 100% on CPU). It takes the EXACT same [`PopulationEvalInputs`] shape
-/// the GA search builds (CSR gene arrays + per-gene sl/tp/smc_flags + shared
-/// per-sample close/high/low/indicators/month/day/timestamps + settings) and
-/// returns the SAME `Vec<[f64; 11]>` per-gene metric layout as
-/// [`evaluate_population_core`].
-///
-/// Unlike `evaluate_population_core` (which CPU+GPU *splits* a single population),
-/// this routes the WHOLE population through the GPU kernel in one launch, then
-/// falls back to a full-CPU re-evaluation on any failure. It is the first
-/// validation consumer of the GPU population kernel: a Monte-Carlo screen builds
-/// `mc_runs` perturbed genes and asks "how many are profitable?", which is a
-/// population eval — identical shape to a GA generation, no kernel change.
-///
-/// Fallback semantics MIRROR the GA hybrid's own fallback
-/// (`evaluate_population_core`, the `match gpu_outcome` arms): a wrong gene count,
-/// an `Err`, or a cubecl pool panic (#243 — cubecl 0.10 has no Result-returning
-/// launch, so a pool exhaustion *panics*; the release profile is `panic="unwind"`,
-/// Cargo.toml, so `catch_unwind` is meaningful) all `tracing::warn!` and fall
-/// through to the exact `eval_gene_cpu` closure used by `evaluate_population_core`.
-/// This keeps the never-OOM invariant: a GPU failure becomes a slow-but-correct
-/// CPU recompute, never a crash.
-///
-/// Determinism note: both GPU and CPU lanes are f64. Callers that consume only
-/// the SIGN of a metric (e.g. the MC profitable-run COUNT, which tests
-/// `metrics[0] > 0.0`) still treat an exact zero as the no-profit boundary; the
-/// parity test `gpu_montecarlo_batch_matches_cpu` pins the result to ±1 run.
+/// Strict validation-tail population route. A sealed CUDA receipt dispatches
+/// the whole population to native Prototype B; a sealed exact-zero-device
+/// receipt uses the canonical CPU evaluator. Device errors, panics, and result
+/// shape mismatches fail closed and never authorize CPU substitution.
 #[cfg(feature = "gpu")]
 fn validation_backtest_population_inner(
     inputs: PopulationEvalInputs<'_>,
-    evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
 ) -> Vec<[f64; 11]> {
     // Reports itself on first call, so "never used" is visible rather
     // than inferred. See `eval_telemetry`.
@@ -2456,15 +2314,10 @@ fn validation_backtest_population_inner(
         _telemetry_items,
         _telemetry_started,
     );
-    let evidence = evidence.unwrap_or_else(|| {
-        panic!(
-            "validation population requires a run-bound sealed device route; refusing detached execution"
-        )
-    });
     let cpu_route = evidence.require_cpu_route_receipt_v1().is_ok();
     #[cfg(feature = "gpu-b-adapter")]
     if !cpu_route {
-        match evaluate_population_b_when_available(&inputs, Some(evidence), "validation_eval") {
+        match evaluate_population_b_when_available(&inputs, evidence, "validation_eval") {
             Ok(Some(rows)) => return rows,
             Ok(None) => panic!("sealed native validation route resolved as CPU"),
             Err(error) => panic!("strict native validation failed: {error}"),
@@ -2496,7 +2349,6 @@ fn validation_backtest_population_inner(
         weights,
         settings,
     } = inputs;
-    init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
     let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
@@ -2505,10 +2357,8 @@ fn validation_backtest_population_inner(
         return Vec::new();
     }
 
-    // Per-gene CPU fallback — lifted VERBATIM from `evaluate_population_core` so
-    // the CSR signal-synth + SL/TP backtest is the SINGLE source of truth shared
-    // with the GA. (Kept as a local closure rather than a free fn because it
-    // closes over the borrowed input slices.)
+    // Canonical per-gene CPU route, shared mathematically with the GA. It is a
+    // local closure because it borrows the input slices.
     let eval_gene_cpu = |g: usize| -> [f64; 11] {
         let (signals, confidences) = synthesize_signals_and_confidence_cpu(
             indicators,
@@ -2543,166 +2393,6 @@ fn validation_backtest_population_inner(
         )
     };
 
-    // Respect the same env kill-switches the GA hybrid honours: if a kernel is
-    // disabled, go straight to CPU. Adaptive per-entry stops are now computed by
-    // the cubecl kernel (bit-parity proven), so an adaptive population no longer
-    // needs to be forced onto the CPU lane.
-    //
-    // The integrated-GPU gate belongs here too, and its absence was a real
-    // crash: a 2026-07-28 AUDUSD H1 discovery (88 032 bars) died with
-    // `wgpu error: Out of Memory` after ~9 minutes. The GA lane had correctly
-    // logged "discovery GPU lane SKIPPED — only an integrated/shared-memory GPU
-    // is present" and run on the CPU, but this validation lane never consulted
-    // that gate, so the Monte-Carlo screen kept dispatching populations to the
-    // iGPU's tiny device-local heap until one exhausted it.
-    //
-    // The `catch_unwind` below cannot save it: wgpu reports allocation failure
-    // as a *fatal* error on its own internal thread, which unwinds that thread
-    // rather than the caller. A guard that keeps the work off the device is the
-    // only thing that holds the never-OOM invariant — peak memory must be a
-    // function of the available hardware, and a run may be slow but must not
-    // crash.
-    // Report the verdict once. When this gate is false the code below is never
-    // reached, so the card is skipped WITHOUT a single line in the log — the
-    // failure mode that hid `prop_search_device: cpu` for eight months. A
-    // measured run had 770 500 of 778 205 validation items on the CPU with
-    // nothing said about why; whichever branch is responsible, it now says so.
-    let signal_ok = cuda_eval_signal_kernel_enabled();
-    let backtest_ok = cuda_eval_backtest_kernel_enabled();
-    let integrated = integrated_gpu_eval_disabled();
-    static GATE_REPORTED: std::sync::Once = std::sync::Once::new();
-    GATE_REPORTED.call_once(|| {
-        if signal_ok && backtest_ok && !integrated {
-            tracing::info!(
-                target: "neoethos_search::eval",
-                "validation GPU gate OPEN — populations dispatch to the card"
-            );
-        } else {
-            tracing::warn!(
-                target: "neoethos_search::eval",
-                signal_kernel_enabled = signal_ok,
-                backtest_kernel_enabled = backtest_ok,
-                integrated_gpu_skip = integrated,
-                "validation GPU gate CLOSED — every population runs on the CPU"
-            );
-        }
-    });
-    if !cpu_route && signal_ok && backtest_ok && !integrated {
-        // See the twin in `evaluate_population_core`: the shared adapter cannot
-        // tell these two callers apart on its own.
-        let _lane = crate::eval_telemetry::LaneScope::enter("validation_eval");
-        let gpu_started = std::time::Instant::now();
-        #[cfg(not(feature = "gpu-b-adapter"))]
-        let device_override = eval_gpu_devices().first().copied();
-        // catch_unwind is the ONLY mitigation for cubecl #243 pool-panics
-        // (no Result-returning launch in cubecl 0.10). `AssertUnwindSafe` is
-        // sound here: on a panic we discard every partial GPU result and
-        // recompute the WHOLE population on the CPU, so no observer sees a
-        // torn intermediate.
-        // Prototype B, the same engine the GA uses.
-        //
-        // Validation went through the cubecl path while the GA went through
-        // prototype B, and the two were never compared because nothing measured
-        // them together. Prototype B is now the one that decides exits in the
-        // reduce, needs no event buffer, and evaluates a population 8.7x faster
-        // with P&L parity against the CPU proven on a real card.
-        //
-        // The split mattered more than it looks: validation is 99.9 % of a run
-        // — 1 231 s of which the GA is 1.2 s — so every kernel improvement so
-        // far applied to a tenth of a percent of the work. The argument lists
-        // are identical, which is why this had gone unnoticed.
-        // `gpu-cuda` links prototype B, so call it directly — that is the
-        // routing 3e72c380 landed. But `gpu-vulkan` and `gpu-rocm` enable `gpu`
-        // WITHOUT `gpu-b-adapter`, and the module below is gated on it
-        // (gpu_native/mod.rs:17-18), so naming it unconditionally inside a
-        // `gpu`-only function made both of those builds fail to compile:
-        //   error[E0433]: cannot find `prototype_b_population_eval` in `gpu_native`
-        // CI builds and parity-tests exactly those two (ci.yml:205/210/248), so
-        // this was a red pipeline, not a theoretical gap. Found by two
-        // independent reviews that ran the check rather than reading the code.
-        //
-        // The argument lists are identical — the same property that let the
-        // original split hide — so the non-CUDA arm is a swap, not a rewrite.
-        // On `gpu-cuda` nothing changes: the direct call is preserved verbatim.
-        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            #[cfg(feature = "gpu-b-adapter")]
-            {
-                evidence.require_exact_cuda_device_ordinal_v1()?;
-                crate::gpu_native::prototype_b_population_eval::try_evaluate_population_b(
-                    evidence,
-                    gene_offsets,
-                    gene_indices,
-                    gene_weights,
-                    long_thr,
-                    short_thr,
-                    sl_pips,
-                    tp_pips,
-                    stop_vol_mult,
-                    gene_smc_flags,
-                    gate_threshold,
-                    weights,
-                )
-            }
-            #[cfg(not(feature = "gpu-b-adapter"))]
-            {
-                crate::cubecl_eval::try_evaluate_population_cuda(
-                    close,
-                    high,
-                    low,
-                    indicators,
-                    gene_offsets,
-                    gene_indices,
-                    gene_weights,
-                    long_thr,
-                    short_thr,
-                    month_idx,
-                    day_idx,
-                    timestamps,
-                    sl_pips,
-                    tp_pips,
-                    stop_vol_mult,
-                    smc_data,
-                    gene_smc_flags,
-                    gate_threshold,
-                    weights,
-                    settings,
-                    device_override,
-                )
-            }
-        }));
-        // 2026-08-11: two further `let gpu = catch_unwind(...)` blocks stood
-        // here, both `cfg(not(gpu-b-adapter))`, both calling the very same
-        // `cubecl_eval::try_evaluate_population_cuda` as the arm above — the
-        // second of them byte-identical to it. `catch_unwind` RUNS its closure,
-        // so on `gpu-vulkan`, `gpu-rocm` and plain `gpu` the entire population
-        // was evaluated THREE times per call and the first two results were
-        // shadowed away unread. `gpu_started` is taken before all three, so the
-        // `record_device("validation_eval", Gpu, ...)` figure those lanes
-        // reported was ~3x the real GPU time — and validation is ~94% of a run,
-        // so this was the dominant cost, tripled and mismeasured at once.
-        // `gpu-cuda` was never affected: the adapter arm cfg'd all of it out.
-        // The compiler said so plainly — `unused variable: gpu`, twice — but
-        // only a per-feature check ever compiled this lane to hear it.
-        match gpu {
-            Ok(Ok(v)) if v.len() == n_genes => {
-                crate::eval_telemetry::record_device(
-                    "validation_eval",
-                    crate::eval_telemetry::Device::Gpu,
-                    gpu_started.elapsed(),
-                );
-                return v;
-            }
-            Ok(Ok(rows)) => panic!(
-                "strict validation GPU returned {} metric rows for {n_genes}; refusing CPU substitution",
-                rows.len()
-            ),
-            Ok(Err(error)) => {
-                panic!("strict validation GPU failed: {error:#}; refusing CPU substitution")
-            }
-            Err(_) => panic!("strict validation GPU panicked; refusing CPU substitution"),
-        }
-    }
-
     // Canonical CPU execution exists only under the sealed exact-zero-device
     // receipt checked above; it is not a recovery action after native failure.
     evidence
@@ -2726,16 +2416,11 @@ fn validation_backtest_population_inner(
 }
 
 #[cfg(feature = "gpu")]
-pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
-    validation_backtest_population_inner(inputs, None)
-}
-
-#[cfg(feature = "gpu")]
 pub(crate) fn validation_backtest_population_with_evidence(
     inputs: PopulationEvalInputs<'_>,
     evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
 ) -> Vec<[f64; 11]> {
-    validation_backtest_population_inner(inputs, Some(evidence))
+    validation_backtest_population_inner(inputs, evidence)
 }
 
 /// Pure-CPU population evaluation — the canonical semantic reference for the
@@ -2748,6 +2433,39 @@ pub(crate) fn validation_backtest_population_with_evidence(
 pub(crate) fn validation_backtest_population_cpu(
     inputs: PopulationEvalInputs<'_>,
 ) -> Vec<[f64; 11]> {
+    validation_backtest_population_cpu_core::<false>(inputs)
+        .expect("metrics-only population retains the existing infallible contract")
+        .into_iter()
+        .map(|(metrics, _)| metrics)
+        .collect()
+}
+
+/// Same CPU population simulator with its actual account-risk ledger retained.
+/// The receipt is checked before execution; a native route cannot enter here.
+pub(crate) fn validation_backtest_population_with_ledger_cpu(
+    inputs: PopulationEvalInputs<'_>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
+) -> anyhow::Result<(Vec<[f64; 11]>, Vec<Vec<Trade>>)> {
+    evidence.require_cpu_route_receipt_v1()?;
+    let expected = inputs.long_thr.len();
+    let started = std::time::Instant::now();
+    let rows = validation_backtest_population_cpu_core::<true>(inputs)?;
+    evidence.record_successful_population(
+        crate::engine_identity::PopulationEvalEngine::Cpu,
+        expected,
+        rows.len(),
+    )?;
+    crate::eval_telemetry::record_device(
+        "validation_eval",
+        crate::eval_telemetry::Device::Cpu,
+        started.elapsed(),
+    );
+    Ok(rows.into_iter().unzip())
+}
+
+fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
+    inputs: PopulationEvalInputs<'_>,
+) -> anyhow::Result<Vec<([f64; 11], Vec<Trade>)>> {
     // Reports itself on first call, so "never used" is visible rather
     // than inferred. See `eval_telemetry`.
     let _telemetry_started = std::time::Instant::now();
@@ -2785,15 +2503,14 @@ pub(crate) fn validation_backtest_population_cpu(
         weights,
         settings,
     } = inputs;
-    init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
     let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
     let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
     if n_genes == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let eval_gene_cpu = |g: usize| -> [f64; 11] {
+    let eval_gene_cpu = |g: usize| -> anyhow::Result<([f64; 11], Vec<Trade>)> {
         let (signals, confidences) = synthesize_signals_and_confidence_cpu(
             indicators,
             gene_offsets,
@@ -2814,17 +2531,34 @@ pub(crate) fn validation_backtest_population_cpu(
         // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
         // Pairs with the shared `adaptive_base_pips` on the cloned settings.
         gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
-        fast_evaluate_strategy_core(
-            close,
-            high,
-            low,
-            &signals,
-            &confidences,
-            month_idx,
-            day_idx,
-            timestamps,
-            &gene_settings,
-        )
+        if RECORD_TRADES {
+            evaluate_strategy_with_confidence_and_ledger_core(
+                close,
+                high,
+                low,
+                &signals,
+                &confidences,
+                month_idx,
+                day_idx,
+                timestamps,
+                &gene_settings,
+            )
+        } else {
+            Ok((
+                fast_evaluate_strategy_core(
+                    close,
+                    high,
+                    low,
+                    &signals,
+                    &confidences,
+                    month_idx,
+                    day_idx,
+                    timestamps,
+                    &gene_settings,
+                ),
+                Vec::new(),
+            ))
+        }
     };
     (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
 }
@@ -2834,18 +2568,12 @@ pub(crate) fn validation_backtest_population_cpu(
 /// reserved for a card-less host or an explicit CPU selection; an attempted
 /// device evaluation can only return rows or terminate with the error below.
 #[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
-fn validation_backtest_population_native_only(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
-    let _ = inputs;
-    panic!("native validation requires a run-bound sealed device route")
-}
-
-#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
 fn validation_backtest_population_native_only_with_evidence(
     inputs: PopulationEvalInputs<'_>,
     evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
 ) -> Vec<[f64; 11]> {
     let expected = inputs.long_thr.len();
-    match evaluate_population_b_when_available(&inputs, Some(evidence), "validation_eval") {
+    match evaluate_population_b_when_available(&inputs, evidence, "validation_eval") {
         Ok(Some(rows)) => rows,
         Ok(None) => {
             evidence
@@ -2866,25 +2594,11 @@ fn validation_backtest_population_native_only_with_evidence(
 }
 
 #[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
-pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
-    validation_backtest_population_native_only(inputs)
-}
-
-#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
 pub(crate) fn validation_backtest_population_with_evidence(
     inputs: PopulationEvalInputs<'_>,
     evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
 ) -> Vec<[f64; 11]> {
     validation_backtest_population_native_only_with_evidence(inputs, evidence)
-}
-
-/// CPU-only twin of [`validation_backtest_population`] for a build with no GPU
-/// engine. It runs the same canonical CPU reference used when a native build is
-/// card-less or was explicitly configured for the CPU.
-#[cfg(not(any(feature = "gpu", feature = "gpu-b-adapter")))]
-pub(crate) fn validation_backtest_population(inputs: PopulationEvalInputs<'_>) -> Vec<[f64; 11]> {
-    let _ = inputs;
-    panic!("CPU validation requires a run-bound sealed zero-device receipt")
 }
 
 #[cfg(not(any(feature = "gpu", feature = "gpu-b-adapter")))]
@@ -2911,11 +2625,8 @@ pub(crate) fn validation_backtest_population_with_evidence(
 
 /// The CPU mirror of a scenario work list.
 ///
-/// This is what makes the scenario lane safe to fall back from. A GPU failure in
-/// a run that asked for 17 400 device-perturbed Monte-Carlo scenarios must not
-/// quietly become 17 400 evaluations of the UNPERTURBED gene — every number
-/// downstream would still look plausible and the screen would be measuring
-/// nothing. So the mirror reproduces each scenario exactly:
+/// This is the canonical implementation for an explicitly sealed CPU route and
+/// the mathematical oracle for CUDA parity. It reproduces each scenario exactly:
 ///
 ///   * the gene named by `base_candidate_id`, sliced out of the shared CSR
 ///     arrays into a one-gene batch and run through the SAME
@@ -2933,8 +2644,7 @@ pub(crate) fn validation_backtest_population_with_evidence(
 /// replaces the whole per-bar resolution, so the mirror clears
 /// `session_spread_profile` as well as setting `spread_pips`. Leaving the
 /// profile in place would make the CPU charge a per-hour spread where the device
-/// charged a flat one, and only on the fallback path — the worst place for a
-/// divergence to hide.
+/// charged a flat one, creating a CPU/CUDA divergence.
 pub fn validation_backtest_scenarios_cpu(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
@@ -2971,7 +2681,6 @@ fn validation_backtest_scenarios_cpu_unchecked(
         weights,
         settings,
     } = inputs;
-    init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();
     if scenarios.is_empty() {
@@ -3088,23 +2797,16 @@ pub(crate) fn validation_backtest_scenarios_cpu_test_oracle(
 /// Monte-Carlo screen wanting 100 needed the genes cloned 100 times. This takes
 /// the work list directly: 174 genes and 17 574 scenarios in one submission.
 ///
-/// Fallback policy is the population twin's: a card-present failure is counted
-/// (`note_cpu_fallback`) and recomputed on the CPU through the mirror above,
-/// which reproduces the scenarios rather than ignoring them. An error from the
-/// mirror is returned rather than swallowed — there is no third thing to try,
-/// and a screen that cannot be computed must not report a number.
+/// Routing is strict: a sealed CUDA receipt uses native Prototype B and fails
+/// closed on any device error; a sealed exact-zero-device receipt uses the CPU
+/// mirror above. No runtime failure changes the selected engine.
 #[cfg(feature = "gpu")]
 fn validation_backtest_scenarios_inner(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
-    evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
 ) -> anyhow::Result<Vec<[f64; 11]>> {
     require_historical_evaluation_authority()?;
-    let evidence = evidence.ok_or_else(|| {
-        anyhow::anyhow!(
-            "validation scenarios require a run-bound sealed device route; refusing detached execution"
-        )
-    })?;
     let cpu_route = evidence.require_cpu_route_receipt_v1().is_ok();
     let n_scenarios = scenarios.len();
     if n_scenarios == 0 {
@@ -3146,85 +2848,6 @@ fn validation_backtest_scenarios_inner(
     if !cpu_route {
         anyhow::bail!("sealed native scenario route requires the compiled native CUDA adapter");
     }
-    let signal_ok = cuda_eval_signal_kernel_enabled();
-    let backtest_ok = cuda_eval_backtest_kernel_enabled();
-    let integrated = integrated_gpu_eval_disabled();
-
-    // The same once-per-process verdict the population twin reports. Without it
-    // a closed gate skips the card WITHOUT A LINE IN THE LOG, which is the
-    // failure mode that hid `prop_search_device: cpu` for eight months — and
-    // this lane is now 50.4 % of measured wall, so it is the worst place to be
-    // silent about it.
-    static SCENARIO_GATE_REPORTED: std::sync::Once = std::sync::Once::new();
-    SCENARIO_GATE_REPORTED.call_once(|| {
-        if signal_ok && backtest_ok && !integrated {
-            tracing::info!(
-                target: "neoethos_search::eval",
-                "validation GPU gate OPEN — scenario work lists dispatch to the card"
-            );
-        } else {
-            tracing::warn!(
-                target: "neoethos_search::eval",
-                signal_kernel_enabled = signal_ok,
-                backtest_kernel_enabled = backtest_ok,
-                integrated_gpu_skip = integrated,
-                "validation GPU gate CLOSED — every scenario work list runs on the CPU"
-            );
-        }
-    });
-
-    // The scenario lane exists only on Prototype B. The cubecl lane has no
-    // notion of a descriptor — it takes a gene array and one settings struct —
-    // so on a Vulkan/ROCm build this whole function is the CPU mirror. That is
-    // stated in a `cfg` rather than discovered at runtime, because a lane that
-    // silently degrades to a different computation is the defect this file has
-    // been repeatedly bitten by.
-    #[cfg(feature = "gpu-b-adapter")]
-    if !cpu_route && signal_ok && backtest_ok && !integrated {
-        let _lane = crate::eval_telemetry::LaneScope::enter("validation_eval");
-        let gpu_started = std::time::Instant::now();
-        evidence.require_exact_cuda_device_ordinal_v1()?;
-        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::gpu_native::prototype_b_population_eval::try_evaluate_scenarios_b(
-                evidence,
-                inputs.gene_offsets,
-                inputs.gene_indices,
-                inputs.gene_weights,
-                inputs.long_thr,
-                inputs.short_thr,
-                inputs.sl_pips,
-                inputs.tp_pips,
-                inputs.stop_vol_mult,
-                inputs.gene_smc_flags,
-                inputs.gate_threshold,
-                inputs.weights,
-                scenarios,
-            )
-        }));
-        match gpu {
-            Ok(Ok(rows)) if rows.len() == n_scenarios => {
-                crate::eval_telemetry::record_device(
-                    "validation_eval",
-                    crate::eval_telemetry::Device::Gpu,
-                    gpu_started.elapsed(),
-                );
-                return Ok(rows);
-            }
-            Ok(Ok(rows)) => anyhow::bail!(
-                "strict scenario GPU returned {} rows for {n_scenarios}; refusing CPU substitution",
-                rows.len()
-            ),
-            Ok(Err(error)) => {
-                anyhow::bail!("strict scenario GPU failed: {error:#}; refusing CPU substitution")
-            }
-            Err(_) => anyhow::bail!("strict scenario GPU panicked; refusing CPU substitution"),
-        }
-    }
-    #[cfg(not(feature = "gpu-b-adapter"))]
-    {
-        let _ = (signal_ok, backtest_ok, integrated);
-    }
-
     evidence.require_cpu_route_receipt_v1()?;
     let cpu_started = std::time::Instant::now();
     let out = validation_backtest_scenarios_cpu(inputs, scenarios);
@@ -3246,20 +2869,12 @@ fn validation_backtest_scenarios_inner(
 }
 
 #[cfg(feature = "gpu")]
-pub fn validation_backtest_scenarios(
-    inputs: PopulationEvalInputs<'_>,
-    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
-) -> anyhow::Result<Vec<[f64; 11]>> {
-    validation_backtest_scenarios_inner(inputs, scenarios, None)
-}
-
-#[cfg(feature = "gpu")]
 pub(crate) fn validation_backtest_scenarios_with_evidence(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
     evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
 ) -> anyhow::Result<Vec<[f64; 11]>> {
-    validation_backtest_scenarios_inner(inputs, scenarios, Some(evidence))
+    validation_backtest_scenarios_inner(inputs, scenarios, evidence)
 }
 
 /// Standalone Prototype-B adapter route without the generic CubeCL `gpu`
@@ -3271,14 +2886,9 @@ pub(crate) fn validation_backtest_scenarios_with_evidence(
 fn validation_backtest_scenarios_native_only(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
-    evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
 ) -> anyhow::Result<Vec<[f64; 11]>> {
     require_historical_evaluation_authority()?;
-    let evidence = evidence.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Prototype B scenarios require sealed exact population evidence; refusing detached caller buffers"
-        )
-    })?;
     let expected = scenarios.len();
     if expected == 0 {
         return Ok(Vec::new());
@@ -3334,30 +2944,12 @@ fn validation_backtest_scenarios_native_only(
 }
 
 #[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
-pub fn validation_backtest_scenarios(
-    _inputs: PopulationEvalInputs<'_>,
-    _scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
-) -> anyhow::Result<Vec<[f64; 11]>> {
-    anyhow::bail!("validation scenarios require a run-bound sealed device route")
-}
-
-#[cfg(all(feature = "gpu-b-adapter", not(feature = "gpu")))]
 pub(crate) fn validation_backtest_scenarios_with_evidence(
     inputs: PopulationEvalInputs<'_>,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
     evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
 ) -> anyhow::Result<Vec<[f64; 11]>> {
-    validation_backtest_scenarios_native_only(inputs, scenarios, Some(evidence))
-}
-
-/// CPU-only twin for a build with neither CubeCL nor the Prototype-B adapter.
-/// See [`validation_backtest_scenarios`].
-#[cfg(not(any(feature = "gpu", feature = "gpu-b-adapter")))]
-pub fn validation_backtest_scenarios(
-    _inputs: PopulationEvalInputs<'_>,
-    _scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
-) -> anyhow::Result<Vec<[f64; 11]>> {
-    anyhow::bail!("CPU validation scenarios require a run-bound sealed zero-device receipt")
+    validation_backtest_scenarios_native_only(inputs, scenarios, evidence)
 }
 
 #[cfg(not(any(feature = "gpu", feature = "gpu-b-adapter")))]
@@ -3580,11 +3172,10 @@ mod scenario_mirror_tests {
         );
     }
 
-    /// The fallback must evaluate the PERTURBED gene, not the gene.
+    /// The CPU mirror must evaluate the PERTURBED gene, not the base gene.
     ///
-    /// This is the property that makes the device Monte-Carlo lane safe to turn
-    /// on: a GPU failure mid-run recomputes the same perturbations rather than
-    /// silently reporting 100 copies of the unperturbed result.
+    /// This is the property that makes it an independent parity oracle rather
+    /// than 100 copies of the unperturbed result.
     #[test]
     fn a_perturbed_scenario_is_not_the_unperturbed_gene() {
         let (close, indicators, smc, months, settings) = fixture();
@@ -3853,7 +3444,7 @@ mod overrides_tests {
     // ─── Phase C.2 carry-cost + conversion-fee helper ────────────────
     //
     // These tests pin the math used by every trade-close branch of the
-    // CPU evaluator. All four sites call `apply_carry_and_fee` so a
+    // CPU evaluator. Both close branches call the size-aware helper, so a
     // regression here would corrupt every backtest's PnL.
 
     fn settings_with_carry(
@@ -3874,11 +3465,11 @@ mod overrides_tests {
     fn carry_fee_zero_zero_is_identity() {
         let s = settings_with_carry(0.0, 0.0, 0.0, 10.0);
         // Day-trade (entry == exit): no swap, no fee → gross.
-        assert!((apply_carry_and_fee(123.45, 1, 0, 0, &s) - 123.45).abs() < 1e-9);
+        assert!((apply_carry_and_fee(123.45, 123.45, 1, 0, 0, &s) - 123.45).abs() < 1e-9);
         // Long trade held 5 days, zero swap & fee → still gross.
         let entry = 1_700_000_000_000_i64;
         let exit = entry + 5 * 86_400_000;
-        assert!((apply_carry_and_fee(123.45, 1, entry, exit, &s) - 123.45).abs() < 1e-9);
+        assert!((apply_carry_and_fee(123.45, 123.45, 1, entry, exit, &s) - 123.45).abs() < 1e-9);
     }
 
     #[test]
@@ -3889,7 +3480,7 @@ mod overrides_tests {
         let s = settings_with_carry(-2.445, -0.105, 0.0, 10.0);
         let entry = 1_700_000_000_000_i64;
         let exit = entry + 5 * 86_400_000;
-        let net = apply_carry_and_fee(200.0, 1, entry, exit, &s);
+        let net = apply_carry_and_fee(200.0, 200.0, 1, entry, exit, &s);
         assert!((net - 77.75).abs() < 1e-6, "expected ~77.75, got {net}");
     }
 
@@ -3900,7 +3491,7 @@ mod overrides_tests {
         let s = settings_with_carry(-0.5, 0.4375, 0.0, 1.0);
         let entry = 1_700_000_000_000_i64;
         let exit = entry + 4 * 86_400_000;
-        let net = apply_carry_and_fee(10.0, -1, entry, exit, &s);
+        let net = apply_carry_and_fee(10.0, 10.0, -1, entry, exit, &s);
         assert!((net - 11.75).abs() < 1e-6, "expected ~11.75, got {net}");
     }
 
@@ -3910,16 +3501,15 @@ mod overrides_tests {
         let s = settings_with_carry(-1.0, -1.0, 0.0, 10.0);
         let entry = 1_700_000_000_000_i64;
         let exit = entry + 12 * 3_600_000;
-        let net = apply_carry_and_fee(50.0, 1, entry, exit, &s);
+        let net = apply_carry_and_fee(50.0, 50.0, 1, entry, exit, &s);
         assert!((net - 45.0).abs() < 1e-6, "expected ~45.0, got {net}");
     }
 
     #[test]
-    fn carry_fee_conversion_scales_after_swap() {
-        // Conversion fee 0.5% applied AFTER swap.
-        // No swap, fee = 0.005. Gross $100 → net $99.50.
+    fn carry_fee_conversion_debits_price_gross() {
+        // No swap/commission, fee = 0.005. Gross $100 → net $99.50.
         let s = settings_with_carry(0.0, 0.0, 0.005, 10.0);
-        let net = apply_carry_and_fee(100.0, 1, 0, 0, &s);
+        let net = apply_carry_and_fee(100.0, 100.0, 1, 0, 0, &s);
         assert!((net - 99.5).abs() < 1e-6, "expected 99.5, got {net}");
     }
 
@@ -3927,7 +3517,7 @@ mod overrides_tests {
     fn carry_fee_handles_missing_timestamps_as_day_trade() {
         // entry_ts = 0 means "no timestamp data": skip swap entirely.
         let s = settings_with_carry(-100.0, -100.0, 0.0, 10.0);
-        let net = apply_carry_and_fee(50.0, 1, 0, 1_700_000_000_000, &s);
+        let net = apply_carry_and_fee(50.0, 50.0, 1, 0, 1_700_000_000_000, &s);
         assert!(
             (net - 50.0).abs() < 1e-9,
             "expected 50.0 (no swap), got {net}"
@@ -3940,18 +3530,150 @@ mod overrides_tests {
         let s = settings_with_carry(-1.0, -1.0, 0.0, 10.0);
         let entry = 1_700_000_000_000_i64;
         let exit = entry - 86_400_000;
-        let net = apply_carry_and_fee(50.0, 1, entry, exit, &s);
+        let net = apply_carry_and_fee(50.0, 50.0, 1, entry, exit, &s);
         assert!((net - 50.0).abs() < 1e-9);
     }
 
     #[test]
     fn carry_fee_rejects_out_of_range_conversion_fee() {
-        // fee = 1.0 would wipe out PnL — reject and skip.
-        let s = settings_with_carry(0.0, 0.0, 1.0, 10.0);
-        assert!((apply_carry_and_fee(100.0, 1, 0, 0, &s) - 100.0).abs() < 1e-9);
-        // Negative fee also rejected.
-        let s = settings_with_carry(0.0, 0.0, -0.1, 10.0);
-        assert!((apply_carry_and_fee(100.0, 1, 0, 0, &s) - 100.0).abs() < 1e-9);
+        for rate in [1.0, -0.1, f64::NAN, f64::INFINITY] {
+            let s = settings_with_carry(0.0, 0.0, rate, 10.0);
+            assert!(
+                std::panic::catch_unwind(|| apply_carry_and_fee(100.0, 100.0, 1, 0, 0, &s))
+                    .is_err()
+            );
+            assert!(validate_sizing_confidences(0, &[], &s).is_err());
+        }
+    }
+
+    #[test]
+    fn research_fee_never_rebates_losses_or_discounts_commission_and_swap() {
+        let entry = 1_700_000_000_000_i64;
+        let exit = entry + 86_400_000;
+        for gross in [100.0_f64, -100.0, 0.0] {
+            for swap in [-2.0_f64, 2.0] {
+                for lots in [0.25_f64, 1.0, 2.5] {
+                    let s = settings_with_carry(swap, -swap, 0.005, 10.0);
+                    for side in [1_i8, -1] {
+                        let costed = (gross - 7.0) * lots;
+                        let carry = if side == 1 { swap } else { -swap } * 10.0 * lots;
+                        let expected = costed + carry - gross.abs() * lots * 0.005;
+                        let actual = apply_carry_and_fee_scaled(
+                            costed,
+                            gross * lots,
+                            lots,
+                            side,
+                            entry,
+                            exit,
+                            &s,
+                        );
+                        assert_eq!(actual.to_bits(), expected.to_bits());
+                        assert!(actual <= costed + carry);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_fee_preserves_legacy_cost_and_swap_bits_for_all_lot_paths() {
+        let entry = 1_700_000_000_000_i64;
+        let exit = entry + 123_456_789;
+        for rate in [0.0, -0.0] {
+            for lots in [0.17, 1.0, 3.71] {
+                for price in [137.123456789_f64, -137.123456789, -0.0] {
+                    let s = settings_with_carry(-2.445, 0.4375, rate, 9.173);
+                    let costed = price * lots - (7.123 + 0.9173) * lots;
+                    let days = (exit - entry) as f64 / 86_400_000.0;
+                    let carry = if lots == 1.0 {
+                        -2.445 * days * 9.173
+                    } else {
+                        -2.445 * days * 9.173 * lots
+                    };
+                    let expected = costed + carry;
+                    // Fee zero must not read/reconstruct the extra fee basis.
+                    let actual =
+                        apply_carry_and_fee_scaled(costed, f64::NAN, lots, 1, entry, exit, &s);
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_cpu_close_branches_charge_fee_on_price_gross_and_match_ledger() {
+        let entry = 1_700_000_000_000_i64;
+        for gap in [false, true] {
+            for gross_move in [100.0_f64, -100.0, 0.0] {
+                for side in [1_i8, -1] {
+                    let times = [entry, entry + 1_000, entry + 86_401_000, entry + 86_402_000];
+                    let close = [
+                        1_000.0,
+                        1_000.0,
+                        1_000.0 + gross_move * f64::from(side),
+                        1_000.0,
+                    ];
+                    let settings = BacktestSettings {
+                        pip_value: 1.0,
+                        pip_value_per_lot: 1.0,
+                        spread_pips: 2.0,
+                        commission_per_trade: 7.0,
+                        sl_pips: 10_000.0,
+                        tp_pips: 10_000.0,
+                        max_hold_bars: 1,
+                        gap_threshold_ms: if gap { 10_000 } else { 0 },
+                        risk_based_sizing: false,
+                        kill_zones_enabled: false,
+                        swap_long_pips_per_day: -2.0,
+                        swap_short_pips_per_day: 3.0,
+                        pnl_conversion_fee_rate: 0.005,
+                        ..BacktestSettings::default()
+                    };
+                    let signals = [side, 0, 0, 0];
+                    let months = [0; 4];
+                    let days = times.map(|t| t / 86_400_000);
+                    let (metrics, trades) = evaluate_strategy_with_confidence_and_ledger_core(
+                        &close,
+                        &close,
+                        &close,
+                        &signals,
+                        &[],
+                        &months,
+                        &days,
+                        &times,
+                        &settings,
+                    )
+                    .unwrap();
+                    let fast = fast_evaluate_strategy_core(
+                        &close,
+                        &close,
+                        &close,
+                        &signals,
+                        &[],
+                        &months,
+                        &days,
+                        &times,
+                        &settings,
+                    );
+                    let price_gross = gross_move - 2.0; // both modeled half-spreads, no commission
+                    let expected = price_gross - 7.0 + if side == 1 { -2.0 } else { 3.0 }
+                        - price_gross.abs() * 0.005;
+                    assert_eq!(trades.len(), 1);
+                    assert_eq!(trades[0].exit_time, Some(times[2]));
+                    assert!(
+                        (trades[0].pnl - expected).abs() < 1e-10,
+                        "gap={gap}, side={side}, move={gross_move}"
+                    );
+                    assert_eq!(metrics.map(f64::to_bits), fast.map(f64::to_bits));
+                    // Net profit is the realized balance delta, not the direct
+                    // trade field: adding to initial equity can round first.
+                    let initial_equity = settings.initial_equity();
+                    let realized_delta = (initial_equity + trades[0].pnl) - initial_equity;
+                    assert_eq!(metrics[0].to_bits(), realized_delta.to_bits());
+                    assert!((metrics[0] - expected).abs() < 1e-10);
+                }
+            }
+        }
     }
 
     // ─── Risk-based, confidence-scaled sizing (Phase 1) ──────────────────
@@ -4074,6 +3796,106 @@ mod overrides_tests {
     }
 
     #[test]
+    fn risk_sizing_subpip_stops_use_the_actual_stop_not_a_one_pip_floor() {
+        let risk = 0.0001;
+        let expected_loss = -risk * BacktestSettings::default().initial_equity();
+        for stop in [0.25, 0.5, 1.0, 20.0] {
+            let metrics = run_single_sl_trade(stop, true, risk, risk, &[1.0; 4]);
+            assert_eq!(metrics[8], 1.0);
+            assert!(
+                (metrics[0] - expected_loss).abs() < 1e-6,
+                "stop={stop}: expected {expected_loss}, got {}",
+                metrics[0]
+            );
+        }
+    }
+
+    #[test]
+    fn risk_sizing_invalid_or_zero_exposure_is_not_a_trade() {
+        let settings = BacktestSettings {
+            pip_value_per_lot: 10.0,
+            ..BacktestSettings::default()
+        };
+        for stop in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(risk_based_pos_lots(1.0, 100_000.0, stop, &settings), 0.0);
+        }
+        let metrics = run_single_sl_trade(20.0, true, 0.0, 0.0, &[1.0; 4]);
+        assert_eq!(
+            metrics[8], 0.0,
+            "zero exposure must not consume a trade slot"
+        );
+    }
+
+    #[test]
+    fn adaptive_unavailable_cells_skip_entries_without_consuming_daily_quota() {
+        let close = [1.0; 7];
+        let high = [1.0; 7];
+        let mut low = [1.0; 7];
+        low[6] = 0.99;
+        let signals = [1_i8; 7];
+        let times: Vec<i64> = (0..7).map(|i| 1_700_000_000_000 + i * 300_000).collect();
+        let days = [times[0] / 86_400_000; 7];
+        let settings = BacktestSettings {
+            sl_pips: 20.0,
+            tp_pips: 40.0,
+            pip_value: 0.0001,
+            pip_value_per_lot: 10.0,
+            spread_pips: 0.0,
+            commission_per_trade: 0.0,
+            kill_zones_enabled: false,
+            risk_based_sizing: false,
+            max_trades_per_day: 1,
+            adaptive_vol_mult: 1.0,
+            adaptive_base_pips: Some(
+                vec![f64::NAN, 0.0, -1.0, f64::INFINITY, 20.0, f64::NAN, 20.0].into(),
+            ),
+            ..BacktestSettings::default()
+        };
+        let metrics = fast_evaluate_strategy_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &[],
+            &[0; 7],
+            &days,
+            &times,
+            &settings,
+        );
+        let trades = simulate_trades_core(&close, &high, &low, &times, &signals, &settings);
+        assert_eq!(metrics[8], 1.0);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(
+            trades[0].entry_time, times[5],
+            "only signal bar 4 has an available stop"
+        );
+        assert_eq!(trades[0].exit_time, Some(times[6]));
+        assert!((trades[0].pnl + 200.0).abs() < 1e-8);
+        assert!((trades[0].r_multiple + 1.0).abs() < 1e-10);
+        // The logger converts the fill price back to pips; the fast evaluator
+        // books the stop directly. Allow floating-point roundoff, not a change
+        // to the loss, entry time, or trade count checked above.
+        let pnl_tolerance =
+            64.0 * f64::EPSILON * metrics[0].abs().max(trades[0].pnl.abs()).max(1.0);
+        assert!((metrics[0] - trades[0].pnl).abs() <= pnl_tolerance);
+    }
+
+    #[test]
+    fn adaptive_entry_cannot_borrow_the_next_bars_stop_or_fixed_fallback() {
+        let mut settings = BacktestSettings::default();
+        settings.adaptive_vol_mult = 1.0;
+        settings.adaptive_base_pips = Some(vec![f64::NAN, 20.0].into());
+        assert_eq!(entry_sl_tp_pips(&settings, 0), None);
+        assert_eq!(entry_sl_tp_pips(&settings, 1), Some((20.0, 40.0)));
+        assert_eq!(entry_sl_tp_pips(&settings, 2), None);
+        settings.adaptive_vol_mult = 0.0;
+        assert_eq!(entry_sl_tp_pips(&settings, 0), Some((20.0, 40.0)));
+        settings.adaptive_vol_mult = 1.0;
+        settings.adaptive_base_pips = None;
+        assert_eq!(entry_sl_tp_pips(&settings, 0), Some((20.0, 40.0)));
+    }
+
+    #[test]
     fn adaptive_stops_constant_series_equals_scalar_and_varying_changes_outcome() {
         // Long entry at bar 1 (signal at bar 0). Price drifts down so a 15-pip
         // stop is hit at bar 3 but a very wide stop is not.
@@ -4113,10 +3935,11 @@ mod overrides_tests {
 
         // (2) an adaptive series IDENTICAL to the scalar must be byte-identical.
         let mut same = base.clone();
-        // base stop 15p, mult 1, rr 2 → sl 15 / tp 30 = the scalar path exactly.
+        // base stop 15p, mult 1, gene rr 30/15 = 2 → scalar path exactly.
+        // Deliberately poison the legacy scalar: valid genes must not read it.
         same.adaptive_base_pips = Some(vec![15.0_f64; n].into());
         same.adaptive_vol_mult = 1.0;
-        same.adaptive_rr = 2.0;
+        same.adaptive_rr = 9.0;
         let same_m = run(&same);
         for k in 0..11 {
             assert_eq!(
@@ -4209,6 +4032,211 @@ mod overrides_tests {
             m_on[0] >= -1.0 * 10.0,
             "trailing ON should exit at ~break-even (>= -1 pip), got {}",
             m_on[0]
+        );
+    }
+}
+
+#[cfg(test)]
+mod protective_exit_tests {
+    use super::*;
+
+    fn protected_settings() -> BacktestSettings {
+        BacktestSettings {
+            sl_pips: 20.0,
+            tp_pips: 40.0,
+            min_hold_bars: 10,
+            max_hold_bars: 0,
+            pip_value: 0.0001,
+            pip_value_per_lot: 10.0,
+            spread_pips: 0.0,
+            commission_per_trade: 0.0,
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
+            kill_zones_enabled: false,
+            risk_based_sizing: false,
+            gap_threshold_ms: 0,
+            trailing_enabled: false,
+            ..BacktestSettings::default()
+        }
+    }
+
+    fn assert_protected_exit(
+        close: &[f64],
+        high: &[f64],
+        low: &[f64],
+        signals: &[i8],
+        settings: &BacktestSettings,
+        exit_bar: usize,
+        expected_pnl: f64,
+    ) {
+        let timestamps: Vec<i64> = (0..close.len())
+            .map(|i| 1_700_000_000_000 + i as i64 * 300_000)
+            .collect();
+        let months = vec![0; close.len()];
+        let days: Vec<i64> = timestamps.iter().map(|ts| ts / 86_400_000).collect();
+        let run = |settings: &BacktestSettings| {
+            (
+                fast_evaluate_strategy_core(
+                    close,
+                    high,
+                    low,
+                    signals,
+                    &[],
+                    &months,
+                    &days,
+                    &timestamps,
+                    settings,
+                ),
+                simulate_trades_core(close, high, low, &timestamps, signals, settings),
+            )
+        };
+        let (metrics, trades) = run(settings);
+        assert_eq!(metrics[8], 1.0, "fast evaluator lost the protected exit");
+        assert_eq!(trades.len(), 1, "trade logger lost the protected exit");
+        assert_eq!(trades[0].entry_time, timestamps[1]);
+        assert_eq!(trades[0].exit_time, Some(timestamps[exit_bar]));
+        for pnl in [metrics[0], trades[0].pnl] {
+            assert!(
+                (pnl - expected_pnl).abs() < 1e-8,
+                "expected independently calculated PnL {expected_pnl}, got {pnl}"
+            );
+        }
+
+        // A minimum-hold preference must not change any protective exit or
+        // deadline. Compare with the established zero-minimum behavior too,
+        // but keep the independent price/time/money assertions above.
+        let mut no_minimum = settings.clone();
+        no_minimum.min_hold_bars = 0;
+        let (baseline_metrics, baseline_trades) = run(&no_minimum);
+        assert_eq!(
+            metrics.map(f64::to_bits),
+            baseline_metrics.map(f64::to_bits)
+        );
+        assert_eq!(trades[0].exit_time, baseline_trades[0].exit_time);
+        assert_eq!(trades[0].pnl.to_bits(), baseline_trades[0].pnl.to_bits());
+    }
+
+    #[test]
+    fn minimum_hold_never_delays_long_or_short_stop_and_target() {
+        for side in [1_i8, -1] {
+            for target in [false, true] {
+                let close = [1.0; 4];
+                let mut high = [1.0001; 4];
+                let mut low = [0.9999; 4];
+                match (side, target) {
+                    (1, false) => low[2] = 0.997,
+                    (1, true) => high[2] = 1.006,
+                    (-1, false) => high[2] = 1.003,
+                    (-1, true) => low[2] = 0.994,
+                    _ => unreachable!(),
+                }
+                assert_protected_exit(
+                    &close,
+                    &high,
+                    &low,
+                    &[side, 0, 0, 0],
+                    &protected_settings(),
+                    2,
+                    if target { 400.0 } else { -200.0 },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn minimum_hold_never_delays_a_trail_and_the_trail_stays_causal() {
+        for side in [1_i8, -1] {
+            let (close, high, low) = if side == 1 {
+                (
+                    [1.0, 1.0, 1.002, 1.0, 1.0],
+                    [1.0001, 1.0001, 1.003, 1.002, 1.0001],
+                    [0.9999, 0.9999, 1.0, 0.999, 0.9999],
+                )
+            } else {
+                (
+                    [1.0, 1.0, 0.998, 1.0, 1.0],
+                    [1.0001, 1.0001, 1.0, 1.001, 1.0001],
+                    [0.9999, 0.9999, 0.997, 0.998, 0.9999],
+                )
+            };
+            let settings = BacktestSettings {
+                tp_pips: 100.0,
+                trailing_enabled: true,
+                trailing_be_trigger_r: 1.0,
+                trailing_atr_multiplier: 0.5,
+                trailing_min_lock_pips: 2.0,
+                ..protected_settings()
+            };
+            // Bar 2 establishes a +20-pip trail. Its own opposite extreme is
+            // already beyond that NEW level, which must protect only bar 3.
+            assert_protected_exit(
+                &close,
+                &high,
+                &low,
+                &[side, 0, 0, 0, 0],
+                &settings,
+                3,
+                200.0,
+            );
+        }
+    }
+
+    #[test]
+    fn minimum_hold_cannot_extend_the_maximum_holding_deadline() {
+        let close = [1.0, 1.0, 1.0, 1.001, 1.001];
+        let high = close.map(|value| value + 0.0001);
+        let low = close.map(|value| value - 0.0001);
+        for side in [1_i8, -1] {
+            let settings = BacktestSettings {
+                max_hold_bars: 2,
+                ..protected_settings()
+            };
+            assert_protected_exit(
+                &close,
+                &high,
+                &low,
+                &[side, 0, 0, 0, 0],
+                &settings,
+                3,
+                side as f64 * 100.0,
+            );
+        }
+    }
+
+    #[test]
+    fn protection_wins_when_stop_target_and_timeout_share_a_bar() {
+        let settings = BacktestSettings {
+            max_hold_bars: 2,
+            ..protected_settings()
+        };
+        for side in [1_i8, -1] {
+            assert_protected_exit(
+                &[1.0, 1.0, 1.0, 1.001],
+                &[1.0001, 1.0001, 1.0001, 1.006],
+                &[0.9999, 0.9999, 0.9999, 0.994],
+                &[side, 0, 0, 0],
+                &settings,
+                3,
+                -200.0,
+            );
+        }
+    }
+
+    #[test]
+    fn opposite_signals_do_not_replace_the_bracket_only_exit_policy() {
+        let settings = BacktestSettings {
+            max_hold_bars: 3,
+            ..protected_settings()
+        };
+        assert_protected_exit(
+            &[1.0, 1.0, 1.0, 1.0, 1.001, 1.001],
+            &[1.0001, 1.0001, 1.0001, 1.0001, 1.0011, 1.0011],
+            &[0.9999, 0.9999, 0.9999, 0.9999, 1.0009, 1.0009],
+            &[1, -1, 1, -1, 1, 0],
+            &settings,
+            4,
+            100.0,
         );
     }
 }
@@ -4564,7 +4592,8 @@ mod gpu_cpu_parity_tests {
     /// GPU↔CPU parity for ADAPTIVE per-entry stops. Same synthetic combo as the
     /// fixed test, but each gene carries `stop_vol_mult > 0` and the settings a
     /// per-bar base vol series, so BOTH lanes scale the stop by volatility at each
-    /// entry (`sl = mult × base[signal_bar]`, `tp = 2 × sl`). Proves the ported
+    /// entry (`sl = mult × base[signal_bar]`) while retaining each gene's own
+    /// `tp/sl` ratio. Proves the ported
     /// kernel's per-entry capture matches the CPU `entry_sl_tp_pips` — the gate
     /// before the adaptive→CPU guard is lifted. Skips cleanly with no GPU.
     #[test]
@@ -4589,9 +4618,10 @@ mod gpu_cpu_parity_tests {
         let gene_weights: Vec<f64> = vec![1.0; 8];
         let long_thr: Vec<f64> = vec![0.3; n_genes];
         let short_thr: Vec<f64> = vec![-0.3; n_genes];
-        // Fixed sl/tp are present but IGNORED once the multiplier is active.
-        let sl_pips: Vec<f64> = vec![25.0; n_genes];
-        let tp_pips: Vec<f64> = vec![50.0; n_genes];
+        // Absolute pips are replaced by volatility scaling, but their ratios
+        // remain active and deliberately differ across the population.
+        let sl_pips: Vec<f64> = vec![25.0, 20.0, 40.0, 10.0];
+        let tp_pips: Vec<f64> = vec![37.5, 40.0, 100.0, 30.0];
         // Per-gene adaptive multipliers (all > 0 ⇒ every gene runs adaptive).
         let stop_vol_mult: Vec<f64> = vec![1.2, 2.0, 0.8, 1.5];
         let smc_data: Vec<SmcRow> = vec![[0i8; 11]; n_samples];
@@ -4615,7 +4645,7 @@ mod gpu_cpu_parity_tests {
         settings.risk_per_trade_min = 0.005;
         settings.risk_per_trade_max = 0.03;
         settings.high_quality_confidence = 0.65;
-        // Shared per-bar base vol series (the exact production builder) + 2R.
+        // Shared per-bar base vol series (the exact production builder).
         let base =
             crate::stop_target::adaptive_base_pips_series(&high, &low, &close, settings.pip_value)
                 .expect("base vol series builds on 800 bars");
@@ -4625,7 +4655,8 @@ mod gpu_cpu_parity_tests {
             "base series must align with n_samples"
         );
         settings.adaptive_base_pips = Some(base.into());
-        settings.adaptive_rr = 2.0;
+        // Deliberately unlike every gene ratio: this is legacy fallback only.
+        settings.adaptive_rr = 9.0;
 
         // CPU reference — each gene runs adaptive via its own multiplier.
         let cpu: Vec<[f64; 11]> = (0..n_genes)
@@ -4736,9 +4767,8 @@ mod gpu_cpu_parity_tests {
         // 600k bars × 8 genes: large enough that an 8MB buffer cap forces SEVERAL
         // sample-windows in the signal synth (600k×8B = 4.8MB/gene > the 8MB/4=2M-elem
         // window) AND several gene-batches in the backtest (8MB/4/600k ≈ 3 genes per
-        // batch → 8 genes = 3 batches). 600k (not 2M) keeps every buffer small enough
-        // that even the larger comparison cap can't OOM a shared-RAM iGPU — windowing
-        // exists precisely to avoid the big single buffer that would.
+        // batch → 8 genes = 3 batches). 600k keeps each test allocation bounded;
+        // windowing exists precisely to avoid one oversized device allocation.
         let n_samples = 600_000usize;
         let n_features = 6usize;
         let n_genes = 8usize;
@@ -4888,8 +4918,8 @@ mod gpu_cpu_parity_tests {
 
         // Two DIFFERENT small caps, both forcing MANY windows / gene-batches over
         // the 2M-row buffers but with DIFFERENT split granularities. Both stay tiny
-        // so they never approach the device's memory limit (a single huge-cap launch
-        // would OOM a shared-RAM iGPU — exactly what windowing exists to avoid).
+        // so they never approach the device's memory limit; this is exactly what
+        // windowing exists to guarantee.
         let gpu_a = run_gpu_with_cap(8)
             .unwrap_or_else(|e| panic!("heavy-row GPU real-device evaluation failed: {e}"));
         let gpu_b =
@@ -5402,9 +5432,9 @@ mod gpu_cpu_parity_tests {
     ///     NOT loosened.
     ///
     /// ACTIVE SMC gating is used so the SMC slice actually influences the gate.
-    /// Modest fixture (1 200 rows × 6 genes) to avoid the iGPU async-OOM. The
-    /// explicit real-device gate skips card-less runs; once selected, the direct
-    /// CubeCL call permits no CPU substitution.
+    /// The modest fixture (1 200 rows × 6 genes) keeps device allocations small.
+    /// The explicit real-device gate skips card-less runs; once selected, the
+    /// direct CubeCL call permits no CPU substitution.
     #[test]
     fn gpu_walkforward_split_matches_cpu() {
         if !real_cuda_search_test_enabled("gpu_walkforward_split_matches_cpu") {
@@ -5559,7 +5589,7 @@ mod gpu_cpu_parity_tests {
             .collect();
 
         // ── GPU PATH — contiguous slice of the indicators/SMC; the kernel
-        // re-synthesizes signals on the slice and backtests (or CPU-falls-back). ──
+        // re-synthesizes signals on the slice and backtests on CUDA. ───────────
         let win_ind = indicators
             .slice(ndarray::s![.., test_start..end])
             .to_owned();
@@ -5649,34 +5679,12 @@ mod gpu_cpu_parity_tests {
 
 #[cfg(test)]
 mod cubecl_trailing_parity_tests {
-    //! The CubeCL lane's trailing stop, at the settings production actually runs.
+    //! Direct CUDA CubeCL trailing-stop parity gate.
     //!
-    //! `EvaluationConfig::for_symbol` (genetic/strategy_gene.rs:851) HARDCODES
-    //! `trailing_enabled: true`, and both production settings builders copy it —
-    //! `discovery_backtest_settings` (discovery.rs:1358) and the GA's
-    //! `b_settings` (genetic/search_engine.rs:547). Every discovery run trails.
-    //!
-    //! Not one fixture in `gpu_cpu_parity_tests` sets the flag. All seven
-    //! inherit `BacktestSettings::default()`'s `trailing_enabled: false`
-    //! (eval.rs:358), so the CubeCL kernel's trailing arithmetic had never been
-    //! compared against the CPU on any backend. That is how tracel-ai/cubecl#1375
-    //! survived in the trail-ratchet arms of
-    //! `define_backtest_population_kernel` (cubecl_eval.rs), where
-    //! `let candidate = if raw > locked { raw } else { locked }` returned the
-    //! ELSE branch unconditionally on the wgpu backend (upstream reproduced it on
-    //! Metal; this file's existing workarounds cite Vulkan — CPU and CUDA are
-    //! correct, and no one has characterised HIP): the ATR trail never ratcheted
-    //! past the min-lock floor, exits landed on a different bar at a different
-    //! price, and selection changed.
-    //!
-    //! `trailing_parity_tests` below covers the same ground for prototype B, but
-    //! it is gated on `gpu-b-adapter` and calls `try_evaluate_population_b`
-    //! directly — it can never reach this kernel. `gpu-vulkan` and `gpu-rocm`
-    //! (neoethos-search/Cargo.toml:85-86) pull neither `gpu-cuda` nor
-    //! `gpu-b-adapter`, so on those shipped build configurations this kernel IS
-    //! production discovery — and `gpu-apple` is `gpu-vulkan`
-    //! (neoethos-app/Cargo.toml:45), i.e. the very backend upstream reproduced
-    //! the miscompilation on.
+    //! The fixture first proves that trailing and its `max(raw, locked)` ratchet
+    //! materially change the result, then compares the CUDA CubeCL kernel with
+    //! the CPU oracle. Native Prototype B has a separate real-device parity
+    //! module below, so the two CUDA engines remain independently covered.
     use super::*;
 
     struct TrailingFixture {

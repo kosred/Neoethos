@@ -695,6 +695,7 @@ const fn is_zero_sha256_v1(value: [u8; 32]) -> bool {
 pub struct AdmittedNativeCudaFullDiscoveryRunV1 {
     physical_inventory_identity_sha256: [u8; 32],
     admission_identity_sha256: [u8; 32],
+    native_preflight_facts_identity_sha256: [u8; 32],
     workspace_plan_identity_sha256: [u8; 32],
     device_uuid: [u8; 16],
     selected_device_ordinal: u32,
@@ -707,6 +708,8 @@ pub struct AdmittedNativeCudaFullDiscoveryRunV1 {
     context_api_version: String,
     compute_capability_major: u16,
     compute_capability_minor: u16,
+    multiprocessor_count: u32,
+    warp_size: u32,
     free_memory_bytes_snapshot: u64,
     plan: SealedFullDiscoveryGpuWorkspacePlanV1,
 }
@@ -733,6 +736,9 @@ pub fn bind_full_discovery_workspace_plan_v1(
         }
         #[cfg(feature = "cuda")]
         SealedDiscoveryRunDeviceAdmissionV1::NativeCuda(native) => {
+            let native_preflight_facts_identity_sha256 =
+                crate::data_population_workspace_plan_v1::native_cuda_data_population_preflight_facts_v1(&native)
+                    .facts_identity_sha256();
             let native = *native;
             let admission_identity_sha256 = native.admission_identity_sha256;
             let workspace_plan_identity_sha256 = plan.workspace_plan_identity_sha256;
@@ -758,6 +764,7 @@ pub fn bind_full_discovery_workspace_plan_v1(
                 native,
                 plan,
                 admission_identity_sha256,
+                native_preflight_facts_identity_sha256,
                 workspace_plan_identity_sha256,
             )
         }
@@ -769,6 +776,7 @@ fn bind_native_full_discovery_workspace_v1(
     admission: SealedNativeCudaRunDeviceAdmissionV1,
     plan: SealedFullDiscoveryGpuWorkspacePlanV1,
     admission_identity_sha256: [u8; 32],
+    native_preflight_facts_identity_sha256: [u8; 32],
     workspace_plan_identity_sha256: [u8; 32],
 ) -> Result<AdmittedFullDiscoveryGpuRunV1, FullDiscoveryWorkspacePlanErrorV1> {
     let free_memory_bytes_snapshot = admission.free_memory_bytes_snapshot;
@@ -776,6 +784,7 @@ fn bind_native_full_discovery_workspace_v1(
         AdmittedNativeCudaFullDiscoveryRunV1 {
             physical_inventory_identity_sha256: admission.physical_inventory_identity_sha256,
             admission_identity_sha256,
+            native_preflight_facts_identity_sha256,
             workspace_plan_identity_sha256,
             device_uuid: admission.device_uuid,
             selected_device_ordinal: admission.ordinal,
@@ -788,6 +797,8 @@ fn bind_native_full_discovery_workspace_v1(
             context_api_version: admission.context_api_version,
             compute_capability_major: admission.compute_capability_major,
             compute_capability_minor: admission.compute_capability_minor,
+            multiprocessor_count: admission.multiprocessor_count,
+            warp_size: admission.warp_size,
             free_memory_bytes_snapshot,
             plan,
         },
@@ -801,6 +812,7 @@ impl AdmittedNativeCudaFullDiscoveryRunV1 {
     ) -> Result<GpuOnlyRunDeviceAdmissionV3, FullDiscoveryWorkspacePlanErrorV1> {
         let Self {
             admission_identity_sha256,
+            native_preflight_facts_identity_sha256,
             workspace_plan_identity_sha256,
             device_uuid,
             selected_device_ordinal,
@@ -812,6 +824,8 @@ impl AdmittedNativeCudaFullDiscoveryRunV1 {
             context_api_version,
             compute_capability_major,
             compute_capability_minor,
+            multiprocessor_count,
+            warp_size,
             free_memory_bytes_snapshot,
             plan,
             ..
@@ -831,11 +845,14 @@ impl AdmittedNativeCudaFullDiscoveryRunV1 {
         } = plan;
         seal_gpu_only_run_device_admission_v3(GpuOnlyRunDeviceAdmissionRequestV3 {
             source_admission_identity_sha256: admission_identity_sha256,
+            native_preflight_facts_identity_sha256,
             workspace_plan_identity_sha256,
             selected_device_ordinal,
             device_uuid,
             compute_capability_major,
             compute_capability_minor,
+            multiprocessor_count,
+            warp_size,
             primary_context,
             run_stream,
             driver_version,
@@ -1130,6 +1147,8 @@ fn hash_full_discovery_receipt_v1(
     hasher.update(run.context_api_version.as_bytes());
     hasher.update(run.compute_capability_major.to_le_bytes());
     hasher.update(run.compute_capability_minor.to_le_bytes());
+    hasher.update(run.multiprocessor_count.to_le_bytes());
+    hasher.update(run.warp_size.to_le_bytes());
     hasher.update(run.free_memory_bytes_snapshot.to_le_bytes());
     hasher.update(final_compact_readback_bytes.to_le_bytes());
     hasher.finalize().into()

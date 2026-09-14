@@ -42,10 +42,9 @@ pub struct Gene {
     /// stop. `0.0` (the serde default for genes saved before this field existed)
     /// means "use the fixed `sl_pips`/`tp_pips`". When `> 0`, the stop is
     /// `stop_vol_mult ×` the dataset's per-bar vol/tail distance and the target is
-    /// a fixed reward:risk multiple of it, so the stop scales with volatility at
-    /// entry. The GA searches this like any other gene parameter; both the IS
-    /// scoring backtest and the OOS validation derive SL/TP from it, so they
-    /// evaluate the SAME strategy.
+    /// that adaptive distance times this gene's `tp_pips / sl_pips` ratio. The GA
+    /// therefore searches both volatility distance and exit payoff; both the IS
+    /// scoring backtest and the OOS validation derive SL/TP from the same pair.
     #[serde(default)]
     pub stop_vol_mult: f64,
 }
@@ -85,14 +84,10 @@ pub struct MarketCostProfile {
     /// and cross-currency conversion fee. `0.0` means "no charge
     /// known"; non-zero comes from the broker's `ProtoOASymbol`
     /// projection (`SymbolFinancials::daily_swap_long/short`,
-    /// `pnl_conversion_fee_rate`). The CPU + GPU eval kernels
-    /// subtract `swap_pips × overnight_days × pip_value_per_lot` at
-    /// each trade exit and apply `(1 − pnl_conversion_fee_rate)`
-    /// once. Defaulting to 0 is **deliberate fail-safe** so a
-    /// missing-broker-data run still produces a backtest; the GA
-    /// fitness function additionally penalises strategies that lean
-    /// heavily on overnight positions when these costs are unknown
-    /// (TODO follow-up — currently a no-op).
+    /// `pnl_conversion_fee_rate`). CPU screening adds signed swap and uses
+    /// the versioned research debit on absolute realized price gross, excluding
+    /// swap/commission from the fee basis. Missing metadata still means an
+    /// unverified zero-cost assumption, not evidence of a broker's zero charge.
     pub swap_long_pips_per_day: f64,
     pub swap_short_pips_per_day: f64,
     pub pnl_conversion_fee_rate: f64,
@@ -403,11 +398,8 @@ pub(crate) fn infer_market_cost_profile(
         account_currency.trim().to_string()
     };
 
-    // Symbol metadata table — disk first (cTrader-populated /
-    // operator-edited), then baked-in defaults for the majors.
-    // Replaces the old `default_pip_size` / `default_contract_size`
-    // heuristic so JPY pairs and metals get correct pip math without
-    // env-var hacks.
+    // Symbol metadata table — cTrader-populated or operator-edited disk data.
+    // There is no in-source production default table.
     let metadata = neoethos_core::symbol_metadata::resolve(&symbol);
 
     let pip_value = cost
@@ -460,8 +452,7 @@ pub(crate) fn infer_market_cost_profile(
         )
     });
 
-    // **F-029 fix (2026-05-25)** — resolved via F-126 (SymbolMetadata
-    // gained `typical_spread_pips` + `commission_per_lot`). The
+    // **F-029 fix (2026-05-25)** — resolved via SymbolMetadata. The
     // resolution order is now:
     //   1. Explicit per-call override (`spread_pips_override` /
     //      `commission_override`) — for unit tests + when the caller
@@ -487,11 +478,6 @@ pub(crate) fn infer_market_cost_profile(
     //      `None`.
     //   3. **SymbolMetadata** screening assumption. The persisted field has no
     //      per-value quote provenance; current cTrader capture leaves it None.
-    //   4. Asset-class synthetic default — LAST RESORT, kept only so
-    //      that pre-F-126 `data/symbol_metadata.json` files (which
-    //      have neither field) keep working. Logs a `tracing::warn!`
-    //      so operators see the synthetic-fallback was taken.
-    //
     // An operator-authored `data/symbol_metadata.json` may populate the spread
     // assumption. It remains broad-screening input, never historical Bid/Ask
     // or execution evidence.
@@ -539,31 +525,20 @@ pub(crate) fn infer_market_cost_profile(
             );
             f64::NAN
         });
-    // Phase D.2e (2026-05-28) — step 3.5 in the resolution chain:
-    // when the operator override and SymbolMetadata.commission_per_lot
-    // are both unset, derive commission from the broker-supplied
-    // `commission_type` + `commission_rate_decimal` (D.2d schema
-    // additions) via `commission_per_lot_account_ccy`. Returns the
-    // commission in **account currency** so it slots directly into
-    // MarketCostProfile.commission_per_trade (which the eval kernel
-    // subtracts from PnL in account ccy). Bails to None for:
-    //   - type 1/2 USD-denominated on non-USD accounts (need USD→
-    //     account rate; deferred to D.2f)
-    //   - cross-currency type 3/4 with missing quote_to_account_rate
-    // In those cases the synthetic $7/lot fallback is taken with a
-    // tracing::warn! — surfaces the gap rather than silently lying.
+    // Derive commission from the broker-supplied commission type and rate.
+    // USD-denominated types receive a separate USD→account leg from the exact
+    // canonical FX store. The old flat metadata field remains a compatibility
+    // fallback, but it is converted from its documented quote currency before
+    // use and never outranks the typed broker schedule.
     //
     // PER SIDE vs ROUND TRIP (2026-08-09). The two leading arms —
     // `commission_override` and `cost.commission_per_trade` — are values a
     // CALLER chose, and by the name of the field they are already the round
     // trip; `DiscoveryConfig::from_settings` converts before it passes one in,
     // and this is the only pair of boundaries that convert, so nothing is
-    // doubled twice. Everything BELOW them comes from a broker schedule or from
-    // the synthetic last resort, both of which are quoted PER SIDE — and the
-    // eval kernels subtract this field exactly once per closed trade. Those
-    // arms are therefore wrapped in `round_trip_commission_per_lot`. Before
-    // this, a per-side broker number was charged once and every backtest paid
-    // half the commission a live fill pays.
+    // doubled twice. Everything BELOW them comes from a broker schedule and is
+    // quoted PER SIDE, while eval kernels subtract this field exactly once per
+    // closed trade.
     let commission_is_per_side = cost.commission_is_per_side;
     let commission_per_trade = commission_override
         .filter(|value| value.is_finite() && *value >= 0.0)
@@ -571,40 +546,56 @@ pub(crate) fn infer_market_cost_profile(
         .or_else(|| {
             metadata
                 .as_ref()
-                .and_then(|m| m.commission_per_lot)
-                .map(|v| round_trip_commission_per_lot(v, commission_is_per_side))
-        })
-        .or_else(|| {
-            metadata
-                .as_ref()
                 .and_then(|m| {
+                    let usd_to_account_rate = if account_currency.eq_ignore_ascii_case("USD") {
+                        None
+                    } else if m.quote.eq_ignore_ascii_case("USD") {
+                        cost.quote_to_account_rate
+                            .or_else(|| crate::fx_rates::quote_to_account("USD", &account_currency))
+                    } else {
+                        crate::fx_rates::quote_to_account("USD", &account_currency)
+                    };
                     m.commission_per_lot_account_ccy(
                         &account_currency,
                         price_hint.or(m.typical_price),
                         cost.quote_to_account_rate,
+                        usd_to_account_rate,
                     )
                 })
                 .map(|v| round_trip_commission_per_lot(v, commission_is_per_side))
         })
+        .or_else(|| {
+            metadata.as_ref().and_then(|m| {
+                let flat_quote_commission = m
+                    .commission_per_lot
+                    .filter(|value| value.is_finite() && *value >= 0.0)?;
+                let account_commission = if m.quote.eq_ignore_ascii_case(&account_currency) {
+                    flat_quote_commission
+                } else {
+                    let quote_to_account = cost.quote_to_account_rate.or_else(|| {
+                        crate::fx_rates::quote_to_account(&m.quote, &account_currency)
+                    })?;
+                    flat_quote_commission * quote_to_account
+                };
+                Some(round_trip_commission_per_lot(
+                    account_commission,
+                    commission_is_per_side,
+                ))
+            })
+        })
         .unwrap_or_else(|| {
-            tracing::warn!(
+            tracing::error!(
                 target: "neoethos_search::cost_model",
                 symbol = %symbol,
                 account_currency = %account_currency,
-                fallback_commission_per_side = 7.0,
-                fallback_commission_round_trip =
-                    round_trip_commission_per_lot(7.0, commission_is_per_side),
                 commission_is_per_side,
-                "Synthetic commission fallback used (F-029 LAST RESORT): \
-                 SymbolMetadata has no `commission_per_lot`, no operator \
-                 override, AND the broker-derived `commission_per_lot_account_ccy` \
-                 returned None (typically: type 1/2 on non-USD account, or \
-                 cross-currency type 3/4 without quote_to_account_rate). \
-                 Populate `commission_type`+`commission_rate_decimal` via \
-                 --rebuild-symbol-metadata and supply quote_to_account_rate \
-                 to silence this."
+                "no authoritative round-trip commission can be resolved. Synthetic \
+                 $7/lot fallback REMOVED — returning NaN so this evaluation is \
+                 rejected. Populate commission_type + commission_rate_decimal and \
+                 the required canonical FX conversion legs, or supply an explicit \
+                 validated commission override."
             );
-            round_trip_commission_per_lot(7.0, commission_is_per_side)
+            f64::NAN
         });
 
     // **Phase C (2026-05-28)**: pull the broker-supplied swap +
@@ -625,11 +616,14 @@ pub(crate) fn infer_market_cost_profile(
         .and_then(|m| m.daily_swap_short_pips)
         .filter(|v| v.is_finite())
         .unwrap_or(0.0);
-    let pnl_conversion_fee_rate = metadata
-        .as_ref()
-        .and_then(|m| m.pnl_conversion_fee_rate)
-        .filter(|v| v.is_finite() && *v >= 0.0 && *v < 1.0)
-        .unwrap_or(0.0);
+    let pnl_conversion_fee_rate = match metadata.as_ref() {
+        Some(meta) => resolve_metadata_conversion_fee(
+            meta.pnl_conversion_fee_rate,
+            &meta.quote,
+            &account_currency,
+        ),
+        None => 0.0,
+    };
 
     MarketCostProfile {
         symbol,
@@ -642,6 +636,20 @@ pub(crate) fn infer_market_cost_profile(
         swap_short_pips_per_day,
         pnl_conversion_fee_rate,
     }
+}
+
+fn resolve_metadata_conversion_fee(rate: Option<f64>, quote: &str, account: &str) -> f64 {
+    let Some(rate) = rate else { return 0.0 };
+    neoethos_core::research_conversion_fee::effective_conversion_fee_rate_v1(
+        rate,
+        &quote.trim().to_ascii_uppercase(),
+        &account.trim().to_ascii_uppercase(),
+    )
+    .unwrap_or_else(|error| {
+        tracing::error!(target: "neoethos_search::cost_model", %error,
+            "invalid conversion fee metadata; refusing a zero-fee fallback");
+        f64::NAN
+    })
 }
 
 impl Gene {
@@ -817,6 +825,8 @@ pub struct SearchResult {
 pub struct EvaluationConfig {
     pub symbol: String,
     pub account_currency: String,
+    /// Run-scoped starting equity shared by Search and account-risk validation.
+    pub initial_equity: f64,
     pub max_hold_bars: usize,
     /// Exit geometry — resolved from `models.exit_policy`, never hardcoded.
     ///
@@ -842,6 +852,14 @@ pub struct EvaluationConfig {
     pub swap_long_pips_per_day: f64,
     pub swap_short_pips_per_day: f64,
     pub pnl_conversion_fee_rate: f64,
+    /// Search-time execution policy. These values must travel with the same
+    /// run-scoped configuration as the financial inputs; otherwise Generation
+    /// 0 and the post-GA validation funnel price different strategies.
+    pub kill_zones_enabled: bool,
+    pub session_spread_pips: Option<[f64; 3]>,
+    pub risk_per_trade_min: f64,
+    pub risk_per_trade_max: f64,
+    pub high_quality_confidence: f64,
     pub smc_gate_threshold: f64,
     pub smc_weight_ob: f64,
     pub smc_weight_fvg: f64,
@@ -854,12 +872,13 @@ pub struct EvaluationConfig {
     pub smc_weight_eqh: f64,
     pub smc_weight_eql: f64,
     pub smc_weight_displacement: f64,
-    /// scoring_version 5 (2026-07-02): when `true` the GA evolves under the
-    /// Kelly log-growth objective (`scoring::ga_fitness_growth`) instead of
-    /// the prop-firm consistency formula. Set by the discovery driver for
-    /// `DiscoveryMode::Risky` only; `false` everywhere else (PropFirm/Strict,
-    /// tests, parity fixtures) keeps the v4 landscape byte-for-byte.
+    /// Selects Risky growth scoring instead of the unchanged PropFirm v4
+    /// consistency formula. A bound `growth_goal` selects measured goal pace
+    /// (v6); without it explicitly legacy callers retain Kelly growth (v5).
+    /// The discovery driver enables this only for `DiscoveryMode::Risky`.
     pub growth_objective: bool,
+    /// Run-bound v6 goal-pace objective; None retains explicitly legacy v5.
+    pub growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
 }
 
 impl Default for EvaluationConfig {
@@ -898,6 +917,7 @@ impl Default for EvaluationConfig {
         Self {
             symbol: String::new(),
             account_currency: String::new(),
+            initial_equity: crate::eval::current_backtest_runtime_overrides().initial_equity,
             max_hold_bars: 0,
             trailing_enabled: exit.trailing_enabled,
             trailing_atr_multiplier: exit.trailing_stop_multiplier,
@@ -910,6 +930,11 @@ impl Default for EvaluationConfig {
             swap_long_pips_per_day: f64::NAN,
             swap_short_pips_per_day: f64::NAN,
             pnl_conversion_fee_rate: f64::NAN,
+            kill_zones_enabled: false,
+            session_spread_pips: None,
+            risk_per_trade_min: 0.005,
+            risk_per_trade_max: 0.03,
+            high_quality_confidence: 0.65,
             smc_gate_threshold: smc.gate_threshold,
             smc_weight_ob: smc.w_ob,
             smc_weight_fvg: smc.w_fvg,
@@ -923,6 +948,7 @@ impl Default for EvaluationConfig {
             smc_weight_eql: smc.w_eql,
             smc_weight_displacement: smc.w_displacement,
             growth_objective: false,
+            growth_goal: None,
         }
     }
 }
@@ -1055,15 +1081,36 @@ mod tests {
 
     #[test]
     fn infer_market_cost_profile_zeroes_swap_and_fee_when_metadata_absent() {
-        // EURUSD baked-in default ships with `daily_swap_*: None` and
-        // `pnl_conversion_fee_rate: None`. The cost-model fall-back
-        // for those is `0.0` (fail-safe — no charge known means no
-        // charge applied). The synthetic-fallback warn is logged for
-        // commission + spread only, not for swap/fee.
-        let profile = infer_market_cost_profile("EURUSD", "USD", None, None, None);
+        // A real pair such as EURUSD can have operator-supplied swap data.
+        // Exercise the missing-metadata branch with a non-currency fixture,
+        // without changing the process-wide broker table or its real costs.
+        let symbol = "ZZZUSD";
+        assert!(neoethos_core::symbol_metadata::resolve(symbol).is_none());
+        let profile = infer_market_cost_profile(symbol, "USD", None, Some(0.0), Some(0.0));
         assert_eq!(profile.swap_long_pips_per_day, 0.0);
         assert_eq!(profile.swap_short_pips_per_day, 0.0);
         assert_eq!(profile.pnl_conversion_fee_rate, 0.0);
+    }
+
+    #[test]
+    fn metadata_conversion_fee_respects_currency_and_keeps_invalid_values_invalid() {
+        assert_eq!(
+            resolve_metadata_conversion_fee(Some(0.005), "USD", "USD"),
+            0.0
+        );
+        assert_eq!(
+            resolve_metadata_conversion_fee(Some(0.005), "USD", "EUR"),
+            0.005
+        );
+        assert_eq!(
+            resolve_metadata_conversion_fee(Some(0.005), "usd", " usd "),
+            0.0
+        );
+        assert_eq!(resolve_metadata_conversion_fee(None, "USD", "EUR"), 0.0);
+        for invalid in [f64::NAN, -0.1, 1.0, f64::INFINITY] {
+            assert!(resolve_metadata_conversion_fee(Some(invalid), "USD", "USD").is_nan());
+            assert!(resolve_metadata_conversion_fee(Some(invalid), "USD", "EUR").is_nan());
+        }
     }
 
     // Note: a follow-up test will verify that broker-supplied swap +

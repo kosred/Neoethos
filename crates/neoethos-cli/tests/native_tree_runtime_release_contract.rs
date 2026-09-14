@@ -193,7 +193,12 @@ fn lightgbm_is_a_static_payload_while_catboost_staging_is_fail_closed() {
     assert!(lightgbm.contains("cargo:rustc-link-lib=static="));
 
     let catboost = source("vendor/catboost-rust-0.3.8-patched/build.rs");
-    let stage = catboost
+    assert!(
+        catboost
+            .contains("build_support::stage_selected_runtime(&lib_source_path, &lib_dest_path)")
+    );
+    let support = source("vendor/catboost-rust-0.3.8-patched/build_support.rs");
+    let stage = support
         .split_once("fn stage_selected_runtime(")
         .expect("CatBoost must have one fail-closed selected-runtime staging helper")
         .1;

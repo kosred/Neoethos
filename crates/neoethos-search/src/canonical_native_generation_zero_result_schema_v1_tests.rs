@@ -251,6 +251,7 @@ fn evaluation_snapshot_binds_versioned_objective_and_request_mode() {
     let mutations: &[fn(&mut EvaluationConfig)] = &[
         |value| value.symbol = "GBPUSD".to_owned(),
         |value| value.account_currency = "EUR".to_owned(),
+        |value| value.initial_equity = f64::from_bits(value.initial_equity.to_bits() + 1),
         |value| value.max_hold_bars += 1,
         |value| value.trailing_enabled = !value.trailing_enabled,
         |value| {
@@ -284,6 +285,18 @@ fn evaluation_snapshot_binds_versioned_objective_and_request_mode() {
             value.pnl_conversion_fee_rate =
                 f64::from_bits(value.pnl_conversion_fee_rate.to_bits() + 1);
         },
+        |value| value.kill_zones_enabled = !value.kill_zones_enabled,
+        |value| value.session_spread_pips = Some([0.8, 1.0, 1.2]),
+        |value| {
+            value.risk_per_trade_min = f64::from_bits(value.risk_per_trade_min.to_bits() + 1);
+        },
+        |value| {
+            value.risk_per_trade_max = f64::from_bits(value.risk_per_trade_max.to_bits() + 1);
+        },
+        |value| {
+            value.high_quality_confidence =
+                f64::from_bits(value.high_quality_confidence.to_bits() + 1);
+        },
         |value| {
             value.smc_gate_threshold = f64::from_bits(value.smc_gate_threshold.to_bits() + 1);
         },
@@ -306,7 +319,7 @@ fn evaluation_snapshot_binds_versioned_objective_and_request_mode() {
                 f64::from_bits(value.smc_weight_displacement.to_bits() + 1);
         },
     ];
-    assert_eq!(mutations.len(), 26);
+    assert_eq!(mutations.len(), 32);
     for mutate in mutations {
         let mut changed = config.clone();
         mutate(&mut changed);
@@ -332,6 +345,31 @@ fn evaluation_snapshot_binds_versioned_objective_and_request_mode() {
         CanonicalNativeGenerationZeroScoringObjectiveV1::RiskyKellyGrowthV5
     );
     assert_ne!(standard.identity_sha256(), growth.identity_sha256());
+    config.growth_goal = Some(crate::scoring::RiskyGrowthGoal {
+        start_balance: 100.0,
+        target_balance: 50_000.0,
+        horizon_days: 180.0,
+    });
+    let error =
+        CanonicalNativeGenerationZeroEvaluationEvidenceV1::checked_from_evaluation_config_v1(
+            &config,
+            crate::discovery::DiscoveryMode::Risky,
+        )
+        .err()
+        .expect("the V1 native snapshot cannot represent goal-aware scoring");
+    assert!(
+        error
+            .to_string()
+            .contains("requires versioned native support")
+    );
+    config.growth_goal = None;
+    let legacy_growth =
+        CanonicalNativeGenerationZeroEvaluationEvidenceV1::checked_from_evaluation_config_v1(
+            &config,
+            crate::discovery::DiscoveryMode::Risky,
+        )
+        .unwrap();
+    assert_eq!(growth.identity_sha256(), legacy_growth.identity_sha256());
 }
 
 #[test]
@@ -349,13 +387,16 @@ fn evaluation_snapshot_census_and_all_f64_inputs_are_fail_closed() {
         .map(str::trim)
         .filter(|line| line.starts_with("pub ") && line.ends_with(','))
         .collect();
-    assert_eq!(field_lines.len(), 27);
+    assert_eq!(field_lines.len(), 34);
     assert_eq!(body.matches(": String,").count(), 2);
     assert_eq!(body.matches(": usize,").count(), 1);
-    assert_eq!(body.matches(": bool,").count(), 2);
-    assert_eq!(body.matches(": f64,").count(), 22);
+    assert_eq!(body.matches(": bool,").count(), 3);
+    assert_eq!(body.matches(": f64,").count(), 26);
+    assert_eq!(body.matches(": Option<[f64; 3]>,").count(), 1);
+    assert_eq!(body.matches("pub growth_goal:").count(), 1);
 
     let setters: &[fn(&mut EvaluationConfig, f64)] = &[
+        |value, invalid| value.initial_equity = invalid,
         |value, invalid| value.trailing_atr_multiplier = invalid,
         |value, invalid| value.trailing_be_trigger_r = invalid,
         |value, invalid| value.trailing_min_lock_pips = invalid,
@@ -366,6 +407,9 @@ fn evaluation_snapshot_census_and_all_f64_inputs_are_fail_closed() {
         |value, invalid| value.swap_long_pips_per_day = invalid,
         |value, invalid| value.swap_short_pips_per_day = invalid,
         |value, invalid| value.pnl_conversion_fee_rate = invalid,
+        |value, invalid| value.risk_per_trade_min = invalid,
+        |value, invalid| value.risk_per_trade_max = invalid,
+        |value, invalid| value.high_quality_confidence = invalid,
         |value, invalid| value.smc_gate_threshold = invalid,
         |value, invalid| value.smc_weight_ob = invalid,
         |value, invalid| value.smc_weight_fvg = invalid,
@@ -379,7 +423,7 @@ fn evaluation_snapshot_census_and_all_f64_inputs_are_fail_closed() {
         |value, invalid| value.smc_weight_eql = invalid,
         |value, invalid| value.smc_weight_displacement = invalid,
     ];
-    assert_eq!(setters.len(), 22);
+    assert_eq!(setters.len(), 26);
     for set in setters {
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut config =
@@ -393,5 +437,29 @@ fn evaluation_snapshot_census_and_all_f64_inputs_are_fail_closed() {
                 .is_err()
             );
         }
+    }
+
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+        let mut config =
+            EvaluationConfig::for_symbol("EURUSD", "USD", Some(1.1), Some(1.2), Some(7.0));
+        config.session_spread_pips = Some([0.8, invalid, 1.2]);
+        assert!(
+            CanonicalNativeGenerationZeroEvaluationEvidenceV1::checked_from_evaluation_config_v1(
+                &config,
+                crate::discovery::DiscoveryMode::PropFirm,
+            )
+            .is_err()
+        );
+    }
+    for invalid in [0.0, -1.0] {
+        let mut config = valid_evaluation_config_v1(false);
+        config.initial_equity = invalid;
+        assert!(
+            CanonicalNativeGenerationZeroEvaluationEvidenceV1::checked_from_evaluation_config_v1(
+                &config,
+                crate::discovery::DiscoveryMode::PropFirm,
+            )
+            .is_err()
+        );
     }
 }

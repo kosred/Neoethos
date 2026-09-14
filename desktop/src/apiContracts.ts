@@ -29,6 +29,22 @@ export type DataImportSourceFormat =
   | "arrow-ipc-stream"
   | "vortex";
 
+export type SupervisorConfig = {
+  enabled: boolean;
+  intervalMinutes: number;
+  maxActionsPerTick: number;
+  directives: string[];
+};
+
+/** JSON key order is not part of the persisted configuration contract. */
+export function sameSupervisorConfig(left: SupervisorConfig, right: SupervisorConfig): boolean {
+  return left.enabled === right.enabled
+    && left.intervalMinutes === right.intervalMinutes
+    && left.maxActionsPerTick === right.maxActionsPerTick
+    && left.directives.length === right.directives.length
+    && left.directives.every((directive, index) => directive === right.directives[index]);
+}
+
 declare const canonicalDatasetIdentityBrand: unique symbol;
 
 /**
@@ -55,6 +71,30 @@ export type DatasetInventorySkipped = Readonly<{
   category: string;
   detail: string;
 }>;
+
+/** The selected revision and its assertions must survive an inventory refresh. */
+export function sameDiscoveryDatasetGeneration(
+  left: DatasetInventoryEntry,
+  right: DatasetInventoryEntry,
+): boolean {
+  return left.datasetIdentity === right.datasetIdentity
+    && left.generation === right.generation
+    && left.manifestBindingSha256 === right.manifestBindingSha256
+    && left.sourceKind === right.sourceKind
+    && left.symbol === right.symbol
+    && left.timeframe === right.timeframe;
+}
+
+/** Only an explicit click can replace a selected identity with another revision. */
+export function toggleDiscoveryDatasetSelection(
+  current: readonly DatasetInventoryEntry[],
+  entry: DatasetInventoryEntry,
+): DatasetInventoryEntry[] {
+  const others = current.filter((selected) => selected.datasetIdentity !== entry.datasetIdentity);
+  return current.some((selected) => sameDiscoveryDatasetGeneration(selected, entry))
+    ? others
+    : [...others, { ...entry }];
+}
 
 export type DiscoveryKnobs = Readonly<{
   higher_tfs?: string[];

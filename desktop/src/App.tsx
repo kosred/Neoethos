@@ -1,96 +1,77 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { appInfo, brokerStatus, type AppInfo, type BrokerStatus } from "./api";
-import Cockpit from "./screens/Cockpit";
-import Dashboard from "./screens/Dashboard";
-import Markets from "./screens/Markets";
-import MarketWatch from "./screens/MarketWatch";
-import Account from "./screens/Account";
-import Actions from "./screens/Actions";
-import Autopilot from "./screens/Autopilot";
-import RiskyMode from "./screens/RiskyMode";
-import Risk from "./screens/Risk";
-import Discovery from "./screens/Discovery";
-import Training from "./screens/Training";
-import StrategyLab from "./screens/StrategyLab";
-import StrategyReport from "./screens/StrategyReport";
-import Intelligence from "./screens/Intelligence";
-import Files from "./screens/Files";
-import Data from "./screens/Data";
-import News from "./screens/News";
-import AiDesk from "./screens/AiDesk";
-import Hardware from "./screens/Hardware";
-import Configuration from "./screens/Configuration";
-import Help from "./screens/Help";
+import {
+  Suspense,
+  lazy,
+  memo,
+  useCallback,
+  useMemo,
+  useEffect,
+  useState,
+  type ComponentType,
+  type LazyExoticComponent,
+} from "react";
+import { apiGet, appInfo, brokerStatus } from "./api";
+import { brokerConnectionView, type BrokerConnectionObservation } from "./runtimeStatus";
+import { usePoll } from "./hooks";
+import { brokerUiAccess } from "./brokerUi";
+import { BrokerUiContext } from "./brokerUiContext";
+import { ScreenBoundary } from "./components/ScreenBoundary";
 import "./App.css";
 
-type View =
-  | "help"
-  | "cockpit" | "dashboard" | "markets" | "marketwatch" | "account" | "actions"
-  | "autopilot" | "riskymode" | "risk" | "discovery" | "training" | "strategylab" | "strategyreport" | "intelligence"
-  | "files" | "data" | "news" | "aidesk" | "hardware" | "settings";
+const AutomationWorkspace = lazy(() => import("./screens/AutomationWorkspace"));
+const Data = lazy(() => import("./screens/Data"));
+const ResearchWorkspace = lazy(() => import("./screens/ResearchWorkspace"));
+const SettingsWorkspace = lazy(() => import("./screens/SettingsWorkspace"));
+const TradingWorkspace = lazy(() => import("./screens/TradingWorkspace"));
 
-type NavEntry = { id: View; label: string; icon: string } | { divider: string };
+type View = "trading" | "research" | "automation" | "data" | "settings";
 
-const NAV: NavEntry[] = [
-  { id: "help", label: "Help & Guide", icon: "❓" },
-  { divider: "Trade" },
-  { id: "cockpit", label: "Trade", icon: "🎯" },
-  { id: "dashboard", label: "Dashboard", icon: "▦" },
-  { id: "markets", label: "Markets", icon: "📈" },
-  { id: "marketwatch", label: "Market Watch", icon: "👁" },
-  { id: "account", label: "Account & Journal", icon: "💳" },
-  { id: "actions", label: "Actions", icon: "✓" },
-  { divider: "Autopilot" },
-  { id: "autopilot", label: "Autopilot", icon: "🤖" },
-  { id: "riskymode", label: "Risky Mode", icon: "🚀" },
-  { id: "risk", label: "Risk", icon: "🛡" },
-  { divider: "Research" },
-  { id: "discovery", label: "Discovery", icon: "🧬" },
-  { id: "training", label: "Training", icon: "🎓" },
-  { id: "strategylab", label: "Strategy Lab", icon: "⚗" },
-  { id: "strategyreport", label: "Strategy Report", icon: "📅" },
-  { id: "intelligence", label: "Intelligence", icon: "🧠" },
-  { divider: "Data & Files" },
-  { id: "files", label: "Files & Storage", icon: "🗂" },
-  { id: "data", label: "Data", icon: "🗄" },
-  { divider: "Desk" },
-  { id: "news", label: "News", icon: "📰" },
-  // AI Desk = the ONE LLM surface: unified chat (Assistant ↔ Supervisor
-  // modes) + the supervisor control panel (2026-07-11 consolidation).
-  { id: "aidesk", label: "AI Desk", icon: "💬" },
-  { divider: "System" },
-  { id: "hardware", label: "Hardware", icon: "🖥" },
-  { id: "settings", label: "Settings", icon: "⚙" },
+type NavEntry = Readonly<{
+  id: View;
+  label: string;
+  eyebrow: string;
+  component: ComponentType | LazyExoticComponent<ComponentType>;
+}>;
+
+const NAV: readonly NavEntry[] = [
+  { id: "trading", label: "Trading", eyebrow: "01", component: TradingWorkspace },
+  { id: "research", label: "Research", eyebrow: "02", component: ResearchWorkspace },
+  { id: "automation", label: "Automation", eyebrow: "03", component: AutomationWorkspace },
+  { id: "data", label: "Data", eyebrow: "04", component: Data },
+  { id: "settings", label: "Settings", eyebrow: "05", component: SettingsWorkspace },
 ];
 
-const SCREENS: Record<View, ReactNode> = {
-  help: <Help />,
-  cockpit: <Cockpit />,
-  dashboard: <Dashboard />,
-  markets: <Markets />,
-  marketwatch: <MarketWatch />,
-  account: <Account />,
-  actions: <Actions />,
-  autopilot: <Autopilot />,
-  riskymode: <RiskyMode />,
-  risk: <Risk />,
-  discovery: <Discovery />,
-  training: <Training />,
-  strategylab: <StrategyLab />,
-  strategyreport: <StrategyReport />,
-  intelligence: <Intelligence />,
-  files: <Files />,
-  data: <Data />,
-  news: <News />,
-  aidesk: <AiDesk />,
-  hardware: <Hardware />,
-  settings: <Configuration />,
-};
+const brokerObservation = () => apiGet<BrokerConnectionObservation>("/broker/status");
+
+// The connection clock must not re-render the chart/workspace every second.
+// NAV entries have stable identity; workspace-owned polls still update normally.
+const WorkspacePane = memo(function WorkspacePane({ active }: { active: NavEntry }) {
+  const ActiveWorkspace = active.component;
+  return (
+    <ScreenBoundary key={active.id} label={active.label}>
+      <Suspense fallback={<div className="workspace-loading">Loading workspace…</div>}>
+        <ActiveWorkspace />
+      </Suspense>
+    </ScreenBoundary>
+  );
+});
 
 export default function App() {
-  const [view, setView] = useState<View>("cockpit");
-  const [info, setInfo] = useState<AppInfo | null>(null);
-  const [status, setStatus] = useState<BrokerStatus | null>(null);
+  const [view, setView] = useState<View>("trading");
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const { data: info, error: infoError } = usePoll(appInfo);
+  const { data: status, error: statusError } = usePoll(brokerStatus, 5000);
+  const { data: connection, error: connectionError } = usePoll(async () => {
+    const observation = await brokerObservation();
+    // A new response may arrive after the last clock tick. Compare it with
+    // actual current time, not a one-second-old value that looks "future".
+    setNowMs(Date.now());
+    return observation;
+  }, 5000);
+
+  useEffect(() => {
+    const interval = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   // A focused <input type="number"> changes its VALUE when the mouse wheel
   // passes over it. Scrolling a settings page therefore silently rewrites the
@@ -113,56 +94,57 @@ export default function App() {
     return () => document.removeEventListener("wheel", onWheel);
   }, []);
 
-  useEffect(() => {
-    appInfo().then(setInfo).catch(() => {});
-    const tick = () => brokerStatus().then(setStatus).catch(() => {});
-    tick();
-    const id = setInterval(tick, 5000);
-    return () => clearInterval(id);
-  }, []);
-
-  const brokerLabel = !status
-    ? "…"
-    : !status.configured
-      ? "not configured"
-      : status.hasToken
-        ? `${status.environment} · ready`
-        : `${status.environment} · needs auth`;
+  const connectionView = brokerConnectionView(status, connection, nowMs, statusError, connectionError);
+  const brokerLabel = connectionView.label;
+  const active = NAV.find((entry) => entry.id === view) ?? NAV[0];
+  const openBrokerSetup = useCallback(() => setView("settings"), []);
+  const brokerUi = useMemo(() => ({
+    access: brokerUiAccess(status, statusError),
+    openSetup: openBrokerSetup,
+  }), [status, statusError, openBrokerSetup]);
 
   return (
     <div className="shell">
       <aside className="sidebar">
         <div className="logo">
-          NeoEthos <span className="pill">TAURI</span>
+          <span className="logo-mark">NE</span>
+          <span>
+            NeoEthos
+            <small>Research &amp; execution</small>
+          </span>
         </div>
-        <nav>
-          {NAV.map((n, i) =>
-            "divider" in n ? (
-              <div className="nav-divider" key={`d${i}`}>{n.divider}</div>
-            ) : (
-              <button
-                key={n.id}
-                className={`nav-item${view === n.id ? " active" : ""}`}
-                onClick={() => setView(n.id)}
-              >
-                <span className="nav-icon">{n.icon}</span>
-                {n.label}
-              </button>
-            ),
-          )}
+        <nav aria-label="Primary">
+          {NAV.map((entry) => (
+            <button
+              key={entry.id}
+              className={`nav-item${view === entry.id ? " active" : ""}`}
+              aria-current={view === entry.id ? "page" : undefined}
+              onClick={() => setView(entry.id)}
+            >
+              <span className="nav-index">{entry.eyebrow}</span>
+              <span>{entry.label}</span>
+            </button>
+          ))}
         </nav>
         <div className="sidebar-foot">
-          <div className={`dot ${status?.hasToken ? "ok" : "off"}`} />
-          cTrader: {brokerLabel}
+          <div className="connection-row">
+            <div className={`dot ${connectionView.connected ? "ok" : "off"}`} aria-hidden="true" />
+            <span>cTrader</span>
+          </div>
+          <strong title={connectionView.detail}>{brokerLabel}</strong>
         </div>
       </aside>
 
       <div className="main">
-        <div className="content">{SCREENS[view]}</div>
+        <div className="content">
+          <BrokerUiContext.Provider value={brokerUi}>
+            <WorkspacePane active={active} />
+          </BrokerUiContext.Provider>
+        </div>
         <footer className="statusbar">
           <span>cTrader · {brokerLabel}</span>
           <span className="spacer" />
-          <span className="muted">{info?.data_root ?? ""}</span>
+          <span className="muted" title={infoError}>{infoError ? "Application info unavailable" : info?.data_root ?? ""}</span>
           <span className="ver">v{info?.version ?? "…"}</span>
         </footer>
       </div>

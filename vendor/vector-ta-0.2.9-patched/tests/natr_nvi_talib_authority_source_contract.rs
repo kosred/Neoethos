@@ -17,13 +17,22 @@ fn source(relative: &str) -> String {
 #[test]
 fn natr_cuda_routes_pin_talib_lookback_period_one_and_zero_rules() {
     let kernel = source("kernels/cuda/natr_kernel.cu");
+    let production_f64 = source("kernels/cuda/neoethos_f64_kernels.cu");
+    let production_natr = production_f64
+        .split("// NATR — reference")
+        .nth(1)
+        .and_then(|tail| tail.split("// ADXR — reference").next())
+        .expect("production f64 NATR section");
 
-    assert!(kernel.contains("first_valid + period"));
-    assert!(kernel.contains("period <= 1"));
-    assert!(kernel.contains("1.0e-14"));
-    assert!(!kernel.contains("first_valid + period - 1"));
-    assert!(!kernel.contains("fma(tr - atr"));
-    assert!(!kernel.contains("__fmaf_rn(alpha"));
+    for source in [kernel.as_str(), production_natr] {
+        assert!(source.contains("first_valid + period"));
+        assert!(source.contains("period <= 1"));
+        assert!(source.contains("== 0.0"));
+        assert!(!source.contains("NATR_TA_EPSILON"));
+        assert!(!source.contains("first_valid + period - 1"));
+        assert!(!source.contains("fma(tr - atr"));
+        assert!(!source.contains("__fmaf_rn(alpha"));
+    }
 }
 
 #[test]

@@ -8,6 +8,9 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+#[path = "build_support/hip_runtime.rs"]
+mod hip_runtime_build;
+
 const DEVICE_SOURCES: [&str; 16] = [
     "native/smoke.cu",
     "native/prototype_b.cu",
@@ -27,10 +30,14 @@ const DEVICE_SOURCES: [&str; 16] = [
     "native/resident_trim_prefilter_v1.cu",
 ];
 
-const RESIDENT_SEARCH_SLICE2_PRIVATE_HEADERS: [&str; 3] = [
+const RESIDENT_SEARCH_SLICE2_PRIVATE_HEADERS: [&str; 7] = [
     "native/resident_generation_v2_internal.cuh",
     "native/resident_scoring_novelty_v2_internal.cuh",
     "native/resident_archive_knn_v2_abi.cuh",
+    "native/resident_archive_layout_v3.hpp",
+    "native/resident_backend_math_v3.cuh",
+    "native/resident_backend_identity_v3.cuh",
+    "native/resident_search_hip_v1_abi.cuh",
 ];
 
 const PRECISION_FLAGS: [&str; 4] = [
@@ -210,6 +217,8 @@ struct ResolvedCudaBuild {
     cuobjdump: String,
     cuobjdump_version: String,
     platform: NativePlatform,
+    target_env: String,
+    target_features: String,
     plan: CudaArchitecturePlan,
 }
 
@@ -411,6 +420,8 @@ pub fn build_nvcc_argv(
     output: &str,
     debug: bool,
     platform: NativePlatform,
+    target_env: &str,
+    target_features: &str,
 ) -> Vec<String> {
     let mut arguments = vec![
         "-c".to_string(),
@@ -423,6 +434,24 @@ pub fn build_nvcc_argv(
     arguments.extend(PRECISION_FLAGS.iter().map(|flag| (*flag).to_string()));
     if platform == NativePlatform::Unix {
         arguments.push("-Xcompiler=-fPIC".to_string());
+    } else {
+        // Current CCCL headers require MSVC's standard-conforming preprocessor.
+        // Select it explicitly instead of suppressing the header's diagnostic.
+        arguments.push("-Xcompiler=/Zc:preprocessor".to_string());
+        if target_env == "msvc" {
+            // Direct nvcc invocation bypasses cc-rs's target CRT selection.
+            // Match Rust's exact target feature, not DEBUG: debug information
+            // does not select the incompatible /MDd or /MTd runtime.
+            let runtime = if target_features
+                .split(',')
+                .any(|feature| feature == "crt-static")
+            {
+                "/MT"
+            } else {
+                "/MD"
+            };
+            arguments.push(format!("-Xcompiler={runtime}"));
+        }
     }
     arguments.extend(["-I".to_string(), "native".to_string()]);
     arguments.push(if debug { "-lineinfo" } else { "-O3" }.to_string());
@@ -506,10 +535,8 @@ fn is_canonical_no_ptx_diagnostic(output: &str) -> bool {
             if diagnostic_archive.replace(archive).is_some() {
                 return false;
             }
-        } else if let Some(member) = canonical_archive_member(line) {
-            members.push(member);
         } else {
-            return false;
+            members.push(line);
         }
     }
 
@@ -517,9 +544,10 @@ fn is_canonical_no_ptx_diagnostic(output: &str) -> bool {
         return false;
     };
     let mut member_objects = BTreeSet::new();
-    members
-        .into_iter()
-        .all(|(archive, object)| archive == diagnostic_archive && member_objects.insert(object))
+    members.into_iter().all(|line| {
+        canonical_archive_member(line, diagnostic_archive)
+            .is_some_and(|object| member_objects.insert(object))
+    })
 }
 
 fn canonical_no_ptx_archive(line: &str) -> Option<&str> {
@@ -533,14 +561,35 @@ fn canonical_no_ptx_archive(line: &str) -> Option<&str> {
     .then_some(archive)
 }
 
-fn canonical_archive_member(line: &str) -> Option<(&str, &str)> {
-    let member = line.strip_prefix("member ")?.strip_suffix(':')?;
-    let (archive, object) = member.rsplit_once(':')?;
-    (!archive.is_empty()
-        && archive.trim() == archive
-        && !archive.chars().any(char::is_control)
-        && is_safe_archive_member_basename(object))
-    .then_some((archive, object))
+fn canonical_archive_member<'a>(line: &'a str, archive: &str) -> Option<&'a str> {
+    if archive.is_empty() || archive.trim() != archive || archive.chars().any(char::is_control) {
+        return None;
+    }
+    // Bind to the independently parsed no-PTX archive first: rsplit_once(':')
+    // mistakes an absolute Windows object's drive colon for the delimiter.
+    let object = line
+        .strip_prefix("member ")?
+        .strip_prefix(archive)?
+        .strip_prefix(':')?
+        .strip_suffix(':')?;
+    if is_safe_archive_member_basename(object) {
+        return Some(object);
+    }
+    // Windows nvcc --lib retains absolute object names. This builder puts all
+    // objects beside the archive; accept only that exact sibling path, not
+    // arbitrary paths/traversal. Return the basename so mixed forms cannot
+    // disguise duplicate members.
+    let (directory, _) = archive.rsplit_once(['\\', '/'])?;
+    let bytes = directory.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return None;
+    }
+    let basename = object.strip_prefix(directory)?.strip_prefix(['\\', '/'])?;
+    is_safe_archive_member_basename(basename).then_some(basename)
 }
 
 fn is_safe_archive_member_basename(object: &str) -> bool {
@@ -632,7 +681,26 @@ fn json_escape(value: &str) -> String {
 
 fn main() {
     let cuda_feature = env::var_os("CARGO_FEATURE_CUDA").is_some();
+    let hip_runtime_feature = env::var_os("CARGO_FEATURE_HIP_RUNTIME").is_some();
+    let hip_native_feature = env::var_os("CARGO_FEATURE_HIP_NATIVE_KERNELS").is_some();
+    assert!(
+        !(cuda_feature && hip_native_feature),
+        "cuda and hip-native-kernels have separate native ABI identities; select one backend build"
+    );
     emit_rerun_contract(cuda_feature);
+    hip_runtime_build::emit_rerun_contract(hip_runtime_feature);
+    // docs.rs (and an explicit local `DOCS_RS=1 cargo check`) must be able to
+    // type-check the CUDA-gated Rust API on hosts without a CUDA toolkit.  This
+    // path deliberately emits no native archive, build manifest, SASS target,
+    // or link directive, so it cannot be mistaken for an executable CUDA
+    // build.  Normal feature builds never set DOCS_RS and retain the strict
+    // toolkit/device probe below.
+    if (cuda_feature || hip_runtime_feature) && env::var_os("DOCS_RS").is_some() {
+        return;
+    }
+    if hip_runtime_feature {
+        hip_runtime_build::compile().unwrap_or_else(|error| panic!("{error}"));
+    }
     // CpuOnly/default builds deliberately perform no NVIDIA or nvcc probe.
     // CUDA builds resolve and validate the complete architecture plan before
     // even the host ABI compiler is started.
@@ -649,7 +717,7 @@ fn main() {
     let mut host = cc::Build::new();
     host.cpp(true).std("c++17").include("native");
     host.file("native/layout_asserts.cpp");
-    if !cuda_feature {
+    if !cuda_feature && !hip_native_feature {
         host.file("native/stub.cpp");
     }
     host.compile("neoethos_gpu_cuda_abi");
@@ -664,8 +732,11 @@ fn emit_rerun_contract(cuda_feature: bool) {
     println!("cargo:rerun-if-changed=native/resident_higher_timeframe_alignment_v3_abi.cuh");
     println!("cargo:rerun-if-changed=native/resident_quant_v3_abi.cuh");
     println!("cargo:rerun-if-changed=native/resident_exact_log_v3.cuh");
+    println!("cargo:rerun-if-changed=native/resident_parallel_primitives_v1.cuh");
+    println!("cargo:rerun-if-changed=native/resident_host_staging_v1.hpp");
     println!("cargo:rerun-if-changed=native/resident_scoring_novelty_v1_abi.cuh");
     println!("cargo:rerun-if-changed=native/resident_generation_v1_abi.cuh");
+    println!("cargo:rerun-if-changed=native/resident_generation_adaptive_v3_abi.cuh");
     println!("cargo:rerun-if-changed=native/resident_generation_v2_abi.cuh");
     println!("cargo:rerun-if-changed=native/resident_search_generation_v2_abi.cuh");
     println!("cargo:rerun-if-changed=native/resident_trim_prefilter_v1_abi.cuh");
@@ -751,6 +822,9 @@ fn resolve_cuda_build() -> Result<ResolvedCudaBuild, String> {
     let target_os = env::var("CARGO_CFG_TARGET_OS")
         .map_err(|error| format!("Cargo did not provide CARGO_CFG_TARGET_OS: {error}"))?;
     let platform = NativePlatform::from_target_os(&target_os)?;
+    let target_env = env::var("CARGO_CFG_TARGET_ENV")
+        .map_err(|error| format!("Cargo did not provide CARGO_CFG_TARGET_ENV: {error}"))?;
+    let target_features = read_optional_env("CARGO_CFG_TARGET_FEATURE")?.unwrap_or_default();
 
     let build_mode = read_optional_env("NEOETHOS_CUDA_BUILD_MODE")?;
     let explicit_architectures = read_optional_env("NEOETHOS_CUDA_ARCHS")?;
@@ -815,6 +889,8 @@ fn resolve_cuda_build() -> Result<ResolvedCudaBuild, String> {
         cuobjdump,
         cuobjdump_version,
         platform,
+        target_env,
+        target_features,
         plan,
     })
 }
@@ -919,6 +995,8 @@ fn compile_device_objects(cuda_build: &ResolvedCudaBuild) {
             object_text,
             debug,
             cuda_build.platform,
+            &cuda_build.target_env,
+            &cuda_build.target_features,
         );
         if resident_search_v2_device_fixtures {
             arguments.push("-DNEOETHOS_CUDA_DEVICE_FIXTURES_V2=1".to_string());

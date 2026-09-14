@@ -27,7 +27,6 @@ fn production_accepts_only_direct_timeframe_generations() {
         "crates/neoethos-data/src/core/direct_timeframes.rs",
         "crates/neoethos-data/src/core/features.rs",
         "crates/neoethos-feature-contracts/src/identity.rs",
-        "crates/neoethos-core/src/config.rs",
         "crates/neoethos-app/src/lib.rs",
         "crates/neoethos-app/src/app_services/discovery.rs",
         "crates/neoethos-search/src/discovery.rs",
@@ -60,6 +59,15 @@ fn production_accepts_only_direct_timeframe_generations() {
         }
     }
 
+    // The sealed loader keeps a migration-only tombstone so a configuration
+    // written by the older release is named and ignored instead of becoming a
+    // hard startup failure. The key is not a field and no runtime source above
+    // may consume it.
+    let config = std::fs::read_to_string(root.join("crates/neoethos-core/src/config.rs"))
+        .expect("sealed config authority must exist");
+    assert!(config.contains("path: \"models.data_runtime.rebuild_stale_higher_tfs\""));
+    assert!(config.contains("kind: RetiredKind::Deleted"));
+
     let direct =
         std::fs::read_to_string(root.join("crates/neoethos-data/src/core/direct_timeframes.rs"))
             .expect("direct timeframe contract must exist");
@@ -71,6 +79,6 @@ fn production_accepts_only_direct_timeframe_generations() {
 
     let data = std::fs::read_to_string(root.join("crates/neoethos-data/src/lib.rs"))
         .expect("data runtime source must exist");
-    assert!(data.contains("align_feature_columns_at_explicit_availability_ms"));
-    assert!(data.contains("next_direct_bar_open_v1"));
+    assert!(data.contains("align_calendar_feature_columns_by_observed_next_open_ms"));
+    assert!(data.contains("next_direct_bar_open_observed_span_expiry_v1"));
 }

@@ -1,167 +1,29 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use neoethos_broker_truth::{
-    BrokerFinancialOperationV1, BrokerFinancialTruthArtifactSourceV1,
-    BrokerFinancialTruthAuthoritySourceClassV2, BrokerFinancialTruthBindingV1,
-    BrokerFinancialTruthBundleManifestV2, BrokerFinancialTruthBundleStoreV1,
+    BrokerFinancialOperationV1, BrokerFinancialTruthAuthoritySourceClassV2,
     BrokerFinancialTruthEvidenceClassV2, BrokerFinancialTruthSemanticIngressErrorCodeV2,
-    BrokerFinancialTruthVortexSchemaV1, BrokerTruthAcquisitionArtifactRoleV1,
-    BrokerTruthAcquisitionArtifactSourceV1, BrokerTruthAcquisitionArtifactV1,
-    BrokerTruthAcquisitionAuthorityManifestV1, BrokerTruthAcquisitionLinkReceiptV1,
     BrokerTruthAcquisitionPromotionEligibilityV1, BrokerTruthAcquisitionSemanticStatusV1,
-    BrokerTruthAcquisitionStoreV1, BrokerTruthReviewedSynchronizationBindingV1, EvidenceWindowV1,
-    ExactBrokerRequestChunkV2, ExactBrokerRequestPageV2, ExactCapturedEvidencePairV1,
-    ExactConversionRouteEvidenceV2, ExactDealReconciliationEvidenceV2, ExactQuoteSideEvidenceV2,
-    ExactSymbolContractEvidenceV2, ImmutableVortexArtifactV1, QuoteSideV1,
-    ReviewedBrokerFinancialTruthEvidenceV2, ReviewedQuoteReplayRuleEvidenceV2,
-    ReviewedQuoteReplayRuleIdentityV2, SynchronizedBidAskEvidenceV2,
+    CanonicalBarSignalResearchDecisionV1, ClosedCanonicalBarTimeExitV1,
+    ClosedCanonicalBarTrailingThresholdV1, EvidenceWindowV1, ExecutionSymbolContractV1,
+    LockedFinalistOosReplayScopeV1, QuoteValidatedExecutionEconomicsLedgerV1,
+    QuoteValidatedResearchExitReasonV1, QuoteValidatedResearchReplayBindingV1,
+    QuoteValidatedResearchReplayErrorCodeV1, QuoteValidatedResearchReplayPlanV1,
+    QuoteValidatedResearchReplayPolicyV1, ResearchPositionDirectionV1,
+    ReviewedQuoteReplayRuleIdentityV2, SealedHistoricalBidAskQuoteReplayEvidenceV1,
+    SealedHistoricalQuoteValidatedResearchLedgerV1, VersionedLatencySlippagePolicyV1,
     current_broker_financial_truth_capability_v1,
     inspect_untrusted_broker_financial_truth_bundle_v2,
+    into_sealed_historical_bid_ask_quote_replay_evidence_v2,
+    open_sealed_historical_bid_ask_quote_replay_evidence_v1,
+    preview_sealed_quote_validated_research_entry_v1,
+    replay_sealed_quote_validated_decision_sequence_v1, replay_sealed_quote_validated_research_v1,
     validate_reviewed_broker_financial_truth_authority_v2,
 };
-use neoethos_dataset_contracts::{
-    BarTimestampConvention, CTraderEnvironment, CanonicalDatasetIdentity, CanonicalTimeframe,
-};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use vortex_array::IntoArray;
-use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinArray};
-use vortex_array::scalar_fn::session::ScalarFnSession;
-use vortex_array::session::ArraySession;
-use vortex_file::WriteOptionsSessionExt;
-use vortex_io::runtime::BlockingRuntime;
-use vortex_io::runtime::current::CurrentThreadRuntime;
-use vortex_io::session::{RuntimeSession, RuntimeSessionExt};
-use vortex_layout::session::LayoutSession;
-use vortex_session::VortexSession;
+use std::fs;
 
-const ACCOUNT_ID: i64 = 7;
-const SYMBOL_ID: i64 = 42;
-const WINDOW_FROM: i64 = 1_700_000_000_000;
-const WINDOW_TO: i64 = WINDOW_FROM + 60_000;
-const TICK_TIMESTAMP: i64 = WINDOW_FROM + 30_000;
-const CANONICAL_RUN_BYTES: &[u8] = b"exact canonical run receipt fixture v2";
-const REVIEW_RECORD_BYTES: &[u8] = b"reviewed quote semantics fixture v2";
-const PROTOCOL_EVIDENCE_BYTES: &[u8] = b"reviewed cTrader protocol fixture v2";
-const TRUST_ROOT_BYTES: &[u8] = b"offline fixture trust root v2";
-
-static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
-static VORTEX_RUNTIME: LazyLock<CurrentThreadRuntime> = LazyLock::new(CurrentThreadRuntime::new);
-static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let mut session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<LayoutSession>()
-        .with::<ScalarFnSession>()
-        .with::<RuntimeSession>()
-        .with_handle(VORTEX_RUNTIME.handle());
-    vortex_file::register_default_encodings(&mut session);
-    session
-});
-
-#[derive(Clone, Copy)]
-enum Tamper {
-    None,
-    CorruptVortex,
-    ExtraDecodedTickField,
-    WrongDeclaredRowCount,
-    TickRawDecodedMismatch,
-    InvalidRawEnvelope,
-    GenericRawDecodedLinkMismatch,
-    DealPageMismatch,
-}
-
-struct FixtureRoot(PathBuf);
-
-impl Drop for FixtureRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-struct AuthorityFixture {
-    store: BrokerTruthAcquisitionStoreV1,
-    link_receipt: BrokerTruthAcquisitionLinkReceiptV1,
-    reviewed: ReviewedBrokerFinancialTruthEvidenceV2,
-}
-
-struct ArtifactBuilder {
-    source_root: PathBuf,
-    sources: Vec<BrokerFinancialTruthArtifactSourceV1>,
-}
-
-impl ArtifactBuilder {
-    fn new(source_root: PathBuf) -> Self {
-        Self {
-            source_root,
-            sources: Vec::new(),
-        }
-    }
-
-    fn array(
-        &mut self,
-        relative_path: &str,
-        schema: BrokerFinancialTruthVortexSchemaV1,
-        array: vortex_array::ArrayRef,
-        declared_rows: Option<u64>,
-    ) -> ImmutableVortexArtifactV1 {
-        let path = self.source_root.join(relative_path);
-        write_vortex(&path, array.clone());
-        let exact =
-            ImmutableVortexArtifactV1::from_file(relative_path, schema, array.len() as u64, &path)
-                .expect("inspect Vortex source");
-        let artifact = if let Some(rows) = declared_rows {
-            ImmutableVortexArtifactV1::new(
-                relative_path,
-                schema,
-                exact.sha256(),
-                exact.byte_len(),
-                rows,
-            )
-            .expect("descriptor with deliberate semantic row-count mismatch")
-        } else {
-            exact
-        };
-        self.sources.push(
-            BrokerFinancialTruthArtifactSourceV1::new(relative_path, path)
-                .expect("artifact source"),
-        );
-        artifact
-    }
-
-    fn corrupt(
-        &mut self,
-        relative_path: &str,
-        schema: BrokerFinancialTruthVortexSchemaV1,
-    ) -> ImmutableVortexArtifactV1 {
-        let path = self.source_root.join(relative_path);
-        fs::write(&path, b"not-a-vortex-file").expect("write corrupt structural fixture");
-        let artifact = ImmutableVortexArtifactV1::from_file(relative_path, schema, 1, &path)
-            .expect("describe corrupt bytes without claiming Vortex semantics");
-        self.sources.push(
-            BrokerFinancialTruthArtifactSourceV1::new(relative_path, path)
-                .expect("corrupt artifact source"),
-        );
-        artifact
-    }
-}
-
-#[derive(Clone)]
-struct EvidenceRow {
-    sequence: u64,
-    account_id: i64,
-    symbol_id: Option<i64>,
-    quote_side: Option<QuoteSideV1>,
-    evidence_kind: u8,
-    requested_window: Option<EvidenceWindowV1>,
-    client_msg_id: String,
-    payload_type: u32,
-    payload_json: String,
-}
+#[path = "support/semantic_fixture.rs"]
+mod semantic_fixture;
+use semantic_fixture::*;
 
 #[test]
 fn structurally_consistent_synthetic_bundle_remains_explicitly_untrusted() {
@@ -280,6 +142,834 @@ fn reviewed_identity_never_overrides_raw_decoded_semantic_failure() {
 }
 
 #[test]
+fn reviewed_quote_transfer_rejects_every_changed_replay_binding() {
+    for changed_field in [
+        "receipt",
+        "account",
+        "symbol_id",
+        "symbol_name",
+        "window",
+        "review",
+        "manifest",
+    ] {
+        let (_root, verified, fixture) = fixture(Tamper::None);
+        let authority = validate_reviewed_broker_financial_truth_authority_v2(
+            &fixture.store,
+            &fixture.link_receipt,
+            fixture.reviewed,
+        )
+        .expect("independently checked fixture authority");
+        let review = if changed_field == "review" {
+            ReviewedQuoteReplayRuleIdentityV2::new(
+                sha256(b"different independent review"),
+                sha256(PROTOCOL_EVIDENCE_BYTES),
+                verified
+                    .manifest()
+                    .primary_quotes()
+                    .replay_rule()
+                    .identity()
+                    .broker_observation_sha256(),
+            )
+            .expect("well-formed but unrelated replay rule")
+        } else {
+            verified
+                .manifest()
+                .primary_quotes()
+                .replay_rule()
+                .identity()
+                .clone()
+        };
+        let scope = LockedFinalistOosReplayScopeV1::new(
+            EvidenceWindowV1::new(
+                WINDOW_FROM + 1_000 + i64::from(changed_field == "window"),
+                WINDOW_TO - 1_000,
+            )
+            .expect("well-formed locked window"),
+            1_000,
+            1_000,
+        )
+        .expect("well-formed padded window");
+        let binding = QuoteValidatedResearchReplayBindingV1::new(
+            if changed_field == "receipt" {
+                sha256(b"another canonical receipt")
+            } else {
+                sha256(CANONICAL_RUN_BYTES)
+            },
+            sha256(b"fixed closed-quote signal fixture"),
+            ACCOUNT_ID + i64::from(changed_field == "account"),
+            SYMBOL_ID + i64::from(changed_field == "symbol_id"),
+            if changed_field == "symbol_name" {
+                "GBPUSD"
+            } else {
+                "EURUSD"
+            },
+            scope,
+            review,
+            if changed_field == "manifest" {
+                sha256(b"another BFT2 manifest")
+            } else {
+                verified.receipt().manifest_sha256().to_owned()
+            },
+        )
+        .expect("self-consistent alternate binding, not merely a broken checksum");
+        let error = into_sealed_historical_bid_ask_quote_replay_evidence_v2(authority, &binding)
+            .expect_err("a reviewed authority must not transfer to another replay binding");
+        assert_eq!(
+            error.code(),
+            neoethos_broker_truth::QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch,
+            "changed {changed_field}",
+        );
+    }
+}
+
+#[test]
+fn reviewed_quote_transfer_uses_the_verified_snapshot_not_later_file_bytes() {
+    let (root, verified, fixture) = fixture_with_ticks(
+        Tamper::None,
+        &[
+            (TICK_TIMESTAMP - 1, 124_000),
+            (TICK_TIMESTAMP + 1_000, 112_500),
+        ],
+        &[(TICK_TIMESTAMP, 125_000)],
+    );
+    let binding = closed_quote_replay_binding(&verified);
+    let authority = validate_reviewed_broker_financial_truth_authority_v2(
+        &fixture.store,
+        &fixture.link_receipt,
+        fixture.reviewed,
+    )
+    .expect("read and verify the complete original Vortex snapshot");
+    let quote_path =
+        verified.artifact_path(verified.manifest().primary_quotes().ask().decoded_ticks());
+    assert!(
+        quote_path.starts_with(&root.0),
+        "only this test's generated fixture may change"
+    );
+    fs::write(
+        &quote_path,
+        b"changed after the reviewed snapshot was fully decoded",
+    )
+    .expect("corrupt only a generated temporary fixture");
+    open_sealed_historical_bid_ask_quote_replay_evidence_v1(
+        &fixture.store,
+        &fixture.link_receipt,
+        &binding,
+    )
+    .expect_err("the old reopen route must refuse the changed on-disk object");
+    let evidence = into_sealed_historical_bid_ask_quote_replay_evidence_v2(authority, &binding)
+        .expect("move the previously verified owned records without reopening the changed file");
+    let plan = closed_quote_replay_plan(binding);
+    let ledger = replay_sealed_quote_validated_research_v1(&plan, &evidence)
+        .expect("the consumer replays the original verified prices");
+    assert_eq!(
+        ledger,
+        replay_sealed_quote_validated_research_v1(&plan, &evidence)
+            .expect("the same immutable snapshot remains reusable after on-disk tampering")
+    );
+    assert_eq!(ledger.positions()[0].modeled_entry_price(), 1.25);
+    assert_eq!(ledger.positions()[0].modeled_exit_price(), Some(1.125));
+    assert_eq!(ledger.positions()[0].additional_spread_pips_charged(), 0.0);
+    assert_eq!(
+        ledger.promotion_eligibility(),
+        neoethos_broker_truth::QuoteValidatedResearchPromotionEligibilityV1::NotPromotionEligible,
+    );
+    current_broker_financial_truth_capability_v1()
+        .require(BrokerFinancialOperationV1::HistoricalEvaluation)
+        .expect_err("snapshot transfer does not open the global V1 gate");
+}
+
+#[test]
+fn sealed_quote_execution_economics_replays_actual_vortex_fills() {
+    let (_root, quotes, economics) = closed_quote_economics_fixture();
+    let position = &quotes.positions()[0];
+    assert_eq!(position.modeled_entry_price(), 1.25);
+    assert_eq!(position.modeled_exit_price(), Some(1.125));
+    assert_eq!(economics.base_units(), 100_000.0);
+    // Independent exact-binary oracle: -(1/8) * 100,000 - 7 - 7.
+    assert_eq!(economics.gross_pnl_account_currency().amount(), -12_500.0);
+    assert_eq!(economics.net_pnl_account_currency().amount(), -12_514.0);
+    economics
+        .validate_against_quote_ledger(&quotes)
+        .expect("economics built from these exact sealed fills must validate");
+    current_broker_financial_truth_capability_v1()
+        .require(BrokerFinancialOperationV1::HistoricalEvaluation)
+        .expect_err("synthetic execution evidence must not open the global financial gate");
+}
+
+#[test]
+fn sealed_quote_execution_economics_rejects_rehashed_detached_fills() {
+    let (_root, quotes, economics) = closed_quote_economics_fixture();
+    let original = serde_json::to_value(&economics).expect("execution fixture JSON");
+    let mut accepted = Vec::new();
+    for changed in [
+        "position_index",
+        "symbol",
+        "direction",
+        "entry_price",
+        "exit_price",
+        "entry_timestamp",
+        "exit_timestamp",
+    ] {
+        let mut wire = original.clone();
+        match changed {
+            "position_index" => wire["quote_position_index"] = json!(1),
+            "symbol" => {
+                wire["symbol_contract"] = serde_json::to_value(
+                    ExecutionSymbolContractV1::new("GBPUSD", "GBP", "USD", 100_000.0)
+                        .expect("different internally valid symbol contract"),
+                )
+                .expect("different contract JSON");
+            }
+            "direction" => wire["direction"] = json!("short"),
+            "entry_price" => {
+                wire["modeled_entry_price"] = json!(1.0);
+                wire["entry_notional_quote_currency"] = json!(100_000.0);
+            }
+            "exit_price" => wire["modeled_exit_price"] = json!(1.375),
+            "entry_timestamp" => wire["entry_fill_timestamp_unix_ms"] = json!(TICK_TIMESTAMP - 1),
+            "exit_timestamp" => wire["exit_fill_timestamp_unix_ms"] = json!(TICK_TIMESTAMP + 1_001),
+            _ => unreachable!("finite fixture mutation set"),
+        }
+        if matches!(changed, "direction" | "entry_price" | "exit_price") {
+            wire["gross_pnl_quote_currency"] = json!(12_500.0);
+            wire["gross_pnl_account_currency"]["amount"] = json!(12_500.0);
+            wire["net_pnl_account_currency"]["amount"] = json!(12_486.0);
+        }
+        rehash_untrusted_execution_fixture(&mut wire);
+        let detached = QuoteValidatedExecutionEconomicsLedgerV1::from_json_bytes(
+            &serde_json::to_vec(&wire).expect("encode detached fixture"),
+        )
+        .expect("forgery is deliberately internally consistent, not a stale-hash failure");
+        assert_eq!(detached.quote_ledger_sha256(), quotes.ledger_sha256());
+        if matches!(changed, "direction" | "entry_price" | "exit_price") {
+            assert_eq!(detached.net_pnl_account_currency().amount(), 12_486.0);
+        }
+        if detached.validate_against_quote_ledger(&quotes).is_ok() {
+            accepted.push(changed);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "sealed loss -12514 was accepted with detached fields: {accepted:?}"
+    );
+}
+
+#[test]
+fn one_reviewed_snapshot_supports_concurrent_replays_of_a_long_short_sequence() {
+    let (_root, binding, evidence) = sealed_quote_sequence_fixture(
+        &[
+            (TICK_TIMESTAMP - 1, 124_000),
+            (TICK_TIMESTAMP + 1_000, 112_500),
+            (TICK_TIMESTAMP + 2_000, 125_000),
+        ],
+        &[
+            (TICK_TIMESTAMP, 125_000),
+            (TICK_TIMESTAMP + 1_999, 126_000),
+            (TICK_TIMESTAMP + 3_000, 112_500),
+        ],
+    );
+    let plans = vec![
+        closed_quote_replay_plan(binding.clone()),
+        quote_replay_plan_at(
+            binding,
+            TICK_TIMESTAMP + 2_000,
+            ResearchPositionDirectionV1::Short,
+            1.5,
+            1.2,
+            Vec::new(),
+        ),
+    ];
+    // Concurrent replays of these same bound inputs share one snapshot.
+    // Time remains ordered inside each replay; this is not a Search scheduler.
+    let (first_run, second_run) = std::thread::scope(|scope| {
+        let other = scope.spawn(|| {
+            replay_sealed_quote_validated_decision_sequence_v1(&plans, &evidence)
+                .expect("second lane uses the same immutable quote snapshot")
+        });
+        let first = replay_sealed_quote_validated_decision_sequence_v1(&plans, &evidence)
+            .expect("long loss then short gain, each closing before the next decision");
+        (first, other.join().expect("bounded replay lane thread"))
+    });
+    assert_eq!(
+        first_run, second_run,
+        "all outcomes and receipt hashes agree"
+    );
+    assert_eq!(first_run.len(), 2);
+    assert_ne!(first_run[0].ledger_sha256(), first_run[1].ledger_sha256());
+    for ledger in &first_run {
+        assert_eq!(ledger.positions().len(), 1);
+        assert!(ledger.entry_unavailable().is_empty());
+        assert_eq!(ledger.positions()[0].modeled_entry_price(), 1.25);
+        assert_eq!(ledger.positions()[0].modeled_exit_price(), Some(1.125));
+        assert_eq!(ledger.positions()[0].additional_spread_pips_charged(), 0.0);
+        assert_eq!(
+            ledger.promotion_eligibility(),
+            neoethos_broker_truth::QuoteValidatedResearchPromotionEligibilityV1::NotPromotionEligible
+        );
+    }
+    let loss = fixture_execution_economics(&first_run[0]);
+    let gain = fixture_execution_economics(&first_run[1]);
+    // Independent exact-binary oracle: +/- (1/8 * 100,000), USD 7 per fill.
+    assert_eq!(loss.net_pnl_account_currency().amount(), -12_514.0);
+    assert_eq!(gain.net_pnl_account_currency().amount(), 12_486.0);
+    assert_eq!(
+        loss.net_pnl_account_currency().amount() + gain.net_pnl_account_currency().amount(),
+        -28.0
+    );
+    current_broker_financial_truth_capability_v1()
+        .require(BrokerFinancialOperationV1::HistoricalEvaluation)
+        .expect_err("multi-decision replay never opens the global V1 gate");
+}
+
+#[test]
+fn replay_sequence_rejects_overlapping_or_same_time_position_transitions() {
+    let (_root, binding, evidence) = sealed_quote_sequence_fixture(
+        &[
+            (TICK_TIMESTAMP - 1, 124_000),
+            (TICK_TIMESTAMP + 1_000, 112_500),
+        ],
+        &[(TICK_TIMESTAMP, 125_000)],
+    );
+    for offset in [500, 1_000] {
+        let plans = vec![
+            closed_quote_replay_plan(binding.clone()),
+            quote_replay_plan_at(
+                binding.clone(),
+                TICK_TIMESTAMP + offset,
+                ResearchPositionDirectionV1::Long,
+                1.2,
+                1.5,
+                Vec::new(),
+            ),
+        ];
+        let error = replay_sealed_quote_validated_decision_sequence_v1(&plans, &evidence)
+            .expect_err("a prior close must strictly precede the next decision");
+        assert_eq!(
+            error.code(),
+            QuoteValidatedResearchReplayErrorCodeV1::OverlappingDecisionWindow
+        );
+    }
+}
+
+#[test]
+fn replay_sequence_retains_open_terminal_position_and_refuses_another_entry() {
+    let (_root, binding, evidence) = sealed_quote_sequence_fixture(
+        &[(TICK_TIMESTAMP - 1, 124_000)],
+        &[(TICK_TIMESTAMP, 125_000)],
+    );
+    let first = closed_quote_replay_plan(binding.clone());
+    let single =
+        replay_sealed_quote_validated_decision_sequence_v1(std::slice::from_ref(&first), &evidence)
+            .expect("a final open position is explicit, never a fabricated close");
+    assert!(single[0].positions()[0].exit_reference().is_none());
+    let next = quote_replay_plan_at(
+        binding,
+        TICK_TIMESTAMP + 2_000,
+        ResearchPositionDirectionV1::Long,
+        1.2,
+        1.5,
+        Vec::new(),
+    );
+    let error = replay_sealed_quote_validated_decision_sequence_v1(&[first, next], &evidence)
+        .expect_err("an open prior position cannot be forgotten by a later decision");
+    assert_eq!(
+        error.code(),
+        QuoteValidatedResearchReplayErrorCodeV1::OpenPositionBeforeNextDecision
+    );
+}
+
+#[test]
+fn replay_sequence_waits_for_non_entry_deadline_before_next_decision() {
+    let (_root, binding, evidence) = sealed_quote_sequence_fixture(
+        &[
+            (TICK_TIMESTAMP + 1_999, 124_000),
+            (TICK_TIMESTAMP + 3_000, 150_000),
+        ],
+        &[(TICK_TIMESTAMP + 2_000, 125_000)],
+    );
+    let first = closed_quote_replay_plan(binding.clone());
+    let next = |offset| {
+        quote_replay_plan_at(
+            binding.clone(),
+            TICK_TIMESTAMP + offset,
+            ResearchPositionDirectionV1::Long,
+            1.2,
+            1.5,
+            Vec::new(),
+        )
+    };
+    for offset in [499, 500] {
+        let error = replay_sealed_quote_validated_decision_sequence_v1(
+            &[first.clone(), next(offset)],
+            &evidence,
+        )
+        .expect_err("a pending entry still owns its inclusive wait deadline");
+        assert_eq!(
+            error.code(),
+            QuoteValidatedResearchReplayErrorCodeV1::OverlappingDecisionWindow
+        );
+    }
+    let ledgers =
+        replay_sealed_quote_validated_decision_sequence_v1(&[first, next(2_000)], &evidence)
+            .expect("expired entry followed by a later executable decision");
+    assert!(ledgers[0].positions().is_empty());
+    assert_eq!(
+        ledgers[0].entry_unavailable()[0].deadline_unix_ms(),
+        TICK_TIMESTAMP + 500
+    );
+    assert_eq!(ledgers[1].positions()[0].modeled_exit_price(), Some(1.5));
+}
+
+#[test]
+fn each_sequence_decision_owns_its_profit_protecting_trailing_schedule() {
+    let (_root, binding, evidence) = sealed_quote_sequence_fixture(
+        &[
+            (TICK_TIMESTAMP - 1, 124_000),
+            (TICK_TIMESTAMP + 1_000, 137_500),
+            (TICK_TIMESTAMP + 1_999, 124_000),
+            (TICK_TIMESTAMP + 2_001, 124_000),
+            (TICK_TIMESTAMP + 3_000, 150_000),
+        ],
+        &[(TICK_TIMESTAMP, 125_000), (TICK_TIMESTAMP + 2_000, 125_000)],
+    );
+    let trail = ClosedCanonicalBarTrailingThresholdV1::new(
+        TICK_TIMESTAMP,
+        TICK_TIMESTAMP + 500,
+        ResearchPositionDirectionV1::Long,
+        1.375,
+    )
+    .expect("closed-bar trailing fixture");
+    let plans = [
+        quote_replay_plan_at(
+            binding.clone(),
+            TICK_TIMESTAMP,
+            ResearchPositionDirectionV1::Long,
+            1.2,
+            1.5,
+            vec![trail],
+        ),
+        quote_replay_plan_at(
+            binding,
+            TICK_TIMESTAMP + 2_000,
+            ResearchPositionDirectionV1::Long,
+            1.2,
+            1.5,
+            Vec::new(),
+        ),
+    ];
+    let ledgers = replay_sealed_quote_validated_decision_sequence_v1(&plans, &evidence)
+        .expect("trailing protection belongs only to the first position");
+    assert_eq!(ledgers[0].positions()[0].modeled_exit_price(), Some(1.375));
+    assert_eq!(
+        ledgers[0].positions()[0].exit_reason(),
+        Some(QuoteValidatedResearchExitReasonV1::TrailingStop)
+    );
+    assert_eq!(ledgers[1].positions()[0].modeled_exit_price(), Some(1.5));
+    assert_eq!(
+        ledgers[1].positions()[0].exit_reason(),
+        Some(QuoteValidatedResearchExitReasonV1::Target)
+    );
+}
+
+#[test]
+fn reviewed_snapshot_entry_preview_and_time_exit_feed_existing_execution_economics() {
+    let (_root, binding, evidence) = sealed_quote_sequence_fixture(
+        &[
+            (TICK_TIMESTAMP - 2, 148_000),
+            (TICK_TIMESTAMP - 1, 124_000),
+            (TICK_TIMESTAMP + 250, 126_000),
+            (TICK_TIMESTAMP + 500, 131_250),
+            (TICK_TIMESTAMP + 1_000, 112_500),
+        ],
+        &[(TICK_TIMESTAMP, 125_000)],
+    );
+    let plan = closed_quote_replay_plan(binding);
+    let entry = preview_sealed_quote_validated_research_entry_v1(&plan, &evidence)
+        .expect("borrow the already reviewed quote snapshot")
+        .expect("fixture entry is available");
+    assert_eq!(entry.timestamp_unix_ms(), TICK_TIMESTAMP);
+    assert_eq!(entry.modeled_entry_price(), 1.25);
+    assert_eq!(
+        entry.bid_extrema_before(TICK_TIMESTAMP + 500).unwrap(),
+        (1.26, 1.24),
+        "neither the pre-entry high nor the close-boundary tick belongs in the entry-bar trail"
+    );
+    let timed = plan
+        .with_time_exit(
+            ClosedCanonicalBarTimeExitV1::new(TICK_TIMESTAMP, TICK_TIMESTAMP + 500).unwrap(),
+        )
+        .unwrap();
+    let quotes = replay_sealed_quote_validated_research_v1(&timed, &evidence).unwrap();
+    assert_eq!(
+        quotes.positions()[0].exit_reason(),
+        Some(QuoteValidatedResearchExitReasonV1::MaxHold)
+    );
+    assert_eq!(quotes.positions()[0].modeled_exit_price(), Some(1.3125));
+    let economics = fixture_execution_economics(&quotes);
+    // Exact binary oracle: (1/16 * 100,000) - USD 7 per fill. The
+    // commission/conversion assumptions are synthetic, not certified costs.
+    assert_eq!(economics.gross_pnl_account_currency().amount(), 6_250.0);
+    assert_eq!(economics.net_pnl_account_currency().amount(), 6_236.0);
+    economics.validate_against_quote_ledger(&quotes).unwrap();
+    current_broker_financial_truth_capability_v1()
+        .require(BrokerFinancialOperationV1::HistoricalEvaluation)
+        .expect_err("this synthetic Vortex proof does not open the global finance gate");
+}
+
+#[test]
+fn sealed_snapshot_checks_exact_context_even_before_any_directional_decision() {
+    let (_root, binding, evidence) = sealed_quote_sequence_fixture(
+        &[(TICK_TIMESTAMP - 1, 124_000)],
+        &[(TICK_TIMESTAMP, 125_000)],
+    );
+    let plan = closed_quote_replay_plan(binding.clone());
+    let policy =
+        serde_json::from_value(serde_json::to_value(&plan).unwrap()["policy"].clone()).unwrap();
+    evidence
+        .validate_replay_context_v1(&binding, &policy)
+        .unwrap();
+    let wire = serde_json::to_value(&binding).unwrap();
+    let changed = QuoteValidatedResearchReplayBindingV1::new(
+        sha256(CANONICAL_RUN_BYTES),
+        sha256(b"different locked signal plan"),
+        ACCOUNT_ID,
+        SYMBOL_ID,
+        "EURUSD",
+        binding.replay_scope(),
+        serde_json::from_value(wire["reviewed_replay_rule"].clone()).unwrap(),
+        wire["quote_evidence_manifest_sha256"].as_str().unwrap(),
+    )
+    .unwrap();
+    let error = evidence
+        .validate_replay_context_v1(&changed, &policy)
+        .expect_err("even an empty/no-direction lane cannot use another signal plan's snapshot");
+    assert_eq!(
+        error.code(),
+        QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch
+    );
+}
+
+#[test]
+fn sealed_kernel_keeps_actual_decision_identity_even_when_different_plans_fill_identically() {
+    let (_root, binding, evidence) = sealed_quote_sequence_fixture(
+        &[
+            (TICK_TIMESTAMP - 1, 124_000),
+            (TICK_TIMESTAMP + 500, 131_250),
+        ],
+        &[(TICK_TIMESTAMP, 125_000)],
+    );
+    let timed = closed_quote_replay_plan(binding)
+        .with_time_exit(
+            ClosedCanonicalBarTimeExitV1::new(TICK_TIMESTAMP, TICK_TIMESTAMP + 500).unwrap(),
+        )
+        .unwrap();
+    let mut changed_wire = serde_json::to_value(&timed).unwrap();
+    changed_wire["decisions"][0]["stop_price"] = serde_json::json!(0.75);
+    let changed: QuoteValidatedResearchReplayPlanV1 = serde_json::from_value(changed_wire).unwrap();
+    let first = replay_sealed_quote_validated_research_v1(&timed, &evidence).unwrap();
+    let second = replay_sealed_quote_validated_research_v1(&changed, &evidence).unwrap();
+    assert_eq!(first.positions(), second.positions());
+    assert_eq!(
+        first.ledger_sha256(),
+        second.ledger_sha256(),
+        "legacy V1 fill identity stays compatible"
+    );
+    assert_ne!(first.executed_plan_sha256(), second.executed_plan_sha256());
+    assert_ne!(
+        first.executed_decision().stop_price(),
+        second.executed_decision().stop_price()
+    );
+    assert_eq!(second.executed_decision().stop_price(), 0.75);
+    assert_eq!(first.executed_time_exit(), second.executed_time_exit());
+    assert!(first.executed_time_exit().is_some());
+    let wire = serde_json::to_value(&first).unwrap();
+    assert_eq!(wire.as_object().unwrap().len(), 1);
+    assert!(
+        wire.get("ledger").is_some(),
+        "constant-space process witnesses do not change V1 wire"
+    );
+}
+
+fn sealed_quote_sequence_fixture(
+    bid: &[(i64, i64)],
+    ask: &[(i64, i64)],
+) -> (
+    FixtureRoot,
+    QuoteValidatedResearchReplayBindingV1,
+    SealedHistoricalBidAskQuoteReplayEvidenceV1,
+) {
+    let (root, verified, fixture) = fixture_with_ticks(Tamper::None, bid, ask);
+    let binding = closed_quote_replay_binding(&verified);
+    let authority = validate_reviewed_broker_financial_truth_authority_v2(
+        &fixture.store,
+        &fixture.link_receipt,
+        fixture.reviewed,
+    )
+    .expect("independent synthetic V2 review over actual temporary Vortex files");
+    let evidence = into_sealed_historical_bid_ask_quote_replay_evidence_v2(authority, &binding)
+        .expect("one transfer of the reviewed quote snapshot");
+    (root, binding, evidence)
+}
+
+fn closed_quote_economics_fixture() -> (
+    FixtureRoot,
+    SealedHistoricalQuoteValidatedResearchLedgerV1,
+    QuoteValidatedExecutionEconomicsLedgerV1,
+) {
+    // Tiny synthetic ticks in genuine Vortex files, not claimed broker observations.
+    let (root, verified, authority_fixture) = fixture_with_ticks(
+        Tamper::None,
+        &[
+            (TICK_TIMESTAMP - 1, 124_000),
+            (TICK_TIMESTAMP + 1_000, 112_500),
+        ],
+        &[(TICK_TIMESTAMP, 125_000)],
+    );
+    let run_authority = validate_reviewed_broker_financial_truth_authority_v2(
+        &authority_fixture.store,
+        &authority_fixture.link_receipt,
+        authority_fixture.reviewed,
+    )
+    .expect("synthetic reviewed authority remains run-scoped");
+    let binding = closed_quote_replay_binding(&verified);
+    let reopened_evidence = open_sealed_historical_bid_ask_quote_replay_evidence_v1(
+        &authority_fixture.store,
+        &authority_fixture.link_receipt,
+        &binding,
+    )
+    .expect("reopen and decode real Vortex files through production sealed ingress");
+    let evidence = into_sealed_historical_bid_ask_quote_replay_evidence_v2(run_authority, &binding)
+        .expect("consume reviewed V2 records through the production replay bridge");
+    let plan = closed_quote_replay_plan(binding);
+    let quotes = replay_sealed_quote_validated_research_v1(&plan, &evidence)
+        .expect("production sealed replay closes the losing long on Bid");
+    let reopened_quotes = replay_sealed_quote_validated_research_v1(&plan, &reopened_evidence)
+        .expect("old sealed ingress remains the exact comparison baseline");
+    assert_eq!(
+        quotes, reopened_quotes,
+        "V2 transfer preserves every fill and receipt digest"
+    );
+    let economics = fixture_execution_economics(&quotes);
+    (root, quotes, economics)
+}
+
+fn closed_quote_replay_binding(
+    verified: &neoethos_broker_truth::VerifiedImmutableBrokerFinancialTruthBundleV2,
+) -> QuoteValidatedResearchReplayBindingV1 {
+    let replay_scope = LockedFinalistOosReplayScopeV1::new(
+        EvidenceWindowV1::new(WINDOW_FROM + 1_000, WINDOW_TO - 1_000).expect("locked window"),
+        1_000,
+        1_000,
+    )
+    .expect("exact padded quote window");
+    QuoteValidatedResearchReplayBindingV1::new(
+        sha256(CANONICAL_RUN_BYTES),
+        sha256(b"fixed closed-quote signal fixture"),
+        ACCOUNT_ID,
+        SYMBOL_ID,
+        "EURUSD",
+        replay_scope,
+        verified
+            .manifest()
+            .primary_quotes()
+            .replay_rule()
+            .identity()
+            .clone(),
+        verified.receipt().manifest_sha256(),
+    )
+    .expect("exact replay fixture binding")
+}
+
+fn closed_quote_replay_plan(
+    binding: QuoteValidatedResearchReplayBindingV1,
+) -> QuoteValidatedResearchReplayPlanV1 {
+    quote_replay_plan_at(
+        binding,
+        TICK_TIMESTAMP,
+        ResearchPositionDirectionV1::Long,
+        1.2,
+        1.5,
+        Vec::new(),
+    )
+}
+
+fn quote_replay_plan_at(
+    binding: QuoteValidatedResearchReplayBindingV1,
+    decision_at: i64,
+    direction: ResearchPositionDirectionV1,
+    stop: f64,
+    target: f64,
+    thresholds: Vec<ClosedCanonicalBarTrailingThresholdV1>,
+) -> QuoteValidatedResearchReplayPlanV1 {
+    let policy = QuoteValidatedResearchReplayPolicyV1::new(
+        500,
+        1_000,
+        500,
+        VersionedLatencySlippagePolicyV1::new("synthetic-fill-binding-v1", 0, 0, 0.0, 0.0001)
+            .expect("explicit fixture slippage assumptions"),
+        None,
+    )
+    .expect("causal fixture quote policy");
+    QuoteValidatedResearchReplayPlanV1::new(
+        binding,
+        policy,
+        vec![
+            CanonicalBarSignalResearchDecisionV1::new(
+                decision_at - 10_000,
+                decision_at,
+                direction,
+                stop,
+                target,
+            )
+            .expect("fixture decision"),
+        ],
+        thresholds,
+    )
+    .expect("one-decision fixture replay")
+}
+
+// Deliberately recreate the public wire digest: hashes prove byte identity, not
+// agreement with the independently held opaque quote ledger. This makes every
+// negative fixture self-consistent rather than merely corrupting its checksum.
+fn rehash_untrusted_execution_fixture(wire: &mut Value) {
+    for role in ["entry", "exit"] {
+        let timestamp_key = format!("{role}_fill_timestamp_unix_ms");
+        let price_key = format!("modeled_{role}_price");
+        let identity = ordered_fixture_hash(
+            "quote-validated-derived-fill",
+            &[
+                ("quote_ledger_sha256", &wire["quote_ledger_sha256"]),
+                ("quote_position_index", &wire["quote_position_index"]),
+                ("fill_role", &json!(role)),
+                ("fill_timestamp_unix_ms", &wire[&timestamp_key]),
+                ("modeled_fill_price", &wire[&price_key]),
+                ("direction", &wire["direction"]),
+            ],
+        );
+        wire[format!("{role}_fill_identity_sha256")] = json!(identity);
+    }
+    let identity = ordered_fixture_hash(
+        "quote-validated-execution-economics-ledger",
+        &[
+            ("schema_version", &wire["schema_version"]),
+            ("quote_ledger_sha256", &wire["quote_ledger_sha256"]),
+            ("quote_position_index", &wire["quote_position_index"]),
+            (
+                "symbol_contract_identity_sha256",
+                &wire["symbol_contract"]["symbol_contract_identity_sha256"],
+            ),
+            ("account_currency", &wire["account_currency"]),
+            (
+                "conversion_evidence_identity_sha256",
+                &wire["conversion"]["conversion_evidence_identity_sha256"],
+            ),
+            (
+                "entry_fill_identity_sha256",
+                &wire["entry_fill_identity_sha256"],
+            ),
+            (
+                "exit_fill_identity_sha256",
+                &wire["exit_fill_identity_sha256"],
+            ),
+            (
+                "commission_policy_identity_sha256",
+                &wire["commission_policy"]["commission_policy_identity_sha256"],
+            ),
+            (
+                "swap_evidence_identity_sha256",
+                &wire["swap"]["swap_evidence_identity_sha256"],
+            ),
+            (
+                "pnl_conversion_fee_evidence_identity_sha256",
+                &wire["pnl_conversion_fee"]["pnl_conversion_fee_evidence_identity_sha256"],
+            ),
+            ("filled_lots", &wire["filled_lots"]),
+            ("base_units", &wire["base_units"]),
+            ("direction", &wire["direction"]),
+            (
+                "entry_fill_timestamp_unix_ms",
+                &wire["entry_fill_timestamp_unix_ms"],
+            ),
+            (
+                "exit_fill_timestamp_unix_ms",
+                &wire["exit_fill_timestamp_unix_ms"],
+            ),
+            ("modeled_entry_price", &wire["modeled_entry_price"]),
+            ("modeled_exit_price", &wire["modeled_exit_price"]),
+            (
+                "entry_notional_quote_currency",
+                &wire["entry_notional_quote_currency"],
+            ),
+            (
+                "gross_pnl_quote_currency",
+                &wire["gross_pnl_quote_currency"],
+            ),
+            (
+                "conversion_rate_account_per_quote",
+                &wire["conversion"]["conversion_rate_account_per_quote"],
+            ),
+            (
+                "conversion_observed_at_unix_ms",
+                &wire["conversion"]["conversion_observed_at_unix_ms"],
+            ),
+            (
+                "gross_pnl_account_currency",
+                &wire["gross_pnl_account_currency"],
+            ),
+            (
+                "entry_commission_account_currency",
+                &wire["entry_commission_account_currency"],
+            ),
+            (
+                "exit_commission_account_currency",
+                &wire["exit_commission_account_currency"],
+            ),
+            (
+                "swap_account_currency_signed",
+                &wire["swap_account_currency_signed"],
+            ),
+            (
+                "pnl_conversion_fee_account_currency",
+                &wire["pnl_conversion_fee_account_currency"],
+            ),
+            (
+                "additional_spread_account_currency",
+                &wire["additional_spread_account_currency"],
+            ),
+            (
+                "net_pnl_account_currency",
+                &wire["net_pnl_account_currency"],
+            ),
+            ("artifact_class", &wire["artifact_class"]),
+            ("promotion_eligibility", &wire["promotion_eligibility"]),
+        ],
+    );
+    wire["ledger_sha256"] = json!(identity);
+}
+
+fn ordered_fixture_hash(domain: &str, fields: &[(&str, &Value)]) -> String {
+    let mut json = String::from("{");
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index != 0 {
+            json.push(',');
+        }
+        json.push_str(&serde_json::to_string(key).expect("fixture key encoding"));
+        json.push(':');
+        if value.get("currency").is_some() && value.get("amount").is_some() {
+            // AccountMoneyV1 has this struct-field order, unlike a JSON map.
+            json.push_str(&format!(
+                "{{\"currency\":{},\"amount\":{}}}",
+                value["currency"], value["amount"]
+            ));
+        } else {
+            json.push_str(&serde_json::to_string(value).expect("fixture value encoding"));
+        }
+    }
+    json.push('}');
+    sha256(format!("neoethos-{domain}-v1\n{json}").as_bytes())
+}
+
+#[test]
 fn source_surface_contains_no_authority_bridge_or_mutable_selector() {
     let source = include_str!("../src/semantic_v2.rs");
     for forbidden in [
@@ -302,993 +992,80 @@ fn source_surface_contains_no_authority_bridge_or_mutable_selector() {
     assert!(source.contains("VerifiedImmutableBrokerFinancialTruthBundleV2"));
 }
 
-fn fixture(
-    tamper: Tamper,
-) -> (
-    FixtureRoot,
-    neoethos_broker_truth::VerifiedImmutableBrokerFinancialTruthBundleV2,
-    AuthorityFixture,
-) {
-    let root = FixtureRoot(unique_root());
-    let source_root = root.0.join("sources");
-    fs::create_dir_all(&source_root).expect("create source directory");
-    let mut artifacts = ArtifactBuilder::new(source_root.clone());
-    let window = EvidenceWindowV1::new(WINDOW_FROM, WINDOW_TO).expect("fixture window");
-    let canonical_run_identity_sha256 = sha256(CANONICAL_RUN_BYTES);
-    let binding = binding(window, &canonical_run_identity_sha256);
-
-    let bid_raw_json = tick_response("bid-page", 110_000);
-    let ask_raw_json = tick_response("ask-page", 120_000);
-    let bid_raw = if matches!(tamper, Tamper::CorruptVortex) {
-        artifacts.corrupt(
-            "primary-bid-pages-raw.vortex",
-            BrokerFinancialTruthVortexSchemaV1::CTraderTickRequestPagesRawV2,
-        )
-    } else {
-        artifacts.array(
-            "primary-bid-pages-raw.vortex",
-            BrokerFinancialTruthVortexSchemaV1::CTraderTickRequestPagesRawV2,
-            raw_tick_page_array(
-                "bid-page",
-                QuoteSideV1::Bid,
-                if matches!(tamper, Tamper::InvalidRawEnvelope) {
-                    r#"{"payloadType":2146,"payload":{}}"#
-                } else {
-                    &bid_raw_json
-                },
-            ),
-            None,
-        )
-    };
-    let bid_decoded = artifacts.array(
-        "primary-bid-ticks-decoded.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderTicksDecodedV2,
-        decoded_tick_array(
-            QuoteSideV1::Bid,
-            if matches!(tamper, Tamper::TickRawDecodedMismatch) {
-                TICK_TIMESTAMP + 1
-            } else {
-                TICK_TIMESTAMP
-            },
-            1.1,
-            matches!(tamper, Tamper::ExtraDecodedTickField),
-        ),
-        matches!(tamper, Tamper::WrongDeclaredRowCount).then_some(2),
-    );
-    let ask_raw = artifacts.array(
-        "primary-ask-pages-raw.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderTickRequestPagesRawV2,
-        raw_tick_page_array("ask-page", QuoteSideV1::Ask, &ask_raw_json),
-        None,
-    );
-    let ask_decoded = artifacts.array(
-        "primary-ask-ticks-decoded.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderTicksDecodedV2,
-        decoded_tick_array(QuoteSideV1::Ask, TICK_TIMESTAMP, 1.2, false),
-        None,
-    );
-    let bid = quote_side(QuoteSideV1::Bid, "bid-page", window, bid_raw, bid_decoded);
-    let ask = quote_side(QuoteSideV1::Ask, "ask-page", window, ask_raw, ask_decoded);
-
-    let sync_raw_rows = vec![
-        evidence_row(
-            0,
-            Some(SYMBOL_ID),
-            Some(QuoteSideV1::Bid),
-            0,
-            Some(window),
-            "sync-bid",
-            2146,
-            json!({"reviewedRawObservation":"bid"}),
-        ),
-        evidence_row(
-            1,
-            Some(SYMBOL_ID),
-            Some(QuoteSideV1::Ask),
-            0,
-            Some(window),
-            "sync-ask",
-            2146,
-            json!({"reviewedRawObservation":"ask"}),
-        ),
-    ];
-    let sync_decoded_rows = vec![evidence_row(
-        0,
-        Some(SYMBOL_ID),
-        None,
-        1,
-        Some(window),
-        "sync-bid",
-        2146,
-        json!({"reviewedReplayRule":"exact-v2"}),
-    )];
-    let observations_raw = artifacts.array(
-        "primary-quote-session-observations-raw.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderQuoteSessionObservationsRawV2,
-        evidence_array(&sync_raw_rows),
-        None,
-    );
-    let rules_decoded = artifacts.array(
-        "primary-reviewed-quote-replay-rules-decoded.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderReviewedQuoteReplayRulesDecodedV2,
-        evidence_array(&sync_decoded_rows),
-        None,
-    );
-    let review_identity = ReviewedQuoteReplayRuleIdentityV2::new(
-        sha256(REVIEW_RECORD_BYTES),
-        sha256(PROTOCOL_EVIDENCE_BYTES),
-        observations_raw.sha256(),
-    )
-    .expect("exact fixture review identity");
-    let authority_review_identity = review_identity.clone();
-    let authority_observations_sha256 = observations_raw.sha256().to_owned();
-    let authority_observations_byte_len = observations_raw.byte_len();
-    let authority_rules_sha256 = rules_decoded.sha256().to_owned();
-    let authority_rules_byte_len = rules_decoded.byte_len();
-    let replay_rule =
-        ReviewedQuoteReplayRuleEvidenceV2::new(review_identity, observations_raw, rules_decoded)
-            .expect("review artifact contract");
-    let primary_quotes =
-        SynchronizedBidAskEvidenceV2::new(bid, ask, replay_rule).expect("primary quotes");
-
-    let light_raw_envelope = json!({
-        "clientMsgId":"light",
-        "payloadType":2115,
-        "payload":{"ctidTraderAccountId":ACCOUNT_ID,"symbol":[{
-            "symbolId":SYMBOL_ID,"symbolName":"EURUSD","baseAssetId":1,"quoteAssetId":2
-        }]}
-    });
-    let full_symbol = json!({
-        "symbolId":SYMBOL_ID,"digits":5,"pipPosition":4,"lotSize":10_000_000,
-        "minVolume":1000,"maxVolume":100_000_000,"stepVolume":1000
-    });
-    let full_raw_envelope = json!({
-        "clientMsgId":"full",
-        "payloadType":2117,
-        "payload":{"ctidTraderAccountId":ACCOUNT_ID,"symbol":[full_symbol.clone()]}
-    });
-    let raw_asset = json!({"assetId":2,"name":"USD","digits":2});
-    let asset_raw_envelope = json!({
-        "clientMsgId":"assets",
-        "payloadType":2113,
-        "payload":{"ctidTraderAccountId":ACCOUNT_ID,"asset":[raw_asset.clone()]}
-    });
-    let raw_trader = json!({"depositAssetId":2,"moneyDigits":2,"balance":100_000});
-    let trader_raw_envelope = json!({
-        "clientMsgId":"trader",
-        "payloadType":2122,
-        "payload":{"ctidTraderAccountId":ACCOUNT_ID,"trader":raw_trader.clone()}
-    });
-    let light_raw = artifacts.array(
-        "light-symbol-responses-v2-raw.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderLightSymbolResponsesRawV2,
-        evidence_array(&[evidence_row(
-            0,
-            None,
-            None,
-            2,
-            None,
-            "light",
-            2115,
-            light_raw_envelope.clone(),
-        )]),
-        None,
-    );
-    let full_raw = artifacts.array(
-        "full-symbol-responses-v2-raw.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderSymbolResponsesRawV2,
-        evidence_array(&[evidence_row(
-            0,
-            Some(SYMBOL_ID),
-            None,
-            4,
-            None,
-            "full",
-            2117,
-            full_raw_envelope.clone(),
-        )]),
-        None,
-    );
-    let asset_raw = artifacts.array(
-        "account-asset-responses-v2-raw.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderAccountAssetResponsesRawV2,
-        evidence_array(&[evidence_row(
-            0,
-            None,
-            None,
-            6,
-            None,
-            "assets",
-            2113,
-            asset_raw_envelope.clone(),
-        )]),
-        None,
-    );
-    let trader_raw = artifacts.array(
-        "trader-account-responses-v2-raw.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderTraderAccountResponsesRawV2,
-        evidence_array(&[evidence_row(
-            0,
-            None,
-            None,
-            8,
-            None,
-            "trader",
-            2122,
-            trader_raw_envelope.clone(),
-        )]),
-        None,
-    );
-    let decoded_contract_rows = vec![
-        evidence_row(
-            0,
-            Some(SYMBOL_ID),
-            None,
-            3,
-            None,
-            "light",
-            2115,
-            json!({
-                "authority":"ProtoOALightSymbol",
-                "exactInstrument":{
-                    "symbolId":SYMBOL_ID,"symbolName":"EURUSD",
-                    "baseAssetId":1,"baseAssetName":"EUR",
-                    "quoteAssetId":2,"quoteAssetName":"USD"
-                },
-                "rawLightSymbol":light_raw_envelope["payload"]["symbol"][0].clone()
-            }),
-        ),
-        evidence_row(
-            1,
-            Some(SYMBOL_ID),
-            None,
-            5,
-            None,
-            "full",
-            2117,
-            json!({"authority":"ProtoOASymbol","rawSymbol":full_symbol}),
-        ),
-        evidence_row(
-            2,
-            None,
-            None,
-            7,
-            None,
-            "assets",
-            2113,
-            json!({"accountAssetId":2,"accountAssetName":"USD","requiredRawAssets":[raw_asset]}),
-        ),
-        evidence_row(
-            3,
-            None,
-            None,
-            9,
-            None,
-            "trader",
-            2122,
-            json!({"accountAssetId":2,"rawTrader":raw_trader}),
-        ),
-    ];
-    let contracts_decoded = artifacts.array(
-        "symbol-money-contracts-v2-decoded.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderSymbolMoneyContractsDecodedV2,
-        evidence_array(&decoded_contract_rows),
-        None,
-    );
-    let symbol_contracts = ExactSymbolContractEvidenceV2::new(
-        light_raw,
-        full_raw,
-        asset_raw,
-        trader_raw,
-        contracts_decoded,
-    )
-    .expect("symbol contract artifacts");
-
-    let pnl_raw_envelope = json!({
-        "clientMsgId":"pnl","payloadType":2188,
-        "payload":{"ctidTraderAccountId":ACCOUNT_ID,"moneyDigits":2,
-            "positionUnrealizedPnL":[{
-                "positionId":9,"grossUnrealizedPnL":123,"netUnrealizedPnL":100
-            }]}
-    });
-    let pnl_raw = artifacts.array(
-        "position-unrealized-pnl-v2-raw.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderUnrealizedPnlResponsesRawV2,
-        evidence_array(&[evidence_row(
-            0,
-            None,
-            None,
-            10,
-            None,
-            "pnl",
-            2188,
-            pnl_raw_envelope,
-        )]),
-        None,
-    );
-    let pnl_decoded_client = if matches!(tamper, Tamper::GenericRawDecodedLinkMismatch) {
-        "missing-raw-client"
-    } else {
-        "pnl"
-    };
-    let pnl_decoded = artifacts.array(
-        "position-unrealized-pnl-v2-decoded.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderUnrealizedPnlDecodedV2,
-        evidence_array(&[evidence_row(
-            0,
-            None,
-            None,
-            11,
-            None,
-            pnl_decoded_client,
-            2188,
-            json!({
-                "accountId":ACCOUNT_ID,"moneyDigits":2,
-                "positions":[{"positionId":9,"grossUnrealizedPnL":1.23,"netUnrealizedPnL":1.0}]
-            }),
-        )]),
-        None,
-    );
-    let pnl_pair = ExactCapturedEvidencePairV1::new(pnl_raw, pnl_decoded);
-
-    let reconcile_payload = json!({
-        "ctidTraderAccountId":ACCOUNT_ID,"position":[],"order":[]
-    });
-    let reconcile_envelope = json!({
-        "clientMsgId":"reconcile","payloadType":2125,"payload":reconcile_payload.clone()
-    });
-    let reconcile_raw = artifacts.array(
-        "reconcile-responses-v2-raw.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderReconcileResponsesRawV2,
-        evidence_array(&[evidence_row(
-            0,
-            None,
-            None,
-            12,
-            Some(window),
-            "reconcile",
-            2125,
-            reconcile_envelope,
-        )]),
-        None,
-    );
-    let deal_payload = json!({"ctidTraderAccountId":ACCOUNT_ID,"hasMore":false});
-    let deal_envelope = json!({
-        "clientMsgId":"deal-page","payloadType":2134,"payload":deal_payload.clone()
-    });
-    let deal_pages_raw = artifacts.array(
-        "deal-pages-v2-raw.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderDealPagesRawV2,
-        raw_deal_page_array(
-            &deal_envelope.to_string(),
-            matches!(tamper, Tamper::DealPageMismatch),
-        ),
-        None,
-    );
-    let reconciliation_decoded = artifacts.array(
-        "close-deal-reconciliation-v2-decoded.vortex",
-        BrokerFinancialTruthVortexSchemaV1::CTraderCloseDealReconciliationDecodedV2,
-        evidence_array(&[evidence_row(
-            0,
-            None,
-            None,
-            13,
-            Some(window),
-            "deal-page",
-            2134,
-            json!({
-                "dealPageRequest":{"fromTimestamp":WINDOW_FROM,"toTimestamp":WINDOW_TO,"maxRows":100},
-                "rawDealPayload":deal_payload,"rawReconcilePayload":reconcile_payload,
-                "returnProtectionOrders":true
-            }),
-        )]),
-        None,
-    );
-    let deal_page =
-        ExactBrokerRequestPageV2::new(0, 0, "deal-page", window, None, None, 0, false, Some(100))
-            .expect("terminal empty deal page");
-    let deal_chunk =
-        ExactBrokerRequestChunkV2::new(0, window, vec![deal_page]).expect("deal chunk");
-    let close_deal = ExactDealReconciliationEvidenceV2::new(
-        window,
-        deal_chunk,
-        reconcile_raw,
-        deal_pages_raw,
-        reconciliation_decoded,
-    )
-    .expect("deal evidence");
-
-    let settlement = ExactConversionRouteEvidenceV2::new(
-        "primary_pnl_settlement",
-        2,
-        "USD",
-        2,
-        "USD",
-        Vec::new(),
-    )
-    .expect("explicit identity conversion");
-    let manifest = BrokerFinancialTruthBundleManifestV2::new(
-        binding.clone(),
-        primary_quotes,
-        vec![settlement],
-        symbol_contracts,
-        pnl_pair,
-        close_deal,
-    )
-    .expect("complete V2 structural manifest");
-    let store = BrokerFinancialTruthBundleStoreV1::new(root.0.join("store"));
-    let receipt = store
-        .publish_v2(&manifest, &artifacts.sources)
-        .expect("publish exact structural fixture");
-    let verified = store
-        .open_exact_v2(&receipt, &binding)
-        .expect("integrity reopen before semantic ingress");
-    let authority_source_root = root.0.join("authority-sources");
-    fs::create_dir_all(&authority_source_root).expect("create authority source directory");
-    let scope_bytes = b"exact canonical holdout scope fixture v2";
-    let root_verification_bytes = b"exact canonical root verification fixture v2";
-    let window_binding_bytes = b"exact canonical scope-window binding fixture v2";
-    let capture_plan_bytes = b"exact BFT2 capture plan fixture v2";
-    let base_specs = [
-        (
-            BrokerTruthAcquisitionArtifactRoleV1::CanonicalSearchInputReceipt,
-            "canonical-search-input-receipt.json",
-            CANONICAL_RUN_BYTES,
-        ),
-        (
-            BrokerTruthAcquisitionArtifactRoleV1::CanonicalSearchArtifactScope,
-            "canonical-search-artifact-scope.json",
-            scope_bytes.as_slice(),
-        ),
-        (
-            BrokerTruthAcquisitionArtifactRoleV1::CanonicalRootVerificationReceipt,
-            "canonical-root-verification.json",
-            root_verification_bytes.as_slice(),
-        ),
-        (
-            BrokerTruthAcquisitionArtifactRoleV1::CanonicalScopeWindowBinding,
-            "canonical-scope-window-binding.json",
-            window_binding_bytes.as_slice(),
-        ),
-        (
-            BrokerTruthAcquisitionArtifactRoleV1::CapturePlan,
-            "broker-truth-capture-plan.json",
-            capture_plan_bytes.as_slice(),
-        ),
-        (
-            BrokerTruthAcquisitionArtifactRoleV1::ReviewRecord,
-            "quote-replay-review-record.json",
-            REVIEW_RECORD_BYTES,
-        ),
-        (
-            BrokerTruthAcquisitionArtifactRoleV1::ProtocolEvidence,
-            "ctrader-protocol-evidence.json",
-            PROTOCOL_EVIDENCE_BYTES,
-        ),
-        (
-            BrokerTruthAcquisitionArtifactRoleV1::TrustRoot,
-            "quote-review-trust-root.pub",
-            TRUST_ROOT_BYTES,
-        ),
-    ];
-    let mut authority_artifacts = Vec::new();
-    let mut authority_sources = Vec::new();
-    for (role, relative_path, bytes) in base_specs {
-        let (artifact, source) =
-            authority_artifact_from_bytes(&authority_source_root, role, relative_path, bytes);
-        authority_artifacts.push(artifact);
-        authority_sources.push(source);
-    }
-    let (observations_artifact, observations_source) = authority_artifact_from_existing(
-        BrokerTruthAcquisitionArtifactRoleV1::QuoteSessionObservations { ordinal: 0 },
-        "quote-session-observations-000.vortex",
-        &source_root.join("primary-quote-session-observations-raw.vortex"),
-        &authority_observations_sha256,
-        authority_observations_byte_len,
-    );
-    authority_artifacts.push(observations_artifact);
-    authority_sources.push(observations_source);
-    let (rules_artifact, rules_source) = authority_artifact_from_existing(
-        BrokerTruthAcquisitionArtifactRoleV1::ReviewedQuoteReplayRules { ordinal: 0 },
-        "reviewed-quote-replay-rules-000.vortex",
-        &source_root.join("primary-reviewed-quote-replay-rules-decoded.vortex"),
-        &authority_rules_sha256,
-        authority_rules_byte_len,
-    );
-    authority_artifacts.push(rules_artifact);
-    authority_sources.push(rules_source);
-
-    let synchronization = BrokerTruthReviewedSynchronizationBindingV1::new(
-        0,
-        ACCOUNT_ID,
-        SYMBOL_ID,
-        window,
-        authority_review_identity,
-        authority_rules_sha256,
-    )
-    .expect("exact reviewed synchronization fixture");
-    let canonical_scope_identity_sha256 = sha256(scope_bytes);
-    let canonical_root_verification_sha256 = sha256(root_verification_bytes);
-    let canonical_scope_window_binding_sha256 = sha256(window_binding_bytes);
-    let capture_plan_sha256 = sha256(capture_plan_bytes);
-    let review_record_sha256 = sha256(REVIEW_RECORD_BYTES);
-    let protocol_evidence_sha256 = sha256(PROTOCOL_EVIDENCE_BYTES);
-    let trust_root_sha256 = sha256(TRUST_ROOT_BYTES);
-    let authority_manifest = BrokerTruthAcquisitionAuthorityManifestV1::new(
-        canonical_run_identity_sha256.clone(),
-        canonical_scope_identity_sha256.clone(),
-        canonical_root_verification_sha256.clone(),
-        canonical_scope_window_binding_sha256.clone(),
-        capture_plan_sha256.clone(),
-        trust_root_sha256.clone(),
-        authority_artifacts,
-        vec![synchronization.clone()],
-    )
-    .expect("complete reviewed acquisition fixture");
-    let acquisition_store = BrokerTruthAcquisitionStoreV1::new(root.0.join("store"));
-    let authority_receipt = acquisition_store
-        .publish_authority(&authority_manifest, &authority_sources)
-        .expect("publish reviewed acquisition fixture");
-    let link_receipt = acquisition_store
-        .publish_link(&authority_receipt, &receipt, &binding)
-        .expect("publish reviewed BFT2 link fixture");
-    let reviewed = ReviewedBrokerFinancialTruthEvidenceV2::checked_new(
-        canonical_run_identity_sha256,
-        canonical_scope_identity_sha256,
-        canonical_root_verification_sha256,
-        canonical_scope_window_binding_sha256,
-        capture_plan_sha256,
-        trust_root_sha256,
-        review_record_sha256,
-        protocol_evidence_sha256,
-        receipt.manifest_sha256(),
-        window,
-        vec![synchronization],
-    )
-    .expect("checked independent review fixture");
-    (
-        root,
-        verified,
-        AuthorityFixture {
-            store: acquisition_store,
-            link_receipt,
-            reviewed,
-        },
-    )
-}
-
-fn binding(
-    window: EvidenceWindowV1,
-    canonical_run_identity_sha256: &str,
-) -> BrokerFinancialTruthBindingV1 {
-    let identity = CanonicalDatasetIdentity::ctrader(
-        CTraderEnvironment::Demo,
-        "demo.ctraderapi.com",
-        ACCOUNT_ID,
-        SYMBOL_ID,
-        "EURUSD",
-        CanonicalTimeframe::M1,
-        BarTimestampConvention::BarOpen,
-    )
-    .expect("canonical identity");
-    BrokerFinancialTruthBindingV1::new(
-        &identity,
-        canonical_run_identity_sha256,
-        window,
-        1,
-        "EUR",
-        2,
-        "USD",
-        2,
-        "USD",
-    )
-    .expect("binding")
-}
-
-fn authority_artifact_from_bytes(
-    root: &Path,
-    role: BrokerTruthAcquisitionArtifactRoleV1,
-    relative_path: &str,
-    bytes: &[u8],
-) -> (
-    BrokerTruthAcquisitionArtifactV1,
-    BrokerTruthAcquisitionArtifactSourceV1,
-) {
-    let path = root.join(relative_path);
-    fs::write(&path, bytes).expect("write authority input fixture");
-    authority_artifact_from_existing(
-        role,
-        relative_path,
-        &path,
-        &sha256(bytes),
-        bytes.len() as u64,
-    )
-}
-
-fn authority_artifact_from_existing(
-    role: BrokerTruthAcquisitionArtifactRoleV1,
-    relative_path: &str,
-    source_path: &Path,
-    digest: &str,
-    byte_len: u64,
-) -> (
-    BrokerTruthAcquisitionArtifactV1,
-    BrokerTruthAcquisitionArtifactSourceV1,
-) {
-    let artifact = BrokerTruthAcquisitionArtifactV1::new(role, relative_path, digest, byte_len)
-        .expect("authority artifact fixture");
-    let source = BrokerTruthAcquisitionArtifactSourceV1::new(relative_path, source_path)
-        .expect("authority source fixture");
-    (artifact, source)
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn quote_side(
-    side: QuoteSideV1,
-    client_msg_id: &str,
-    window: EvidenceWindowV1,
-    raw: ImmutableVortexArtifactV1,
-    decoded: ImmutableVortexArtifactV1,
-) -> ExactQuoteSideEvidenceV2 {
-    let page = ExactBrokerRequestPageV2::new(
-        0,
-        0,
-        client_msg_id,
-        window,
-        Some(TICK_TIMESTAMP),
-        Some(TICK_TIMESTAMP),
-        1,
-        false,
-        None,
-    )
-    .expect("tick request page");
-    let chunk = ExactBrokerRequestChunkV2::new(0, window, vec![page]).expect("tick chunk");
-    ExactQuoteSideEvidenceV2::new(
-        side,
-        SYMBOL_ID,
-        "EURUSD",
-        1,
-        2,
-        window,
-        vec![chunk],
-        raw,
-        decoded,
-    )
-    .expect("quote-side evidence")
-}
-
-fn evidence_row(
-    sequence: u64,
-    symbol_id: Option<i64>,
-    quote_side: Option<QuoteSideV1>,
-    evidence_kind: u8,
-    requested_window: Option<EvidenceWindowV1>,
-    client_msg_id: &str,
-    payload_type: u32,
-    payload_json: Value,
-) -> EvidenceRow {
-    EvidenceRow {
-        sequence,
-        account_id: ACCOUNT_ID,
-        symbol_id,
-        quote_side,
-        evidence_kind,
-        requested_window,
-        client_msg_id: client_msg_id.to_owned(),
-        payload_type,
-        payload_json: payload_json.to_string(),
-    }
-}
-
-fn tick_response(client_msg_id: &str, raw_price: i64) -> String {
-    json!({
-        "clientMsgId":client_msg_id,"payloadType":2146,
-        "payload":{"ctidTraderAccountId":ACCOUNT_ID,"hasMore":false,
-            "tickData":[{"timestamp":TICK_TIMESTAMP,"tick":raw_price}]}
-    })
-    .to_string()
-}
-
-fn raw_tick_page_array(
-    client_msg_id: &str,
-    side: QuoteSideV1,
-    raw_response_json: &str,
-) -> vortex_array::ArrayRef {
-    StructArray::from_fields(&[
-        (
-            "chunk_sequence",
-            PrimitiveArray::from_iter([0_u64]).into_array(),
-        ),
-        (
-            "page_sequence_in_chunk",
-            PrimitiveArray::from_iter([0_u64]).into_array(),
-        ),
-        (
-            "account_id",
-            PrimitiveArray::from_iter([ACCOUNT_ID]).into_array(),
-        ),
-        (
-            "symbol_id",
-            PrimitiveArray::from_iter([SYMBOL_ID]).into_array(),
-        ),
-        (
-            "quote_side",
-            PrimitiveArray::from_iter([quote_side_code(side)]).into_array(),
-        ),
-        (
-            "client_msg_id",
-            VarBinArray::from(vec![client_msg_id]).into_array(),
-        ),
-        (
-            "chunk_from_unix_ms_inclusive",
-            PrimitiveArray::from_iter([WINDOW_FROM]).into_array(),
-        ),
-        (
-            "chunk_to_unix_ms_exclusive",
-            PrimitiveArray::from_iter([WINDOW_TO]).into_array(),
-        ),
-        (
-            "page_from_unix_ms_inclusive",
-            PrimitiveArray::from_iter([WINDOW_FROM]).into_array(),
-        ),
-        (
-            "page_to_unix_ms_exclusive",
-            PrimitiveArray::from_iter([WINDOW_TO]).into_array(),
-        ),
-        (
-            "first_tick_timestamp_ms",
-            PrimitiveArray::from_iter([TICK_TIMESTAMP]).into_array(),
-        ),
-        (
-            "last_tick_timestamp_ms",
-            PrimitiveArray::from_iter([TICK_TIMESTAMP]).into_array(),
-        ),
-        (
-            "decoded_tick_count",
-            PrimitiveArray::from_iter([1_u64]).into_array(),
-        ),
-        ("has_more", PrimitiveArray::from_iter([0_u8]).into_array()),
-        (
-            "raw_response_json",
-            VarBinArray::from(vec![raw_response_json]).into_array(),
-        ),
-    ])
-    .expect("raw tick array")
-    .into_array()
-}
-
-fn decoded_tick_array(
-    side: QuoteSideV1,
-    timestamp_ms: i64,
-    price: f64,
-    extra_field: bool,
-) -> vortex_array::ArrayRef {
-    let mut fields = vec![
-        (
-            "chunk_sequence",
-            PrimitiveArray::from_iter([0_u64]).into_array(),
-        ),
-        (
-            "page_sequence_in_chunk",
-            PrimitiveArray::from_iter([0_u64]).into_array(),
-        ),
-        (
-            "row_sequence_in_page",
-            PrimitiveArray::from_iter([0_u64]).into_array(),
-        ),
-        (
-            "account_id",
-            PrimitiveArray::from_iter([ACCOUNT_ID]).into_array(),
-        ),
-        (
-            "symbol_id",
-            PrimitiveArray::from_iter([SYMBOL_ID]).into_array(),
-        ),
-        (
-            "quote_side",
-            PrimitiveArray::from_iter([quote_side_code(side)]).into_array(),
-        ),
-        (
-            "timestamp_ms",
-            PrimitiveArray::from_iter([timestamp_ms]).into_array(),
-        ),
-        ("price", PrimitiveArray::from_iter([price]).into_array()),
-    ];
-    if extra_field {
-        fields.push(("unexpected", PrimitiveArray::from_iter([1_u8]).into_array()));
-    }
-    StructArray::from_fields(&fields)
-        .expect("decoded tick array")
-        .into_array()
-}
-
-fn evidence_array(rows: &[EvidenceRow]) -> vortex_array::ArrayRef {
-    let has_symbol_id = rows.iter().map(|row| u8::from(row.symbol_id.is_some()));
-    let symbol_ids = rows.iter().map(|row| row.symbol_id.unwrap_or(0));
-    let has_quote_side = rows.iter().map(|row| u8::from(row.quote_side.is_some()));
-    let quote_sides = rows
-        .iter()
-        .map(|row| row.quote_side.map_or(0, quote_side_code));
-    let has_window = rows
-        .iter()
-        .map(|row| u8::from(row.requested_window.is_some()));
-    let from = rows.iter().map(|row| {
-        row.requested_window
-            .map_or(0, |window| window.from_unix_ms_inclusive())
-    });
-    let to = rows.iter().map(|row| {
-        row.requested_window
-            .map_or(0, |window| window.to_unix_ms_exclusive())
-    });
-    StructArray::from_fields(&[
-        (
-            "sequence",
-            PrimitiveArray::from_iter(rows.iter().map(|row| row.sequence)).into_array(),
-        ),
-        (
-            "account_id",
-            PrimitiveArray::from_iter(rows.iter().map(|row| row.account_id)).into_array(),
-        ),
-        (
-            "evidence_kind",
-            PrimitiveArray::from_iter(rows.iter().map(|row| row.evidence_kind)).into_array(),
-        ),
-        (
-            "has_symbol_id",
-            PrimitiveArray::from_iter(has_symbol_id).into_array(),
-        ),
-        (
-            "symbol_id",
-            PrimitiveArray::from_iter(symbol_ids).into_array(),
-        ),
-        (
-            "has_quote_side",
-            PrimitiveArray::from_iter(has_quote_side).into_array(),
-        ),
-        (
-            "quote_side",
-            PrimitiveArray::from_iter(quote_sides).into_array(),
-        ),
-        (
-            "has_requested_window",
-            PrimitiveArray::from_iter(has_window).into_array(),
-        ),
-        (
-            "requested_from_unix_ms_inclusive",
-            PrimitiveArray::from_iter(from).into_array(),
-        ),
-        (
-            "requested_to_unix_ms_exclusive",
-            PrimitiveArray::from_iter(to).into_array(),
-        ),
-        (
-            "client_msg_id",
-            VarBinArray::from(
-                rows.iter()
-                    .map(|row| row.client_msg_id.as_str())
-                    .collect::<Vec<_>>(),
+fn batched_ticks() -> (Vec<(i64, i64)>, Vec<(i64, i64)>) {
+    let bid = (0..20_000)
+        .map(|index| {
+            (
+                WINDOW_FROM + index * 2,
+                if index == 19_999 { 112_500 } else { 124_000 },
             )
-            .into_array(),
-        ),
-        (
-            "payload_type",
-            PrimitiveArray::from_iter(rows.iter().map(|row| row.payload_type)).into_array(),
-        ),
-        (
-            "payload_json",
-            VarBinArray::from(
-                rows.iter()
-                    .map(|row| row.payload_json.as_str())
-                    .collect::<Vec<_>>(),
-            )
-            .into_array(),
-        ),
-    ])
-    .expect("evidence array")
-    .into_array()
+        })
+        .collect();
+    let ask = (0..20_000)
+        .map(|index| (WINDOW_FROM + index * 2 + 1, 125_000))
+        .collect();
+    (bid, ask)
 }
 
-fn raw_deal_page_array(
-    raw_response_json: &str,
-    mismatched_has_more: bool,
-) -> vortex_array::ArrayRef {
-    StructArray::from_fields(&[
-        (
-            "chunk_sequence",
-            PrimitiveArray::from_iter([0_u64]).into_array(),
-        ),
-        (
-            "page_sequence_in_chunk",
-            PrimitiveArray::from_iter([0_u64]).into_array(),
-        ),
-        (
-            "account_id",
-            PrimitiveArray::from_iter([ACCOUNT_ID]).into_array(),
-        ),
-        (
-            "client_msg_id",
-            VarBinArray::from(vec!["deal-page"]).into_array(),
-        ),
-        (
-            "chunk_from_unix_ms_inclusive",
-            PrimitiveArray::from_iter([WINDOW_FROM]).into_array(),
-        ),
-        (
-            "chunk_to_unix_ms_exclusive",
-            PrimitiveArray::from_iter([WINDOW_TO]).into_array(),
-        ),
-        (
-            "page_from_unix_ms_inclusive",
-            PrimitiveArray::from_iter([WINDOW_FROM]).into_array(),
-        ),
-        (
-            "page_to_unix_ms_exclusive",
-            PrimitiveArray::from_iter([WINDOW_TO]).into_array(),
-        ),
-        (
-            "max_rows",
-            PrimitiveArray::from_iter([100_u32]).into_array(),
-        ),
-        ("has_events", PrimitiveArray::from_iter([0_u8]).into_array()),
-        (
-            "first_deal_execution_timestamp_ms",
-            PrimitiveArray::from_iter([0_i64]).into_array(),
-        ),
-        (
-            "last_deal_execution_timestamp_ms",
-            PrimitiveArray::from_iter([0_i64]).into_array(),
-        ),
-        (
-            "decoded_deal_count",
-            PrimitiveArray::from_iter([0_u64]).into_array(),
-        ),
-        (
-            "has_more",
-            PrimitiveArray::from_iter([u8::from(mismatched_has_more)]).into_array(),
-        ),
-        (
-            "raw_response_json",
-            VarBinArray::from(vec![raw_response_json]).into_array(),
-        ),
-    ])
-    .expect("raw deal page array")
-    .into_array()
+#[test]
+fn batched_vortex_ingress_preserves_all_pages_and_a_fill_beyond_the_first_decode_batch() {
+    let (bid, ask) = batched_ticks();
+    let (_root, verified, fixture) = fixture_with_ticks(Tamper::None, &bid, &ask);
+    assert_eq!(
+        verified
+            .manifest()
+            .primary_quotes()
+            .bid()
+            .raw_pages()
+            .row_count(),
+        3
+    );
+    let binding = closed_quote_replay_binding(&verified);
+    let authority = validate_reviewed_broker_financial_truth_authority_v2(
+        &fixture.store,
+        &fixture.link_receipt,
+        fixture.reviewed,
+    )
+    .expect("every Vortex batch and exact newest-first page must validate");
+    let evidence =
+        into_sealed_historical_bid_ask_quote_replay_evidence_v2(authority, &binding).unwrap();
+    let ledger =
+        replay_sealed_quote_validated_research_v1(&closed_quote_replay_plan(binding), &evidence)
+            .unwrap();
+    assert_eq!(ledger.positions().len(), 1);
+    assert_eq!(ledger.positions()[0].modeled_entry_price(), 1.25);
+    assert_eq!(ledger.positions()[0].modeled_exit_price(), Some(1.125));
+    assert_eq!(
+        ledger.positions()[0]
+            .exit_reference()
+            .unwrap()
+            .timestamp_unix_ms(),
+        WINDOW_FROM + 39_998
+    );
+    assert_eq!(
+        fixture_execution_economics(&ledger)
+            .net_pnl_account_currency()
+            .amount(),
+        -12_514.0
+    );
+    current_broker_financial_truth_capability_v1()
+        .require(BrokerFinancialOperationV1::HistoricalEvaluation)
+        .expect_err("large synthetic replay is still not global financial authority");
 }
 
-fn write_vortex(path: &Path, array: vortex_array::ArrayRef) {
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(path)
-        .expect("create Vortex fixture");
-    let mut writer = VORTEX_SESSION
-        .write_options()
-        .blocking(&*VORTEX_RUNTIME)
-        .writer(&mut file, array.dtype().clone());
-    writer.push(array).expect("write Vortex row batch");
-    writer.finish().expect("finish Vortex fixture");
-    file.flush().expect("flush Vortex fixture");
-}
-
-fn quote_side_code(side: QuoteSideV1) -> u8 {
-    match side {
-        QuoteSideV1::Bid => 0,
-        QuoteSideV1::Ask => 1,
+#[test]
+fn batched_vortex_ingress_refuses_changed_page_ordinals_and_corruption_after_row_16384() {
+    let (bid, ask) = batched_ticks();
+    for tamper in [
+        Tamper::TickPageOrdinalMismatch,
+        Tamper::TickFinalRowMismatch,
+    ] {
+        let (_root, verified, _fixture) = fixture_with_ticks(tamper, &bid, &ask);
+        let error = inspect_untrusted_broker_financial_truth_bundle_v2(verified)
+            .expect_err("hash-valid files with altered ticks or page identity must be refused");
+        assert_eq!(
+            error.code(),
+            BrokerFinancialTruthSemanticIngressErrorCodeV2::RawDecodedMismatch
+        );
     }
-}
-
-fn unique_root() -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let sequence = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "neoethos-broker-truth-semantic-v2-{}-{nonce}-{sequence}",
-        std::process::id()
-    ))
 }

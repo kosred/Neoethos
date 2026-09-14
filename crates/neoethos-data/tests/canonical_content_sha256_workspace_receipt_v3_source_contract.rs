@@ -137,9 +137,9 @@ fn receipt_moves_with_the_existing_component_authority_without_clone_or_rehydrat
     require_all(
         &compact,
         &[
-            "GpuOnlyFeatureRecipePreflightV3{plan,footprint,feature_major_to_bar_major,canonical_content_sha256,}",
-            "GpuOnlyFeatureMaterializationAdmissionV3{authority:DATA_GPU_ONLY_ADMISSION_AUTHORITY_V3,contract,run_device,footprint,feature_major_to_bar_major,canonical_content_sha256,}",
-            "GpuOnlyFeatureMaterializationSealTokenV3{authority:self.authority,contract:self.contract,footprint:self.footprint,feature_major_to_bar_major:self.feature_major_to_bar_major,canonical_content_sha256:self.canonical_content_sha256,}",
+            "feature_major_to_bar_major,canonical_content_sha256,}=preflight;",
+            "feature_major_to_bar_major,canonical_content_sha256,feature_identity,produced_higher_timeframe_column_count_v2,})",
+            "feature_major_to_bar_major:self.feature_major_to_bar_major,canonical_content_sha256:self.canonical_content_sha256,",
             "canonical_content_sha256:seal_token.canonical_content_sha256,",
         ],
     );
@@ -188,30 +188,32 @@ fn production_census_retains_canonical_receipt_after_later_producers_advance() {
         "pub const CURRENT_PENDING_RESIDENT_PRODUCERS_V3:",
         "];",
     );
-    for producer in [
-        "ResidentFeatureProducerV3::Quant",
-        "ResidentFeatureProducerV3::Session",
-        "ResidentFeatureProducerV3::Regime",
-        "ResidentFeatureProducerV3::HigherTimeframeAlignment",
-        "ResidentFeatureProducerV3::RobustNormalization",
-    ] {
-        assert!(pending.contains(producer), "missing pending {producer}");
-    }
-    assert_eq!(pending.matches("ResidentFeatureProducerV3::").count(), 5);
-    assert!(!pending.contains("CanonicalContentSha256"));
-    assert!(!pending.contains("FeatureMajorToBarMajor"));
+    assert_eq!(pending.matches("ResidentFeatureProducerV3::").count(), 0);
+    assert!(pending.trim().ends_with("0] = ["));
 }
 
 #[test]
-fn complete_workspace_component_remains_red_and_requires_both_real_receipts() {
-    let source = read("tests/gpu_only_feature_workspace_preflight_v3_source_contract.rs");
-    let red = section(
+fn complete_workspace_component_requires_both_real_receipts() {
+    let source = read("src/core/gpu_resident_feature_store_v3.rs");
+    let preflight = section(
         &source,
-        "fn red_data_component_receipt_must_consume_the_preflight_without_caller_evidence()",
-        "\n}",
+        "pub(crate) struct GpuOnlyFeatureRecipePreflightV3",
+        "impl GpuOnlyFeatureRecipePreflightV3",
     );
     require_all(
-        red,
+        preflight,
+        &[
+            "feature_major_to_bar_major: SealedFeatureMajorToBarMajorComponentReceiptV3",
+            "canonical_content_sha256: SealedCanonicalContentSha256ComponentReceiptV3",
+        ],
+    );
+    let admission = section(
+        &source,
+        "pub struct GpuOnlyFeatureMaterializationAdmissionV3",
+        "impl GpuOnlyFeatureMaterializationAdmissionV3",
+    );
+    require_all(
+        admission,
         &[
             "feature_major_to_bar_major: SealedFeatureMajorToBarMajorComponentReceiptV3",
             "canonical_content_sha256: SealedCanonicalContentSha256ComponentReceiptV3",

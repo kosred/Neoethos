@@ -195,7 +195,7 @@ fn exit_runtime_metadata(
         CapabilityState::Implemented,
         feature_columns,
         canonical_three_class_label_mapping(),
-        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0),
+        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0, 0),
     )
 }
 
@@ -244,12 +244,16 @@ fn validate_exit_metadata(
             metadata.training_summary.dataset_rows
         );
     }
-    if metadata.training_summary.train_rows + metadata.training_summary.val_rows
-        != metadata.training_summary.dataset_rows
-    {
+    let accounted_rows = metadata
+        .training_summary
+        .train_rows
+        .checked_add(metadata.training_summary.embargo_rows)
+        .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows));
+    if accounted_rows != Some(metadata.training_summary.dataset_rows) {
         anyhow::bail!(
-            "exit-agent metadata rows are inconsistent: train_rows {} + val_rows {} != dataset_rows {}",
+            "exit-agent metadata rows are inconsistent: train_rows {} + embargo_rows {} + val_rows {} != dataset_rows {}",
             metadata.training_summary.train_rows,
+            metadata.training_summary.embargo_rows,
             metadata.training_summary.val_rows,
             metadata.training_summary.dataset_rows
         );
@@ -261,20 +265,8 @@ fn validate_exit_metadata_consistency(
     sidecar: &RuntimeArtifactMetadata,
     embedded: &RuntimeArtifactMetadata,
 ) -> Result<()> {
-    if sidecar.model_name != embedded.model_name
-        || sidecar.family != embedded.family
-        || sidecar.state != embedded.state
-    {
-        anyhow::bail!("exit-agent metadata identity mismatch between sidecar and embedded payload");
-    }
-    if sidecar.feature_columns != embedded.feature_columns {
-        anyhow::bail!("exit-agent metadata feature columns drift between sidecar and embedded");
-    }
-    if sidecar.label_mapping != embedded.label_mapping {
-        anyhow::bail!("exit-agent metadata label mapping drift between sidecar and embedded");
-    }
-    if sidecar.training_summary != embedded.training_summary {
-        anyhow::bail!("exit-agent metadata training summary drift between sidecar and embedded");
+    if sidecar != embedded {
+        anyhow::bail!("exit-agent runtime metadata drift between sidecar and embedded payload");
     }
     Ok(())
 }
@@ -653,13 +645,8 @@ impl ExitAgent {
     pub fn with_device_policy(mut self, policy: impl Into<String>) -> Result<Self> {
         let requested = policy.into();
         let (device, selection) = resolve_train_device(&requested)?;
-        // **2026-05-25 — gpu-vulkan build fix**: under the wgpu backend
-        // `Device` is a non-Copy handle (vs. `NdArrayDevice` which is
-        // a zero-sized Copy type). The previous code moved `device`
-        // into `self.device` on the line above and then tried to
-        // `&device` it for `init()` — which only compiled when the
-        // device was Copy. Borrow from `self.device` so the same
-        // source works for both backends.
+        // Keep the selected device owned by the agent before constructing
+        // backend tensors so non-Copy accelerator handles remain valid.
         self.device = device;
         self.model = ExitAgentNetConfig::new()
             .with_input_dim(self.input_dim)

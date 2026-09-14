@@ -8,10 +8,13 @@ import {
   journalStats,
   journalTrades,
   journalAnalytics,
+  type BrokerExpectedMargin,
   type BucketSummary,
   type JournalAnalytics,
 } from "../api";
 import { usePoll } from "../hooks";
+import { useBrokerUi } from "../brokerUiContext";
+import BrokerUnavailable from "../components/BrokerUnavailable";
 
 const fmt = (v: unknown) =>
   typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(5)) : v == null ? "—" : String(v);
@@ -19,13 +22,15 @@ const fmt = (v: unknown) =>
 const fmt2 = (v: unknown) =>
   typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2)) : v == null ? "—" : String(v);
 
-const num = (v: any, d = 2) => (typeof v === "number" && isFinite(v) ? v.toFixed(d) : "—");
-const price = (v: any) => (typeof v === "number" && isFinite(v) ? v.toString() : "—");
-const fmtTime = (ms: any) => (typeof ms === "number" && ms > 0 ? new Date(ms).toLocaleString() : "—");
-
-// "winRatePct" / "max_drawdown_pct" → "WIN RATE PCT"
-const label = (k: string) =>
-  k.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ").toUpperCase();
+const num = (v: unknown, d = 2) =>
+  typeof v === "number" && Number.isFinite(v) ? v.toFixed(d) : "—";
+const price = (v: unknown) =>
+  typeof v === "number" && Number.isFinite(v) ? v.toString() : "—";
+const quantity = (v: unknown) =>
+  typeof v === "number" && Number.isFinite(v)
+    ? v.toLocaleString(undefined, { maximumSignificantDigits: 15 }) : "—";
+const fmtTime = (ms: unknown) =>
+  typeof ms === "number" && ms > 0 ? new Date(ms).toLocaleString() : "—";
 
 // Audit #124 — the per-trade analytics table.
 //
@@ -48,7 +53,7 @@ function Bucket({ title, rows, note }: { title: string; rows: BucketSummary[]; n
             <th>Trades</th>
             <th>Win %</th>
             <th>Expectancy / trade</th>
-            <th>Net pips</th>
+            <th>Observed price-move pips</th>
             <th>Net P/L</th>
           </tr>
         </thead>
@@ -59,7 +64,10 @@ function Bucket({ title, rows, note }: { title: string; rows: BucketSummary[]; n
               <td>{b.trades}</td>
               <td>{num(b.winRatePct, 1)}%</td>
               <td className={b.expectancy >= 0 ? "buy" : "sell"}>{num(b.expectancy)}</td>
-              <td className={b.netPips >= 0 ? "buy" : "sell"}>{num(b.netPips, 1)}</td>
+              <td className={b.netPips == null || !b.pipsTrades ? "muted" : b.netPips >= 0 ? "buy" : "sell"}>
+                {b.pipsTrades > 0 ? num(b.netPips, 1) : "—"}
+                <div className="muted small">{b.pipsTrades ?? "unknown"}/{b.trades} measured</div>
+              </td>
               <td className={b.netProfit >= 0 ? "buy" : "sell"}>{num(b.netProfit)}</td>
             </tr>
           ))}
@@ -76,8 +84,8 @@ function AnalyticsTab({ data, error }: { data: JournalAnalytics | null; error?: 
   if (trades.length === 0) {
     return (
       <p className="muted">
-        No closed trades recorded yet — this view derives everything from the journal, so it fills
-        in as trades close.
+        No closed trades in the local journal. This does not confirm that the broker has no
+        trading history; broker reconciliation may be unavailable or incomplete.
       </p>
     );
   }
@@ -101,19 +109,19 @@ function AnalyticsTab({ data, error }: { data: JournalAnalytics | null; error?: 
     <>
       <div className="cards" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
         <div className="card">
-          <div className="card-label">REALISED PAYOFF (PIPS)</div>
-          <div className={`card-value ${isFinite(payoff) && payoff >= 2 ? "buy" : "sell"}`} style={{ fontSize: 20 }}>
+          <div className="card-label">PRICE-MOVE PAYOFF (PIPS)</div>
+          <div className={`card-value ${!isFinite(payoff) ? "muted" : payoff >= 2 ? "buy" : "sell"}`} style={{ fontSize: 20 }}>
             {num(payoff)}
           </div>
         </div>
         <div className="card">
           <div className="card-label">WIN RATE</div>
-          <div className="card-value" style={{ fontSize: 20 }}>{num(winRate, 1)}%</div>
+          <div className="card-value" style={{ fontSize: 20 }}>{Number.isFinite(winRate) ? `${num(winRate, 1)}%` : "—"}</div>
         </div>
         <div className="card">
-          <div className="card-label">BREAK-EVEN WIN RATE</div>
-          <div className={`card-value ${winRate >= breakEven ? "buy" : "sell"}`} style={{ fontSize: 20 }}>
-            {num(breakEven, 1)}%
+          <div className="card-label">GROSS BREAK-EVEN WIN RATE</div>
+          <div className={`card-value ${!Number.isFinite(breakEven) ? "muted" : winRate >= breakEven ? "buy" : "sell"}`} style={{ fontSize: 20 }}>
+            {Number.isFinite(breakEven) ? `${num(breakEven, 1)}%` : "—"}
           </div>
         </div>
         <div className="card">
@@ -125,14 +133,20 @@ function AnalyticsTab({ data, error }: { data: JournalAnalytics | null; error?: 
       </div>
       <p className="muted small">
         Payoff = average winning move ÷ average losing move, in <b>pips</b>, over the{" "}
-        {withPips.length} closed trades whose pip move could be computed. Break-even win rate is
-        what that payoff needs to stop losing money. <b>Avg kept of best</b> is the mean capture
+        {withPips.length} closed trades whose pip move could be computed. The gross break-even rate
+        excludes commissions, swaps and other cash costs; it is not an account-profitability threshold. <b>Avg kept of best</b> is the mean capture
         ratio: how much of the favourable excursion each trade actually kept — a low number with a
         healthy MFE means winners are being given back, not that entries are wrong.
         {data.avgMfePips != null && <> Mean best-ever excursion: <b>{num(data.avgMfePips, 1)} pips</b>.</>}
       </p>
 
       <Bucket title="By symbol" rows={data.bySymbol} />
+      {data.coverage && <div className="banner info">
+        Coverage: pips {data.coverage.withPips}/{data.coverage.tradesTotal} · excursion {data.coverage.withExcursion}/{data.coverage.tradesTotal} · estimated R {data.coverage.withRMultiple}/{data.coverage.tradesTotal}.
+        {data.coverage.missingEntryTime > 0 && <> {data.coverage.missingEntryTime} trades lack an entry timestamp.</>}
+        {data.coverage.missingPriceSeries > 0 && <> {data.coverage.missingPriceSeries} trade windows lack usable price evidence.</>}
+        {data.coverage.symbolsUsingFallbackRisk.length > 0 && <> R uses a pooled, cross-symbol risk estimate for {data.coverage.symbolsUsingFallbackRisk.join(", ")}.</>}
+      </div>}
       <Bucket title="By direction" rows={data.bySide} />
       <Bucket
         title="By entry hour (UTC)"
@@ -153,7 +167,7 @@ function AnalyticsTab({ data, error }: { data: JournalAnalytics | null; error?: 
             <th>Symbol</th>
             <th>Side</th>
             <th>Pips</th>
-            <th>R</th>
+            <th>R estimate</th>
             <th>MFE (pips)</th>
             <th>MAE (pips)</th>
             <th>Kept of best</th>
@@ -171,7 +185,7 @@ function AnalyticsTab({ data, error }: { data: JournalAnalytics | null; error?: 
                 <td><b>{t.symbol}</b></td>
                 <td className={String(t.side).toUpperCase().includes("BUY") ? "buy" : "sell"}>{t.side}</td>
                 <td className={(t.pips ?? 0) >= 0 ? "buy" : "sell"}>{num(t.pips, 1)}</td>
-                <td className={(t.rMultiple ?? 0) >= 0 ? "buy" : "sell"}>{num(t.rMultiple)}</td>
+                <td className={t.rMultiple == null ? "muted" : t.rMultiple >= 0 ? "buy" : "sell"} title={`Estimated risk per lot: ${num(t.riskPerLot)} · basis: ${t.riskBasis ?? "unknown"}`}>{num(t.rMultiple)}</td>
                 <td>{num(t.mfePips, 1)}</td>
                 <td>{num(t.maePips, 1)}</td>
                 <td>{t.captureRatio != null ? `${num(t.captureRatio * 100, 0)}%` : "—"}</td>
@@ -182,8 +196,9 @@ function AnalyticsTab({ data, error }: { data: JournalAnalytics | null; error?: 
         </tbody>
       </table>
       <p className="muted small">
-        Empty cells are honest gaps, not zeros: <b>R</b> needs a risk estimate for the symbol, and{" "}
-        <b>MFE/MAE</b> need local price bars covering the trade's window. A missing excursion never
+        Empty cells are honest gaps, not zeros: <b>R</b> is inferred from historical losses per lot,
+        not the trade's original stop risk. <b>MFE/MAE</b> are bar-based estimates and need local
+        price evidence covering the trade's window. A missing excursion never
         reads as "the trade never went anywhere".
       </p>
     </>
@@ -191,43 +206,64 @@ function AnalyticsTab({ data, error }: { data: JournalAnalytics | null; error?: 
 }
 
 export default function Account() {
+  const { access } = useBrokerUi();
+  // Never carry a margin result or broker history into another account context.
+  return <AccountContent key={access.key} brokerEnabled={access.requestsEnabled} brokerKey={access.key} />;
+}
+
+function AccountContent({ brokerEnabled, brokerKey }: { brokerEnabled: boolean; brokerKey: string }) {
   // One screen for everything account-shaped: the closed-trade journal
   // (day-to-day view), the per-trade analytics (#124), plus broker identity,
   // order history, cash flow, margin.
   const [tab, setTab] = useState<"journal" | "analytics" | "broker">("journal");
 
-  const { data: profile } = usePoll(brokerProfile, 0);
-  const { data: version } = usePoll(brokerVersion, 0);
-  const { data: hist, error: he } = usePoll(ordersHistory, 0);
-  const { data: cash } = usePoll(cashFlow, 0);
-  const { data: stats, error: e1 } = usePoll(journalStats, 0);
-  const { data: trades, error: e2 } = usePoll(journalTrades, 0);
-  const { data: analytics, error: e3 } = usePoll(journalAnalytics, 0);
+  const { data: profile, error: pe, loading: pl, reload: reloadProfile } = usePoll(brokerProfile, 0, brokerKey, brokerEnabled);
+  const { data: version, error: ve, loading: vl, reload: reloadVersion } = usePoll(brokerVersion, 0, brokerKey, brokerEnabled);
+  const { data: hist, error: he, loading: hl, reload: reloadHistory } = usePoll(ordersHistory, 0, brokerKey, brokerEnabled);
+  const { data: cash, error: ce, loading: cl, reload: reloadCash } = usePoll(cashFlow, 0, brokerKey, brokerEnabled);
+  const { data: stats, error: e1, loading: sl, reload: reloadStats } = usePoll(journalStats, 0);
+  const { data: trades, error: e2, loading: tl, reload: reloadTrades } = usePoll(journalTrades, 0);
+  const { data: analytics, error: e3, loading: al, reload: reloadAnalytics } = usePoll(journalAnalytics, 0);
+  const refreshing = pl || vl || hl || cl || sl || tl || al;
 
   const [symId, setSymId] = useState("1");
   const [vol, setVol] = useState("100000");
-  const [margin, setMargin] = useState<any>(null);
+  const [margin, setMargin] = useState<BrokerExpectedMargin | null>(null);
   const [mErr, setMErr] = useState("");
+  const [marginBusy, setMarginBusy] = useState(false);
+  const marginValid = Number.isSafeInteger(Number(symId)) && Number(symId) > 0
+    && Number.isSafeInteger(Number(vol)) && Number(vol) > 0;
 
   const calcMargin = async () => {
+    if (!brokerEnabled || marginBusy || !marginValid) return;
+    setMarginBusy(true);
     setMErr("");
+    setMargin(null);
     try {
       setMargin(await expectedMargin(Number(symId), Number(vol)));
     } catch (e) {
       setMErr(String(e));
       setMargin(null);
+    } finally {
+      setMarginBusy(false);
     }
   };
 
-  const orders: any[] = hist?.orders ?? [];
-  const ocols = orders.length ? ["orderId", "side", "orderType", "orderStatus", "volumeLots", "limitPrice", "stopPrice"] : [];
-  const entries: any[] = cash?.entries ?? [];
-
-  const statEntries =
-    stats && typeof stats === "object"
-      ? Object.entries(stats).filter(([, v]) => typeof v !== "object" || v === null)
-      : [];
-  const tradeRows: any[] = Array.isArray(trades) ? trades : (trades?.trades ?? []);
+  const orders = hist?.orders ?? [];
+  const entries = cash?.entries ?? [];
+  const statEntries = stats
+    ? [
+        ["TOTAL TRADES", fmt2(stats.totalTrades)],
+        ["WINS", fmt2(stats.wins)],
+        ["LOSSES", fmt2(stats.losses)],
+        ["WIN RATE", stats.totalTrades > 0 ? `${num(stats.winRatePct, 1)}%` : "—"],
+        ["NET PROFIT", stats.totalTrades > 0 ? fmt2(stats.netProfit) : "—"],
+        ["PROFIT FACTOR", stats.totalTrades > 0 ? num(stats.profitFactor) : "—"],
+        ["EXPECTANCY", stats.totalTrades > 0 ? fmt2(stats.expectancy) : "—"],
+        ["MAX DRAWDOWN", stats.totalTrades > 0 ? `${num(stats.maxDrawdownPct, 1)}%` : "—"],
+      ] as const
+    : [];
+  const tradeRows = trades ?? [];
   // newest first
   const rows = [...tradeRows].sort(
     (a, b) => (b.exitTsMs ?? b.recordedAtUnixMs ?? 0) - (a.exitTsMs ?? a.recordedAtUnixMs ?? 0),
@@ -238,6 +274,15 @@ export default function Account() {
       <h1>Account &amp; Journal</h1>
       <p className="sub">Closed-trade log &amp; stats · per-trade pips/R/MFE · broker identity · order history · cash flow · margin</p>
 
+      <div className="btn-row"><button disabled={refreshing} onClick={() => void Promise.all([
+        reloadProfile(), reloadVersion(), reloadHistory(), reloadCash(), reloadStats(), reloadTrades(), reloadAnalytics(),
+      ])}>{refreshing ? "Refreshing…" : brokerEnabled ? "Refresh account & journal" : "Refresh local journal"}</button></div>
+      <BrokerUnavailable />
+      {pe && <div className="banner warn" role="alert">Broker profile unavailable: {pe}</div>}
+      {ve && <div className="banner warn" role="alert">Broker version unavailable: {ve}</div>}
+      {he && <div className="banner warn" role="alert">Broker order history unavailable. Local journal figures do not confirm current account performance. {he}</div>}
+      {ce && <div className="banner warn" role="alert">Broker cash-flow history unavailable: {ce}</div>}
+
       <div className="settings-grid">
         <div className="kv"><span>cTID user</span><b>{profile?.userId ?? "—"}</b></div>
         <div className="kv"><span>Broker API</span><b>v{version?.version ?? "—"}</b></div>
@@ -245,31 +290,37 @@ export default function Account() {
       </div>
 
       <div className="seg" style={{ margin: "12px 0" }}>
-        <button className={tab === "journal" ? "on" : ""} onClick={() => setTab("journal")}>Journal</button>
+        <button className={tab === "journal" ? "on" : ""} onClick={() => setTab("journal")}>Local journal</button>
         <button className={tab === "analytics" ? "on" : ""} onClick={() => setTab("analytics")}>Analytics (pips · R · MFE)</button>
         <button className={tab === "broker" ? "on" : ""} onClick={() => setTab("broker")}>Broker &amp; history</button>
       </div>
+
+      {tab !== "broker" && <div className="banner info" role="status">
+        These figures describe the local journal only. They do not establish a complete,
+        broker-reconciled trading history. Missing records are not proof of zero profit or loss.
+      </div>}
 
       {tab === "analytics" ? (
         <AnalyticsTab data={analytics} error={e3} />
       ) : tab === "journal" ? (
         <>
-          {(e1 || e2) && <div className="banner warn">{e1 || e2}</div>}
+          {e1 && <div className="banner warn" role="alert">Journal statistics could not refresh. Retained figures may be stale. {e1}</div>}
+          {e2 && <div className="banner warn" role="alert">Journal trades could not refresh. Retained rows may be stale. {e2}</div>}
 
           {statEntries.length > 0 && (
             <div className="cards" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
-              {statEntries.slice(0, 8).map(([k, v]) => (
-                <div className="card" key={k}>
-                  <div className="card-label">{label(k)}</div>
-                  <div className="card-value" style={{ fontSize: 18 }}>{fmt2(v)}</div>
+              {statEntries.map(([statLabel, value]) => (
+                <div className="card" key={statLabel}>
+                  <div className="card-label">{statLabel}</div>
+                  <div className="card-value" style={{ fontSize: 18 }}>{value}</div>
                 </div>
               ))}
             </div>
           )}
 
-          <h2>Trades ({rows.length})</h2>
+          <h2>Trades ({trades ? rows.length : "unknown"})</h2>
           {rows.length === 0 ? (
-            <p className="muted">No closed trades recorded yet.</p>
+            <p className="muted">{e2 ? "Local closed-trade history unavailable." : !trades ? "Loading local closed trades…" : "No closed trades in the local journal. Broker history may be unavailable or not yet reconciled."}</p>
           ) : (
             <table className="tbl">
               <thead>
@@ -287,10 +338,10 @@ export default function Account() {
               </thead>
               <tbody>
                 {rows.slice(0, 300).map((r, i) => {
-                  const net = Number(r.netProfit ?? 0);
-                  const costs = Number(r.commission ?? 0) + Number(r.swap ?? 0);
+                  const net = typeof r.netProfit === "number" ? r.netProfit : NaN;
+                  const costs = typeof r.commission === "number" && typeof r.swap === "number" ? r.commission + r.swap : NaN;
                   const buy = String(r.side ?? "").toUpperCase().includes("BUY");
-                  const cls = net >= 0 ? "buy" : "sell";
+                  const cls = !Number.isFinite(net) ? "" : net >= 0 ? "buy" : "sell";
                   return (
                     <tr key={r.positionId ?? i}>
                       <td className="muted">{fmtTime(r.exitTsMs ?? r.recordedAtUnixMs)}</td>
@@ -301,7 +352,7 @@ export default function Account() {
                       <td>{price(r.exitPrice)}</td>
                       <td className="muted">{num(costs)}</td>
                       <td className={cls}><b>{net >= 0 ? "+" : ""}{num(net)}</b></td>
-                      <td>{net > 0 ? "✓ win" : net < 0 ? "✗ loss" : "— BE"}</td>
+                      <td>{!Number.isFinite(net) ? "Unknown" : net > 0 ? "✓ win" : net < 0 ? "✗ loss" : "— BE"}</td>
                     </tr>
                   );
                 })}
@@ -314,46 +365,77 @@ export default function Account() {
           <h2>Margin calculator</h2>
           <div className="ticket">
             <div className="ticket-row">
-              <label>Symbol id<input value={symId} onChange={(e) => setSymId(e.target.value)} style={{ width: 80 }} /></label>
-              <label>Volume (units)<input value={vol} onChange={(e) => setVol(e.target.value)} style={{ width: 120 }} /></label>
-              <button className="primary" onClick={calcMargin}>Compute</button>
+              <label>Symbol id<input disabled={!brokerEnabled || marginBusy} type="number" min={1} step={1} value={symId} onChange={(e) => { setSymId(e.target.value); setMargin(null); }} style={{ width: 80 }} /></label>
+              <label>Volume (0.01 units)<input disabled={!brokerEnabled || marginBusy} type="number" min={1} step={1} value={vol} onChange={(e) => { setVol(e.target.value); setMargin(null); }} style={{ width: 160 }} /></label>
+              <button className="primary" disabled={!brokerEnabled || marginBusy || !marginValid} onClick={calcMargin}>{marginBusy ? "Computing…" : "Compute"}</button>
             </div>
+            <p className="muted small">This broker endpoint takes integer hundredths of a unit, not lots: 100,000 means 1,000 units. Lot size depends on the symbol.</p>
             {mErr && <div className="banner warn">{mErr}</div>}
             {margin && (
-              <table className="tbl">
-                <tbody>
-                  {Object.entries(margin).map(([k, v]) => (
-                    <tr key={k}><td style={{ color: "#9ca3af" }}>{k}</td><td>{fmt(v)}</td></tr>
-                  ))}
-                </tbody>
-              </table>
+              <>
+                <p className="muted small">Broker account #{margin.accountId} · symbol #{margin.symbolId ?? "unknown"}. Lots use the current broker lotSize, read at {fmtTime(margin.lotSizeObservedAtUnixMs)}.</p>
+                {margin.lotSizeError && <div className="banner warn" role="alert">{margin.lotSizeError}</div>}
+                <table className="tbl">
+                  <thead><tr><th>Volume (units)</th><th>Volume (lots)</th><th>Buy margin</th><th>Sell margin</th></tr></thead>
+                  <tbody>
+                    {margin.entries.map((entry) => (
+                      <tr key={entry.volumeRawCentiUnits}>
+                        <td>{quantity(entry.volumeUnits)}</td>
+                        <td title={`Broker lotSize: ${entry.lotSizeRawCentiUnits ?? "unavailable"} centi-units`}>{entry.lotSizeRawCentiUnits != null ? quantity(entry.volumeLots) : "—"}</td>
+                        <td>{fmt(entry.buyMargin)}</td>
+                        <td>{fmt(entry.sellMargin)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
             )}
           </div>
 
-          <h2>Order history ({orders.length})</h2>
-          {he && <div className="banner warn">{he}</div>}
+          <h2>Order history ({hist ? orders.length : "unknown"})</h2>
+          {hist?.hasMore && <div className="banner info">The broker reports more orders in the requested interval. This response is incomplete.</div>}
+          {hist?.lotSizeError && <div className="banner warn" role="alert">{hist.lotSizeError}</div>}
+          {orders.length > 0 && <p className="muted small">Units are the recorded order quantities. Lots use the current broker lotSize, read at {fmtTime(hist?.lotSizeObservedAtUnixMs)}; this does not prove the contract size at the historical fill. Requested and filled volumes remain separate.</p>}
           {orders.length === 0 ? (
-            <p className="muted">No order history.</p>
+            <p className="muted">{!brokerEnabled ? "Broker order history is unknown until broker setup is available." : he ? "Order history unavailable." : !hist ? "Loading order history…" : "No orders in the returned history window."}</p>
           ) : (
-            <table className="tbl">
-              <thead><tr>{ocols.map((c) => <th key={c}>{c}</th>)}</tr></thead>
+            <div style={{ overflowX: "auto", maxHeight: 480 }}><table className="tbl">
+              <thead><tr><th>Order / symbol</th><th>Side</th><th>Type</th><th>Status</th><th>Units</th><th>Lots (current contract)</th><th>Filled units</th><th>Filled lots</th><th>Limit</th><th>Stop</th></tr></thead>
               <tbody>
-                {orders.slice(0, 200).map((o, i) => (
-                  <tr key={i}>{ocols.map((c) => <td key={c}>{fmt(o[c])}</td>)}</tr>
+                {orders.map((order) => (
+                  <tr key={order.orderId}>
+                    <td>#{order.orderId}<div className="muted small">Symbol #{order.symbolId}</div></td>
+                    <td>{order.side}</td>
+                    <td>{order.orderType}</td>
+                    <td>{order.orderStatus}</td>
+                    <td>{quantity(order.volumeUnits)}</td>
+                    <td title={`Broker lotSize: ${order.lotSizeRawCentiUnits ?? "unavailable"} centi-units`}>{order.lotSizeRawCentiUnits != null ? quantity(order.volumeLots) : "—"}</td>
+                    <td>{quantity(order.executedVolumeUnits)}</td>
+                    <td>{order.lotSizeRawCentiUnits != null ? quantity(order.executedVolumeLots) : "—"}</td>
+                    <td>{price(order.limitPrice)}</td>
+                    <td>{price(order.stopPrice)}</td>
+                  </tr>
                 ))}
               </tbody>
-            </table>
+            </table></div>
           )}
 
-          <h2>Cash flow ({entries.length})</h2>
+          <h2>Cash flow ({cash ? entries.length : "unknown"})</h2>
           {entries.length === 0 ? (
-            <p className="muted">No deposits / withdrawals / swaps recorded.</p>
+            <p className="muted">{!brokerEnabled ? "Broker cash-flow history is unknown until broker setup is available." : ce ? "Cash-flow history unavailable." : !cash ? "Loading cash flow…" : "No deposits / withdrawals / swaps in the returned history window."}</p>
           ) : (
             <table className="tbl">
-              <thead><tr>{Object.keys(entries[0]).map((c) => <th key={c}>{c}</th>)}</tr></thead>
+              <thead><tr><th>When</th><th>Operation</th><th>Delta</th><th>Balance</th><th>Equity</th><th>Note</th></tr></thead>
               <tbody>
-                {entries.slice(0, 200).map((e, i) => (
-                  <tr key={i}>{Object.keys(entries[0]).map((c) => <td key={c}>{fmt(e[c])}</td>)}</tr>
+                {entries.slice(0, 200).map((entry) => (
+                  <tr key={entry.balanceHistoryId}>
+                    <td className="muted">{fmtTime(entry.changeBalanceTimestampMs)}</td>
+                    <td>{entry.operationType}</td>
+                    <td className={entry.delta >= 0 ? "buy" : "sell"}>{fmt2(entry.delta)}</td>
+                    <td>{fmt2(entry.balance)}</td>
+                    <td>{fmt2(entry.equity)}</td>
+                    <td className="muted">{entry.externalNote || "—"}</td>
+                  </tr>
                 ))}
               </tbody>
             </table>

@@ -258,6 +258,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_discovery_stage_order_is_exact_and_complete() {
+        assert_eq!(
+            PipelineStage::FULL_DISCOVERY,
+            [
+                PipelineStage::FeaturePreparation,
+                PipelineStage::GaGenerationSelection,
+                PipelineStage::PopulationEvaluation,
+                PipelineStage::SignalAndMinTradeFilter,
+                PipelineStage::QualityScreen,
+                PipelineStage::MonteCarlo,
+                PipelineStage::PropFirmWindow,
+                PipelineStage::CandidateCorrelation,
+                PipelineStage::WalkForward,
+                PipelineStage::Cpcv,
+                PipelineStage::Pbo,
+                PipelineStage::RobustnessPermutationPlateau,
+                PipelineStage::RiskDiagnostics,
+                PipelineStage::CanonicalReplay,
+                PipelineStage::ForwardTailReplay,
+                PipelineStage::SurvivorRanking,
+            ]
+        );
+    }
+
+    #[test]
     fn auto_backend_cannot_bypass_strict_preflight() {
         let error = gpu_pipeline_preflight(
             EvaluationBackend::AUTO,

@@ -343,7 +343,8 @@ fn tradjema_compute_into_scalar(
 
     let alpha = 2.0 / (length as f64 + 1.0);
 
-    let cap = length;
+    // A length-sized window needs one spare ring slot to distinguish full from empty.
+    let cap = length + 1;
     let mut min_vals = vec![0.0f64; cap];
     let mut min_idx = vec![0usize; cap];
     let mut max_vals = vec![0.0f64; cap];
@@ -548,30 +549,31 @@ fn tradjema_compute_into_scalar_len40(
     }
 
     let alpha = 2.0 / 41.0;
-    let mut min_vals = [0.0f64; 40];
-    let mut min_idx = [0usize; 40];
-    let mut max_vals = [0.0f64; 40];
-    let mut max_idx = [0usize; 40];
+    // The window is still 40 bars; only the deque has one spare slot.
+    let mut min_vals = [0.0f64; 41];
+    let mut min_idx = [0usize; 41];
+    let mut max_vals = [0.0f64; 41];
+    let mut max_idx = [0usize; 41];
     let (mut min_head, mut min_tail) = (0usize, 0usize);
     let (mut max_head, mut max_tail) = (0usize, 0usize);
 
     #[inline(always)]
     fn inc(i: &mut usize) {
         *i += 1;
-        if *i == 40 {
+        if *i == 41 {
             *i = 0;
         }
     }
     #[inline(always)]
     fn dec(i: usize) -> usize {
-        if i == 0 { 39 } else { i - 1 }
+        if i == 0 { 40 } else { i - 1 }
     }
     #[inline(always)]
     fn minq_push(
         v: f64,
         idx: usize,
-        vals: &mut [f64; 40],
-        id: &mut [usize; 40],
+        vals: &mut [f64; 41],
+        id: &mut [usize; 41],
         head: &mut usize,
         tail: &mut usize,
     ) {
@@ -590,8 +592,8 @@ fn tradjema_compute_into_scalar_len40(
     fn maxq_push(
         v: f64,
         idx: usize,
-        vals: &mut [f64; 40],
-        id: &mut [usize; 40],
+        vals: &mut [f64; 41],
+        id: &mut [usize; 41],
         head: &mut usize,
         tail: &mut usize,
     ) {
@@ -607,7 +609,7 @@ fn tradjema_compute_into_scalar_len40(
         inc(tail);
     }
     #[inline(always)]
-    fn q_expire(cur: usize, id: &mut [usize; 40], head: &mut usize, tail: &mut usize) {
+    fn q_expire(cur: usize, id: &mut [usize; 41], head: &mut usize, tail: &mut usize) {
         let lim = cur.saturating_sub(40);
         while *head != *tail && unsafe { *id.get_unchecked(*head) } <= lim {
             inc(head);
@@ -825,7 +827,10 @@ impl TradjemaStream {
         if mult <= 0.0 || !mult.is_finite() {
             return Err(TradjemaError::InvalidMult { mult });
         }
-        let cap = length;
+        let cap = length.checked_add(1).ok_or(TradjemaError::InvalidLength {
+            length,
+            data_len: 0,
+        })?;
 
         Ok(Self {
             length,
@@ -862,7 +867,7 @@ impl TradjemaStream {
     }
     #[inline(always)]
     fn minq_push(&mut self, v: f64, idx: usize) {
-        let cap = self.length;
+        let cap = self.min_vals.len();
         let mut back = Self::dec(self.min_tail, cap);
 
         while self.min_tail != self.min_head && self.min_vals[back] > v {
@@ -875,7 +880,7 @@ impl TradjemaStream {
     }
     #[inline(always)]
     fn maxq_push(&mut self, v: f64, idx: usize) {
-        let cap = self.length;
+        let cap = self.max_vals.len();
         let mut back = Self::dec(self.max_tail, cap);
 
         while self.max_tail != self.max_head && self.max_vals[back] < v {
@@ -943,7 +948,7 @@ impl TradjemaStream {
             return Some(self.tradjema);
         }
 
-        let cap = self.length;
+        let cap = self.min_vals.len();
         Self::q_expire(
             &mut self.min_head,
             &mut self.min_tail,
@@ -1296,7 +1301,8 @@ fn tradjema_batch_inner_into(
         }
         let alpha = 2.0 / (length as f64 + 1.0);
 
-        let cap = length;
+        // Leave a spare slot without changing the length-bar expiry window.
+        let cap = length + 1;
         let mut min_vals = vec![0.0f64; cap];
         let mut min_idx = vec![0usize; cap];
         let mut max_vals = vec![0.0f64; cap];
@@ -1527,6 +1533,159 @@ mod tests {
     #[cfg(feature = "proptest")]
     use proptest::prelude::*;
     use std::error::Error;
+
+    // Independent oracle: scan each complete window; never reuse the production deques.
+    // Keep the scalar/stream fused and batch unfused recurrences distinct.
+    fn naive_full_window_tradjema(
+        ranges: &[f64],
+        close: &[f64],
+        first: usize,
+        length: usize,
+        mult: f64,
+        fused: bool,
+    ) -> Vec<f64> {
+        let mut out = vec![f64::NAN; close.len()];
+        let alpha = 2.0 / (length as f64 + 1.0);
+        let mut y = 0.0;
+        for i in length - 1..ranges.len() {
+            let window = &ranges[i + 1 - length..=i];
+            let lo = window.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = window.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let adjusted = if hi != lo {
+                (ranges[i] - lo) / (hi - lo)
+            } else {
+                0.0
+            };
+            let a = alpha * (1.0 + adjusted * mult);
+            let src = close[first + i - 1];
+            y = if i == length - 1 {
+                if fused { src.mul_add(a, 0.0) } else { a * src }
+            } else if fused {
+                (src - y).mul_add(a, y)
+            } else {
+                y + a * (src - y)
+            };
+            out[first + i] = y;
+        }
+        out
+    }
+
+    fn assert_full_window_values(actual: &[f64], expected: &[f64], route: &str) {
+        assert_eq!(actual.len(), expected.len(), "{route}");
+        for (i, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "{route} warmup at {i}: {actual}");
+            } else {
+                assert!(expected.is_finite(), "{route} invalid oracle at {i}");
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{route} at {i}");
+            }
+        }
+    }
+
+    fn assert_full_window_routes(length: usize, first: usize, ranges: &[f64], mult: f64) {
+        let n = first + ranges.len();
+        let mut high = vec![f64::NAN; n];
+        let mut low = vec![f64::NAN; n];
+        let mut close = vec![f64::NAN; n];
+        for (i, &range) in ranges.iter().enumerate() {
+            high[first + i] = 1000.0 + range / 2.0;
+            low[first + i] = 1000.0 - range / 2.0;
+            // Vary the source within every bar so an incorrect alpha cannot hide at a fixed point.
+            close[first + i] = 1000.0 + (i % 3) as f64 * 0.25;
+            assert_eq!(high[first + i] - low[first + i], range);
+        }
+        let params = TradjemaParams {
+            length: Some(length),
+            mult: Some(mult),
+        };
+        let input = TradjemaInput::from_slices(&high, &low, &close, params.clone());
+        let expected = naive_full_window_tradjema(ranges, &close, first, length, mult, true);
+        let scalar = tradjema_with_kernel(&input, Kernel::Scalar).unwrap();
+        assert_full_window_values(&scalar.values, &expected, "scalar");
+
+        let batch = tradjema_batch_with_kernel(
+            &high,
+            &low,
+            &close,
+            &TradjemaBatchRange {
+                length: (length, length, 0),
+                mult: (mult, mult, 0.0),
+            },
+            Kernel::ScalarBatch,
+        )
+        .unwrap();
+        let batch_expected = naive_full_window_tradjema(ranges, &close, first, length, mult, false);
+        assert_full_window_values(&batch.values, &batch_expected, "batch");
+
+        // Stream starts at the same first valid bar; leading-NaN discovery is the slice API's job.
+        let mut stream = TradjemaStream::try_new(params).unwrap();
+        let mut streamed = vec![f64::NAN; n];
+        for i in 0..ranges.len() {
+            if let Some(value) = stream.update(high[first + i], low[first + i], close[first + i]) {
+                streamed[first + i] = value;
+                let window = &ranges[i + 1 - length..=i];
+                let lo = window.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = window.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                assert_ne!(
+                    stream.min_head, stream.min_tail,
+                    "nonempty min window at {i}"
+                );
+                assert_ne!(
+                    stream.max_head, stream.max_tail,
+                    "nonempty max window at {i}"
+                );
+                assert_eq!(stream.min_vals[stream.min_head], lo, "rolling min at {i}");
+                assert_eq!(stream.max_vals[stream.max_head], hi, "rolling max at {i}");
+            }
+        }
+        assert_full_window_values(&streamed, &expected, "stream");
+    }
+
+    #[test]
+    fn tradjema_full_window_minimal_counterexample_matches_naive() {
+        // At the first slide, [1,2] -> [2,3] must have adjusted TR = 1, not 0.
+        assert_full_window_routes(2, 0, &[1.0, 2.0, 3.0], 10.0);
+    }
+
+    #[test]
+    fn tradjema_full_window_monotone_periods_two_and_forty_match_naive() {
+        for length in [2, 40] {
+            let n = length * 5 + 7;
+            let increasing: Vec<_> = (1..=n).map(|i| i as f64).collect();
+            let decreasing: Vec<_> = increasing.iter().rev().copied().collect();
+            for first in [0, 3] {
+                let mult = if length == 2 { 0.5 } else { 10.0 };
+                assert_full_window_routes(length, first, &increasing, mult);
+                assert_full_window_routes(length, first, &decreasing, mult);
+            }
+        }
+    }
+
+    #[test]
+    fn tradjema_full_window_wrap_plateau_and_reversal_match_naive() {
+        for length in [2, 40] {
+            let mut ranges = vec![2.0; length + 3];
+            ranges.extend((1..=length * 3).rev().map(|i| i as f64));
+            ranges.extend((1..=length * 3).map(|i| i as f64));
+            ranges.extend((0..length * 4).map(|i| if i % 2 == 0 { 1.0 } else { 3.0 }));
+            let mult = if length == 2 { 0.5 } else { 10.0 };
+            assert_full_window_routes(length, 3, &ranges, mult);
+        }
+    }
+
+    #[test]
+    fn tradjema_full_window_stream_rejects_capacity_overflow() {
+        assert!(matches!(
+            TradjemaStream::try_new(TradjemaParams {
+                length: Some(usize::MAX),
+                mult: Some(10.0)
+            }),
+            Err(TradjemaError::InvalidLength {
+                length: usize::MAX,
+                data_len: 0
+            })
+        ));
+    }
 
     fn check_tradjema_partial_params(
         test_name: &str,

@@ -1,15 +1,17 @@
-// **2026-05-25 — gpu-vulkan build fix**: burn-wgpu + burn-cubecl pull
-// in `wgpu_hal::dynamic::DynShaderModule` and `naga::ir::ImageClass`
-// through deeply nested generics. The default 128 trait-resolution
-// recursion limit overflows when verifying `Sync` bounds on the
-// ensemble-inference adapters. 512 covers the deepest chains we have
-// without measurably slowing the type-checker. Standard fix per the
-// rustc error E0275 documentation.
+// Burn/CubeCL model graphs produce deeply nested generic types. The default
+// trait-resolution recursion limit is insufficient for their inference
+// adapters; 512 covers the active CUDA and CPU builds.
 #![recursion_limit = "512"]
 
 // Base classes and utilities (derived from models/base.py)
 pub mod base;
 pub mod common;
+#[cfg(all(feature = "burn-cuda-backend", feature = "burn-rocm-backend"))]
+compile_error!(
+    "select exactly one native Burn backend: burn-cuda-backend or burn-rocm-backend; use neither for the explicit ndarray CPU build"
+);
+#[cfg(feature = "burn-rocm-backend")]
+mod burn_rocm_backend;
 #[cfg(any(
     feature = "neuro-evolution-gpu",
     feature = "statistical-gpu",

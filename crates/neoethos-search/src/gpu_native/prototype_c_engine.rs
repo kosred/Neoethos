@@ -170,13 +170,13 @@ pub fn survivor_summary_from_device_metrics(
     })
 }
 
-#[cfg(any(feature = "gpu-cuda", feature = "gpu-vulkan"))]
+#[cfg(feature = "gpu-cuda")]
 pub use device::{PrototypeCBacktestEngine, PrototypeCResources, create_prototype_c_engine};
 
-#[cfg(any(feature = "gpu-cuda", feature = "gpu-vulkan"))]
+#[cfg(feature = "gpu-cuda")]
 mod device;
 
-#[cfg(all(test, any(feature = "gpu-cuda", feature = "gpu-vulkan")))]
+#[cfg(all(test, feature = "gpu-cuda"))]
 mod device_tests;
 
 #[cfg(test)]

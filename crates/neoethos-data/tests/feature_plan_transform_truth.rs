@@ -5,7 +5,10 @@ use neoethos_data::core::{
     cross_pair_features::{
         CROSS_PAIR_TRANSFORM_SEMANTIC_VERSION, compute_cross_pair_feature_columns_f64,
     },
-    features::{HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION, align_feature_columns_by_ms},
+    features::{
+        HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION,
+        align_calendar_feature_columns_by_observed_next_open_ms, align_feature_columns_by_ms,
+    },
     normalization::NORMALIZATION_TRANSFORM_SEMANTIC_VERSION,
 };
 
@@ -136,7 +139,7 @@ fn non_finite_cell_cannot_be_marked_valid() {
 #[test]
 fn repaired_transform_contracts_have_explicit_semantic_versions() {
     assert_eq!(NORMALIZATION_TRANSFORM_SEMANTIC_VERSION, 2);
-    assert_eq!(HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION, 3);
+    assert_eq!(HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION, 4);
     assert_eq!(CROSS_PAIR_TRANSFORM_SEMANTIC_VERSION, 2);
 }
 
@@ -340,4 +343,47 @@ fn typed_higher_timeframe_alignment_propagates_source_invalidity() {
     );
     assert_eq!(aligned[0].validity[1], FeatureCellValidity::Warmup);
     assert_eq!(aligned[0].validity[2], FeatureCellValidity::Valid);
+}
+
+#[test]
+fn calendar_higher_timeframe_never_exposes_the_open_tail_or_fills_stale_data_forever() {
+    const HOUR_MS: i64 = 60 * M1_MS;
+    let base_ms = [22, 23, 46, 47, 71, 72].map(|hour| TEST_EPOCH_MS + hour * HOUR_MS);
+    let feature_open_ms = [
+        TEST_EPOCH_MS,
+        TEST_EPOCH_MS + 23 * HOUR_MS,
+        TEST_EPOCH_MS + 47 * HOUR_MS,
+    ];
+    let source = column(
+        "D1_truth",
+        vec![10.0, 20.0, 30.0],
+        vec![FeatureCellValidity::Valid; 3],
+    );
+
+    let aligned = align_calendar_feature_columns_by_observed_next_open_ms(
+        &base_ms,
+        &feature_open_ms,
+        &[source],
+        true,
+    )
+    .expect("observed-span calendar alignment");
+
+    assert_eq!(
+        aligned[0].validity,
+        vec![
+            FeatureCellValidity::AlignmentMissing,
+            FeatureCellValidity::Valid,
+            FeatureCellValidity::Valid,
+            FeatureCellValidity::Valid,
+            FeatureCellValidity::Valid,
+            FeatureCellValidity::Stale,
+        ]
+    );
+    assert_eq!(aligned[0].values[1], 10.0);
+    assert_eq!(aligned[0].values[2], 10.0);
+    assert_eq!(aligned[0].values[3], 20.0);
+    assert_eq!(aligned[0].values[4], 20.0);
+    assert!(aligned[0].values[0].is_nan());
+    assert!(aligned[0].values[5].is_nan());
+    assert!(!aligned[0].values.contains(&30.0));
 }

@@ -14,9 +14,13 @@ import {
   discoveryStartBody,
   promoteStrategyBody,
   selectedDatasetGenerationForBrokerFetch,
+  sameDiscoveryDatasetGeneration,
+  sameSupervisorConfig,
   stopDataFetchFollowingActiveRun,
   symbolCoverageFailureText,
+  toggleDiscoveryDatasetSelection,
   type CanonicalDatasetIdentity,
+  type DatasetInventoryEntry,
   type DiscoveryKnobs,
 } from "../src/apiContracts.ts";
 
@@ -44,6 +48,22 @@ test("dataImportBody serializes the camelCase server fixture byte-for-byte", () 
     JSON.stringify(body),
     '{"sourcePath":"C:/market-data/EURUSD.csv","sourceFormat":"csv","sourceNamespace":"operator-upload","symbol":"EURUSD","timeframe":"M5","barTimestampConvention":"bar_open","expectedGeneration":null}',
   );
+});
+
+test("editing only TP preserves the broker stop and trailing flag", () => {
+  assert.deepEqual(amendProtectionBody(42, undefined, 1.2), {
+    positionId: 42, stopLossPrice: null, takeProfitPrice: 1.2, trailingStopLoss: null,
+  });
+  assert.equal(amendProtectionBody(42, 1.1, undefined, false).trailingStopLoss, false);
+});
+
+test("supervisor draft equality ignores JSON key ordering but retains every saved value", () => {
+  const draft = { enabled: false, intervalMinutes: 30, maxActionsPerTick: 3, directives: ["observe"] };
+  const server = { directives: ["observe"], enabled: false, intervalMinutes: 30, maxActionsPerTick: 3 };
+  assert.equal(sameSupervisorConfig(draft, server), true);
+  assert.equal(sameSupervisorConfig({ ...draft, intervalMinutes: 12 }, server), false);
+  assert.equal(sameSupervisorConfig({ ...draft, directives: ["trade"] }, server), false);
+  assert.equal(sameSupervisorConfig({ ...draft, enabled: true }, server), false);
 });
 
 test("dataFetchBody serializes the camelCase server fixture byte-for-byte", () => {
@@ -321,6 +341,65 @@ test("discovery request cannot be constructed without an authoritative inventory
     () => discoveryStartBody(undefined, {}),
     /Select an exact canonical dataset generation from Data/,
   );
+});
+
+function discoverySelectionFixture(): DatasetInventoryEntry {
+  return {
+    datasetIdentity: "d1-exact-selected-account" as CanonicalDatasetIdentity,
+    generation: `g1-${"11".repeat(32)}.vortex`,
+    manifestBindingSha256: "22".repeat(32),
+    symbol: "EURUSD",
+    timeframe: "M5",
+    sourceKind: "ctrader",
+    verification: "manifest_only",
+  };
+}
+
+test("Discovery pins a detached complete revision instead of taking newer inventory values", () => {
+  const inventoryEntry = { ...discoverySelectionFixture() };
+  const selected = toggleDiscoveryDatasetSelection([], inventoryEntry);
+  const originalBody = discoveryStartBody(selected[0], {});
+  assert.notEqual(selected[0], inventoryEntry);
+
+  inventoryEntry.generation = `g1-${"33".repeat(32)}.vortex`;
+  inventoryEntry.manifestBindingSha256 = "44".repeat(32);
+  assert.equal(sameDiscoveryDatasetGeneration(selected[0], inventoryEntry), false);
+  assert.deepEqual(discoveryStartBody(selected[0], {}), originalBody);
+  assert.equal(originalBody.dataset_selection.generation_id, `g1-${"11".repeat(32)}.vortex`);
+  assert.equal(originalBody.dataset_selection.manifest_binding_sha256, "22".repeat(32));
+});
+
+test("Discovery matches the exact binding and assertions but not a mutable verification label", () => {
+  const selected = Object.freeze(discoverySelectionFixture());
+  const changes: Partial<DatasetInventoryEntry>[] = [
+    { datasetIdentity: "D1-exact-selected-account" as CanonicalDatasetIdentity },
+    { generation: `g1-${"33".repeat(32)}.vortex` },
+    { manifestBindingSha256: "44".repeat(32) },
+    { sourceKind: "external" },
+    { symbol: "eurusd" },
+    { symbol: null },
+    { timeframe: "H1" },
+    { timeframe: null },
+  ];
+  for (const change of changes) {
+    assert.equal(sameDiscoveryDatasetGeneration(selected, { ...selected, ...change }), false, JSON.stringify(change));
+  }
+  assert.equal(sameDiscoveryDatasetGeneration(selected, { ...selected }), true);
+  assert.equal(sameDiscoveryDatasetGeneration(selected, { ...selected, verification: "generation_verified" }), true);
+});
+
+test("only explicit re-selection replaces one stale revision and preserves other account selections", () => {
+  const first = Object.freeze(discoverySelectionFixture());
+  const second = Object.freeze({ ...first, datasetIdentity: "d1-second-account" as CanonicalDatasetIdentity });
+  const current = Object.freeze([first, second]);
+  const updated = { ...first, generation: `g1-${"55".repeat(32)}.vortex`, manifestBindingSha256: "66".repeat(32) };
+  const replaced = toggleDiscoveryDatasetSelection(current, updated);
+  assert.deepEqual(current, [first, second]);
+  assert.deepEqual(replaced, [second, updated]);
+  assert.notEqual(replaced[1], updated);
+  assert.equal(replaced.filter((entry) => entry.datasetIdentity === first.datasetIdentity).length, 1);
+  assert.deepEqual(toggleDiscoveryDatasetSelection(replaced, { ...updated }), [second]);
+  assert.deepEqual(toggleDiscoveryDatasetSelection([second], first), [second, first]);
 });
 
 test("discovery request fails closed when inventory omits assertion metadata", () => {

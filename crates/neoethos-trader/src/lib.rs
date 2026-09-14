@@ -14,7 +14,7 @@
 //! | Seam ([`contracts`]) | Phase 1 stub | Wired later |
 //! |---|---|---|
 //! | [`SignalEngine`] | [`signal::MomentumStubSignal`] | Gene + `SoftVotingEnsemble` blend (P4) |
-//! | [`RiskGate`] | [`risk::PermissiveRiskGate`] / [`risk::MaxOpenPositionsGate`] | `RiskyModeManager` (P5). NOT the core `RiskManager` — it has no production constructor; see [`risk`] |
+//! | [`RiskGate`] | [`risk::PermissiveRiskGate`] / [`risk::MaxOpenPositionsGate`] | `RiskyModeManager` (P5). Account-level prop-firm limits are owned by the app's live `neoethos_core::domain::risk::RiskManager`; see [`risk`] |
 //! | [`ExecutionAdapter`] | [`execution::MockExecutionAdapter`] | cTrader `broker_api` (P5; demo vs live = the account) |
 //! | [`portfolio::PortfolioRegistry`] | explicit list / JSON manifest | promotion-artifact scan + hot-reload (P2) |
 //!
@@ -56,6 +56,7 @@ mod execution;
 pub mod gene_signal;
 pub mod portfolio;
 pub mod position;
+mod quote_signal_replay;
 mod replay;
 pub mod risk;
 pub mod signal;
@@ -85,7 +86,8 @@ pub use engine_money_v2::{
     try_from_legacy_engine_stats, try_from_legacy_exec_report,
 };
 pub use gene_signal::{
-    PrecomputedSignalEngine, combine_gene_signals, combine_gene_signals_with_brackets,
+    NettedGeneSignals, PrecomputedSignalEngine, combine_gene_signals,
+    combine_gene_signals_with_archived_policy, combine_gene_signals_with_brackets,
     combine_gene_signals_with_confidence,
 };
 pub use portfolio::PortfolioRegistry;

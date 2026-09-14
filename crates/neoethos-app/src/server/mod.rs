@@ -1,8 +1,6 @@
-//! HTTP API surface that the Flutter front-end talks to.
+//! HTTP API shared by the Tauri desktop UI and headless clients.
 //!
-//! Backend HTTP surface for the Flutter migration. The goal of this module
-//! is to expose TradingSession state and broker actions over stable JSON so
-//! a thin Flutter client can render the UI.
+//! Exposes TradingSession state and broker actions over stable JSON.
 //!
 //! ## Layering
 //!
@@ -14,17 +12,14 @@
 //!
 //! ## Port
 //!
-//! The Flutter client (`experiments/forex-flutter-ui/lib/api/
-//! backend_client.dart`) hard-codes `http://127.0.0.1:7423`. We bind there
-//! by default. Override with the `NEOETHOS_SERVER_BIND` env var
-//! (`host:port` form) when running multiple instances on the same machine.
+//! Headless HTTP defaults to `127.0.0.1:7423`; the desktop shell supplies an
+//! ephemeral loopback listener. `NEOETHOS_SERVER_BIND` (`host:port`) selects
+//! a different headless address; non-loopback requires a bearer token.
 //!
 //! ## CORS
 //!
-//! Flutter desktop binaries open a native window and don't need CORS, but
-//! `flutter run -d chrome` (used for hot-reload dev) does. We allow any
-//! origin for now — the server is loopback-only so the surface is small.
-//! Tighten before exposing on non-loopback interfaces.
+//! The Tauri webview and local development server are allowlisted. Arbitrary
+//! website origins are rejected. CORS does not replace API authentication.
 
 pub mod account;
 pub mod auth;
@@ -135,11 +130,28 @@ fn origin_is_allowed(origin: &str) -> bool {
         Some(("tauri", rest)) => rest,
         _ => return false,
     };
-    let host = rest.split([':', '/']).next().unwrap_or("");
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "[::1]" | "tauri.localhost"
-    )
+    // An Origin is scheme + authority, not an arbitrary URL. Splitting at ':'
+    // truncated IPv6 to '[' and silently rejected the documented loopback UI.
+    if rest.contains(['/', '?', '#', '@']) {
+        return false;
+    }
+    let Ok(authority) = rest.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    let host = authority.host();
+    let suffix = &authority.as_str()[host.len()..];
+    if !suffix.is_empty()
+        && !suffix.strip_prefix(':').is_some_and(|port| {
+            !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok()
+        })
+    {
+        return false;
+    }
+    ["localhost", "127.0.0.1", "[::1]", "tauri.localhost"]
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
 }
 
 #[cfg(test)]
@@ -155,6 +167,9 @@ mod cors_tests {
             "http://localhost:5173",
             "http://127.0.0.1:5173",
             "http://localhost",
+            "http://[::1]:5173",
+            "http://[::1]",
+            "https://LOCALHOST:5173",
         ] {
             assert!(origin_is_allowed(origin), "{origin} must be allowed");
         }
@@ -172,6 +187,15 @@ mod cors_tests {
             "file://localhost",           // wrong scheme
             "null",                       // sandboxed iframe origin
             "",
+            "http://localhost:invalid",
+            "http://localhost:65536",
+            "http://localhost:",
+            "http://localhost/path",
+            "http://localhost?query",
+            "http://localhost#fragment",
+            "http://user@localhost",
+            "http://[::1].evil.example",
+            "http://[2001:db8::1]:5173",
         ] {
             assert!(!origin_is_allowed(origin), "{origin} must be denied");
         }
@@ -415,6 +439,7 @@ pub fn router(state: AppApiState) -> Router {
         .route("/auth/codex/logout", post(codex::logout))
         .route("/codex/chat", post(codex::chat))
         .route("/intelligence", get(intelligence::intelligence))
+        .route("/intelligence/research", get(intelligence::research))
         // Live tick stream (#137). Reads from the cache that the
         // long-running spot streamer populates; sub-2s freshness
         // for active majors.
@@ -491,8 +516,7 @@ fn configure_api_auth(addr: &SocketAddr) -> anyhow::Result<()> {
 /// file to find every NeoEthos env knob. This shim keeps the
 /// `default_bind_addr()` callsite stable.
 ///
-/// The port is mirrored in `lib/api/backend_client.dart`; if either
-/// side changes, both must change in the same commit.
+/// The desktop shell instead supplies its own bound listener to `serve_on`.
 fn default_bind_addr() -> SocketAddr {
     crate::app_services::env_overrides::server_bind_addr()
 }
@@ -514,31 +538,26 @@ pub async fn serve(state: AppApiState) -> anyhow::Result<()> {
     tracing::info!(
         target: "neoethos_app::server",
         bind_addr = %addr,
-        "NeoEthos HTTP server listening — Flutter client should connect here"
+        "NeoEthos HTTP API listening"
     );
 
-    // 2026-06-10: the trading endpoints (/orders, /positions/close,
-    // /broker/credentials, …) carry NO authentication — the security model
-    // is "loopback-only", enforced solely by the bind address. Make that
-    // assumption explicit in the logs, and SHOUT if the operator ever points
-    // the bind at a non-loopback interface, where those endpoints would become
-    // reachable (and trade-capable) from the network with no auth in front.
+    // Report the authentication actually installed above; a non-loopback
+    // listener cannot reach this point without the required bearer gate.
+    let bearer_authentication = auth::current_api_token().is_some();
     if addr.ip().is_loopback() {
         tracing::info!(
             target: "neoethos_app::server",
             bind_addr = %addr,
-            "server is loopback-only (no endpoint authentication by design — \
-             do not expose this port on a public interface)"
+            bearer_authentication,
+            "server is loopback-only; do not expose an unauthenticated local API"
         );
     } else {
         tracing::warn!(
             target: "neoethos_app::server",
             bind_addr = %addr,
-            "SECURITY: HTTP server bound to a NON-loopback address — the trading \
-             endpoints have NO authentication and are now reachable from the \
-             network. Anyone who can reach this port can place/close live trades \
-             and change broker credentials. Bind to 127.0.0.1 unless you have put \
-             your own auth/firewall in front."
+            bearer_authentication,
+            "HTTP server is network-accessible with bearer authentication; \
+             protect the token and use a trusted encrypted transport"
         );
     }
 

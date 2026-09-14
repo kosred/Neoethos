@@ -1,17 +1,26 @@
 #include "resident_archive_knn_v2_abi.cuh"
+#include "resident_archive_layout_v3.hpp"
+#include "resident_backend_identity_v3.cuh"
+#if defined(__HIP_PLATFORM_AMD__)
+#include "resident_search_hip_v1_abi.cuh"
+#endif
 #include "resident_generation_v2_internal.cuh"
 #include "resident_scoring_novelty_v2_internal.cuh"
 
-#include <cub/cub.cuh>
+#include "resident_parallel_primitives_v1.cuh"
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <cfloat>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <new>
+
+namespace backend_identity_v3 = ::neoethos::resident_backend_identity_v3;
 
 namespace neoethos::resident_archive_knn_v2 {
 
@@ -129,24 +138,6 @@ bool checked_mul_v2(std::uint64_t left, std::uint64_t right,
   *result = left * right;
   return true;
 }
-
-bool checked_aligned_region_size_v2(std::uint64_t item_count,
-                                    std::uint64_t elements_per_item,
-                                    std::uint64_t element_size,
-                                    std::uint64_t* result) {
-  std::uint64_t element_count = 0;
-  std::uint64_t raw_bytes = 0;
-  if (item_count == 0 || elements_per_item == 0 || element_size == 0 ||
-      !checked_mul_v2(item_count, elements_per_item, &element_count) ||
-      !checked_mul_v2(element_count, element_size, &raw_bytes)) {
-    return false;
-  }
-  const std::uint64_t remainder = raw_bytes % kAlignmentV2;
-  const std::uint64_t padding =
-      remainder == 0 ? 0 : kAlignmentV2 - remainder;
-  return checked_add_v2(raw_bytes, padding, result);
-}
-
 bool nonzero_uuid_v2(const std::uint8_t uuid[16]) {
   std::uint8_t aggregate = 0;
   for (std::size_t index = 0; index < 16; ++index) {
@@ -154,38 +145,23 @@ bool nonzero_uuid_v2(const std::uint8_t uuid[16]) {
   }
   return aggregate != 0;
 }
-
-bool validate_region_v2(const NeoResidentArchiveKnnArenaRegionV2& region,
-                        std::uint64_t expected_size,
-                        std::uint64_t* cursor) {
-  std::uint64_t end = 0;
-  if (cursor == nullptr || region.offset_bytes != *cursor ||
-      region.offset_bytes % kAlignmentV2 != 0 ||
-      region.size_bytes != expected_size || region.size_bytes == 0 ||
-      region.size_bytes % kAlignmentV2 != 0 ||
-      !checked_add_v2(region.offset_bytes, region.size_bytes, &end)) {
-    return false;
-  }
-  *cursor = end;
-  return true;
-}
-
 bool validate_binding_layout_v2(const NeoResidentArchiveKnnBindV2& binding) {
   if (binding.abi_version != NEO_RESIDENT_ARCHIVE_KNN_ABI_V2 ||
-      binding.reserved != 0 || binding.reserved_extents != 0 ||
+      !backend_identity_v3::archive_backend_valid(binding) || binding.reserved_extents != 0 ||
       binding.population_count == 0 ||
       binding.population_count >
           NEO_RESIDENT_ARCHIVE_KNN_MAX_POPULATION_COUNT_V2 ||
       binding.archive_capacity == 0 ||
       binding.archive_capacity > NEO_RESIDENT_ARCHIVE_KNN_MAX_CAPACITY_V2 ||
-      binding.signature_word_count !=
+      binding.signature_word_count <
           NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 ||
-      binding.novelty_neighbor_count != NEO_RESIDENT_ARCHIVE_KNN_K_V2 ||
-      binding.max_terms_per_gene != NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 ||
+      binding.novelty_neighbor_count == 0 ||
+      binding.max_terms_per_gene == 0u ||
+      binding.max_terms_per_gene > NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 ||
       !nonzero_uuid_v2(binding.device_uuid) ||
-      binding.primary_context_identity == 0 ||
+      backend_identity_v3::archive_owner_identity(binding) == 0 ||
       binding.search_stream_identity == 0 ||
-      binding.active_pool_identity == 0 || binding.cuda_build_identity == 0 ||
+      binding.active_pool_identity == 0 || backend_identity_v3::archive_build_identity(binding) == 0 ||
       binding.kernel_semantics_identity == 0 ||
       binding.binary64_math_identity == 0 || binding.plan_identity == 0 ||
       binding.run_identity == 0 ||
@@ -194,89 +170,8 @@ bool validate_binding_layout_v2(const NeoResidentArchiveKnnBindV2& binding) {
     return false;
   }
 
-  std::uint64_t population_scalar_bytes = 0;
-  std::uint64_t archive_gene_scalar_bytes = 0;
-  std::uint64_t archive_term_index_bytes = 0;
-  std::uint64_t archive_term_weight_bytes = 0;
-  std::uint64_t archive_metric_row_bytes = 0;
-  std::uint64_t archive_signature_bytes = 0;
-  std::uint64_t archive_hash_bytes = 0;
-  std::uint64_t population_signature_bytes = 0;
-  std::uint64_t exact_top_k_bytes = 0;
-  std::uint64_t admission_flag_bytes = 0;
-  std::uint64_t admission_offset_bytes = 0;
-  if (!checked_aligned_region_size_v2(binding.population_count, 1,
-                                      sizeof(double),
-                                      &population_scalar_bytes) ||
-      !checked_aligned_region_size_v2(binding.archive_capacity, 1,
-                                      sizeof(GeneScalarV2),
-                                      &archive_gene_scalar_bytes) ||
-      !checked_aligned_region_size_v2(
-          binding.archive_capacity, binding.max_terms_per_gene,
-          sizeof(std::uint64_t), &archive_term_index_bytes) ||
-      !checked_aligned_region_size_v2(
-          binding.archive_capacity, binding.max_terms_per_gene,
-          sizeof(double), &archive_term_weight_bytes) ||
-      !checked_aligned_region_size_v2(binding.archive_capacity, 1,
-                                      sizeof(MetricRowV2),
-                                      &archive_metric_row_bytes) ||
-      !checked_aligned_region_size_v2(
-          binding.archive_capacity, binding.signature_word_count,
-          sizeof(std::uint64_t), &archive_signature_bytes) ||
-      !checked_aligned_region_size_v2(binding.archive_capacity, 1,
-                                      sizeof(std::uint64_t),
-                                      &archive_hash_bytes) ||
-      !checked_aligned_region_size_v2(
-          binding.population_count, binding.signature_word_count,
-          sizeof(std::uint64_t), &population_signature_bytes) ||
-      !checked_aligned_region_size_v2(
-          binding.population_count, binding.novelty_neighbor_count,
-          sizeof(ExactNeighborKeyV2), &exact_top_k_bytes) ||
-      !checked_aligned_region_size_v2(binding.population_count, 1,
-                                      sizeof(std::uint32_t),
-                                      &admission_flag_bytes) ||
-      !checked_aligned_region_size_v2(binding.population_count, 1,
-                                      sizeof(std::uint64_t),
-                                      &admission_offset_bytes)) {
-    return false;
-  }
-
-  std::uint64_t cursor = 0;
-  if (!validate_region_v2(binding.fitness_scores, population_scalar_bytes,
-                          &cursor) ||
-      !validate_region_v2(binding.decision_keys, population_scalar_bytes,
-                          &cursor) ||
-      binding.cub_scratch.offset_bytes != cursor ||
-      binding.cub_scratch.size_bytes == 0 ||
-      binding.cub_scratch.size_bytes % kAlignmentV2 != 0 ||
-      !checked_add_v2(binding.cub_scratch.offset_bytes,
-                      binding.cub_scratch.size_bytes, &cursor) ||
-      !validate_region_v2(binding.archive_gene_scalars,
-                          archive_gene_scalar_bytes, &cursor) ||
-      !validate_region_v2(binding.archive_term_indices,
-                          archive_term_index_bytes, &cursor) ||
-      !validate_region_v2(binding.archive_term_weights,
-                          archive_term_weight_bytes, &cursor) ||
-      !validate_region_v2(binding.archive_metric_rows,
-                          archive_metric_row_bytes, &cursor) ||
-      !validate_region_v2(binding.archive_signatures, archive_signature_bytes,
-                          &cursor) ||
-      !validate_region_v2(binding.archive_hashes, archive_hash_bytes,
-                          &cursor) ||
-      !validate_region_v2(binding.current_population_signatures,
-                          population_signature_bytes, &cursor) ||
-      !validate_region_v2(binding.novelty_scores, population_scalar_bytes,
-                          &cursor) ||
-      !validate_region_v2(binding.exact_top_k_keys, exact_top_k_bytes,
-                          &cursor) ||
-      !validate_region_v2(binding.admission_flags, admission_flag_bytes,
-                          &cursor) ||
-      !validate_region_v2(binding.admission_offsets, admission_offset_bytes,
-                          &cursor) ||
-      !validate_region_v2(binding.archive_control_and_seal, 256, &cursor)) {
-    return false;
-  }
-  return cursor == binding.total_device_bytes;
+  return archive_layout_v3::validate_geometry_v3<
+      sizeof(GeneScalarV2), sizeof(MetricRowV2), sizeof(ExactNeighborKeyV2)>(binding);
 }
 
 template <typename T>
@@ -354,7 +249,8 @@ __device__ bool load_current_gene_sources_v2(
       seal->logical_population_count != expected.logical_population_count ||
       seal->feature_count != expected.feature_count ||
       seal->max_terms_per_gene != expected.max_terms_per_gene ||
-      seal->max_terms_per_gene != NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 ||
+      seal->max_terms_per_gene == 0u ||
+      seal->max_terms_per_gene > NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 ||
       seal->scalar_store[seal->current_store_index] == nullptr ||
       seal->term_index_store[seal->current_store_index] == nullptr ||
       seal->term_weight_store[seal->current_store_index] == nullptr) {
@@ -374,8 +270,10 @@ __device__ std::uint64_t f64_bits(double value) {
 __device__ bool full_fixed_stride_gene_equal_v2(
     const GeneScalarV2& left, const std::uint64_t* left_term_indices,
     const double* left_term_weights, std::uint64_t left_ordinal,
+    std::uint32_t left_stride,
     const GeneScalarV2& right, const std::uint64_t* right_term_indices,
-    const double* right_term_weights, std::uint64_t right_ordinal) {
+    const double* right_term_weights, std::uint64_t right_ordinal,
+    std::uint32_t right_stride) {
   if (left.term_count != right.term_count ||
       left.smc_flags != right.smc_flags ||
       f64_bits(left.long_threshold) != f64_bits(right.long_threshold) ||
@@ -386,16 +284,20 @@ __device__ bool full_fixed_stride_gene_equal_v2(
           f64_bits(right.stop_vol_multiplier)) {
     return false;
   }
-  const std::uint64_t left_base =
-      left_ordinal * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2;
-  const std::uint64_t right_base =
-      right_ordinal * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2;
+  const std::uint64_t left_base = left_ordinal * left_stride;
+  const std::uint64_t right_base = right_ordinal * right_stride;
   for (std::uint32_t term = 0;
        term < NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2; ++term) {
-    if (left_term_indices[left_base + term] !=
-            right_term_indices[right_base + term] ||
-        f64_bits(left_term_weights[left_base + term]) !=
-            f64_bits(right_term_weights[right_base + term])) {
+    const std::uint64_t left_index =
+        term < left_stride ? left_term_indices[left_base + term] : 0ull;
+    const std::uint64_t right_index =
+        term < right_stride ? right_term_indices[right_base + term] : 0ull;
+    const double left_weight =
+        term < left_stride ? left_term_weights[left_base + term] : 0.0;
+    const double right_weight =
+        term < right_stride ? right_term_weights[right_base + term] : 0.0;
+    if (left_index != right_index ||
+        f64_bits(left_weight) != f64_bits(right_weight)) {
       return false;
     }
   }
@@ -428,14 +330,14 @@ __device__ bool neighbor_less_v2(const ExactNeighborKeyV2& left,
 
 __device__ void insert_neighbor_v2(const ExactNeighborKeyV2& candidate,
                                    ExactNeighborKeyV2* selected,
-                                   std::uint32_t* selected_count) {
+                                   std::uint32_t* selected_count, std::uint32_t capacity) {
   std::uint32_t count = *selected_count;
-  if (count == NEO_RESIDENT_ARCHIVE_KNN_K_V2 &&
+  if (count == capacity &&
       !neighbor_less_v2(candidate, selected[count - 1])) {
     return;
   }
   std::uint32_t position = count;
-  if (position == NEO_RESIDENT_ARCHIVE_KNN_K_V2) {
+  if (position == capacity) {
     --position;
   } else {
     ++count;
@@ -477,7 +379,8 @@ __global__ void build_population_signatures_v2(
     const GeneSealV2* seal, GeneViewV2 expected,
     const MetricRowV2* metric_rows, const std::uint64_t* expected_scenarios,
     const ScoringSealV2* scoring_seal, std::uint64_t* signatures,
-    std::uint32_t* admission_flags, ArchiveControlV2* control) {
+    std::uint32_t* admission_flags, ArchiveControlV2* control,
+    std::uint32_t signature_word_count, NeoResidentArchivePolicyV3 policy) {
   const std::uint64_t candidate =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (candidate >= expected.logical_population_count) {
@@ -496,61 +399,60 @@ __global__ void build_population_signatures_v2(
   const GeneScalarV2 scalar = genes.scalars[candidate];
   const MetricRowV2 row = metric_rows[candidate];
   if (scalar.term_count == 0 ||
-      scalar.term_count > NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 ||
+      scalar.term_count > expected.max_terms_per_gene ||
       row.candidate_id != scalar.gene_identity ||
       row.scenario_id != expected_scenarios[candidate]) {
     latch_device_fault_v2(control, kGeneShapeFaultV2);
     admission_flags[candidate] = 0;
     return;
   }
-  for (std::uint32_t metric = 0;
-       metric < NEO_RESIDENT_ARCHIVE_KNN_METRIC_COUNT_V2; ++metric) {
-    if (!isfinite(row.values[metric])) {
-      latch_device_fault_v2(control, kNonFiniteMetricFaultV2);
-      admission_flags[candidate] = 0;
-      return;
-    }
+  using resident_scoring_novelty_v2_internal::ResidentMetricStatusV2;
+  const auto metric_status =
+      resident_scoring_novelty_v2_internal::classify_resident_metrics_v2(row.values);
+  if (metric_status == ResidentMetricStatusV2::Fault) {
+    latch_device_fault_v2(control, kNonFiniteMetricFaultV2);
+    admission_flags[candidate] = 0;
+    return;
   }
 
-  std::uint64_t local[NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2] = {};
-  const std::uint64_t base =
-      candidate * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2;
-  for (std::uint32_t term = 0;
-       term < NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2; ++term) {
+  // This kernel also runs after CUB reused the first four population-sized
+  // arrays. Clear the complete dynamic row, including its last partial word.
+  std::uint64_t* signature = signatures + candidate * signature_word_count;
+  for (std::uint32_t word = 0; word < signature_word_count; ++word) {
+    signature[word] = 0ull;
+  }
+  const std::uint64_t base = candidate * expected.max_terms_per_gene;
+  bool any_signature_bit = false;
+  for (std::uint32_t term = 0; term < expected.max_terms_per_gene; ++term) {
     const std::uint64_t feature = genes.term_indices[base + term];
     const double weight = genes.term_weights[base + term];
     if (term < scalar.term_count) {
-      if (feature >= expected.feature_count || feature / 64ull >=
-                                                   NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 ||
+      if (feature >= expected.feature_count ||
+          feature / 64ull >= signature_word_count ||
           !isfinite(weight)) {
         latch_device_fault_v2(control, kGeneShapeFaultV2);
         admission_flags[candidate] = 0;
         return;
       }
-      local[feature / 64ull] |= 1ull << (feature % 64ull);
+      signature[feature / 64ull] |= 1ull << (feature % 64ull);
+      any_signature_bit = true;
     } else if (feature != 0 || f64_bits(weight) != 0) {
       latch_device_fault_v2(control, kGeneShapeFaultV2);
       admission_flags[candidate] = 0;
       return;
     }
   }
-  bool any_signature_bit = false;
-  for (std::uint32_t word = 0;
-       word < NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2; ++word) {
-    signatures[candidate * NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 + word] =
-        local[word];
-    any_signature_bit = any_signature_bit || local[word] != 0;
-  }
   if (!any_signature_bit) {
     latch_device_fault_v2(control, kSignatureFaultV2);
     admission_flags[candidate] = 0;
     return;
   }
-  admission_flags[candidate] =
-      row.values[kTradeCountMetricSlotV2] > 0.0 &&
-              row.values[kNetMetricSlotV2] > 0.0
-          ? 1u
-          : 0u;
+  const bool mode_passed = policy.mode == 1u ||
+      (policy.mode == 2u ? row.values[5] > policy.minimum_profit_factor :
+       policy.mode == 3u ? row.values[1] > policy.minimum_sharpe :
+                          row.values[kNetMetricSlotV2] > policy.minimum_net);
+  admission_flags[candidate] = metric_status == ResidentMetricStatusV2::Finite &&
+      row.values[kTradeCountMetricSlotV2] > 0.0 && mode_passed ? 1u : 0u;
 }
 
 __global__ void exact_archive_population_knn_v2(
@@ -559,7 +461,9 @@ __global__ void exact_archive_population_knn_v2(
     const GeneScalarV2* archive_scalars,
     const std::uint64_t* archive_signatures, ExactNeighborKeyV2* top_k,
     double* novelty_scores, const ScoringSealV2* scoring_seal,
-    ArchiveControlV2* control, std::uint64_t archive_capacity) {
+    ArchiveControlV2* control, std::uint64_t archive_capacity,
+    std::uint32_t signature_word_count, std::uint32_t neighbor_count,
+    bool population_only) {
   const std::uint64_t query =
       static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (query >= expected.logical_population_count) {
@@ -584,21 +488,27 @@ __global__ void exact_archive_population_knn_v2(
     return;
   }
 
-  ExactNeighborKeyV2 selected[NEO_RESIDENT_ARCHIVE_KNN_K_V2] = {};
+  // Each query owns its pre-admitted k-row segment. This supports the actual
+  // configured k without fixed local-array truncation or a new allocation.
+  ExactNeighborKeyV2* selected = top_k + query * neighbor_count;
   std::uint32_t selected_count = 0;
   const std::uint64_t* query_signature =
-      current_signatures +
-      query * NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2;
+      current_signatures + query * signature_word_count;
   const std::uint64_t available =
-      expected.logical_population_count - 1ull + archive_count;
+      expected.logical_population_count - 1ull + (population_only ? 0ull : archive_count);
   if (available == 0) {
+    if (population_only) {
+      novelty_scores[query] = 0.0;
+      for (std::uint32_t i = 0; i < neighbor_count; ++i) selected[i] = {};
+      return;
+    }
     latch_device_fault_v2(control, kNeighborBoundFaultV2);
     novelty_scores[query] = 0.0;
     return;
   }
 
   const std::uint64_t neighbor_extent =
-      expected.logical_population_count + archive_count;
+      expected.logical_population_count + (population_only ? 0ull : archive_count);
   for (std::uint64_t combined = 0; combined < neighbor_extent; ++combined) {
     const bool current = combined < expected.logical_population_count;
     const std::uint64_t ordinal =
@@ -608,15 +518,11 @@ __global__ void exact_archive_population_knn_v2(
     }
     const std::uint64_t* signature =
         current
-            ? current_signatures +
-                  ordinal * NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2
-            : archive_signatures +
-                  ordinal * NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2;
-    std::uint32_t intersection = 0;
-    std::uint32_t union_count = 0;
-#pragma unroll
-    for (std::uint32_t word = 0;
-         word < NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2; ++word) {
+            ? current_signatures + ordinal * signature_word_count
+            : archive_signatures + ordinal * signature_word_count;
+    std::uint64_t intersection = 0;
+    std::uint64_t union_count = 0;
+    for (std::uint32_t word = 0; word < signature_word_count; ++word) {
       intersection += __popcll(query_signature[word] & signature[word]);
       union_count += __popcll(query_signature[word] | signature[word]);
     }
@@ -627,21 +533,23 @@ __global__ void exact_archive_population_knn_v2(
       return;
     }
     ExactNeighborKeyV2 neighbor{};
-    neighbor.numerator = union_count - intersection;
-    neighbor.denominator = union_count;
+    // At most 16 active terms per gene still bounds a valid union to 32,
+    // independently of vocabulary width; narrow only after that check.
+    neighbor.numerator = static_cast<std::uint32_t>(union_count - intersection);
+    neighbor.denominator = static_cast<std::uint32_t>(union_count);
     neighbor.gene_identity =
         current ? genes.scalars[ordinal].gene_identity
                 : archive_scalars[ordinal].gene_identity;
     neighbor.source_kind = current ? kSourceCurrentV2 : kSourceArchiveV2;
     neighbor.source_ordinal = static_cast<std::uint32_t>(ordinal);
-    insert_neighbor_v2(neighbor, selected, &selected_count);
+    insert_neighbor_v2(neighbor, selected, &selected_count, neighbor_count);
   }
 
   const std::uint32_t expected_count =
       static_cast<std::uint32_t>(
-          available < NEO_RESIDENT_ARCHIVE_KNN_K_V2
+          available < neighbor_count
               ? available
-              : NEO_RESIDENT_ARCHIVE_KNN_K_V2);
+              : neighbor_count);
   if (selected_count != expected_count || selected_count == 0) {
     latch_device_fault_v2(control, kNeighborBoundFaultV2);
     novelty_scores[query] = 0.0;
@@ -649,9 +557,9 @@ __global__ void exact_archive_population_knn_v2(
   }
   double sum = 0.0;
   for (std::uint32_t neighbor = 0;
-       neighbor < NEO_RESIDENT_ARCHIVE_KNN_K_V2; ++neighbor) {
+       neighbor < neighbor_count; ++neighbor) {
     const std::uint64_t output =
-        query * NEO_RESIDENT_ARCHIVE_KNN_K_V2 + neighbor;
+        query * neighbor_count + neighbor;
     top_k[output] = neighbor < selected_count ? selected[neighbor]
                                              : ExactNeighborKeyV2{};
     if (neighbor < selected_count) {
@@ -687,7 +595,8 @@ __global__ void build_blended_rank_inputs_v2(
     const GeneSealV2* seal, GeneViewV2 expected, const double* fitness_scores,
     const double* novelty_scores, std::uint64_t* decision_keys,
     std::uint64_t* ordinal_keys, std::uint64_t* ordinal_values,
-    const ScoringSealV2* scoring_seal, ArchiveControlV2* control) {
+    const ScoringSealV2* scoring_seal, ArchiveControlV2* control,
+    double novelty_weight) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
@@ -695,6 +604,10 @@ __global__ void build_blended_rank_inputs_v2(
   control->staged_ready = 0;
   control->staged_count = 0;
   control->staged_collision_count = 0;
+  if (!isfinite(novelty_weight) || novelty_weight < 0.0 || novelty_weight > 1.0) {
+    latch_device_fault_v2(control, kNonFiniteMetricFaultV2);
+    return;
+  }
   DeviceGeneSourcesV2 genes{};
   if (!scoring_seal_valid_v2(scoring_seal)) {
     latch_device_fault_v2(control, kScoringSealFaultV2);
@@ -706,34 +619,58 @@ __global__ void build_blended_rank_inputs_v2(
   double minimum_fitness = DBL_MAX;
   double maximum_fitness = -DBL_MAX;
   double maximum_novelty = 0.0;
+  bool any_finite_fitness = false;
+  const double rejected_fitness =
+      -__longlong_as_double(static_cast<long long>(0x7ff0000000000000ULL));
   for (std::uint64_t candidate = 0;
        candidate < expected.logical_population_count; ++candidate) {
-    if (!isfinite(fitness_scores[candidate]) ||
+    if ((!isfinite(fitness_scores[candidate]) &&
+         fitness_scores[candidate] != rejected_fitness) ||
         !isfinite(novelty_scores[candidate]) || novelty_scores[candidate] < 0.0) {
       latch_device_fault_v2(control, kNonFiniteMetricFaultV2);
       return;
     }
-    minimum_fitness = fitness_scores[candidate] < minimum_fitness
-                          ? fitness_scores[candidate]
-                          : minimum_fitness;
-    maximum_fitness = fitness_scores[candidate] > maximum_fitness
-                          ? fitness_scores[candidate]
-                          : maximum_fitness;
+    // The sealed scoring producer distinguishes economic -infinity from a
+    // device/math fault. CPU novelty uses all genes, but fitness normalization
+    // uses only finite scores; archive metric eligibility is separate.
+    if (isfinite(fitness_scores[candidate])) {
+      any_finite_fitness = true;
+      minimum_fitness = fitness_scores[candidate] < minimum_fitness
+                            ? fitness_scores[candidate]
+                            : minimum_fitness;
+      maximum_fitness = fitness_scores[candidate] > maximum_fitness
+                            ? fitness_scores[candidate]
+                            : maximum_fitness;
+    }
     maximum_novelty = novelty_scores[candidate] > maximum_novelty
                           ? novelty_scores[candidate]
                           : maximum_novelty;
   }
 
-  double fitness_range = __dsub_rn(maximum_fitness, minimum_fitness);
+  // An all-rejected population still has a deterministic rank. Never evaluate
+  // an unused subtraction of the uninitialized finite extrema in that case.
+  double fitness_range = any_finite_fitness
+                             ? __dsub_rn(maximum_fitness, minimum_fitness)
+                             : 1.0e-9;
   fitness_range = fitness_range < 1.0e-9 ? 1.0e-9 : fitness_range;
   const double novelty_range =
       maximum_novelty < 1.0e-9 ? 1.0e-9 : maximum_novelty;
-  const double novelty_weight =
-      __longlong_as_double(
-          static_cast<long long>(NEO_RESIDENT_ARCHIVE_KNN_NOVELTY_WEIGHT_BITS_V2));
   const double fitness_weight = __dsub_rn(1.0, novelty_weight);
   for (std::uint64_t candidate = 0;
        candidate < expected.logical_population_count; ++candidate) {
+    ordinal_keys[candidate] = candidate;
+    ordinal_values[candidate] = candidate;
+    if (fitness_scores[candidate] == rejected_fitness) {
+      // Zero remains invalid; one sorts below every finite blended key.
+      decision_keys[candidate] = 1ull;
+      continue;
+    }
+    // With novelty disabled, CPU selection uses the raw score. Normalizing it
+    // would preserve order but change softmax temperature and improvement epsilon.
+    if (novelty_weight == 0.0 || expected.logical_population_count <= 1) {
+      decision_keys[candidate] = ordered_finite_f64_key_v2(fitness_scores[candidate]);
+      continue;
+    }
     const double normalized_fitness =
         __ddiv_rn(__dsub_rn(fitness_scores[candidate], minimum_fitness),
                   fitness_range);
@@ -747,8 +684,6 @@ __global__ void build_blended_rank_inputs_v2(
       latch_device_fault_v2(control, kNonFiniteMetricFaultV2);
       return;
     }
-    ordinal_keys[candidate] = candidate;
-    ordinal_values[candidate] = candidate;
   }
 }
 
@@ -833,7 +768,7 @@ __global__ void stage_ranked_archive_tail_v2(
     std::uint64_t* archive_term_indices, double* archive_term_weights,
     MetricRowV2* archive_metrics, std::uint64_t* archive_signatures,
     std::uint64_t* archive_hashes, ArchiveControlV2* control,
-    std::uint64_t archive_capacity) {
+    std::uint64_t archive_capacity, std::uint32_t signature_word_count) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
@@ -882,8 +817,10 @@ __global__ void stage_ranked_archive_tail_v2(
       }
       if (full_fixed_stride_gene_equal_v2(
               scalar, current.term_indices, current.term_weights, candidate,
+              expected.max_terms_per_gene,
               archive_scalars[archived], archive_term_indices,
-              archive_term_weights, archived)) {
+              archive_term_weights, archived,
+              NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2)) {
         duplicate = true;
         break;
       }
@@ -902,25 +839,24 @@ __global__ void stage_ranked_archive_tail_v2(
     archive_scalars[destination] = scalar;
     archive_metrics[destination] = current_metrics[candidate];
     archive_hashes[destination] = scalar.content_hash;
+    archive_hashes[2 * archive_capacity + destination] = destination;
 #pragma unroll
     for (std::uint32_t term = 0;
          term < NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2; ++term) {
       archive_term_indices[
           destination * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + term] =
-          current.term_indices[
-              candidate * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + term];
+          term < expected.max_terms_per_gene
+              ? current.term_indices[candidate * expected.max_terms_per_gene + term]
+              : 0ull;
       archive_term_weights[
           destination * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + term] =
-          current.term_weights[
-              candidate * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + term];
+          term < expected.max_terms_per_gene
+              ? current.term_weights[candidate * expected.max_terms_per_gene + term]
+              : 0.0;
     }
-#pragma unroll
-    for (std::uint32_t word = 0;
-         word < NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2; ++word) {
-      archive_signatures[
-          destination * NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 + word] =
-          current_signatures[
-              candidate * NEO_RESIDENT_ARCHIVE_KNN_SIGNATURE_WORDS_V2 + word];
+    for (std::uint32_t word = 0; word < signature_word_count; ++word) {
+      archive_signatures[destination * signature_word_count + word] =
+          current_signatures[candidate * signature_word_count + word];
     }
     staged_destinations[candidate] = destination;
     admission_flags[candidate] = 4u;
@@ -931,6 +867,304 @@ __global__ void stage_ranked_archive_tail_v2(
     admission_offsets[candidate] = staged_destinations[candidate];
   }
   control->staged_count = staged;
+  control->staged_collision_count = collisions;
+  control->staged_ready = control->device_fault_word == 0 ? 1u : 0u;
+}
+
+// Adaptive retention uses two admitted banks. The current packed store bit
+// selects committed observations; no staged replacement can corrupt that bank.
+__global__ void copy_committed_archive_bank_v3(
+    GeneScalarV2* scalars, std::uint64_t* indices, double* weights,
+    MetricRowV2* metrics, std::uint64_t* signatures, std::uint64_t* hashes,
+    ArchiveControlV2* control, std::uint64_t capacity, std::uint32_t words) {
+  const auto item = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto commit = atomic_read_commit_v2(&control->packed_commit_word);
+  const auto count = unpack_archive_count_v2(commit);
+  if (control->device_fault_word || item >= count) return;
+  if (count > capacity || !control->ranked_ready || commit != control->ranked_source_commit_word) {
+    latch_device_fault_v2(control, kPublicationFaultV2); return;
+  }
+  const auto from = unpack_store_v2(commit) * capacity + item;
+  const auto to = (1u - unpack_store_v2(commit)) * capacity + item;
+  scalars[to] = scalars[from]; metrics[to] = metrics[from]; hashes[to] = hashes[from];
+  hashes[2 * capacity + to] = hashes[2 * capacity + from];
+  for (std::uint32_t t = 0; t < NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2; ++t) {
+    indices[to * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + t] = indices[from * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + t];
+    weights[to * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + t] = weights[from * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + t];
+  }
+  for (std::uint32_t w = 0; w < words; ++w) signatures[to * words + w] = signatures[from * words + w];
+}
+
+// Rebuilt from the staged bank each generation. This scratch never participates
+// in publication: a failed offer leaves the committed bank and its order intact.
+struct AdaptiveArchiveIndexV3 {
+  std::uint64_t* table;
+  std::uint64_t* heap;
+  std::uint64_t* positions;
+  const GeneScalarV2* scalars;
+  const MetricRowV2* metrics;
+  const std::uint64_t* sequence;
+  ArchiveControlV2* control;
+  std::uint64_t base;
+  std::uint64_t capacity;
+  std::uint64_t table_capacity;
+};
+
+__device__ std::uint64_t adaptive_archive_hash_home_v3(
+    std::uint64_t hash, std::uint64_t table_capacity) {
+  hash ^= hash >> 33; hash *= 0xff51afd7ed558ccdull;
+  hash ^= hash >> 33; hash *= 0xc4ceb9fe1a85ec53ull;
+  hash ^= hash >> 33;
+  return hash & (table_capacity - 1);
+}
+
+__device__ bool adaptive_archive_index_fault_v3(const AdaptiveArchiveIndexV3& index) {
+  latch_device_fault_v2(index.control, kArchiveBoundFaultV2);
+  return false;
+}
+
+__device__ bool adaptive_archive_hash_insert_v3(
+    const AdaptiveArchiveIndexV3& index, std::uint64_t slot, std::uint64_t count) {
+  if (slot >= count || count > index.capacity) return adaptive_archive_index_fault_v3(index);
+  auto at = adaptive_archive_hash_home_v3(index.scalars[index.base + slot].content_hash,
+                                         index.table_capacity);
+  for (std::uint64_t probe = 0; probe < index.table_capacity; ++probe) {
+    const auto entry = index.table[at];
+    if (entry == 0) { index.table[at] = slot + 1; return true; }
+    if (entry > count || entry == slot + 1) return adaptive_archive_index_fault_v3(index);
+    at = (at + 1) & (index.table_capacity - 1);
+  }
+  return adaptive_archive_index_fault_v3(index);
+}
+
+__device__ bool adaptive_archive_hash_erase_v3(
+    const AdaptiveArchiveIndexV3& index, std::uint64_t slot, std::uint64_t count) {
+  if (slot >= count || count > index.capacity) return adaptive_archive_index_fault_v3(index);
+  const auto mask = index.table_capacity - 1;
+  auto hole = adaptive_archive_hash_home_v3(index.scalars[index.base + slot].content_hash,
+                                           index.table_capacity);
+  bool found = false;
+  for (std::uint64_t probe = 0; probe < index.table_capacity; ++probe) {
+    const auto entry = index.table[hole];
+    if (entry == 0 || entry > count) return adaptive_archive_index_fault_v3(index);
+    if (entry == slot + 1) { found = true; break; }
+    hole = (hole + 1) & mask;
+  }
+  if (!found) return adaptive_archive_index_fault_v3(index);
+  // Backward shifting preserves the search chain without accumulating tombstones.
+  // The evicted scalar must still contain its OLD key throughout this operation.
+  auto scan = (hole + 1) & mask;
+  for (std::uint64_t probe = 0; probe < index.table_capacity; ++probe) {
+    const auto entry = index.table[scan];
+    if (entry == 0) { index.table[hole] = 0; return true; }
+    if (entry > count) return adaptive_archive_index_fault_v3(index);
+    const auto home = adaptive_archive_hash_home_v3(
+        index.scalars[index.base + entry - 1].content_hash, index.table_capacity);
+    if (((scan - home) & mask) >= ((scan - hole) & mask)) {
+      index.table[hole] = entry;
+      hole = scan;
+    }
+    scan = (scan + 1) & mask;
+  }
+  return adaptive_archive_index_fault_v3(index);
+}
+
+__device__ bool adaptive_archive_hash_lookup_v3(
+    const AdaptiveArchiveIndexV3& index, const DeviceGeneSourcesV2& current,
+    const GeneScalarV2& scalar, std::uint64_t candidate, std::uint32_t active_terms,
+    const std::uint64_t* archive_indices, const double* archive_weights,
+    std::uint64_t count, std::uint64_t* result, std::uint64_t* collisions) {
+  if (count > index.capacity) return adaptive_archive_index_fault_v3(index);
+  const auto home = adaptive_archive_hash_home_v3(scalar.content_hash, index.table_capacity);
+  auto at = home;
+  *result = count;
+  *collisions = 0;
+  bool complete = false;
+  for (std::uint64_t probe = 0; probe < index.table_capacity; ++probe) {
+    const auto entry = index.table[at];
+    if (entry == 0) { complete = true; break; }
+    if (entry > count) return adaptive_archive_index_fault_v3(index);
+    const auto slot = entry - 1;
+    const auto& archived = index.scalars[index.base + slot];
+    if (archived.content_hash == scalar.content_hash) {
+      if (full_fixed_stride_gene_equal_v2(scalar, current.term_indices, current.term_weights,
+          candidate, active_terms, archived, archive_indices, archive_weights,
+          index.base + slot, NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2)) {
+        if (slot < *result) *result = slot;
+      } else ++*collisions;
+    }
+    at = (at + 1) & (index.table_capacity - 1);
+  }
+  if (!complete) return adaptive_archive_index_fault_v3(index);
+  if (*result < count && *collisions != 0) {
+    // Preserve the old ordinal-scan collision diagnostic as well as membership:
+    // only unequal same-hash slots preceding the first duplicate were visited.
+    *collisions = 0;
+    at = home;
+    for (std::uint64_t probe = 0; probe < index.table_capacity; ++probe) {
+      const auto entry = index.table[at];
+      if (entry == 0) return true;
+      if (entry > count) return adaptive_archive_index_fault_v3(index);
+      if (entry - 1 < *result &&
+          index.scalars[index.base + entry - 1].content_hash == scalar.content_hash) ++*collisions;
+      at = (at + 1) & (index.table_capacity - 1);
+    }
+    return adaptive_archive_index_fault_v3(index);
+  }
+  return true;
+}
+
+__device__ bool adaptive_archive_heap_worse_v3(
+    const AdaptiveArchiveIndexV3& index, std::uint64_t left, std::uint64_t right) {
+  const auto left_net = index.metrics[index.base + left].values[kNetMetricSlotV2];
+  const auto right_net = index.metrics[index.base + right].values[kNetMetricSlotV2];
+  const auto left_sequence = index.sequence[index.base + left];
+  const auto right_sequence = index.sequence[index.base + right];
+  return left_net < right_net || (left_net == right_net &&
+      (left_sequence > right_sequence || (left_sequence == right_sequence && left < right)));
+}
+
+__device__ bool adaptive_archive_heap_node_valid_v3(
+    const AdaptiveArchiveIndexV3& index, std::uint64_t node, std::uint64_t count) {
+  return node < count && index.heap[node] < count &&
+         index.positions[index.heap[node]] == node;
+}
+
+__device__ void adaptive_archive_heap_swap_v3(
+    const AdaptiveArchiveIndexV3& index, std::uint64_t left, std::uint64_t right) {
+  const auto slot = index.heap[left];
+  index.heap[left] = index.heap[right]; index.heap[right] = slot;
+  index.positions[index.heap[left]] = left; index.positions[index.heap[right]] = right;
+}
+
+__device__ bool adaptive_archive_heap_down_v3(
+    const AdaptiveArchiveIndexV3& index, std::uint64_t node, std::uint64_t count) {
+  if (count > index.capacity || !adaptive_archive_heap_node_valid_v3(index, node, count))
+    return adaptive_archive_index_fault_v3(index);
+  while (node < count / 2) {
+    auto worst = node * 2 + 1;
+    if (!adaptive_archive_heap_node_valid_v3(index, worst, count))
+      return adaptive_archive_index_fault_v3(index);
+    if (worst + 1 < count) {
+      if (!adaptive_archive_heap_node_valid_v3(index, worst + 1, count))
+        return adaptive_archive_index_fault_v3(index);
+      if (adaptive_archive_heap_worse_v3(index, index.heap[worst + 1], index.heap[worst])) ++worst;
+    }
+    if (!adaptive_archive_heap_worse_v3(index, index.heap[worst], index.heap[node])) break;
+    adaptive_archive_heap_swap_v3(index, node, worst);
+    node = worst;
+  }
+  return true;
+}
+
+__device__ bool adaptive_archive_heap_up_v3(
+    const AdaptiveArchiveIndexV3& index, std::uint64_t node, std::uint64_t count) {
+  if (count > index.capacity || !adaptive_archive_heap_node_valid_v3(index, node, count))
+    return adaptive_archive_index_fault_v3(index);
+  while (node != 0) {
+    const auto parent = (node - 1) / 2;
+    if (!adaptive_archive_heap_node_valid_v3(index, parent, count))
+      return adaptive_archive_index_fault_v3(index);
+    if (!adaptive_archive_heap_worse_v3(index, index.heap[node], index.heap[parent])) break;
+    adaptive_archive_heap_swap_v3(index, node, parent);
+    node = parent;
+  }
+  return true;
+}
+
+__global__ void stage_adaptive_archive_v3(
+    const GeneSealV2* seal, GeneViewV2 expected, const MetricRowV2* current_metrics,
+    const std::uint64_t* current_signatures, const std::uint64_t* ranked_ordinals,
+    const std::uint32_t* admission_flags, GeneScalarV2* archive_scalars,
+    std::uint64_t* archive_indices, double* archive_weights, MetricRowV2* archive_metrics,
+    std::uint64_t* archive_signatures, std::uint64_t* archive_hashes,
+    ArchiveControlV2* control, std::uint64_t capacity, std::uint32_t words,
+    std::uint64_t hash_capacity) {
+  if (blockIdx.x || threadIdx.x) return;
+  DeviceGeneSourcesV2 current{};
+  if (!load_current_gene_sources_v2(seal, expected, control, &current)) return;
+  const auto commit = atomic_read_commit_v2(&control->packed_commit_word);
+  const auto committed = unpack_archive_count_v2(commit);
+  if (capacity == 0 || hash_capacity < 2 * capacity ||
+      (hash_capacity & (hash_capacity - 1)) != 0 ||
+      committed > capacity || !control->ranked_ready || commit != control->ranked_source_commit_word) {
+    latch_device_fault_v2(control, kPublicationFaultV2); return;
+  }
+  const auto base = (1u - unpack_store_v2(commit)) * capacity;
+  auto* sequence = archive_hashes + 2 * capacity;
+  auto* table = archive_hashes + 4 * capacity;
+  auto* heap = table + hash_capacity;
+  auto* positions = heap + capacity;
+  const AdaptiveArchiveIndexV3 index{table, heap, positions, archive_scalars,
+      archive_metrics, sequence, control, base, capacity, hash_capacity};
+  std::uint64_t next_sequence = 0, count = committed, collisions = 0;
+  for (std::uint64_t i = 0; i < count; ++i) {
+    if (sequence[base + i] == ~std::uint64_t{0}) { latch_device_fault_v2(control, kArchiveBoundFaultV2); return; }
+    if (next_sequence <= sequence[base + i]) next_sequence = sequence[base + i] + 1;
+    heap[i] = i; positions[i] = i;
+    if (!adaptive_archive_hash_insert_v3(index, i, count)) return;
+  }
+  // Floyd construction is linear; thereafter the root is the exact worst entry.
+  for (std::uint64_t node = count / 2; node != 0; --node)
+    if (!adaptive_archive_heap_down_v3(index, node - 1, count)) return;
+  // CPU offers the descending selection rank in order. Exact behavior equality
+  // excludes display identity/ancestry; hashes accelerate, never replace, it.
+  // Expected hash lookup plus indexed heap repair removes the two archive-wide
+  // scans per offer without replacing causal eviction/reintroduction by top-A.
+  for (std::uint64_t rank = 0; rank < expected.logical_population_count; ++rank) {
+    const auto candidate = ranked_ordinals[rank];
+    if (candidate >= expected.logical_population_count) { latch_device_fault_v2(control, kGeneShapeFaultV2); return; }
+    if (!admission_flags[candidate]) continue;
+    const auto scalar = current.scalars[candidate];
+    const auto net = current_metrics[candidate].values[kNetMetricSlotV2];
+    std::uint64_t slot = count;
+    std::uint64_t candidate_collisions = 0;
+    if (!adaptive_archive_hash_lookup_v3(index, current, scalar, candidate,
+        expected.max_terms_per_gene, archive_indices, archive_weights,
+        count, &slot, &candidate_collisions)) return;
+    if (candidate_collisions > ~std::uint64_t{0} - collisions) {
+      latch_device_fault_v2(control, kArchiveBoundFaultV2); return;
+    }
+    collisions += candidate_collisions;
+    const bool duplicate = slot < count;
+    bool appended = false;
+    if (duplicate) {
+      if (net <= archive_metrics[base + slot].values[kNetMetricSlotV2]) continue;
+      // Improving an existing behavior retains its original admission priority.
+    } else {
+      if (count == capacity) {
+        if (!adaptive_archive_heap_node_valid_v3(index, 0, count)) {
+          adaptive_archive_index_fault_v3(index); return;
+        }
+        slot = heap[0];
+        if (net <= archive_metrics[base + slot].values[kNetMetricSlotV2]) continue;
+        if (!adaptive_archive_hash_erase_v3(index, slot, count)) return;
+      } else { slot = count++; appended = true; }
+      if (next_sequence == ~std::uint64_t{0}) { latch_device_fault_v2(control, kArchiveBoundFaultV2); return; }
+      sequence[base + slot] = next_sequence++;
+    }
+    const auto to = base + slot;
+    archive_scalars[to] = scalar; archive_metrics[to] = current_metrics[candidate];
+    archive_hashes[to] = scalar.content_hash;
+    for (std::uint32_t t = 0; t < NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2; ++t) {
+      archive_indices[to * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + t] = t < expected.max_terms_per_gene
+          ? current.term_indices[candidate * expected.max_terms_per_gene + t] : 0;
+      archive_weights[to * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2 + t] = t < expected.max_terms_per_gene
+          ? current.term_weights[candidate * expected.max_terms_per_gene + t] : 0.0;
+    }
+    for (std::uint32_t w = 0; w < words; ++w)
+      archive_signatures[to * words + w] = current_signatures[candidate * words + w];
+    if (!duplicate && !adaptive_archive_hash_insert_v3(index, slot, count)) return;
+    if (appended) {
+      heap[count - 1] = slot; positions[slot] = count - 1;
+      if (!adaptive_archive_heap_up_v3(index, count - 1, count)) return;
+    } else {
+      // Both duplicate improvement and replacement strictly increase net; no
+      // upward repair is needed and duplicate admission sequence stays intact.
+      if (!adaptive_archive_heap_down_v3(index, positions[slot], count)) return;
+    }
+  }
+  control->staged_count = count - committed;
   control->staged_collision_count = collisions;
   control->staged_ready = control->device_fault_word == 0 ? 1u : 0u;
 }
@@ -1085,6 +1319,11 @@ struct NeoResidentArchiveKnnOwnerV2 {
   HostPhaseV2 phase;
   bool poisoned;
   bool terminal_event_proven;
+  bool candidates_exported;
+  double novelty_weight;
+  bool novelty_configured;
+  NeoResidentArchivePolicyV3 policy;
+  bool adaptive_policy_configured;
 };
 
 namespace {
@@ -1190,7 +1429,7 @@ extern "C" std::int32_t bind_preallocated_resident_archive_knn_v2(
     NeoResidentArchiveKnnOwnerV2** owner) {
   if (scoring == nullptr || generation == nullptr || genes == nullptr ||
       binding == nullptr || owner == nullptr || *owner != nullptr ||
-      binding->reserved != 0 || binding->reserved_extents != 0) {
+      !backend_identity_v3::archive_backend_valid(*binding) || binding->reserved_extents != 0) {
     return NEO_ARCHIVE_KNN_STATUS_INVALID_ARGUMENT_V2;
   }
   if (!validate_binding_layout_v2(*binding)) {
@@ -1203,8 +1442,8 @@ extern "C" std::int32_t bind_preallocated_resident_archive_knn_v2(
       genes->expected_run_token != binding->run_identity ||
       genes->logical_population_count != binding->population_count ||
       genes->max_terms_per_gene != binding->max_terms_per_gene ||
-      genes->feature_count >
-          binding->signature_word_count * std::uint64_t{64}) {
+      signature_word_count_v2(genes->feature_count) !=
+          binding->signature_word_count) {
     return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
   }
   std::int32_t status =
@@ -1262,6 +1501,13 @@ extern "C" std::int32_t bind_preallocated_resident_archive_knn_v2(
     return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
   }
 
+#if defined(__HIP_PLATFORM_AMD__)
+  if (!resident_search_hip_v1::validate_population_owner_v1(
+          lifecycle.population_lifetime_owner_v2(), *binding,
+          access.admitted_run_stream)) {
+    return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
+  }
+#endif
   auto* created = new (std::nothrow) NeoResidentArchiveKnnOwnerV2{};
   if (created == nullptr) {
     return NEO_ARCHIVE_KNN_STATUS_STATE_ERROR_V2;
@@ -1276,6 +1522,10 @@ extern "C" std::int32_t bind_preallocated_resident_archive_knn_v2(
       static_cast<NeoResidentArchiveKnnTerminalV2*>(
           lifecycle.terminal_host_receipt_v2());
   created->phase = HostPhaseV2::Bound;
+  const std::uint64_t legacy_novelty_bits = NEO_RESIDENT_ARCHIVE_KNN_NOVELTY_WEIGHT_BITS_V2;
+  std::memcpy(&created->novelty_weight, &legacy_novelty_bits, sizeof(double));
+  created->policy.abi_version = 3u;
+  created->policy.novelty_weight = created->novelty_weight;
   created->same_stream_enqueue_count =
       lifecycle.source_same_stream_enqueue_count_v2();
   created->initial_source_commit_word = pack_commit_word_v2(
@@ -1293,6 +1543,38 @@ extern "C" std::int32_t bind_preallocated_resident_archive_knn_v2(
   }
   ++created->same_stream_enqueue_count;
   *owner = created;
+  return NEO_ARCHIVE_KNN_STATUS_OK_V2;
+}
+
+extern "C" std::int32_t configure_resident_archive_novelty_v3(
+    NeoResidentArchiveKnnOwnerV2* owner, std::uint64_t expected_run_identity,
+    double novelty_weight) {
+  if (owner == nullptr || !std::isfinite(novelty_weight) ||
+      novelty_weight < 0.0 || novelty_weight > 1.0) {
+    return NEO_ARCHIVE_KNN_STATUS_INVALID_ARGUMENT_V2;
+  }
+  if (owner->poisoned || owner->phase != HostPhaseV2::Bound || owner->novelty_configured) {
+    return NEO_ARCHIVE_KNN_STATUS_STATE_ERROR_V2;
+  }
+  if (expected_run_identity == 0 || expected_run_identity != owner->binding.run_identity ||
+      expected_run_identity != owner->retained_gene_view.expected_run_token) {
+    return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
+  }
+  owner->novelty_weight = novelty_weight;
+  owner->novelty_configured = true;
+  return NEO_ARCHIVE_KNN_STATUS_OK_V2;
+}
+
+extern "C" std::int32_t configure_resident_archive_policy_v3(
+    NeoResidentArchiveKnnOwnerV2* owner, std::uint64_t expected_run_identity,
+    const NeoResidentArchivePolicyV3* policy) {
+  if (policy == nullptr || policy->abi_version != 3u || policy->mode > 3u ||
+      !std::isfinite(policy->minimum_net) || !std::isfinite(policy->minimum_profit_factor) ||
+      !std::isfinite(policy->minimum_sharpe)) return NEO_ARCHIVE_KNN_STATUS_INVALID_ARGUMENT_V2;
+  const auto status = configure_resident_archive_novelty_v3(owner, expected_run_identity, policy->novelty_weight);
+  if (status != NEO_ARCHIVE_KNN_STATUS_OK_V2) return status;
+  owner->policy = *policy;
+  owner->adaptive_policy_configured = true;
   return NEO_ARCHIVE_KNN_STATUS_OK_V2;
 }
 
@@ -1376,7 +1658,8 @@ extern "C" std::int32_t enqueue_resident_archive_score_and_rank_v2(
       owner->retained_gene_view.seal_device, owner->retained_gene_view,
       finite_rows.metric_rows_device, finite_rows.expected_scenario_ids_device,
       finite_rows.device_seal, owner->current_population_signatures,
-      owner->admission_flags, owner->control);
+      owner->admission_flags, owner->control,
+      owner->binding.signature_word_count, owner->policy);
   if (!advance_global_enqueue_count_v2(owner, 1)) {
     return poison_owner_v2(owner,
                            NEO_ARCHIVE_KNN_STATUS_ARITHMETIC_OVERFLOW_V2);
@@ -1385,13 +1668,18 @@ extern "C" std::int32_t enqueue_resident_archive_score_and_rank_v2(
   if (status != NEO_ARCHIVE_KNN_STATUS_OK_V2) {
     return poison_owner_v2(owner, status);
   }
-  exact_archive_population_knn_v2<<<
+  if (owner->novelty_weight == 0.0) {
+    const auto cleared = cudaMemsetAsync(owner->novelty_scores, 0,
+        owner->binding.population_count * sizeof(double), stream);
+    if (cleared != cudaSuccess) return poison_owner_v2(owner, NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2);
+  } else exact_archive_population_knn_v2<<<
       grid_for_v2(owner->binding.population_count), kThreadsV2, 0, stream>>>(
       owner->retained_gene_view.seal_device, owner->retained_gene_view,
       owner->current_population_signatures, owner->archive_gene_scalars,
       owner->archive_signatures, owner->exact_top_k_keys,
       owner->novelty_scores, finite_rows.device_seal, owner->control,
-      owner->binding.archive_capacity);
+      owner->binding.archive_capacity, owner->binding.signature_word_count,
+      owner->binding.novelty_neighbor_count, owner->adaptive_policy_configured);
   if (!advance_global_enqueue_count_v2(owner, 1)) {
     return poison_owner_v2(owner,
                            NEO_ARCHIVE_KNN_STATUS_ARITHMETIC_OVERFLOW_V2);
@@ -1408,7 +1696,8 @@ extern "C" std::int32_t enqueue_resident_archive_score_and_rank_v2(
   build_blended_rank_inputs_v2<<<1, 1, 0, stream>>>(
       owner->retained_gene_view.seal_device, owner->retained_gene_view,
       owner->fitness_scores, owner->novelty_scores, owner->decision_keys,
-      rank_keys_a, rank_values_a, finite_rows.device_seal, owner->control);
+      rank_keys_a, rank_values_a, finite_rows.device_seal, owner->control,
+      owner->novelty_weight);
   if (!advance_global_enqueue_count_v2(owner, 1)) {
     return poison_owner_v2(owner,
                            NEO_ARCHIVE_KNN_STATUS_ARITHMETIC_OVERFLOW_V2);
@@ -1420,7 +1709,7 @@ extern "C" std::int32_t enqueue_resident_archive_score_and_rank_v2(
 
   std::size_t scratch_bytes = static_cast<std::size_t>(
       owner->binding.cub_scratch.size_bytes);
-  cudaError_t cub_status = cub::DeviceRadixSort::SortPairs(
+  cudaError_t cub_status = neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(
       owner->cub_scratch, scratch_bytes, rank_keys_a, rank_keys_b,
       rank_values_a, rank_values_b,
       static_cast<int>(owner->binding.population_count), 0, 64, stream);
@@ -1447,7 +1736,7 @@ extern "C" std::int32_t enqueue_resident_archive_score_and_rank_v2(
 
   scratch_bytes = static_cast<std::size_t>(
       owner->binding.cub_scratch.size_bytes);
-  cub_status = cub::DeviceRadixSort::SortPairs(
+  cub_status = neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(
       owner->cub_scratch, scratch_bytes, rank_keys_a, rank_keys_b,
       rank_values_b, rank_values_a,
       static_cast<int>(owner->binding.population_count), 0, 64, stream);
@@ -1474,7 +1763,7 @@ extern "C" std::int32_t enqueue_resident_archive_score_and_rank_v2(
 
   scratch_bytes = static_cast<std::size_t>(
       owner->binding.cub_scratch.size_bytes);
-  cub_status = cub::DeviceRadixSort::SortPairsDescending(
+  cub_status = neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(
       owner->cub_scratch, scratch_bytes, rank_keys_a, rank_keys_b,
       rank_values_a, rank_values_b,
       static_cast<int>(owner->binding.population_count), 0, 64, stream);
@@ -1504,7 +1793,8 @@ extern "C" std::int32_t enqueue_resident_archive_score_and_rank_v2(
       owner->retained_gene_view.seal_device, owner->retained_gene_view,
       finite_rows.metric_rows_device, finite_rows.expected_scenario_ids_device,
       finite_rows.device_seal, owner->current_population_signatures,
-      owner->admission_flags, owner->control);
+      owner->admission_flags, owner->control,
+      owner->binding.signature_word_count, owner->policy);
   if (!advance_global_enqueue_count_v2(owner, 1)) {
     return poison_owner_v2(owner,
                            NEO_ARCHIVE_KNN_STATUS_ARITHMETIC_OVERFLOW_V2);
@@ -1538,7 +1828,32 @@ extern "C" std::int32_t enqueue_resident_archive_stage_from_rank_v2(
       !valid_finite_rows_v2(owner->finite_rows, *owner)) {
     return NEO_ARCHIVE_KNN_STATUS_STATE_ERROR_V2;
   }
-  stage_ranked_archive_tail_v2<<<
+  if (owner->adaptive_policy_configured) {
+    const auto stream = owner->arena_access.admitted_run_stream;
+    const auto hash_capacity = archive_hash_table_capacity_v3(owner->binding.archive_capacity);
+    // Only transient index slots are cleared. Both payload/sequence banks stay
+    // intact until the existing checked staged-bank copy/publication protocol.
+    if (cudaMemsetAsync(owner->archive_hashes + 4 * owner->binding.archive_capacity,
+                        0, hash_capacity * sizeof(std::uint64_t), stream) != cudaSuccess)
+      return poison_owner_v2(owner, NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2);
+    if (!advance_global_enqueue_count_v2(owner, 1))
+      return poison_owner_v2(owner, NEO_ARCHIVE_KNN_STATUS_ARITHMETIC_OVERFLOW_V2);
+    copy_committed_archive_bank_v3<<<grid_for_v2(owner->binding.archive_capacity), kThreadsV2, 0, stream>>>(
+        owner->archive_gene_scalars, owner->archive_term_indices, owner->archive_term_weights,
+        owner->archive_metric_rows, owner->archive_signatures, owner->archive_hashes,
+        owner->control, owner->binding.archive_capacity, owner->binding.signature_word_count);
+    if (!advance_global_enqueue_count_v2(owner, 1))
+      return poison_owner_v2(owner, NEO_ARCHIVE_KNN_STATUS_ARITHMETIC_OVERFLOW_V2);
+    const auto status = launch_status_v2();
+    if (status != NEO_ARCHIVE_KNN_STATUS_OK_V2) return poison_owner_v2(owner, status);
+    stage_adaptive_archive_v3<<<1, 1, 0, stream>>>(
+        owner->retained_gene_view.seal_device, owner->retained_gene_view,
+        owner->finite_rows.metric_rows_device, owner->current_population_signatures,
+        owner->admission_offsets, owner->admission_flags, owner->archive_gene_scalars,
+        owner->archive_term_indices, owner->archive_term_weights, owner->archive_metric_rows,
+        owner->archive_signatures, owner->archive_hashes, owner->control,
+        owner->binding.archive_capacity, owner->binding.signature_word_count, hash_capacity);
+  } else stage_ranked_archive_tail_v2<<<
       1, 1, 0, owner->arena_access.admitted_run_stream>>>(
       owner->retained_gene_view.seal_device, owner->retained_gene_view,
       owner->finite_rows.metric_rows_device,
@@ -1548,7 +1863,7 @@ extern "C" std::int32_t enqueue_resident_archive_stage_from_rank_v2(
       owner->archive_gene_scalars, owner->archive_term_indices,
       owner->archive_term_weights, owner->archive_metric_rows,
       owner->archive_signatures, owner->archive_hashes, owner->control,
-      owner->binding.archive_capacity);
+      owner->binding.archive_capacity, owner->binding.signature_word_count);
   if (!advance_global_enqueue_count_v2(owner, 1)) {
     return poison_owner_v2(owner,
                            NEO_ARCHIVE_KNN_STATUS_ARITHMETIC_OVERFLOW_V2);
@@ -1574,10 +1889,7 @@ extern "C" std::int32_t enqueue_resident_archive_evolve_and_publish_v2(
   if (!resident_generation_v2_internal::
            borrow_resident_generation_terminal_lifecycle_v2(
                owner->generation, sizeof(NeoResidentArchiveKnnTerminalV2),
-               &generation_before) ||
-      generation_before.admitted_run_stream_v2() !=
-          owner->arena_access.admitted_run_stream ||
-      generation_before.run_token_v2() != owner->binding.run_identity) {
+               &generation_before)) {
     return poison_owner_v2(owner,
                            NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2);
   }
@@ -1606,8 +1918,8 @@ extern "C" std::int32_t enqueue_resident_archive_evolve_and_publish_v2(
   TerminalLifecycleV2 generation_after{};
   if (!resident_generation_v2_internal::
            borrow_resident_generation_terminal_lifecycle_v2(
-               owner->generation, sizeof(NeoResidentArchiveKnnTerminalV2),
-               &generation_after) ||
+                owner->generation, sizeof(NeoResidentArchiveKnnTerminalV2),
+                &generation_after) ||
       generation_after.same_stream_enqueue_count_v2() <
           generation_before.same_stream_enqueue_count_v2()) {
     return poison_owner_v2(owner,
@@ -1731,6 +2043,15 @@ extern "C" std::int32_t try_complete_resident_archive_terminal_v2(
       !exact_pending_v2(*owner, *pending)) {
     return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
   }
+#if defined(__HIP_PLATFORM_AMD__)
+  if (!resident_search_hip_v1::validate_population_owner_v1(
+          owner->terminal_lifecycle.population_lifetime_owner_v2(),
+          owner->binding, owner->arena_access.admitted_run_stream)) {
+    owner->poisoned = true;
+    owner->terminal_event_proven = false;
+    return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
+  }
+#endif
   const cudaError_t query =
       cudaEventQuery(owner->terminal_lifecycle.completion_event_v2());
   ++owner->completion_event_query_count;
@@ -1801,6 +2122,161 @@ extern "C" std::int32_t try_complete_resident_archive_terminal_v2(
   return NEO_ARCHIVE_KNN_STATUS_OK_V2;
 }
 
+const TerminalLifecycleV2* borrow_completed_archive_terminal_lifecycle_v3(
+    const NeoResidentArchiveKnnOwnerV2* owner,
+    const resident_generation_v1::NeoResidentGenerationRunV1* generation,
+    const NeoResidentArchiveKnnTerminalV2* expected_terminal) {
+  if (owner == nullptr || generation == nullptr || expected_terminal == nullptr ||
+      owner->generation != generation || owner->poisoned ||
+      owner->phase != HostPhaseV2::TerminalComplete ||
+      !owner->terminal_event_proven || owner->terminal_host == nullptr) {
+    return nullptr;
+  }
+  auto normalized = *expected_terminal;
+  if (normalized.completion_event_query_count != owner->completion_event_query_count ||
+      normalized.terminal_status != NEO_ARCHIVE_KNN_TERMINAL_COMMITTED_V2 ||
+      normalized.device_fault_word != 0 || normalized.validation_fault_word != 0) {
+    return nullptr;
+  }
+  normalized.completion_event_query_count = 0;
+  const auto& lifecycle = owner->terminal_lifecycle;
+  if (std::memcmp(&normalized, owner->terminal_host, sizeof(normalized)) != 0 ||
+      lifecycle.generation_owner_v2() != generation ||
+      lifecycle.terminal_host_receipt_v2() != owner->terminal_host ||
+      lifecycle.run_token_v2() != normalized.run_identity ||
+      normalized.run_identity != owner->binding.run_identity ||
+      lifecycle.generation_index_v2() != unpack_generation_v2(normalized.packed_commit_word) ||
+      lifecycle.store_epoch_v2() != unpack_epoch_v2(normalized.packed_commit_word) ||
+      lifecycle.current_store_index_v2() != unpack_store_v2(normalized.packed_commit_word) ||
+      lifecycle.completion_event_identity_v2() != normalized.completion_event_identity ||
+      lifecycle.admitted_run_stream_v2() != owner->arena_access.admitted_run_stream ||
+      normalized.same_stream_enqueue_count != owner->same_stream_enqueue_count) {
+    return nullptr;
+  }
+#if defined(__HIP_PLATFORM_AMD__)
+  if (!resident_search_hip_v1::validate_population_owner_v1(
+          lifecycle.population_lifetime_owner_v2(), owner->binding,
+          lifecycle.admitted_run_stream_v2())) return nullptr;
+#else
+  CUcontext context = nullptr;
+  unsigned long long context_id = 0;
+  if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || context == nullptr ||
+      cuCtxGetId(context, &context_id) != CUDA_SUCCESS ||
+      context_id != backend_identity_v3::archive_owner_identity(owner->binding)) {
+    return nullptr;
+  }
+#endif
+  return &lifecycle;
+}
+
+extern "C" std::int32_t copy_resident_archive_terminal_candidates_v4(
+    NeoResidentArchiveKnnOwnerV2* owner,
+    const NeoResidentArchiveKnnTerminalV2* expected_terminal,
+    GeneScalarV2* scalars, std::uint64_t* term_indices, double* term_weights,
+    MetricRowV2* metrics, std::uint64_t* admission_sequences, std::uint64_t candidate_capacity,
+    std::uint64_t term_capacity, NeoResidentArchiveExportReceiptV3* receipt) {
+  if (receipt == nullptr) {
+    return NEO_ARCHIVE_KNN_STATUS_INVALID_ARGUMENT_V2;
+  }
+  *receipt = {};
+  if (owner == nullptr || expected_terminal == nullptr) {
+    return NEO_ARCHIVE_KNN_STATUS_INVALID_ARGUMENT_V2;
+  }
+  if (owner->poisoned || owner->phase != HostPhaseV2::TerminalComplete ||
+      !owner->terminal_event_proven || owner->terminal_host == nullptr ||
+      owner->candidates_exported) {
+    return NEO_ARCHIVE_KNN_STATUS_STATE_ERROR_V2;
+  }
+  // try_complete adds its host-side polling count to the returned copy, while
+  // the device-produced control receipt retains zero in that field.
+  auto normalized = *expected_terminal;
+  if (normalized.completion_event_query_count !=
+          owner->completion_event_query_count ||
+      normalized.terminal_status != NEO_ARCHIVE_KNN_TERMINAL_COMMITTED_V2 ||
+      normalized.device_fault_word != 0 ||
+      normalized.validation_fault_word != 0) {
+    return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
+  }
+  normalized.completion_event_query_count = 0;
+  if (std::memcmp(&normalized, owner->terminal_host, sizeof(normalized)) != 0) {
+    return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
+  }
+#if defined(__HIP_PLATFORM_AMD__)
+  if (!resident_search_hip_v1::validate_population_owner_v1(
+          owner->terminal_lifecycle.population_lifetime_owner_v2(),
+          owner->binding, owner->arena_access.admitted_run_stream)) {
+    owner->poisoned = true;
+    return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
+  }
+#else
+  CUcontext current_context = nullptr;
+  unsigned long long current_context_id = 0;
+  if (cuCtxGetCurrent(&current_context) != CUDA_SUCCESS ||
+      current_context == nullptr ||
+      cuCtxGetId(current_context, &current_context_id) != CUDA_SUCCESS ||
+      current_context_id != backend_identity_v3::archive_owner_identity(owner->binding)) {
+    return NEO_ARCHIVE_KNN_STATUS_IDENTITY_MISMATCH_V2;
+  }
+#endif
+  const std::uint64_t count =
+      unpack_archive_count_v2(normalized.packed_commit_word);
+  std::uint64_t terms = 0;
+  std::uint64_t scalar_bytes = 0;
+  std::uint64_t index_bytes = 0;
+  std::uint64_t weight_bytes = 0;
+  std::uint64_t metric_bytes = 0;
+  std::uint64_t sequence_bytes = 0;
+  std::uint64_t total_bytes = 0;
+  if (count > owner->binding.archive_capacity ||
+      !checked_mul_v2(count, NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2, &terms) ||
+      !checked_mul_v2(count, sizeof(GeneScalarV2), &scalar_bytes) ||
+      !checked_mul_v2(terms, sizeof(std::uint64_t), &index_bytes) ||
+      !checked_mul_v2(terms, sizeof(double), &weight_bytes) ||
+      !checked_mul_v2(count, sizeof(MetricRowV2), &metric_bytes) ||
+      !checked_mul_v2(count, sizeof(std::uint64_t), &sequence_bytes) ||
+      !checked_add_v2(scalar_bytes, index_bytes, &total_bytes) ||
+      !checked_add_v2(total_bytes, weight_bytes, &total_bytes) ||
+      !checked_add_v2(total_bytes, metric_bytes, &total_bytes) ||
+      !checked_add_v2(total_bytes, sequence_bytes, &total_bytes)) {
+    return NEO_ARCHIVE_KNN_STATUS_ARITHMETIC_OVERFLOW_V2;
+  }
+  if (candidate_capacity != count || term_capacity != terms ||
+      (count != 0 && (scalars == nullptr || term_indices == nullptr ||
+                      term_weights == nullptr || metrics == nullptr || admission_sequences == nullptr))) {
+    return NEO_ARCHIVE_KNN_STATUS_RANGE_ERROR_V2;
+  }
+  // These copies occur only after every Search kernel has completed. CUDA's
+  // synchronous D2H API returns after the host buffer is populated, including
+  // pageable memory. Do not substitute Async here without retaining output
+  // ownership through a separate completion event on every error path.
+  const auto bank_offset = owner->adaptive_policy_configured
+      ? unpack_store_v2(normalized.packed_commit_word) * owner->binding.archive_capacity : 0ull;
+  const auto bank_terms = bank_offset * NEO_RESIDENT_ARCHIVE_KNN_MAX_TERMS_V2;
+  if (count != 0 &&
+      (cudaMemcpy(scalars, owner->archive_gene_scalars + bank_offset, scalar_bytes,
+                  cudaMemcpyDeviceToHost) != cudaSuccess ||
+       cudaMemcpy(term_indices, owner->archive_term_indices + bank_terms, index_bytes,
+                  cudaMemcpyDeviceToHost) != cudaSuccess ||
+       cudaMemcpy(term_weights, owner->archive_term_weights + bank_terms, weight_bytes,
+                  cudaMemcpyDeviceToHost) != cudaSuccess ||
+       cudaMemcpy(metrics, owner->archive_metric_rows + bank_offset, metric_bytes,
+                  cudaMemcpyDeviceToHost) != cudaSuccess ||
+       cudaMemcpy(admission_sequences, owner->archive_hashes + 2 * owner->binding.archive_capacity + bank_offset, sequence_bytes,
+                  cudaMemcpyDeviceToHost) != cudaSuccess)) {
+    return poison_owner_v2(owner, NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2);
+  }
+  receipt->abi_version = 4;
+  receipt->run_identity = normalized.run_identity;
+  receipt->packed_commit_word = normalized.packed_commit_word;
+  receipt->candidate_count = count;
+  receipt->term_count = terms;
+  receipt->feature_count = owner->retained_gene_view.feature_count;
+  receipt->host_copy_count = count == 0 ? 0 : 5;
+  receipt->host_copy_bytes = total_bytes;
+  owner->candidates_exported = true;
+  return NEO_ARCHIVE_KNN_STATUS_OK_V2;
+}
+
 extern "C" std::int32_t
 neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2(
     void* session, NeoResidentArchiveKnnOwnerV2* owner) {
@@ -1823,5 +2299,140 @@ neoethos_gpu_cuda_population_release_resident_archive_knn_owner_v2(
   delete owner;
   return NEO_ARCHIVE_KNN_STATUS_OK_V2;
 }
+
+#if defined(NEOETHOS_CUDA_DEVICE_FIXTURES_V2)
+struct AdaptiveArchiveIndexFixtureV3 {
+  ArchiveControlV2 control;
+  std::uint64_t passed_checks;
+};
+
+// Primitive regression only, not a fabricated Search run/receipt. The exact
+// production helpers execute on device with deliberately colliding test keys.
+__global__ void fixture_check_adaptive_archive_index_kernel_v3(
+    AdaptiveArchiveIndexFixtureV3* output) {
+  if (blockIdx.x || threadIdx.x) return;
+  *output = {};
+  constexpr std::uint64_t capacity = 4, hash_capacity = 8;
+  std::uint64_t table[hash_capacity]{}, heap[capacity]{}, positions[capacity]{};
+  std::uint64_t sequence[capacity]{}, indices[capacity * 16]{};
+  double weights[capacity * 16]{};
+  GeneScalarV2 scalars[capacity]{};
+  MetricRowV2 metrics[capacity]{};
+  const AdaptiveArchiveIndexV3 index{table, heap, positions, scalars, metrics,
+      sequence, &output->control, 0, capacity, hash_capacity};
+  const DeviceGeneSourcesV2 current{scalars, indices, weights};
+  std::uint64_t colliding_hash = 0;
+  for (; colliding_hash < 1024; ++colliding_hash)
+    if (adaptive_archive_hash_home_v3(colliding_hash, hash_capacity) == hash_capacity - 1) break;
+  if (colliding_hash == 1024) return;
+  for (std::uint64_t i = 0; i < 3; ++i) {
+    scalars[i].content_hash = colliding_hash; scalars[i].term_count = 1;
+    scalars[i].gene_identity = i; indices[i * 16] = i; weights[i * 16] = 1.0;
+    heap[i] = i; positions[i] = i; sequence[i] = i + 1;
+    if (!adaptive_archive_hash_insert_v3(index, i, 3)) return;
+  }
+  std::uint64_t found = 0, collisions = 0;
+  if (!adaptive_archive_hash_lookup_v3(index, current, scalars[2], 2, 16,
+      indices, weights, 3, &found, &collisions) || found != 2 || collisions != 2 ||
+      table[7] != 1 || table[0] != 2 || table[1] != 3) return;
+  output->passed_checks |= 1ull;
+  if (!adaptive_archive_hash_erase_v3(index, 1, 3) ||
+      !adaptive_archive_hash_lookup_v3(index, current, scalars[2], 2, 16,
+          indices, weights, 3, &found, &collisions) || found != 2 || collisions != 1 ||
+      !adaptive_archive_hash_lookup_v3(index, current, scalars[1], 1, 16,
+          indices, weights, 3, &found, &collisions) || found != 3 || collisions != 2 ||
+      table[7] != 1 || table[0] != 3 || table[1] != 0) return;
+  output->passed_checks |= 2ull;
+  indices[16] = 9;
+  if (!adaptive_archive_hash_insert_v3(index, 1, 3) ||
+      !adaptive_archive_hash_lookup_v3(index, current, scalars[1], 1, 16,
+          indices, weights, 3, &found, &collisions) || found != 1 || collisions != 1) return;
+  output->passed_checks |= 4ull;
+
+  metrics[0].values[kNetMetricSlotV2] = 10;
+  metrics[1].values[kNetMetricSlotV2] = 10;
+  metrics[2].values[kNetMetricSlotV2] = 20;
+  if (!adaptive_archive_heap_down_v3(index, 0, 3) || heap[0] != 1) return;
+  output->passed_checks |= 8ull;
+  metrics[1].values[kNetMetricSlotV2] = 30;
+  if (!adaptive_archive_heap_down_v3(index, positions[1], 3) || heap[0] != 0 ||
+      sequence[1] != 2) return;
+  output->passed_checks |= 16ull;
+
+  // Remove the old root from its wraparound chain BEFORE changing its hash.
+  if (!adaptive_archive_hash_erase_v3(index, 0, 3)) return;
+  scalars[0].content_hash = colliding_hash + 1; indices[0] = 42;
+  metrics[0].values[kNetMetricSlotV2] = 25; sequence[0] = 4;
+  if (!adaptive_archive_hash_insert_v3(index, 0, 3) ||
+      !adaptive_archive_heap_down_v3(index, positions[0], 3) || heap[0] != 2) return;
+  for (std::uint64_t slot = 0; slot < 3; ++slot) {
+    if (!adaptive_archive_hash_lookup_v3(index, current, scalars[slot], slot, 16,
+        indices, weights, 3, &found, &collisions) || found != slot ||
+        !adaptive_archive_heap_node_valid_v3(index, positions[slot], 3)) return;
+  }
+  output->passed_checks |= 32ull;
+
+  scalars[3].content_hash = colliding_hash + 2; scalars[3].term_count = 1;
+  indices[48] = 43; weights[48] = 1.0; sequence[3] = 5;
+  metrics[3].values[kNetMetricSlotV2] = -0.0;
+  if (!adaptive_archive_hash_insert_v3(index, 3, 4)) return;
+  heap[3] = 3; positions[3] = 3;
+  if (!adaptive_archive_heap_up_v3(index, 3, 4) || heap[0] != 3) return;
+  metrics[2].values[kNetMetricSlotV2] = 0.0;
+  if (!adaptive_archive_heap_up_v3(index, positions[2], 4) || heap[0] != 3 ||
+      !adaptive_archive_heap_worse_v3(index, 3, 2) ||
+      adaptive_archive_heap_worse_v3(index, 2, 3) || output->control.device_fault_word) return;
+  output->passed_checks |= 64ull;
+
+  table[adaptive_archive_hash_home_v3(scalars[0].content_hash, hash_capacity)] = 5;
+  if (adaptive_archive_hash_lookup_v3(index, current, scalars[0], 0, 16,
+      indices, weights, 4, &found, &collisions) || !output->control.device_fault_word) return;
+  output->passed_checks |= 128ull;
+}
+
+extern "C" std::int32_t fixture_check_adaptive_archive_index_v3(
+    std::uint32_t device, std::uint64_t* passed_checks) {
+  if (passed_checks == nullptr || device > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+    return NEO_ARCHIVE_KNN_STATUS_INVALID_ARGUMENT_V2;
+  *passed_checks = 0;
+  auto* copied_checks = new (std::nothrow) std::uint64_t{};
+  if (copied_checks == nullptr) return NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2;
+  if (cudaSetDevice(static_cast<int>(device)) != cudaSuccess) {
+    delete copied_checks;
+    return NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2;
+  }
+  cudaStream_t stream = nullptr;
+  if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+    delete copied_checks;
+    return NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2;
+  }
+  AdaptiveArchiveIndexFixtureV3* state = nullptr;
+  if (cudaMalloc(&state, sizeof(*state)) != cudaSuccess) {
+    const auto cleanup = cudaStreamDestroy(stream);
+    if (cleanup != cudaSuccess) {
+      // No fixture work was submitted, but destruction is not acknowledged.
+      // Report it without retrying the handle or replacing the first failure.
+      std::fprintf(stderr, "archive fixture stream cleanup failed (%d); handle retained\n",
+                   static_cast<int>(cleanup));
+    }
+    delete copied_checks;
+    return NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2;
+  }
+  fixture_check_adaptive_archive_index_kernel_v3<<<1, 1, 0, stream>>>(state);
+  // Ambiguous execution/copy errors retain this fixture's tiny native graph and
+  // heap readback destination. No caller-owned pointer is an async destination.
+  if (cudaPeekAtLastError() != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess ||
+      cudaMemcpy(copied_checks,
+          reinterpret_cast<const std::uint8_t*>(state) + offsetof(AdaptiveArchiveIndexFixtureV3, passed_checks),
+          sizeof(*copied_checks), cudaMemcpyDeviceToHost) != cudaSuccess)
+    return NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2;
+  const auto checks = *copied_checks;
+  delete copied_checks;
+  if (cudaFree(state) != cudaSuccess || cudaStreamDestroy(stream) != cudaSuccess)
+    return NEO_ARCHIVE_KNN_STATUS_CUDA_ERROR_V2;
+  *passed_checks = checks;
+  return NEO_ARCHIVE_KNN_STATUS_OK_V2;
+}
+#endif
 
 }  // namespace neoethos::resident_archive_knn_v2

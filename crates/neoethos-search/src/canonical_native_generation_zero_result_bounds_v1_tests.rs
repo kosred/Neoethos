@@ -28,6 +28,7 @@ fn pre_v5_fixed_metadata_bound_constructs_pcap_without_post_run_receipts() {
         contract_artifact_relative_path_compact_json_bytes: 34,
         source_count: 2,
         total_source_segment_count: 3,
+        feature_metadata_json_upper_bound_bytes: 0,
     };
     let preflight = checked_preflight_from_fixed_metadata_shape_v1(5, 0, 10, shape)
         .expect("pre-V5 request/F facts must derive Pcap");
@@ -167,6 +168,7 @@ fn grouped_b_empty_equation_is_exact_stream_counted_and_escape_aware() {
     let evaluation_snapshot = independent_compact_object_len_v1(&[
         ("symbol", general_string),
         ("account_currency", general_string),
+        ("initial_equity", finite_f64_max),
         ("max_hold_bars", integer_max),
         ("trailing_enabled", false_json),
         ("trailing_atr_multiplier", finite_f64_max),
@@ -179,6 +181,12 @@ fn grouped_b_empty_equation_is_exact_stream_counted_and_escape_aware() {
         ("swap_long_pips_per_day", finite_f64_max),
         ("swap_short_pips_per_day", finite_f64_max),
         ("pnl_conversion_fee_rate", finite_f64_max),
+        ("kill_zones_enabled", false_json),
+        // `Some([f64; 3])` serializes as `[x,x,x]`: brackets + two commas.
+        ("session_spread_pips", 3 * finite_f64_max + 4),
+        ("risk_per_trade_min", finite_f64_max),
+        ("risk_per_trade_max", finite_f64_max),
+        ("high_quality_confidence", finite_f64_max),
         ("smc_gate_threshold", finite_f64_max),
         ("smc_weight_ob", finite_f64_max),
         ("smc_weight_fvg", finite_f64_max),
@@ -193,7 +201,7 @@ fn grouped_b_empty_equation_is_exact_stream_counted_and_escape_aware() {
         ("smc_weight_displacement", finite_f64_max),
         ("growth_objective", false_json),
     ]);
-    assert_eq!(evaluation_snapshot, 787_554);
+    assert_eq!(evaluation_snapshot, 787_865);
     let generation_zero_evaluation = independent_compact_object_len_v1(&[
         ("snapshot_v1", evaluation_snapshot),
         ("snapshot_identity_sha256", lower_hex_string),
@@ -203,7 +211,7 @@ fn grouped_b_empty_equation_is_exact_stream_counted_and_escape_aware() {
         ("genes", 2),
         ("metrics", 2),
     ]);
-    assert_eq!(generation_zero_evaluation, 787_866);
+    assert_eq!(generation_zero_evaluation, 788_177);
     let residency_counters = independent_compact_object_len_v1(&[
         ("parent_upload_count", integer_max),
         ("parent_upload_bytes", integer_max),
@@ -254,7 +262,7 @@ fn grouped_b_empty_equation_is_exact_stream_counted_and_escape_aware() {
         ("replay", replay),
         ("evidence_identity_sha256", lower_hex_string),
     ]);
-    assert_eq!(independently_counted_grouped_static, 791_605);
+    assert_eq!(independently_counted_grouped_static, 791_916);
 
     let contract = CompactContractCountProbeV1 {
         schema: "neoethos.test.contract.v1",
@@ -281,19 +289,20 @@ fn grouped_b_empty_equation_is_exact_stream_counted_and_escape_aware() {
                 contract_artifact_relative_path_compact_json_bytes: path_json_string_bytes,
                 source_count: 2,
                 total_source_segment_count: 3,
+                feature_metadata_json_upper_bound_bytes: 0,
             },
         )
         .unwrap()
     };
     let expected_plain =
-        8_266_104_u64 + contract_bytes + plain_json + 1_966_378_u64 * 2 + 148_u64 * 3;
+        8_266_579_u64 + contract_bytes + plain_json + 1_966_378_u64 * 2 + 148_u64 * 3;
     assert_eq!(
         GROUPED_FIXED_METADATA_STATIC_JSON_BYTES_V1,
         independently_counted_grouped_static
     );
     assert_eq!(
         GROUPED_FIXED_METADATA_BASE_WITH_V2_V3_JSON_BYTES_V1,
-        8_266_104
+        8_266_579
     );
     assert_eq!(checked(plain_json), expected_plain);
     assert_eq!(checked(escaped_json), expected_plain + 1);
@@ -309,6 +318,7 @@ fn grouped_b_empty_equation_is_exact_stream_counted_and_escape_aware() {
             contract_artifact_relative_path_compact_json_bytes: plain_json,
             source_count: 2,
             total_source_segment_count: 3,
+            feature_metadata_json_upper_bound_bytes: 0,
         },
     )
     .unwrap();
@@ -351,7 +361,7 @@ fn wrapper_option_and_identity_bounds_cover_their_largest_compact_forms() {
 fn pre_v5_unknown_receipt_bounds_match_the_reviewed_analytic_census() {
     assert_eq!(
         RESIDENT_POPULATION_SIZING_RECEIPT_V2_JSON_UPPER_BOUND_BYTES_V1,
-        7_080_504
+        7_080_668
     );
     for (sources, segments) in [(1, 1), (2, 2), (2, 3), (12, 1_000_000)] {
         assert_eq!(
@@ -390,15 +400,25 @@ fn receipt_schema_census_prevents_magic_upper_bounds_from_hiding_new_fields() {
             .count()
     };
     assert_eq!(count(": String,"), 18);
-    assert_eq!(count(": u64,"), 32);
-    assert_eq!(count(": bool,"), 4);
+    assert_eq!(count(": u64,"), 35);
+    assert_eq!(count(": bool,"), 5);
     assert_eq!(count(": u16,"), 1);
     assert_eq!(count(": u32,"), 1);
     assert_eq!(count(": [u8; 32],"), 2);
-    assert_eq!(18 + 32 + 4 + 1 + 1 + 2, 58);
+    assert_eq!(18 + 35 + 5 + 1 + 1 + 2, 62);
+    // Four added members: their keys, quotes/colon/comma, and maximum values.
+    // Replace the new object's two braces with the one extra comma needed to
+    // join its members to the existing object, so the net adjustment is -1.
+    let validation_policy_bytes = independent_compact_object_len_v1(&[
+        ("selection_row_start", 20),
+        ("selection_row_end", 20),
+        ("validation_cpcv_enabled", 5),
+        ("validation_cpcv_max_rows", 20),
+    ]) - 1;
+    assert_eq!(validation_policy_bytes, 164);
     assert_eq!(
         RESIDENT_POPULATION_SIZING_RECEIPT_V2_FIXED_JSON_BYTES_V1,
-        2_616
+        2_616 + validation_policy_bytes
     );
     assert_eq!(
         RESIDENT_POPULATION_SIZING_RECEIPT_V2_JSON_UPPER_BOUND_BYTES_V1,
@@ -416,6 +436,23 @@ fn receipt_schema_census_prevents_magic_upper_bounds_from_hiding_new_fields() {
         .0;
     assert_eq!(v3.matches(": String,").count(), 6);
     assert_eq!(v3.matches(": u64,").count(), 2);
+    assert_eq!(v3.matches("Option<Vec<u8>>").count(), 1);
+    assert_eq!(
+        v3.matches("Option<SearchNormalizationFittedStateV1>")
+            .count(),
+        1
+    );
+    assert_eq!(
+        v3.matches("skip_serializing_if = \"Option::is_none\"")
+            .count(),
+        2
+    );
+    // These two optional payloads are charged by actual prepared recipe
+    // geometry, separately from the unchanged legacy fixed-field census.
+    assert!(
+        include_str!("canonical_native_generation_zero_result_v1.rs")
+            .contains("bytes.checked_add(shape.feature_metadata_json_upper_bound_bytes)")
+    );
     assert_eq!(NATIVE_V3_FIXED_JSON_UPPER_BOUND_BYTES_V1, 393_995);
     assert_eq!(
         NATIVE_V3_SOURCE_BINDING_JSON_UPPER_BOUND_BYTES_V1,
@@ -548,4 +585,147 @@ fn strategy_id_worst_escape_is_258_bytes_and_stays_inside_the_gene_bound() {
     for invalid in ["", "bad id", "bad\nid", "στρατηγική"] {
         assert!(validate_strategy_id_v1(invalid).is_err());
     }
+}
+
+#[test]
+fn actual_portable_metadata_is_charged_before_population_capacity() {
+    for normalized in [false, true] {
+        let receipt = crate::data_selection::normalization_receipt_codec_fixture_v3(normalized);
+        receipt.validate().unwrap();
+        let plan = receipt.recorded_feature_plan().unwrap().unwrap();
+        let shape = CanonicalNativeFeatureMetadataSizeV1::checked_from_recipe_v3(
+            receipt.row_count(),
+            plan.final_outputs().iter().map(String::as_str),
+            normalized,
+            plan.canonical_bytes().len(),
+        )
+        .unwrap();
+        let actual = checked_actual_feature_metadata_json_bytes_v3(&receipt).unwrap();
+        assert!(actual <= shape.json_upper_bound_bytes());
+        validate_actual_feature_metadata_size_v3(&receipt, shape.json_upper_bound_bytes()).unwrap();
+        validate_actual_feature_metadata_size_v3(&receipt, actual).unwrap();
+        assert!(validate_actual_feature_metadata_size_v3(&receipt, actual - 1).is_err());
+        assert!(validate_actual_feature_metadata_size_v3(&receipt, 0).is_err());
+        let mut serialized = serde_json::to_value(&receipt).unwrap();
+        let full = serde_json::to_vec(&serialized).unwrap().len() as u64;
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("feature_plan_canonical_bytes");
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("normalization_fitted_state");
+        let without = serde_json::to_vec(&serialized).unwrap().len() as u64;
+        assert_eq!(
+            full - without,
+            actual,
+            "all field keys/separators must be charged"
+        );
+        let base = CanonicalNativeGenerationZeroFixedMetadataShapeV1 {
+            contract_compact_json_bytes: 4096,
+            contract_artifact_relative_path_compact_json_bytes: 34,
+            source_count: 1,
+            total_source_segment_count: 1,
+            feature_metadata_json_upper_bound_bytes: 0,
+        };
+        let uncharged = checked_preflight_from_fixed_metadata_shape_v1(2, 2, 10, base).unwrap();
+        let charged = checked_preflight_from_fixed_metadata_shape_v1(
+            2,
+            2,
+            10,
+            CanonicalNativeGenerationZeroFixedMetadataShapeV1 {
+                feature_metadata_json_upper_bound_bytes: shape.json_upper_bound_bytes(),
+                ..base
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            charged.fixed_metadata_upper_bound_with_empty_arrays_bytes()
+                - uncharged.fixed_metadata_upper_bound_with_empty_arrays_bytes(),
+            shape.json_upper_bound_bytes()
+        );
+        assert!(charged.population_cap() < uncharged.population_cap());
+        assert!(
+            charged
+                .checked_upper_bound_for_population(charged.population_cap() + 1)
+                .is_err()
+        );
+        if normalized {
+            let missing_fit_charge = CanonicalNativeFeatureMetadataSizeV1::checked_from_recipe_v3(
+                receipt.row_count(),
+                plan.final_outputs().iter().map(String::as_str),
+                false,
+                plan.canonical_bytes().len(),
+            )
+            .unwrap();
+            // Use an exact plan byte-array serialization charge: its decimal
+            // upper-bound slack must not conceal omission of the actual fit.
+            let plan_only_actual = checked_compact_json_byte_count_v1(plan.canonical_bytes())
+                .unwrap()
+                + b",\"feature_plan_canonical_bytes\":".len() as u64;
+            assert!(actual > plan_only_actual);
+            assert!(shape.json_upper_bound_bytes() > missing_fit_charge.json_upper_bound_bytes());
+        }
+    }
+}
+
+#[test]
+fn metadata_size_is_escape_aware_checked_and_not_a_fixed_allowance() {
+    let plain = CanonicalNativeFeatureMetadataSizeV1::checked_from_recipe_v3(
+        100,
+        ["aa"].into_iter(),
+        true,
+        100,
+    )
+    .unwrap();
+    let escaped = CanonicalNativeFeatureMetadataSizeV1::checked_from_recipe_v3(
+        100,
+        ["\"\\"].into_iter(),
+        true,
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        escaped.json_upper_bound_bytes() - plain.json_upper_bound_bytes(),
+        2
+    );
+    let bigger_plan = CanonicalNativeFeatureMetadataSizeV1::checked_from_recipe_v3(
+        100,
+        ["aa"].into_iter(),
+        true,
+        101,
+    )
+    .unwrap();
+    assert_eq!(
+        bigger_plan.json_upper_bound_bytes() - plain.json_upper_bound_bytes(),
+        4
+    );
+    for (rows, columns, plan_bytes) in [
+        (0, 1, 100),
+        (100, 0, 100),
+        (100, 1, 0),
+        (100, 1, usize::MAX),
+        (100, MAX_CANONICAL_NATIVE_GEN0_TERMS_V1 + 1, 100),
+    ] {
+        assert!(
+            CanonicalNativeFeatureMetadataSizeV1::checked_from_recipe_v3(
+                rows,
+                std::iter::repeat_n("x", columns),
+                true,
+                plan_bytes
+            )
+            .is_err()
+        );
+    }
+    let too_long = "x".repeat(MAX_CANONICAL_NATIVE_GEN0_STRING_BYTES_V1 + 1);
+    assert!(
+        CanonicalNativeFeatureMetadataSizeV1::checked_from_recipe_v3(
+            100,
+            [too_long.as_str()].into_iter(),
+            true,
+            100
+        )
+        .is_err()
+    );
 }

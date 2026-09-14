@@ -135,6 +135,44 @@ pub struct SoftVotingEnsemble {
     /// per-predict cost of re-checking. Surfaced via
     /// [`Self::experts_unused_for_voting`] for the chrome banner.
     unused_for_voting: HashSet<String>,
+    model_feature_input: Option<crate::runtime::feature_input::ModelFeatureInputV1>,
+}
+
+/// An immutable numerical input binding. Only windows of this exact shared
+/// frame may reach its ensemble without repeating the full fitted-state check.
+pub struct BoundModelInference<'a> {
+    ensemble: &'a SoftVotingEnsemble,
+    frame: &'a std::sync::Arc<FeatureFrame>,
+    projections: Vec<neoethos_data::BoundFeatureColumnProjection>,
+    expert_projections: Vec<Option<usize>>,
+}
+
+impl BoundModelInference<'_> {
+    /// Infer causally using at most `history_rows` ending immediately before
+    /// `end_exclusive`. Future rows cannot enter an expert's history window.
+    pub fn last_row(
+        &self,
+        end_exclusive: usize,
+        history_rows: usize,
+        lease: &CpuLease,
+    ) -> Result<EnsembleDecision> {
+        anyhow::ensure!(
+            history_rows > 0 && end_exclusive > 0 && end_exclusive <= self.frame.n_samples(),
+            "bound model window must have positive history and a valid exclusive end"
+        );
+        let start = end_exclusive.saturating_sub(history_rows);
+        self.ensemble
+            .predict_with_roles_selected(end_exclusive - start, |index, expert| {
+                let projection = self.expert_projections[index].ok_or_else(|| {
+                    anyhow::anyhow!("active expert has no bound column projection")
+                })?;
+                let window = self.projections[projection].row_window(start..end_exclusive)?;
+                expert.predict(&window, lease)
+            })?
+            .into_iter()
+            .next_back()
+            .ok_or_else(|| anyhow::anyhow!("bound model window returned no final decision"))
+    }
 }
 
 impl SoftVotingEnsemble {
@@ -173,6 +211,120 @@ impl SoftVotingEnsemble {
             outcome,
             config,
             unused_for_voting: unused,
+            model_feature_input: None,
+        })
+    }
+
+    pub(crate) fn bind_model_feature_input(
+        mut self,
+        input: crate::runtime::feature_input::ModelFeatureInputV1,
+    ) -> Result<Self> {
+        input.validate()?;
+        let columns = input
+            .feature_columns()
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        for expert in &self.outcome.loaded {
+            anyhow::ensure!(
+                expert
+                    .feature_columns()
+                    .iter()
+                    .all(|name| columns.contains(name.as_str())),
+                "expert '{}' requests columns absent from its model producer contract",
+                expert.name()
+            );
+        }
+        self.model_feature_input = Some(input);
+        Ok(self)
+    }
+
+    pub fn model_feature_input(
+        &self,
+    ) -> Option<&crate::runtime::feature_input::ModelFeatureInputV1> {
+        self.model_feature_input.as_ref()
+    }
+
+    /// Produce the saved model's own numerical input, independently of Search.
+    pub fn prepare_model_features(
+        &self,
+        dataset: &neoethos_data::SymbolDataset,
+    ) -> Result<FeatureFrame> {
+        self.prepare_model_features_with_control(
+            dataset,
+            &neoethos_data::FeatureBuildControl::default(),
+        )
+    }
+
+    pub fn prepare_model_features_with_control(
+        &self,
+        dataset: &neoethos_data::SymbolDataset,
+        control: &neoethos_data::FeatureBuildControl,
+    ) -> Result<FeatureFrame> {
+        self.model_feature_input
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ensemble has no persisted model-owned preprocessing"))?
+            .prepare_features_with_control(dataset, control)
+    }
+
+    pub fn bind_model_features<'a>(
+        &'a self,
+        frame: &'a std::sync::Arc<FeatureFrame>,
+    ) -> Result<BoundModelInference<'a>> {
+        self.model_feature_input
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("verified model inference requires persisted preprocessing")
+            })?
+            .validate_features(frame)?;
+        let indices_by_name = frame
+            .names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), index))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut schemas = std::collections::HashMap::<Vec<usize>, usize>::new();
+        let mut projections = Vec::new();
+        let mut expert_projections = Vec::with_capacity(self.outcome.loaded.len());
+        for expert in &self.outcome.loaded {
+            if self.config.excluded_names.contains(expert.name())
+                || expert.output_kind() != ExpertOutputKind::Classification3
+            {
+                expert_projections.push(None);
+                continue;
+            }
+            anyhow::ensure!(
+                !expert.feature_columns().is_empty(),
+                "expert '{}' has no recorded feature columns",
+                expert.name()
+            );
+            let indices = expert
+                .feature_columns()
+                .iter()
+                .map(|name| {
+                    indices_by_name.get(name.as_str()).copied().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "bound expert '{}' feature '{name}' is absent",
+                            expert.name()
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let projection = if let Some(&existing) = schemas.get(&indices) {
+                existing
+            } else {
+                let index = projections.len();
+                projections.push(frame.bind_column_projection(&indices)?);
+                schemas.insert(indices, index);
+                index
+            };
+            expert_projections.push(Some(projection));
+        }
+        Ok(BoundModelInference {
+            ensemble: self,
+            frame,
+            projections,
+            expert_projections,
         })
     }
 
@@ -214,7 +366,27 @@ impl SoftVotingEnsemble {
         frame: &FeatureFrame,
         lease: &CpuLease,
     ) -> Result<Vec<EnsembleDecision>> {
-        let n_rows = frame.n_samples();
+        if let Some(input) = &self.model_feature_input {
+            input.validate_features(frame)?;
+        }
+        self.predict_with_roles_validated(frame, lease)
+    }
+
+    fn predict_with_roles_validated(
+        &self,
+        frame: &FeatureFrame,
+        lease: &CpuLease,
+    ) -> Result<Vec<EnsembleDecision>> {
+        self.predict_with_roles_selected(frame.n_samples(), |_, expert| {
+            expert.predict(frame, lease)
+        })
+    }
+
+    fn predict_with_roles_selected(
+        &self,
+        n_rows: usize,
+        predict: impl Fn(usize, &dyn super::ExpertModel) -> Result<Vec<ExpertPrediction>>,
+    ) -> Result<Vec<EnsembleDecision>> {
         if n_rows == 0 {
             return Ok(Vec::new());
         }
@@ -230,7 +402,7 @@ impl SoftVotingEnsemble {
         let mut anomaly_scores: Option<Vec<f64>> = None;
         let mut anomaly_validity: Option<Vec<FeatureCellValidity>> = None;
 
-        for expert in &self.outcome.loaded {
+        for (expert_index, expert) in self.outcome.loaded.iter().enumerate() {
             let name = expert.name();
             if self.config.excluded_names.contains(name) {
                 continue;
@@ -248,7 +420,7 @@ impl SoftVotingEnsemble {
                 );
             };
 
-            let preds: Vec<ExpertPrediction> = expert.predict(frame, lease)?;
+            let preds: Vec<ExpertPrediction> = predict(expert_index, expert.as_ref())?;
             if preds.len() != n_rows {
                 anyhow::bail!(
                     "expert '{}' returned {} predictions for a {}-row FeatureFrame",
@@ -930,5 +1102,407 @@ mod tests {
         )
         .expect_err("canonical feature frames cannot be empty");
         assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn candidate_ensemble_rejects_raw_or_refitted_inputs_before_expert_prediction() {
+        let raw = small_frame(12);
+        let normalized =
+            neoethos_data::test_fixtures::ctrader_test_feature_frame_with_normalization(
+                &raw,
+                0..6,
+                None,
+            )
+            .unwrap();
+        let anchor = normalized.provenance().bindings()[0].dataset_identity();
+        let input = crate::runtime::feature_input::ModelFeatureInputV1::from_training_frame(
+            anchor,
+            &normalized,
+            Some(raw.timestamps[8]),
+            2,
+        )
+        .unwrap();
+        let ensemble = default_ensemble(outcome_with(vec![Box::new(ConstantClassifier {
+            name: "xgboost".into(),
+            probs: [0.1, 0.8, 0.1],
+        })]))
+        .unwrap()
+        .bind_model_feature_input(input)
+        .unwrap();
+        let lease = one_worker_lease();
+        assert_eq!(
+            ensemble
+                .predict_with_roles(&normalized, &lease)
+                .unwrap()
+                .len(),
+            12
+        );
+        assert!(ensemble.predict_with_roles(&raw, &lease).is_err());
+        let refitted = neoethos_data::test_fixtures::ctrader_test_feature_frame_with_normalization(
+            &raw,
+            0..10,
+            None,
+        )
+        .unwrap();
+        assert!(ensemble.predict_with_roles(&refitted, &lease).is_err());
+        assert!(
+            ensemble
+                .predict_with_roles(&normalized.row_window(10, 12).unwrap(), &lease)
+                .is_ok()
+        );
+    }
+
+    struct WindowMeanClassifier;
+    impl ExpertModel for WindowMeanClassifier {
+        fn name(&self) -> &str {
+            "xgboost"
+        }
+        fn family(&self) -> ModelFamily {
+            ModelFamily::Tree
+        }
+        fn output_kind(&self) -> ExpertOutputKind {
+            ExpertOutputKind::Classification3
+        }
+        fn feature_columns(&self) -> &[String] {
+            static COLUMNS: std::sync::LazyLock<Vec<String>> =
+                std::sync::LazyLock::new(|| vec!["f1".into()]);
+            &COLUMNS
+        }
+        fn predict(&self, frame: &FeatureFrame, _: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+            let column = frame.feature_column(0)?;
+            let mean = column.values.iter().sum::<f64>() / column.len() as f64;
+            let buy = 0.5 + 0.4 * mean.tanh();
+            (0..frame.n_samples())
+                .map(|_| {
+                    ExpertPrediction::valid(
+                        ExpertOutputKind::Classification3,
+                        vec![0.0, buy, 1.0 - buy],
+                    )
+                })
+                .collect()
+        }
+    }
+
+    struct ProjectedMeanClassifier {
+        name: &'static str,
+        columns: Vec<String>,
+    }
+
+    impl ExpertModel for ProjectedMeanClassifier {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn family(&self) -> ModelFamily {
+            ModelFamily::Tree
+        }
+        fn output_kind(&self) -> ExpertOutputKind {
+            ExpertOutputKind::Classification3
+        }
+        fn feature_columns(&self) -> &[String] {
+            &self.columns
+        }
+        fn predict(&self, frame: &FeatureFrame, _: &CpuLease) -> Result<Vec<ExpertPrediction>> {
+            let projected = super::super::project_expert_frame(frame, &self.columns, self.name)?;
+            let column = projected.feature_column(0)?;
+            let mean = column.values.iter().sum::<f64>() / column.len() as f64;
+            let buy = 0.5 + 0.4 * mean.tanh();
+            (0..frame.n_samples())
+                .map(|_| {
+                    ExpertPrediction::valid(
+                        ExpertOutputKind::Classification3,
+                        vec![0.0, buy, 1.0 - buy],
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn bound_expert_projections_are_deduplicated_and_match_general_causal_inference() {
+        use crate::runtime::feature_input::ModelFeatureInputV1;
+        use std::sync::Arc;
+        let raw = Arc::new(
+            neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns_with_options(
+                neoethos_data::test_fixtures::canonical_test_timestamps(12),
+                ["f1", "f2"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(column, name)| {
+                        FeatureColumnF64::new(
+                            name,
+                            (0..12)
+                                .map(|row| (row + 1) as f64 * (column + 1) as f64)
+                                .collect(),
+                            vec![FeatureCellValidity::Valid; 12],
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+                neoethos_data::FeatureBuildOptions::default(),
+            )
+            .unwrap(),
+        );
+        let fit = raw
+            .fit_normalization(0..6, true, &neoethos_data::FeatureBuildControl::default())
+            .unwrap();
+        let normalized = Arc::new(raw.with_fitted_normalization(&fit).unwrap());
+        let lease = one_worker_lease();
+        for frame in [&raw, &normalized] {
+            let input = ModelFeatureInputV1::from_training_frame(
+                frame.provenance().bindings()[0].dataset_identity(),
+                frame,
+                Some(raw.timestamps[8]),
+                2,
+            )
+            .unwrap();
+            let ensemble = default_ensemble(outcome_with(vec![
+                Box::new(ProjectedMeanClassifier {
+                    name: "xgboost",
+                    columns: vec!["f2".into(), "f1".into()],
+                }),
+                Box::new(ProjectedMeanClassifier {
+                    name: "lightgbm",
+                    columns: vec!["f2".into(), "f1".into()],
+                }),
+                Box::new(ProjectedMeanClassifier {
+                    name: "logistic",
+                    columns: vec!["f1".into()],
+                }),
+            ]))
+            .unwrap()
+            .bind_model_feature_input(input)
+            .unwrap();
+            let bound = ensemble.bind_model_features(frame).unwrap();
+            assert_eq!(bound.projections.len(), 2);
+            assert_eq!(bound.expert_projections, vec![Some(0), Some(0), Some(1)]);
+            for end in 4..=12 {
+                let direct = ensemble
+                    .predict_with_roles(&frame.shared_row_window(end - 4..end).unwrap(), &lease)
+                    .unwrap();
+                assert_eq!(bound.last_row(end, 4, &lease).unwrap(), direct[3]);
+            }
+        }
+    }
+
+    #[test]
+    fn bound_swarm_uses_exact_raw_prices_and_matches_the_real_loaded_adapter() {
+        use crate::ensemble_inference::ExpertLoader;
+        use crate::ensemble_inference::swarm_adapter::SwarmForecasterAdapterLoader;
+        use crate::forecasting::swarm_impl::SwarmForecaster;
+        use crate::runtime::feature_input::{MODEL_FEATURE_INPUT_FILE_V1, ModelFeatureInputV1};
+        use std::sync::Arc;
+        struct OwnedDirectory(std::path::PathBuf);
+        impl Drop for OwnedDirectory {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                    eprintln!("owned bound-Swarm fixture cleanup failed: {error}");
+                }
+            }
+        }
+        let directory = OwnedDirectory(std::env::temp_dir().join(format!(
+            "neoethos-bound-swarm-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let raw = Arc::new(
+            neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns_with_options(
+                neoethos_data::test_fixtures::canonical_test_timestamps(64),
+                vec![
+                    FeatureColumnF64::new(
+                        "quant_close",
+                        (0..64).map(|row| 1.1 + row as f64 * 0.0001).collect(),
+                        vec![FeatureCellValidity::Valid; 64],
+                    )
+                    .unwrap(),
+                    FeatureColumnF64::new(
+                        "f1",
+                        (0..64).map(|row| row as f64).collect(),
+                        vec![FeatureCellValidity::Valid; 64],
+                    )
+                    .unwrap(),
+                ],
+                neoethos_data::FeatureBuildOptions::default(),
+            )
+            .unwrap(),
+        );
+        let fit = raw
+            .fit_normalization(0..40, true, &neoethos_data::FeatureBuildControl::default())
+            .unwrap();
+        let normalized = Arc::new(raw.with_fitted_normalization(&fit).unwrap());
+        let input = ModelFeatureInputV1::from_training_frame(
+            raw.provenance().bindings()[0].dataset_identity(),
+            &normalized,
+            Some(raw.timestamps[44]),
+            4,
+        )
+        .unwrap();
+        neoethos_core::storage::json::write_bytes_atomic(
+            &directory.0.join(MODEL_FEATURE_INPUT_FILE_V1),
+            &input.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        let artifact_dir = directory.0.join("swarm_forecaster");
+        let lease = one_worker_lease();
+        let mut model = SwarmForecaster::new(64.0);
+        model.config.horizon = 2;
+        model
+            .fit_from_frame(&normalized.row_window(0, 40).unwrap(), "EURUSD", &lease)
+            .unwrap();
+        model.save(&artifact_dir).unwrap();
+        let adapter = SwarmForecasterAdapterLoader.load(&artifact_dir).unwrap();
+        let expected_raw = adapter
+            .predict(&raw.shared_row_window(16..48).unwrap(), &lease)
+            .unwrap();
+        let ensemble = default_ensemble(outcome_with(vec![adapter]))
+            .unwrap()
+            .bind_model_feature_input(input.clone())
+            .unwrap();
+        let bound = ensemble.bind_model_features(&normalized).unwrap();
+        assert_eq!(bound.projections.len(), 1);
+        let projected = bound.projections[0].row_window(16..48).unwrap();
+        assert_eq!(projected.names, vec!["quant_close"]);
+        assert_eq!(
+            projected.raw_model_column("quant_close").unwrap().values,
+            raw.feature_column(0).unwrap().values[16..48]
+        );
+        let actual = bound.last_row(48, 32, &lease).unwrap();
+        let direct = ensemble
+            .predict_with_roles(&normalized.shared_row_window(16..48).unwrap(), &lease)
+            .unwrap();
+        assert_eq!(actual, direct[31]);
+        assert!(actual.validity.is_valid());
+        let raw_last = &expected_raw[31];
+        let direct_adapter = ensemble.outcome.loaded[0]
+            .predict(&projected, &lease)
+            .unwrap();
+        assert_eq!(direct_adapter[31].values, raw_last.values);
+        assert_eq!(direct_adapter[31].validity, raw_last.validity);
+        let mut columns = raw.project_columns(&[0, 1], 0..64).unwrap().columns.clone();
+        for column in &mut columns {
+            for value in &mut column.values[48..] {
+                *value += 1000.0;
+            }
+        }
+        let changed = Arc::new(
+            neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns_with_options(
+                raw.timestamps.clone(),
+                columns,
+                neoethos_data::FeatureBuildOptions::default(),
+            )
+            .unwrap(),
+        );
+        let changed = Arc::new(input.apply_to_raw_features(changed).unwrap());
+        assert_eq!(
+            actual,
+            ensemble
+                .bind_model_features(&changed)
+                .unwrap()
+                .last_row(48, 32, &lease)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn saved_model_input_is_independent_of_raw_search_or_a_different_search_fit() {
+        use crate::runtime::feature_input::ModelFeatureInputV1;
+        use std::sync::Arc;
+        let raw = Arc::new(small_frame(12));
+        let fit = raw
+            .fit_normalization(0..6, true, &neoethos_data::FeatureBuildControl::default())
+            .unwrap();
+        let model = raw.with_fitted_normalization(&fit).unwrap();
+        let input = ModelFeatureInputV1::from_training_frame(
+            model.provenance().bindings()[0].dataset_identity(),
+            &model,
+            Some(raw.timestamps[8]),
+            2,
+        )
+        .unwrap();
+        let input = ModelFeatureInputV1::from_json_bytes(&input.to_json_bytes().unwrap()).unwrap();
+        let ensemble = default_ensemble(outcome_with(vec![Box::new(WindowMeanClassifier)]))
+            .unwrap()
+            .bind_model_feature_input(input.clone())
+            .unwrap();
+        let search_fit = raw
+            .fit_normalization(0..9, true, &neoethos_data::FeatureBuildControl::default())
+            .unwrap();
+        let normalized_search = Arc::new(raw.with_fitted_normalization(&search_fit).unwrap());
+        assert!(ensemble.bind_model_features(&raw).is_err());
+        assert!(ensemble.bind_model_features(&normalized_search).is_err());
+        let lease = one_worker_lease();
+        for search in [&raw, &normalized_search] {
+            // Search values exist independently but never enter the model helper.
+            assert_eq!(search.n_samples(), 12);
+            let prepared = Arc::new(input.apply_to_raw_features(Arc::clone(&raw)).unwrap());
+            assert_eq!(prepared.normalization_fitted_state(), Some(&fit));
+            assert_eq!(
+                prepared.feature_column(0).unwrap().values,
+                model.feature_column(0).unwrap().values
+            );
+            let bound = ensemble.bind_model_features(&prepared).unwrap();
+            let observed = bound.last_row(12, 4, &lease).unwrap();
+            let direct = ensemble
+                .predict_with_roles(&prepared.shared_row_window(8..12).unwrap(), &lease)
+                .unwrap();
+            assert_eq!(observed, direct[3]);
+        }
+    }
+
+    #[test]
+    fn borrowed_model_windows_ignore_future_perturbations_and_refuse_drift_on_binding() {
+        use crate::runtime::feature_input::ModelFeatureInputV1;
+        use std::sync::Arc;
+        let raw = Arc::new(small_frame(12));
+        let fit = raw
+            .fit_normalization(0..6, true, &neoethos_data::FeatureBuildControl::default())
+            .unwrap();
+        let model = Arc::new(raw.with_fitted_normalization(&fit).unwrap());
+        let input = ModelFeatureInputV1::from_training_frame(
+            model.provenance().bindings()[0].dataset_identity(),
+            &model,
+            Some(raw.timestamps[8]),
+            2,
+        )
+        .unwrap();
+        let ensemble = default_ensemble(outcome_with(vec![Box::new(WindowMeanClassifier)]))
+            .unwrap()
+            .bind_model_feature_input(input.clone())
+            .unwrap();
+        let altered = Arc::new(
+            neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+                raw.timestamps.clone(),
+                vec![
+                    FeatureColumnF64::new(
+                        "f1",
+                        (0..12)
+                            .map(|r| if r < 8 { r as f64 + 1.0 } else { -10_000.0 })
+                            .collect(),
+                        vec![FeatureCellValidity::Valid; 12],
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        let altered = Arc::new(input.apply_to_raw_features(altered).unwrap());
+        let first = ensemble.bind_model_features(&model).unwrap();
+        let second = ensemble.bind_model_features(&altered).unwrap();
+        let lease = one_worker_lease();
+        assert_eq!(
+            first.last_row(8, 4, &lease).unwrap(),
+            second.last_row(8, 4, &lease).unwrap()
+        );
+        assert_ne!(
+            first.last_row(12, 4, &lease).unwrap(),
+            second.last_row(12, 4, &lease).unwrap()
+        );
+        for (end, history) in [(0, 4), (13, 4), (8, 0)] {
+            assert!(first.last_row(end, history, &lease).is_err());
+        }
+        let mut drift = model.shared_view().unwrap();
+        drift.names[0] = "wrong_schema".into();
+        assert!(ensemble.bind_model_features(&Arc::new(drift)).is_err());
+        let legacy = default_ensemble(outcome_with(vec![Box::new(WindowMeanClassifier)])).unwrap();
+        assert!(legacy.bind_model_features(&model).is_err());
     }
 }

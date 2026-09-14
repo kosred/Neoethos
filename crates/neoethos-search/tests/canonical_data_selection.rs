@@ -455,6 +455,144 @@ fn runnable_search_input_owns_the_receipt_and_rejects_foreign_ohlcv_values() {
 }
 
 #[test]
+fn prepared_receipt_rejects_one_changed_feature_bit_before_search() {
+    let root = TempRoot::new("prepared-payload-substitution");
+    let selected = external_identity("broker-a", "EURUSD", CanonicalTimeframe::M1);
+    publish(root.path(), &selected, 1.10);
+    let input = ExactCanonicalSeries::open(root.path(), selected)
+        .expect("select exact canonical series")
+        .load_search_input(&[])
+        .expect("build the selected feature payload");
+    let prepared_receipt = input.receipt().expect("seal prepared receipt");
+    let fresh = CanonicalSearchRunInputV2::from_fresh_feature_frame(
+        input.anchor_identity(),
+        input.features(),
+        input.base_frame(),
+    )
+    .expect("bind the unchanged fresh payload");
+    assert_eq!(fresh.receipt(), &prepared_receipt);
+
+    let indices = (0..input.features().n_features()).collect::<Vec<_>>();
+    let columns = input
+        .features()
+        .project_columns(&indices, 0..input.features().n_samples())
+        .expect("copy exact columns for the substitution test")
+        .columns
+        .clone();
+    // Keep the real producer recipe, fitted state, source-row IDs and leases.
+    // Reconstructing with from_columns would drop that metadata and reject the
+    // frame before the exact payload-bit check this regression must exercise.
+    let mut changed = input.features().clone();
+    changed.data = neoethos_data::FeatureData::InMemory(columns);
+    prepared_receipt
+        .validate_against(input.anchor_identity(), &changed)
+        .expect("the materialized copy must retain every original receipt field");
+    let neoethos_data::FeatureData::InMemory(columns) = &mut changed.data else {
+        unreachable!("the substitution fixture owns its materialized columns")
+    };
+    let (column_index, row_index) = columns
+        .iter()
+        .enumerate()
+        .find_map(|(column_index, column)| {
+            column
+                .values
+                .iter()
+                .zip(&column.validity)
+                .position(|(value, validity)| {
+                    value.is_finite() && *validity == FeatureCellValidity::Valid
+                })
+                .map(|row_index| (column_index, row_index))
+        })
+        .expect("fixture must have one valid finite feature value");
+    let value = &mut columns[column_index].values[row_index];
+    *value = f64::from_bits(value.to_bits() ^ 1);
+    assert_eq!(changed.plan_identity(), input.features().plan_identity());
+    assert_eq!(
+        changed.provenance_identity(),
+        input.features().provenance_identity()
+    );
+    assert_eq!(
+        changed.feature_build_options(),
+        input.features().feature_build_options()
+    );
+    assert_eq!(
+        changed.normalization_fitted_state(),
+        input.features().normalization_fitted_state()
+    );
+
+    // Rebuilding a fresh receipt would accept and relabel the changed values.
+    // The prepared consumer must instead retain the original authority and
+    // reject the change before entering the search/financial evaluation.
+    let relabeled = CanonicalSearchRunInputV2::from_fresh_feature_frame(
+        input.anchor_identity(),
+        &changed,
+        input.base_frame(),
+    )
+    .expect("changed values can form a different fresh input, not the prepared one");
+    assert_ne!(relabeled.receipt(), &prepared_receipt);
+    let error = CanonicalSearchRunInputV2::new(prepared_receipt, &changed, input.base_frame())
+        .expect_err("a prepared receipt must reject even one changed value bit");
+    assert!(
+        error
+            .to_string()
+            .contains("feature content SHA-256 does not match"),
+        "{error}"
+    );
+}
+
+#[test]
+fn prepared_owner_retains_its_original_receipt_and_revalidates_at_search_binding() {
+    let root = TempRoot::new("prepared-owner-receipt");
+    let selected = external_identity("broker-a", "EURUSD", CanonicalTimeframe::M1);
+    publish(root.path(), &selected, 1.10);
+    let input = ExactCanonicalSeries::open(root.path(), selected)
+        .expect("select exact canonical series")
+        .load_search_input(&[])
+        .expect("build exact canonical input");
+    let expected = input.receipt().expect("original feature receipt");
+    let prepared =
+        neoethos_search::data_selection::CanonicalSearchInput::from_prepared_canonical_frame(
+            input.anchor_identity().clone(),
+            input.base_frame().clone(),
+            input.features().clone(),
+        )
+        .expect("prepare and verify exact input");
+    assert_eq!(prepared.receipt().expect("saved receipt"), expected);
+    assert_eq!(
+        prepared.clone().receipt().expect("cloned owner's receipt"),
+        expected
+    );
+    assert_eq!(
+        prepared
+            .as_run_input()
+            .expect("revalidated input")
+            .receipt(),
+        &expected
+    );
+
+    // Check that the production owner uses the original receipt at the
+    // consumer boundary, not the fresh-receipt path that relabels mutations.
+    let source = include_str!("../src/data_selection.rs");
+    let receipt_body = source
+        .split("pub fn receipt(&self) -> Result<CanonicalSearchInputReceiptV2")
+        .nth(1)
+        .expect("owner receipt getter")
+        .split("pub fn as_run_input")
+        .next()
+        .unwrap();
+    assert!(receipt_body.contains("return Ok(receipt.clone())"));
+    let consumer = source
+        .split("pub fn as_run_input(")
+        .nth(1)
+        .expect("owner consumer")
+        .split("/// The only data shape")
+        .next()
+        .unwrap();
+    assert!(consumer.contains("return CanonicalSearchRunInputV2::new_with_control("));
+    assert!(consumer.contains("receipt.clone()"));
+}
+
+#[test]
 fn runnable_multitimeframe_input_binds_each_direct_generation_without_derivation() {
     let root = TempRoot::new("runnable-direct-mtf");
     let base = external_identity("broker-a", "EURUSD", CanonicalTimeframe::M1);

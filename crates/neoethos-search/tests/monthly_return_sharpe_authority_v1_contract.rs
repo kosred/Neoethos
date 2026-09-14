@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use neoethos_search::scoring::{ga_fitness, ga_fitness_growth};
+
 const MONTHS_PER_YEAR_SQRT_V1: f64 = 3.4641;
 const INVALID_MONTHLY_RETURN_SHARPE_V1: f64 = f64::NEG_INFINITY;
 
@@ -96,12 +98,11 @@ fn invalid_period_return_inputs_reach_the_existing_fitness_rejection() {
         f64::NEG_INFINITY
     );
 
-    let scoring = read_utf8(&search_manifest_dir().join("src/scoring/named.rs"));
-    assert!(
-        scoring.matches("if !sharpe.is_finite()").count() >= 2
-            && scoring.contains("return f64::NEG_INFINITY;"),
-        "both strict and growth fitness must keep non-finite Sharpe as a hard rejection"
-    );
+    let mut invalid_metrics = [0.0; 11];
+    invalid_metrics[1] = INVALID_MONTHLY_RETURN_SHARPE_V1;
+    invalid_metrics[8] = 1.0;
+    assert_eq!(ga_fitness(&invalid_metrics), f64::NEG_INFINITY);
+    assert_eq!(ga_fitness_growth(&invalid_metrics), f64::NEG_INFINITY);
     let evolution = read_utf8(&search_manifest_dir().join("src/genetic/evolution_math.rs"));
     assert!(
         evolution.contains("crate::scoring::ga_fitness_growth(m)")

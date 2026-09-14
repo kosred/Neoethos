@@ -132,7 +132,7 @@ thiserror   = "2.0.16"
 # ── Dev profile — local debug builds + tests ─────────────────────────────────
 # `debug = "line-tables-only"` instead of the default full DWARF. The workspace
 # binary is enormous (neoethos-app links ~260 object files across the whole
-# crate graph: polars, burn/cubecl, candle, the tree-model FFI, arrow, etc.).
+# crate graph: burn/cubecl, candle, the tree-model FFI, Arrow/Vortex, etc.).
 # Full type info pushes the monolithic Windows PDB past the MSVC linker's
 # internal cap and the link dies with `LNK1318: Unexpected PDB error; LIMIT (12)`
 # — so `cargo build` / `cargo test` could not link locally at all. Line-tables
@@ -167,6 +167,18 @@ codegen-units = 16
 [patch.crates-io]
 lightgbm3 = { path = "vendor/lightgbm3" }
 lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
+# Burn's upstream umbrella manifest locks every optional backend, including
+# burn-wgpu, even when NeoEthos requests only its shared API and Autodiff. The
+# local facade keeps that used API and removes the retired backend edges at the
+# dependency boundary. CUDA remains the explicit burn-cuda dependency in
+# neoethos-models; ROCm/HIP remains separate future work.
+burn = { path = "vendor/burn-0.21.0-neoethos" }
+# The upstream CubeCL facade declares WGPU/Vulkan, Metal, WebGPU and CPU
+# runtimes as optional dependencies. Cargo therefore retains that entire
+# backend family in Cargo.lock even though NeoEthos selects CUDA only. This
+# narrow facade preserves the shared CubeCL API plus CUDA and future HIP/ROCm,
+# while making the retired WGPU/Vulkan family impossible to select or resolve.
+cubecl = { path = "vendor/cubecl-0.10.0-cuda-hip-only" }
 # VENDORED 2026-08-04 for one line: upstream build.rs canonicalizes the CMake
 # source dir with std::fs::canonicalize, whose Windows `\\?\` prefix empties
 # CMake's file(GLOB) — configure dies with "No SOURCES given to target:
@@ -202,6 +214,8 @@ vector-ta = { path = "vendor/vector-ta-0.2.9-patched" }
 # aggregate their memory reports, and drain both GPU and pinned-host pools.
 cubecl-runtime = { path = "vendor/cubecl-runtime-0.10.0-patched" }
 cubecl-cuda = { path = "vendor/cubecl-cuda-0.10.0-patched" }
+# Matching HIP lifecycle repair: retire upload staging and clean both pools.
+cubecl-hip = { path = "vendor/cubecl-hip-0.10.0-neoethos" }
 # CubeK 0.2 validates TMA only after it has already built tensor-map bindings.
 # On pre-Hopper NVIDIA cards that reaches cuTensorMapEncodeTiled and returns
 # CUDA_ERROR_NOT_SUPPORTED before the autotuner can reject the candidate. This

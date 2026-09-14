@@ -5,11 +5,14 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+#[cfg(any(test, target_os = "linux"))]
+use neoethos_data::PreparedCompactSelectedStoreV2;
 use neoethos_data::{
     CanonicalPinnedSourceBindingFactsV1, CanonicalPinnedSourceProjectionV1,
     CanonicalPinnedSourceSegmentFactsV1, GpuOnlyFeatureMaterializationErrorV3,
     PreparedGpuOnlyFeatureMaterializationV3,
 };
+use neoethos_gpu_contracts::resident_feature_store_v3::ResidentWorkingSetExtentV3;
 use neoethos_gpu_cuda::{
     DATA_POPULATION_ALLOCATOR_RESERVE_BYTES_V1, DATA_POPULATION_ALLOCATOR_RESERVE_POLICY_V1,
     DataPopulationWorkspacePlanErrorCodeV1, DataPopulationWorkspacePlanErrorV1,
@@ -19,10 +22,19 @@ use neoethos_gpu_cuda::{
     SealedDataPopulationGpuWorkspacePlanV1, SealedNativeCudaDataPopulationPreflightFactsV1,
 };
 
+#[cfg(any(test, target_os = "linux"))]
+use crate::resident_selection_scope_v2::ResidentFeatureScreeningScopeV2;
+
 pub const RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V2: u16 = 2;
 const RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_HASH_DOMAIN_V2: &[u8] =
     b"neoethos.search.resident-population-auto-sizing-receipt.v2\0";
-pub(crate) const RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2: usize = 16_384;
+/// Absolute native ABI ceiling, not a search-budget default.
+///
+/// The active CUDA implementation stores both population and scenario extents
+/// in signed C++ `int` fields.  The actual run remains bounded much lower by
+/// the external result envelope, the admitted free-VRAM snapshot and the
+/// timeframe-derived per-launch cap.
+pub(crate) const RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2: usize = i32::MAX as usize;
 
 fn checked_effective_hard_growth_cap_v2(
     external_hard_population_cap: usize,
@@ -36,16 +48,18 @@ fn checked_effective_hard_growth_cap_v2(
     Ok(external_hard_population_cap.min(RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2))
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn checked_configured_population_against_external_hard_cap_v2(
     configured_population: usize,
     external_hard_population_cap: usize,
 ) -> Result<(), ResidentPopulationAutoSizingErrorV2> {
-    checked_effective_hard_growth_cap_v2(external_hard_population_cap)?;
-    if configured_population > external_hard_population_cap {
+    let effective_hard_population_cap =
+        checked_effective_hard_growth_cap_v2(external_hard_population_cap)?;
+    if configured_population > effective_hard_population_cap {
         return Err(ResidentPopulationAutoSizingErrorV2::new(
             ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
             format!(
-                "configured resident population {configured_population} exceeds external hard cap {external_hard_population_cap}"
+                "configured resident population {configured_population} exceeds effective native/external hard cap {effective_hard_population_cap}"
             ),
         ));
     }
@@ -58,6 +72,74 @@ type InternalWorkspaceBytesV2 = (
     u64,
     u64,
 );
+
+trait ResidentDataWorkspacePlanSourceV2 {
+    fn workspace_extent_v2(&self) -> &ResidentWorkingSetExtentV3;
+    fn pinned_source_projection_v2(&self) -> &CanonicalPinnedSourceProjectionV1;
+    fn seal_data_population_workspace_plan_v2(
+        &self,
+        native_facts: SealedNativeCudaDataPopulationPreflightFactsV1,
+        max_ordered_index_count: usize,
+        max_adaptive_row_count: usize,
+        gene_plan: PopulationGeneStorePlanV1,
+        metrics_plan: PopulationMetricsOnlyPlanV1,
+    ) -> Result<SealedDataPopulationGpuWorkspacePlanV1, GpuOnlyFeatureMaterializationErrorV3>;
+}
+
+impl ResidentDataWorkspacePlanSourceV2 for PreparedGpuOnlyFeatureMaterializationV3 {
+    fn workspace_extent_v2(&self) -> &ResidentWorkingSetExtentV3 {
+        self.workspace_extent()
+    }
+
+    fn pinned_source_projection_v2(&self) -> &CanonicalPinnedSourceProjectionV1 {
+        self.pinned_source_projection_v1()
+    }
+
+    fn seal_data_population_workspace_plan_v2(
+        &self,
+        native_facts: SealedNativeCudaDataPopulationPreflightFactsV1,
+        max_ordered_index_count: usize,
+        max_adaptive_row_count: usize,
+        gene_plan: PopulationGeneStorePlanV1,
+        metrics_plan: PopulationMetricsOnlyPlanV1,
+    ) -> Result<SealedDataPopulationGpuWorkspacePlanV1, GpuOnlyFeatureMaterializationErrorV3> {
+        self.seal_data_population_workspace_plan_v1(
+            native_facts,
+            max_ordered_index_count,
+            max_adaptive_row_count,
+            gene_plan,
+            metrics_plan,
+        )
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl ResidentDataWorkspacePlanSourceV2 for PreparedCompactSelectedStoreV2 {
+    fn workspace_extent_v2(&self) -> &ResidentWorkingSetExtentV3 {
+        self.workspace_extent()
+    }
+
+    fn pinned_source_projection_v2(&self) -> &CanonicalPinnedSourceProjectionV1 {
+        self.pinned_source_projection_v1()
+    }
+
+    fn seal_data_population_workspace_plan_v2(
+        &self,
+        native_facts: SealedNativeCudaDataPopulationPreflightFactsV1,
+        max_ordered_index_count: usize,
+        max_adaptive_row_count: usize,
+        gene_plan: PopulationGeneStorePlanV1,
+        metrics_plan: PopulationMetricsOnlyPlanV1,
+    ) -> Result<SealedDataPopulationGpuWorkspacePlanV1, GpuOnlyFeatureMaterializationErrorV3> {
+        self.seal_data_population_workspace_plan_v1(
+            native_facts,
+            max_ordered_index_count,
+            max_adaptive_row_count,
+            gene_plan,
+            metrics_plan,
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidentPopulationAutoSizingErrorCodeV2 {
@@ -151,6 +233,49 @@ fn resolve_adaptive_stage_extent_v2(
         max_adaptive_row_count: evaluation_rows,
         reason: ADAPTIVE_RESOLUTION_RESIDENT_EXACT_V1,
     })
+}
+
+/// Capacity is bounded by the authorized selection, not the resident parent or
+/// the shorter Stage1 recipe. CPCV uses the same capped selection tail as the
+/// CPU gate; its train/test index lists are subsets of that tail. An admitted
+/// adaptive capacity does not waive the explicit tail cap on any actual view.
+fn selection_validation_capacities_v2(
+    parent_rows: u64,
+    selection: std::ops::Range<u64>,
+    stage1: std::ops::Range<u64>,
+    adaptive_requested: bool,
+    cpcv_enabled: bool,
+    cpcv_max_rows: u64,
+) -> Result<(u64, u64), ResidentPopulationAutoSizingErrorV2> {
+    if selection.start >= selection.end
+        || selection.end > parent_rows
+        || stage1.start >= stage1.end
+        || stage1.start < selection.start
+        || stage1.end > selection.end
+    {
+        return Err(ResidentPopulationAutoSizingErrorV2::new(
+            ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
+            "resident Stage1 must lie inside the nonempty authorized selection",
+        ));
+    }
+    let selection_rows = selection.end - selection.start;
+    let ordered = if cpcv_enabled {
+        if cpcv_max_rows > 0 {
+            selection_rows.min(cpcv_max_rows)
+        } else {
+            selection_rows
+        }
+    } else {
+        0
+    };
+    let adaptive = if adaptive_requested
+        && selection_rows >= ResidentAdaptiveBaseRequestV1::MIN_VIEW_ROWS_V1 as u64
+    {
+        selection_rows
+    } else {
+        0
+    };
+    Ok((ordered, adaptive))
 }
 
 fn build_resident_adaptive_stage1_request_v2(
@@ -300,6 +425,10 @@ pub struct ResidentPopulationAutoSizingRequestV2 {
     stage1_role: String,
     stage1_row_start: usize,
     stage1_row_end: usize,
+    selection_row_start: usize,
+    selection_row_end: usize,
+    validation_cpcv_enabled: bool,
+    validation_cpcv_max_rows: usize,
     max_ordered_index_count: usize,
     max_adaptive_row_count: usize,
     migration_enabled_for_run: bool,
@@ -324,9 +453,11 @@ impl ResidentPopulationAutoSizingRequestV2 {
     /// may choose only the already-validated `DiscoveryConfig`; they cannot
     /// invent the Stage1 range, month capacity, migration state or adaptive
     /// stop policy carried into the native stage plan.
-    pub fn from_discovery_config_v2(
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn from_discovery_config_v2(
         config: &crate::DiscoveryConfig,
         resident_parent_rows: usize,
+        screening_scope: ResidentFeatureScreeningScopeV2,
         financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
     ) -> Result<Self, ResidentPopulationAutoSizingErrorV2> {
         if resident_parent_rows == 0 {
@@ -336,15 +467,40 @@ impl ResidentPopulationAutoSizingRequestV2 {
             ));
         }
         let stage1_pct = config.runtime_overrides.resolved_funnel_stage1_pct();
-        let stage1_len =
-            ((resident_parent_rows as f64 * stage1_pct) as usize).min(resident_parent_rows);
-        let (stage1_row_start, stage1_row_end) = match config.runtime_overrides.stage1_window {
-            crate::discovery::Stage1Window::MostRecent => (
-                resident_parent_rows.saturating_sub(stage1_len),
-                resident_parent_rows,
-            ),
-            crate::discovery::Stage1Window::Earliest => (0, stage1_len),
+        let stage1_scope = screening_scope
+            .resolve_stage1_v2(stage1_pct, config.runtime_overrides.stage1_window)
+            .map_err(|message| {
+                ResidentPopulationAutoSizingErrorV2::new(
+                    ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
+                    message,
+                )
+            })?;
+        let checked_scope_row = |value: u64, label: &'static str| {
+            usize::try_from(value).map_err(|_| {
+                ResidentPopulationAutoSizingErrorV2::new(
+                    ResidentPopulationAutoSizingErrorCodeV2::ArithmeticOverflow,
+                    format!("resident screening {label} does not fit this process"),
+                )
+            })
         };
+        let scope_parent_rows =
+            checked_scope_row(screening_scope.parent_row_count(), "parent rows")?;
+        if scope_parent_rows != resident_parent_rows {
+            return Err(ResidentPopulationAutoSizingErrorV2::new(
+                ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
+                "resident screening scope is detached from the compact resident parent",
+            ));
+        }
+        let stage1_row_start =
+            checked_scope_row(stage1_scope.stage1_row_start(), "Stage1 row start")?;
+        let stage1_row_end = checked_scope_row(stage1_scope.stage1_row_end(), "Stage1 row end")?;
+        let stage1_len = stage1_row_end - stage1_row_start;
+        let selection = screening_scope.selection_range_v3().map_err(|message| {
+            ResidentPopulationAutoSizingErrorV2::new(
+                ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
+                message,
+            )
+        })?;
         validate_canonical_trendbar_financial_contract_against_config_v2(
             config,
             financial_contract,
@@ -367,6 +523,15 @@ impl ResidentPopulationAutoSizingRequestV2 {
             stage1_len,
             adaptive_runtime.tail_max_bars,
         )?;
+        let (max_ordered_index_count, max_adaptive_row_count) = selection_validation_capacities_v2(
+            checked_u64(resident_parent_rows, "parent rows")?,
+            checked_u64(selection.start, "selection start")?
+                ..checked_u64(selection.end, "selection end")?,
+            stage1_scope.stage1_row_start()..stage1_scope.stage1_row_end(),
+            adaptive_resolution.requested,
+            config.enable_cpcv,
+            checked_u64(config.cpcv_max_rows, "CPCV row cap")?,
+        )?;
         let resident_adaptive_request_identity_sha256 = if adaptive_resolution.effective {
             let (_, request) = build_resident_adaptive_stage1_request_v2(
                 resident_parent_rows,
@@ -388,8 +553,15 @@ impl ResidentPopulationAutoSizingRequestV2 {
             stage1_role: RESIDENT_SELECTION_STAGE1_ROLE_V2.to_owned(),
             stage1_row_start,
             stage1_row_end,
-            max_ordered_index_count: 0,
-            max_adaptive_row_count: adaptive_resolution.max_adaptive_row_count,
+            selection_row_start: selection.start,
+            selection_row_end: selection.end,
+            validation_cpcv_enabled: config.enable_cpcv,
+            validation_cpcv_max_rows: config.cpcv_max_rows,
+            max_ordered_index_count: checked_scope_row(
+                max_ordered_index_count,
+                "ordered capacity",
+            )?,
+            max_adaptive_row_count: checked_scope_row(max_adaptive_row_count, "adaptive capacity")?,
             migration_enabled_for_run: crate::genetic::migration_enabled(),
             adaptive_stops_requested_for_run: adaptive_resolution.requested,
             adaptive_base_effective_for_stage1: adaptive_resolution.effective,
@@ -410,6 +582,7 @@ impl ResidentPopulationAutoSizingRequestV2 {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn validate_canonical_trendbar_financial_contract_against_config_v2(
     config: &crate::DiscoveryConfig,
     contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
@@ -444,6 +617,7 @@ fn validate_canonical_trendbar_financial_contract_against_config_v2(
 /// contract without consulting symbol metadata, a typical price, or the
 /// ambient installed-contract slot. The result is intended to be carried by
 /// the prepared V5 native input and consumed unchanged by Generation 0.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn evaluation_config_from_canonical_trendbar_contract_v2(
     config: &crate::DiscoveryConfig,
     contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
@@ -452,6 +626,12 @@ pub(crate) fn evaluation_config_from_canonical_trendbar_contract_v2(
     let mut evaluation = crate::genetic::EvaluationConfig::default();
     evaluation.symbol = contract.symbol().to_owned();
     evaluation.account_currency = contract.account_currency().to_owned();
+    evaluation.initial_equity = config.initial_balance;
+    evaluation.kill_zones_enabled = config.kill_zones_enabled;
+    evaluation.session_spread_pips = None; // The explicit contract owns the scalar cost policy.
+    evaluation.risk_per_trade_min = config.risk_per_trade_min;
+    evaluation.risk_per_trade_max = config.risk_per_trade_max;
+    evaluation.high_quality_confidence = config.high_quality_confidence;
     evaluation.pip_value = contract.pip_size();
     evaluation.pip_value_per_lot = contract.pip_value_per_lot();
     evaluation.spread_pips = contract.screening_spread_and_slippage_round_trip_pips();
@@ -460,6 +640,14 @@ pub(crate) fn evaluation_config_from_canonical_trendbar_contract_v2(
     evaluation.swap_short_pips_per_day = contract.swap_short_pips_per_day();
     evaluation.pnl_conversion_fee_rate = contract.pnl_conversion_fee_rate();
     evaluation.growth_objective = matches!(config.mode, crate::discovery::DiscoveryMode::Risky);
+    evaluation.growth_goal =
+        evaluation
+            .growth_objective
+            .then_some(crate::scoring::RiskyGrowthGoal {
+                start_balance: config.risky_start_balance,
+                target_balance: config.risky_target_balance,
+                horizon_days: config.risky_horizon_days,
+            });
     Ok(evaluation)
 }
 
@@ -536,6 +724,14 @@ where
             "configured population and time/hard caps must be non-zero",
         ));
     }
+    if configured_population > hard_growth_cap {
+        return Err(ResidentPopulationAutoSizingErrorV2::new(
+            ResidentPopulationAutoSizingErrorCodeV2::InvalidInput,
+            format!(
+                "configured population {configured_population} exceeds hard growth cap {hard_growth_cap}"
+            ),
+        ));
+    }
     if workspace_fit(configured_population, 1)? != WorkspaceFitV2::Fits {
         return Err(ResidentPopulationAutoSizingErrorV2::new(
             ResidentPopulationAutoSizingErrorCodeV2::ConfiguredGeneNoRoom,
@@ -543,8 +739,14 @@ where
         ));
     }
 
-    let automatic_upper = effective_time_cap.min(hard_growth_cap);
-    let memory_one_launch_population_cap = highest_fitting_v2(1, automatic_upper, |candidate| {
+    // Total search breadth and one-launch breadth are different quantities.
+    // The unsplittable gene store plus one scenario determines how large the
+    // whole population may be.  The timeframe-derived time cap applies only to
+    // each scenario chunk, never to the total search population.
+    let growth_cap = highest_fitting_v2(configured_population, hard_growth_cap, |candidate| {
+        workspace_fit(candidate, 1)
+    })?;
+    let memory_one_launch_population_cap = highest_fitting_v2(1, hard_growth_cap, |candidate| {
         workspace_fit(candidate, candidate)
     })?;
     if memory_one_launch_population_cap == 0 {
@@ -553,13 +755,12 @@ where
             "the admitted Data workspace leaves no room for one strict metrics-only scenario",
         ));
     }
-    let growth_cap = memory_one_launch_population_cap.min(automatic_upper);
     let resolved_population = if population_auto {
-        configured_population.max(growth_cap)
+        growth_cap
     } else {
         configured_population
     };
-    let scenario_upper = resolved_population.min(automatic_upper).max(1);
+    let scenario_upper = resolved_population.min(effective_time_cap);
     let max_concurrent_scenario_count = highest_fitting_v2(1, scenario_upper, |scenarios| {
         workspace_fit(resolved_population, scenarios)
     })?;
@@ -592,6 +793,10 @@ pub struct ResidentPopulationAutoSizingReceiptV2 {
     stage1_role: String,
     stage1_row_start: u64,
     stage1_row_end: u64,
+    selection_row_start: u64,
+    selection_row_end: u64,
+    validation_cpcv_enabled: bool,
+    validation_cpcv_max_rows: u64,
     migration_enabled_for_run: bool,
     adaptive_stops_requested_for_run: bool,
     adaptive_base_effective_for_stage1: bool,
@@ -865,9 +1070,22 @@ impl ResidentPopulationAutoSizingReceiptV2 {
         Option<(PopulationEvaluationViewV1, ResidentAdaptiveBaseRequestV1)>,
         ResidentPopulationAutoSizingErrorV2,
     > {
+        let expected_capacities = selection_validation_capacities_v2(
+            self.resident_parent_rows,
+            self.selection_row_start..self.selection_row_end,
+            self.stage1_row_start..self.stage1_row_end,
+            self.adaptive_stops_requested_for_run,
+            self.validation_cpcv_enabled,
+            self.validation_cpcv_max_rows,
+        )?;
+        if (self.max_ordered_index_count, self.max_adaptive_row_count) != expected_capacities {
+            return Err(ResidentPopulationAutoSizingErrorV2::new(
+                ResidentPopulationAutoSizingErrorCodeV2::AuthorityMismatch,
+                "resident validation capacity drifted from the sealed selection policy",
+            ));
+        }
         if !self.adaptive_base_effective_for_stage1 {
-            let valid_fixed = self.max_adaptive_row_count == 0
-                && self.resident_adaptive_request_identity_sha256 == [0; 32]
+            let valid_fixed = self.resident_adaptive_request_identity_sha256 == [0; 32]
                 && self.resident_adaptive_semantic_v1.is_empty()
                 && self.stop_target_log_operation_schedule_v3.is_empty()
                 && ((!self.adaptive_stops_requested_for_run
@@ -891,7 +1109,7 @@ impl ResidentPopulationAutoSizingReceiptV2 {
             || self.resident_adaptive_semantic_v1 != RESIDENT_ADAPTIVE_BASE_SEMANTIC_V1
             || self.stop_target_log_operation_schedule_v3
                 != crate::stop_target::STOP_TARGET_LOG_OPERATION_SCHEDULE_V3
-            || self.max_adaptive_row_count != self.evaluation_rows
+            || self.max_adaptive_row_count < self.evaluation_rows
             || self.evaluation_rows < ResidentAdaptiveBaseRequestV1::MIN_VIEW_ROWS_V1 as u64
             || self.resident_adaptive_request_identity_sha256 == [0; 32]
         {
@@ -1030,6 +1248,8 @@ impl ResidentPopulationAutoSizingReceiptV2 {
     /// native/workspace validator (and the later 2A2 binder).
     pub(crate) fn validate_self_v2(&self) -> Result<(), ResidentPopulationAutoSizingErrorV2> {
         let computed_identity = self.computed_identity_sha256()?;
+        // Validate selection/capacity policy before using its sizes in admission.
+        self.resident_adaptive_view_and_request_v2()?;
         let to_usize = |value: u64, field: &'static str| {
             usize::try_from(value).map_err(|_| {
                 ResidentPopulationAutoSizingErrorV2::new(
@@ -1105,8 +1325,6 @@ impl ResidentPopulationAutoSizingReceiptV2 {
             "auto_disabled"
         } else if expected_resolution.resolved_population > configured_population {
             "resident_cuda_auto_grew"
-        } else if configured_population > expected_resolution.growth_cap {
-            "resident_cuda_configured_above_growth_cap_no_shrink"
         } else {
             "resident_cuda_configured_at_growth_cap"
         };
@@ -1130,6 +1348,7 @@ impl ResidentPopulationAutoSizingReceiptV2 {
             && self.configured_population > 0
             && self.resolved_population >= self.configured_population
             && resolved_population == expected_resolution.resolved_population
+            && resolved_population <= hard_growth_cap
             && self.resident_parent_rows > 0
             && self.feature_count > 0
             && self.evaluation_rows > 0
@@ -1157,7 +1376,11 @@ impl ResidentPopulationAutoSizingReceiptV2 {
             && (1..=RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2).contains(&hard_growth_cap)
             && memory_population_cap == expected_resolution.memory_one_launch_population_cap
             && growth_cap == expected_resolution.growth_cap
+            && growth_cap >= configured_population
+            && growth_cap <= hard_growth_cap
+            && memory_population_cap <= growth_cap
             && scenario_count == expected_resolution.max_concurrent_scenario_count
+            && scenario_count <= resolved_population
             && self.data_peak_device_bytes > 0
             && self.data_steady_device_bytes > 0
             && self.data_peak_device_bytes >= self.data_steady_device_bytes
@@ -1170,8 +1393,7 @@ impl ResidentPopulationAutoSizingReceiptV2 {
             && self.allocator_context_reserve_policy == DATA_POPULATION_ALLOCATOR_RESERVE_POLICY_V1
             && expected_required_including <= self.pre_materialization_free_bytes_snapshot
             && self.resolution_reason == expected_resolution_reason
-            && canonical_hashes
-            && self.resident_adaptive_view_and_request_v2().is_ok();
+            && canonical_hashes;
         if !valid {
             return Err(ResidentPopulationAutoSizingErrorV2::new(
                 ResidentPopulationAutoSizingErrorCodeV2::AuthorityMismatch,
@@ -1350,8 +1572,8 @@ fn map_native_plan_error_v2(
     ResidentPopulationAutoSizingErrorV2::new(code, format!("{context}: {error}"))
 }
 
-fn workspace_plan_attempt_v2(
-    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
+fn workspace_plan_attempt_v2<S: ResidentDataWorkspacePlanSourceV2 + ?Sized>(
+    prepared: &S,
     native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
     request: &ResidentPopulationAutoSizingRequestV2,
     term_cap: usize,
@@ -1379,7 +1601,7 @@ fn workspace_plan_attempt_v2(
     )
     .map_err(|error| map_native_plan_error_v2("resident metrics-only plan", error))?;
     prepared
-        .seal_data_population_workspace_plan_v1(
+        .seal_data_population_workspace_plan_v2(
             *native_facts,
             request.max_ordered_index_count,
             request.max_adaptive_row_count,
@@ -1410,8 +1632,8 @@ fn workspace_plan_attempt_v2(
         })
 }
 
-fn workspace_fit_for_extents_v2(
-    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
+fn workspace_fit_for_extents_v2<S: ResidentDataWorkspacePlanSourceV2 + ?Sized>(
+    prepared: &S,
     native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
     request: &ResidentPopulationAutoSizingRequestV2,
     term_cap: usize,
@@ -1453,8 +1675,10 @@ pub fn seal_resident_population_auto_sizing_receipt_v2(
     )
 }
 
-fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
-    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
+fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2<
+    S: ResidentDataWorkspacePlanSourceV2 + ?Sized,
+>(
+    prepared: &S,
     native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
     request: ResidentPopulationAutoSizingRequestV2,
     external_hard_population_cap: usize,
@@ -1466,7 +1690,7 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
     ResidentPopulationAutoSizingErrorV2,
 > {
     let hard_growth_cap = checked_effective_hard_growth_cap_v2(external_hard_population_cap)?;
-    let extent = prepared.workspace_extent();
+    let extent = prepared.workspace_extent_v2();
     let parent_rows = usize::try_from(extent.row_count()).map_err(|_| {
         ResidentPopulationAutoSizingErrorV2::new(
             ResidentPopulationAutoSizingErrorCodeV2::ArithmeticOverflow,
@@ -1485,6 +1709,10 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
         || request.stage1_role.trim().is_empty()
         || request.stage1_row_end <= request.stage1_row_start
         || request.stage1_row_end > parent_rows
+        || request.selection_row_start >= request.selection_row_end
+        || request.selection_row_end > parent_rows
+        || request.stage1_row_start < request.selection_row_start
+        || request.stage1_row_end > request.selection_row_end
         || request.max_ordered_index_count > parent_rows
         || request.max_adaptive_row_count > parent_rows
         || !(request.adaptive_pip_size.is_finite() && request.adaptive_pip_size > 0.0)
@@ -1502,7 +1730,7 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
             "resident population-auto request has an empty or out-of-parent extent",
         ));
     }
-    if prepared.pinned_source_projection_v1().identity_sha256()
+    if prepared.pinned_source_projection_v2().identity_sha256()
         != request.financial_source_projection_identity_sha256
     {
         return Err(ResidentPopulationAutoSizingErrorV2::new(
@@ -1522,6 +1750,16 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
         evaluation_rows,
         request.adaptive_tail_max_bars,
     )?;
+    let expected_capacities = selection_validation_capacities_v2(
+        checked_u64(parent_rows, "parent rows")?,
+        checked_u64(request.selection_row_start, "selection start")?
+            ..checked_u64(request.selection_row_end, "selection end")?,
+        checked_u64(request.stage1_row_start, "Stage1 start")?
+            ..checked_u64(request.stage1_row_end, "Stage1 end")?,
+        request.adaptive_stops_requested_for_run,
+        request.validation_cpcv_enabled,
+        checked_u64(request.validation_cpcv_max_rows, "CPCV row cap")?,
+    )?;
     let adaptive_request_identity = if adaptive_resolution.effective {
         let (_, adaptive_request) = build_resident_adaptive_stage1_request_v2(
             parent_rows,
@@ -1537,7 +1775,11 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
     };
     if request.adaptive_base_effective_for_stage1 != adaptive_resolution.effective
         || request.adaptive_resolution_reason != adaptive_resolution.reason
-        || request.max_adaptive_row_count != adaptive_resolution.max_adaptive_row_count
+        || (
+            checked_u64(request.max_ordered_index_count, "ordered capacity")?,
+            checked_u64(request.max_adaptive_row_count, "adaptive capacity")?,
+        ) != expected_capacities
+        || adaptive_resolution.max_adaptive_row_count > request.max_adaptive_row_count
         || request.resident_adaptive_request_identity_sha256 != adaptive_request_identity
     {
         return Err(ResidentPopulationAutoSizingErrorV2::new(
@@ -1596,8 +1838,6 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
         "auto_disabled"
     } else if resolution.resolved_population > request.configured_population {
         "resident_cuda_auto_grew"
-    } else if request.configured_population > resolution.growth_cap {
-        "resident_cuda_configured_above_growth_cap_no_shrink"
     } else {
         "resident_cuda_configured_at_growth_cap"
     };
@@ -1618,6 +1858,10 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
         stage1_role: request.stage1_role,
         stage1_row_start: checked_u64(request.stage1_row_start, "stage1 row start")?,
         stage1_row_end: checked_u64(request.stage1_row_end, "stage1 row end")?,
+        selection_row_start: checked_u64(request.selection_row_start, "selection row start")?,
+        selection_row_end: checked_u64(request.selection_row_end, "selection row end")?,
+        validation_cpcv_enabled: request.validation_cpcv_enabled,
+        validation_cpcv_max_rows: checked_u64(request.validation_cpcv_max_rows, "CPCV row cap")?,
         migration_enabled_for_run: false,
         adaptive_stops_requested_for_run: adaptive_resolution.requested,
         adaptive_base_effective_for_stage1: adaptive_resolution.effective,
@@ -1695,59 +1939,14 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
     Ok((receipt, workspace_plan))
 }
 
-/// Search-owned canonical-trendbar research entrypoint. The validated
-/// financial contract is explicit because sizing precedes installation of the
-/// run-scoped research execution guard. General broker/TUI Discovery has no
-/// sealed scalar value receipt yet and must not call this route.
-pub fn seal_resident_population_auto_for_canonical_trendbar_research_v2(
-    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
+#[cfg(any(test, target_os = "linux"))]
+fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2<
+    S: ResidentDataWorkspacePlanSourceV2 + ?Sized,
+>(
+    prepared: &S,
     native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
     config: &crate::DiscoveryConfig,
-    financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
-) -> Result<
-    (
-        ResidentPopulationAutoSizingReceiptV2,
-        SealedDataPopulationGpuWorkspacePlanV1,
-    ),
-    ResidentPopulationAutoSizingErrorV2,
-> {
-    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
-        prepared,
-        native_facts,
-        config,
-        financial_contract,
-        RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2,
-        false,
-    )
-}
-
-pub(crate) fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_v2(
-    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
-    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
-    config: &crate::DiscoveryConfig,
-    financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
-    external_hard_population_cap: usize,
-) -> Result<
-    (
-        ResidentPopulationAutoSizingReceiptV2,
-        SealedDataPopulationGpuWorkspacePlanV1,
-    ),
-    ResidentPopulationAutoSizingErrorV2,
-> {
-    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
-        prepared,
-        native_facts,
-        config,
-        financial_contract,
-        external_hard_population_cap,
-        true,
-    )
-}
-
-fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
-    prepared: &PreparedGpuOnlyFeatureMaterializationV3,
-    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
-    config: &crate::DiscoveryConfig,
+    screening_scope: ResidentFeatureScreeningScopeV2,
     financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
     external_hard_population_cap: usize,
     enforce_configured_population_cap: bool,
@@ -1765,8 +1964,8 @@ fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_i
             external_hard_population_cap,
         )?;
     }
-    let resident_parent_rows =
-        usize::try_from(prepared.workspace_extent().row_count()).map_err(|_| {
+    let resident_parent_rows = usize::try_from(prepared.workspace_extent_v2().row_count())
+        .map_err(|_| {
             ResidentPopulationAutoSizingErrorV2::new(
                 ResidentPopulationAutoSizingErrorCodeV2::ArithmeticOverflow,
                 "resident parent rows do not fit this process",
@@ -1775,6 +1974,7 @@ fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_i
     let request = ResidentPopulationAutoSizingRequestV2::from_discovery_config_v2(
         config,
         resident_parent_rows,
+        screening_scope,
         financial_contract,
     )?;
     seal_resident_population_auto_sizing_receipt_with_hard_cap_v2(
@@ -1785,9 +1985,121 @@ fn seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_i
     )
 }
 
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn seal_resident_population_auto_for_compact_canonical_trendbar_research_with_hard_cap_v2(
+    prepared: &PreparedCompactSelectedStoreV2,
+    native_facts: &SealedNativeCudaDataPopulationPreflightFactsV1,
+    config: &crate::DiscoveryConfig,
+    screening_scope: ResidentFeatureScreeningScopeV2,
+    financial_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    external_hard_population_cap: usize,
+) -> Result<
+    (
+        ResidentPopulationAutoSizingReceiptV2,
+        SealedDataPopulationGpuWorkspacePlanV1,
+    ),
+    ResidentPopulationAutoSizingErrorV2,
+> {
+    seal_resident_population_auto_for_canonical_trendbar_research_with_hard_cap_impl_v2(
+        prepared,
+        native_facts,
+        config,
+        screening_scope,
+        financial_contract,
+        external_hard_population_cap,
+        true,
+    )
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_resident_evaluation_preserves_the_explicit_account_and_risk_policy() {
+        use crate::canonical_trendbar_research::{
+            CanonicalTrendbarResearchCostAssumptionsV2,
+            CanonicalTrendbarResearchExecutionContractV3,
+        };
+        let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let anchor = features.provenance().bindings()[0]
+            .dataset_identity()
+            .clone();
+        let receipt = crate::data_selection::CanonicalSearchInputReceiptV2::from_feature_frame(
+            &anchor, &features,
+        )
+        .unwrap();
+        let contract = CanonicalTrendbarResearchExecutionContractV3::new(
+            receipt,
+            CanonicalTrendbarResearchCostAssumptionsV2 {
+                symbol: "EURUSD",
+                account_currency: "USD",
+                assumption_source_id: "neoethos.test.resident-account-policy.v1",
+                assumption_source_sha256: &"c".repeat(64),
+                pip_size: 0.0001,
+                pip_value_per_lot: 10.0,
+                full_spread_pips_assumption: 1.2,
+                slippage_pips_per_fill_assumption: 0.1,
+                commission_account_per_lot_per_fill_assumption: 3.5,
+                swap_long_pips_per_day: -0.2,
+                swap_short_pips_per_day: -0.1,
+                pnl_conversion_fee_rate: 0.0,
+            },
+        )
+        .unwrap();
+        let mut config = crate::DiscoveryConfig {
+            evaluation_symbol: "EURUSD".to_owned(),
+            evaluation_account_currency: "USD".to_owned(),
+            evaluation_spread_pips: contract.screening_spread_and_slippage_round_trip_pips(),
+            evaluation_commission_per_trade: contract.round_trip_commission_account_per_lot(),
+            swap_long_pips_per_day: contract.swap_long_pips_per_day(),
+            swap_short_pips_per_day: contract.swap_short_pips_per_day(),
+            initial_balance: 12_345.25,
+            kill_zones_enabled: true,
+            session_spread_pips: None,
+            risk_per_trade_min: 0.0125,
+            risk_per_trade_max: 0.075,
+            high_quality_confidence: 0.8,
+            mode: crate::discovery::DiscoveryMode::Risky,
+            risky_start_balance: 100.0,
+            risky_target_balance: 50_000.0,
+            risky_horizon_days: 180.0,
+            ..Default::default()
+        };
+        let evaluation =
+            evaluation_config_from_canonical_trendbar_contract_v2(&config, &contract).unwrap();
+        for (actual, expected) in [
+            (evaluation.initial_equity, config.initial_balance),
+            (evaluation.risk_per_trade_min, config.risk_per_trade_min),
+            (evaluation.risk_per_trade_max, config.risk_per_trade_max),
+            (
+                evaluation.high_quality_confidence,
+                config.high_quality_confidence,
+            ),
+            (evaluation.pip_value_per_lot, contract.pip_value_per_lot()),
+            (
+                evaluation.spread_pips,
+                contract.screening_spread_and_slippage_round_trip_pips(),
+            ),
+        ] {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert!(evaluation.kill_zones_enabled);
+        assert_eq!(evaluation.session_spread_pips, None);
+        assert_eq!(
+            evaluation.growth_goal,
+            Some(crate::scoring::RiskyGrowthGoal {
+                start_balance: 100.0,
+                target_balance: 50_000.0,
+                horizon_days: 180.0,
+            })
+        );
+        config.session_spread_pips = Some([1.0; 3]);
+        assert!(evaluation_config_from_canonical_trendbar_contract_v2(&config, &contract).is_err());
+        config.session_spread_pips = None;
+        config.evaluation_account_currency = "GBP".to_owned();
+        assert!(evaluation_config_from_canonical_trendbar_contract_v2(&config, &contract).is_err());
+    }
 
     #[test]
     fn unknown_async_cuda_outcomes_fail_closed_as_workspace_plan_errors() {
@@ -1824,7 +2136,9 @@ mod tests {
         receipt.required_device_bytes_including_reserve = including;
     }
 
-    fn self_validating_receipt_fixture_v2() -> ResidentPopulationAutoSizingReceiptV2 {
+    fn self_validating_receipt_fixture_with_v2(
+        prepare: impl FnOnce(&mut ResidentPopulationAutoSizingReceiptV2),
+    ) -> ResidentPopulationAutoSizingReceiptV2 {
         let mut receipt = ResidentPopulationAutoSizingReceiptV2 {
             schema_version: RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V2,
             population_auto: false,
@@ -1839,6 +2153,10 @@ mod tests {
             stage1_role: "selection_stage1".to_owned(),
             stage1_row_start: 500,
             stage1_row_end: 1_000,
+            selection_row_start: 0,
+            selection_row_end: 1_000,
+            validation_cpcv_enabled: false,
+            validation_cpcv_max_rows: 0,
             migration_enabled_for_run: false,
             adaptive_stops_requested_for_run: false,
             adaptive_base_effective_for_stage1: false,
@@ -1887,6 +2205,7 @@ mod tests {
             data_extent_identity_sha256: "a".repeat(64),
             identity_sha256: String::new(),
         };
+        prepare(&mut receipt);
         let (raw_time_cap, effective_time_cap, _) =
             crate::gpu_native::prototype_b_population_eval::checked_candidates_for_target_launch_v1(
                 receipt.evaluation_rows as usize,
@@ -1894,7 +2213,6 @@ mod tests {
             .unwrap();
         receipt.raw_time_cap = raw_time_cap;
         receipt.effective_time_cap = effective_time_cap;
-        refresh_fixture_workspace_bytes_v2(&mut receipt);
         let resolution = resolve_population_auto_extents_v2(
             receipt.population_auto,
             receipt.configured_population as usize,
@@ -1918,11 +2236,141 @@ mod tests {
             },
         )
         .unwrap();
+        receipt.resolved_population = resolution.resolved_population as u64;
+        receipt.max_concurrent_scenario_count = resolution.max_concurrent_scenario_count as u64;
         receipt.memory_one_launch_population_cap =
             resolution.memory_one_launch_population_cap as u64;
         receipt.growth_cap = resolution.growth_cap as u64;
+        receipt.resolution_reason = if !receipt.population_auto {
+            "auto_disabled"
+        } else if resolution.resolved_population > receipt.configured_population as usize {
+            "resident_cuda_auto_grew"
+        } else {
+            "resident_cuda_configured_at_growth_cap"
+        }
+        .to_owned();
+        refresh_fixture_workspace_bytes_v2(&mut receipt);
         receipt.identity_sha256 = receipt.computed_identity_sha256().unwrap();
         receipt
+    }
+
+    #[cfg(all(test, feature = "gpu-cuda"))]
+    pub(crate) fn canonical_result_fixture_receipt_v2(
+        financial_authority_identity_sha256: String,
+        financial_input_receipt_sha256: String,
+        financial_source_projection_identity_sha256: [u8; 32],
+        selected_device_ordinal: u32,
+        resident_parent_rows: u64,
+        stage1_row_start: u64,
+        stage1_row_end: u64,
+        desired_scenario_count: usize,
+    ) -> ResidentPopulationAutoSizingReceiptV2 {
+        self_validating_receipt_fixture_with_v2(|receipt| {
+            receipt.financial_authority_identity_sha256 = financial_authority_identity_sha256;
+            receipt.financial_input_receipt_sha256 = financial_input_receipt_sha256;
+            receipt.financial_source_projection_identity_sha256 =
+                financial_source_projection_identity_sha256;
+            receipt.selected_device_ordinal = selected_device_ordinal;
+            receipt.resident_parent_rows = resident_parent_rows;
+            receipt.stage1_row_start = stage1_row_start;
+            receipt.stage1_row_end = stage1_row_end;
+            // Legacy Gen0 test-only full-parent evaluation is not a retained
+            // selection authority; production derives its range from the scope.
+            receipt.selection_row_start = stage1_row_start;
+            receipt.selection_row_end = stage1_row_end;
+            receipt.evaluation_rows = stage1_row_end - stage1_row_start;
+            receipt.pre_materialization_free_bytes_snapshot = receipt
+                .internal_workspace_bytes_v2(
+                    receipt.configured_population as usize,
+                    desired_scenario_count,
+                    receipt.term_cap as usize,
+                    receipt.month_capacity as u32,
+                )
+                .unwrap()
+                .3;
+        })
+    }
+
+    #[cfg(all(test, feature = "gpu-cuda", target_os = "linux"))]
+    pub(crate) fn canonical_result_forge_feature_count_without_rehash_v2_for_test(
+        mut receipt: ResidentPopulationAutoSizingReceiptV2,
+    ) -> ResidentPopulationAutoSizingReceiptV2 {
+        receipt.feature_count = receipt.feature_count.checked_add(1).unwrap();
+        receipt
+    }
+
+    #[cfg(all(test, feature = "gpu-cuda"))]
+    pub(crate) fn canonical_result_maximum_json_receipt_v2_for_test(
+        maximum_general_string: &str,
+    ) -> ResidentPopulationAutoSizingReceiptV2 {
+        let mut receipt = self_validating_receipt_fixture_v2();
+        receipt.schema_version = u16::MAX;
+        receipt.population_auto = false;
+        receipt.configured_population = u64::MAX;
+        receipt.resolved_population = u64::MAX;
+        receipt.resident_parent_rows = u64::MAX;
+        receipt.feature_count = u64::MAX;
+        receipt.evaluation_rows = u64::MAX;
+        receipt.month_capacity = u64::MAX;
+        receipt.requested_max_indicators = u64::MAX;
+        receipt.term_cap = u64::MAX;
+        receipt.stage1_role = maximum_general_string.to_owned();
+        receipt.stage1_row_start = u64::MAX;
+        receipt.stage1_row_end = u64::MAX;
+        receipt.selection_row_start = u64::MAX;
+        receipt.selection_row_end = u64::MAX;
+        receipt.validation_cpcv_enabled = false;
+        receipt.validation_cpcv_max_rows = u64::MAX;
+        receipt.migration_enabled_for_run = false;
+        receipt.adaptive_stops_requested_for_run = false;
+        receipt.adaptive_base_effective_for_stage1 = false;
+        receipt.adaptive_resolution_reason = maximum_general_string.to_owned();
+        receipt.resident_adaptive_semantic_v1 = maximum_general_string.to_owned();
+        receipt.stop_target_log_operation_schedule_v3 = maximum_general_string.to_owned();
+        receipt.resident_adaptive_request_identity_sha256 = [u8::MAX; 32];
+        receipt.adaptive_pip_size_bits = u64::MAX;
+        receipt.pip_value_per_lot_bits = u64::MAX;
+        receipt.financial_authority_identity_sha256 = maximum_general_string.to_owned();
+        receipt.financial_input_receipt_sha256 = maximum_general_string.to_owned();
+        receipt.financial_source_projection_identity_sha256 = [u8::MAX; 32];
+        receipt.evaluation_symbol = maximum_general_string.to_owned();
+        receipt.evaluation_account_currency = maximum_general_string.to_owned();
+        receipt.adaptive_rr_bits = u64::MAX;
+        receipt.adaptive_tail_max_bars = u64::MAX;
+        receipt.adaptive_tail_step = u64::MAX;
+        receipt.max_ordered_index_count = u64::MAX;
+        receipt.max_adaptive_row_count = u64::MAX;
+        receipt.selected_device_ordinal = u32::MAX;
+        receipt.pre_materialization_free_bytes_snapshot = u64::MAX;
+        receipt.allocator_context_reserve_bytes = u64::MAX;
+        receipt.allocator_context_reserve_policy = maximum_general_string.to_owned();
+        receipt.admission_identity_sha256 = maximum_general_string.to_owned();
+        receipt.native_preflight_facts_identity_sha256 = maximum_general_string.to_owned();
+        receipt.cuda_build_manifest_sha256 = maximum_general_string.to_owned();
+        receipt.cuda_build_artifact_sha256 = maximum_general_string.to_owned();
+        receipt.data_peak_device_bytes = u64::MAX;
+        receipt.data_steady_device_bytes = u64::MAX;
+        receipt.gene_store_device_bytes = u64::MAX;
+        receipt.metrics_scenario_device_bytes = u64::MAX;
+        receipt.max_concurrent_scenario_count = u64::MAX;
+        receipt.bounded_host_metric_readback_bytes = u64::MAX;
+        receipt.required_device_bytes_excluding_reserve = u64::MAX;
+        receipt.required_device_bytes_including_reserve = u64::MAX;
+        receipt.raw_time_cap = u64::MAX;
+        receipt.effective_time_cap = u64::MAX;
+        receipt.hard_growth_cap = u64::MAX;
+        receipt.memory_one_launch_population_cap = u64::MAX;
+        receipt.growth_cap = u64::MAX;
+        receipt.resolution_reason = maximum_general_string.to_owned();
+        receipt.workspace_plan_identity_sha256 = maximum_general_string.to_owned();
+        receipt.population_sizing_authority_sha256 = maximum_general_string.to_owned();
+        receipt.data_extent_identity_sha256 = maximum_general_string.to_owned();
+        receipt.identity_sha256 = maximum_general_string.to_owned();
+        receipt
+    }
+
+    fn self_validating_receipt_fixture_v2() -> ResidentPopulationAutoSizingReceiptV2 {
+        self_validating_receipt_fixture_with_v2(|_| {})
     }
 
     fn recompute_fixture_identity_v2(receipt: &mut ResidentPopulationAutoSizingReceiptV2) {
@@ -1938,8 +2386,8 @@ mod tests {
         assert_eq!(receipt.metrics_scenario_device_bytes, 3_520);
         assert_eq!(receipt.required_device_bytes_excluding_reserve, 6_742);
         assert_eq!(receipt.required_device_bytes_including_reserve, 67_115_606);
-        assert_eq!(receipt.memory_one_launch_population_cap, 16_384);
-        assert_eq!(receipt.growth_cap, 16_384);
+        assert!(receipt.memory_one_launch_population_cap > 16_384);
+        assert!(receipt.growth_cap > receipt.memory_one_launch_population_cap);
         receipt
             .validate_self_v2()
             .expect("valid algebraic V2 receipt");
@@ -1976,7 +2424,7 @@ mod tests {
         macro_rules! reject_if_accepted {
             ($name:literal, |$receipt:ident| $($mutation:stmt);+ $(;)?) => {{
             let mut $receipt = self_validating_receipt_fixture_v2();
-            $($mutation;)+
+            $($mutation)+
             recompute_fixture_identity_v2(&mut $receipt);
             if $receipt.validate_self_v2().is_ok() {
                 accepted.push($name);
@@ -2002,7 +2450,7 @@ mod tests {
         reject_if_accepted!("peak below steady", |receipt| receipt.data_peak_device_bytes = receipt.data_steady_device_bytes - 1);
         reject_if_accepted!("memory and growth caps", |receipt| receipt.memory_one_launch_population_cap -= 1; receipt.growth_cap -= 1);
         reject_if_accepted!("scenario and dependent bytes", |receipt| receipt.max_concurrent_scenario_count -= 1; refresh_fixture_workspace_bytes_v2(&mut receipt));
-        reject_if_accepted!("hard cap above ceiling", |receipt| receipt.hard_growth_cap = 16_385);
+        reject_if_accepted!("hard cap above ceiling", |receipt| receipt.hard_growth_cap = RESIDENT_POPULATION_AUTO_HARD_GROWTH_CAP_V2 as u64 + 1);
         assert!(accepted.is_empty(), "self-validation accepted correlated mutations: {accepted:?}");
     }
 
@@ -2053,23 +2501,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_grows_to_the_one_launch_memory_cap() {
+    fn auto_grows_total_population_beyond_the_time_bounded_launch_chunk() {
         let resolved =
-            resolve_population_auto_extents_v2(true, 200, 16_384, 16_384, linear_fit(10_000))
+            resolve_population_auto_extents_v2(true, 200, 1_000, 8_000, linear_fit(10_000))
                 .expect("auto resolution");
-        assert_eq!(resolved.resolved_population, 5_000);
-        assert_eq!(resolved.max_concurrent_scenario_count, 5_000);
+        assert_eq!(resolved.resolved_population, 8_000);
+        assert_eq!(resolved.max_concurrent_scenario_count, 1_000);
         assert_eq!(resolved.memory_one_launch_population_cap, 5_000);
+        assert_eq!(resolved.growth_cap, 8_000);
     }
 
     #[test]
-    fn configured_population_never_shrinks_and_scenarios_split() {
+    fn configured_population_at_the_total_cap_uses_memory_bounded_scenario_chunks() {
         let resolved =
-            resolve_population_auto_extents_v2(true, 8_000, 16_384, 16_384, linear_fit(9_000))
-                .expect("no-shrink resolution");
+            resolve_population_auto_extents_v2(true, 8_000, 16_384, 8_000, linear_fit(9_000))
+                .expect("chunked resolution");
         assert_eq!(resolved.resolved_population, 8_000);
         assert_eq!(resolved.memory_one_launch_population_cap, 4_500);
         assert_eq!(resolved.max_concurrent_scenario_count, 1_000);
+        assert_eq!(resolved.growth_cap, 8_000);
     }
 
     #[test]
@@ -2079,6 +2529,7 @@ mod tests {
                 .expect("disabled-auto admission");
         assert_eq!(resolved.resolved_population, 200);
         assert_eq!(resolved.max_concurrent_scenario_count, 200);
+        assert_eq!(resolved.growth_cap, 9_999);
     }
 
     #[test]
@@ -2090,6 +2541,198 @@ mod tests {
             error.code(),
             ResidentPopulationAutoSizingErrorCodeV2::ConfiguredGeneNoRoom
         );
+    }
+
+    #[test]
+    fn configured_population_above_the_effective_hard_cap_fails_loud() {
+        let error =
+            resolve_population_auto_extents_v2(true, 8_001, 16_384, 8_000, linear_fit(20_000))
+                .expect_err("configured population above the hard cap must fail");
+        assert_eq!(
+            error.code(),
+            ResidentPopulationAutoSizingErrorCodeV2::InvalidInput
+        );
+    }
+
+    #[test]
+    fn selection_validation_capacity_uses_only_configured_selection_views() {
+        for (adaptive, cpcv, cap, expected) in [
+            (false, false, 0, (0, 0)),
+            (true, false, 250, (0, 800)),
+            (false, true, 250, (250, 0)),
+            (true, true, 250, (250, 800)),
+            (true, true, 0, (800, 800)),
+            (true, true, 5_000, (800, 800)),
+        ] {
+            assert_eq!(
+                selection_validation_capacities_v2(1_000, 100..900, 800..900, adaptive, cpcv, cap,)
+                    .unwrap(),
+                expected,
+            );
+        }
+        for (rows, expected_adaptive) in [(100, 0), (101, 101)] {
+            assert_eq!(
+                selection_validation_capacities_v2(1_000, 50..50 + rows, 50..51, true, true, 0,)
+                    .unwrap(),
+                (rows, expected_adaptive),
+            );
+        }
+    }
+
+    #[test]
+    fn selection_validation_capacity_rejects_out_of_scope_and_overflowing_storage() {
+        for (selection, stage1) in [
+            (100..100, 100..101),
+            (900..100, 100..101),
+            (100..1_001, 100..101),
+            (100..900, 99..200),
+            (100..900, 800..901),
+            (100..900, 800..800),
+        ] {
+            assert!(
+                selection_validation_capacities_v2(1_000, selection, stage1, true, true, 0)
+                    .is_err()
+            );
+        }
+        let mut receipt = self_validating_receipt_fixture_v2();
+        receipt.resident_parent_rows = u64::MAX;
+        receipt.selection_row_end = u64::MAX;
+        receipt.max_ordered_index_count = u64::MAX;
+        receipt.validation_cpcv_enabled = true;
+        assert!(receipt.internal_workspace_bytes_v2(10, 10, 5, 12).is_err());
+    }
+
+    fn adaptive_selection_fixture_v2(
+        selection: std::ops::Range<u64>,
+        stage1: std::ops::Range<u64>,
+        tail_max_bars: usize,
+    ) -> ResidentPopulationAutoSizingReceiptV2 {
+        self_validating_receipt_fixture_with_v2(|receipt| {
+            receipt.selection_row_start = selection.start;
+            receipt.selection_row_end = selection.end;
+            receipt.stage1_row_start = stage1.start;
+            receipt.stage1_row_end = stage1.end;
+            receipt.evaluation_rows = stage1.end - stage1.start;
+            receipt.validation_cpcv_enabled = true;
+            receipt.validation_cpcv_max_rows = 250;
+            receipt.adaptive_stops_requested_for_run = true;
+            receipt.adaptive_tail_max_bars = tail_max_bars as u64;
+            let resolution = resolve_adaptive_stage_extent_v2(
+                true,
+                receipt.evaluation_rows as usize,
+                tail_max_bars,
+            )
+            .unwrap();
+            receipt.adaptive_base_effective_for_stage1 = resolution.effective;
+            receipt.adaptive_resolution_reason = resolution.reason.to_owned();
+            (
+                receipt.max_ordered_index_count,
+                receipt.max_adaptive_row_count,
+            ) = selection_validation_capacities_v2(
+                receipt.resident_parent_rows,
+                selection,
+                stage1,
+                true,
+                true,
+                250,
+            )
+            .unwrap();
+            if resolution.effective {
+                let (_, request) = build_resident_adaptive_stage1_request_v2(
+                    receipt.resident_parent_rows as usize,
+                    receipt.stage1_row_start(),
+                    receipt.stage1_row_end(),
+                    receipt.adaptive_pip_size(),
+                    receipt.adaptive_tail_step(),
+                    tail_max_bars,
+                )
+                .unwrap();
+                receipt.resident_adaptive_request_identity_sha256 = request.identity_sha256();
+                receipt.resident_adaptive_semantic_v1 =
+                    RESIDENT_ADAPTIVE_BASE_SEMANTIC_V1.to_owned();
+                receipt.stop_target_log_operation_schedule_v3 =
+                    crate::stop_target::STOP_TARGET_LOG_OPERATION_SCHEDULE_V3.to_owned();
+            }
+        })
+    }
+
+    #[test]
+    fn short_stage1_keeps_fixed_recipe_and_admits_later_selection_capacity() {
+        let receipt = adaptive_selection_fixture_v2(100..900, 800..900, 100);
+        receipt.validate_self_v2().unwrap();
+        assert!(!receipt.adaptive_base_effective_for_stage1());
+        assert_eq!(
+            receipt.adaptive_resolution_reason(),
+            ADAPTIVE_RESOLUTION_FIXED_TOO_SHORT_V2
+        );
+        assert!(
+            receipt
+                .resident_adaptive_view_and_request_v2()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(receipt.max_adaptive_row_count, 800);
+        assert_eq!(receipt.max_ordered_index_count, 250);
+        assert_eq!(receipt.resident_adaptive_request_identity_sha256, [0; 32]);
+        // Allocating enough space is not permission to exceed a per-view cap.
+        assert!(
+            build_resident_adaptive_stage1_request_v2(1_000, 100, 900, 0.0001, 1, 100).is_err()
+        );
+    }
+
+    #[test]
+    fn effective_stage1_identity_is_independent_of_larger_validation_capacity() {
+        let larger = adaptive_selection_fixture_v2(100..900, 700..900, 200);
+        let smaller = adaptive_selection_fixture_v2(300..900, 700..900, 200);
+        larger.validate_self_v2().unwrap();
+        smaller.validate_self_v2().unwrap();
+        assert_eq!(larger.evaluation_rows, 200);
+        assert_eq!(larger.max_adaptive_row_count, 800);
+        assert_eq!(smaller.max_adaptive_row_count, 600);
+        assert_eq!(
+            larger
+                .resident_adaptive_view_and_request_v2()
+                .unwrap()
+                .unwrap()
+                .1
+                .identity_sha256(),
+            smaller
+                .resident_adaptive_view_and_request_v2()
+                .unwrap()
+                .unwrap()
+                .1
+                .identity_sha256(),
+        );
+        assert_ne!(larger.identity_sha256(), smaller.identity_sha256());
+        assert_eq!(
+            larger.required_device_bytes_including_reserve
+                - smaller.required_device_bytes_including_reserve,
+            (800 - 600) * 8,
+        );
+    }
+
+    #[test]
+    fn validation_scope_and_capacities_reject_correlated_rehashed_tampering() {
+        let receipt = adaptive_selection_fixture_v2(100..900, 800..900, 100);
+        for mutate in [
+            |value: &mut ResidentPopulationAutoSizingReceiptV2| value.selection_row_start = 801,
+            |value: &mut ResidentPopulationAutoSizingReceiptV2| value.selection_row_end = 899,
+            |value: &mut ResidentPopulationAutoSizingReceiptV2| value.selection_row_end = 1_001,
+            |value: &mut ResidentPopulationAutoSizingReceiptV2| value.max_adaptive_row_count = 100,
+            |value: &mut ResidentPopulationAutoSizingReceiptV2| value.max_ordered_index_count = 800,
+            |value: &mut ResidentPopulationAutoSizingReceiptV2| {
+                value.validation_cpcv_enabled = false
+            },
+            |value: &mut ResidentPopulationAutoSizingReceiptV2| {
+                value.validation_cpcv_max_rows = 251
+            },
+        ] {
+            let mut invalid = receipt.clone();
+            mutate(&mut invalid);
+            refresh_fixture_workspace_bytes_v2(&mut invalid);
+            recompute_fixture_identity_v2(&mut invalid);
+            assert!(invalid.validate_self_v2().is_err());
+        }
     }
 
     #[test]

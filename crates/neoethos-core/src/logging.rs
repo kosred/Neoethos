@@ -11,9 +11,7 @@
 // so the default retention is intentionally short. Override the dir with
 // the `LOG_DIR` environment variable.
 
-use crate::sectioned_log::{
-    CanonicalSectionedLog, SectionedRunRecord, SubsystemSection, update_section_file,
-};
+use crate::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use chrono::Utc;
 use std::fs;
 use std::path::Path;
@@ -230,23 +228,12 @@ pub fn canonical_log_path() -> PathBuf {
 
 /// Emit a subsystem checkpoint into the unified log file.
 ///
-/// Previously this wrote to a parallel `neoethos.log` JSON file via
-/// `update_section_file`. That created a *second* place operators had to
-/// hunt for clues. Now the record is formatted as a multi-line block with
-/// visual dividers and routed through tracing, so it lands in the **same**
-/// daily file as the live event stream.
-///
-/// The return type is preserved for backward compatibility with callers
-/// that ignore the result (every production caller does); we return an
-/// empty `CanonicalSectionedLog` marker.
-///
-/// For tests that need the structured JSON round-trip, call
-/// `write_subsystem_record_to_path` with an explicit path — it still
-/// writes the legacy JSON snapshot file.
+/// The record is formatted as a multi-line block and routed through tracing,
+/// so subsystem checkpoints and the live event stream share one daily file.
 pub fn write_subsystem_record(
     section: SubsystemSection,
     record: SectionedRunRecord,
-) -> anyhow::Result<CanonicalSectionedLog> {
+) -> anyhow::Result<()> {
     let block = format_section_block(section, &record);
     // The target prefix `subsystem.*` is what makes these blocks scannable
     // in the file (e.g. `grep target=subsystem.training`). tracing's
@@ -275,17 +262,7 @@ pub fn write_subsystem_record(
             tracing::info!(target: "subsystem.bindings", "{block}");
         }
     }
-    Ok(CanonicalSectionedLog::new())
-}
-
-/// Test-only escape hatch: write the legacy JSON sectioned snapshot to
-/// an explicit path. Production code path is `write_subsystem_record`.
-pub fn write_subsystem_record_to_path(
-    path: impl AsRef<Path>,
-    section: SubsystemSection,
-    record: SectionedRunRecord,
-) -> anyhow::Result<CanonicalSectionedLog> {
-    update_section_file(path, section, record)
+    Ok(())
 }
 
 /// Render a `SectionedRunRecord` as a multi-line visual block. The horizontal
@@ -435,12 +412,10 @@ fn initialize_console_and_file_tracing(verbose: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Delete `neoethos.*.log` files older than `retain_days` in `dir`.
+/// Delete only exact daily log filenames older than `retain_days`.
 ///
-/// Scoped narrowly to our own filename prefix so we never touch other files
-/// even if the operator pointed `LOG_DIR` at a shared directory. The mtime
-/// check uses the OS-reported modification time; we ignore files whose
-/// metadata we can't read.
+/// Accepted names are `neoethos.YYYY-MM-DD.log[.gz]` with a valid date.
+/// Other files in a shared LOG_DIR are never retention targets.
 fn cleanup_old_logs(dir: &Path, retain_days: u64) -> std::io::Result<()> {
     let now = SystemTime::now();
     let max_age = Duration::from_secs(retain_days.saturating_mul(86_400));
@@ -457,10 +432,7 @@ fn cleanup_old_logs(dir: &Path, retain_days: u64) -> std::io::Result<()> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        // Only touch our own files: neoethos.YYYY-MM-DD.log (or .log alone).
-        let prefix_matches = name.starts_with(LOG_FILE_PREFIX);
-        let ext_matches = name.ends_with(".log") || name.ends_with(".log.gz");
-        if !prefix_matches || !ext_matches {
+        if !is_daily_log_filename(name) {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {
@@ -469,10 +441,10 @@ fn cleanup_old_logs(dir: &Path, retain_days: u64) -> std::io::Result<()> {
         let Ok(modified) = metadata.modified() else {
             continue;
         };
-        if let Ok(age) = now.duration_since(modified) {
-            if age > max_age {
-                let _ = fs::remove_file(&path);
-            }
+        if let Ok(age) = now.duration_since(modified)
+            && age > max_age
+        {
+            let _ = fs::remove_file(&path);
         }
     }
     Ok(())
@@ -513,18 +485,35 @@ pub fn default_log_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("logs"))
 }
 
-/// Build today's unified-log path inside `log_dir`.
-///
-/// Format: `neoethos.YYYY-MM-DD.log`. The date component is evaluated every
-/// call so the path follows the calendar — important when the app runs
-/// across midnight. We use `chrono::Local` (not `Utc`) so the file name
-/// matches what the operator's clock shows; tracing-appender's daily
-/// rotator also uses local-time rotation by default.
+/// Build today's UTC path, matching tracing-appender's daily rotation.
 fn canonical_log_path_from_dir(log_dir: impl AsRef<Path>) -> PathBuf {
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    log_dir
-        .as_ref()
-        .join(format!("{LOG_FILE_PREFIX}.{today}.log"))
+    canonical_log_path_at(log_dir.as_ref(), Utc::now())
+}
+
+fn canonical_log_path_at(log_dir: &Path, now: chrono::DateTime<Utc>) -> PathBuf {
+    log_dir.join(format!("{LOG_FILE_PREFIX}.{}.log", now.format("%Y-%m-%d")))
+}
+
+fn is_daily_log_filename(name: &str) -> bool {
+    let Some(date) = name
+        .strip_prefix(LOG_FILE_PREFIX)
+        .and_then(|tail| tail.strip_prefix('.'))
+        .and_then(|tail| {
+            tail.strip_suffix(".log.gz")
+                .or_else(|| tail.strip_suffix(".log"))
+        })
+    else {
+        return false;
+    };
+    date.len() == 10
+        && date.bytes().enumerate().all(|(index, byte)| {
+            if index == 4 || index == 7 {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+        && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
 }
 
 fn system_record(operation: &str, status: &str, message: String) -> SectionedRunRecord {
@@ -566,67 +555,57 @@ mod tests {
     }
 
     #[test]
-    fn canonical_log_path_carries_todays_date_and_prefix() {
-        // The unified file is `neoethos.YYYY-MM-DD.log` inside the chosen
-        // dir, where YYYY-MM-DD is today's local date. We test the *shape*
-        // (parent + prefix + suffix) rather than the exact date so the test
-        // is stable across the midnight boundary.
-        let path = canonical_log_path_from_dir("logs");
-        let parent = path.parent().expect("path must have a parent");
-        assert_eq!(parent, Path::new("logs"));
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("path must have a filename");
-        assert!(
-            name.starts_with("neoethos."),
-            "expected neoethos.* prefix, got {name}"
-        );
-        assert!(name.ends_with(".log"), "expected .log suffix, got {name}");
-        // Sanity: the date segment is the chrono-formatted local date.
-        let expected_date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        assert!(
-            name.contains(&expected_date),
-            "expected {expected_date} in filename, got {name}"
-        );
+    fn canonical_log_path_uses_utc_across_local_midnight_and_year_boundaries() {
+        for (timestamp, expected) in [
+            ("2026-09-08T00:30:00+02:00", "neoethos.2026-09-07.log"),
+            ("2026-12-31T23:30:00-02:00", "neoethos.2027-01-01.log"),
+            ("2024-03-01T00:30:00+02:00", "neoethos.2024-02-29.log"),
+        ] {
+            let instant = chrono::DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(
+                canonical_log_path_at(Path::new("logs"), instant),
+                Path::new("logs").join(expected)
+            );
+        }
     }
 
     #[test]
-    fn test_write_subsystem_record_to_path_updates_expected_section() {
-        // This exercises the *test-only* JSON snapshot path. Production now
-        // routes through `write_subsystem_record` → tracing, which lands in
-        // the unified daily file — that path is covered by the formatter
-        // test below. We use a custom filename here so the test doesn't
-        // collide with the daily-rotator filename pattern.
-        let dir = unique_temp_dir("write_subsystem_record");
-        fs::create_dir_all(&dir).expect("create temp log dir");
-        let path = dir.join("legacy-snapshot.log");
-        let record = SectionedRunRecord {
-            run_id: "training-1".to_string(),
-            parent_run_id: None,
-            started_at: "2026-03-21T12:00:00Z".to_string(),
-            finished_at: "2026-03-21T12:00:01Z".to_string(),
-            subsystem: SubsystemSection::Training,
-            operation: "train".to_string(),
-            status: "SUCCESS".to_string(),
-            symbol: Some("EURUSD".to_string()),
-            timeframe: Some("M1".to_string()),
-            error_code: None,
-            message: "training ok".to_string(),
-            body: "body".to_string(),
-        };
-
-        let log = write_subsystem_record_to_path(&path, SubsystemSection::Training, record.clone())
-            .expect("section write should succeed");
-
-        let training = log
-            .section(SubsystemSection::Training)
-            .expect("training section should exist");
-        assert_eq!(training.current.as_ref(), Some(&record));
-        assert!(path.exists(), "canonical log file should be created");
-
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_dir_all(dir);
+    fn canonical_path_matches_the_actual_daily_appender_file() {
+        use std::io::Write;
+        let dir = unique_temp_dir("actual_daily_appender");
+        let before = Utc::now();
+        let mut writer = RollingFileAppender::builder()
+            .rotation(Rotation::DAILY)
+            .filename_prefix(LOG_FILE_PREFIX)
+            .filename_suffix("log")
+            .build(&dir)
+            .unwrap();
+        writer.write_all(b"actual daily writer\n").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let after = Utc::now();
+        let files: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(!files.is_empty());
+        for path in &files {
+            assert!(
+                path == &canonical_log_path_at(&dir, before)
+                    || path == &canonical_log_path_at(&dir, after)
+            );
+            assert!(is_daily_log_filename(
+                path.file_name().unwrap().to_str().unwrap()
+            ));
+        }
+        assert!(
+            files
+                .iter()
+                .any(|path| fs::read(path).unwrap() == b"actual daily writer\n")
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -677,55 +656,41 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_old_logs_deletes_only_stale_neoethos_files() {
-        use std::fs::File;
-        use std::time::Duration;
-
+    fn cleanup_old_logs_deletes_only_stale_exact_daily_filenames() {
         let dir = unique_temp_dir("cleanup_stale");
-        fs::create_dir_all(&dir).expect("create temp log dir");
-
-        // 1. A stale neoethos log — should be deleted. Back-date its mtime
-        //    to 30 days ago using std::fs::File::set_modified (Rust 1.75+).
-        let stale = dir.join("neoethos.2020-01-01.log");
-        fs::write(&stale, b"old\n").expect("write stale file");
-        let thirty_days_ago = SystemTime::now() - Duration::from_secs(30 * 86_400);
-        let stale_handle = File::options()
-            .write(true)
-            .open(&stale)
-            .expect("open stale for mtime");
-        stale_handle
-            .set_modified(thirty_days_ago)
-            .expect("backdate stale mtime");
-        drop(stale_handle);
-
-        // 2. A recent neoethos log (mtime = now) — must survive.
+        fs::create_dir_all(&dir).unwrap();
+        let stale_names = ["neoethos.2020-01-01.log", "neoethos.2020-02-29.log.gz"];
+        let unrelated_names = [
+            "neoethos-notes.log",
+            "neoethos.log",
+            "neoethos.2020-02-30.log",
+            "neoethos.2020-1-01.log",
+            "neoethos.2020-01-01.log.backup",
+            "neoethos.2020-01-01-notes.log.gz",
+            "other.2020-01-01.log",
+        ];
+        let old = SystemTime::now() - Duration::from_secs(30 * 86_400);
+        for name in stale_names.into_iter().chain(unrelated_names) {
+            let path = dir.join(name);
+            fs::write(&path, b"old\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
         let recent = dir.join("neoethos.2099-01-01.log");
-        fs::write(&recent, b"fresh\n").expect("write recent file");
-
-        // 3. An unrelated file with our prefix substring but wrong shape — must survive.
-        let unrelated = dir.join("not-our-logs.txt");
-        fs::write(&unrelated, b"unrelated\n").expect("write unrelated file");
-
-        // 4. A file matching prefix but not the .log extension — must survive.
-        let prefix_only = dir.join("neoethos-keepme.txt");
-        fs::write(&prefix_only, b"keep\n").expect("write prefix-only file");
-
-        // Run cleanup with 7-day retention. Stale (30 days old) must go;
-        // the rest must stay.
-        cleanup_old_logs(&dir, 7).expect("cleanup ran");
-
-        assert!(!stale.exists(), "stale neoethos log was not deleted");
-        assert!(
-            recent.exists(),
-            "recent neoethos log was incorrectly deleted"
-        );
-        assert!(unrelated.exists(), "unrelated file was incorrectly deleted");
-        assert!(
-            prefix_only.exists(),
-            "prefix-matching non-.log file was incorrectly deleted"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
+        fs::write(&recent, b"fresh\n").unwrap();
+        cleanup_old_logs(&dir, 7).unwrap();
+        for name in stale_names {
+            assert!(!dir.join(name).exists(), "stale exact log retained: {name}");
+        }
+        for name in unrelated_names {
+            assert!(dir.join(name).exists(), "unrelated file removed: {name}");
+        }
+        assert!(recent.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -741,18 +706,61 @@ mod tests {
 
     #[test]
     fn default_log_dir_honours_log_dir_env_override() {
-        // SAFETY-NOTE: this test mutates a process-global env var. If run in
-        // parallel with another test that reads LOG_DIR it could flake; the
-        // workspace runs `cargo test` single-process per-crate so we accept
-        // this trade-off rather than wiring serial_test in.
+        // A child owns its environment. No parent mutation or private mutex
+        // can race with the other logging tests or erase an existing LOG_DIR.
+        const CHILD: &str = "NEOETHOS_LOG_DIR_TEST_CHILD";
+        if let Some(expected) = std::env::var_os(CHILD) {
+            assert_eq!(default_log_dir(), PathBuf::from(expected));
+            return;
+        }
         let sentinel = unique_temp_dir("log_dir_override");
-        unsafe {
-            std::env::set_var("LOG_DIR", &sentinel);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "logging::tests::default_log_dir_honours_log_dir_env_override",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("LOG_DIR", &sentinel)
+            .env(CHILD, &sentinel)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "LOG_DIR child timed out: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        let resolved = default_log_dir();
-        assert_eq!(resolved, sentinel, "LOG_DIR override was not honoured");
-        unsafe {
-            std::env::remove_var("LOG_DIR");
-        }
+        let output = child.wait_with_output().unwrap();
+        println!(
+            "=== BEGIN LOG_DIR CHILD STDOUT ===\n{}\n=== END LOG_DIR CHILD STDOUT ===",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        eprintln!(
+            "=== BEGIN LOG_DIR CHILD STDERR ===\n{}\n=== END LOG_DIR CHILD STDERR ===",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "LOG_DIR child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child must actually run its one exact test"
+        );
     }
 }

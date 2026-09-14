@@ -296,45 +296,11 @@ struct SnapshotPlan {
     files: BTreeMap<String, Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotFault {
-    None,
-    AfterFirstMemberWrite,
-    BeforeCurrentSwap,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ValidationSnapshotTestFault {
-    AfterFirstMemberWrite,
-    BeforeCurrentSwap,
-}
-
 pub fn save_discovery_validation_snapshot(
     root: impl AsRef<Path>,
     result: &DiscoveryResult,
 ) -> Result<DiscoveryValidationSnapshotPointerV1> {
-    save_snapshot_with_fault(root.as_ref(), result, SnapshotFault::None)
-}
-
-#[cfg(test)]
-pub(crate) fn save_discovery_validation_snapshot_with_test_fault(
-    root: impl AsRef<Path>,
-    result: &DiscoveryResult,
-    fault: ValidationSnapshotTestFault,
-) -> Result<DiscoveryValidationSnapshotPointerV1> {
-    let fault = match fault {
-        ValidationSnapshotTestFault::AfterFirstMemberWrite => SnapshotFault::AfterFirstMemberWrite,
-        ValidationSnapshotTestFault::BeforeCurrentSwap => SnapshotFault::BeforeCurrentSwap,
-    };
-    save_snapshot_with_fault(root.as_ref(), result, fault)
-}
-
-fn save_snapshot_with_fault(
-    root: &Path,
-    result: &DiscoveryResult,
-    fault: SnapshotFault,
-) -> Result<DiscoveryValidationSnapshotPointerV1> {
+    let root = root.as_ref();
     let plan = build_snapshot_plan(result)?;
     prepare_snapshot_root(root)?;
     let generations_dir = root.join(GENERATIONS_DIR_NAME);
@@ -345,18 +311,9 @@ fn save_snapshot_with_fault(
     } else {
         let staging_dir = create_unique_staging_dir(&generations_dir)?;
         let write_result = (|| -> Result<()> {
-            let mut wrote_first_member = false;
             for (relative, bytes) in &plan.files {
                 let path = staging_dir.join(relative);
                 write_snapshot_bytes(&path, bytes)?;
-                if relative != MANIFEST_FILE_NAME && !wrote_first_member {
-                    wrote_first_member = true;
-                    if fault == SnapshotFault::AfterFirstMemberWrite {
-                        bail!(
-                            "injected validation snapshot failure after the first staged member write"
-                        );
-                    }
-                }
             }
             verify_generation_tree(&staging_dir, &plan)?;
             match fs::rename(&staging_dir, &generation_dir) {
@@ -383,9 +340,6 @@ fn save_snapshot_with_fault(
         write_result?;
     }
 
-    if fault == SnapshotFault::BeforeCurrentSwap {
-        bail!("injected validation snapshot failure before CURRENT swap");
-    }
     plan.pointer.validate()?;
     let current_path = root.join(CURRENT_FILE_NAME);
     match fs::symlink_metadata(&current_path) {

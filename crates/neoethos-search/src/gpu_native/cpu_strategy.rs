@@ -175,14 +175,15 @@ where
     Ok(operation())
 }
 
-/// Execute canonical CPU work only after the run-owned native probe proved
-/// that the loaded CUDA runtime enumerated exactly zero devices.
+/// Execute canonical CPU work only after the run-owned route carries exact,
+/// non-zero CPU authority. That authority is either a complete no-compatible-
+/// GPU receipt or an exact canonical ResearchOnly contract/input binding.
 ///
 /// This boundary deliberately has no [`EvaluationBackend`] argument: operator
 /// configuration cannot grant or revoke the CPU authority carried by the
 /// opaque receipt. The ordinary [`run`] policy remains available to reference
 /// and legacy callers, while production Discovery consumes this sealed route.
-pub(crate) fn run_with_sealed_no_gpu_receipt<T, F>(
+pub(crate) fn run_with_sealed_cpu_route_receipt<T, F>(
     receipt: &crate::strict_discovery_device_route_v1::SealedCpuDiscoveryRouteReceiptV2,
     audit: &CpuStrategyAuditContext,
     category: CpuStrategyCategory,
@@ -265,8 +266,8 @@ mod tests {
     }
 
     #[test]
-    fn optional_cpu_path_records_attempt_and_execution() {
-        let audit = CpuStrategyAuditContext::production(43);
+    fn validation_cpu_path_records_attempt_and_execution() {
+        let audit = CpuStrategyAuditContext::validation_reference(43);
         let value = run(
             EvaluationBackend::AUTO,
             &audit,
@@ -301,9 +302,9 @@ mod tests {
 
     #[test]
     fn cloned_contexts_share_only_their_own_work_unit() {
-        let first = CpuStrategyAuditContext::production(100);
+        let first = CpuStrategyAuditContext::validation_reference(100);
         let first_clone = first.clone();
-        let second = CpuStrategyAuditContext::production(200);
+        let second = CpuStrategyAuditContext::validation_reference(200);
 
         run(
             EvaluationBackend::AUTO,

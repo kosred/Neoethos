@@ -233,8 +233,11 @@ fn data_owner_consumes_native_closure_and_runtime_receipt_without_caller_capabil
         assert!(source.contains(required), "Data owner omitted `{required}`");
     }
     let store = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
+    let compact_store = compact(&store);
     assert!(
-        store.contains("session_runtime.append_to(&mut assembler, session_bindings)?"),
+        compact_store.contains(
+            "post_smc.session_runtime.append_to(assembler,post_smc.session_bindings)?"
+        ),
         "crate-owned materializer does not consume the prepared Session runtime"
     );
     let compact_source = compact(&source);

@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::acquisition_store_v1::{
     BrokerTruthAcquisitionLinkReceiptV1, BrokerTruthAcquisitionStoreV1,
 };
+use crate::authority_v2::BrokerFinancialTruthAuthorityV2;
 use crate::contracts::{EvidenceWindowV1, QuoteSideV1, sha256_bytes, validate_sha256_hex};
 use crate::contracts_v2::ReviewedQuoteReplayRuleIdentityV2;
 use crate::semantic_v2::{
-    StructurallyVerifiedQuoteSideReplayV2, inspect_untrusted_broker_financial_truth_bundle_v2,
+    StructurallyVerifiedPrimaryBidAskQuoteReplayV2, StructurallyVerifiedQuoteSideReplayV2,
+    inspect_untrusted_broker_financial_truth_bundle_v2,
 };
 use crate::store::BrokerFinancialTruthBundleStoreV1;
 
@@ -33,6 +35,8 @@ pub enum QuoteValidatedResearchReplayErrorCodeV1 {
     CrossedSynchronizedBook,
     ModeledEntryOutsideDecisionBounds,
     ExitReferenceUnavailable,
+    OverlappingDecisionWindow,
+    OpenPositionBeforeNextDecision,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -294,6 +298,76 @@ struct ReplayBindingHashPayloadV1<'a> {
 }
 
 impl QuoteValidatedResearchReplayBindingV1 {
+    /// Validate exact binding, execution assumptions and evidence padding even
+    /// when a strategy emits no directional decisions.
+    pub fn validate_replay_policy_v1(
+        &self,
+        policy: &QuoteValidatedResearchReplayPolicyV1,
+    ) -> Result<(), QuoteValidatedResearchReplayErrorV1> {
+        self.validate()?;
+        policy.validate()?;
+        if let Some(rule) = &policy.reviewed_same_timestamp_merge_rule
+            && rule.reviewed_replay_rule.identity_sha256()
+                != self.reviewed_replay_rule.identity_sha256()
+        {
+            return Err(replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch,
+                "same-timestamp merge rule is not bound to the reviewed replay rule",
+            ));
+        }
+        if self.replay_scope.seed_padding_ms() < policy.max_quote_staleness_ms {
+            return Err(replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::RequiredCoverageWindowMismatch,
+                "seed padding is shorter than the synchronized-book staleness horizon",
+            ));
+        }
+        let required_exit_padding = policy
+            .latency_slippage
+            .exit_latency_ms
+            .checked_add(policy.max_exit_wait_ms)
+            .ok_or_else(|| {
+                replay_error(
+                    QuoteValidatedResearchReplayErrorCodeV1::InvalidPolicy,
+                    "exit latency and wait overflow the required padding",
+                )
+            })?;
+        if self.replay_scope.exit_padding_ms() < required_exit_padding {
+            return Err(replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::RequiredCoverageWindowMismatch,
+                "exit padding is shorter than the modeled exit horizon",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn symbol_name(&self) -> &str {
+        &self.symbol_name
+    }
+
+    pub const fn replay_scope(&self) -> LockedFinalistOosReplayScopeV1 {
+        self.replay_scope
+    }
+
+    pub fn canonical_search_input_receipt_sha256(&self) -> &str {
+        &self.canonical_search_input_receipt_sha256
+    }
+
+    pub fn canonical_signal_plan_sha256(&self) -> &str {
+        &self.canonical_signal_plan_sha256
+    }
+
+    pub const fn account_id(&self) -> i64 {
+        self.account_id
+    }
+
+    pub const fn symbol_id(&self) -> i64 {
+        self.symbol_id
+    }
+
+    pub fn reviewed_replay_rule_identity_sha256(&self) -> &str {
+        self.reviewed_replay_rule.identity_sha256()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         canonical_search_input_receipt_sha256: impl Into<String>,
@@ -790,6 +864,18 @@ impl CanonicalBarSignalResearchDecisionV1 {
         self.next_canonical_bar_open_unix_ms
     }
 
+    pub const fn direction(&self) -> ResearchPositionDirectionV1 {
+        self.direction
+    }
+
+    pub const fn stop_price(&self) -> f64 {
+        self.stop_price
+    }
+
+    pub const fn target_price(&self) -> f64 {
+        self.target_price
+    }
+
     fn validate(&self) -> Result<(), QuoteValidatedResearchReplayErrorV1> {
         if self.signal_bar_open_unix_ms < 0
             || self.next_canonical_bar_open_unix_ms <= self.signal_bar_open_unix_ms
@@ -1025,6 +1111,10 @@ struct ReplayPolicyHashPayloadV1<'a> {
 }
 
 impl QuoteValidatedResearchReplayPolicyV1 {
+    pub const fn pip_size(&self) -> f64 {
+        self.latency_slippage.pip_size
+    }
+
     pub fn new(
         max_entry_wait_ms: i64,
         max_quote_staleness_ms: i64,
@@ -1095,14 +1185,56 @@ impl QuoteValidatedResearchReplayPolicyV1 {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ClosedCanonicalBarTimeExitV1 {
+    source_bar_open_unix_ms: i64,
+    effective_at_next_bar_open_unix_ms: i64,
+}
+
+impl ClosedCanonicalBarTimeExitV1 {
+    pub fn new(
+        source_bar_open_unix_ms: i64,
+        effective_at_next_bar_open_unix_ms: i64,
+    ) -> Result<Self, QuoteValidatedResearchReplayErrorV1> {
+        let exit = Self {
+            source_bar_open_unix_ms,
+            effective_at_next_bar_open_unix_ms,
+        };
+        exit.validate()?;
+        Ok(exit)
+    }
+
+    fn validate(&self) -> Result<(), QuoteValidatedResearchReplayErrorV1> {
+        if self.source_bar_open_unix_ms < 0
+            || self.effective_at_next_bar_open_unix_ms <= self.source_bar_open_unix_ms
+        {
+            return Err(replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::InvalidDecision,
+                "time exit must follow its own closed canonical bar",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuoteValidatedResearchReplayPlanV1 {
     binding: QuoteValidatedResearchReplayBindingV1,
     policy: QuoteValidatedResearchReplayPolicyV1,
     decisions: Vec<CanonicalBarSignalResearchDecisionV1>,
     trailing_thresholds: Vec<ClosedCanonicalBarTrailingThresholdV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    time_exit: Option<ClosedCanonicalBarTimeExitV1>,
 }
 
 impl QuoteValidatedResearchReplayPlanV1 {
+    /// Identity of the complete plan used by sealed kernel witnesses. Keep
+    /// this encoding in one place for independent pinned-policy verification.
+    pub fn identity_sha256(&self) -> Result<String, QuoteValidatedResearchReplayErrorV1> {
+        self.validate()?;
+        hash_json("quote-validated executed decision plan v2", self)
+    }
+
     pub fn new(
         binding: QuoteValidatedResearchReplayBindingV1,
         policy: QuoteValidatedResearchReplayPolicyV1,
@@ -1114,46 +1246,63 @@ impl QuoteValidatedResearchReplayPlanV1 {
             policy,
             decisions,
             trailing_thresholds,
+            time_exit: None,
         };
         plan.validate()?;
         Ok(plan)
     }
 
-    fn validate(&self) -> Result<(), QuoteValidatedResearchReplayErrorV1> {
-        self.binding.validate()?;
-        self.policy.validate()?;
-        if let Some(rule) = &self.policy.reviewed_same_timestamp_merge_rule
-            && rule.reviewed_replay_rule.identity_sha256()
-                != self.binding.reviewed_replay_rule.identity_sha256()
-        {
-            return Err(replay_error(
-                QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch,
-                "same-timestamp merge rule is not bound to the reviewed replay rule",
-            ));
-        }
-        if self.binding.replay_scope.seed_padding_ms() < self.policy.max_quote_staleness_ms {
-            return Err(replay_error(
-                QuoteValidatedResearchReplayErrorCodeV1::RequiredCoverageWindowMismatch,
-                "seed padding is shorter than the synchronized-book staleness horizon",
-            ));
-        }
-        let required_exit_padding = self
-            .policy
-            .latency_slippage
-            .exit_latency_ms
-            .checked_add(self.policy.max_exit_wait_ms)
-            .ok_or_else(|| {
-                replay_error(
+    /// A max-hold exit is a market-close trigger, not a candle close-price fill.
+    /// Old plans keep their exact wire representation when no timer is armed.
+    pub fn with_time_exit(
+        mut self,
+        time_exit: ClosedCanonicalBarTimeExitV1,
+    ) -> Result<Self, QuoteValidatedResearchReplayErrorV1> {
+        self.time_exit = Some(time_exit);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Check the fixed binding, policy and causal order before evidence IO.
+    /// Whether a previous position has actually closed is checked by replay.
+    pub fn validate_ordered_sequence(
+        plans: &[Self],
+    ) -> Result<(), QuoteValidatedResearchReplayErrorV1> {
+        let first = plans.first().ok_or_else(|| {
+            replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::InvalidDecision,
+                "quote replay decision sequence is empty",
+            )
+        })?;
+        let mut previous_decision_at = None;
+        for plan in plans {
+            plan.validate()?;
+            if plan.binding != first.binding {
+                return Err(replay_error(
+                    QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch,
+                    "decision sequence changes its exact replay binding",
+                ));
+            }
+            if plan.policy != first.policy {
+                return Err(replay_error(
                     QuoteValidatedResearchReplayErrorCodeV1::InvalidPolicy,
-                    "exit latency and wait overflow the required padding",
-                )
-            })?;
-        if self.binding.replay_scope.exit_padding_ms() < required_exit_padding {
-            return Err(replay_error(
-                QuoteValidatedResearchReplayErrorCodeV1::RequiredCoverageWindowMismatch,
-                "exit padding is shorter than the modeled exit horizon",
-            ));
+                    "decision sequence changes its fixed execution policy",
+                ));
+            }
+            let decision_at = plan.decisions[0].next_canonical_bar_open_unix_ms;
+            if previous_decision_at.is_some_and(|previous| previous >= decision_at) {
+                return Err(replay_error(
+                    QuoteValidatedResearchReplayErrorCodeV1::InvalidDecision,
+                    "canonical-bar decision sequence is not strictly time ordered",
+                ));
+            }
+            previous_decision_at = Some(decision_at);
         }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), QuoteValidatedResearchReplayErrorV1> {
+        self.binding.validate_replay_policy_v1(&self.policy)?;
         if self.decisions.len() != 1 {
             return Err(replay_error(
                 QuoteValidatedResearchReplayErrorCodeV1::InvalidDecision,
@@ -1172,16 +1321,19 @@ impl QuoteValidatedResearchReplayPlanV1 {
                 ));
             }
         }
-        for pair in self.decisions.windows(2) {
-            if pair[0].next_canonical_bar_open_unix_ms >= pair[1].next_canonical_bar_open_unix_ms {
+        let quote_window = self.binding.replay_scope.required_quote_coverage_window();
+        let sole_decision = &self.decisions[0];
+        if let Some(exit) = &self.time_exit {
+            exit.validate()?;
+            if exit.source_bar_open_unix_ms < sole_decision.next_canonical_bar_open_unix_ms
+                || exit.effective_at_next_bar_open_unix_ms > locked_window.to_unix_ms_exclusive()
+            {
                 return Err(replay_error(
                     QuoteValidatedResearchReplayErrorCodeV1::InvalidDecision,
-                    "canonical-bar decisions are not strictly time ordered",
+                    "time exit is outside the sole position's locked canonical-bar ownership",
                 ));
             }
         }
-        let quote_window = self.binding.replay_scope.required_quote_coverage_window();
-        let sole_decision = &self.decisions[0];
         for threshold in &self.trailing_thresholds {
             threshold.validate()?;
             if threshold.source_bar_open_unix_ms < locked_window.from_unix_ms_inclusive()
@@ -1238,6 +1390,7 @@ pub enum QuoteValidatedResearchExitReasonV1 {
     Stop,
     Target,
     TrailingStop,
+    MaxHold,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1535,20 +1688,17 @@ fn latest_book_quote_at_entry<'a>(
     candidate_timestamp_unix_ms: i64,
     policy: &QuoteValidatedResearchReplayPolicyV1,
 ) -> Result<Option<&'a ExactHistoricalQuoteV1>, QuoteValidatedResearchReplayErrorV1> {
-    let mut before = None;
-    let mut same_timestamp = None;
-    for quote in quotes {
-        if quote.timestamp_unix_ms < candidate_timestamp_unix_ms {
-            before = Some(quote);
-        } else if quote.timestamp_unix_ms == candidate_timestamp_unix_ms {
-            same_timestamp = Some(quote);
-        } else {
-            break;
-        }
-    }
-    let Some(same_timestamp) = same_timestamp else {
+    // Coverage ingress has already checked (timestamp, source ordinal) order.
+    // Keep the last source-ordered update at a timestamp, exactly as the scan did.
+    let first_at =
+        quotes.partition_point(|quote| quote.timestamp_unix_ms < candidate_timestamp_unix_ms);
+    let after_at =
+        quotes.partition_point(|quote| quote.timestamp_unix_ms <= candidate_timestamp_unix_ms);
+    let before = first_at.checked_sub(1).map(|index| &quotes[index]);
+    if first_at == after_at {
         return Ok(before);
-    };
+    }
+    let same_timestamp = &quotes[after_at - 1];
     if let Some(rule) = &policy.reviewed_same_timestamp_merge_rule {
         if side_precedes(opposite_side, entry_side, rule.side_order) {
             return Ok(Some(same_timestamp));
@@ -1599,10 +1749,9 @@ fn select_entry(
             )
         })?;
     let mut saw_stale_candidate = false;
-    for candidate in entry_quotes {
-        if candidate.timestamp_unix_ms < eligible_at {
-            continue;
-        }
+    let first_eligible =
+        entry_quotes.partition_point(|quote| quote.timestamp_unix_ms < eligible_at);
+    for candidate in &entry_quotes[first_eligible..] {
         if candidate.timestamp_unix_ms > deadline {
             break;
         }
@@ -1654,24 +1803,28 @@ fn effective_stop_price(
     thresholds: &[ClosedCanonicalBarTrailingThresholdV1],
     timestamp_unix_ms: i64,
 ) -> (f64, QuoteValidatedResearchExitReasonV1) {
-    let mut stop_price = decision.stop_price;
-    let mut reason = QuoteValidatedResearchExitReasonV1::Stop;
-    for threshold in thresholds {
-        if threshold.direction != decision.direction
-            || threshold.effective_at_next_bar_open_unix_ms > timestamp_unix_ms
-        {
-            continue;
-        }
+    // A validated single-decision plan owns a time-ordered, never-loosening
+    // schedule in one direction. Only its latest effective threshold matters.
+    let effective_count = thresholds.partition_point(|threshold| {
+        threshold.effective_at_next_bar_open_unix_ms <= timestamp_unix_ms
+    });
+    if let Some(index) = effective_count.checked_sub(1) {
+        let threshold = &thresholds[index];
         let tightens = match decision.direction {
-            ResearchPositionDirectionV1::Long => threshold.threshold_price > stop_price,
-            ResearchPositionDirectionV1::Short => threshold.threshold_price < stop_price,
+            ResearchPositionDirectionV1::Long => threshold.threshold_price > decision.stop_price,
+            ResearchPositionDirectionV1::Short => threshold.threshold_price < decision.stop_price,
         };
         if tightens {
-            stop_price = threshold.threshold_price;
-            reason = QuoteValidatedResearchExitReasonV1::TrailingStop;
+            return (
+                threshold.threshold_price,
+                QuoteValidatedResearchExitReasonV1::TrailingStop,
+            );
         }
     }
-    (stop_price, reason)
+    (
+        decision.stop_price,
+        QuoteValidatedResearchExitReasonV1::Stop,
+    )
 }
 
 fn threshold_reason(
@@ -1714,12 +1867,55 @@ fn same_timestamp_exit_occurs_after_entry(
         .map(|rule| side_precedes(entry_side, exit_side, rule.side_order))
 }
 
+fn select_exit_reference(
+    exit_quotes: &[ExactHistoricalQuoteV1],
+    first_index: usize,
+    trigger_at_unix_ms: i64,
+    reason: QuoteValidatedResearchExitReasonV1,
+    policy: &QuoteValidatedResearchReplayPolicyV1,
+) -> Result<
+    Option<(ExactHistoricalQuoteV1, QuoteValidatedResearchExitReasonV1)>,
+    QuoteValidatedResearchReplayErrorV1,
+> {
+    let eligible_at = trigger_at_unix_ms
+        .checked_add(policy.latency_slippage.exit_latency_ms)
+        .ok_or_else(|| {
+            replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::InvalidPolicy,
+                "exit latency overflows the trigger timestamp",
+            )
+        })?;
+    let deadline = trigger_at_unix_ms
+        .checked_add(policy.max_exit_wait_ms)
+        .ok_or_else(|| {
+            replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::InvalidPolicy,
+                "exit wait overflows the trigger timestamp",
+            )
+        })?;
+    let after_trigger = &exit_quotes[first_index..];
+    let execution_index =
+        after_trigger.partition_point(|quote| quote.timestamp_unix_ms < eligible_at);
+    let reference = after_trigger
+        .get(execution_index)
+        .filter(|quote| quote.timestamp_unix_ms <= deadline)
+        .cloned()
+        .ok_or_else(|| {
+            replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::ExitReferenceUnavailable,
+                "complete quote evidence has no exit reference within the explicit wait",
+            )
+        })?;
+    Ok(Some((reference, reason)))
+}
+
 fn select_exit(
     decision: &CanonicalBarSignalResearchDecisionV1,
     entry_quote: &ExactHistoricalQuoteV1,
     evidence: &CompleteBidAskQuoteReplayEvidenceV1,
     policy: &QuoteValidatedResearchReplayPolicyV1,
     thresholds: &[ClosedCanonicalBarTrailingThresholdV1],
+    time_exit: Option<&ClosedCanonicalBarTimeExitV1>,
 ) -> Result<
     Option<(ExactHistoricalQuoteV1, QuoteValidatedResearchExitReasonV1)>,
     QuoteValidatedResearchReplayErrorV1,
@@ -1736,14 +1932,35 @@ fn select_exit(
             evidence.ask.quote_records.as_slice(),
         ),
     };
-    for (trigger_index, trigger_quote) in exit_quotes.iter().enumerate() {
-        if trigger_quote.timestamp_unix_ms < entry_quote.timestamp_unix_ms {
-            continue;
+    let timer_at = time_exit.map(|exit| exit.effective_at_next_bar_open_unix_ms);
+    if timer_at.is_some_and(|at| at <= entry_quote.timestamp_unix_ms) {
+        return Err(replay_error(
+            QuoteValidatedResearchReplayErrorCodeV1::InvalidDecision,
+            "max-hold trigger does not follow the modeled entry",
+        ));
+    }
+    let first_possible_trigger = exit_quotes
+        .partition_point(|quote| quote.timestamp_unix_ms < entry_quote.timestamp_unix_ms);
+    for (trigger_index, trigger_quote) in
+        exit_quotes.iter().enumerate().skip(first_possible_trigger)
+    {
+        // A later quote cannot postpone the timer or replace it with a later
+        // price trigger. Its execution deadline is anchored to the timer itself.
+        if let Some(at) = timer_at
+            && trigger_quote.timestamp_unix_ms > at
+        {
+            return select_exit_reference(
+                exit_quotes,
+                trigger_index,
+                at,
+                QuoteValidatedResearchExitReasonV1::MaxHold,
+                policy,
+            );
         }
-        let Some(reason) = threshold_reason(decision, thresholds, trigger_quote) else {
-            continue;
-        };
-        if trigger_quote.timestamp_unix_ms == entry_quote.timestamp_unix_ms {
+        let price_reason = threshold_reason(decision, thresholds, trigger_quote);
+        if price_reason.is_some()
+            && trigger_quote.timestamp_unix_ms == entry_quote.timestamp_unix_ms
+        {
             match same_timestamp_exit_occurs_after_entry(entry_side, exit_side, policy) {
                 Some(true) => {}
                 Some(false) => continue,
@@ -1755,38 +1972,30 @@ fn select_exit(
                 }
             }
         }
-
-        let eligible_at = trigger_quote
-            .timestamp_unix_ms
-            .checked_add(policy.latency_slippage.exit_latency_ms)
-            .ok_or_else(|| {
-                replay_error(
-                    QuoteValidatedResearchReplayErrorCodeV1::InvalidPolicy,
-                    "exit latency overflows the trigger timestamp",
-                )
-            })?;
-        let deadline = trigger_quote
-            .timestamp_unix_ms
-            .checked_add(policy.max_exit_wait_ms)
-            .ok_or_else(|| {
-                replay_error(
-                    QuoteValidatedResearchReplayErrorCodeV1::InvalidPolicy,
-                    "exit wait overflows the trigger timestamp",
-                )
-            })?;
-        let reference = exit_quotes[trigger_index..]
-            .iter()
-            .find(|quote| {
-                quote.timestamp_unix_ms >= eligible_at && quote.timestamp_unix_ms <= deadline
-            })
-            .cloned()
-            .ok_or_else(|| {
-                replay_error(
-                    QuoteValidatedResearchReplayErrorCodeV1::ExitReferenceUnavailable,
-                    "complete quote evidence has no exit reference within the explicit wait",
-                )
-            })?;
-        return Ok(Some((reference, reason)));
+        // Match the position manager's stop/target-before-time precedence at
+        // the same timestamp. The quote, never the threshold, is the fill.
+        let reason = price_reason.or_else(|| {
+            (timer_at == Some(trigger_quote.timestamp_unix_ms))
+                .then_some(QuoteValidatedResearchExitReasonV1::MaxHold)
+        });
+        if let Some(reason) = reason {
+            return select_exit_reference(
+                exit_quotes,
+                trigger_index,
+                trigger_quote.timestamp_unix_ms,
+                reason,
+                policy,
+            );
+        }
+    }
+    if let Some(at) = timer_at {
+        return select_exit_reference(
+            exit_quotes,
+            exit_quotes.len(),
+            at,
+            QuoteValidatedResearchExitReasonV1::MaxHold,
+            policy,
+        );
     }
     Ok(None)
 }
@@ -1821,12 +2030,179 @@ pub struct SealedHistoricalBidAskQuoteReplayEvidenceV1 {
     acquisition_link_manifest_sha256: String,
 }
 
+impl SealedHistoricalBidAskQuoteReplayEvidenceV1 {
+    pub fn acquisition_link_manifest_sha256(&self) -> &str {
+        &self.acquisition_link_manifest_sha256
+    }
+
+    pub fn validate_replay_context_v1(
+        &self,
+        binding: &QuoteValidatedResearchReplayBindingV1,
+        policy: &QuoteValidatedResearchReplayPolicyV1,
+    ) -> Result<(), QuoteValidatedResearchReplayErrorV1> {
+        binding.validate_replay_policy_v1(policy)?;
+        if binding != &self.evidence.binding {
+            return Err(replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch,
+                "strategy context differs from the sealed quote snapshot",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read-only entry geometry for relative strategy protections. It cannot mint
+/// a ledger or financial permit, and borrows the exact immutable quote slice.
+pub struct QuoteValidatedResearchEntryPreviewV1<'a> {
+    evidence: &'a CompleteBidAskQuoteReplayEvidenceV1,
+    selected: SelectedEntryBookV1,
+    direction: ResearchPositionDirectionV1,
+    same_timestamp_order: Option<SameTimestampCrossSideOrderV1>,
+    modeled_entry_price: f64,
+}
+
+impl QuoteValidatedResearchEntryPreviewV1<'_> {
+    pub const fn timestamp_unix_ms(&self) -> i64 {
+        self.selected.entry_quote.timestamp_unix_ms
+    }
+
+    pub const fn modeled_entry_price(&self) -> f64 {
+        self.modeled_entry_price
+    }
+
+    /// The entry bar's Bid extrema AFTER entry, excluding its close boundary.
+    /// Seeding with the synchronized Bid at entry preserves the executable
+    /// book without importing a pre-entry high/low from the full candle.
+    pub fn bid_extrema_before(
+        &self,
+        closed_bar_end_unix_ms: i64,
+    ) -> Result<(f64, f64), QuoteValidatedResearchReplayErrorV1> {
+        if closed_bar_end_unix_ms <= self.timestamp_unix_ms()
+            || closed_bar_end_unix_ms
+                > self
+                    .evidence
+                    .binding
+                    .replay_scope
+                    .locked_evaluation_window()
+                    .to_unix_ms_exclusive()
+        {
+            return Err(replay_error(
+                QuoteValidatedResearchReplayErrorCodeV1::InvalidWindow,
+                "entry-bar extrema require a later closed boundary inside the locked window",
+            ));
+        }
+        let quotes = &self.evidence.bid.quote_records;
+        let first =
+            quotes.partition_point(|quote| quote.timestamp_unix_ms < self.timestamp_unix_ms());
+        let after =
+            quotes.partition_point(|quote| quote.timestamp_unix_ms < closed_bar_end_unix_ms);
+        let mut high = self.selected.bid_quote.price;
+        let mut low = high;
+        for quote in &quotes[first..after] {
+            if quote.timestamp_unix_ms == self.timestamp_unix_ms() {
+                let before_entry = match self.direction {
+                    ResearchPositionDirectionV1::Short => {
+                        quote.source_ordinal < self.selected.entry_quote.source_ordinal
+                    }
+                    ResearchPositionDirectionV1::Long => {
+                        self.same_timestamp_order
+                            == Some(SameTimestampCrossSideOrderV1::BidBeforeAsk)
+                    }
+                };
+                if before_entry {
+                    continue;
+                }
+            }
+            high = high.max(quote.price);
+            low = low.min(quote.price);
+        }
+        Ok((high, low))
+    }
+}
+
+fn preview_entry_with_evidence_v1<'a>(
+    plan: &QuoteValidatedResearchReplayPlanV1,
+    evidence: &'a CompleteBidAskQuoteReplayEvidenceV1,
+) -> Result<Option<QuoteValidatedResearchEntryPreviewV1<'a>>, QuoteValidatedResearchReplayErrorV1> {
+    plan.validate()?;
+    if plan.binding != evidence.binding {
+        return Err(replay_error(
+            QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch,
+            "entry preview and quote snapshot have different exact bindings",
+        ));
+    }
+    let decision = &plan.decisions[0];
+    let EntrySelectionV1::Available(selected) = select_entry(decision, evidence, &plan.policy)?
+    else {
+        return Ok(None);
+    };
+    let modeled_entry_price = modeled_price(
+        selected.entry_quote.price,
+        decision.direction,
+        true,
+        &plan.policy.latency_slippage,
+    )?;
+    Ok(Some(QuoteValidatedResearchEntryPreviewV1 {
+        evidence,
+        selected,
+        direction: decision.direction,
+        same_timestamp_order: plan
+            .policy
+            .reviewed_same_timestamp_merge_rule
+            .as_ref()
+            .map(|rule| rule.side_order),
+        modeled_entry_price,
+    }))
+}
+
+/// Geometry only from untrusted caller quotes. As with raw replay, every row
+/// and digest is validated; this result never carries historical authority.
+pub fn preview_quote_validated_research_entry_v1<'a>(
+    plan: &QuoteValidatedResearchReplayPlanV1,
+    evidence: &'a CompleteBidAskQuoteReplayEvidenceV1,
+) -> Result<Option<QuoteValidatedResearchEntryPreviewV1<'a>>, QuoteValidatedResearchReplayErrorV1> {
+    evidence.validate()?;
+    preview_entry_with_evidence_v1(plan, evidence)
+}
+
+/// Reuse the reviewed snapshot's entry selection without a full-vector clone
+/// or revalidation. The final replay still enforces the actual entry bracket.
+pub fn preview_sealed_quote_validated_research_entry_v1<'a>(
+    plan: &QuoteValidatedResearchReplayPlanV1,
+    evidence: &'a SealedHistoricalBidAskQuoteReplayEvidenceV1,
+) -> Result<Option<QuoteValidatedResearchEntryPreviewV1<'a>>, QuoteValidatedResearchReplayErrorV1> {
+    preview_entry_with_evidence_v1(plan, &evidence.evidence)
+}
+
 #[derive(Debug, PartialEq, Serialize)]
 pub struct SealedHistoricalQuoteValidatedResearchLedgerV1 {
     ledger: QuoteValidatedResearchLedgerV1,
+    // Immutable process-local witnesses of the plan actually run by the kernel.
+    // They do not change the old V1 wire/hash, cannot be deserialized into a
+    // seal, and retain constant space rather than every trailing threshold.
+    #[serde(skip)]
+    executed_decision: CanonicalBarSignalResearchDecisionV1,
+    #[serde(skip)]
+    executed_time_exit: Option<ClosedCanonicalBarTimeExitV1>,
+    #[serde(skip)]
+    executed_plan_sha256: String,
 }
 
 impl SealedHistoricalQuoteValidatedResearchLedgerV1 {
+    pub fn executed_decision(&self) -> &CanonicalBarSignalResearchDecisionV1 {
+        &self.executed_decision
+    }
+
+    pub fn executed_time_exit(&self) -> Option<&ClosedCanonicalBarTimeExitV1> {
+        self.executed_time_exit.as_ref()
+    }
+
+    /// Identifies the actual decision, complete trailing schedule and timer,
+    /// not merely the resulting prices (different plans can have equal fills).
+    pub fn executed_plan_sha256(&self) -> &str {
+        &self.executed_plan_sha256
+    }
+
     pub fn receipt(&self) -> &QuoteValidatedResearchReplayReceiptV1 {
         self.ledger.receipt()
     }
@@ -2008,6 +2384,58 @@ pub fn open_sealed_historical_bid_ask_quote_replay_evidence_v1(
             "structurally decoded primary quotes differ from the sealed replay binding",
         ));
     }
+    seal_structurally_verified_primary_replay(
+        primary,
+        expected_replay_binding,
+        link_receipt.manifest_sha256(),
+    )
+}
+
+/// Transfer a reviewed V2 run's owned quote records to the existing research
+/// replay boundary. No files are reopened and no caller-supplied quotes enter
+/// this path. The resulting seal proves historical Bid/Ask references only;
+/// it does not upgrade commission, swap, volume, or conversion assumptions.
+pub fn into_sealed_historical_bid_ask_quote_replay_evidence_v2(
+    authority: BrokerFinancialTruthAuthorityV2,
+    expected_replay_binding: &QuoteValidatedResearchReplayBindingV1,
+) -> Result<SealedHistoricalBidAskQuoteReplayEvidenceV1, QuoteValidatedResearchReplayErrorV1> {
+    expected_replay_binding.validate()?;
+    let (verified_link, semantic_ingress) = authority.into_verified_quote_replay_inputs();
+    validate_linked_replay_binding(verified_link.manifest().binding(), expected_replay_binding)?;
+    if verified_link
+        .manifest()
+        .broker_truth_receipt()
+        .manifest_sha256()
+        != expected_replay_binding.quote_evidence_manifest_sha256
+    {
+        return Err(replay_error(
+            QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch,
+            "reviewed broker-truth manifest differs from the exact replay binding",
+        ));
+    }
+    seal_structurally_verified_primary_replay(
+        semantic_ingress.into_primary_quote_replay(),
+        expected_replay_binding,
+        verified_link.receipt().manifest_sha256(),
+    )
+}
+
+fn seal_structurally_verified_primary_replay(
+    primary: StructurallyVerifiedPrimaryBidAskQuoteReplayV2,
+    expected_replay_binding: &QuoteValidatedResearchReplayBindingV1,
+    acquisition_link_manifest_sha256: &str,
+) -> Result<SealedHistoricalBidAskQuoteReplayEvidenceV1, QuoteValidatedResearchReplayErrorV1> {
+    if primary.symbol_name != expected_replay_binding.symbol_name
+        || primary.reviewed_replay_rule_identity_sha256
+            != expected_replay_binding
+                .reviewed_replay_rule
+                .identity_sha256()
+    {
+        return Err(replay_error(
+            QuoteValidatedResearchReplayErrorCodeV1::BindingMismatch,
+            "verified primary quotes differ from the expected symbol or reviewed replay rule",
+        ));
+    }
     let evidence = CompleteBidAskQuoteReplayEvidenceV1::new(
         expected_replay_binding.clone(),
         complete_side_from_structural_ingress(primary.bid)?,
@@ -2015,7 +2443,7 @@ pub fn open_sealed_historical_bid_ask_quote_replay_evidence_v1(
     )?;
     Ok(SealedHistoricalBidAskQuoteReplayEvidenceV1 {
         evidence,
-        acquisition_link_manifest_sha256: link_receipt.manifest_sha256().to_owned(),
+        acquisition_link_manifest_sha256: acquisition_link_manifest_sha256.to_owned(),
     })
 }
 
@@ -2035,35 +2463,90 @@ pub fn replay_quote_validated_research_v1(
     plan: &QuoteValidatedResearchReplayPlanV1,
     evidence: CompleteBidAskQuoteReplayEvidenceV1,
 ) -> Result<QuoteValidatedResearchLedgerV1, QuoteValidatedResearchReplayErrorV1> {
+    plan.validate()?;
+    // This DTO can be deserialized by an untrusted caller: validate every row
+    // and its digest here, even when its constructor was not used.
+    evidence.validate()?;
     replay_with_authority_v1(
         plan,
-        evidence,
+        &evidence,
         QuoteValidatedResearchAuthorityV1::UnverifiedCallerSuppliedQuotes,
         None,
     )
 }
 
+/// Reuse an immutable ingress-validated snapshot without copying or rehashing
+/// its quote vectors. The opaque seal has no deserializer or mutation surface.
 pub fn replay_sealed_quote_validated_research_v1(
     plan: &QuoteValidatedResearchReplayPlanV1,
-    evidence: SealedHistoricalBidAskQuoteReplayEvidenceV1,
+    evidence: &SealedHistoricalBidAskQuoteReplayEvidenceV1,
 ) -> Result<SealedHistoricalQuoteValidatedResearchLedgerV1, QuoteValidatedResearchReplayErrorV1> {
     let ledger = replay_with_authority_v1(
         plan,
-        evidence.evidence,
+        &evidence.evidence,
         QuoteValidatedResearchAuthorityV1::HistoricalBidAskQuotesOnly,
-        Some(evidence.acquisition_link_manifest_sha256),
+        Some(evidence.acquisition_link_manifest_sha256.clone()),
     )?;
-    Ok(SealedHistoricalQuoteValidatedResearchLedgerV1 { ledger })
+    Ok(SealedHistoricalQuoteValidatedResearchLedgerV1 {
+        ledger,
+        executed_decision: plan.decisions[0].clone(),
+        executed_time_exit: plan.time_exit.clone(),
+        executed_plan_sha256: plan.identity_sha256()?,
+    })
+}
+
+/// Replay a fixed, single-position execution lane over one sealed snapshot.
+/// Each plan still owns exactly one decision and its trailing schedule. A next
+/// decision must be strictly after the prior modeled exit or unfilled-entry
+/// deadline; same-time transitions have no reviewed ordering and are refused.
+/// An open final position is retained, never silently liquidated. This is not
+/// a bar-signal strategy engine, hedged portfolio or promotion authorization.
+pub fn replay_sealed_quote_validated_decision_sequence_v1(
+    plans: &[QuoteValidatedResearchReplayPlanV1],
+    evidence: &SealedHistoricalBidAskQuoteReplayEvidenceV1,
+) -> Result<Vec<SealedHistoricalQuoteValidatedResearchLedgerV1>, QuoteValidatedResearchReplayErrorV1>
+{
+    QuoteValidatedResearchReplayPlanV1::validate_ordered_sequence(plans)?;
+    let mut ledgers: Vec<SealedHistoricalQuoteValidatedResearchLedgerV1> = Vec::new();
+    for plan in plans {
+        if let Some(previous) = ledgers.last() {
+            let completed_at = match (previous.positions(), previous.entry_unavailable()) {
+                ([position], []) => position
+                    .exit_reference()
+                    .ok_or_else(|| {
+                        replay_error(
+                            QuoteValidatedResearchReplayErrorCodeV1::OpenPositionBeforeNextDecision,
+                            "previous modeled position is still open before the next decision",
+                        )
+                    })?
+                    .timestamp_unix_ms(),
+                ([], [unavailable]) => unavailable.deadline_unix_ms(),
+                _ => {
+                    return Err(replay_error(
+                        QuoteValidatedResearchReplayErrorCodeV1::InvalidDecision,
+                        "previous replay did not produce exactly one decision outcome",
+                    ));
+                }
+            };
+            if plan.decisions[0].next_canonical_bar_open_unix_ms <= completed_at {
+                return Err(replay_error(
+                    QuoteValidatedResearchReplayErrorCodeV1::OverlappingDecisionWindow,
+                    "next decision overlaps the prior position or pending entry, or has ambiguous same-time order",
+                ));
+            }
+        }
+        ledgers.push(replay_sealed_quote_validated_research_v1(plan, evidence)?);
+    }
+    Ok(ledgers)
 }
 
 fn replay_with_authority_v1(
     plan: &QuoteValidatedResearchReplayPlanV1,
-    evidence: CompleteBidAskQuoteReplayEvidenceV1,
+    evidence: &CompleteBidAskQuoteReplayEvidenceV1,
     authority: QuoteValidatedResearchAuthorityV1,
     historical_acquisition_link_manifest_sha256: Option<String>,
 ) -> Result<QuoteValidatedResearchLedgerV1, QuoteValidatedResearchReplayErrorV1> {
     plan.validate()?;
-    evidence.validate()?;
     match (
         authority,
         historical_acquisition_link_manifest_sha256.as_deref(),
@@ -2089,7 +2572,7 @@ fn replay_with_authority_v1(
     let mut positions = Vec::new();
     let mut entry_unavailable = Vec::new();
     for decision in &plan.decisions {
-        let selected_entry = match select_entry(decision, &evidence, &plan.policy)? {
+        let selected_entry = match select_entry(decision, evidence, &plan.policy)? {
             EntrySelectionV1::Available(entry) => entry,
             EntrySelectionV1::Unavailable(unavailable) => {
                 entry_unavailable.push(unavailable);
@@ -2137,9 +2620,10 @@ fn replay_with_authority_v1(
         let selected_exit = select_exit(
             decision,
             &entry_quote,
-            &evidence,
+            evidence,
             &plan.policy,
             &plan.trailing_thresholds,
+            plan.time_exit.as_ref(),
         )?;
         let (exit_reference, exit_reason, modeled_exit_price, slippage_pips_charged) =
             if let Some((exit_quote, exit_reason)) = selected_exit {
@@ -2229,4 +2713,137 @@ fn replay_with_authority_v1(
         authority,
         promotion_eligibility,
     })
+}
+
+#[cfg(test)]
+mod indexed_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn indexed_book_lookup_matches_linear_oracle_including_duplicate_timestamps() {
+        let digest = "11".repeat(32);
+        let identity = ReviewedQuoteReplayRuleIdentityV2::new(&digest, &digest, &digest)
+            .expect("synthetic review identity");
+        for order in [
+            None,
+            Some(SameTimestampCrossSideOrderV1::BidBeforeAsk),
+            Some(SameTimestampCrossSideOrderV1::AskBeforeBid),
+        ] {
+            let policy = QuoteValidatedResearchReplayPolicyV1::new(
+                100,
+                100,
+                100,
+                VersionedLatencySlippagePolicyV1::new("lookup-fixture", 0, 0, 0.0, 0.0001)
+                    .expect("explicit synthetic assumptions"),
+                order.map(|order| {
+                    ReviewedSameTimestampMergeRuleV1::new(identity.clone(), order)
+                        .expect("synthetic same-timestamp ordering")
+                }),
+            )
+            .expect("synthetic lookup policy");
+            for length in 0..34 {
+                let quotes = (0..length)
+                    .map(|index| {
+                        ExactHistoricalQuoteV1::new(
+                            1_000 + index / 3,
+                            1.0 + index as f64 / 1_024.0,
+                            ExactQuoteSourceOrdinalV1::new(0, 0, index as u64)
+                                .expect("source ordinal"),
+                        )
+                        .expect("sorted synthetic quote")
+                    })
+                    .collect::<Vec<_>>();
+                for at in 998..1_014 {
+                    for (opposite, entry) in [
+                        (QuoteSideV1::Bid, QuoteSideV1::Ask),
+                        (QuoteSideV1::Ask, QuoteSideV1::Bid),
+                    ] {
+                        let before = quotes.iter().rfind(|quote| quote.timestamp_unix_ms < at);
+                        let at_time = quotes.iter().rfind(|quote| quote.timestamp_unix_ms == at);
+                        let expected = match (at_time, order) {
+                            (None, _) => Ok(before),
+                            (Some(_), None) => Err(QuoteValidatedResearchReplayErrorCodeV1::AmbiguousSameTimestampCrossSideOutcome),
+                            (Some(quote), Some(SameTimestampCrossSideOrderV1::BidBeforeAsk))
+                                if opposite == QuoteSideV1::Bid => Ok(Some(quote)),
+                            (Some(quote), Some(SameTimestampCrossSideOrderV1::AskBeforeBid))
+                                if opposite == QuoteSideV1::Ask => Ok(Some(quote)),
+                            _ => Ok(before),
+                        };
+                        let actual =
+                            latest_book_quote_at_entry(opposite, entry, &quotes, at, &policy)
+                                .map_err(|error| error.code());
+                        assert_eq!(
+                            actual, expected,
+                            "length={length}, at={at}, order={order:?}, opposite={opposite:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_trailing_lookup_matches_linear_oracle_at_every_boundary() {
+        for (direction, stop, target, prices) in [
+            (
+                ResearchPositionDirectionV1::Long,
+                1.0,
+                2.0,
+                [0.75, 1.0, 1.0, 1.25, 1.5],
+            ),
+            (
+                ResearchPositionDirectionV1::Short,
+                2.0,
+                1.0,
+                [2.25, 2.0, 2.0, 1.75, 1.5],
+            ),
+        ] {
+            let decision =
+                CanonicalBarSignalResearchDecisionV1::new(1_000, 2_000, direction, stop, target)
+                    .expect("synthetic decision");
+            let thresholds = prices
+                .into_iter()
+                .enumerate()
+                .map(|(index, price)| {
+                    let at = 2_000 + index as i64 * 10;
+                    ClosedCanonicalBarTrailingThresholdV1::new(at - 1, at, direction, price)
+                        .expect("monotone owned trailing threshold")
+                })
+                .collect::<Vec<_>>();
+            for count in 0..=thresholds.len() {
+                let schedule = &thresholds[..count];
+                for at in 1_999..2_052 {
+                    let expected = schedule
+                        .iter()
+                        .filter(|threshold| threshold.effective_at_next_bar_open_unix_ms <= at)
+                        .fold(
+                            (stop, QuoteValidatedResearchExitReasonV1::Stop),
+                            |previous, threshold| {
+                                let tightens = match direction {
+                                    ResearchPositionDirectionV1::Long => {
+                                        threshold.threshold_price > previous.0
+                                    }
+                                    ResearchPositionDirectionV1::Short => {
+                                        threshold.threshold_price < previous.0
+                                    }
+                                };
+                                if tightens {
+                                    (
+                                        threshold.threshold_price,
+                                        QuoteValidatedResearchExitReasonV1::TrailingStop,
+                                    )
+                                } else {
+                                    previous
+                                }
+                            },
+                        );
+                    assert_eq!(
+                        effective_stop_price(&decision, schedule, at),
+                        expected,
+                        "count={count}, at={at}, direction={direction:?}"
+                    );
+                }
+            }
+        }
+    }
 }

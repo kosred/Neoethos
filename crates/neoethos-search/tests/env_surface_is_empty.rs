@@ -26,12 +26,19 @@ use std::path::{Path, PathBuf};
 /// Reads that are allowed to remain, each because it CANNOT change what a run
 /// computes. `(path suffix, why)` — the path is matched with `ends_with` on a
 /// forward-slash-normalised relative path.
-const ALLOWED: &[(&str, &str)] = &[(
-    "src/execution_profile.rs",
-    "RECORDER + the retired-env reporter. `raw_env` writes ambient values into the run \
+const ALLOWED: &[(&str, &str)] = &[
+    (
+        "src/execution_profile.rs",
+        "RECORDER + the retired-env reporter. `raw_env` writes ambient values into the run \
          profile and nothing branches on the result; `report_retired_env_vars` exists \
          precisely to shout that a retired name is set and ignored.",
-)];
+    ),
+    (
+        "src/population_execution_evidence_v1_contract.rs",
+        "TEST-ONLY MODULE selected by `#[cfg(test)]` plus an explicit `#[path]` in lib.rs; \
+         its CUDA opt-in read can only select a real-device test and is absent from release.",
+    ),
+];
 
 fn is_env_read(line: &str) -> bool {
     let trimmed = line.trim_start();
@@ -114,7 +121,12 @@ fn cfg_test_lines(src: &str) -> Vec<bool> {
     let mut skip = vec![false; lines.len()];
     let mut i = 0usize;
     while i < lines.len() {
-        if !lines[i].trim_start().starts_with("#[cfg(test)]") {
+        let attribute = lines[i].trim_start();
+        let cfg_mentions_test = attribute.starts_with("#[cfg(")
+            && attribute
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .any(|token| token == "test");
+        if !cfg_mentions_test {
             i += 1;
             continue;
         }

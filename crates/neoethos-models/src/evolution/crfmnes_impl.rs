@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use crfmnes::{CrfmnesOptimizer as CrfmnesBackendOptimizer, rec_lamb};
 #[cfg(feature = "neuro-evolution")]
 use nalgebra::DVector;
-use ndarray::Array2;
+use ndarray::{Array2, Axis};
 use neoethos_data::FeatureFrame;
 use neoethos_execution_budget::CpuLease;
 use rand::SeedableRng;
@@ -15,7 +15,7 @@ use std::path::Path;
 use neoethos_core::BackendKind;
 
 #[cfg(feature = "neuro-evolution-gpu")]
-use super::crfmnes_gpu::try_selection_losses_cuda;
+use super::crfmnes_gpu::CrfmnesCudaSession;
 use crate::base::{
     ExpertModel, build_runtime_prediction_with_details, three_class_runtime_confidence,
     try_build_runtime_artifact_metadata,
@@ -32,7 +32,7 @@ use crate::runtime::capabilities::{
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     FeatureScaler, METADATA_FILE_NAME, ensure_feature_columns_match, feature_matrix_from_frame,
-    read_json, remap_three_class_labels, softmax_rows, write_json,
+    read_json, remap_three_class_labels, softmax_rows, temporal_train_validation_split, write_json,
 };
 
 const NEURO_EVO_ARTIFACT_FILE_NAME: &str = "neuro_evo.json";
@@ -416,6 +416,7 @@ struct NeuroEvoArtifact {
     islands: usize,
     dataset_rows: usize,
     train_rows: usize,
+    embargo_rows: usize,
     val_rows: usize,
     feature_columns: Vec<String>,
     scaler: FeatureScaler,
@@ -444,6 +445,7 @@ impl Default for NeuroEvoArtifact {
             islands: 1,
             dataset_rows: 0,
             train_rows: 0,
+            embargo_rows: 0,
             val_rows: 0,
             feature_columns: Vec::new(),
             scaler: FeatureScaler {
@@ -471,6 +473,7 @@ pub struct NeuroEvoExpert {
     islands: usize,
     dataset_rows: usize,
     train_rows: usize,
+    embargo_rows: usize,
     val_rows: usize,
     feature_columns: Vec<String>,
     scaler: Option<FeatureScaler>,
@@ -531,6 +534,7 @@ impl NeuroEvoExpert {
             islands: 1,
             dataset_rows: 0,
             train_rows: 0,
+            embargo_rows: 0,
             val_rows: 0,
             feature_columns: Vec::new(),
             scaler: None,
@@ -558,20 +562,6 @@ impl NeuroEvoExpert {
         };
         self.effective_device_policy = "unresolved".to_string();
         self
-    }
-
-    fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
-        if rows <= 4 {
-            return ((0..rows).collect(), Vec::new());
-        }
-
-        let val_rows = ((rows as f64) * 0.2).round() as usize;
-        let val_rows = val_rows.clamp(1, rows.saturating_sub(1));
-        let train_rows = rows - val_rows;
-
-        let train = (0..train_rows).collect::<Vec<_>>();
-        let val = (train_rows..rows).collect::<Vec<_>>();
-        (train, val)
     }
 
     fn slice_rows(features: &Array2<f32>, indices: &[usize]) -> Array2<f32> {
@@ -661,9 +651,12 @@ impl NeuroEvoExpert {
             bail!("neuro-evo artifact label mapping mismatch");
         }
 
-        if metadata.training_summary.dataset_rows
-            != metadata.training_summary.train_rows + metadata.training_summary.val_rows
-        {
+        let accounted_rows = metadata
+            .training_summary
+            .train_rows
+            .checked_add(metadata.training_summary.embargo_rows)
+            .and_then(|rows| rows.checked_add(metadata.training_summary.val_rows));
+        if accounted_rows != Some(metadata.training_summary.dataset_rows) {
             bail!("neuro-evo artifact training summary is inconsistent");
         }
         if metadata.training_summary.train_rows == 0 {
@@ -742,8 +735,14 @@ impl NeuroEvoExpert {
         if artifact.train_rows == 0 {
             bail!("neuro-evo artifact train_rows must be greater than zero");
         }
-        if artifact.train_rows + artifact.val_rows != artifact.dataset_rows {
-            bail!("neuro-evo artifact train_rows + val_rows must equal dataset_rows");
+        let accounted_rows = artifact
+            .train_rows
+            .checked_add(artifact.embargo_rows)
+            .and_then(|rows| rows.checked_add(artifact.val_rows));
+        if accounted_rows != Some(artifact.dataset_rows) {
+            bail!(
+                "neuro-evo artifact train_rows + embargo_rows + val_rows must equal dataset_rows"
+            );
         }
         if artifact.search_backend.trim().is_empty() {
             bail!("neuro-evo artifact must persist a runtime backend label");
@@ -836,6 +835,7 @@ impl NeuroEvoExpert {
             bail!("neuro-evo artifact dataset row count does not match metadata");
         }
         if metadata.training_summary.train_rows != artifact.train_rows
+            || metadata.training_summary.embargo_rows != artifact.embargo_rows
             || metadata.training_summary.val_rows != artifact.val_rows
         {
             bail!("neuro-evo artifact training summary does not match metadata");
@@ -993,7 +993,11 @@ impl NeuroEvoExpert {
         if self.dataset_rows == 0 || self.train_rows == 0 {
             bail!("neuro-evo training summary is incomplete");
         }
-        if self.train_rows + self.val_rows != self.dataset_rows {
+        let accounted_rows = self
+            .train_rows
+            .checked_add(self.embargo_rows)
+            .and_then(|rows| rows.checked_add(self.val_rows));
+        if accounted_rows != Some(self.dataset_rows) {
             bail!("neuro-evo training summary is inconsistent");
         }
         let scaler = self.scaler.as_ref().context("neuro-evo scaler missing")?;
@@ -1055,26 +1059,28 @@ impl ExpertModel for NeuroEvoExpert {
     fn fit(&mut self, x: &FeatureFrame, y: &[i32], lease: &CpuLease) -> Result<()> {
         lease.scope(|| {
         let (features, feature_columns) = feature_matrix_from_frame(x)?;
-        let scaler = FeatureScaler::fit(&features)?;
-        let scaled = neuro_evo_backend_f32_matrix(&scaler.transform(&features)?)?;
         let labels = remap_three_class_labels(y)?;
-        if scaled.nrows() < 32 {
+        if features.nrows() < 32 {
             bail!(
                 "neuro-evo requires at least 32 rows, received {}",
-                scaled.nrows()
+                features.nrows()
             );
         }
+
+        let split = temporal_train_validation_split(features.nrows());
+        let scaler = FeatureScaler::fit(&features.select(Axis(0), &split.train_indices))?;
+        let scaled = neuro_evo_backend_f32_matrix(&scaler.transform(&features)?)?;
 
         self.input_dim = scaled.ncols().max(1);
         self.feature_columns = feature_columns;
         self.scaler = Some(scaler.clone());
         self.dataset_rows = scaled.nrows();
-        let (train_indices, val_indices) = Self::split_train_val_indices(scaled.nrows());
-        let train_features = Self::slice_rows(&scaled, &train_indices);
-        let val_features = Self::slice_rows(&scaled, &val_indices);
-        let train_labels = Self::slice_labels(&labels, &train_indices);
-        let val_labels = Self::slice_labels(&labels, &val_indices);
+        let train_features = Self::slice_rows(&scaled, &split.train_indices);
+        let val_features = Self::slice_rows(&scaled, &split.validation_indices);
+        let train_labels = Self::slice_labels(&labels, &split.train_indices);
+        let val_labels = Self::slice_labels(&labels, &split.validation_indices);
         self.train_rows = train_features.nrows();
+        self.embargo_rows = split.embargo_rows;
         self.val_rows = val_features.nrows();
         let param_dim = Self::parameter_dim(self.input_dim, self.hidden_dim);
         let mut best_params = vec![0.0_f32; param_dim];
@@ -1103,6 +1109,26 @@ impl ExpertModel for NeuroEvoExpert {
         let _cubecl_training_residency_scope = resolved_cuda_policy
             .as_ref()
             .map(|_| crate::cubecl_lifecycle::cubecl_residency_scope());
+        // One immutable device dataset spans every island and generation.
+        // The evolutionary solver's ask/tell remains on the host; the session
+        // uploads only changing candidates and reads compact losses thereafter.
+        #[cfg(feature = "neuro-evolution-gpu")]
+        let mut cuda_session = resolved_cuda_policy
+            .as_deref()
+            .map(|policy| {
+                CrfmnesCudaSession::new(
+                    &train_features,
+                    &train_labels,
+                    &val_features,
+                    &val_labels,
+                    self.input_dim,
+                    self.hidden_dim,
+                    param_dim,
+                    policy,
+                )
+            })
+            .transpose()
+            .context("prepare run-owned CR-FM-NES CUDA fitness datasets")?;
         #[cfg(not(feature = "neuro-evolution-gpu"))]
         if let crate::common::ResolvedCudaDevicePolicy::Cuda { ordinal } = resolved_cuda_device {
             bail!(
@@ -1129,18 +1155,8 @@ impl ExpertModel for NeuroEvoExpert {
             for _ in 0..effective_generations {
                 let _ = optimizer.run_generation_batch(|candidates| {
                     #[cfg(feature = "neuro-evolution-gpu")]
-                    if let Some(cuda_policy) = resolved_cuda_policy.as_deref() {
-                        let losses = try_selection_losses_cuda(
-                            candidates,
-                            &train_features,
-                            &train_labels,
-                            &val_features,
-                            &val_labels,
-                            self.input_dim,
-                            self.hidden_dim,
-                            param_dim,
-                            cuda_policy,
-                        )
+                    if let Some(session) = cuda_session.as_mut() {
+                        let losses = session.selection_losses(candidates)
                         .context("execute requested CR-FM-NES cuda fitness kernel")?;
                         if losses.len() != candidates.len() {
                             bail!(
@@ -1237,7 +1253,12 @@ impl ExpertModel for NeuroEvoExpert {
             CapabilityState::Implemented,
             self.feature_columns.clone(),
             default_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(self.dataset_rows, self.train_rows, self.val_rows),
+            TrainingSummaryMetadata::new(
+                self.dataset_rows,
+                self.train_rows,
+                self.embargo_rows,
+                self.val_rows,
+            ),
         )?;
         write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
         write_json(
@@ -1251,6 +1272,7 @@ impl ExpertModel for NeuroEvoExpert {
                 islands: self.islands,
                 dataset_rows: self.dataset_rows,
                 train_rows: self.train_rows,
+                embargo_rows: self.embargo_rows,
                 val_rows: self.val_rows,
                 feature_columns: self.feature_columns.clone(),
                 scaler: self.scaler.clone().context("neuro-evo scaler missing")?,
@@ -1279,6 +1301,7 @@ impl ExpertModel for NeuroEvoExpert {
         let next_islands = artifact.islands.max(1);
         let next_dataset_rows = artifact.dataset_rows;
         let next_train_rows = artifact.train_rows;
+        let next_embargo_rows = artifact.embargo_rows;
         let next_val_rows = artifact.val_rows;
         let next_feature_columns = artifact.feature_columns;
         let next_scaler = Some(artifact.scaler);
@@ -1298,6 +1321,7 @@ impl ExpertModel for NeuroEvoExpert {
         self.islands = next_islands;
         self.dataset_rows = next_dataset_rows;
         self.train_rows = next_train_rows;
+        self.embargo_rows = next_embargo_rows;
         self.val_rows = next_val_rows;
         self.feature_columns = next_feature_columns;
         self.scaler = next_scaler;
@@ -1322,6 +1346,7 @@ impl NeuroEvoExpert {
             TrainingSummaryMetadata::new(
                 artifact.dataset_rows,
                 artifact.train_rows,
+                artifact.embargo_rows,
                 artifact.val_rows,
             ),
         )
@@ -1331,20 +1356,8 @@ impl NeuroEvoExpert {
         sidecar: &RuntimeArtifactMetadata,
         embedded: &RuntimeArtifactMetadata,
     ) -> Result<()> {
-        if sidecar.model_name != embedded.model_name
-            || sidecar.family != embedded.family
-            || sidecar.state != embedded.state
-        {
-            bail!("neuro-evo metadata identity mismatch between sidecar and embedded payload");
-        }
-        if sidecar.feature_columns != embedded.feature_columns {
-            bail!("neuro-evo metadata feature columns drift between sidecar and embedded");
-        }
-        if sidecar.label_mapping != embedded.label_mapping {
-            bail!("neuro-evo metadata label mapping drift between sidecar and embedded");
-        }
-        if sidecar.training_summary != embedded.training_summary {
-            bail!("neuro-evo metadata training summary drift between sidecar and embedded");
+        if sidecar != embedded {
+            bail!("neuro-evo runtime metadata drift between sidecar and embedded payload");
         }
         Ok(())
     }
@@ -1478,11 +1491,13 @@ mod tests {
         let metadata: crate::runtime::artifacts::RuntimeArtifactMetadata =
             read_json(&path.join(METADATA_FILE_NAME))?;
         assert_eq!(metadata.training_summary.dataset_rows, 32);
-        assert_eq!(metadata.training_summary.train_rows, 26);
+        assert_eq!(metadata.training_summary.train_rows, 25);
+        assert_eq!(metadata.training_summary.embargo_rows, 1);
         assert_eq!(metadata.training_summary.val_rows, 6);
 
         let artifact: NeuroEvoArtifact = read_json(&path.join(NEURO_EVO_ARTIFACT_FILE_NAME))?;
-        assert_eq!(artifact.train_rows, 26);
+        assert_eq!(artifact.train_rows, 25);
+        assert_eq!(artifact.embargo_rows, 1);
         assert_eq!(artifact.val_rows, 6);
         let (expected_backend, expected_reason) = expected_training_backend();
         assert_eq!(artifact.search_backend, expected_backend);
@@ -1507,7 +1522,8 @@ mod tests {
         expert.scaler = Some(scaler);
         expert.params = vec![0.0; NeuroEvoExpert::parameter_dim(2, 8)];
         expert.dataset_rows = 32;
-        expert.train_rows = 26;
+        expert.train_rows = 25;
+        expert.embargo_rows = 1;
         expert.val_rows = 6;
         expert.fitted = true;
 
@@ -1530,7 +1546,8 @@ mod tests {
         expert.scaler = Some(scaler);
         expert.params = vec![0.0; NeuroEvoExpert::parameter_dim(2, 8)];
         expert.dataset_rows = 32;
-        expert.train_rows = 26;
+        expert.train_rows = 25;
+        expert.embargo_rows = 1;
         expert.val_rows = 6;
         expert.search_backend = FALLBACK_BACKEND_NAME.to_string();
         expert.runtime_degraded_reason = Some(FALLBACK_DEGRADED_REASON.to_string());
@@ -1567,7 +1584,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["f1".to_string()],
             default_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(32, 26, 6),
+            TrainingSummaryMetadata::new(32, 25, 1, 6),
         );
         let artifact = NeuroEvoArtifact {
             input_dim: 1,
@@ -1578,6 +1595,7 @@ mod tests {
             islands: 1,
             dataset_rows: 32,
             train_rows: 32,
+            embargo_rows: 0,
             val_rows: 1,
             feature_columns: vec!["f1".to_string()],
             scaler: FeatureScaler {
@@ -1596,7 +1614,10 @@ mod tests {
 
         let err = NeuroEvoExpert::validate_loaded_artifact(&metadata, &artifact)
             .expect_err("inconsistent train/val rows should be rejected");
-        assert!(err.to_string().contains("train_rows + val_rows"));
+        assert!(
+            err.to_string()
+                .contains("train_rows + embargo_rows + val_rows")
+        );
         Ok(())
     }
 
@@ -1608,7 +1629,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["f1".to_string()],
             default_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(32, 26, 6),
+            TrainingSummaryMetadata::new(32, 25, 1, 6),
         );
         let artifact = NeuroEvoArtifact {
             input_dim: 1,
@@ -1618,7 +1639,8 @@ mod tests {
             population: 4,
             islands: 1,
             dataset_rows: 32,
-            train_rows: 26,
+            train_rows: 25,
+            embargo_rows: 1,
             val_rows: 6,
             feature_columns: vec!["f1".to_string()],
             scaler: FeatureScaler {
@@ -1649,7 +1671,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["f1".to_string()],
             default_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(32, 26, 6),
+            TrainingSummaryMetadata::new(32, 25, 1, 6),
         );
         let artifact = NeuroEvoArtifact {
             input_dim: 1,
@@ -1659,7 +1681,8 @@ mod tests {
             population: 4,
             islands: 1,
             dataset_rows: 32,
-            train_rows: 26,
+            train_rows: 25,
+            embargo_rows: 1,
             val_rows: 6,
             feature_columns: vec!["f1".to_string()],
             scaler: FeatureScaler {
@@ -1712,7 +1735,10 @@ mod tests {
 
         let mut loaded = NeuroEvoExpert::default();
         loaded.load(&path)?;
-        assert_eq!(loaded.train_rows + loaded.val_rows, loaded.dataset_rows);
+        assert_eq!(
+            loaded.train_rows + loaded.embargo_rows + loaded.val_rows,
+            loaded.dataset_rows
+        );
         let _ = std::fs::remove_dir_all(&path);
         Ok(())
     }

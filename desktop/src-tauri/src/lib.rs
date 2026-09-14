@@ -215,6 +215,30 @@ mod mcp_sidecar {
 
     static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
 
+    fn candidate_paths(
+        bin_name: &str,
+        resource_dir: Option<&std::path::Path>,
+        executable: Option<&std::path::Path>,
+        debug_build: bool,
+        dev_server: bool,
+        developer_candidate: impl FnOnce() -> Option<std::path::PathBuf>,
+    ) -> Vec<std::path::PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(resource_dir) = resource_dir {
+            candidates.push(resource_dir.join(bin_name));
+        }
+        if debug_build && dev_server {
+            if let Some(path) = developer_candidate() {
+                candidates.push(path);
+            }
+        }
+        if let Some(dir) = executable.and_then(std::path::Path::parent) {
+            candidates.push(dir.join(bin_name));
+            candidates.push(dir.join("resources").join(bin_name));
+        }
+        candidates
+    }
+
     /// Locate + spawn the sidecar. Called AFTER `prepare_data_root` so the
     /// CWD is the per-user data root — `mcp_servers.json` lives there and
     /// the sidecar's relative default resolves to it.
@@ -224,8 +248,9 @@ mod mcp_sidecar {
         } else {
             "neoethos-mcp"
         };
-        // Search the path reported by Tauri first, then the two development /
-        // portable layouts. Linux deb/rpm resources live under
+        // Search the path reported by Tauri first, then the isolated workspace
+        // output in debug dev-server builds, then the two portable layouts. Linux deb/rpm
+        // resources live under
         // `/usr/lib/NeoEthos`, not beside the `/usr/bin` executable, so current
         // executable discovery alone is not a packaged-runtime contract.
         //
@@ -238,16 +263,34 @@ mod mcp_sidecar {
         // real install uses; `warn_retired_env_vars` names the variable if it
         // is still set.
         let mut checked: Vec<std::path::PathBuf> = Vec::new();
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(resource_dir) = resource_dir {
-            candidates.push(resource_dir.join(bin_name));
-        }
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(dir) = exe_path.parent() {
-                candidates.push(dir.join(bin_name)); // beside the exe
-                candidates.push(dir.join("resources").join(bin_name)); // tauri resources subdir
-            }
-        }
+        // `npm run tauri dev` builds the isolated outbound MCP workspace via
+        // the `predev:tauri` hook.  It deliberately has its own target tree, so
+        // it will never appear beside `target/debug/neoethos-desktop.exe` unless
+        // this debug dev-server path is included. Release builds do not
+        // contain the developer checkout path; their config bundles the sidecar
+        // into Tauri's resource directory above.
+        let executable = std::env::current_exe().ok();
+        let candidates = candidate_paths(
+            bin_name,
+            resource_dir,
+            executable.as_deref(),
+            cfg!(debug_assertions),
+            tauri::is_dev(),
+            || {
+                #[cfg(debug_assertions)]
+                {
+                    Some(
+                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../mcp/target/debug")
+                            .join(bin_name),
+                    )
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    None
+                }
+            },
+        );
         let exe = candidates.into_iter().find(|p| {
             let hit = p.exists();
             if !hit {
@@ -295,6 +338,78 @@ mod mcp_sidecar {
                 }
             }
             Err(e) => eprintln!("MCP sidecar failed to start ({}): {e}", exe.display()),
+        }
+    }
+
+    #[cfg(test)]
+    mod candidate_tests {
+        use super::candidate_paths;
+        use std::cell::Cell;
+        use std::path::{Path, PathBuf};
+
+        fn portable_paths() -> Vec<PathBuf> {
+            vec![
+                PathBuf::from("bundle").join("neoethos-mcp.exe"),
+                PathBuf::from("runtime").join("neoethos-mcp.exe"),
+                PathBuf::from("runtime")
+                    .join("resources")
+                    .join("neoethos-mcp.exe"),
+            ]
+        }
+
+        #[test]
+        fn embedded_debug_and_release_candidates_never_resolve_checkout() {
+            for (debug_build, dev_server) in [(true, false), (false, false), (false, true)] {
+                let paths = candidate_paths(
+                    "neoethos-mcp.exe",
+                    Some(Path::new("bundle")),
+                    Some(Path::new("runtime/neoethos-desktop.exe")),
+                    debug_build,
+                    dev_server,
+                    || panic!("embedded debug/release must not inspect the checkout"),
+                );
+                assert_eq!(paths, portable_paths());
+            }
+        }
+
+        #[test]
+        fn development_server_keeps_resource_then_checkout_then_portable_order() {
+            let calls = Cell::new(0);
+            let checkout = PathBuf::from("checkout/mcp/target/debug/neoethos-mcp.exe");
+            let paths = candidate_paths(
+                "neoethos-mcp.exe",
+                Some(Path::new("bundle")),
+                Some(Path::new("runtime/neoethos-desktop.exe")),
+                true,
+                true,
+                || {
+                    calls.set(calls.get() + 1);
+                    Some(checkout.clone())
+                },
+            );
+            let mut expected = portable_paths();
+            expected.insert(1, checkout);
+            assert_eq!(paths, expected);
+            assert_eq!(calls.get(), 1);
+        }
+
+        #[test]
+        fn actual_tauri_feature_mode_controls_development_candidate() {
+            let calls = Cell::new(0);
+            let paths = candidate_paths(
+                "neoethos-mcp.exe",
+                None,
+                None,
+                cfg!(debug_assertions),
+                tauri::is_dev(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Some(PathBuf::from("checkout"))
+                },
+            );
+            let expected = usize::from(cfg!(debug_assertions) && tauri::is_dev());
+            assert_eq!(paths.len(), expected);
+            assert_eq!(calls.get(), expected);
         }
     }
 
@@ -1033,6 +1148,34 @@ mod gate1_desktop_contract_tests {
         assert!(error.contains("g1-abcd"));
         assert!(error.contains("refresh the Data inventory"));
     }
+
+    #[test]
+    fn desktop_close_preserves_confirmation_and_sidecars_before_default_tauri_teardown() {
+        // This guards the wiring; native idle and busy-close tests must still
+        // verify actual WebView destruction and termination of worker threads.
+        let source = include_str!("lib.rs");
+        let run = &source[source.rfind("pub fn run()").expect("desktop entrypoint")..];
+        let handler = run
+            .split_once(".on_window_event(")
+            .expect("desktop window handler")
+            .1
+            .split_once(".run(tauri::generate_context!())")
+            .expect("default Tauri event loop")
+            .0;
+        assert!(handler.contains("tauri::WindowEvent::CloseRequested"));
+        assert!(handler.contains("backend::engine_running()"));
+        assert!(handler.contains(".set_parent(window)"));
+        assert!(handler.contains("rfd::MessageDialogResult::Yes"));
+        let cancel = handler.find("api.prevent_close();").expect("close veto");
+        let cancel_return = cancel + handler[cancel..].find("return;").expect("veto returns");
+        let mcp = handler.find("mcp_sidecar::stop();").expect("owned MCP cleanup");
+        let mesh = handler.find("mesh_sidecar::stop();").expect("owned mesh cleanup");
+        assert!(cancel < cancel_return && cancel_return < mcp && mcp < mesh);
+        assert!(
+            !handler.contains("process::exit("),
+            "accepted close must return to Tauri so the window and WebView are destroyed first"
+        );
+    }
 }
 
 /// Environment variables this shell used to obey and no longer does, paired
@@ -1118,6 +1261,14 @@ fn prepare_desktop_startup(raw_args: &[String]) -> Result<PreparedDesktopStartup
     trace
         .record(StartupEvent::ConfigurationLoaded)
         .map_err(|error| error.to_string())?;
+
+    // The backend is linked into this executable: neoethos-app's main() never
+    // runs here. Install the shared file/console subscriber before any workers
+    // start, in release as well as debug. Its log bridge also captures Tauri's
+    // and the broker adapter's log:: events; a second plugin logger conflicts
+    // with that process-global bridge.
+    neoethos_core::logging::setup_logging(false)
+        .map_err(|error| format!("initialize desktop runtime logging: {error:#}"))?;
 
     let parent_cpu_assignment =
         parse_parent_cpu_assignment(raw_args).map_err(|error| error.to_string())?;
@@ -1223,13 +1374,6 @@ pub fn run() {
 
     let run_result = tauri::Builder::default()
         .setup(|app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
             // Start the full neoethos-app API in-process (Discovery, Training,
             // Risk, Journal, News, Intelligence, Data, Hardware, Autonomous,
             // Codex, …) — every old Flutter feature, reachable from the new UI.
@@ -1272,14 +1416,12 @@ pub fn run() {
             broker::reauth_broker,
             broker::refresh_broker_costs,
         ])
-        .on_window_event(|_window, event| {
-            // Heavy Discovery/Training work runs on tokio blocking threads. A
-            // tight CPU loop there can keep the process alive past window close
-            // — the operator reported a stuck search that only a full REBOOT
-            // stopped. When the operator closes the window, hard-exit the whole
-            // process so EVERY worker thread dies immediately: "close = stop",
-            // guaranteed, no orphaned CPU, no reboot. Broker positions are held
-            // server-side by cTrader, so exiting never touches live orders.
+        .on_window_event(|window, event| {
+            // Preserve "close = stop", including CPU-bound blocking workers.
+            // The normal Tauri event loop exits the process after destroying
+            // the last window; it does not wait for our Tokio runtime to drop.
+            // Exiting inside CloseRequested skipped that destruction and the
+            // WebView2 controller's cleanup.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // Accidental-close guard (2026-07-20): a ~30h discovery run
                 // was killed at 95.5% by an unintended window close. When an
@@ -1288,6 +1430,9 @@ pub fn run() {
                 // operator in an unclosable window.
                 if backend::engine_running() {
                     let close_anyway = rfd::MessageDialog::new()
+                        // Keep the confirmation modal to this window; an
+                        // unowned dialog leaves the close button active.
+                        .set_parent(window)
                         .set_level(rfd::MessageLevel::Warning)
                         .set_title("NeoEthos — engine running")
                         .set_description(
@@ -1303,11 +1448,10 @@ pub fn run() {
                         return;
                     }
                 }
-                // Kill the sidecar children FIRST — process::exit would
-                // orphan them (they're independent OS processes).
+                // Stop our independent child processes before returning to
+                // Tauri for window/WebView destruction and process teardown.
                 mcp_sidecar::stop();
                 mesh_sidecar::stop();
-                std::process::exit(0);
             }
         })
         .run(tauri::generate_context!());

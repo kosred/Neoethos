@@ -153,6 +153,7 @@ pub struct RegimeHmmExpert {
     /// Stored as a Vec of N_STATES 2×2 matrices for clarity.
     emission_covs: Vec<Array2<f64>>,
     feature_columns: Vec<String>,
+    training_summary: TrainingSummaryMetadata,
     config: HmmRegimeConfig,
 }
 
@@ -378,6 +379,7 @@ impl RegimeHmmExpert {
             emission_means,
             emission_covs: covs,
             feature_columns,
+            training_summary: TrainingSummaryMetadata::new(n, n, 0, 0),
             config,
         })
     }
@@ -723,7 +725,7 @@ impl RegimeHmmExpert {
             CapabilityState::Implemented,
             self.feature_columns.clone(),
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(1, 1, 0),
+            self.training_summary.clone(),
         )?;
         let artifact = HmmRegimeArtifact {
             precision_schema: HMM_F64_SCHEMA.to_string(),
@@ -737,7 +739,7 @@ impl RegimeHmmExpert {
                 .iter()
                 .flat_map(|m| m.iter().copied())
                 .collect(),
-            training_summary: TrainingSummaryMetadata::new(1, 1, 0),
+            training_summary: self.training_summary.clone(),
             runtime_metadata: Some(metadata),
             config: self.config,
         };
@@ -778,6 +780,22 @@ impl RegimeHmmExpert {
                 HMM_FEATURE_COLUMNS,
                 artifact.feature_columns
             );
+        }
+        let expected_runtime_metadata = try_build_runtime_artifact_metadata(
+            MODEL_NAME,
+            ModelFamily::Meta,
+            CapabilityState::Implemented,
+            artifact.feature_columns.clone(),
+            canonical_three_class_label_mapping(),
+            artifact.training_summary.clone(),
+        )
+        .context("validate HMM regime training summary")?;
+        let runtime_metadata = artifact
+            .runtime_metadata
+            .as_ref()
+            .context("HMM regime artifact is missing runtime metadata")?;
+        if runtime_metadata != &expected_runtime_metadata {
+            bail!("HMM regime runtime metadata does not match the persisted training contract");
         }
         if artifact.initial_probs.len() != N_STATES {
             bail!(
@@ -846,6 +864,7 @@ impl RegimeHmmExpert {
             emission_means,
             emission_covs,
             feature_columns: artifact.feature_columns,
+            training_summary: artifact.training_summary,
             config: artifact.config,
         })
     }
@@ -980,6 +999,10 @@ mod tests {
         expert.save_to_path(&tmp).expect("save");
         let loaded = RegimeHmmExpert::load_from_artifact(&tmp).expect("load");
         assert_eq!(loaded.feature_columns, expert.feature_columns);
+        assert_eq!(loaded.training_summary.dataset_rows, 600);
+        assert_eq!(loaded.training_summary.train_rows, 600);
+        assert_eq!(loaded.training_summary.embargo_rows, 0);
+        assert_eq!(loaded.training_summary.val_rows, 0);
         // π should round-trip exactly.
         for s in 0..3 {
             assert!(

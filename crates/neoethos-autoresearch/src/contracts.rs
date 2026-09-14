@@ -53,8 +53,8 @@ mod required_symbols {
     };
     // Run identity: two sweeps with the same hash are the same experiment.
     use neoethos_search::run_identity::{
-        MEASURED_TRAILING_PAYOFF_CEILING, PayoffCeilingInputs, ResolvedConfigStamp,
-        assert_payoff_floor_reachable, max_achievable_payoff,
+        PayoffCeilingInputs, ResolvedConfigStamp, assert_payoff_floor_reachable,
+        max_achievable_payoff,
     };
     // The DSR / PBO reader. `redeflate_sharpe` is what lets the runner install
     // the session-wide N after the fact: a single search cannot know the honest
@@ -237,9 +237,8 @@ pub enum MissingCapability {
     /// §13.2.3 — the OOS window is empty, too short, or overlaps the span the
     /// sweeps will load.
     OosWindowUnusable { detail: String },
-    /// §13.2.4 — the BASELINE configuration's payoff floor is unreachable under
-    /// its own geometry. The space cannot express the question.
-    BaselineFloorUnreachable { floor: f64, detail: String },
+    /// The baseline floor or execution geometry contains invalid numerical inputs.
+    InvalidBaselinePayoffInputs { floor: f64, detail: String },
     /// §13.2.5 — the FIRST live sweep produced no readable trial-returns
     /// matrix. On sweep 1 that means the wiring is absent, not that the
     /// configuration was bad.
@@ -280,12 +279,9 @@ impl fmt::Display for MissingCapability {
                  cannot carry a verdict makes every promotion unfalsifiable, and a leaked OOS \
                  window cannot be un-leaked."
             ),
-            Self::BaselineFloorUnreachable { floor, detail } => write!(
+            Self::InvalidBaselinePayoffInputs { floor, detail } => write!(
                 f,
-                "STARTUP ABORT — the BASELINE configuration's payoff floor ({floor}) is \
-                 unreachable under its own resolved geometry, so the space cannot express the \
-                 question the loop is being asked. Every sweep's answer would be fixed before a \
-                 bar was read. {detail}"
+                "STARTUP ABORT — invalid baseline payoff inputs (floor {floor}): {detail}"
             ),
             Self::FirstSweepUnreadable { reason } => write!(
                 f,
@@ -377,11 +373,11 @@ pub fn startup_selfcheck(cfg: &ResolvedInputs<'_>) -> Result<(), MissingCapabili
         });
     }
 
-    // 4. The baseline configuration must be able to EXPRESS the question.
+    // 4. Validate numerical domains, not an assumed ceiling on realized payoff.
     if let Err(err) =
         assert_payoff_floor_reachable(cfg.baseline_payoff_floor, &cfg.baseline_payoff_inputs)
     {
-        return Err(MissingCapability::BaselineFloorUnreachable {
+        return Err(MissingCapability::InvalidBaselinePayoffInputs {
             floor: cfg.baseline_payoff_floor,
             detail: format!("{err:#}"),
         });
@@ -537,14 +533,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_baseline_floor_aborts() {
+    fn an_ambitious_baseline_floor_is_measured_not_prejudged() {
         let g = goals();
         let mut cfg = inputs(&g);
-        // A floor of 20.0 against a 40:10 geometry is arithmetically impossible.
+        // Full-TP/full-SL geometry does not bound average realized wins/losses.
         cfg.baseline_payoff_floor = 20.0;
+        assert!(startup_selfcheck(&cfg).is_ok());
+    }
+
+    #[test]
+    fn invalid_baseline_payoff_inputs_still_abort() {
+        let g = goals();
+        let mut cfg = inputs(&g);
+        cfg.baseline_payoff_inputs.sl_min_pips = 0.0;
         assert!(matches!(
             startup_selfcheck(&cfg),
-            Err(MissingCapability::BaselineFloorUnreachable { .. })
+            Err(MissingCapability::InvalidBaselinePayoffInputs { .. })
         ));
     }
 

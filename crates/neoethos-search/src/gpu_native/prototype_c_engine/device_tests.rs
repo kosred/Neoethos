@@ -85,9 +85,14 @@ fn adaptive_stop_workload(population: usize, bars: usize) -> PrototypePopulation
     let fixture = TinyPopulationFixture::new(population, bars, 4);
     let (mut dataset, mut genes, scenarios) = fixture.prototype_a_uploads();
     dataset.settings.adaptive_base_pips = Some(vec![14.0; dataset.bars()]);
-    dataset.settings.adaptive_rr = 2.0;
+    // A deliberately unrelated fallback ensures device/oracle parity can only
+    // pass if adaptive candidates retain their own target/stop ratio.
+    dataset.settings.adaptive_rr = 9.0;
     for (index, multiplier) in genes.stop_vol_multipliers.iter_mut().enumerate() {
         *multiplier = if index % 2 == 0 { 0.0 } else { 1.25 };
+        let stop = 10.0 + index as f64;
+        genes.stop_pips[index] = stop;
+        genes.target_pips[index] = stop * (1.25 + index as f64 * 0.5);
     }
     PrototypePopulationWorkload::from_uploads(
         dataset,

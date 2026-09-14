@@ -60,7 +60,7 @@ fn scope_classic_ta_device_fixture_admission_v3(
         .iter()
         .copied()
         .collect::<HashSet<_>>();
-    let mut admission = build_classic_ta_admission_plan(rows, rows);
+    let mut admission = build_classic_ta_admission_plan(rows, rows, None);
     admission.admitted_indicator_ids = admitted_indicator_ids;
     admission.capability_deferred_indicator_ids = Vec::new();
     admission.capability_deferred_output_count = 0;

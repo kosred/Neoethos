@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     //
     // Now: a failed load is fatal for every subcommand that decides money or
     // spends hours, and survivable ONLY for the diagnostic commands you would
-    // reach for to fix it (`config`, `credentials`, `setup`, `wizard`,
+    // reach for to fix it (`config`, `credentials`, `setup`,
     // `--help`, `--version`). Those run on built-in defaults with an
     // unmissable banner, never quietly.
     let raw_args: Vec<String> = std::env::args().collect();
@@ -63,7 +63,6 @@ fn main() -> Result<()> {
                 "config"
                     | "credentials"
                     | "setup"
-                    | "wizard"
                     | "--help"
                     | "-h"
                     | "help"
@@ -75,7 +74,7 @@ fn main() -> Result<()> {
             eprintln!("──────────────────────────────────────────────────────────────");
             eprintln!("CONFIG NOT LOADED");
             eprintln!(
-                "  tried: $CONFIG_FILE, then {}, then ./config.yaml",
+                "  tried: $CONFIG_FILE, then {} (the cwd ./config.yaml fallback is retired)",
                 path.display()
             );
             eprintln!("  {err:#}");
@@ -182,7 +181,10 @@ fn main() -> Result<()> {
                 "failed to write CLI 'tui STARTED' subsystem record"
             );
         }
-        let res = tui::run_tui(None);
+        let res = tui::run_tui(
+            startup_settings.system.data_dir.clone(),
+            startup_settings.system.cache_dir.clone(),
+        );
         if let Err(err) = write_subsystem_record(
             SubsystemSection::Cli,
             cli_record(
@@ -228,7 +230,6 @@ fn main() -> Result<()> {
         "canonical-cost-build" => canonical_full_run::build_cost_assumptions(tail, settings),
         "canonical-contract-build" => canonical_full_run::build_contract(tail, settings),
         "canonical-train" => canonical_full_run::train_receipt_bound(tail, settings),
-        "canonical-full-run" => canonical_full_run::run(&args[2..], &startup_settings),
         "native-research" => native_research::run(tail),
         "train" => cmd_train(&args[2..]),
         "discover" => cmd_discover(&args[2..]),
@@ -249,7 +250,6 @@ fn main() -> Result<()> {
         "autoresearch" => cmd_autoresearch(&args[2..]),
         "schedule" => cmd_schedule(&args[2..]),
         "stop-target" => cmd_stop_target(&args[2..]),
-        "wizard" => cmd_wizard(&args[2..]),
         "setup" => cmd_setup(&args[2..]),
         "credentials" => cmd_credentials(&args[2..]),
         _ => {
@@ -1441,6 +1441,11 @@ fn cmd_discovery_promote_weekly(args: &[String]) -> Result<()> {
         .with_context(|| format!("load strict v3 live portfolio {portfolio_path}"))?;
     let search_receipt = artifact.search_scope.receipt().clone();
     let config_hash = artifact.search_config_hash.clone();
+    let resolved_config_hash = &artifact.live_trading_policy.source_resolved_config_hash;
+    anyhow::ensure!(
+        !resolved_config_hash.is_empty(),
+        "weekly promotion requires the validated portfolio's resolved-config hash"
+    );
     let anchor = search_receipt.validate()?;
     let symbol = anchor.symbol_name().to_owned();
     let tf = anchor.timeframe().as_str().to_owned();
@@ -1454,6 +1459,7 @@ fn cmd_discovery_promote_weekly(args: &[String]) -> Result<()> {
         &tf,
         &search_receipt,
         &config_hash,
+        resolved_config_hash,
     )?
     .ok_or_else(|| {
         anyhow::anyhow!(
@@ -1984,14 +1990,172 @@ struct StreamingArtifactBundle {
     streamed: bool,
 }
 
+const CANONICAL_CPU_RESEARCH_FLAGS: [&str; 6] = [
+    "--research-authority-root",
+    "--research-plan-sha256",
+    "--research-matrix-sha256",
+    "--research-cost-assumptions",
+    "--research-broker-symbol-contract",
+    "--research-settings-source",
+];
+
+#[derive(Debug, Clone)]
+struct CanonicalCpuResearchInputs {
+    authority_root: std::path::PathBuf,
+    plan_sha256: String,
+    matrix_sha256: String,
+    cost_assumptions: std::path::PathBuf,
+    broker_symbol_contract: std::path::PathBuf,
+    settings_source: std::path::PathBuf,
+}
+
+fn parse_canonical_cpu_research_inputs(
+    args: &[String],
+) -> Result<Option<CanonicalCpuResearchInputs>> {
+    let requested = CANONICAL_CPU_RESEARCH_FLAGS
+        .iter()
+        .any(|flag| args.iter().any(|arg| arg == flag));
+    if !requested {
+        return Ok(None);
+    }
+
+    let value = |flag: &str| -> Result<String> {
+        let positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| (arg == flag).then_some(index))
+            .collect();
+        anyhow::ensure!(
+            positions.len() == 1,
+            "canonical CPU research requires {flag} exactly once (found {})",
+            positions.len()
+        );
+        let value = args
+            .get(positions[0] + 1)
+            .filter(|value| !value.trim().is_empty() && !value.starts_with("--"))
+            .with_context(|| format!("canonical CPU research argument {flag} has no value"))?;
+        Ok(value.clone())
+    };
+
+    Ok(Some(CanonicalCpuResearchInputs {
+        authority_root: value("--research-authority-root")?.into(),
+        plan_sha256: value("--research-plan-sha256")?,
+        matrix_sha256: value("--research-matrix-sha256")?,
+        cost_assumptions: value("--research-cost-assumptions")?.into(),
+        broker_symbol_contract: value("--research-broker-symbol-contract")?.into(),
+        settings_source: value("--research-settings-source")?.into(),
+    }))
+}
+
+fn discovery_config_from_cli(
+    args: &[String],
+    defaults: &neoethos_search::DiscoveryConfig,
+    symbol: &str,
+    base: &str,
+    higher_timeframes: &[String],
+    account_currency: &str,
+) -> neoethos_search::DiscoveryConfig {
+    let population = parse_flag(args, "--population")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(defaults.population);
+    let generations = parse_flag(args, "--generations")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(defaults.generations);
+    let max_indicators = parse_flag(args, "--max-indicators")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(defaults.max_indicators);
+    let candidate_count = parse_flag(args, "--candidates")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(defaults.candidate_count);
+    let portfolio_size = parse_flag(args, "--portfolio-size")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(defaults.portfolio_size);
+    let corr_threshold = parse_flag(args, "--corr")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(defaults.corr_threshold);
+    let min_trades_per_day = parse_flag(args, "--min-trades")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(defaults.min_trades_per_day);
+
+    neoethos_search::DiscoveryConfig {
+        timeframe_label: base.to_owned(),
+        evaluation_symbol: symbol.to_owned(),
+        evaluation_account_currency: account_currency.to_owned(),
+        population,
+        generations,
+        max_indicators,
+        candidate_count,
+        portfolio_size,
+        corr_threshold,
+        min_trades_per_day,
+        higher_timeframes: higher_timeframes.to_vec(),
+        filtering: defaults.filtering.clone(),
+        ..defaults.clone()
+    }
+    .apply_mode_overrides()
+}
+
+fn emit_cpu_research_stage(stage: &str) {
+    println!("canonical_cpu_research_stage={stage}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn emit_cpu_research_progress(progress: neoethos_search::DiscoveryProgress) {
+    println!("canonical_cpu_research_progress={progress:?}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
 fn cmd_discover(args: &[String]) -> Result<()> {
+    let installed = neoethos_core::execution_budget::installed_process_budget()
+        .context("Discovery unavailable before the immutable process CPU budget is installed")?;
+    let width = installed.resolved().effective_worker_limit;
+    let broker = installed.broker().clone();
+    let executor =
+        neoethos_core::execution::BudgetedCpuExecutor::new_for_broker(broker.clone(), width);
+    let lease = broker
+        .acquire(neoethos_core::execution_budget::CpuPermitRequest::local(
+            width,
+        ))
+        .context("acquire the complete process CPU budget for Discovery")?;
+
+    executor
+        .execute(lease.into_transfer(), move || {
+            let observed_width =
+                neoethos_core::execution::BudgetedCpuExecutor::current_pool_width();
+            anyhow::ensure!(
+                observed_width == width.get(),
+                "Discovery CPU execution width mismatch: installed={}, observed={observed_width}",
+                width.get()
+            );
+            tracing::info!(
+                target: "neoethos_cli::discover",
+                installed_worker_limit = width.get(),
+                rayon_pool_workers = observed_width,
+                "Discovery entered the lease-bound CPU pool"
+            );
+            cmd_discover_on_budgeted_pool(args)
+        })
+        .context("execute Discovery on the lease-bound CPU pool")?
+}
+
+fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
     let result = (|| -> Result<(String, String, usize, usize)> {
         let settings = resolve_cli_settings(args)?;
-        let defaults = settings
-            .as_ref()
-            .map(neoethos_search::DiscoveryConfig::try_from_settings)
-            .transpose()?
-            .unwrap_or_default();
+        let canonical_cpu_research = parse_canonical_cpu_research_inputs(args)?;
+        #[cfg(feature = "gpu-nvidia")]
+        anyhow::ensure!(
+            canonical_cpu_research.is_none(),
+            "canonical CPU research flags require a CPU-only neoethos-cli build; CUDA builds must use the sealed native research route"
+        );
+        let defaults = if canonical_cpu_research.is_some() {
+            neoethos_search::DiscoveryConfig::default()
+        } else {
+            settings
+                .as_ref()
+                .map(neoethos_search::DiscoveryConfig::try_from_settings)
+                .transpose()?
+                .unwrap_or_default()
+        };
         let root = parse_root(args, settings.as_ref());
         let symbol =
             parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
@@ -2039,27 +2203,6 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                     .filter(|c| !c.trim().is_empty())
             })
             .unwrap_or_default();
-        let population: usize = parse_flag(args, "--population")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(defaults.population);
-        let generations: usize = parse_flag(args, "--generations")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(defaults.generations);
-        let max_indicators: usize = parse_flag(args, "--max-indicators")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(defaults.max_indicators);
-        let candidate_count: usize = parse_flag(args, "--candidates")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(defaults.candidate_count);
-        let portfolio_size: usize = parse_flag(args, "--portfolio-size")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(defaults.portfolio_size);
-        let corr_threshold: f64 = parse_flag(args, "--corr")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(defaults.corr_threshold);
-        let min_trades_per_day: f64 = parse_flag(args, "--min-trades")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(defaults.min_trades_per_day);
         let out = parse_flag(args, "--out")
             .unwrap_or_else(|| "cache/vector_ta_knowledge.json".to_string());
 
@@ -2079,27 +2222,19 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         #[cfg(not(feature = "gpu-nvidia"))]
         let base_ohlcv = base_frame.ohlcv();
 
-        let config = neoethos_search::DiscoveryConfig {
-            timeframe_label: base.clone(),
-            // F-304 fix (2026-05-28): bind the CLI-resolved symbol +
-            // account currency BEFORE `..defaults.clone()` so the
-            // cost-model receives the operator's chosen values, not
-            // the (potentially stale or empty) settings copy. Empty
-            // values still propagate and trip the run-loud guard.
-            evaluation_symbol: symbol.clone(),
-            evaluation_account_currency: account_currency.clone(),
-            population,
-            generations,
-            max_indicators,
-            candidate_count,
-            portfolio_size,
-            corr_threshold,
-            min_trades_per_day,
-            filtering: defaults.filtering,
-            ..defaults.clone()
-        }
-        .apply_mode_overrides();
-        // ── THE STREAMING WORKING-SET SWEEP (opt-in) ────────────────────────
+        // F-304 fix (2026-05-28): bind the CLI-resolved symbol + account
+        // currency before the cost model runs. The explicit higher-TF list is
+        // bound here too; previously `--higher` changed feature preparation but
+        // left the serialized/runtime config on the settings list.
+        let config = discovery_config_from_cli(
+            args,
+            &defaults,
+            &symbol,
+            &base,
+            &higher_list,
+            &account_currency,
+        );
+        // ── THE STREAMING WORKING-SET SWEEP ─────────────────────────────────
         //
         // `--stream-sweep` advances the working set through the
         // (indicator, period) space in batches instead of building ONE cube and
@@ -2111,10 +2246,14 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         // memory is a function of the hardware and never of what the operator
         // typed (the never-OOM invariant).
         //
-        // WITHOUT the flag this is byte-for-byte the previous code: one
+        // For ordinary Discovery, WITHOUT the flag this is byte-for-byte the previous code: one
         // `prepare_multitimeframe_features`, one holdout cycle, the same
         // artifacts. That is the parity case, and it is the default.
-        let stream_sweep = has_flag(args, "--stream-sweep");
+        // Canonical CPU research always advances through the complete bounded
+        // working-set sweep.  Every batch is sealed against its own exact
+        // content receipt below, so wider search no longer weakens provenance.
+        // Ordinary Discovery keeps the historical opt-in flag.
+        let stream_sweep = canonical_cpu_research.is_some() || has_flag(args, "--stream-sweep");
         let stream_max_batches: usize = parse_flag(args, "--stream-max-batches")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
@@ -2192,20 +2331,19 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                         )?;
                         let base_frame = dataset
                             .canonical_frame(selection.base_identity.timeframe().as_str())?;
-                        let input = neoethos_data::with_extended_sweep_working_set(batch, || {
-                            let features =
-                                neoethos_data::prepare_multitimeframe_features_with_options(
-                                    &dataset,
-                                    selection.base_identity.timeframe().as_str(),
-                                    &feature_options,
-                                )?;
-                            neoethos_search::data_selection::CanonicalSearchInput::from_prepared_canonical_frame(
-                                selection.base_identity.clone(),
-                                base_frame,
-                                features,
-                            )
-                            .map_err(anyhow::Error::new)
-                        })?;
+                        let features =
+                            neoethos_data::prepare_multitimeframe_features_batch_with_options(
+                                &dataset,
+                                selection.base_identity.timeframe().as_str(),
+                                &feature_options,
+                                batch,
+                            )?;
+                        let input = neoethos_search::data_selection::CanonicalSearchInput::from_prepared_canonical_frame(
+                            selection.base_identity.clone(),
+                            base_frame,
+                            features,
+                        )
+                        .map_err(anyhow::Error::new)?;
                         Ok((input, no_physical_gpu_admission))
                     },
                     |_batch| {
@@ -2270,16 +2408,215 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         };
 
         #[cfg(not(feature = "gpu-nvidia"))]
+        if let Some(research_inputs) = canonical_cpu_research.as_ref() {
+            let settings_ref = settings
+                .as_ref()
+                .context("canonical CPU research requires loaded settings")?;
+            let base_timeframe = base
+                .parse::<neoethos_data::CanonicalTimeframe>()
+                .map_err(anyhow::Error::msg)
+                .context("parse canonical CPU research base timeframe")?;
+            let normalization_training_rows =
+                neoethos_search::canonical_discovery_normalization_training_rows(
+                    base_ohlcv.close.len(),
+                )?;
+            let feature_options = neoethos_data::FeatureBuildOptions {
+                higher_tfs: higher_list.clone(),
+                prefix_base_features: settings_ref.system.multi_resolution_prefix_base,
+                normalization_training_rows: Some(normalization_training_rows),
+                ..neoethos_data::FeatureBuildOptions::default()
+            };
+
+            if let Some(parent) = std::path::Path::new(&out).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            canonical_full_run::ensure_cpu_research_output_target(
+                std::path::Path::new(&out),
+                &[
+                    research_inputs.cost_assumptions.as_path(),
+                    research_inputs.broker_symbol_contract.as_path(),
+                    research_inputs.settings_source.as_path(),
+                ],
+            )?;
+
+            let mut outcome = neoethos_search::orchestration::run_streaming_working_set(
+                &neoethos_search::orchestration::StreamingPlan::streaming(stream_max_batches),
+                base_ohlcv.close.len(),
+                |batch| {
+                    let cursor = batch.as_ref().map(|value| value.cursor).unwrap_or(0);
+                    emit_cpu_research_stage(&format!("feature_build_started cursor={cursor}"));
+                    let features =
+                        neoethos_data::prepare_multitimeframe_features_batch_with_options(
+                            &dataset,
+                            &base,
+                            &feature_options,
+                            batch,
+                        )?;
+                    emit_cpu_research_stage(&format!("feature_build_completed cursor={cursor}"));
+                    Ok(features)
+                },
+                |features| {
+                    emit_cpu_research_stage("content_receipt_started");
+                    let run_input = neoethos_search::data_selection::CanonicalSearchRunInputV2::from_fresh_feature_frame(
+                        &selection.base_identity,
+                        features,
+                        &base_frame,
+                    )?;
+                    let receipt = run_input.receipt().clone();
+                    emit_cpu_research_stage("content_receipt_completed");
+                    let contract = canonical_full_run::seal_cpu_research_contract_for_input(
+                        settings_ref,
+                        &research_inputs.authority_root,
+                        std::path::Path::new(&root),
+                        &research_inputs.plan_sha256,
+                        &research_inputs.matrix_sha256,
+                        &symbol,
+                        base_timeframe,
+                        &research_inputs.cost_assumptions,
+                        &research_inputs.broker_symbol_contract,
+                        &research_inputs.settings_source,
+                        receipt,
+                    )?;
+                    let research_defaults = neoethos_search::DiscoveryConfig::try_from_settings_for_canonical_trendbar_research(
+                        settings_ref,
+                        &contract,
+                    )?;
+                    let research_config = discovery_config_from_cli(
+                        args,
+                        &research_defaults,
+                        &symbol,
+                        &base,
+                        &higher_list,
+                        &account_currency,
+                    );
+                    emit_cpu_research_stage("search_pipeline_started");
+                    neoethos_search::run_canonical_trendbar_research_discovery_with_holdout_and_progress(
+                        &run_input,
+                        &research_config,
+                        &contract,
+                        neoethos_search::PropFirmRiskRules::default(),
+                        emit_cpu_research_progress,
+                    )
+                },
+            )?;
+
+            let canonical_survivors = outcome.survivors();
+            let canonical_feature_names = outcome.canonical.names().to_vec();
+            let ledger = outcome.ledger.clone();
+            let streamed = outcome.streamed;
+            let next_cursor = outcome.next_cursor;
+            let space_len = outcome.space_len;
+            let batch_columns = outcome.batch_columns;
+
+            // Keep every completed receipt-bound result, including negative
+            // batches. A failed build/cycle has no valid envelope and remains
+            // represented by its exact cursor and reason in `ledger`.
+            let mut completed = Vec::with_capacity(
+                outcome.batches.len() + outcome.completed_without_survivors.len(),
+            );
+            completed.extend(
+                outcome
+                    .batches
+                    .drain(..)
+                    .map(|batch| (batch.cursor, batch.pairs, batch.result)),
+            );
+            completed.extend(
+                outcome
+                    .completed_without_survivors
+                    .drain(..)
+                    .map(|batch| (batch.cursor, batch.pairs, batch.result)),
+            );
+            completed.sort_by_key(|(cursor, _, _)| *cursor);
+
+            // The compatibility path `<out>` remains one complete V3 research
+            // envelope. Prefer a surviving batch as primary; the run-level
+            // index beside it names every other exact envelope.
+            if let Some(primary) = completed
+                .iter()
+                .position(|(_, _, research)| !research.discovery_result().portfolio.is_empty())
+            {
+                completed.swap(0, primary);
+            }
+
+            let mut batch_evidence = Vec::with_capacity(completed.len());
+            let mut portfolio_count = 0usize;
+            let mut candidate_count = 0usize;
+            for (index, (cursor, pairs, research)) in completed.iter().enumerate() {
+                research.validate()?;
+                let path = if index == 0 {
+                    out.clone()
+                } else {
+                    format!("{out}.batch{cursor}.research.json")
+                };
+                neoethos_core::storage::json::write_json_atomic(&path, research)?;
+                let batch_portfolios = research.discovery_result().portfolio.len();
+                let batch_candidates = research.discovery_result().candidates.len();
+                portfolio_count += batch_portfolios;
+                candidate_count += batch_candidates;
+                batch_evidence.push(serde_json::json!({
+                    "cursor": cursor,
+                    "pairs": pairs,
+                    "evidence_path": path,
+                    "research_contract_sha256": research.execution_contract().identity_sha256()?,
+                    "discovery_evidence_sha256": research.evidence_identity_sha256(),
+                    "portfolio_count": batch_portfolios,
+                    "candidate_count": batch_candidates,
+                }));
+            }
+
+            let streaming_path = format!("{out}.streaming.json");
+            let streaming_index = serde_json::json!({
+                "schema": "neoethos.canonical-cpu-research-streaming-index.v1",
+                "artifact_class": "ResearchOnly",
+                "promotion_eligibility": "NotPromotionEligible",
+                "authorization_issued": false,
+                "symbol": &symbol,
+                "base_timeframe": &base,
+                "streamed": streamed,
+                "next_cursor": next_cursor,
+                "space_len": space_len,
+                "batch_columns": batch_columns,
+                "canonical_feature_names": canonical_feature_names,
+                "canonical_survivors": canonical_survivors,
+                "ledger": ledger,
+                "batch_evidence": batch_evidence,
+                "portfolio_count": portfolio_count,
+                "candidate_count": candidate_count,
+            });
+            neoethos_core::storage::json::write_json_atomic(&streaming_path, &streaming_index)?;
+
+            println!("canonical_cpu_research_status=complete");
+            println!("artifact_class=ResearchOnly");
+            println!("promotion_eligibility=NotPromotionEligible");
+            println!("authorization_issued=false");
+            println!("streamed={streamed}");
+            println!("cursor={next_cursor}/{space_len}");
+            println!("batch_columns={batch_columns}");
+            println!("completed_batch_evidence={}", completed.len());
+            println!("portfolio_count={portfolio_count}");
+            println!("candidate_count={candidate_count}");
+            println!("evidence_path={out}");
+            println!("streaming_index_path={streaming_path}");
+            anyhow::ensure!(
+                !completed.is_empty(),
+                "canonical CPU research completed no receipt-bound batch; inspect {streaming_path} for the per-cursor failure ledger"
+            );
+            anyhow::ensure!(
+                portfolio_count > 0,
+                "canonical CPU research {symbol} {base} completed the bounded sweep but selected no portfolio; every completed negative envelope and the run ledger were persisted under {out}"
+            );
+            return Ok((symbol, base, portfolio_count, candidate_count));
+        }
+
+        #[cfg(not(feature = "gpu-nvidia"))]
         let (result, streaming) = if !stream_sweep {
             let features =
                 neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs)?;
-            let receipt =
-                neoethos_search::data_selection::CanonicalSearchInputReceiptV2::from_feature_frame(
-                    &selection.base_identity,
-                    &features,
-                )?;
-            let run_input = neoethos_search::data_selection::CanonicalSearchRunInputV2::new(
-                receipt,
+            let run_input =
+                neoethos_search::data_selection::CanonicalSearchRunInputV2::from_fresh_feature_frame(
+                &selection.base_identity,
                 &features,
                 &base_frame,
             )?;
@@ -2306,13 +2643,9 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                     )
                 },
                 |features| {
-                    let receipt = neoethos_search::data_selection::CanonicalSearchInputReceiptV2::from_feature_frame(
-                        &selection.base_identity,
-                        features,
-                    )?;
                     let run_input =
-                        neoethos_search::data_selection::CanonicalSearchRunInputV2::new(
-                            receipt,
+                        neoethos_search::data_selection::CanonicalSearchRunInputV2::from_fresh_feature_frame(
+                            &selection.base_identity,
                             features,
                             &base_frame,
                         )?;
@@ -2936,7 +3269,7 @@ fn truncate(s: &str, n: usize) -> String {
 /// Enumerates symbol×TF combos, asks `scheduler::plan_combo` how each should be
 /// admitted, then runs single-card / CPU combos across all cards concurrently —
 /// each as a subprocess `discover` pinned via
-/// `NEOETHOS_BOT_SEARCH_EVAL_{WGPU,CUDA}_DEVICE`. Oversized populations are
+/// `NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE`. Oversized populations are
 /// reported as requiring single-device chunking; they are never described as
 /// cross-card shards that the worker does not execute.
 ///
@@ -3253,16 +3586,9 @@ fn spawn_discover_combo(
         // Read back in `main()` via `parse_flag(&raw_args, "--cpu-threads")`.
         .arg("--cpu-threads")
         .arg(a.cpu_threads.to_string());
-    // NOTE: intra-combo GPU sharding (the plural *_DEVICES env) is DISABLED at
-    // the dispatch layer — the cubecl wgpu multi-device path panics
-    // at runtime ("Memory page 0 doesn't exist" in cubecl-runtime client.rs) and
-    // falls back to slow CPU recompute. Validated 2026-06-07 on the 2×A6000 VPS:
-    // M1 ran 58 min on CPU (gen 305/20000, 0 results) before we caught it. Until
-    // that cubecl multi-device issue is fixed, every combo runs on the PROVEN
-    // single-device path, pinned to its first assigned card (H4 validated: card
-    // at 120 MiB, clean run). Combo-level throughput (one combo per card,
-    // concurrent) is preserved; the multi-device code in eval.rs stays in place,
-    // gated behind the plural env which we simply no longer set.
+    // One worker owns one CUDA device. Combo-level throughput still uses all
+    // cards by running one combo per card concurrently; no retired backend
+    // selector or cross-device alias is emitted.
     for (key, value) in gpu_assignment_env(a, hardware) {
         cmd.env(key, value);
     }
@@ -3294,20 +3620,13 @@ fn gpu_assignment_env(
                     device.backend_index.to_string(),
                 );
             }
-            backend if backend.is_wgpu_family() => {
-                if let Some(selector) = device.cubecl_wgpu_selector() {
-                    envs.insert("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", selector);
-                }
-            }
             AcceleratorBackend::Cpu | AcceleratorBackend::Rocm => {}
-            _ => {}
         }
         return envs;
     }
 
     // Backwards compatibility for synthetic/legacy profiles that contain only
     // `gpu_mem_gb` and therefore cannot describe a backend or adapter class.
-    envs.insert("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE", slot.to_string());
     envs.insert("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE", slot.to_string());
     envs
 }
@@ -3979,16 +4298,10 @@ fn autoresearch_help() {
     println!("    autoresearch store. It never places an order and never touches the broker.");
 }
 
-/// `neoethos-cli wizard` — TUI counterpart of the desktop first-run
-/// wizard. Spec §8 (`installer_wizard_ux_spec.md`).
-fn cmd_wizard(_args: &[String]) -> Result<()> {
-    tui::run_wizard_tui()
-}
-
 /// `neoethos-cli setup` — Task #61 headless setup helper. Closes the
 /// CLI parity gap: prints canonical credentials paths, shows which
-/// config files exist on disk, and emits ready-to-paste TOML / JSON
-/// templates for the operator to scp into place on a headless host.
+/// config files exist on disk, and emits a ready-to-paste TOML template
+/// for the operator to place on a headless host.
 ///
 /// Sub-modes:
 ///   `neoethos-cli setup`             — same as `setup show`
@@ -3996,12 +4309,9 @@ fn cmd_wizard(_args: &[String]) -> Result<()> {
 ///   `neoethos-cli setup ctrader`     — print broker_credentials.toml template
 ///   `neoethos-cli setup paths`       — print just the canonical directories
 ///
-/// We intentionally do NOT write binary state here — the on-disk
-/// schemas live in `neoethos-app::app_services` which the CLI crate
-/// can't depend on (creates a cycle). Operators paste the template
-/// into the canonical path manually OR drive the egui wizard once
-/// on a desktop and `scp` the resulting `broker_credentials.toml`
-/// to the headless host.
+/// `setup` is read-only. The separate `credentials set` command writes the
+/// shared `neoethos_core::broker_config` contract directly, so there is one
+/// writer for both the CLI and desktop application.
 fn cmd_setup(args: &[String]) -> Result<()> {
     let mode = args.first().map(String::as_str).unwrap_or("show");
     match mode {
@@ -4034,14 +4344,15 @@ fn setup_help() {
     println!("    paths      Print just the canonical directories, one per line (scripting)");
     println!("    ctrader    Emit a broker_credentials.toml template for the cTrader broker");
     println!();
-    println!("    The CLI does NOT write binary state — paste the template into the canonical");
-    println!("    path printed by `setup paths`. Drive the egui wizard once on a desktop if you");
-    println!("    prefer a graphical flow, then `scp` the resulting `broker_credentials.toml`.");
+    println!("    `setup` is read-only. Use `neoethos-cli credentials set ...` to write the");
+    println!(
+        "    shared broker_credentials.toml contract, or use Broker Setup in the desktop app."
+    );
 }
 
 /// Canonical user-config directory — matches the resolution in
-/// `neoethos-app::broker_persistence::credentials_file_path` exactly so
-/// `neoethos-cli setup` prints the same paths the GUI writes to.
+/// `neoethos_core::broker_config::credentials_file_path` exactly so
+/// `neoethos-cli setup` prints the same path every active writer uses.
 /// Order: env override → `dirs::config_dir()/neoethos` → `.local/neoethos`.
 fn canonical_user_config_dir() -> std::path::PathBuf {
     // Test-seam env var: matches `BROKER_CREDENTIALS_PATH_ENV_VAR` in
@@ -4081,15 +4392,7 @@ fn setup_show() -> Result<()> {
         ),
         (
             "risky_mode_state.json",
-            "Risky Mode arm + ack ledger (written by the desktop wizard's Apply step)",
-        ),
-        (
-            "wizard_state.json",
-            "Wizard completion sentinel + per-step status (resume-from-disk hint)",
-        ),
-        (
-            "risk_acknowledgement.json",
-            "Append-only ledger of the 5-question risk-quiz acknowledgements (Task #68)",
+            "Risky Mode arm and kill-switch persistence (written by the app runtime)",
         ),
     ];
     println!("Expected files:");
@@ -4118,7 +4421,7 @@ fn setup_ctrader_template() -> Result<()> {
     println!("# Replace the placeholder values with the credentials from the cTrader Open API");
     println!("# Developer Portal (https://openapi.ctrader.com). For accounts with");
     println!("# `enabled_for_execution = true`, the bot will route orders. Leaving the");
-    println!("# array empty is fine — the GUI's account-discovery step populates it.");
+    println!("# array empty is fine — Broker Setup in the desktop app can populate it.");
     println!();
     println!("schema_version = 1");
     println!();
@@ -4457,7 +4760,7 @@ fn has_flag(args: &[String], name: &str) -> bool {
 
 /// `credentials` subcommand — write `broker_credentials.toml` headlessly.
 ///
-/// This is the CLI parity for the Flutter Settings → cTrader credentials
+/// This is the CLI parity for the desktop Settings → cTrader credentials
 /// form. Same file, same schema, same path-resolution rules — the
 /// shared writer lives in `neoethos_core::broker_config` so the two
 /// frontends can never drift.
@@ -4664,9 +4967,6 @@ fn print_help() {
         "  canonical-contract-build --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --base-timeframe M1 --cost-assumptions <json> --broker-symbol-contract <json> --settings-source <yaml> --contract-out <json> --receipt-out <json>"
     );
     println!(
-        "  canonical-full-run --authority-root <dir> --data-root <dir> --plan-sha256 <sha> \\\n         --matrix-sha256 <sha> --symbol EURUSD --base-timeframe M1 \\\n         --cost-assumptions <json> --broker-symbol-contract <json> \\\n         --settings-source <yaml> --models-dir <dir> --out <json> \\\n         --receipt-out <json>"
-    );
-    println!(
         "  canonical-train --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --base-timeframe H4 --input-receipt <json> --cost-assumptions <json> --broker-symbol-contract <json> --settings-source <yaml> --models-dir <dir> --oos-from-ms <unix-ms> --out <json> --receipt-out <json>"
     );
     println!(
@@ -4679,10 +4979,13 @@ fn print_help() {
         "  discover --symbol EURUSD --base M1 --higher H1,H4 [--dataset-identity d1-...] --population 100 --generations 5 --max-indicators 12 --portfolio-size 100 --candidates 200 --corr 0.7 --min-trades 1 --out cache/vector_ta_knowledge.json --root data"
     );
     println!(
+        "  discover ... --research-authority-root <dir> --research-plan-sha256 <sha> --research-matrix-sha256 <sha> --research-cost-assumptions <json> --research-broker-symbol-contract <json> --research-settings-source <yaml>  CPU-only exact-receipt canonical-trendbar run; <out> is the complete ResearchOnly / NotPromotionEligible evidence envelope, never a live portfolio."
+    );
+    println!(
         "                               Historical search requires every exact generation named by its receipt. Discovery/schedule require the direct base plus explicitly requested higher TFs. No timeframe is manufactured; missing data requires import/download."
     );
     println!(
-        "  discover ... --stream-sweep [--stream-max-batches N]  Sweep the (indicator, period) space in BATCHES instead of building one cube: a batch is sized from FREE RAM (never a flag), a discovery cycle runs per batch, and a batch whose candidates cannot clear the CONFIGURED expectancy floor is abandoned before the quality screen. Survivors from different batches are remapped onto one run-level feature list; every abandoned batch is named by cursor in <out>.streaming.json."
+        "  discover ... --stream-sweep [--stream-max-batches N]  Sweep the base-indicator and (indicator, period) space in disjoint BATCHES instead of rebuilding one fixed cube: a batch is sized from FREE RAM (never a flag), a discovery cycle runs per batch, and a batch whose candidates cannot clear the CONFIGURED expectancy floor is abandoned before the quality screen. Survivors from different batches are remapped onto one run-level feature list; every completed negative batch is retained by cursor in <out>.streaming.json. Canonical CPU Research enables the complete sweep automatically."
     );
     println!(
         "  discovery-promote-weekly --portfolio <live_portfolio.json> [--cache-dir cache/search]  Weekly-refresh using the strict v3 portfolio's embedded exact receipt/config authority; print 'added N new, carried M, total K'."
@@ -4741,7 +5044,6 @@ fn print_help() {
     println!(
         "                               It never places an order and never writes live_portfolio.json. The operator promotes."
     );
-    println!("  wizard                       Launch the interactive first-run wizard (TUI).");
     println!("  setup [show|paths|ctrader]  Headless credentials helper (Task #61).");
     println!("                               Prints canonical paths + ready-to-paste templates.");
     println!("  credentials show             Show on-disk broker_credentials.toml (redacted).");
@@ -5054,7 +5356,7 @@ mod tests {
     }
 
     #[test]
-    fn integrated_wgpu_assignment_uses_typed_selector_without_cuda_pin() {
+    fn cuda_assignment_uses_the_typed_backend_index() {
         use neoethos_core::scheduler::Assignment;
         use neoethos_core::system::{
             AcceleratorBackend, AcceleratorDevice, AcceleratorDeviceClass, HardwareProfile,
@@ -5068,23 +5370,23 @@ mod tests {
             cpu_threads: 3,
             class: neoethos_core::scheduler::ComboClass::Light,
         };
-        let profile = HardwareProfile {
+        let mut profile = HardwareProfile {
             schema_version: neoethos_core::system::HARDWARE_PROFILE_SCHEMA_VERSION,
             cpu_cores: 12,
             total_ram_gb: 32.0,
             available_ram_gb: 24.0,
-            gpu_names: vec!["AMD Radeon Graphics".to_string()],
+            gpu_names: vec!["NVIDIA CUDA GPU".to_string()],
             num_gpus: 1,
             gpu_mem_gb: vec![0.0],
             accelerator_devices: vec![AcceleratorDevice {
                 id: 0,
-                name: "AMD Radeon Graphics".to_string(),
-                backend: AcceleratorBackend::Vulkan,
-                device_class: AcceleratorDeviceClass::IntegratedGpu,
-                backend_index: 0,
-                memory_gb: 0.0,
-                supported_precisions: vec![TrainingPrecision::Fp32],
-                compute_capability: None,
+                name: "NVIDIA CUDA GPU".to_string(),
+                backend: AcceleratorBackend::Cuda,
+                device_class: AcceleratorDeviceClass::DiscreteGpu,
+                backend_index: 3,
+                memory_gb: 24.0,
+                supported_precisions: vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16],
+                compute_capability: Some((8, 9)),
                 source: "test".to_string(),
             }],
             timestamp: "test".to_string(),
@@ -5094,10 +5396,17 @@ mod tests {
         let envs = gpu_assignment_env(&assignment, &profile);
 
         assert_eq!(
-            envs.get("NEOETHOS_BOT_SEARCH_EVAL_WGPU_DEVICE"),
-            Some(&"integrated:0".to_string())
+            envs.get("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE"),
+            Some(&"3".to_string())
         );
-        assert!(!envs.contains_key("NEOETHOS_BOT_SEARCH_EVAL_CUDA_DEVICE"));
+
+        for backend in [AcceleratorBackend::Cpu, AcceleratorBackend::Rocm] {
+            profile.accelerator_devices[0].backend = backend;
+            assert!(
+                gpu_assignment_env(&assignment, &profile).is_empty(),
+                "an explicitly typed non-CUDA device must not emit a CUDA ordinal"
+            );
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@ use neoethos_feature_contracts::SourceArtifactBindingV1;
 use sha2::{Digest, Sha256};
 use std::{error::Error, fmt};
 
+#[cfg(feature = "gpu-cuda")]
 use super::pinned_canonical_series_v1::MaterializedPinnedResidentCanonicalSourcesV1;
 
 pub const CANONICAL_PINNED_SOURCE_PROJECTION_SCHEMA_VERSION_V1: u16 = 1;
@@ -392,6 +393,7 @@ fn update_bytes_v1(
     Ok(())
 }
 
+#[cfg(feature = "gpu-cuda")]
 pub(crate) fn derive_pinned_source_projection_v1(
     sources: &MaterializedPinnedResidentCanonicalSourcesV1,
 ) -> Result<CanonicalPinnedSourceProjectionV1, CanonicalPinnedSourceProjectionErrorV1> {

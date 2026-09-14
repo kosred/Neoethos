@@ -15,6 +15,12 @@ pub mod app_services;
 pub mod app_state;
 pub mod server;
 
+// Only tests that exercise the real process-global admission authority need
+// isolation. Their worker internals and all other tests remain parallel.
+#[cfg(test)]
+pub(crate) static PROCESS_EXECUTION_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 /// Install EVERY runtime override from the operator's settings — the SINGLE
 /// path both front-ends must call so a non-default config knob resolves to the
 /// SAME engine state everywhere (audit S05).

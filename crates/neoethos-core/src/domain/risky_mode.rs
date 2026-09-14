@@ -3,23 +3,19 @@
 //! operator directive.
 //!
 //! **This is NOT an FTMO / prop-firm variant.** It is a completely
-//! separate operating mode with explicit informed-consent semantics:
+//! separate operating mode with explicit high-risk semantics:
 //!
-//! - The operator starts with a small bankroll (default $20) and
-//!   accepts that they are extremely likely (≥ 99 % probability per
-//!   the §6.4 acceptance ceiling) to lose the starting balance while
-//!   attempting to reach a much larger target.
-//! - The bot — not the operator — owns every sizing and entry
-//!   decision once Risky Mode is armed. Manual BUY/SELL orders are
-//!   REJECTED at the gate; only [`crate::domain::risky_mode`]-aware
-//!   AI signals can place trades. This is the
-//!   `autonomous_only_contract` invariant enforced by
-//!   [`RiskyModeConfig::autonomous_only_contract_accepted`].
-//! - Risk per trade is in the operator-stated band 30 %–50 % of the
-//!   *current* bankroll (default 40 %). This is two orders of
-//!   magnitude larger than any prop-firm guidance — the operator
-//!   has signed the §6.4 acknowledgement that this is expected to
-//!   wipe out the starting capital in the typical case.
+//! - The operator starts with a small bankroll (default $20) and accepts a
+//!   higher failure rate than PropFirm mode, but risk is still sized from the
+//!   strategy's measured edge. Deliberately forcing near-certain ruin is not a
+//!   trading objective.
+//! - The autonomous live loop owns every sizing and entry decision it
+//!   sends. Manual-order policy belongs to the separate manual order
+//!   route; this manager neither receives nor pretends to gate it.
+//! - Risk per trade is a positive fraction no greater than 50 % of the current
+//!   bankroll. The shipped fallback is 10 % (half-Kelly for the fallback
+//!   52 % / 1.5R edge); production live execution replaces it with the exact
+//!   held-out half-Kelly fraction carried by the promoted portfolio.
 //!
 //! ## Strategy framing — scalp many times, net profit after expenses
 //!
@@ -46,9 +42,9 @@
 //!   via [`RiskyModeConfig::expected_trades_per_day`] to reflect
 //!   their broker's typical fill cadence.
 //!
-//! The auto-trade producer in
-//! `crates/neoethos-app/src/app_services/trading/auto_trade.rs` is the
-//! consumer of this manager.
+//! The live order path in
+//! `crates/neoethos-app/src/app_services/live_trading.rs` constructs and
+//! consults this manager.
 //!
 //! ## Composition with the rest of the risk stack
 //!
@@ -87,9 +83,8 @@ use anyhow::{Result, bail};
 
 // ---------------------------------------------------------------------------
 // Defaults — operator-directive-derived (2026-05-17 framing).
-// Every constant is `pub const` so the wizard, the auto-trade producer,
-// and the UI can render the canonical value from a single source of
-// truth.
+// Every constant is `pub const` so the live producer and the UI can render
+// the canonical value from a single source of truth.
 // ---------------------------------------------------------------------------
 
 /// Default starting bankroll in USD. The operator's "$20" framing
@@ -106,49 +101,37 @@ pub const DEFAULT_TARGET_CAPITAL_USD: f64 = 50_000.0;
 /// factor.
 pub const DEFAULT_DOUBLING_FACTOR: f64 = 2.0;
 
-/// Default risk-per-trade fraction (lower edge of the operator-stated
-/// 30 %–50 % band). This is the fraction of the *current* bankroll
-/// the bot is allowed to risk on a single trade — i.e. the SL
-/// distance × lot value implied by this fraction is what gets sent
-/// to the broker. Per the operator directive this is two orders of
-/// magnitude larger than any prop-firm-style sizing and is expected
-/// to wipe out the starting capital in the typical case.
-///
-/// **Kelly-aligned default 2026-05-25** (operator approval via math
-/// audit): lowered from 0.40 to 0.30 because Kelly criterion for
-/// the operator's typical strong-edge configuration
-/// (win_rate=0.55, reward_to_risk=2.0) gives optimal-growth
-/// f* = (0.55*2.0 − 0.45) / 2.0 = **0.325** — anything above sits
-/// in over-Kelly territory where variance dominates without
-/// commensurate growth benefit. Empirical comparison for
-/// $100→$100K target (see `docs/audit/AUDIT-FINDINGS.md` Kelly
-/// analysis table):
-///
-/// | risk_f | Expected | Ruin |
-/// |--------|---------:|-----:|
-/// | 0.40 (old) | 8 days | **5.6%** |
-/// | **0.30 (new)** | **8 days** | **0.48%** ← 12× safer, same speed |
-/// | 0.20 (sub-Kelly) | 9 days | 0.004% |
-///
-/// Operators wanting MORE aggression can still set per-stage values
-/// up to [`RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION`] (0.50) via the
-/// wizard; the default just sits at the safest point inside the
-/// signed §7.1 band.
-pub const RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION: f64 = 0.30;
+/// Fallback risk-per-trade fraction used only when no promoted strategy edge is
+/// available (for example, a standalone scenario projection). With the
+/// fallback 52 % win rate and 1.5 reward:risk, full Kelly is 20 % and
+/// half-Kelly is 10 %. Live trading does not invent this value: schema-v5
+/// portfolios carry their own held-out half-Kelly evidence.
+pub const RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION: f64 = 0.10;
 
-/// Lower bound on the per-trade risk fraction in Risky Mode. The
-/// operator-stated band is 30 %–50 %; anything below 30 % degenerates
-/// into "FTMO with a different name" and is rejected by the config
-/// validator. Operators wanting a more conservative profile should
-/// disable Risky Mode and rely on the standard
-/// [`crate::domain::risk::RiskManager`] path.
-pub const RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION: f64 = 0.30;
+/// There is no evidence-based universal positive floor. Zero is exposed as the
+/// conceptual lower boundary; validated active stages still require `> 0`.
+pub const RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION: f64 = 0.0;
 
 /// Upper bound on the per-trade risk fraction in Risky Mode. Above
-/// 50 % the single-loss-wipes-the-account regime gets so degenerate
-/// that the per-day kill switch is the only thing preventing total
-/// loss; the validator rejects anything beyond this ceiling.
+/// 50 % a single loss destroys at least half the bankroll. This remains a hard
+/// defence-in-depth ceiling, not a target or a minimum.
 pub const RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION: f64 = 0.50;
+
+/// Half-Kelly for a binary payoff described by win rate and reward:risk,
+/// bounded by the Risky hard ceiling. A non-positive edge returns zero.
+pub fn half_kelly_fraction_from_win_rate_reward_to_risk(win_rate: f64, reward_to_risk: f64) -> f64 {
+    if !win_rate.is_finite()
+        || !reward_to_risk.is_finite()
+        || win_rate <= 0.0
+        || win_rate >= 1.0
+        || reward_to_risk <= 0.0
+    {
+        return 0.0;
+    }
+    let loss_rate = 1.0 - win_rate;
+    let full_kelly = (win_rate * reward_to_risk - loss_rate) / reward_to_risk;
+    (0.5 * full_kelly).clamp(0.0, RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
+}
 
 /// Pre-broker-send sanity ceiling as a fraction of bankroll. Even
 /// with Risky Mode armed and a 50 % per-trade target, no single
@@ -156,31 +139,9 @@ pub const RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION: f64 = 0.50;
 /// process. Defence-in-depth against bugs in our own sizing.
 pub const DEFAULT_PRESEND_SANITY_CEILING_FRACTION: f64 = 0.55;
 
-/// Default minimum AI-ensemble confidence required for an entry.
-/// The auto-trade producer must clear this before its signal reaches
-/// the dispatch gate. Lower confidence → noisier scalps → expenses
-/// (commission + spread + swap) eat the net edge; the floor keeps
-/// the producer honest about what counts as actionable.
-pub const DEFAULT_SWARM_CONFIDENCE_MIN: f64 = 0.65;
-
-/// Default pairwise correlation cap. Concurrent positions in
-/// directionally-correlated pairs effectively concentrate risk; the
-/// gate refuses to open a second position when the abs correlation
-/// with an existing position exceeds this fraction.
-pub const DEFAULT_CORRELATION_CAP: f64 = 0.7;
-
-/// Default volatility-sigma threshold for the per-stage pause. When
-/// the rolling 30-day ATR exceeds this many sigmas above its mean,
-/// the per-stage kill switch fires (research §4.6.2).
-pub const DEFAULT_VOLATILITY_SIGMA_PAUSE: f64 = 3.0;
-
-/// Operator-acknowledged tail-risk ceiling on the *initial-stage*
-/// ruin probability (per `risky_mode_compounding_research.md` §6.4
-/// and the 2026-05-17 operator directive §7.1). The operator
-/// explicitly accepts that this fraction of attempts will lose the
-/// starting balance — 99 % is the directive value, capturing the
-/// "you will almost certainly lose your $20" honesty floor.
-pub const MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY: f64 = 0.99;
+/// Default cumulative monthly-loss cap as a fraction of the current
+/// bankroll. At 0.99 it is intentionally looser than the per-day cap.
+pub const DEFAULT_MONTHLY_LOSS_CAP_FRACTION: f64 = 0.99;
 
 /// Default trades-per-day **assumption** for the days-to-target
 /// estimator. This is a throughput *projection* — it has no gating /
@@ -189,8 +150,8 @@ pub const MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY: f64 = 0.99;
 /// operator can override per-session via
 /// [`RiskyModeConfig::expected_trades_per_day`] to reflect their own
 /// broker's typical fill latency and the producer's signal frequency.
-/// The estimator multiplies trades-to-target by this value to surface
-/// the wizard's "approximately N trading days at M trades/day" figure.
+/// The estimator multiplies trades-to-target by this value for the
+/// scenarios API and dashboard.
 pub const DEFAULT_RISKY_TRADES_PER_DAY: f64 = 10.0;
 
 /// Default expected win-rate of the bot's signal source AFTER
@@ -224,13 +185,9 @@ pub const DEFAULT_EXPECTED_REWARD_TO_RISK: f64 = 1.5;
 /// Stages tile the bankroll range from `starting_capital_usd` up to
 /// (or past) `target_capital_usd`; the manager picks the active
 /// stage by where the live bankroll lands. Each stage carries its
-/// own sizing fraction and kill-switch caps. Unlike the
-/// previous Kelly-tapered build, the per-trade risk fraction is a
-/// direct knob (`risk_per_trade_fraction`) rather than a Kelly
-/// multiplier — the operator-directive sizing is "30–50 % of the
-/// current bankroll per trade", which is the variable Risky Mode
-/// tunes; Kelly is irrelevant because the framing accepts ≥99 %
-/// ruin probability up-front.
+/// own sizing fraction and kill-switch caps. Bankroll stages control capital
+/// protection; they do not manufacture a larger bet merely because the account
+/// is small. The live fraction comes from held-out strategy evidence.
 ///
 /// Convention: ranges are half-open `[bankroll_lower_usd,
 /// bankroll_upper_usd)` so consecutive stages tile the line without
@@ -246,14 +203,9 @@ pub struct RiskyStage {
     pub bankroll_upper_usd: f64,
     /// Fraction of the current bankroll the bot may risk on a
     /// single trade. Must lie in
-    /// `[RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION,
-    /// RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION]` (i.e. `[0.30, 0.50]`).
-    /// Tapers from 0.50 at the first stage to 0.30 at the last
-    /// stage in the default table — the small-bankroll early stages
-    /// are the most aggressive (the operator needs the geometric
-    /// kick) and the late stages soften so a wiped late-game stage
-    /// gives the bot a chance to retreat rather than blow up at the
-    /// finish line.
+    /// `(RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION,
+    /// RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION]` (i.e. `(0, 0.50]`).
+    /// The default table is flat; an explicitly supplied table may taper.
     pub risk_per_trade_fraction: f64,
     /// Maximum number of simultaneously open positions at this
     /// stage. Defaults to 1 in the table built by
@@ -282,9 +234,7 @@ pub struct RiskyStage {
 // Top-level Risky Mode configuration.
 // ---------------------------------------------------------------------------
 
-/// Operator-tunable Risky Mode configuration. Constructed by the
-/// wizard's `AutonomyRisk` step (Step 9.5) and consumed by
-/// [`RiskyModeManager::new`].
+/// Risky Mode configuration consumed by [`RiskyModeManager::new`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiskyModeConfig {
     /// Starting bankroll in USD.
@@ -296,62 +246,25 @@ pub struct RiskyModeConfig {
     /// Pre-computed stage table; built by
     /// [`build_logarithmic_stages`].
     pub stages: Vec<RiskyStage>,
-    /// Operator-acknowledged tail-risk ceiling. Default
-    /// [`MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY`] (0.99).
-    ///
-    /// **This is a PROBABILITY and feeds the ruin model only.** Until
-    /// 2026-08-09 [`RiskyModeManager::check_trade_allowed`] also used it as the
-    /// per-month LOSS FRACTION, so re-tuning the ruin model would silently have
-    /// moved the monthly kill switch. That is now
-    /// [`Self::monthly_loss_cap_fraction`].
-    pub acknowledged_ruin_probability_ceiling: f64,
     /// Cumulative realized loss over the calendar month, as a fraction of the
     /// CURRENT bankroll, above which [`KillSwitchTier::PerMonth`] trips.
-    ///
-    /// **Split out 2026-08-09 from `acknowledged_ruin_probability_ceiling`,
-    /// with the identical default value, so this change permits and refuses
-    /// exactly what it did before** — the defect fixed here is the type
-    /// confusion, not the threshold. At the default
-    /// [`MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY`] (0.99) this tier is
-    /// effectively inert: the per-day cap (0.80 → 0.50 of bankroll) always
-    /// binds first. Lower it to make the monthly tier actually bite.
+    /// At the default [`DEFAULT_MONTHLY_LOSS_CAP_FRACTION`] (0.99) this tier is
+    /// effectively inert because the per-day cap binds first.
     pub monthly_loss_cap_fraction: f64,
     /// Pre-broker-send sanity check fraction. No single order's
     /// implied risk may exceed this fraction of the current
     /// bankroll, regardless of stage sizing.
     pub presend_sanity_ceiling_fraction: f64,
-    /// **Autonomous-only contract acceptance.** When set, the
-    /// manager rejects every manual order via
-    /// [`Self::rejects_manual_orders`]; only AI signals from the
-    /// auto-trade producer can place trades. The operator
-    /// affirmatively ticks this in the wizard's `AutonomyRisk`
-    /// step. False by default — a Risky Mode session whose
-    /// `enable_risky_mode` call is made with this field unset is
-    /// rejected by the validator.
-    pub autonomous_only_contract_accepted: bool,
-    /// Whether Risky Mode is allowed to drive a live broker. False
-    /// by default — paper trading first per research §10.3.
-    pub allow_live_broker: bool,
-    /// Minimum AI ensemble confidence for an entry.
-    pub require_swarm_confidence_min: f64,
-    /// Require regime filter (research §4.6.4).
-    pub require_regime_filter: bool,
-    /// Require news blackout (research §4.6.3).
-    pub require_news_blackout: bool,
-    /// Pairwise correlation ceiling for concurrent positions.
-    pub correlation_cap: f64,
-    /// Volatility-sigma threshold for the per-stage pause.
-    pub volatility_sigma_pause: f64,
     /// Operator-tuned **expected** scalping cadence — used only by
     /// [`RiskyModeManager::estimated_days_to_target`] to convert
     /// trades-to-target into a "trading days" estimate for the
-    /// wizard's surface. Has no gating effect on the live producer:
+    /// scenarios API. Has no gating effect on the live producer:
     /// the dispatch gate accepts as many signals per day as the
     /// producer emits. Default
     /// [`DEFAULT_RISKY_TRADES_PER_DAY`] = 10.0.
     pub expected_trades_per_day: f64,
-    /// Operator-tuned **expected** win-rate AFTER expenses (commission
-    /// + spread + swap). Drives the Brownian-motion ruin-probability
+    /// Operator-tuned **expected** win-rate after commission, spread,
+    /// and swap expenses. Drives the Brownian-motion ruin-probability
     /// estimate via [`RiskyModeManager::current_ruin_probability_estimate`]
     /// and the days-to-target projection. Must lie in `(0.0, 1.0)`.
     /// Default [`DEFAULT_EXPECTED_WIN_RATE`] = 0.52.
@@ -364,10 +277,8 @@ pub struct RiskyModeConfig {
 }
 
 impl Default for RiskyModeConfig {
-    /// Returns the operator-directive default: `$20 → $50,000` in a
-    /// logarithmic stage table, 40 % per-trade default, autonomous-
-    /// only contract UNACCEPTED (the wizard step must explicitly
-    /// flip it), paper trading only, all upstream filter gates on.
+    /// Returns `$20 → $50,000` in a logarithmic stage table with the
+    /// evidence-compatible 10 % fallback risk.
     fn default() -> Self {
         let stages = build_logarithmic_stages(
             DEFAULT_STARTING_CAPITAL_USD,
@@ -379,16 +290,8 @@ impl Default for RiskyModeConfig {
             target_capital_usd: DEFAULT_TARGET_CAPITAL_USD,
             stage_doubling_factor: DEFAULT_DOUBLING_FACTOR,
             stages,
-            acknowledged_ruin_probability_ceiling: MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
-            monthly_loss_cap_fraction: MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
+            monthly_loss_cap_fraction: DEFAULT_MONTHLY_LOSS_CAP_FRACTION,
             presend_sanity_ceiling_fraction: DEFAULT_PRESEND_SANITY_CEILING_FRACTION,
-            autonomous_only_contract_accepted: false,
-            allow_live_broker: false,
-            require_swarm_confidence_min: DEFAULT_SWARM_CONFIDENCE_MIN,
-            require_regime_filter: true,
-            require_news_blackout: true,
-            correlation_cap: DEFAULT_CORRELATION_CAP,
-            volatility_sigma_pause: DEFAULT_VOLATILITY_SIGMA_PAUSE,
             expected_trades_per_day: DEFAULT_RISKY_TRADES_PER_DAY,
             expected_win_rate: DEFAULT_EXPECTED_WIN_RATE,
             expected_reward_to_risk: DEFAULT_EXPECTED_REWARD_TO_RISK,
@@ -425,9 +328,9 @@ impl RiskyModeConfig {
             bail!("stages must contain at least one RiskyStage");
         }
 
-        // Stage table monotonicity + sizing bounds. Operator
-        // directive 30–50 % per-trade band is enforced PER STAGE so
-        // a misconfigured table cannot silently fall outside it.
+        // Stage table monotonicity + sizing bounds. Risk may taper but cannot
+        // rise as bankroll grows, and every active stage must remain positive
+        // and under the catastrophic-loss ceiling.
         for window in self.stages.windows(2) {
             let a = &window[0];
             let b = &window[1];
@@ -462,12 +365,12 @@ impl RiskyModeConfig {
                     stage.bankroll_lower_usd
                 );
             }
-            // 30 %–50 % per-trade band per operator directive §7.1.
-            if !(RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
-                .contains(&stage.risk_per_trade_fraction)
+            if !stage.risk_per_trade_fraction.is_finite()
+                || stage.risk_per_trade_fraction <= RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION
+                || stage.risk_per_trade_fraction > RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION
             {
                 bail!(
-                    "risk_per_trade_fraction must be in [{}, {}] per operator directive §7.1, stage {} = {}",
+                    "risk_per_trade_fraction must be in ({}, {}], stage {} = {}",
                     RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION,
                     RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION,
                     stage.stage_idx,
@@ -510,15 +413,6 @@ impl RiskyModeConfig {
             }
         }
 
-        if !self.acknowledged_ruin_probability_ceiling.is_finite()
-            || self.acknowledged_ruin_probability_ceiling <= 0.0
-            || self.acknowledged_ruin_probability_ceiling > 1.0
-        {
-            bail!(
-                "acknowledged_ruin_probability_ceiling must be in (0, 1.0], got {}",
-                self.acknowledged_ruin_probability_ceiling
-            );
-        }
         if !self.monthly_loss_cap_fraction.is_finite()
             || self.monthly_loss_cap_fraction <= 0.0
             || self.monthly_loss_cap_fraction > 1.0
@@ -535,24 +429,6 @@ impl RiskyModeConfig {
             bail!(
                 "presend_sanity_ceiling_fraction must be in (0, 1.0], got {}",
                 self.presend_sanity_ceiling_fraction
-            );
-        }
-        if !(0.0..=1.0).contains(&self.require_swarm_confidence_min) {
-            bail!(
-                "require_swarm_confidence_min must be in [0, 1.0], got {}",
-                self.require_swarm_confidence_min
-            );
-        }
-        if !(0.0..=1.0).contains(&self.correlation_cap) {
-            bail!(
-                "correlation_cap must be in [0, 1.0], got {}",
-                self.correlation_cap
-            );
-        }
-        if !self.volatility_sigma_pause.is_finite() || self.volatility_sigma_pause <= 0.0 {
-            bail!(
-                "volatility_sigma_pause must be positive and finite, got {}",
-                self.volatility_sigma_pause
             );
         }
         if !self.expected_trades_per_day.is_finite() || self.expected_trades_per_day <= 0.0 {
@@ -594,26 +470,18 @@ pub enum KillSwitchTier {
     PerTrade,
     /// Cumulative daily loss exceeded the stage cap (research §5.2).
     PerDay,
+    /// Cumulative loss for the current ISO week exceeded the stage cap.
+    PerWeek,
     /// Bankroll dropped below the previous stage's lower boundary
     /// (research §5.3 — auto-retreat).
     PerStage,
     /// Cumulative monthly drawdown exceeded the ack-ceiling
     /// (research §5.4).
     PerMonth,
-    /// Operator hit HALT — manual kill switch from the UI
-    /// (research §5.5).
-    Manual,
-    /// Hardware / connection-loss flatten (research §5.6).
-    HardwareConnLoss,
     /// Pre-broker-send sanity check rejected the order because its
     /// implied risk exceeded `presend_sanity_ceiling_fraction` of
     /// the bankroll (research §5.7).
     PreSendSanity,
-    /// **Operator attempted a manual BUY/SELL while Risky Mode
-    /// armed the autonomous-only contract.** Manual orders are
-    /// strictly forbidden in that mode — only AI signals from the
-    /// auto-trade producer can place trades.
-    ManualOrderWhileAutonomousOnly,
 }
 
 // ---------------------------------------------------------------------------
@@ -635,7 +503,6 @@ pub struct RiskyModeManager {
     weekly_loss_accumulated_usd: f64,
     monthly_loss_accumulated_usd: f64,
     consecutive_losses: u32,
-    last_kill_switch_trip: Option<(KillSwitchTier, chrono::DateTime<chrono::Utc>)>,
 }
 
 impl RiskyModeManager {
@@ -643,14 +510,6 @@ impl RiskyModeManager {
     /// bankroll. The bankroll determines the starting stage.
     pub fn new(config: RiskyModeConfig, initial_bankroll_usd: f64) -> Result<Self> {
         config.validate()?;
-        if !config.autonomous_only_contract_accepted {
-            bail!(
-                "RiskyModeManager rejects construction without \
-                 autonomous_only_contract_accepted=true — the operator must \
-                 have explicitly signed the wizard's AutonomyRisk acknowledgement \
-                 (§7.1 informed-consent gate) before Risky Mode can run."
-            );
-        }
         if !initial_bankroll_usd.is_finite() || initial_bankroll_usd <= 0.0 {
             bail!(
                 "initial_bankroll_usd must be positive and finite, got {}",
@@ -667,7 +526,6 @@ impl RiskyModeManager {
             weekly_loss_accumulated_usd: 0.0,
             monthly_loss_accumulated_usd: 0.0,
             consecutive_losses: 0,
-            last_kill_switch_trip: None,
         })
     }
 
@@ -696,31 +554,9 @@ impl RiskyModeManager {
         self.monthly_loss_accumulated_usd
     }
 
-    /// Last kill-switch trip, if any.
-    pub fn last_kill_switch_trip(&self) -> Option<(KillSwitchTier, chrono::DateTime<chrono::Utc>)> {
-        self.last_kill_switch_trip
-    }
-
     /// Active stage descriptor.
     pub fn current_stage(&self) -> &RiskyStage {
         &self.config.stages[self.current_stage_idx as usize]
-    }
-
-    /// `true` iff Risky Mode is in autonomous-only mode and a
-    /// manual BUY/SELL order from the operator must be rejected at
-    /// the gate. The `&` borrow is intentional — callers in the
-    /// trading session inspect this before forwarding an order to
-    /// the broker fill path.
-    ///
-    /// Returns `false` when:
-    /// - the config flag is not set (Risky Mode is "armed-by-default"
-    ///   to autonomous, but the wizard contract must be signed
-    ///   first), or
-    /// - the operator never enabled Risky Mode in the first place
-    ///   (in which case there is no manager and this method is not
-    ///   reachable).
-    pub fn rejects_manual_orders(&self) -> bool {
-        self.config.autonomous_only_contract_accepted
     }
 
     /// Returns `Ok(())` if a new order at `size_usd` is allowed.
@@ -733,14 +569,6 @@ impl RiskyModeManager {
         proposed_sl_pips: f64,
         proposed_tp_pips: f64,
     ) -> std::result::Result<(), KillSwitchTier> {
-        // Sticky manual / hardware halts — even after their time
-        // window expires the operator must explicitly clear them.
-        if let Some((tier, _ts)) = self.last_kill_switch_trip
-            && (tier == KillSwitchTier::Manual || tier == KillSwitchTier::HardwareConnLoss)
-        {
-            return Err(tier);
-        }
-
         // Per-trade SL must be present (research §5.1).
         if !proposed_sl_pips.is_finite()
             || proposed_sl_pips <= 0.0
@@ -763,6 +591,15 @@ impl RiskyModeManager {
             return Err(KillSwitchTier::PerDay);
         }
 
+        // Per-week cap. The accumulator is account-wide and ISO-week scoped at
+        // the live call site. Keeping this as its own tier matters: a daily
+        // reset must not silently reopen trading after the week is already
+        // spent.
+        let weekly_cap_usd = stage.weekly_drawdown_cap_fraction * self.current_bankroll_usd;
+        if self.weekly_loss_accumulated_usd >= weekly_cap_usd {
+            return Err(KillSwitchTier::PerWeek);
+        }
+
         // Per-stage retreat trigger (research §5.3).
         //
         // **Fixed 2026-08-09 — this tier was unreachable.** It used to compare
@@ -783,10 +620,7 @@ impl RiskyModeManager {
             }
         }
 
-        // Per-month cap (research §5.4). See `monthly_loss_cap_fraction` — this
-        // read used `acknowledged_ruin_probability_ceiling`, a PROBABILITY, as a
-        // loss FRACTION until 2026-08-09. Same default value, so the threshold
-        // is unchanged; the coupling to the ruin model is gone.
+        // Per-month cap (research §5.4).
         let monthly_cap_usd = self.config.monthly_loss_cap_fraction * self.current_bankroll_usd;
         if self.monthly_loss_accumulated_usd >= monthly_cap_usd {
             return Err(KillSwitchTier::PerMonth);
@@ -932,21 +766,6 @@ impl RiskyModeManager {
         self.monthly_loss_accumulated_usd = 0.0;
     }
 
-    /// Manual operator kill-switch.
-    pub fn trip_manual_halt(&mut self) {
-        self.last_kill_switch_trip = Some((KillSwitchTier::Manual, chrono::Utc::now()));
-    }
-
-    /// Hardware/connection-loss flatten signal.
-    pub fn trip_hardware_kill(&mut self) {
-        self.last_kill_switch_trip = Some((KillSwitchTier::HardwareConnLoss, chrono::Utc::now()));
-    }
-
-    /// Clear a sticky halt.
-    pub fn clear_halt(&mut self) {
-        self.last_kill_switch_trip = None;
-    }
-
     /// Ruin probability estimate using the per-stage
     /// `risk_per_trade_fraction` and the operator-configured
     /// [`RiskyModeConfig::expected_win_rate`] /
@@ -1074,8 +893,8 @@ impl RiskyModeManager {
     /// - `0.50` → median survivor (very close to `estimated_days_to_target`)
     /// - `0.75` → conservative tail
     ///
-    /// Surface this for the wizard so the operator's "$100→$100K"
-    /// choice produces a meaningful range (best/median/conservative)
+    /// Surface this through the scenarios API so a "$100→$100K"
+    /// configuration produces a meaningful range (best/median/conservative)
     /// rather than a single deterministic number that hides the
     /// variance.
     pub fn estimated_days_to_target_percentile(&self, percentile: f64) -> Option<u32> {
@@ -1140,8 +959,8 @@ impl RiskyModeManager {
 
     /// Operator-facing time-to-target SCENARIO triple.
     /// Returns `(best_case_days, expected_days, conservative_days,
-    /// ruin_probability)`. The wizard renders this triple so the
-    /// operator can see the FULL distribution, not just the mean:
+    /// ruin_probability)`. The API exposes this triple so the full
+    /// distribution is visible, not just the mean:
     ///
     /// - `best_case_days` = 10th-percentile (a lucky top-10% run)
     /// - `expected_days` = deterministic (50th-percentile-ish)
@@ -1164,9 +983,8 @@ impl RiskyModeManager {
 
 /// Operator-facing time-to-target estimate covering the full
 /// distribution rather than a single deterministic number. Returned
-/// by [`RiskyModeManager::time_to_target_scenarios`]; surfaced by the
-/// wizard's `AutonomyRisk` step and the Risky Mode dashboard so the
-/// operator sees variance honestly.
+/// by [`RiskyModeManager::time_to_target_scenarios`] and surfaced by the
+/// Risky Mode dashboard so the operator sees variance honestly.
 ///
 /// All `_days` fields are `None` when the configured edge produces
 /// non-positive expected log-growth (the strategy cannot reach the
@@ -1185,8 +1003,7 @@ pub struct TimeToTargetScenarios {
     /// about how long a successful run can drag.
     pub conservative_days: Option<u32>,
     /// Brownian-motion barrier estimate of ruin probability from the
-    /// current bankroll. The operator's signed §6.4 acknowledgement
-    /// ceiling defaults to 0.99.
+    /// current bankroll.
     pub ruin_probability: f64,
 }
 
@@ -1201,7 +1018,7 @@ fn inverse_standard_normal_cdf(p: f64) -> f64 {
         -3.969683028665376e+01,
         2.209460984245205e+02,
         -2.759285104469687e+02,
-        1.383577518672690e+02,
+        1.383_577_518_672_69e+02,
         -3.066479806614716e+01,
         2.506628277459239e+00,
     ];
@@ -1252,16 +1069,30 @@ fn inverse_standard_normal_cdf(p: f64) -> f64 {
 // Stage-table construction.
 // ---------------------------------------------------------------------------
 
-/// Build a logarithmic stage table from `starting_capital_usd` to
-/// (or past) `target_capital_usd`, doubling the bankroll at each
-/// step by `doubling_factor`. The per-trade risk fraction tapers
-/// linearly from [`RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION`] (0.50)
-/// at the first stage to [`RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION`]
-/// (0.30) at the last. Returns at least one stage.
+/// Build the default logarithmic capital-protection ladder. Position risk is
+/// flat at [`RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION`]; bankroll alone is
+/// not evidence that the strategy's edge changed.
 pub fn build_logarithmic_stages(
     starting_capital_usd: f64,
     target_capital_usd: f64,
     doubling_factor: f64,
+) -> Vec<RiskyStage> {
+    build_logarithmic_stages_at_risk(
+        starting_capital_usd,
+        target_capital_usd,
+        doubling_factor,
+        RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION,
+    )
+}
+
+/// Build the same capital ladder at one explicit, evidence-derived risk
+/// fraction. Invalid inputs remain visible in the returned fallback stage so
+/// [`RiskyModeConfig::validate`] can refuse them rather than silently clamp.
+pub fn build_logarithmic_stages_at_risk(
+    starting_capital_usd: f64,
+    target_capital_usd: f64,
+    doubling_factor: f64,
+    risk_per_trade_fraction: f64,
 ) -> Vec<RiskyStage> {
     // Defensive: bad inputs produce a single trivial stage at the
     // bankroll itself so the manager can still be constructed
@@ -1277,9 +1108,9 @@ pub fn build_logarithmic_stages(
             stage_idx: 0,
             bankroll_lower_usd: starting_capital_usd.max(0.0),
             bankroll_upper_usd: target_capital_usd.max(starting_capital_usd + 1.0),
-            risk_per_trade_fraction: RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION,
+            risk_per_trade_fraction,
             max_concurrent_positions: 1,
-            max_pair_exposure_fraction: RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION,
+            max_pair_exposure_fraction: risk_per_trade_fraction,
             daily_loss_cap_fraction: 0.80,
             weekly_drawdown_cap_fraction: 0.95,
         }];
@@ -1305,11 +1136,6 @@ pub fn build_logarithmic_stages(
             (i as f64) / ((stage_count - 1) as f64)
         };
 
-        // Per-trade risk: 0.50 -> 0.30 linear across stages.
-        let risk_per_trade = RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION
-            - taper_t
-                * (RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION - RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION);
-
         // Daily loss cap: 0.80 -> 0.50 linear taper.
         let daily_cap = 0.80 - taper_t * (0.80 - 0.50);
         // Weekly DD cap: 0.95 -> 0.60 linear taper.
@@ -1319,11 +1145,11 @@ pub fn build_logarithmic_stages(
             stage_idx: i as u8,
             bankroll_lower_usd: lower,
             bankroll_upper_usd: upper,
-            risk_per_trade_fraction: risk_per_trade,
+            risk_per_trade_fraction,
             max_concurrent_positions: 1,
             // Single-position regime; pair-exposure equals the
             // per-trade risk fraction at this stage.
-            max_pair_exposure_fraction: risk_per_trade,
+            max_pair_exposure_fraction: risk_per_trade_fraction,
             daily_loss_cap_fraction: daily_cap.max(0.50),
             weekly_drawdown_cap_fraction: weekly_cap.max(0.60),
         });
@@ -1331,15 +1157,9 @@ pub fn build_logarithmic_stages(
     stages
 }
 
-/// Live per-trade risk fraction for a given `bankroll_usd` under the
-/// Risky Mode stage ladder built from `(start, target, doubling)`.
-///
-/// Pure and stateless: it builds the SAME logarithmic stage table the
-/// [`RiskyModeManager`] uses and returns the `risk_per_trade_fraction`
-/// (0.30–0.50) of the stage the bankroll lands in. This is what lets the
-/// live autopilot size to the operator-directive 30–50 % ladder WITHOUT
-/// constructing a full stateful manager (with its kill-switch history) on
-/// the hot path.
+/// Resolve the fallback per-trade fraction for a bankroll stage. The default
+/// ladder is flat, so this remains a compatibility helper for callers that do
+/// not yet carry promoted OOS sizing evidence.
 ///
 /// Returns `None` for degenerate inputs (non-finite, `target <= start`,
 /// `doubling <= 1.0`, or a non-positive bankroll) so the caller can fall
@@ -1399,21 +1219,12 @@ fn locate_stage_idx(stages: &[RiskyStage], bankroll_usd: f64) -> u8 {
 mod tests {
     use super::*;
 
-    /// Build a default config with the autonomous contract explicitly
-    /// accepted — the test harness equivalent of the operator ticking
-    /// the wizard acknowledgement. New() rejects without this.
-    fn signed_default_config() -> RiskyModeConfig {
-        let mut cfg = RiskyModeConfig::default();
-        cfg.autonomous_only_contract_accepted = true;
-        cfg
-    }
-
     #[test]
     fn sync_bankroll_relocates_the_stage_without_touching_the_ledgers() {
         // W3 (2026-08-09). `sync_bankroll` exists so the live gate measures a
         // proposed order against the balance that actually exists, not against
         // a cursor that only ever saw one engine's trades.
-        let mut m = RiskyModeManager::new(signed_default_config(), 20.0).expect("manager");
+        let mut m = RiskyModeManager::new(RiskyModeConfig::default(), 20.0).expect("manager");
         assert_eq!(m.current_stage().stage_idx, 0);
         m.record_trade_outcome(-5.0);
         let ledger = m.daily_loss_accumulated_usd();
@@ -1429,7 +1240,6 @@ mod tests {
             (m.daily_loss_accumulated_usd() - ledger).abs() < 1e-9,
             "reconciling the balance must not launder the day's losses"
         );
-        assert!(m.last_kill_switch_trip().is_none());
     }
 
     #[test]
@@ -1437,7 +1247,7 @@ mod tests {
         // 0.0 is what `fetch_account_runtime_blocking` yields on failure.
         // Accepting it would zero the bankroll and trip PerStage on the next
         // entry of every running engine.
-        let mut m = RiskyModeManager::new(signed_default_config(), 640.0).expect("manager");
+        let mut m = RiskyModeManager::new(RiskyModeConfig::default(), 640.0).expect("manager");
         let before = m.current_bankroll_usd();
         let stage_before = m.current_stage().stage_idx;
         m.sync_bankroll(0.0);
@@ -1455,13 +1265,9 @@ mod tests {
         assert_eq!(cfg.target_capital_usd, 50_000.0);
         assert_eq!(cfg.stage_doubling_factor, 2.0);
         assert_eq!(
-            cfg.acknowledged_ruin_probability_ceiling,
-            MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY
+            cfg.monthly_loss_cap_fraction,
+            DEFAULT_MONTHLY_LOSS_CAP_FRACTION
         );
-        // Default is paper trading only, autonomous contract NOT
-        // accepted — the wizard must flip these before live use.
-        assert!(!cfg.allow_live_broker);
-        assert!(!cfg.autonomous_only_contract_accepted);
     }
 
     #[test]
@@ -1481,7 +1287,8 @@ mod tests {
         for w in cfg.stages.windows(2) {
             assert!(w[0].bankroll_upper_usd <= w[1].bankroll_lower_usd + 1e-9);
         }
-        // Risk fraction tapers DOWN across stages and stays in band.
+        // The fallback risk is flat across bankroll stages and stays under the
+        // hard ceiling. Capital alone is not a new estimate of edge.
         for stage in &cfg.stages {
             assert!(
                 (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
@@ -1493,37 +1300,24 @@ mod tests {
         }
         for w in cfg.stages.windows(2) {
             assert!(
-                w[0].risk_per_trade_fraction >= w[1].risk_per_trade_fraction - 1e-9,
-                "risk_per_trade must be non-increasing"
+                (w[0].risk_per_trade_fraction - w[1].risk_per_trade_fraction).abs() < 1e-9,
+                "default risk_per_trade must remain flat"
             );
         }
     }
 
     #[test]
-    fn new_rejects_when_autonomous_contract_unsigned() {
-        let cfg = RiskyModeConfig::default(); // autonomous_only_contract_accepted = false
-        let err =
-            RiskyModeManager::new(cfg, 20.0).expect_err("must reject without autonomous contract");
-        assert!(
-            err.to_string()
-                .contains("autonomous_only_contract_accepted"),
-            "wrong error: {err}"
-        );
-    }
-
-    #[test]
-    fn new_accepts_when_autonomous_contract_signed() {
-        let cfg = signed_default_config();
-        let mgr = RiskyModeManager::new(cfg, 20.0).expect("must accept signed config");
-        assert!(mgr.rejects_manual_orders());
+    fn new_accepts_a_valid_default_config() {
+        let mgr = RiskyModeManager::new(RiskyModeConfig::default(), 20.0)
+            .expect("must accept valid config");
         assert_eq!(mgr.current_bankroll_usd(), 20.0);
         assert_eq!(mgr.current_stage().stage_idx, 0);
     }
 
     #[test]
-    fn validate_rejects_risk_fraction_below_30_percent() {
-        let mut cfg = signed_default_config();
-        cfg.stages[0].risk_per_trade_fraction = 0.29;
+    fn validate_rejects_non_positive_risk_fraction() {
+        let mut cfg = RiskyModeConfig::default();
+        cfg.stages[0].risk_per_trade_fraction = 0.0;
         let err = cfg.validate().expect_err("must reject");
         assert!(
             err.to_string().contains("risk_per_trade_fraction"),
@@ -1533,14 +1327,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_risk_fraction_above_50_percent() {
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.stages[0].risk_per_trade_fraction = 0.51;
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_non_monotonic_risk_fraction() {
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         // Make stage 0 less aggressive than stage 1.
         cfg.stages[0].risk_per_trade_fraction = 0.30;
         if cfg.stages.len() > 1 {
@@ -1552,7 +1346,7 @@ mod tests {
 
     #[test]
     fn check_trade_allowed_passes_at_default_state() {
-        let cfg = signed_default_config();
+        let cfg = RiskyModeConfig::default();
         let mgr = RiskyModeManager::new(cfg, 20.0).expect("manager");
         // Tiny order well inside the per-stage cap.
         let ok = mgr.check_trade_allowed(1.0, 10.0, 30.0);
@@ -1561,7 +1355,7 @@ mod tests {
 
     #[test]
     fn check_trade_allowed_rejects_missing_sl() {
-        let cfg = signed_default_config();
+        let cfg = RiskyModeConfig::default();
         let mgr = RiskyModeManager::new(cfg, 20.0).expect("manager");
         let res = mgr.check_trade_allowed(1.0, 0.0, 30.0);
         assert_eq!(res, Err(KillSwitchTier::PerTrade));
@@ -1569,7 +1363,7 @@ mod tests {
 
     #[test]
     fn check_trade_allowed_rejects_when_size_breaches_presend_ceiling() {
-        let cfg = signed_default_config();
+        let cfg = RiskyModeConfig::default();
         let mgr = RiskyModeManager::new(cfg, 100.0).expect("manager");
         // presend ceiling default is 0.55 -> 55 USD.
         let res = mgr.check_trade_allowed(60.0, 10.0, 30.0);
@@ -1578,7 +1372,7 @@ mod tests {
 
     #[test]
     fn check_trade_allowed_rejects_after_daily_cap_exceeded() {
-        let mut mgr = RiskyModeManager::new(signed_default_config(), 100.0).expect("manager");
+        let mut mgr = RiskyModeManager::new(RiskyModeConfig::default(), 100.0).expect("manager");
         // Stage 0 daily cap is generous (0.80 in the default table)
         // -> 80 USD. Push the accumulator past it.
         mgr.daily_loss_accumulated_usd = 81.0;
@@ -1587,18 +1381,40 @@ mod tests {
     }
 
     #[test]
-    fn manual_halt_makes_all_subsequent_trades_reject_with_manual() {
-        let mut mgr = RiskyModeManager::new(signed_default_config(), 100.0).expect("manager");
-        mgr.trip_manual_halt();
-        let res = mgr.check_trade_allowed(1.0, 10.0, 30.0);
-        assert_eq!(res, Err(KillSwitchTier::Manual));
-        mgr.clear_halt();
-        assert!(mgr.check_trade_allowed(1.0, 10.0, 30.0).is_ok());
+    fn check_trade_allowed_enforces_weekly_cap_until_weekly_reset() {
+        let mut mgr = RiskyModeManager::new(RiskyModeConfig::default(), 100.0).expect("manager");
+        let weekly_cap = mgr.current_stage().weekly_drawdown_cap_fraction * 100.0;
+
+        mgr.raise_period_losses(0.0, weekly_cap - 0.01, 0.0);
+        assert!(
+            mgr.check_trade_allowed(1.0, 10.0, 30.0).is_ok(),
+            "a weekly loss below the configured cap must remain eligible"
+        );
+
+        mgr.raise_period_losses(0.0, weekly_cap, 0.0);
+        assert_eq!(
+            mgr.check_trade_allowed(1.0, 10.0, 30.0),
+            Err(KillSwitchTier::PerWeek),
+            "the weekly cap must bind exactly at its configured threshold"
+        );
+
+        mgr.reset_daily_accumulator();
+        assert_eq!(
+            mgr.check_trade_allowed(1.0, 10.0, 30.0),
+            Err(KillSwitchTier::PerWeek),
+            "a day rollover must not launder a spent ISO week"
+        );
+
+        mgr.reset_weekly_accumulator();
+        assert!(
+            mgr.check_trade_allowed(1.0, 10.0, 30.0).is_ok(),
+            "the ISO-week rollover must reopen the weekly gate"
+        );
     }
 
     #[test]
     fn calculate_position_size_uses_risk_per_trade_fraction_times_bankroll() {
-        let cfg = signed_default_config();
+        let cfg = RiskyModeConfig::default();
         let mgr = RiskyModeManager::new(cfg, 100.0).expect("manager");
         // At full confidence at stage 0 with 0.50 risk fraction,
         // size should be 50.0.
@@ -1613,7 +1429,7 @@ mod tests {
 
     #[test]
     fn calculate_position_size_scales_with_confidence() {
-        let mgr = RiskyModeManager::new(signed_default_config(), 100.0).expect("manager");
+        let mgr = RiskyModeManager::new(RiskyModeConfig::default(), 100.0).expect("manager");
         let full = mgr.calculate_position_size_usd(1.0);
         let half = mgr.calculate_position_size_usd(0.5);
         assert!(
@@ -1624,27 +1440,22 @@ mod tests {
 
     #[test]
     fn calculate_position_size_returns_zero_for_non_positive_confidence() {
-        let mgr = RiskyModeManager::new(signed_default_config(), 100.0).expect("manager");
+        let mgr = RiskyModeManager::new(RiskyModeConfig::default(), 100.0).expect("manager");
         assert_eq!(mgr.calculate_position_size_usd(0.0), 0.0);
         assert_eq!(mgr.calculate_position_size_usd(-0.5), 0.0);
         assert_eq!(mgr.calculate_position_size_usd(f64::NAN), 0.0);
     }
 
     #[test]
-    fn ruin_probability_is_extreme_at_default_sizing() {
-        // With 30-50% per trade and the operator's honest
-        // 0.52 / 1.5 (win-rate / reward-to-risk) defaults, the
-        // Brownian-motion model returns P(ruin) ≈ 1.0 at stage 0 —
-        // negative expected log-growth → guaranteed-ruin in the
-        // model's idealisation. This is exactly the §7.1 framing
-        // the operator signed for; if a future refactor inflates
-        // the defaults back to overly-optimistic values this
-        // assertion will catch it.
-        let mgr = RiskyModeManager::new(signed_default_config(), 20.0).expect("manager");
+    fn half_kelly_default_avoids_near_certain_ruin() {
+        // 52% / 1.5R implies full Kelly 20% and half-Kelly 10%. The default
+        // must preserve positive log growth instead of deliberately selecting
+        // the old near-certain-ruin 30-50% band.
+        let mgr = RiskyModeManager::new(RiskyModeConfig::default(), 20.0).expect("manager");
         let p = mgr.current_ruin_probability_estimate();
         assert!(
-            p > 0.95,
-            "ruin probability should be ≥0.95 at default sizing, got {p}"
+            p < 0.01,
+            "half-Kelly fallback should keep modeled ruin below 1%, got {p}"
         );
         assert!((0.0..=1.0).contains(&p));
     }
@@ -1660,8 +1471,8 @@ mod tests {
         // smaller than 1. This is the cross-stage sanity property
         // we want pinned: as the operator climbs the stage ladder
         // the ruin estimate eases off.
-        let mgr_small = RiskyModeManager::new(signed_default_config(), 20.0).expect("small");
-        let mgr_large = RiskyModeManager::new(signed_default_config(), 25_000.0).expect("large");
+        let mgr_small = RiskyModeManager::new(RiskyModeConfig::default(), 20.0).expect("small");
+        let mgr_large = RiskyModeManager::new(RiskyModeConfig::default(), 25_000.0).expect("large");
         let p_small = mgr_small.current_ruin_probability_estimate();
         let p_large = mgr_large.current_ruin_probability_estimate();
         assert!(
@@ -1671,30 +1482,17 @@ mod tests {
     }
 
     #[test]
-    fn kelly_aligned_default_constant_is_030() {
-        // GROUP #230 remediation 2026-05-25: operator-approved default
-        // lowered from 0.40 → 0.30 based on Kelly analysis. This test
-        // pins the new value so an accidental revert by a future
-        // refactor is caught immediately. Math: for the operator's
-        // typical strong-edge configuration (win_rate=0.55, RR=2.0),
-        // Kelly f* = (0.55*2.0 − 0.45) / 2.0 = 0.325. The 0.30 default
-        // sits just below Kelly (slightly sub-Kelly) which gives
-        // ~12× lower ruin probability than 0.40 for identical
-        // expected time-to-target — see AUDIT-FINDINGS.md Kelly
-        // analysis table.
+    fn fallback_default_is_half_kelly_for_fallback_edge() {
+        let derived = half_kelly_fraction_from_win_rate_reward_to_risk(
+            DEFAULT_EXPECTED_WIN_RATE,
+            DEFAULT_EXPECTED_REWARD_TO_RISK,
+        );
         assert!(
-            (RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION - 0.30).abs() < 1e-9,
-            "Kelly-aligned default must remain 0.30, got {}",
+            (RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION - 0.10).abs() < 1e-9,
+            "half-Kelly fallback must remain 0.10, got {}",
             RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION
         );
-        // Sanity: default still inside the operator-signed §7.1 band.
-        assert!(
-            (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
-                .contains(&RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION),
-            "default must be inside [{}, {}] band",
-            RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION,
-            RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION
-        );
+        assert!((derived - RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION).abs() < 1e-12);
     }
 
     #[test]
@@ -1704,10 +1502,10 @@ mod tests {
         // the model's ruin estimate at the same stage / bankroll
         // must drop. Pins the (p, r) sensitivity so a future refactor
         // that drops the config wiring gets caught.
-        let mut cfg_thin = signed_default_config();
+        let mut cfg_thin = RiskyModeConfig::default();
         cfg_thin.expected_win_rate = 0.52;
         cfg_thin.expected_reward_to_risk = 1.5;
-        let mut cfg_fat = signed_default_config();
+        let mut cfg_fat = RiskyModeConfig::default();
         cfg_fat.expected_win_rate = 0.60;
         cfg_fat.expected_reward_to_risk = 2.0;
         // Pick a bankroll where the taper has reduced f enough that
@@ -1726,7 +1524,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_expected_win_rate() {
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.expected_win_rate = 0.0;
         assert!(cfg.validate().is_err());
         cfg.expected_win_rate = 1.0;
@@ -1735,32 +1533,53 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_positive_reward_to_risk() {
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.expected_reward_to_risk = 0.0;
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn days_to_target_returns_some_zero_when_at_or_past_target() {
-        let cfg = signed_default_config();
+        let cfg = RiskyModeConfig::default();
         let target = cfg.target_capital_usd;
         let mgr = RiskyModeManager::new(cfg, target).expect("manager");
         assert_eq!(mgr.estimated_days_to_target(), Some(0));
     }
 
     #[test]
-    fn days_to_target_returns_none_at_default_negative_growth() {
-        // With the honest §7.1 defaults (win-rate 0.52, RR 1.5) the
-        // stage-0 per-trade log-growth is NEGATIVE: the model's
-        // expected outcome is ruin, not target. The estimator must
-        // refuse to invent a "days to target" number in that regime
-        // (research §10.5 — don't surface optimistic projections
-        // when the math says target is unreachable in expectation).
-        let mgr = RiskyModeManager::new(signed_default_config(), DEFAULT_STARTING_CAPITAL_USD)
+    fn days_to_target_is_finite_at_half_kelly_fallback() {
+        let mgr = RiskyModeManager::new(RiskyModeConfig::default(), DEFAULT_STARTING_CAPITAL_USD)
             .expect("manager");
+        assert!(mgr.estimated_days_to_target().is_some());
+    }
+
+    #[test]
+    fn no_positive_edge_does_not_invent_a_time_to_profit() {
+        let mut cfg = RiskyModeConfig::default();
+        cfg.expected_win_rate = 0.4;
+        cfg.expected_reward_to_risk = 1.0;
+        let mgr = RiskyModeManager::new(cfg, DEFAULT_STARTING_CAPITAL_USD).unwrap();
+        assert_eq!(mgr.estimated_days_to_target(), None);
+        assert_eq!(
+            half_kelly_fraction_from_win_rate_reward_to_risk(0.4, 1.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn operator_risk_below_old_thirty_percent_floor_is_preserved() {
+        let mut cfg = RiskyModeConfig::default();
+        cfg.stages = build_logarithmic_stages_at_risk(
+            cfg.starting_capital_usd,
+            cfg.target_capital_usd,
+            DEFAULT_DOUBLING_FACTOR,
+            0.02,
+        );
+        cfg.validate().unwrap();
         assert!(
-            mgr.estimated_days_to_target().is_none(),
-            "estimator must return None when expected log-growth is non-positive"
+            cfg.stages
+                .iter()
+                .all(|stage| (stage.risk_per_trade_fraction - 0.02).abs() < 1e-12)
         );
     }
 
@@ -1772,7 +1591,7 @@ mod tests {
         // figure. We don't band the exact value tightly — the
         // property under test is "estimator works for a credible
         // positive-EV configuration".
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.expected_win_rate = 0.60;
         cfg.expected_reward_to_risk = 2.0;
         let mgr = RiskyModeManager::new(cfg, DEFAULT_STARTING_CAPITAL_USD).expect("manager");
@@ -1794,7 +1613,7 @@ mod tests {
         // expectation, which is faster than the 75th-percentile
         // (conservative). Property under test — exact magnitudes
         // depend on the operator's edge so we don't band tightly.
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.expected_win_rate = 0.55;
         cfg.expected_reward_to_risk = 2.0;
         let mgr = RiskyModeManager::new(cfg, DEFAULT_STARTING_CAPITAL_USD).expect("manager");
@@ -1822,12 +1641,12 @@ mod tests {
     fn time_to_target_scenarios_handles_user_chosen_target_100k() {
         // Operator-supplied target test: $100 → $100,000 (= 1000×
         // growth). With a credible strong-edge configuration
-        // (win-rate 0.55, RR 2.0, 40% per-trade risk, 10 trades/day)
+        // (win-rate 0.55, RR 2.0, 30%-50% stage risk, 10 trades/day)
         // the deterministic expectation is ~7-8 days, the 10th-
         // percentile is faster (a lucky run), and the 75th-percentile
         // is slower. Property under test: the user can pick ANY
         // positive target larger than start and get a meaningful triple.
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.starting_capital_usd = 100.0;
         cfg.target_capital_usd = 100_000.0;
         cfg.stages = build_logarithmic_stages(100.0, 100_000.0, 2.0);
@@ -1855,9 +1674,9 @@ mod tests {
     fn time_to_target_scenarios_handles_user_chosen_target_50k() {
         // Same operator-facing scenario for the $100 → $50K target
         // (= 500× growth) — must also produce a sensible triple. Pins
-        // that the user can configure the wizard for either common
+        // that the user can configure either common
         // milestone ($50K, $100K, etc.) and the estimator works.
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.starting_capital_usd = 100.0;
         cfg.target_capital_usd = 50_000.0;
         cfg.stages = build_logarithmic_stages(100.0, 50_000.0, 2.0);
@@ -1873,18 +1692,14 @@ mod tests {
     }
 
     #[test]
-    fn time_to_target_scenarios_returns_none_at_negative_growth() {
-        // With the default honest §7.1 edge (win-rate 0.52, RR 1.5,
-        // 40% risk), expected log-growth is non-positive → all three
-        // _days fields must be None. Ruin probability is still 1.0
-        // (matches the operator's signed §6.4 acknowledgement).
-        let mgr = RiskyModeManager::new(signed_default_config(), DEFAULT_STARTING_CAPITAL_USD)
+    fn time_to_target_scenarios_are_finite_at_half_kelly_fallback() {
+        let mgr = RiskyModeManager::new(RiskyModeConfig::default(), DEFAULT_STARTING_CAPITAL_USD)
             .expect("manager");
         let scenarios = mgr.time_to_target_scenarios();
-        assert!(scenarios.best_case_days.is_none());
-        assert!(scenarios.expected_days.is_none());
-        assert!(scenarios.conservative_days.is_none());
-        assert!((scenarios.ruin_probability - 1.0).abs() < 1e-9);
+        assert!(scenarios.best_case_days.is_some());
+        assert!(scenarios.expected_days.is_some());
+        assert!(scenarios.conservative_days.is_some());
+        assert!(scenarios.ruin_probability < 0.01);
     }
 
     #[test]
@@ -1916,7 +1731,7 @@ mod tests {
         // must yield a strictly larger days-to-target figure. Pins
         // the cadence semantics: it's a divisor on trades-to-target,
         // not a gating cap.
-        let mut cfg_fast = signed_default_config();
+        let mut cfg_fast = RiskyModeConfig::default();
         cfg_fast.expected_win_rate = 0.60;
         cfg_fast.expected_reward_to_risk = 2.0;
         cfg_fast.expected_trades_per_day = 50.0;
@@ -1934,7 +1749,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_positive_expected_trades_per_day() {
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.expected_trades_per_day = 0.0;
         let err = cfg.validate().expect_err("must reject zero cadence");
         assert!(
@@ -1945,7 +1760,7 @@ mod tests {
 
     #[test]
     fn record_trade_outcome_advances_stage_after_large_profit() {
-        let mut mgr = RiskyModeManager::new(signed_default_config(), 20.0).expect("manager");
+        let mut mgr = RiskyModeManager::new(RiskyModeConfig::default(), 20.0).expect("manager");
         assert_eq!(mgr.current_stage().stage_idx, 0);
         // Push bankroll into stage 1's range.
         let stage1_lower = mgr.config.stages[1].bankroll_lower_usd;
@@ -1956,7 +1771,7 @@ mod tests {
 
     #[test]
     fn record_trade_outcome_retreats_stage_after_large_loss() {
-        let mut mgr = RiskyModeManager::new(signed_default_config(), 40.0).expect("manager");
+        let mut mgr = RiskyModeManager::new(RiskyModeConfig::default(), 40.0).expect("manager");
         let starting_idx = mgr.current_stage().stage_idx;
         // Burn the bankroll back to <20 -> stage 0.
         mgr.record_trade_outcome(-mgr.current_bankroll_usd + 1.0);
@@ -1970,26 +1785,13 @@ mod tests {
 
     #[test]
     fn record_trade_outcome_accumulates_losses_separately() {
-        let mut mgr = RiskyModeManager::new(signed_default_config(), 100.0).expect("manager");
+        let mut mgr = RiskyModeManager::new(RiskyModeConfig::default(), 100.0).expect("manager");
         mgr.record_trade_outcome(-5.0);
         mgr.record_trade_outcome(-7.0);
         mgr.record_trade_outcome(3.0); // ignored by daily accumulator
         assert!((mgr.daily_loss_accumulated_usd() - 12.0).abs() < 1e-9);
         assert!((mgr.weekly_loss_accumulated_usd() - 12.0).abs() < 1e-9);
         assert!((mgr.monthly_loss_accumulated_usd() - 12.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn rejects_manual_orders_is_authoritative_for_autonomous_contract() {
-        let mut cfg = signed_default_config();
-        let mgr = RiskyModeManager::new(cfg.clone(), 20.0).expect("manager");
-        assert!(mgr.rejects_manual_orders());
-
-        // If the contract were unsigned the new() call rejects, so
-        // we can't construct a manager without it. This is the
-        // intended invariant.
-        cfg.autonomous_only_contract_accepted = false;
-        assert!(RiskyModeManager::new(cfg, 20.0).is_err());
     }
 
     #[test]
@@ -2000,12 +1802,10 @@ mod tests {
     }
 
     #[test]
-    fn stage_risk_fraction_tapers_and_rejects_bad_inputs() {
-        // Early (small bankroll) sizes bigger than late (near target); both
-        // stay inside the operator band [0.30, 0.50].
+    fn stage_risk_fraction_is_flat_and_rejects_bad_inputs() {
         let early = stage_risk_fraction_for_bankroll(100.0, 50_000.0, 2.0, 120.0).unwrap();
         let late = stage_risk_fraction_for_bankroll(100.0, 50_000.0, 2.0, 40_000.0).unwrap();
-        assert!(early > late, "early {early} should exceed late {late}");
+        assert_eq!(early, late, "bankroll alone must not change measured edge");
         assert!(
             (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
                 .contains(&early)
@@ -2034,7 +1834,7 @@ mod tests {
     /// HIGH-WATER stage.
     #[test]
     fn per_stage_fires_on_a_retreat_below_the_previous_rung_of_the_high_water_stage() {
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.starting_capital_usd = 100.0;
         cfg.target_capital_usd = 50_000.0;
         cfg.stages = build_logarithmic_stages(100.0, 50_000.0, DEFAULT_DOUBLING_FACTOR);
@@ -2068,7 +1868,7 @@ mod tests {
     /// (that is precisely how the old cursor erased the retreat).
     #[test]
     fn the_high_water_stage_never_walks_back_down() {
-        let mut cfg = signed_default_config();
+        let mut cfg = RiskyModeConfig::default();
         cfg.stages = build_logarithmic_stages(100.0, 50_000.0, DEFAULT_DOUBLING_FACTOR);
         cfg.starting_capital_usd = 100.0;
         cfg.target_capital_usd = 50_000.0;
@@ -2084,18 +1884,14 @@ mod tests {
         assert!(m.current_stage().stage_idx < peak);
     }
 
-    /// The monthly cap must no longer be driven by the ruin PROBABILITY, and
-    /// splitting it must not have moved the threshold.
     #[test]
-    fn the_monthly_cap_is_its_own_knob_and_defaults_to_the_previous_value() {
+    fn the_monthly_cap_defaults_and_remains_configurable() {
         let cfg = RiskyModeConfig::default();
         assert_eq!(
-            cfg.monthly_loss_cap_fraction, MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
-            "behaviour must be identical to before the split"
+            cfg.monthly_loss_cap_fraction, DEFAULT_MONTHLY_LOSS_CAP_FRACTION,
+            "default monthly loss cap changed"
         );
-        // Re-tuning the ruin model must not move the kill switch any more.
-        let mut cfg = signed_default_config();
-        cfg.acknowledged_ruin_probability_ceiling = 0.10;
+        let mut cfg = RiskyModeConfig::default();
         cfg.monthly_loss_cap_fraction = 0.50;
         let mut m = RiskyModeManager::new(cfg, 100.0).expect("manager");
         m.raise_period_losses(0.0, 0.0, 40.0);
@@ -2109,7 +1905,7 @@ mod tests {
             Err(KillSwitchTier::PerMonth)
         );
         // Rejected by the validator, not silently clamped.
-        let mut bad = signed_default_config();
+        let mut bad = RiskyModeConfig::default();
         bad.monthly_loss_cap_fraction = 0.0;
         assert!(RiskyModeManager::new(bad, 100.0).is_err());
     }
@@ -2118,7 +1914,7 @@ mod tests {
     /// close this engine's day, and it must never double-count or subtract.
     #[test]
     fn raise_period_losses_takes_the_max_and_never_lowers() {
-        let mut m = RiskyModeManager::new(signed_default_config(), 100.0).expect("manager");
+        let mut m = RiskyModeManager::new(RiskyModeConfig::default(), 100.0).expect("manager");
         m.record_trade_outcome(-10.0); // this engine's own loss
         assert!((m.daily_loss_accumulated_usd() - 10.0).abs() < 1e-9);
         // The journal reports the same trade — must count ONCE, not twice.

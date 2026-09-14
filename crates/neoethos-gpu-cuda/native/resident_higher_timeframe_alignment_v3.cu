@@ -20,6 +20,17 @@ __device__ __forceinline__ double canonical_nan_v3() {
   return __longlong_as_double(static_cast<long long>(0x7ff8000000000000ULL));
 }
 
+__device__ __forceinline__ bool nonnegative_difference_v3(
+    std::int64_t later_ms, std::int64_t earlier_ms,
+    std::int64_t* difference_ms) {
+  if (later_ms < earlier_ms ||
+      (earlier_ms < 0 && later_ms > INT64_MAX + earlier_ms)) {
+    return false;
+  }
+  *difference_ms = later_ms - earlier_ms;
+  return true;
+}
+
 __device__ __forceinline__ bool availability_at_v3(
     const NeoResidentHigherTimeframeParentSegmentV3& segment,
     std::uint64_t parent_row, std::int64_t* available_at_ms) {
@@ -86,17 +97,24 @@ __global__ void resident_higher_timeframe_alignment_f64_v3(
       segment, base_timestamp_ms, &parent_row, &available_at_ms);
   std::uint8_t unavailable_validity = kAlignmentMissingV3;
   bool source_available = parent_resolved;
-  if (parent_resolved && segment.availability_rule ==
-                             NEOETHOS_RESIDENT_HTF_AVAILABILITY_FIXED_V3) {
-    if (base_timestamp_ms < available_at_ms) {
+  if (parent_resolved) {
+    std::int64_t age_ms = 0;
+    std::int64_t effective_max_age_ms = segment.max_age_ms;
+    if (!nonnegative_difference_v3(base_timestamp_ms, available_at_ms,
+                                   &age_ms)) {
       source_available = false;
       unavailable_validity = kComputeFailureV3;
-    } else {
-      const std::int64_t age_ms = base_timestamp_ms - available_at_ms;
-      if (age_ms > segment.max_age_ms) {
-        source_available = false;
-        unavailable_validity = kStaleV3;
-      }
+    } else if (segment.availability_rule ==
+                   NEOETHOS_RESIDENT_HTF_AVAILABILITY_NEXT_DIRECT_OPEN_V3 &&
+               (!nonnegative_difference_v3(
+                    available_at_ms, segment.parent_open_ms[parent_row],
+                    &effective_max_age_ms) ||
+                effective_max_age_ms <= 0)) {
+      source_available = false;
+      unavailable_validity = kComputeFailureV3;
+    } else if (age_ms > effective_max_age_ms) {
+      source_available = false;
+      unavailable_validity = kStaleV3;
     }
   }
 

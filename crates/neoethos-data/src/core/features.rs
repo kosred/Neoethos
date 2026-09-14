@@ -35,10 +35,12 @@ pub enum FeatureCellValidity {
     AlignmentMissing = 9,
 }
 
-/// Version 3 supports an explicit per-row close-availability schedule. Fixed
-/// timeframes use open + exact period; calendar timeframes use the next direct
-/// broker bar-open and never invent 24-hour/7-day/30-day durations.
-pub const HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION: u32 = 3;
+/// Version 4 supports an explicit per-row close-availability schedule and
+/// bounded freshness for calendar timeframes. Fixed timeframes use open + exact
+/// period; calendar timeframes become available at the next direct broker
+/// bar-open and expire after that just-closed bar's observed open-to-open span.
+/// No 24-hour/7-day/30-day duration is invented.
+pub const HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION: u32 = 4;
 
 impl FeatureCellValidity {
     #[inline]
@@ -176,13 +178,9 @@ impl FromStr for FeatureProfile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureBuildOptions {
     pub profile: FeatureProfile,
-    pub include_smc: bool,
-    pub include_hpc_ta: bool,
-    pub include_regime: bool,
-    pub include_quant: bool,
     pub prefix_base_features: bool,
     pub higher_tfs: Vec<String>,
     /// Exact in-sample rows used to fit normalization. `None` is valid only
@@ -195,20 +193,21 @@ pub struct FeatureBuildOptions {
     /// versioned feature projection policy.
     #[serde(default)]
     pub drop_columns_without_normalization_training_support: bool,
+    /// Exact Classic selection captured by a streaming producer. None retains
+    /// the legacy adaptive-prefix recipe; replay never invents a missing batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classic_ta_working_set: Option<super::hpc_ta::SweepBatch>,
 }
 
 impl Default for FeatureBuildOptions {
     fn default() -> Self {
         Self {
             profile: FeatureProfile::Standard,
-            include_smc: true,
-            include_hpc_ta: true,
-            include_regime: true,
-            include_quant: true,
             prefix_base_features: false,
             higher_tfs: Vec::new(),
             normalization_training_rows: None,
             drop_columns_without_normalization_training_support: false,
+            classic_ta_working_set: None,
         }
     }
 }
@@ -232,6 +231,8 @@ pub struct FeatureFrameView {
     parent: Arc<FeatureFrame>,
     column_indices: Vec<usize>,
     row_range: Range<usize>,
+    normalization: Option<Vec<crate::core::normalization::RobustNormalizationFitF64>>,
+    row_indices: Option<Arc<Vec<usize>>>,
 }
 
 /// Immutable source-row receipts carried by a feature frame. Ordinary frames
@@ -255,6 +256,118 @@ pub struct FeatureDenseMatrixF64 {
     pub validity: Array2<FeatureCellValidity>,
 }
 
+fn dense_window_destination_layout(rows: usize, columns: usize) -> Result<(usize, u64)> {
+    let cells = rows
+        .checked_mul(columns)
+        .ok_or_else(|| anyhow::anyhow!("dense feature destination cell count overflowed"))?;
+    let value_bytes = cells
+        .checked_mul(std::mem::size_of::<f64>())
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or_else(|| anyhow::anyhow!("dense feature destination value capacity overflowed"))?;
+    let bytes = cells
+        .checked_mul(std::mem::size_of::<FeatureCellValidity>())
+        .and_then(|validity_bytes| validity_bytes.checked_add(value_bytes))
+        .ok_or_else(|| anyhow::anyhow!("dense feature destination byte count overflowed"))?;
+    Ok((cells, u64::try_from(bytes)?))
+}
+
+/// RAM-bounded projection schedule for consumers that scan a complete feature
+/// frame. Vortex can project many columns in one physical scan, but asking it
+/// for the complete cube at once defeats the scratch-store boundary. This plan
+/// converts current allocation headroom and the frame's actual row count into
+/// both a column batch width and a maximum number of concurrent batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveFeatureProjectionPlan {
+    pub columns_per_batch: usize,
+    pub concurrent_batches: usize,
+    pub budget_bytes: u64,
+    pub estimated_bytes_per_batch: u64,
+}
+
+const FEATURE_PROJECTION_MAX_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const FEATURE_PROJECTION_BYTES_PER_ROW_FIXED: u64 = 16; // timestamp + source row id
+const FEATURE_PROJECTION_BYTES_PER_CELL: u64 = 16; // f64 + validity + decode headroom
+const FEATURE_PROJECTION_BATCH_OVERHEAD_BYTES: u64 = 1024 * 1024;
+
+/// Resolve a fallible projection plan from measured allocation headroom.
+///
+/// Kept public so Search can use the same calculation for hashing, statistics
+/// and prefilter scoring. Production callers should pass
+/// [`neoethos_core::allocation_headroom_bytes`]; the explicit argument makes
+/// the boundary deterministic and directly testable. A nonempty request is
+/// refused if even one complete column cannot fit the estimated budget. Zero
+/// headroom does not authorize a fallback allocation or a reduced dataset.
+pub fn adaptive_feature_projection_plan_for_available_memory(
+    row_count: usize,
+    column_count: usize,
+    requested_concurrency: usize,
+    available_memory_bytes: u64,
+) -> Result<AdaptiveFeatureProjectionPlan> {
+    if column_count == 0 {
+        return Ok(AdaptiveFeatureProjectionPlan {
+            columns_per_batch: 0,
+            concurrent_batches: 0,
+            budget_bytes: 0,
+            estimated_bytes_per_batch: 0,
+        });
+    }
+
+    // Retain two thirds of current headroom for resident OHLCV, search
+    // state, allocator fragmentation and the operating system. The cap keeps
+    // one scan from becoming a multi-gigabyte latency spike on large hosts.
+    let budget_bytes = (available_memory_bytes / 3).min(FEATURE_PROJECTION_MAX_BUDGET_BYTES);
+    let rows = u64::try_from(row_count)?;
+    let fixed_bytes = rows
+        .checked_mul(FEATURE_PROJECTION_BYTES_PER_ROW_FIXED)
+        .and_then(|bytes| bytes.checked_add(FEATURE_PROJECTION_BATCH_OVERHEAD_BYTES))
+        .ok_or_else(|| anyhow::anyhow!("feature projection fixed-byte estimate overflowed"))?;
+    let bytes_per_column = rows
+        .checked_mul(FEATURE_PROJECTION_BYTES_PER_CELL)
+        .ok_or_else(|| anyhow::anyhow!("feature projection column-byte estimate overflowed"))?
+        .max(1);
+    let minimum_batch_bytes = fixed_bytes
+        .checked_add(bytes_per_column)
+        .ok_or_else(|| anyhow::anyhow!("feature projection batch-byte estimate overflowed"))?;
+    anyhow::ensure!(
+        minimum_batch_bytes <= budget_bytes,
+        "feature projection admission refused: one complete {row_count}-row column needs an estimated {minimum_batch_bytes} bytes, but the projection budget is {budget_bytes} bytes from {available_memory_bytes} bytes of measured allocation headroom; no rows or columns were omitted"
+    );
+    let requested_concurrency = requested_concurrency.max(1).min(column_count);
+    let affordable_concurrency =
+        usize::try_from(budget_bytes / minimum_batch_bytes).unwrap_or(usize::MAX);
+    let concurrent_batches = requested_concurrency.min(affordable_concurrency);
+    let per_batch_budget = budget_bytes / concurrent_batches as u64;
+    // Spare RAM must not collapse a wide independent workload into one batch
+    // and leave the admitted workers idle. Bound batch width by useful work as
+    // well as bytes; this changes scheduling, never column coverage/order.
+    let columns_per_batch = ((per_batch_budget - fixed_bytes) / bytes_per_column)
+        .min(column_count.div_ceil(concurrent_batches) as u64) as usize;
+    let estimated_bytes_per_batch = fixed_bytes + bytes_per_column * columns_per_batch as u64;
+
+    Ok(AdaptiveFeatureProjectionPlan {
+        columns_per_batch,
+        concurrent_batches,
+        budget_bytes,
+        estimated_bytes_per_batch,
+    })
+}
+
+/// Resolve a projection plan from live allocation headroom and the actual
+/// frame dimensions. Failure propagates before projection or worker dispatch;
+/// callers must not replace it with a one-column or fixed-memory fallback.
+/// The estimate is a snapshot, not a process-wide byte reservation.
+pub fn adaptive_feature_projection_plan(
+    frame: &FeatureFrame,
+    requested_concurrency: usize,
+) -> Result<AdaptiveFeatureProjectionPlan> {
+    adaptive_feature_projection_plan_for_available_memory(
+        frame.n_samples(),
+        frame.n_features(),
+        requested_concurrency,
+        neoethos_core::allocation_headroom_bytes(),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct FeatureFrame {
     pub timestamps: Vec<i64>,
@@ -265,9 +378,85 @@ pub struct FeatureFrame {
     source_generation_leases:
         Arc<Vec<Arc<crate::core::dataset_generation_lease::DatasetGenerationLease>>>,
     row_ids: FeatureFrameRowIds,
+    normalization_fitted_state:
+        Option<Arc<crate::core::normalization::SearchNormalizationFittedStateV1>>,
+    feature_build_options: Option<Arc<FeatureBuildOptions>>,
+}
+
+/// A sealed column projection of one immutable shared source. Construct once
+/// before causal inference; each row window reuses its plan/provenance without
+/// retaining another full timestamp vector or materializing feature values.
+pub struct BoundFeatureColumnProjection {
+    source: Arc<FeatureFrame>,
+    column_indices: Vec<usize>,
+    plan: Arc<FeaturePlanV1>,
+    provenance: Arc<DatasetFeatureArtifactProvenanceV1>,
+}
+
+impl BoundFeatureColumnProjection {
+    pub fn row_window(&self, rows: Range<usize>) -> Result<FeatureFrame> {
+        anyhow::ensure!(
+            rows.start < rows.end && rows.end <= self.source.n_samples(),
+            "bound column window must be nonempty and within its source"
+        );
+        let timestamps = self.source.timestamps[rows.clone()].to_vec();
+        crate::core::timestamps::validate_canonical_millisecond_timestamps(&timestamps)?;
+        let frame = FeatureFrame {
+            timestamps,
+            names: self.plan.final_outputs().to_vec(),
+            data: FeatureData::View(FeatureFrameView {
+                parent: Arc::clone(&self.source),
+                column_indices: self.column_indices.clone(),
+                row_range: rows.clone(),
+                normalization: None,
+                row_indices: None,
+            }),
+            plan: Arc::clone(&self.plan),
+            provenance: Arc::clone(&self.provenance),
+            source_generation_leases: Arc::clone(&self.source.source_generation_leases),
+            row_ids: self.source.row_ids_for_window(rows)?,
+            normalization_fitted_state: self.source.normalization_fitted_state.clone(),
+            feature_build_options: self.source.feature_build_options.clone(),
+        };
+        frame.validate_backing()?;
+        Ok(frame)
+    }
 }
 
 impl FeatureFrame {
+    pub fn bind_column_projection(
+        self: &Arc<Self>,
+        column_indices: &[usize],
+    ) -> Result<BoundFeatureColumnProjection> {
+        anyhow::ensure!(
+            self.names == self.plan.final_outputs(),
+            "bound feature source schema differs from its immutable plan"
+        );
+        self.validate_backing()?;
+        self.validate_projection(column_indices, &(0..self.n_samples()))?;
+        let identity = column_indices.iter().copied().eq(0..self.n_features());
+        let (plan, provenance) = if identity {
+            (Arc::clone(&self.plan), Arc::clone(&self.provenance))
+        } else {
+            let names = column_indices
+                .iter()
+                .map(|&index| self.names[index].clone())
+                .collect();
+            let plan = Arc::new(FeaturePlanV1::new(self.plan.nodes().to_vec(), names)?);
+            let provenance = Arc::new(DatasetFeatureArtifactProvenanceV1::new(
+                &plan,
+                self.provenance.bindings().to_vec(),
+            )?);
+            (plan, provenance)
+        };
+        Ok(BoundFeatureColumnProjection {
+            source: Arc::clone(self),
+            column_indices: column_indices.to_vec(),
+            plan,
+            provenance,
+        })
+    }
+
     pub fn from_columns(
         timestamps: Vec<i64>,
         columns: Vec<FeatureColumnF64>,
@@ -379,6 +568,8 @@ impl FeatureFrame {
             Arc::new(provenance),
             Arc::new(source_generation_leases),
             FeatureFrameRowIds::Contiguous { origin: row_origin },
+            None,
+            None,
         )
     }
 
@@ -392,6 +583,10 @@ impl FeatureFrame {
             Vec<Arc<crate::core::dataset_generation_lease::DatasetGenerationLease>>,
         >,
         row_ids: FeatureFrameRowIds,
+        normalization_fitted_state: Option<
+            Arc<crate::core::normalization::SearchNormalizationFittedStateV1>,
+        >,
+        feature_build_options: Option<Arc<FeatureBuildOptions>>,
     ) -> Result<Self> {
         crate::core::timestamps::validate_canonical_millisecond_timestamps(&timestamps)?;
         anyhow::ensure!(!names.is_empty(), "feature frame must contain columns");
@@ -412,6 +607,8 @@ impl FeatureFrame {
             provenance,
             source_generation_leases,
             row_ids,
+            normalization_fitted_state,
+            feature_build_options,
         };
         frame.validate_backing()?;
         Ok(frame)
@@ -506,6 +703,26 @@ impl FeatureFrame {
                 );
             }
             FeatureData::View(view) => {
+                if let Some(indices) = &view.row_indices {
+                    anyhow::ensure!(
+                        indices.len() == rows
+                            && indices.windows(2).all(|pair| pair[0] < pair[1])
+                            && indices
+                                .last()
+                                .is_some_and(|last| *last < view.parent.n_samples()),
+                        "indexed feature view row receipt mismatch"
+                    );
+                }
+                if let Some(fits) = &view.normalization {
+                    anyhow::ensure!(
+                        fits.len() == self.names.len(),
+                        "normalized view fit count mismatch"
+                    );
+                    anyhow::ensure!(
+                        view.parent.normalization_fitted_state().is_none(),
+                        "normalized view cannot normalize its parent twice"
+                    );
+                }
                 anyhow::ensure!(
                     view.row_range.start <= view.row_range.end
                         && view.row_range.end <= view.parent.n_samples(),
@@ -563,6 +780,305 @@ impl FeatureFrame {
 
     pub fn provenance(&self) -> &DatasetFeatureArtifactProvenanceV1 {
         &self.provenance
+    }
+
+    /// Original train-only normalization parameters, shared unchanged across
+    /// column projections and row windows. Their hash remains bound to the
+    /// full normalization node even when the final output selects a subset.
+    pub fn normalization_fitted_state(
+        &self,
+    ) -> Option<&crate::core::normalization::SearchNormalizationFittedStateV1> {
+        self.normalization_fitted_state.as_deref()
+    }
+
+    pub fn feature_build_options(&self) -> Option<&FeatureBuildOptions> {
+        self.feature_build_options.as_deref()
+    }
+
+    /// Estimate only from explicit raw training rows, one admitted column
+    /// batch at a time. The full backing remains shared for later fold/live
+    /// transformations; no inverse of the clipped values is ever attempted.
+    pub fn fit_normalization(
+        &self,
+        training_rows: Range<usize>,
+        drop_unsupported: bool,
+        control: &crate::FeatureBuildControl,
+    ) -> Result<crate::SearchNormalizationFittedStateV1> {
+        use rayon::prelude::*;
+        anyhow::ensure!(
+            self.normalization_fitted_state.is_none(),
+            "normalization fit requires raw features"
+        );
+        anyhow::ensure!(
+            training_rows.start < training_rows.end && training_rows.end <= self.n_samples(),
+            "normalization training range is outside raw frame"
+        );
+        let mut names = Vec::new();
+        let mut fits = Vec::new();
+        let mut start = 0;
+        while start < self.n_features() {
+            control.checkpoint()?;
+            // Fitter scratch plus raw projection and its mutation. Admission
+            // uses current headroom and the caller's installed CPU lease.
+            let per_worker = (training_rows.len() as u64).saturating_mul(64);
+            let budget = crate::higher_timeframe_parallel_budget_bytes(
+                false,
+                neoethos_core::allocation_headroom_bytes(),
+                0,
+                0,
+            );
+            let workers = rayon::current_num_threads()
+                .min(self.n_features() - start)
+                .min(usize::try_from(budget / per_worker.max(1)).unwrap_or(usize::MAX));
+            anyhow::ensure!(
+                workers > 0,
+                "model normalization training scratch exceeds available RAM; no rows or vocabulary were removed"
+            );
+            let end = start + workers;
+            let batch = (start..end)
+                .into_par_iter()
+                .map(|index| -> Result<_> {
+                    control.checkpoint()?;
+                    let projected = self.project_columns(&[index], training_rows.clone())?;
+                    let mut column = projected.columns[0].clone();
+                    if !column.validity.iter().any(|validity| validity.is_valid())
+                        && drop_unsupported
+                    {
+                        return Ok(None);
+                    }
+                    let rows = column.len();
+                    let mut fit = crate::core::normalization::normalize_search_feature_column_f64(
+                        &mut column,
+                        0..rows,
+                    )?;
+                    fit.training_rows = training_rows.clone();
+                    control.checkpoint()?;
+                    Ok(Some((self.names[index].clone(), fit)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (name, fit) in batch.into_iter().flatten() {
+                names.push(name);
+                fits.push(fit);
+            }
+            start = end;
+        }
+        crate::SearchNormalizationFittedStateV1::new(names, fits)
+    }
+
+    /// Lazy immutable transform over an existing raw RAM/Vortex frame. This
+    /// MODEL/fold path retains the raw graph and binds its exact fitted state;
+    /// the existing Search producer's plan and arithmetic remain unchanged.
+    pub fn with_fitted_normalization(
+        self: &Arc<Self>,
+        state: &crate::SearchNormalizationFittedStateV1,
+    ) -> Result<Self> {
+        use neoethos_feature_contracts::{FeatureNodeV1, FeatureOperationTagV1, FeatureOutputV1};
+        anyhow::ensure!(
+            self.normalization_fitted_state.is_none()
+                && !self
+                    .plan
+                    .nodes()
+                    .iter()
+                    .any(|node| node.operation() == FeatureOperationTagV1::Normalization),
+            "frozen normalization requires a raw frame; double normalization is forbidden"
+        );
+        state.validate()?;
+        let raw_indices = self
+            .names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), index))
+            .collect::<std::collections::HashMap<_, _>>();
+        let columns = state
+            .column_names()
+            .iter()
+            .map(|name| {
+                raw_indices.get(name.as_str()).copied().ok_or_else(|| {
+                    anyhow::anyhow!("raw model input is missing fitted column `{name}`")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut nodes = Vec::with_capacity(self.plan.nodes().len() + 1);
+        let mut inputs = Vec::new();
+        for node in self.plan.nodes() {
+            let has_output = node
+                .outputs()
+                .iter()
+                .any(|output| raw_indices.contains_key(output.name()));
+            if has_output {
+                inputs.push(node.id().to_owned());
+                nodes.push(
+                    node.with_output_names(
+                        node.outputs()
+                            .iter()
+                            .map(|output| {
+                                if raw_indices.contains_key(output.name()) {
+                                    format!("model-input:raw:{}", output.name())
+                                } else {
+                                    output.name().to_owned()
+                                }
+                            })
+                            .collect(),
+                    )?,
+                );
+            } else {
+                nodes.push(node.clone());
+            }
+        }
+        let source_hash = crate::semantic_source_hash(&[include_bytes!("normalization.rs")]);
+        nodes.push(FeatureNodeV1::transform(
+            "normalization:robust-f64",
+            FeatureOperationTagV1::Normalization,
+            crate::SEARCH_NORMALIZATION_POLICY_VERSION,
+            inputs,
+            state
+                .column_names()
+                .iter()
+                .map(|name| {
+                    FeatureOutputV1::f64(name.clone(), crate::SEARCH_NORMALIZATION_POLICY_VERSION)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            Vec::new(),
+            source_hash,
+            source_hash,
+            Some(state.fitted_state_hash()?),
+        )?);
+        let plan = FeaturePlanV1::new(nodes, state.column_names().to_vec())?;
+        state.validate_plan(&plan)?;
+        let provenance =
+            DatasetFeatureArtifactProvenanceV1::new(&plan, self.provenance.bindings().to_vec())?;
+        let mut options = self.feature_build_options().cloned().unwrap_or_default();
+        options.normalization_training_rows = Some(state.training_rows()?);
+        Self::build_with_authority(
+            self.timestamps.clone(),
+            state.column_names().to_vec(),
+            FeatureData::View(FeatureFrameView {
+                parent: Arc::clone(self),
+                column_indices: columns,
+                row_range: 0..self.n_samples(),
+                normalization: Some(state.fits().to_vec()),
+                row_indices: None,
+            }),
+            Arc::new(plan),
+            Arc::new(provenance),
+            Arc::clone(&self.source_generation_leases),
+            self.row_ids.clone(),
+            Some(Arc::new(state.clone())),
+            Some(Arc::new(options)),
+        )
+    }
+
+    /// A whole-frame view with a genuinely shared in-memory backing. Unlike
+    /// cloning an owned `InMemory(Vec<...>)`, this allocates no feature values.
+    pub fn shared_view(self: &Arc<Self>) -> Result<Self> {
+        Self::build_with_authority(
+            self.timestamps.clone(),
+            self.names.clone(),
+            FeatureData::View(FeatureFrameView {
+                parent: Arc::clone(self),
+                column_indices: (0..self.n_features()).collect(),
+                row_range: 0..self.n_samples(),
+                normalization: None,
+                row_indices: None,
+            }),
+            Arc::clone(&self.plan),
+            Arc::clone(&self.provenance),
+            Arc::clone(&self.source_generation_leases),
+            self.row_ids.clone(),
+            self.normalization_fitted_state.clone(),
+            self.feature_build_options.clone(),
+        )
+    }
+
+    /// Derive a bounded row view without cloning source values/timestamps or
+    /// re-hashing its unchanged private plan/provenance. Those immutable Arcs
+    /// were validated when the parent was constructed; public schema and the
+    /// new row/backing invariants are still checked here.
+    pub fn shared_row_window(self: &Arc<Self>, rows: Range<usize>) -> Result<Self> {
+        anyhow::ensure!(
+            rows.start < rows.end && rows.end <= self.n_samples(),
+            "shared feature window must be nonempty and within its source"
+        );
+        anyhow::ensure!(
+            self.names == self.plan.final_outputs(),
+            "shared feature source schema differs from its immutable plan"
+        );
+        let timestamps = self.timestamps[rows.clone()].to_vec();
+        crate::core::timestamps::validate_canonical_millisecond_timestamps(&timestamps)?;
+        let frame = Self {
+            timestamps,
+            names: self.names.clone(),
+            data: FeatureData::View(FeatureFrameView {
+                parent: Arc::clone(self),
+                column_indices: (0..self.n_features()).collect(),
+                row_range: rows.clone(),
+                normalization: None,
+                row_indices: None,
+            }),
+            plan: Arc::clone(&self.plan),
+            provenance: Arc::clone(&self.provenance),
+            source_generation_leases: Arc::clone(&self.source_generation_leases),
+            row_ids: self.row_ids_for_window(rows)?,
+            normalization_fitted_state: self.normalization_fitted_state.clone(),
+            feature_build_options: self.feature_build_options.clone(),
+        };
+        frame.validate_backing()?;
+        Ok(frame)
+    }
+
+    pub(crate) fn with_feature_build_options(mut self, options: FeatureBuildOptions) -> Self {
+        self.feature_build_options = Some(Arc::new(options));
+        self
+    }
+
+    /// Indexed views share raw values and materialize only requested batches.
+    pub fn shared_select_rows(self: &Arc<Self>, indices: &[usize]) -> Result<Self> {
+        anyhow::ensure!(
+            !indices.is_empty()
+                && indices.windows(2).all(|pair| pair[0] < pair[1])
+                && indices.last().is_some_and(|last| *last < self.n_samples()),
+            "shared feature rows must be nonempty, ordered, unique and within the source"
+        );
+        let row_ids = indices
+            .iter()
+            .map(|&row| match &self.row_ids {
+                FeatureFrameRowIds::Contiguous { origin } => origin
+                    .checked_add(row)
+                    .and_then(|row| u64::try_from(row).ok())
+                    .ok_or_else(|| anyhow::anyhow!("source row identity overflow")),
+                FeatureFrameRowIds::Explicit(ids) => Ok(ids[row]),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::build_with_authority(
+            indices.iter().map(|&row| self.timestamps[row]).collect(),
+            self.names.clone(),
+            FeatureData::View(FeatureFrameView {
+                parent: Arc::clone(self),
+                column_indices: (0..self.n_features()).collect(),
+                row_range: 0..indices.len(),
+                normalization: None,
+                row_indices: Some(Arc::new(indices.to_vec())),
+            }),
+            Arc::clone(&self.plan),
+            Arc::clone(&self.provenance),
+            Arc::clone(&self.source_generation_leases),
+            FeatureFrameRowIds::Explicit(Arc::new(row_ids)),
+            self.normalization_fitted_state.clone(),
+            self.feature_build_options.clone(),
+        )
+    }
+
+    pub(crate) fn with_normalization_fitted_state(
+        mut self,
+        state: crate::core::normalization::SearchNormalizationFittedStateV1,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            self.normalization_fitted_state.is_none(),
+            "feature frame already has a fitted normalization state"
+        );
+        state.validate_plan(&self.plan)?;
+        self.normalization_fitted_state = Some(Arc::new(state));
+        Ok(self)
     }
 
     pub fn ensure_semantically_compatible(&self, other: &Self) -> Result<()> {
@@ -625,7 +1141,22 @@ impl FeatureFrame {
         column_indices: &[usize],
         row_range: Range<usize>,
     ) -> Result<Arc<crate::core::vortex_feature_store::VortexFeatureBatch>> {
+        self.project_columns_mode(column_indices, row_range, true)
+    }
+
+    fn project_columns_mode(
+        &self,
+        column_indices: &[usize],
+        row_range: Range<usize>,
+        apply_normalization: bool,
+    ) -> Result<Arc<crate::core::vortex_feature_store::VortexFeatureBatch>> {
         self.validate_projection(column_indices, &row_range)?;
+        anyhow::ensure!(
+            apply_normalization
+                || self.normalization_fitted_state.is_none()
+                || matches!(self.data, FeatureData::View(_)),
+            "raw model input is unavailable for materialized normalized features; inverse normalization is forbidden"
+        );
         match &self.data {
             FeatureData::InMemory(columns) => {
                 let selected = column_indices
@@ -657,8 +1188,66 @@ impl FeatureFrame {
                     .collect::<Vec<_>>();
                 let physical_range = (view.row_range.start + row_range.start)
                     ..(view.row_range.start + row_range.end);
-                view.parent
-                    .project_columns(&physical_columns, physical_range)
+                let batch = if let Some(indices) = &view.row_indices {
+                    let selected = &indices[row_range];
+                    let mut output = crate::core::vortex_feature_store::VortexFeatureBatch {
+                        timestamps: Vec::with_capacity(selected.len()),
+                        row_ids: Vec::with_capacity(selected.len()),
+                        columns: physical_columns
+                            .iter()
+                            .map(|&column| {
+                                FeatureColumnF64::new(
+                                    view.parent.names[column].clone(),
+                                    Vec::with_capacity(selected.len()),
+                                    Vec::with_capacity(selected.len()),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    };
+                    let mut offset = 0;
+                    while offset < selected.len() {
+                        let start = selected[offset];
+                        let mut end = offset + 1;
+                        while end < selected.len() && selected[end] == selected[end - 1] + 1 {
+                            end += 1;
+                        }
+                        let source = view.parent.project_columns_mode(
+                            &physical_columns,
+                            start..(selected[end - 1] + 1),
+                            apply_normalization,
+                        )?;
+                        output.timestamps.extend_from_slice(&source.timestamps);
+                        output.row_ids.extend_from_slice(&source.row_ids);
+                        for (destination, source) in output.columns.iter_mut().zip(&source.columns)
+                        {
+                            destination.values.extend_from_slice(&source.values);
+                            destination.validity.extend_from_slice(&source.validity);
+                        }
+                        offset = end;
+                    }
+                    Arc::new(output)
+                } else {
+                    view.parent.project_columns_mode(
+                        &physical_columns,
+                        physical_range,
+                        apply_normalization,
+                    )?
+                };
+                if let Some(fits) = &view.normalization
+                    && apply_normalization
+                {
+                    let mut transformed =
+                        Arc::try_unwrap(batch).unwrap_or_else(|shared| (*shared).clone());
+                    for (&logical, column) in column_indices.iter().zip(&mut transformed.columns) {
+                        crate::core::normalization::apply_search_normalization_fit(
+                            column,
+                            &fits[logical],
+                        )?;
+                    }
+                    Ok(Arc::new(transformed))
+                } else {
+                    Ok(batch)
+                }
             }
         }
     }
@@ -668,6 +1257,21 @@ impl FeatureFrame {
     /// `FeaturePlanIdentity`; concrete dataset provenance stays identical.
     pub fn select_columns(&self, column_indices: &[usize]) -> Result<Self> {
         self.validate_projection(column_indices, &(0..self.n_samples()))?;
+        // Adapters receive bounded already-projected views from a bound
+        // inference context. Their identity projection must not rebuild the
+        // complete graph. Only a View can be cheaply cloned; validate its
+        // public schema/backing before reusing the immutable sealed authority.
+        if matches!(&self.data, FeatureData::View(_))
+            && column_indices.iter().copied().eq(0..self.n_features())
+        {
+            anyhow::ensure!(
+                self.names == self.plan.final_outputs(),
+                "identity projection schema differs from its immutable plan"
+            );
+            crate::core::timestamps::validate_canonical_millisecond_timestamps(&self.timestamps)?;
+            self.validate_backing()?;
+            return Ok(self.clone());
+        }
         let names = column_indices
             .iter()
             .map(|&column| self.names[column].clone())
@@ -686,11 +1290,15 @@ impl FeatureFrame {
                 parent: Arc::new(self.clone()),
                 column_indices: column_indices.to_vec(),
                 row_range: 0..self.n_samples(),
+                normalization: None,
+                row_indices: None,
             }),
             Arc::new(plan),
             Arc::new(provenance),
             Arc::clone(&self.source_generation_leases),
             self.row_ids.clone(),
+            self.normalization_fitted_state.clone(),
+            self.feature_build_options.clone(),
         )
     }
 
@@ -777,6 +1385,8 @@ impl FeatureFrame {
             Arc::clone(&self.provenance),
             Arc::clone(&self.source_generation_leases),
             FeatureFrameRowIds::Explicit(Arc::new(selected_row_ids)),
+            self.normalization_fitted_state.clone(),
+            self.feature_build_options.clone(),
         )
     }
 
@@ -804,6 +1414,58 @@ impl FeatureFrame {
         Ok(Arc::new(batch.columns[0].clone()))
     }
 
+    /// Price-only adapters get the original raw column through retained
+    /// model view lineage, preserving every row projection. No inverse of
+    /// clipped/materialized normalization is available or attempted.
+    pub fn raw_model_column(&self, name: &str) -> Result<Arc<FeatureColumnF64>> {
+        let index = self
+            .names
+            .iter()
+            .position(|candidate| candidate == name)
+            .ok_or_else(|| anyhow::anyhow!("raw model feature `{name}` is absent"))?;
+        let batch = self.project_columns_mode(&[index], 0..self.n_samples(), false)?;
+        Ok(Arc::new(batch.columns[0].clone()))
+    }
+
+    /// Resolve a base feature only from the recorded prefix recipe and exact
+    /// source identity. No lowest-timeframe or name-substring guessing.
+    pub fn model_base_feature_name(&self, unprefixed: &str) -> Result<String> {
+        let name = if let Some(options) = self
+            .feature_build_options()
+            .filter(|options| options.prefix_base_features)
+        {
+            let higher = options
+                .higher_tfs
+                .iter()
+                .map(|tf| tf.parse::<crate::CanonicalTimeframe>())
+                .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()?;
+            let bases = self
+                .provenance
+                .bindings()
+                .iter()
+                .map(|binding| binding.dataset_identity())
+                .filter(|identity| !higher.contains(&identity.timeframe()))
+                .map(|identity| (identity.to_path_component(), identity.timeframe()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            anyhow::ensure!(
+                bases.len() == 1,
+                "model base-column alias requires one exact recipe-bound source identity"
+            );
+            format!(
+                "{}_{}",
+                bases.values().next().expect("one base").as_str(),
+                unprefixed
+            )
+        } else {
+            unprefixed.to_owned()
+        };
+        anyhow::ensure!(
+            self.names.contains(&name),
+            "model base feature `{name}` is absent"
+        );
+        Ok(name)
+    }
+
     pub fn cell(&self, sample: usize, feature: usize) -> Result<FeatureCellF64> {
         let batch = self.project_columns(&[feature], sample..sample.saturating_add(1))?;
         Ok(FeatureCellF64 {
@@ -821,21 +1483,98 @@ impl FeatureFrame {
     }
 
     pub fn dense_window(&self, start: usize, end: usize) -> Result<FeatureDenseMatrixF64> {
+        self.dense_window_with_headroom(start, end, neoethos_core::allocation_headroom_bytes)
+    }
+
+    fn dense_window_with_headroom(
+        &self,
+        start: usize,
+        end: usize,
+        mut allocation_headroom: impl FnMut() -> u64,
+    ) -> Result<FeatureDenseMatrixF64> {
+        use rayon::prelude::*;
+
         let columns = (0..self.n_features()).collect::<Vec<_>>();
-        let batch = self.project_columns(&columns, start..end)?;
-        let rows = end.saturating_sub(start);
-        let mut values = Array2::from_elem((rows, self.n_features()), f64::NAN);
-        let mut validity = Array2::from_elem(
-            (rows, self.n_features()),
-            FeatureCellValidity::AlignmentMissing,
-        );
-        for (column_index, column) in batch.columns.iter().enumerate() {
-            for row in 0..rows {
-                values[(row, column_index)] = column.values[row];
-                validity[(row, column_index)] = column.validity[row];
+        self.validate_projection(&columns, &(start..end))?;
+        let rows = end - start;
+        let (cells, destination_bytes) = dense_window_destination_layout(rows, columns.len())?;
+        if rows == 0 {
+            return Ok(FeatureDenseMatrixF64 {
+                values: Array2::from_shape_vec((0, columns.len()), Vec::new())?,
+                validity: Array2::from_shape_vec((0, columns.len()), Vec::new())?,
+            });
+        }
+
+        // Reserve the unavoidable destination once before admitting transient
+        // projections. This is a headroom estimate plus fallible reservations,
+        // not a process-wide reservation or a guarantee of physical RAM.
+        let available = allocation_headroom();
+        let projection_headroom = available.checked_sub(destination_bytes).ok_or_else(|| {
+            anyhow::anyhow!(
+                "dense feature destination admission refused: {rows} rows by {} columns need {destination_bytes} bytes, exceeding {available} bytes of measured allocation headroom; no rows or columns were omitted",
+                columns.len()
+            )
+        })?;
+        let workers = rayon::current_num_threads();
+        let mut plan = adaptive_feature_projection_plan_for_available_memory(
+            rows,
+            columns.len(),
+            workers,
+            projection_headroom,
+        )?;
+        let mut values = Vec::new();
+        values.try_reserve_exact(cells)?;
+        let mut validity = Vec::new();
+        validity.try_reserve_exact(cells)?;
+        values.resize(cells, f64::NAN);
+        validity.resize(cells, FeatureCellValidity::AlignmentMissing);
+
+        let mut first_column = 0;
+        while first_column < columns.len() {
+            let wave_end = first_column
+                .saturating_add(
+                    plan.columns_per_batch
+                        .saturating_mul(plan.concurrent_batches),
+                )
+                .min(columns.len());
+            let projected = columns[first_column..wave_end]
+                .par_chunks(plan.columns_per_batch)
+                .enumerate()
+                .map(|(batch_index, selected)| {
+                    self.project_columns(selected, start..end)
+                        .map(|batch| (first_column + batch_index * plan.columns_per_batch, batch))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            values
+                .par_chunks_mut(columns.len())
+                .zip(validity.par_chunks_mut(columns.len()))
+                .enumerate()
+                .for_each(|(row, (values, validity))| {
+                    for (offset, batch) in &projected {
+                        for (local, column) in batch.columns.iter().enumerate() {
+                            values[offset + local] = column.values[row];
+                            validity[offset + local] = column.validity[row];
+                        }
+                    }
+                });
+            drop(projected);
+            first_column = wave_end;
+            if first_column < columns.len() {
+                // The destination is now resident: do not subtract it again.
+                // Fresh headroom also observes retained decoded-cache growth;
+                // dropping a projection wave does not empty backing caches.
+                plan = adaptive_feature_projection_plan_for_available_memory(
+                    rows,
+                    columns.len() - first_column,
+                    workers,
+                    allocation_headroom(),
+                )?;
             }
         }
-        Ok(FeatureDenseMatrixF64 { values, validity })
+        Ok(FeatureDenseMatrixF64 {
+            values: Array2::from_shape_vec((rows, columns.len()), values)?,
+            validity: Array2::from_shape_vec((rows, columns.len()), validity)?,
+        })
     }
 
     pub fn row_slice(&self, start: usize, end: usize) -> Result<Self> {
@@ -851,6 +1590,8 @@ impl FeatureFrame {
             Arc::clone(&self.provenance),
             Arc::clone(&self.source_generation_leases),
             FeatureFrameRowIds::Explicit(Arc::new(batch.row_ids.clone())),
+            self.normalization_fitted_state.clone(),
+            self.feature_build_options.clone(),
         )
     }
 
@@ -864,11 +1605,15 @@ impl FeatureFrame {
                 parent: Arc::new(self.clone()),
                 column_indices: (0..self.n_features()).collect(),
                 row_range: start..end,
+                normalization: None,
+                row_indices: None,
             }),
             Arc::clone(&self.plan),
             Arc::clone(&self.provenance),
             Arc::clone(&self.source_generation_leases),
             self.row_ids_for_window(start..end)?,
+            self.normalization_fitted_state.clone(),
+            self.feature_build_options.clone(),
         )
     }
 
@@ -926,6 +1671,40 @@ pub fn align_feature_columns_by_ms(
     )
 }
 
+/// Causally align a direct calendar-timeframe source without inventing a fixed
+/// duration.
+///
+/// Source row `N` becomes observable only at the actually observed open of row
+/// `N + 1`. Its freshness window is then bounded by the observed
+/// `open[N]..open[N + 1]` span. The final source row has no evidenced close and
+/// is therefore never exposed. This deliberately fails stale rather than
+/// forward-filling the last known D1/W1/MN1 feature forever when newer direct
+/// broker rows are missing.
+pub fn align_calendar_feature_columns_by_observed_next_open_ms(
+    base_ms: &[i64],
+    feature_open_ms: &[i64],
+    feature_columns: &[FeatureColumnF64],
+    forward_fill: bool,
+) -> Result<Vec<FeatureColumnF64>> {
+    let mut available_at_ms = feature_open_ms
+        .iter()
+        .skip(1)
+        .copied()
+        .map(Some)
+        .collect::<Vec<_>>();
+    if !feature_open_ms.is_empty() {
+        available_at_ms.push(None);
+    }
+    align_feature_columns_at_explicit_availability_ms_with_freshness(
+        base_ms,
+        feature_open_ms,
+        &available_at_ms,
+        feature_columns,
+        forward_fill,
+        AlignmentFreshness::ObservedSourceSpan,
+    )
+}
+
 /// Align source rows using exact per-row availability timestamps.
 ///
 /// `None` means that a row has no evidenced close yet. Once a `None` appears,
@@ -940,9 +1719,33 @@ pub fn align_feature_columns_at_explicit_availability_ms(
     forward_fill: bool,
     max_age_ms: Option<i64>,
 ) -> Result<Vec<FeatureColumnF64>> {
+    align_feature_columns_at_explicit_availability_ms_with_freshness(
+        base_ms,
+        feature_open_ms,
+        available_at_ms,
+        feature_columns,
+        forward_fill,
+        AlignmentFreshness::Fixed(max_age_ms),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum AlignmentFreshness {
+    Fixed(Option<i64>),
+    ObservedSourceSpan,
+}
+
+fn align_feature_columns_at_explicit_availability_ms_with_freshness(
+    base_ms: &[i64],
+    feature_open_ms: &[i64],
+    available_at_ms: &[Option<i64>],
+    feature_columns: &[FeatureColumnF64],
+    forward_fill: bool,
+    freshness: AlignmentFreshness,
+) -> Result<Vec<FeatureColumnF64>> {
     use crate::core::timestamps::validate_canonical_millisecond_timestamps;
 
-    if let Some(max_age_ms) = max_age_ms {
+    if let AlignmentFreshness::Fixed(Some(max_age_ms)) = freshness {
         anyhow::ensure!(max_age_ms >= 0, "feature max age must be non-negative");
     }
     validate_canonical_millisecond_timestamps(base_ms)
@@ -1031,6 +1834,20 @@ pub fn align_feature_columns_at_explicit_availability_ms(
         if age != 0 && !forward_fill {
             continue;
         }
+        let max_age_ms = match freshness {
+            AlignmentFreshness::Fixed(max_age_ms) => max_age_ms,
+            AlignmentFreshness::ObservedSourceSpan => Some(
+                available_ms
+                    .checked_sub(feature_open_ms[feature_row])
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "observed calendar span overflow at source row {feature_row}: \
+                             {available_ms} - {}",
+                            feature_open_ms[feature_row]
+                        )
+                    })?,
+            ),
+        };
         if max_age_ms.is_some_and(|max_age| age > max_age) {
             for validity in &mut output_validity {
                 validity[base_row] = FeatureCellValidity::Stale;
@@ -1056,9 +1873,574 @@ pub fn align_feature_columns_at_explicit_availability_ms(
 }
 
 #[cfg(test)]
+mod fitted_model_view_tests {
+    use super::*;
+
+    fn dense_test_frame() -> Arc<FeatureFrame> {
+        Arc::new(
+            crate::test_fixtures::ctrader_test_feature_frame_from_columns(
+                crate::test_fixtures::canonical_test_timestamps(17),
+                (0..7)
+                    .map(|column| {
+                        FeatureColumnF64::new(
+                            format!("dense_{column}"),
+                            (0..17)
+                                .map(|row| match row {
+                                    0 => -0.0,
+                                    1 => 0.0,
+                                    _ => (row * 7 + column) as f64 / 13.0,
+                                })
+                                .collect(),
+                            (0..17)
+                                .map(|row| {
+                                    if row < 10 {
+                                        FeatureCellValidity::Valid
+                                    } else {
+                                        FeatureCellValidity::from_code(
+                                            (1 + (row + column) % 9) as u8,
+                                        )
+                                        .unwrap()
+                                    }
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn assert_dense_waves_match_projection(frame: &FeatureFrame, start: usize, end: usize) {
+        let columns = (0..frame.n_features()).collect::<Vec<_>>();
+        let expected = frame.project_columns(&columns, start..end).unwrap();
+        let rows = end - start;
+        let (_, destination_bytes) =
+            dense_window_destination_layout(rows, frame.n_features()).unwrap();
+        let minimum = FEATURE_PROJECTION_BATCH_OVERHEAD_BYTES
+            + rows as u64
+                * (FEATURE_PROJECTION_BYTES_PER_ROW_FIXED + FEATURE_PROJECTION_BYTES_PER_CELL);
+        // Exactly two one-column projections per wave; seven columns force an
+        // uneven final wave. Later snapshots already exclude the destination.
+        let mut snapshots = 0;
+        let dense = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                frame.dense_window_with_headroom(start, end, || {
+                    snapshots += 1;
+                    6 * minimum + if snapshots == 1 { destination_bytes } else { 0 }
+                })
+            })
+            .unwrap();
+        assert_eq!(snapshots, frame.n_features().div_ceil(2));
+        assert_eq!(dense.values.dim(), (rows, frame.n_features()));
+        assert!(dense.values.is_standard_layout());
+        assert!(dense.validity.is_standard_layout());
+        for row in 0..rows {
+            for (column, source) in expected.columns.iter().enumerate() {
+                assert_eq!(
+                    dense.values[(row, column)].to_bits(),
+                    source.values[row].to_bits()
+                );
+                assert_eq!(dense.validity[(row, column)], source.validity[row]);
+            }
+        }
+    }
+
+    #[test]
+    fn dense_window_waves_preserve_exact_cells_and_row_major_order() {
+        let frame = dense_test_frame();
+        assert_dense_waves_match_projection(&frame, 0, 17);
+        assert_dense_waves_match_projection(&frame, 3, 16);
+        let dense = frame.dense_window(0, 17).unwrap();
+        assert_eq!(dense.values[(0, 0)].to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(dense.values[(1, 0)].to_bits(), 0.0_f64.to_bits());
+        for code in 1..10 {
+            assert!(dense.validity.iter().any(|reason| *reason as u8 == code));
+        }
+        for (value, reason) in dense.values.iter().zip(&dense.validity) {
+            if !reason.is_valid() {
+                assert_eq!(value.to_bits(), f64::NAN.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn dense_window_admission_checks_destination_ranges_and_later_headroom() {
+        assert_eq!(dense_window_destination_layout(17, 7).unwrap(), (119, 1071));
+        assert!(dense_window_destination_layout(usize::MAX, 2).is_err());
+        assert!(dense_window_destination_layout(isize::MAX as usize, 1).is_err());
+        let frame = dense_test_frame();
+        for (start, end) in [(5, 4), (0, 18), (18, 18)] {
+            assert!(
+                frame
+                    .dense_window_with_headroom(start, end, || {
+                        panic!("invalid ranges must be refused before allocation planning")
+                    })
+                    .is_err()
+            );
+        }
+        for index in [0, 5, 17] {
+            let empty = frame
+                .dense_window_with_headroom(index, index, || {
+                    panic!("empty windows need no destination or projection allocation")
+                })
+                .unwrap();
+            assert_eq!(empty.values.dim(), (0, 7));
+            assert_eq!(empty.validity.dim(), (0, 7));
+        }
+        let (_, destination_bytes) = dense_window_destination_layout(17, 7).unwrap();
+        let error = frame
+            .dense_window_with_headroom(0, 17, || destination_bytes - 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("destination admission refused"));
+        let minimum = FEATURE_PROJECTION_BATCH_OVERHEAD_BYTES
+            + 17 * (FEATURE_PROJECTION_BYTES_PER_ROW_FIXED + FEATURE_PROJECTION_BYTES_PER_CELL);
+        let error = frame
+            .dense_window_with_headroom(0, 17, || destination_bytes + 3 * minimum - 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("projection admission refused"));
+        let mut snapshots = 0;
+        let error = frame
+            .dense_window_with_headroom(0, 17, || {
+                snapshots += 1;
+                if snapshots == 1 {
+                    destination_bytes + 3 * minimum
+                } else {
+                    0
+                }
+            })
+            .unwrap_err();
+        assert_eq!(snapshots, 2);
+        assert!(error.to_string().contains("projection admission refused"));
+    }
+
+    #[test]
+    fn dense_window_vortex_waves_preserve_normalized_indexed_cells() -> Result<()> {
+        use crate::core::feature_run_lease::FeatureRunLease;
+        use crate::core::vortex_feature_store::{VortexFeatureStore, VortexFeatureStoreOptions};
+
+        let raw = dense_test_frame();
+        let FeatureData::InMemory(columns) = &raw.data else {
+            unreachable!()
+        };
+        let temp = tempfile::tempdir()?;
+        let lease = Arc::new(FeatureRunLease::create(
+            temp.path(),
+            "dense-wave-regression",
+        )?);
+        let store = VortexFeatureStore::create(
+            lease,
+            &raw.timestamps,
+            columns,
+            VortexFeatureStoreOptions {
+                chunk_rows: 8,
+                decoded_cache_bytes: 0,
+            },
+        )?;
+        let vortex = Arc::new(FeatureFrame::from_vortex(
+            raw.timestamps.clone(),
+            store,
+            (*raw.plan).clone(),
+            (*raw.provenance).clone(),
+        )?);
+        assert_dense_waves_match_projection(&vortex, 0, 17);
+        assert_eq!(vortex.dense_window(17, 17)?.values.dim(), (0, 7));
+        let fit = raw.fit_normalization(0..10, false, &crate::FeatureBuildControl::default())?;
+        let normalized = Arc::new(vortex.with_fitted_normalization(&fit)?);
+        let reordered = Arc::new(normalized.select_columns(&[6, 0, 5, 1, 4, 2, 3])?);
+        let indexed = reordered.shared_select_rows(&[1, 3, 4, 7, 10, 16])?;
+        assert_dense_waves_match_projection(&indexed, 0, 6);
+        assert_dense_waves_match_projection(&indexed, 1, 5);
+        assert_eq!(
+            indexed.normalization_fitted_state(),
+            reordered.normalization_fitted_state()
+        );
+        assert_eq!(
+            indexed.project_columns(&[0], 0..6)?.row_ids,
+            vec![1, 3, 4, 7, 10, 16]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_feature_options_keep_exact_wire_shape_without_a_working_set() {
+        let legacy = br#"{"profile":"Standard","prefix_base_features":false,"higher_tfs":[],"normalization_training_rows":null,"drop_columns_without_normalization_training_support":false}"#;
+        let options: FeatureBuildOptions = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(options, FeatureBuildOptions::default());
+        assert_eq!(serde_json::to_vec(&options).unwrap(), legacy);
+    }
+
+    fn raw_frame(offset: f64) -> Arc<FeatureFrame> {
+        Arc::new(
+            crate::test_fixtures::ctrader_test_feature_frame_from_columns(
+                crate::test_fixtures::canonical_test_timestamps(20),
+                vec![
+                    FeatureColumnF64::new(
+                        "signal",
+                        (0..20)
+                            .map(|row| row as f64 + if row >= 10 { offset } else { 0.0 })
+                            .collect(),
+                        vec![FeatureCellValidity::Valid; 20],
+                    )
+                    .unwrap(),
+                    FeatureColumnF64::new(
+                        "future_only",
+                        (0..20)
+                            .map(|row| if row < 10 { f64::NAN } else { row as f64 })
+                            .collect(),
+                        (0..20)
+                            .map(|row| {
+                                if row < 10 {
+                                    FeatureCellValidity::Warmup
+                                } else {
+                                    FeatureCellValidity::Valid
+                                }
+                            })
+                            .collect(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn shared_causal_window_retains_exact_authority_and_only_shares_parent_values() {
+        let raw = raw_frame(0.0);
+        let window = raw.shared_row_window(3..7).unwrap();
+        let FeatureData::View(view) = &window.data else {
+            panic!("must remain a view")
+        };
+        assert!(Arc::ptr_eq(&view.parent, &raw));
+        assert!(Arc::ptr_eq(&window.plan, &raw.plan));
+        assert!(Arc::ptr_eq(&window.provenance, &raw.provenance));
+        assert_eq!(window.timestamps, raw.timestamps[3..7]);
+        let projected = window.project_columns(&[0], 0..4).unwrap();
+        assert_eq!(projected.row_ids, vec![3, 4, 5, 6]);
+        assert_eq!(projected.columns[0].values, vec![3.0, 4.0, 5.0, 6.0]);
+        assert!(raw.shared_row_window(3..3).is_err());
+        assert!(raw.shared_row_window(3..21).is_err());
+        let mut changed_schema = raw.shared_view().unwrap();
+        changed_schema.names[0] = "not_the_plan".into();
+        assert!(Arc::new(changed_schema).shared_row_window(3..7).is_err());
+    }
+
+    #[test]
+    fn bound_column_windows_reuse_one_sealed_projection_and_preserve_raw_model_rows() {
+        let raw = raw_frame(0.0);
+        let fit = raw
+            .fit_normalization(0..20, false, &crate::FeatureBuildControl::default())
+            .unwrap();
+        let normalized = Arc::new(raw.with_fitted_normalization(&fit).unwrap());
+        for source in [&raw, &normalized] {
+            let bound = source.bind_column_projection(&[1, 0]).unwrap();
+            assert!(Arc::ptr_eq(&bound.source, source));
+            let first = bound.row_window(3..7).unwrap();
+            let second = bound.row_window(7..11).unwrap();
+            assert!(Arc::ptr_eq(&first.plan, &second.plan));
+            assert!(Arc::ptr_eq(&first.provenance, &second.provenance));
+            let original = source
+                .shared_row_window(3..7)
+                .unwrap()
+                .select_columns(&[1, 0])
+                .unwrap();
+            assert_eq!(first.plan_identity(), original.plan_identity());
+            assert_eq!(first.provenance_identity(), original.provenance_identity());
+            assert_eq!(
+                first.normalization_fitted_state(),
+                original.normalization_fitted_state()
+            );
+            let actual = first.project_columns(&[0, 1], 0..4).unwrap();
+            let expected = original.project_columns(&[0, 1], 0..4).unwrap();
+            assert_eq!(actual.timestamps, expected.timestamps);
+            assert_eq!(actual.row_ids, expected.row_ids);
+            for (actual, expected) in actual.columns.iter().zip(&expected.columns) {
+                assert_eq!(actual.name, expected.name);
+                assert_eq!(actual.validity, expected.validity);
+                assert_eq!(
+                    actual
+                        .values
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .values
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(
+                first.raw_model_column("signal").unwrap().values,
+                vec![3.0, 4.0, 5.0, 6.0]
+            );
+            let identity = first.select_columns(&[0, 1]).unwrap();
+            assert!(Arc::ptr_eq(&first.plan, &identity.plan));
+            let FeatureData::View(view) = &identity.data else {
+                panic!("must remain shared")
+            };
+            assert!(Arc::ptr_eq(&view.parent, source));
+            assert!(bound.row_window(1..21).is_err());
+            assert!(bound.row_window(3..3).is_err());
+            let mut drift = first.clone();
+            drift.names.swap(0, 1);
+            assert!(drift.select_columns(&[0, 1]).is_err());
+        }
+        assert!(raw.bind_column_projection(&[0, 0]).is_err());
+        assert!(raw.bind_column_projection(&[2]).is_err());
+        let mut drift = raw.shared_view().unwrap();
+        drift.names[0] = "wrong_schema".into();
+        assert!(Arc::new(drift).bind_column_projection(&[0]).is_err());
+    }
+
+    #[test]
+    fn frozen_model_view_shares_raw_backing_and_never_fits_on_validation() {
+        let raw = raw_frame(0.0);
+        let altered = raw_frame(1.0e9);
+        let control = crate::FeatureBuildControl::default();
+        let fit = raw.fit_normalization(0..10, true, &control).unwrap();
+        assert_eq!(
+            fit,
+            altered.fit_normalization(0..10, true, &control).unwrap()
+        );
+        assert_eq!(fit.column_names(), &["signal".to_owned()]);
+        let transformed = Arc::new(raw.with_fitted_normalization(&fit).unwrap());
+        let FeatureData::View(view) = &transformed.data else {
+            panic!("must be lazy")
+        };
+        assert!(Arc::ptr_eq(&view.parent, &raw));
+        assert_eq!(raw.cell(15, 0).unwrap().value, 15.0);
+        let selected = transformed.shared_select_rows(&[1, 3, 8, 15]).unwrap();
+        let batch = selected.project_columns(&[0], 1..4).unwrap();
+        assert_eq!(batch.row_ids, vec![3, 8, 15]);
+        assert_eq!(
+            selected.raw_model_column("signal").unwrap().values,
+            vec![1.0, 3.0, 8.0, 15.0]
+        );
+        for (local, original) in [3, 8, 15].into_iter().enumerate() {
+            assert_eq!(
+                batch.columns[0].values[local].to_bits(),
+                transformed.cell(original, 0).unwrap().value.to_bits()
+            );
+        }
+        assert!(transformed.with_fitted_normalization(&fit).is_err());
+        let materialized = transformed.row_slice(0, 10).unwrap();
+        assert!(materialized.raw_model_column("signal").is_err());
+        let live = Arc::new(altered.shared_select_rows(&[18, 19]).unwrap());
+        let live = live.with_fitted_normalization(&fit).unwrap();
+        assert_eq!(
+            live.cell(0, 0).unwrap().value,
+            crate::core::normalization::Z_CLIP_F64
+        );
+        assert_eq!(live.normalization_fitted_state(), Some(&fit));
+    }
+
+    #[test]
+    fn raw_shared_views_preserve_exact_rows_without_copying_the_cube() {
+        let raw = raw_frame(0.0);
+        let shared = raw.shared_view().unwrap();
+        let FeatureData::View(view) = &shared.data else {
+            panic!("must be shared")
+        };
+        assert!(Arc::ptr_eq(&view.parent, &raw));
+        assert_eq!(shared.plan_identity(), raw.plan_identity());
+        assert!(shared.normalization_fitted_state().is_none());
+        let selected = raw.shared_select_rows(&[2, 4, 6]).unwrap();
+        assert_eq!(
+            selected.project_columns(&[0], 0..3).unwrap().row_ids,
+            vec![2, 4, 6]
+        );
+        assert!(raw.shared_select_rows(&[2, 2]).is_err());
+        assert!(raw.shared_select_rows(&[19, 20]).is_err());
+    }
+
+    #[test]
+    fn model_base_alias_uses_explicit_recipe_and_keeps_raw_prices_after_projection() {
+        let raw = crate::test_fixtures::ctrader_test_feature_frame_from_columns(
+            crate::test_fixtures::canonical_test_timestamps(12),
+            vec![
+                FeatureColumnF64::new(
+                    "M1_quant_close",
+                    (0..12).map(|row| 1.0 + row as f64 * 0.01).collect(),
+                    vec![FeatureCellValidity::Valid; 12],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+        .with_feature_build_options(FeatureBuildOptions {
+            prefix_base_features: true,
+            normalization_training_rows: Some(0..6),
+            ..Default::default()
+        });
+        let raw = Arc::new(raw);
+        let fit = raw
+            .fit_normalization(0..6, true, &crate::FeatureBuildControl::default())
+            .unwrap();
+        let normalized = raw.with_fitted_normalization(&fit).unwrap();
+        let projected = normalized
+            .select_columns(&[0])
+            .unwrap()
+            .row_window(1, 4)
+            .unwrap();
+        let name = projected.model_base_feature_name("quant_close").unwrap();
+        assert_eq!(name, "M1_quant_close");
+        assert_eq!(
+            projected.raw_model_column(&name).unwrap().values,
+            vec![1.01, 1.02, 1.03]
+        );
+        assert!(
+            projected.raw_model_column("quant_close").is_err(),
+            "raw reader must not guess an alias"
+        );
+    }
+}
+
+#[cfg(test)]
 mod align_tests {
     use super::*;
     use ndarray::{Array2, array};
+
+    #[test]
+    fn adaptive_projection_plan_scales_with_rows_ram_and_concurrency() -> Result<()> {
+        let small = adaptive_feature_projection_plan_for_available_memory(
+            10_000,
+            800,
+            1,
+            16 * 1024 * 1024 * 1024,
+        )?;
+        let dense = adaptive_feature_projection_plan_for_available_memory(
+            1_000_000,
+            800,
+            1,
+            16 * 1024 * 1024 * 1024,
+        )?;
+        let parallel = adaptive_feature_projection_plan_for_available_memory(
+            1_000_000,
+            800,
+            11,
+            16 * 1024 * 1024 * 1024,
+        )?;
+
+        assert!(small.columns_per_batch > dense.columns_per_batch);
+        assert!(parallel.concurrent_batches > 1);
+        assert!(parallel.columns_per_batch < dense.columns_per_batch);
+        assert!(
+            parallel
+                .estimated_bytes_per_batch
+                .saturating_mul(parallel.concurrent_batches as u64)
+                <= parallel.budget_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_projection_plan_refuses_zero_and_insufficient_headroom() {
+        for available in [0, 1, 64 * 1024 * 1024] {
+            let error = adaptive_feature_projection_plan_for_available_memory(
+                1_000_000, 779, 11, available,
+            )
+            .expect_err("no invented 64 MiB or oversized one-column fallback");
+            assert!(error.to_string().contains("admission refused"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("no rows or columns were omitted")
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_projection_plan_admits_the_exact_single_column_boundary() -> Result<()> {
+        // Independent arithmetic: timestamps/row IDs + f64/validity/decode
+        // allowance, plus the existing one-MiB overhead. One third is admitted.
+        let minimum = 1_000 * (16 + 16) + 1_048_576;
+        let plan =
+            adaptive_feature_projection_plan_for_available_memory(1_000, 7, 11, 3 * minimum)?;
+        assert_eq!(plan.columns_per_batch, 1);
+        assert_eq!(plan.concurrent_batches, 1);
+        assert_eq!(plan.budget_bytes, minimum);
+        assert_eq!(plan.estimated_bytes_per_batch, minimum);
+        assert!(
+            adaptive_feature_projection_plan_for_available_memory(1_000, 7, 11, 3 * minimum - 1)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_projection_plan_keeps_small_columns_parallel_when_ram_is_plentiful() -> Result<()> {
+        let plan = adaptive_feature_projection_plan_for_available_memory(
+            10_000,
+            800,
+            11,
+            16 * 1024 * 1024 * 1024,
+        )?;
+        assert_eq!(plan.concurrent_batches, 11);
+        assert_eq!(plan.columns_per_batch, 73);
+        assert_eq!(800usize.div_ceil(plan.columns_per_batch), 11);
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_projection_plan_covers_every_column_within_each_admitted_wave() -> Result<()> {
+        for rows in [1_000, 25_000, 2_000_000] {
+            for columns in [1, 7, 800] {
+                for workers in [0, 1, 3, 11] {
+                    for available in [10 << 20, 64 << 20, 2 << 30, 32u64 << 30] {
+                        let minimum = rows as u64 * 32 + 1_048_576;
+                        let budget = (available / 3).min(2_147_483_648);
+                        let result = adaptive_feature_projection_plan_for_available_memory(
+                            rows, columns, workers, available,
+                        );
+                        if budget < minimum {
+                            assert!(result.is_err());
+                            continue;
+                        }
+                        let plan = result?;
+                        assert!(plan.columns_per_batch > 0);
+                        assert!(plan.concurrent_batches > 0);
+                        assert!(plan.concurrent_batches <= workers.max(1).min(columns));
+                        assert!(
+                            plan.estimated_bytes_per_batch * plan.concurrent_batches as u64
+                                <= budget
+                        );
+                        let ids = (0..columns).collect::<Vec<_>>();
+                        let mut seen = Vec::new();
+                        for wave in ids.chunks(plan.columns_per_batch * plan.concurrent_batches) {
+                            let mut peak = 0;
+                            for batch in wave.chunks(plan.columns_per_batch) {
+                                peak += rows as u64 * 16 * (1 + batch.len() as u64) + 1_048_576;
+                                seen.extend_from_slice(batch);
+                            }
+                            assert!(peak <= budget);
+                        }
+                        assert_eq!(seen, ids);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_projection_plan_refuses_overflow_and_preserves_empty_work() -> Result<()> {
+        assert!(
+            adaptive_feature_projection_plan_for_available_memory(usize::MAX, 1, 1, u64::MAX)
+                .is_err()
+        );
+        let empty = adaptive_feature_projection_plan_for_available_memory(usize::MAX, 0, 11, 0)?;
+        assert_eq!(empty.columns_per_batch, 0);
+        assert_eq!(empty.concurrent_batches, 0);
+        assert_eq!(empty.budget_bytes, 0);
+        assert_eq!(empty.estimated_bytes_per_batch, 0);
+        Ok(())
+    }
 
     fn ms_grid(start_min: i64, step_min: i64, n: usize) -> Vec<i64> {
         const START_MS: i64 = 1_700_000_000_000;
@@ -1106,19 +2488,14 @@ mod align_tests {
     }
 
     #[test]
-    fn calendar_alignment_uses_the_next_direct_bar_open_without_a_fixed_period() {
+    fn calendar_alignment_uses_observed_closes_and_expires_without_an_invented_period() {
         const HOUR_MS: i64 = 60 * 60 * 1_000;
         const START_MS: i64 = 1_700_000_000_000;
-        let base_ms = [0, 12, 22, 23, 24, 46, 47, 48]
+        let base_ms = [0, 12, 22, 23, 24, 46, 47, 48, 71, 72]
             .into_iter()
             .map(|hour| START_MS + hour * HOUR_MS)
             .collect::<Vec<_>>();
         let feature_open_ms = vec![START_MS, START_MS + 23 * HOUR_MS, START_MS + 47 * HOUR_MS];
-        let available_at_ms = vec![
-            Some(START_MS + 23 * HOUR_MS),
-            Some(START_MS + 47 * HOUR_MS),
-            None,
-        ];
         let source = FeatureColumnF64::new(
             "D1_truth",
             vec![10.0, 20.0, 30.0],
@@ -1126,13 +2503,11 @@ mod align_tests {
         )
         .expect("valid calendar source column");
 
-        let aligned = align_feature_columns_at_explicit_availability_ms(
+        let aligned = align_calendar_feature_columns_by_observed_next_open_ms(
             &base_ms,
             &feature_open_ms,
-            &available_at_ms,
             &[source],
             true,
-            None,
         )
         .expect("align by broker-observed next opens");
 
@@ -1148,10 +2523,12 @@ mod align_tests {
             assert_eq!(aligned[0].validity[row], FeatureCellValidity::Valid);
             assert_eq!(aligned[0].values[row], 10.0);
         }
-        for row in 6..8 {
+        for row in 6..9 {
             assert_eq!(aligned[0].validity[row], FeatureCellValidity::Valid);
             assert_eq!(aligned[0].values[row], 20.0);
         }
+        assert_eq!(aligned[0].validity[9], FeatureCellValidity::Stale);
+        assert!(aligned[0].values[9].is_nan());
         assert!(
             !aligned[0].values.contains(&30.0),
             "the last direct calendar bar has no evidenced close and must stay invisible"

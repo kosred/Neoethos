@@ -18,10 +18,7 @@ use crate::gpu_native::prototype_a::{
 use crate::gpu_native::scenario::{NO_MICRO_OVERRIDE, NO_TICK_OVERRIDE, SCENARIO_BASE};
 use cubecl::prelude::{ComputeClient, Runtime};
 
-#[cfg(feature = "gpu-cuda")]
 pub type PrototypeAActiveRuntime = cubecl::cuda::CudaRuntime;
-#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-pub type PrototypeAActiveRuntime = cubecl::wgpu::WgpuRuntime;
 
 struct DatasetSlot {
     handle: DatasetHandle,
@@ -86,7 +83,7 @@ pub fn create_prototype_a_engine(
     let residency_scope = crate::cubecl_eval::cubecl_residency_scope();
     let client = create_gpu_client(device_override).map_err(|error| {
         let message = error.to_string();
-        if crate::gpu_native::prototype_a::is_known_no_adapter_error(&message) {
+        if crate::gpu_native::prototype_a::is_known_no_cuda_device_error(&message) {
             EngineError::UnsupportedCapability {
                 operation: "prototype_a_gpu_adapter",
                 detail: message,
@@ -118,14 +115,8 @@ pub fn create_prototype_a_engine(
     })
 }
 
-#[cfg(feature = "gpu-cuda")]
 const fn active_backend_id() -> u32 {
     1
-}
-
-#[cfg(all(feature = "gpu-vulkan", not(feature = "gpu-cuda")))]
-const fn active_backend_id() -> u32 {
-    2
 }
 
 impl<R: Runtime> PrototypeABacktestEngine<R> {

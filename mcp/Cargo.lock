@@ -693,6 +693,9 @@ dependencies = [
 [[package]]
 name = "neoethos-execution-budget"
 version = "0.1.0"
+dependencies = [
+ "raw-cpuid",
+]
 
 [[package]]
 name = "neoethos-mcp"
@@ -826,6 +829,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags",
+]
 
 [[package]]
 name = "ref-cast"

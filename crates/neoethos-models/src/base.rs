@@ -236,7 +236,7 @@ pub fn try_build_runtime_artifact_metadata(
     if training_summary.dataset_rows == 0 {
         bail!("runtime artifact metadata requires a non-zero dataset row count");
     }
-    let training_summary = normalize_training_summary_for_metadata(&model_name, training_summary)?;
+    let training_summary = validate_training_summary_for_metadata(&model_name, training_summary)?;
     Ok(RuntimeArtifactMetadata::new(
         model_name,
         family,
@@ -247,51 +247,25 @@ pub fn try_build_runtime_artifact_metadata(
     ))
 }
 
-fn normalize_training_summary_for_metadata(
+fn validate_training_summary_for_metadata(
     model_name: &str,
-    mut summary: TrainingSummaryMetadata,
+    summary: TrainingSummaryMetadata,
 ) -> Result<TrainingSummaryMetadata> {
-    let current_total = summary.train_rows + summary.val_rows;
-    if current_total != summary.dataset_rows {
-        if summary.train_rows <= summary.dataset_rows {
-            let repaired_val_rows = summary.dataset_rows.saturating_sub(summary.train_rows);
-            warn!(
-                "runtime artifact metadata train/val mismatch for {}: repairing train_rows={} val_rows={} dataset_rows={} -> val_rows={}",
-                model_name,
-                summary.train_rows,
-                summary.val_rows,
-                summary.dataset_rows,
-                repaired_val_rows
-            );
-            summary.val_rows = repaired_val_rows;
-        } else if summary.val_rows <= summary.dataset_rows {
-            let repaired_train_rows = summary.dataset_rows.saturating_sub(summary.val_rows);
-            warn!(
-                "runtime artifact metadata train/val mismatch for {}: repairing train_rows={} val_rows={} dataset_rows={} -> train_rows={}",
-                model_name,
-                summary.train_rows,
-                summary.val_rows,
-                summary.dataset_rows,
-                repaired_train_rows
-            );
-            summary.train_rows = repaired_train_rows;
-        } else {
-            bail!(
-                "runtime artifact metadata cannot repair split rows: train_rows={} val_rows={} dataset_rows={}",
-                summary.train_rows,
-                summary.val_rows,
-                summary.dataset_rows
-            );
-        }
+    if summary.train_rows == 0 {
+        bail!("runtime artifact metadata for {model_name} requires non-zero training rows");
     }
-
-    if summary.train_rows == 0 && summary.dataset_rows > 0 {
-        warn!(
-            "runtime artifact metadata for {} has zero train rows; promoting split to train_rows={} val_rows=0",
-            model_name, summary.dataset_rows
+    let partition_rows = summary
+        .train_rows
+        .checked_add(summary.embargo_rows)
+        .and_then(|rows| rows.checked_add(summary.val_rows));
+    if partition_rows != Some(summary.dataset_rows) {
+        bail!(
+            "runtime artifact metadata split mismatch for {model_name}: train_rows={} embargo_rows={} val_rows={} dataset_rows={}",
+            summary.train_rows,
+            summary.embargo_rows,
+            summary.val_rows,
+            summary.dataset_rows
         );
-        summary.train_rows = summary.dataset_rows;
-        summary.val_rows = 0;
     }
 
     Ok(summary)
@@ -481,7 +455,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string(), "atr".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(12_345, 10_000, 2_345),
+            TrainingSummaryMetadata::new(12_345, 10_000, 0, 2_345),
         );
 
         assert_eq!(metadata.model_name, "lightgbm");
@@ -498,6 +472,7 @@ mod tests {
         );
         assert_eq!(metadata.training_summary.dataset_rows, 12_345);
         assert_eq!(metadata.training_summary.train_rows, 10_000);
+        assert_eq!(metadata.training_summary.embargo_rows, 0);
         assert_eq!(metadata.training_summary.val_rows, 2_345);
     }
 
@@ -510,7 +485,7 @@ mod tests {
             CapabilityState::Implemented,
             Vec::new(),
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(10, 8, 2),
+            TrainingSummaryMetadata::new(10, 8, 0, 2),
         );
     }
 
@@ -522,7 +497,7 @@ mod tests {
             CapabilityState::Implemented,
             Vec::new(),
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(10, 8, 2),
+            TrainingSummaryMetadata::new(10, 8, 0, 2),
         )
         .expect_err("expected contract validation error");
 
@@ -533,20 +508,18 @@ mod tests {
     }
 
     #[test]
-    fn try_build_runtime_artifact_metadata_repairs_train_val_mismatch_when_possible() {
-        let metadata = try_build_runtime_artifact_metadata(
+    fn try_build_runtime_artifact_metadata_rejects_split_mismatch() {
+        let err = try_build_runtime_artifact_metadata(
             "lightgbm",
             ModelFamily::Tree,
             CapabilityState::Implemented,
             vec!["rsi".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::raw_for_validation(10, 8, 1),
+            TrainingSummaryMetadata::raw_for_validation(10, 8, 0, 1),
         )
-        .expect("metadata split should be repaired");
+        .expect_err("metadata split mismatch must fail closed");
 
-        assert_eq!(metadata.training_summary.dataset_rows, 10);
-        assert_eq!(metadata.training_summary.train_rows, 8);
-        assert_eq!(metadata.training_summary.val_rows, 2);
+        assert!(err.to_string().contains("split mismatch"));
     }
 
     #[test]
@@ -557,7 +530,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string()],
             Vec::new(),
-            TrainingSummaryMetadata::new(10, 8, 2),
+            TrainingSummaryMetadata::new(10, 8, 0, 2),
         )
         .expect("empty label mapping should be defaulted");
 
@@ -575,28 +548,26 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::raw_for_validation(10, 12, 12),
+            TrainingSummaryMetadata::raw_for_validation(10, 12, 0, 12),
         )
         .expect_err("split larger than dataset should remain invalid");
 
-        assert!(err.to_string().contains("cannot repair split rows"));
+        assert!(err.to_string().contains("split mismatch"));
     }
 
     #[test]
-    fn try_build_runtime_artifact_metadata_promotes_zero_train_rows() {
-        let metadata = try_build_runtime_artifact_metadata(
+    fn try_build_runtime_artifact_metadata_rejects_zero_train_rows() {
+        let err = try_build_runtime_artifact_metadata(
             "lightgbm",
             ModelFamily::Tree,
             CapabilityState::Implemented,
             vec!["rsi".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::raw_for_validation(7, 0, 7),
+            TrainingSummaryMetadata::raw_for_validation(7, 0, 0, 7),
         )
-        .expect("zero-train split should be promoted");
+        .expect_err("zero-train split must fail closed");
 
-        assert_eq!(metadata.training_summary.dataset_rows, 7);
-        assert_eq!(metadata.training_summary.train_rows, 7);
-        assert_eq!(metadata.training_summary.val_rows, 0);
+        assert!(err.to_string().contains("non-zero training rows"));
     }
 
     #[test]

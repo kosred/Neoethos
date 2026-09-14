@@ -37,6 +37,7 @@ struct PoolCache {
 #[derive(Debug)]
 pub enum BudgetedCpuExecutorError {
     MismatchedLeaseAuthority,
+    OutsideLeasedPool,
     PoolBuild {
         width: usize,
         source: rayon::ThreadPoolBuildError,
@@ -46,7 +47,7 @@ pub enum BudgetedCpuExecutorError {
 impl BudgetedCpuExecutorError {
     pub fn width(&self) -> Option<usize> {
         match self {
-            Self::MismatchedLeaseAuthority => None,
+            Self::MismatchedLeaseAuthority | Self::OutsideLeasedPool => None,
             Self::PoolBuild { width, .. } => Some(*width),
         }
     }
@@ -59,6 +60,8 @@ impl fmt::Display for BudgetedCpuExecutorError {
                 formatter,
                 "transferred CPU lease was issued by a different capacity authority"
             ),
+            Self::OutsideLeasedPool => formatter
+                .write_str("CPU work is outside the exact private pool holding its active lease"),
             Self::PoolBuild { width, source } => write!(
                 formatter,
                 "failed to build a {width}-worker budgeted Rayon pool: {source}"
@@ -70,9 +73,38 @@ impl fmt::Display for BudgetedCpuExecutorError {
 impl Error for BudgetedCpuExecutorError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::MismatchedLeaseAuthority => None,
+            Self::MismatchedLeaseAuthority | Self::OutsideLeasedPool => None,
             Self::PoolBuild { source, .. } => Some(source),
         }
+    }
+}
+
+/// Borrowed proof of the exact reservation and private worker pool executing
+/// this work. Only the executor creates it, and its lifetime cannot outlive
+/// the accepted lease. Equal worker counts or thread names are not authority.
+pub struct BudgetedCpuScope<'scope> {
+    lease: &'scope CpuLease,
+    pool: &'scope ThreadPool,
+}
+
+impl BudgetedCpuScope<'_> {
+    pub fn lease(&self) -> &CpuLease {
+        self.lease
+    }
+
+    pub fn worker_limit(&self) -> WorkerLimit {
+        self.lease.width()
+    }
+
+    /// Check the specific pool, without consulting or initializing Rayon's
+    /// global pool. Nested parallel work in this same pool remains valid.
+    pub fn require_current_pool(&self) -> Result<(), BudgetedCpuExecutorError> {
+        if self.pool.current_thread_index().is_none()
+            || self.pool.current_num_threads() != self.lease.width().get()
+        {
+            return Err(BudgetedCpuExecutorError::OutsideLeasedPool);
+        }
+        Ok(())
     }
 }
 
@@ -108,7 +140,7 @@ impl BudgetedCpuExecutor {
         R: Send,
         Work: FnOnce() -> R + Send,
     {
-        self.execute_scoped(transfer, move |_| work())
+        self.execute_with_scope(transfer, |_| work())
     }
 
     /// Execute work on the matching private pool while lending the accepted
@@ -124,13 +156,35 @@ impl BudgetedCpuExecutor {
         R: Send,
         Work: FnOnce(&CpuLease) -> R + Send,
     {
+        self.execute_with_scope(transfer, |scope| work(scope.lease()))
+    }
+
+    /// Lend proof of both the reservation and its exact executing pool to
+    /// consumers which must reject accidental global/foreign-pool execution.
+    pub fn execute_with_scope<R, Work>(
+        &self,
+        transfer: CpuLeaseTransfer,
+        work: Work,
+    ) -> Result<R, BudgetedCpuExecutorError>
+    where
+        R: Send,
+        Work: FnOnce(&BudgetedCpuScope<'_>) -> R + Send,
+    {
         if !self.inner.authority.owns_transfer(&transfer) {
             return Err(BudgetedCpuExecutorError::MismatchedLeaseAuthority);
         }
         let lease = transfer.accept();
         let width = lease.width().get();
         let checkout = self.checkout(width)?;
-        let result = checkout.pool().scope(|_| lease.scope(|| work(&lease)));
+        let pool = checkout.pool();
+        let result = pool.install(|| {
+            lease.scope(|| {
+                work(&BudgetedCpuScope {
+                    lease: &lease,
+                    pool,
+                })
+            })
+        });
 
         drop(lease);
         drop(checkout);
@@ -276,4 +330,105 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution_budget::CpuPermitRequest;
+
+    #[test]
+    fn execute_binds_nested_rayon_work_to_the_exact_lease_width() {
+        let width = WorkerLimit::new(3).expect("positive worker width");
+        let broker = CpuPermitBroker::new(width);
+        let executor = BudgetedCpuExecutor::new_for_broker(broker.clone(), width);
+        let lease = broker
+            .acquire(CpuPermitRequest::local(width))
+            .expect("acquire the complete test budget");
+
+        let mut observations = executor
+            .execute(lease.into_transfer(), || {
+                rayon::broadcast(|context| {
+                    (
+                        context.index(),
+                        rayon::current_num_threads(),
+                        std::thread::current().name().map(str::to_owned),
+                    )
+                })
+            })
+            .expect("execute on the lease-bound pool");
+        observations.sort_by_key(|observation| observation.0);
+
+        assert_eq!(observations.len(), width.get());
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.0)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.1 == width.get())
+        );
+        assert!(observations.iter().all(|observation| {
+            observation
+                .2
+                .as_deref()
+                .is_some_and(|name| name.starts_with("neoethos-cpu-"))
+        }));
+        assert_eq!(broker.snapshot().available_permits, width.get());
+    }
+
+    #[test]
+    fn scope_accepts_every_worker_of_its_exact_leased_pool() {
+        let width = WorkerLimit::new(3).unwrap();
+        let broker = CpuPermitBroker::new(width);
+        let executor = BudgetedCpuExecutor::new_for_broker(broker.clone(), width);
+        let lease = broker.acquire(CpuPermitRequest::local(width)).unwrap();
+        let observations = executor
+            .execute_with_scope(lease.into_transfer(), |scope| {
+                scope.require_current_pool().unwrap();
+                assert_eq!(scope.worker_limit(), width);
+                rayon::broadcast(|context| {
+                    scope.require_current_pool().unwrap();
+                    (context.index(), rayon::current_num_threads())
+                })
+            })
+            .unwrap();
+        assert_eq!(observations.len(), 3);
+        assert!(observations.iter().all(|(_, workers)| *workers == 3));
+        assert_eq!(broker.snapshot().live_reserved_sum, 0);
+    }
+
+    #[test]
+    fn scope_rejects_foreign_equal_width_pool_and_plain_thread() {
+        let width = WorkerLimit::new(2).unwrap();
+        let broker = CpuPermitBroker::new(width);
+        let executor = BudgetedCpuExecutor::new_for_broker(broker.clone(), width);
+        let foreign = ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let lease = broker.acquire(CpuPermitRequest::local(width)).unwrap();
+        executor
+            .execute_with_scope(lease.into_transfer(), |scope| {
+                let rejected = foreign.install(|| scope.require_current_pool());
+                assert!(matches!(
+                    rejected,
+                    Err(BudgetedCpuExecutorError::OutsideLeasedPool)
+                ));
+                std::thread::scope(|threads| {
+                    let rejected = threads
+                        .spawn(|| scope.require_current_pool())
+                        .join()
+                        .unwrap();
+                    assert!(matches!(
+                        rejected,
+                        Err(BudgetedCpuExecutorError::OutsideLeasedPool)
+                    ));
+                });
+                scope.require_current_pool().unwrap();
+            })
+            .unwrap();
+        assert_eq!(broker.snapshot().live_reserved_sum, 0);
+    }
 }

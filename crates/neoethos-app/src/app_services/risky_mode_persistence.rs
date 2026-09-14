@@ -1,13 +1,10 @@
-//! Persistence layer for the wizard's Risky Mode arm signal.
+//! Persistence layer for the Risky Mode kill-switch cooldown.
 //!
-//! Closes the `TODO(risky-mode-boot-wire)` gap that survived the
-//! 2026-05-18 cleanup pass: the wizard's `risky_mode_armed` flag was
-//! captured in `WizardConfig` (in memory) but never written to disk,
-//! so `TradingSession::new_with_persisted_credentials` had no way to
-//! restore the arm state across app restarts. As a result the operator
-//! would tick "Arm Risky Mode" in the wizard, click Apply, restart the
-//! app, and Risky Mode would silently be OFF — exactly the
-//! "κενά από εναλλαγές" the operator flagged.
+//! A deleted setup flow originally wrote arm/acknowledgement fields into
+//! this file. Production never consumed those fields; live entry decisions use
+//! resolved Settings and the RiskyModeManager. Schema v3 removes that inert
+//! state and keeps the one value that is actively enforced across restarts:
+//! `last_killed_at_utc_ms`.
 //!
 //! # Lookup order (highest priority first)
 //!
@@ -18,17 +15,10 @@
 //! 3. `<cwd>/.local/neoethos/risky_mode_state.json` — dev machine
 //!    fallback.
 //!
-//! # Why a sibling file (not extending `Settings` or `WizardStateFile`)
+//! # Why a sibling file instead of `Settings`
 //!
-//! - `Settings` lives in `neoethos-core` and is reloaded by every
-//!   component. Adding risky-mode fields there would touch every
-//!   `Settings::default()` call site + add neoethos-core schema churn.
-//! - `WizardStateFile` is wizard-session state (which steps are done);
-//!   the Risky Mode arm is a *runtime* contract, not a wizard
-//!   bookkeeping field. Keeping them separate lets the wizard be
-//!   reset / re-run without disarming Risky Mode, and lets Risky Mode
-//!   be disarmed without invalidating the wizard's completed-steps
-//!   record.
+//! - Settings describe operator policy; this file records a runtime safety
+//!   event and its cooldown clock.
 //! - The pattern mirrors `broker_persistence.rs`, which is already the
 //!   established neoethos-app convention for "one persisted contract per
 //!   sibling file".
@@ -37,9 +27,8 @@
 //!
 //! Carries `schema_version: SchemaVersion` exactly like every other
 //! Phase-D4 contract. Future shape changes bump the version; readers
-//! older than the file's version log an error and fall back to
-//! `armed = false` (the safe default — Risky Mode stays disabled
-//! until the operator re-arms via the wizard).
+//! older than the file's version log an error and treat the cooldown state as
+//! unreadable/fail-closed at the live-entry boundary.
 
 use anyhow::{Context, Result};
 use neoethos_core::{HasSchemaVersion, SchemaVersion, default_v1};
@@ -51,16 +40,15 @@ use std::{env, fs};
 /// state. Bumped on breaking changes to [`RiskyModeStateFile`].
 ///
 /// **v2 (2026-05-25)** — added `last_killed_at_utc_ms` for the 24h
-/// auto re-arm cooldown (operator directive F-231/F-501/F-630). v1
-/// files load cleanly because the new field has `#[serde(default)]`
-/// → `None`, which means "no kill on record" → Risky Mode behaves
-/// exactly like v1 on legacy files.
-pub const RISKY_MODE_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
+/// cooldown. **v3 (2026-08-31)** — removed the deleted setup flow's inert
+/// arm/acknowledgement fields. Serde ignores those fields in v1/v2 JSON, so old
+/// files still load and the next safety-event write naturally compacts them.
+pub const RISKY_MODE_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(3);
 
 /// Cooldown duration before Risky Mode auto re-arms after a
 /// kill-switch trip. Operator-chosen 24h via the architectural
 /// AskUserQuestion answer (2026-05-25).
-pub const RISKY_MODE_AUTO_REARM_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000;
+pub const RISKY_MODE_KILL_SWITCH_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000;
 
 const APP_CONFIG_SUBDIR: &str = "neoethos";
 const STATE_FILENAME: &str = "risky_mode_state.json";
@@ -73,10 +61,7 @@ const STATE_FILENAME: &str = "risky_mode_state.json";
 #[cfg(test)]
 const ENV_OVERRIDE_VAR: &str = crate::app_services::env_overrides::ENV_RISKY_MODE_STATE_PATH;
 
-/// On-disk representation of the operator's Risky Mode arm decision.
-///
-/// All fields are wizard-set values that the running app reads at
-/// session boot to decide whether to auto-arm Risky Mode.
+/// On-disk representation of the enforced Risky Mode cooldown state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RiskyModeStateFile {
     /// Phase-D4 schema version. Defaults to v1 (pre-versioning shape)
@@ -84,36 +69,6 @@ pub struct RiskyModeStateFile {
     /// breaking — see [`RISKY_MODE_STATE_SCHEMA_VERSION`].
     #[serde(default = "default_v1")]
     pub schema_version: SchemaVersion,
-    /// Whether the operator has explicitly armed Risky Mode. Only
-    /// `true` when the operator ticked both the ruin-probability
-    /// acknowledgement AND the arm toggle in the wizard's
-    /// `AutonomyRisk` step.
-    #[serde(default)]
-    pub armed: bool,
-    /// Operator-acknowledged ruin-probability ceiling (e.g. 0.99 for
-    /// the operator-directive 99% S1 ruin ceiling). `None` when the
-    /// operator has not ticked the acknowledgement checkbox.
-    ///
-    /// Persisted independently of `armed` so the acknowledgement is
-    /// not lost if the operator temporarily disarms.
-    #[serde(default)]
-    pub ruin_ceiling_acknowledged: Option<f64>,
-    /// Starting bankroll the operator wants Risky Mode to begin from,
-    /// in USD. `None` falls back to
-    /// `neoethos_core::RiskyModeConfig::default().starting_capital_usd`
-    /// ($20) per research §4.1 / operator directive §7.1.
-    ///
-    /// Distinct from the broker-reported balance: this is the
-    /// operator's commit at wizard time, not the live equity. The
-    /// live balance comes in later via `refresh_runtime`.
-    #[serde(default)]
-    pub starting_capital_usd: Option<f64>,
-    /// Whether the operator accepted the "autonomous-only contract"
-    /// — Risky Mode rejects manual orders when this is true.
-    /// `false` is the safe default (auto-arm is rejected, see
-    /// `RiskyModeConfig::validate`).
-    #[serde(default)]
-    pub autonomous_only_contract_accepted: bool,
     /// Last write time as Unix-milliseconds, UTC. Lets a concurrent
     /// app instance detect a stale file.
     #[serde(default)]
@@ -121,12 +76,10 @@ pub struct RiskyModeStateFile {
     /// **F-231/F-501/F-630 closure (2026-05-25 — schema v2)**: Unix-
     /// millisecond timestamp of the last time the Risky Mode kill-
     /// switch tripped. When non-`None` AND within the
-    /// [`RISKY_MODE_AUTO_REARM_COOLDOWN_MS`] window from `now`, the
-    /// `armed` flag is forced to `false` regardless of its persisted
-    /// value — the kill-switch sticks for 24 h. After the cooldown,
+    /// [`RISKY_MODE_KILL_SWITCH_COOLDOWN_MS`] window from `now`, the
+    /// kill-switch stays active for 24 h. After the cooldown,
     /// the background task in `server::bridge::run` calls
-    /// `auto_re_arm_if_ready` which sets `armed = true` (operator-
-    /// approved auto re-arm policy) and clears this field.
+    /// `clear_expired_kill_switch`, which clears this field.
     ///
     /// `None` = no kill on record (initial state, or post-re-arm).
     #[serde(default)]
@@ -142,22 +95,22 @@ impl RiskyModeStateFile {
     pub fn cooldown_remaining_secs(&self, now_utc_ms: i64) -> Option<u64> {
         let killed_at = self.last_killed_at_utc_ms?;
         let elapsed = now_utc_ms.saturating_sub(killed_at);
-        if elapsed >= RISKY_MODE_AUTO_REARM_COOLDOWN_MS {
+        if elapsed >= RISKY_MODE_KILL_SWITCH_COOLDOWN_MS {
             None
         } else {
-            Some(((RISKY_MODE_AUTO_REARM_COOLDOWN_MS - elapsed) / 1000) as u64)
+            Some(((RISKY_MODE_KILL_SWITCH_COOLDOWN_MS - elapsed) / 1000) as u64)
         }
     }
 
     /// Whether the kill-switch cooldown has elapsed since the last
     /// kill. `true` when (a) a kill is on record AND (b) more than
     /// 24 h have passed. The background task uses this gate before
-    /// flipping `armed = true` and clearing `last_killed_at_utc_ms`.
-    pub fn auto_rearm_ready(&self, now_utc_ms: i64) -> bool {
+    /// clearing `last_killed_at_utc_ms`.
+    pub fn cooldown_expired(&self, now_utc_ms: i64) -> bool {
         match self.last_killed_at_utc_ms {
             Some(killed_at) => {
                 let elapsed = now_utc_ms.saturating_sub(killed_at);
-                elapsed >= RISKY_MODE_AUTO_REARM_COOLDOWN_MS
+                elapsed >= RISKY_MODE_KILL_SWITCH_COOLDOWN_MS
             }
             None => false,
         }
@@ -168,10 +121,6 @@ impl Default for RiskyModeStateFile {
     fn default() -> Self {
         Self {
             schema_version: RISKY_MODE_STATE_SCHEMA_VERSION,
-            armed: false,
-            ruin_ceiling_acknowledged: None,
-            starting_capital_usd: None,
-            autonomous_only_contract_accepted: false,
             last_updated_utc_ms: 0,
             last_killed_at_utc_ms: None,
         }
@@ -241,7 +190,7 @@ fn candidate_paths() -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Persist the Risky Mode arm state to disk. Stamps
+/// Persist the Risky Mode kill-switch state to disk. Stamps
 /// `last_updated_utc_ms` to the current wall clock before writing so
 /// staleness checks work.
 ///
@@ -249,9 +198,8 @@ fn candidate_paths() -> Result<Vec<PathBuf>> {
 /// file in place. Uses the M07 atomic writer (temp + fsync + rename)
 /// so a crash mid-save can never leave a torn JSON on disk.
 // **F-231/F-501/F-630 closure (2026-05-25)**: `save_risky_mode_state`
-// is now USED by `record_kill_switch_trip` and `auto_re_arm_if_ready`
-// below, so the `#[allow(dead_code)]` that masked it during the
-// pre-Flutter-wizard interim is gone. Production write path is live.
+// is now USED by `record_kill_switch_trip` and `clear_expired_kill_switch`
+// below, so the old `#[allow(dead_code)]` is gone. Production write path is live.
 pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
     let path = state_file_path().context("resolve risky mode state path")?;
 
@@ -273,8 +221,8 @@ pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
         target: "neoethos_app::risky_mode_persistence",
         path = %path.display(),
         schema_version = %to_write.schema_version,
-        armed = to_write.armed,
-        "persisted risky mode state"
+        cooldown_active = to_write.last_killed_at_utc_ms.is_some(),
+        "persisted Risky Mode kill-switch state"
     );
 
     Ok(())
@@ -301,19 +249,18 @@ pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
 /// prop-firm-mode entries too.
 ///
 /// Effect:
-/// - `armed = false` (kill-switch active)
 /// - `last_killed_at_utc_ms = Some(now)` (24 h cooldown clock starts)
 ///
 /// The background task in `server::bridge::run` checks
-/// `auto_rearm_ready` every 5 s; once the 24 h cooldown elapses it
-/// calls `auto_re_arm_if_ready` (below) to flip `armed = true` and
-/// clear `last_killed_at_utc_ms` automatically.
+/// `cooldown_expired` every 5 s; once the 24 h cooldown elapses it
+/// calls `clear_expired_kill_switch` (below) to clear
+/// `last_killed_at_utc_ms` automatically.
 ///
 /// **2026-08-09 (W3) — the `#[allow(dead_code)]` is GONE, and that is the
 /// point.** The attribute used to read "called only by the autonomous risk
 /// gate ... which is Phase 2-5 pending", and it was the compiler-verified
-/// proof that nothing could ever set `armed = false` or start the cooldown
-/// clock. Meanwhile `bridge.rs:240` re-armed every 5 s and `server/risk.rs`
+/// proof that nothing could start the cooldown clock. Meanwhile
+/// `bridge.rs:240` polled every 5 s and `server/risk.rs`
 /// rendered a cooldown the operator could never see move. The writer is now
 /// wired: `live_trading::run` calls this on the account-level `Err` branch of
 /// `RiskyModeManager::check_trade_allowed`. Do NOT re-add the attribute to
@@ -323,13 +270,12 @@ pub fn record_kill_switch_trip() -> Result<()> {
     let mut state = load_risky_mode_state()
         .context("load risky mode state before kill-switch trip")?
         .unwrap_or_default();
-    state.armed = false;
     state.last_killed_at_utc_ms = Some(current_unix_ms());
     save_risky_mode_state(&state).context("persist kill-switch trip timestamp")?;
     tracing::warn!(
         target: "neoethos_app::risky_mode_persistence",
         killed_at_utc_ms = state.last_killed_at_utc_ms,
-        cooldown_hours = RISKY_MODE_AUTO_REARM_COOLDOWN_MS / (60 * 60 * 1000),
+        cooldown_hours = RISKY_MODE_KILL_SWITCH_COOLDOWN_MS / (60 * 60 * 1000),
         "Risky Mode kill-switch tripped; 24h auto re-arm cooldown started"
     );
     Ok(())
@@ -342,13 +288,12 @@ pub fn record_kill_switch_trip() -> Result<()> {
 /// record, or cooldown still in progress).
 ///
 /// Effect (when ready):
-/// - `armed = true` (Risky Mode comes back online)
 /// - `last_killed_at_utc_ms = None` (cooldown cleared)
 ///
 /// Idempotent: calling repeatedly after re-arm returns `Ok(false)`.
 /// The bridge task can poll every 5 s without worrying about
 /// double-flips.
-pub fn auto_re_arm_if_ready() -> Result<bool> {
+pub fn clear_expired_kill_switch() -> Result<bool> {
     let Some(mut state) =
         load_risky_mode_state().context("load risky mode state for auto re-arm check")?
     else {
@@ -356,17 +301,15 @@ pub fn auto_re_arm_if_ready() -> Result<bool> {
         return Ok(false);
     };
     let now = current_unix_ms();
-    if !state.auto_rearm_ready(now) {
+    if !state.cooldown_expired(now) {
         return Ok(false);
     }
-    state.armed = true;
     state.last_killed_at_utc_ms = None;
-    save_risky_mode_state(&state).context("persist auto re-arm")?;
+    save_risky_mode_state(&state).context("persist expired kill-switch cleanup")?;
     tracing::warn!(
         target: "neoethos_app::risky_mode_persistence",
-        re_armed_at_utc_ms = now,
-        "Risky Mode auto re-armed after 24h cooldown — operator-approved policy. \
-         Operator can manually disarm via Settings if undesired."
+        cooldown_cleared_at_utc_ms = now,
+        "Risky Mode kill-switch cooldown expired and was cleared"
     );
     Ok(true)
 }
@@ -380,12 +323,8 @@ pub fn auto_re_arm_if_ready() -> Result<bool> {
 /// loses its accumulators and its sticky halt when the process dies; the
 /// persisted timestamp does not. `live_trading::run` consults this before every
 /// Risky-Mode entry, so a tripped kill switch keeps refusing entries across
-/// restarts until `auto_re_arm_if_ready` (bridge poll, 5 s) clears it 24 h later.
+/// restarts until `clear_expired_kill_switch` (bridge poll, 5 s) clears it 24 h later.
 ///
-/// Deliberately reads ONLY `last_killed_at_utc_ms`, never `armed`: `armed` is
-/// the wizard's arm flag and is `false` for an operator who never ran the
-/// (now-deleted Flutter) wizard, so gating on it would refuse every Risky-Mode
-/// entry forever for a reason that has nothing to do with risk.
 /// **FAIL-CLOSED (2026-08-09 correction).** This used to be
 /// `load_risky_mode_state().ok().flatten()`, and `.ok()` decided in favour of
 /// trading: a corrupt, truncated, permission-denied or unparseable
@@ -408,7 +347,7 @@ pub fn kill_switch_cooldown_remaining_secs() -> Option<u64> {
                  the kill switch is tripped — treating it as TRIPPED and refusing \
                  Risky-Mode entries. Fix or delete the file to clear this."
             );
-            Some(RISKY_MODE_AUTO_REARM_COOLDOWN_MS as u64 / 1000)
+            Some(RISKY_MODE_KILL_SWITCH_COOLDOWN_MS as u64 / 1000)
         }
     }
 }
@@ -453,15 +392,15 @@ pub fn load_risky_mode_state() -> Result<Option<RiskyModeStateFile>> {
         target: "neoethos_app::risky_mode_persistence",
         path = %path.display(),
         schema_version = %state.schema_version,
-        armed = state.armed,
-        "loaded risky mode state from disk"
+        cooldown_active = state.last_killed_at_utc_ms.is_some(),
+        "loaded Risky Mode kill-switch state from disk"
     );
 
     Ok(Some(state))
 }
 
 // Used by save_risky_mode_state to stamp last_updated_utc_ms, by
-// record_kill_switch_trip / auto_re_arm_if_ready, and by
+// record_kill_switch_trip / clear_expired_kill_switch, and by
 // kill_switch_cooldown_remaining_secs.
 fn current_unix_ms() -> i64 {
     std::time::SystemTime::now()
@@ -500,10 +439,7 @@ mod tests {
         }
 
         let mut state = RiskyModeStateFile {
-            armed: true,
-            ruin_ceiling_acknowledged: Some(0.99),
-            starting_capital_usd: Some(20.0),
-            autonomous_only_contract_accepted: true,
+            last_killed_at_utc_ms: Some(123_456),
             ..Default::default()
         };
         // last_updated_utc_ms gets stamped on save; assert the round
@@ -565,8 +501,13 @@ mod tests {
             .expect("load")
             .expect("file present");
         assert_eq!(loaded.schema_version, SchemaVersion::new(1));
-        assert!(loaded.armed);
-        assert_eq!(loaded.ruin_ceiling_acknowledged, Some(0.99));
+        assert_eq!(loaded.last_killed_at_utc_ms, None);
+
+        save_risky_mode_state(&loaded).expect("rewrite legacy state");
+        let rewritten = fs::read_to_string(&path).expect("read compacted state");
+        assert!(!rewritten.contains("armed"));
+        assert!(!rewritten.contains("ruin_ceiling_acknowledged"));
+        assert!(rewritten.contains("\"schema_version\": 3"));
 
         unsafe {
             std::env::remove_var(ENV_OVERRIDE_VAR);
@@ -595,7 +536,7 @@ mod tests {
     #[test]
     fn future_schema_version_loads_as_none_with_log() {
         // A file with a schema version newer than this build's
-        // MAX_READABLE (= CURRENT = v1) must NOT crash the app. It
+        // MAX_READABLE (= CURRENT) must NOT crash the app. It
         // logs an error and treats Risky Mode as disabled until the
         // operator updates the app.
         let _g = ENV_LOCK.lock().unwrap();

@@ -2,8 +2,12 @@
 //!
 //! This boundary deliberately stops before combined OOS, promotion, or live deployment.
 
+mod codec;
+#[cfg(test)]
+mod compact_handoff_tests;
 mod config;
 mod install;
+mod wire;
 
 use config::resolve_promotion_candidate_training_config_with_plan_v1;
 pub use config::{
@@ -11,6 +15,7 @@ pub use config::{
     resolve_promotion_candidate_training_config_identity_v1,
 };
 
+use crate::training_orchestrator::effective_label_horizon_bars_v1;
 use crate::{ModelTrainingProgress, TrainingOrchestrator};
 use neoethos_core::Settings;
 use neoethos_data::{CanonicalDatasetSeriesReceiptV1, CanonicalTimeframe};
@@ -30,11 +35,18 @@ use std::path::Path;
 pub(crate) use install::install_promotion_candidate_model_tree_v1;
 
 const HANDOFF_SCHEMA_V1: &str = "neoethos.promotion-candidate-training-handoff.v1";
+const HANDOFF_SCHEMA_V2: &str = "neoethos.promotion-candidate-training-handoff.v2";
+const HANDOFF_SCHEMA_V3: &str = "neoethos.promotion-candidate-training-handoff.v3";
 const LOCKED_PORTFOLIO_SCHEMA_V1: &str = "neoethos.locked-promotion-portfolio-envelope.v1";
+const LOCKED_PORTFOLIO_SCHEMA_V2: &str = "neoethos.locked-promotion-portfolio-envelope.v2";
 const BROKER_IDENTITY_SCHEMA_V1: &str = "neoethos.promotion-candidate-broker-authority.v1";
 const MANIFEST_SCHEMA_V1: &str = "neoethos.promotion-candidate-training-manifest.v1";
 const SCHEMA_VERSION_V1: u16 = 1;
+const SCHEMA_VERSION_V2: u16 = 2;
+const SCHEMA_VERSION_V3: u16 = 3;
 const HANDOFF_IDENTITY_DOMAIN_V1: &[u8] = b"neoethos.promotion-candidate-training-handoff.v1\0";
+const HANDOFF_IDENTITY_DOMAIN_V2: &[u8] = b"neoethos.promotion-candidate-training-handoff.v2\0";
+const HANDOFF_IDENTITY_DOMAIN_V3: &[u8] = b"neoethos.promotion-candidate-training-handoff.v3\0";
 const LOCKED_PORTFOLIO_IDENTITY_DOMAIN_V1: &[u8] = b"neoethos.locked-final-portfolio.v1\0";
 
 pub const MAX_PROMOTION_CANDIDATE_HANDOFF_BYTES_V1: usize = 8 * 1024 * 1024;
@@ -45,6 +57,12 @@ pub const PROMOTION_CANDIDATE_TRAINING_EVIDENCE_FILE_V1: &str =
 const MAX_PLANNED_MODELS_V1: usize = 256;
 const MAX_MODEL_NAME_BYTES_V1: usize = 128;
 const MAX_REFUSAL_DETAIL_BYTES_V1: usize = 4096;
+
+#[cfg(test)]
+std::thread_local! {
+    // Per-test-thread observation only; never a production cache or trust flag.
+    static SHARED_PORTFOLIO_DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,31 +170,16 @@ pub struct PromotionCandidateLockedPortfolioV1 {
     version: u16,
     canonical_json: String,
     identity_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_receipt: Option<Box<CanonicalSearchInputReceiptV2>>,
 }
 
 impl PromotionCandidateLockedPortfolioV1 {
     pub fn from_serializable<T: Serialize>(
         portfolio: &T,
     ) -> Result<Self, PromotionCandidateTrainingRefusalV1> {
-        let bytes = serde_json::to_vec(portfolio).map_err(|error| {
-            refusal_v1(
-                PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
-                format!("encode locked finalist portfolio: {error}"),
-            )
-        })?;
-        if bytes.len() > MAX_PROMOTION_CANDIDATE_HANDOFF_BYTES_V1 {
-            return Err(refusal_v1(
-                PromotionCandidateTrainingRefusalCodeV1::HandoffTooLarge,
-                format!("locked finalist portfolio is {} bytes", bytes.len()),
-            ));
-        }
-        let identity_sha256 =
-            canonical_locked_portfolio_identity_sha256_v1(portfolio).map_err(|error| {
-                refusal_v1(
-                    PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
-                    format!("hash locked finalist portfolio: {error}"),
-                )
-            })?;
+        let bytes = codec::encode_bounded(portfolio)?;
+        let identity_sha256 = domain_sha256_v1(LOCKED_PORTFOLIO_IDENTITY_DOMAIN_V1, &bytes);
         let value = Self {
             schema: LOCKED_PORTFOLIO_SCHEMA_V1.to_owned(),
             version: SCHEMA_VERSION_V1,
@@ -187,12 +190,17 @@ impl PromotionCandidateLockedPortfolioV1 {
                 )
             })?,
             identity_sha256,
+            shared_receipt: None,
         };
         value.validate()?;
         Ok(value)
     }
 
     fn validate(&self) -> Result<(), PromotionCandidateTrainingRefusalV1> {
+        if self.schema == LOCKED_PORTFOLIO_SCHEMA_V2 && self.version == 2 {
+            self.deserialize_shared_live_portfolio()?;
+            return Ok(());
+        }
         if self.schema != LOCKED_PORTFOLIO_SCHEMA_V1 || self.version != SCHEMA_VERSION_V1 {
             return Err(refusal_v1(
                 PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
@@ -205,7 +213,13 @@ impl PromotionCandidateLockedPortfolioV1 {
                 "locked finalist portfolio exceeds the handoff byte cap",
             ));
         }
-        serde_json::from_str::<serde_json::Value>(&self.canonical_json).map_err(|error| {
+        if self.shared_receipt.is_some() {
+            return Err(refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
+                "legacy locked portfolio cannot contain a shared receipt",
+            ));
+        }
+        serde_json::from_str::<serde::de::IgnoredAny>(&self.canonical_json).map_err(|error| {
             refusal_v1(
                 PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
                 format!("locked finalist portfolio is not JSON: {error}"),
@@ -236,6 +250,12 @@ impl PromotionCandidateLockedPortfolioV1 {
     where
         T: DeserializeOwned + Serialize,
     {
+        if self.version != 1 {
+            return Err(refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
+                "shared-receipt portfolios require deserialize_live_portfolio",
+            ));
+        }
         self.validate()?;
         let value: T = serde_json::from_slice(self.canonical_json_bytes()).map_err(|error| {
             refusal_v1(
@@ -257,26 +277,120 @@ impl PromotionCandidateLockedPortfolioV1 {
         }
         Ok(value)
     }
+
+    /// Compact persistence keeps one receipt but retains the original V5 portfolio identity.
+    pub fn from_live_portfolio(
+        portfolio: &neoethos_search::live_portfolio::LivePortfolioArtifact,
+    ) -> Result<Self, PromotionCandidateTrainingRefusalV1> {
+        let body = portfolio.shared_receipt_body_v1().map_err(|error| {
+            refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
+                error.to_string(),
+            )
+        })?;
+        let bytes = codec::encode_bounded(&body)?;
+        let identity_sha256 = body.portfolio_identity_sha256().to_owned();
+        let value = Self {
+            schema: LOCKED_PORTFOLIO_SCHEMA_V2.to_owned(),
+            version: 2,
+            canonical_json: String::from_utf8(bytes).map_err(|error| {
+                refusal_v1(
+                    PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
+                    error.to_string(),
+                )
+            })?,
+            identity_sha256,
+            shared_receipt: Some(Box::new(portfolio.search_scope.receipt().clone())),
+        };
+        // The borrowed body already validated this exact immutable portfolio.
+        // Its bounded encoding, identity and receipt above come from that same
+        // value; decoding our own fresh envelope would repeat that validation.
+        // Every externally supplied envelope still takes the strict reader.
+        Ok(value)
+    }
+
+    pub fn deserialize_live_portfolio(
+        &self,
+    ) -> Result<
+        neoethos_search::live_portfolio::LivePortfolioArtifact,
+        PromotionCandidateTrainingRefusalV1,
+    > {
+        if self.version == 1 {
+            self.deserialize_exact()
+        } else {
+            self.deserialize_shared_live_portfolio()
+        }
+    }
+
+    fn deserialize_shared_live_portfolio(
+        &self,
+    ) -> Result<
+        neoethos_search::live_portfolio::LivePortfolioArtifact,
+        PromotionCandidateTrainingRefusalV1,
+    > {
+        if self.schema != LOCKED_PORTFOLIO_SCHEMA_V2 || self.version != 2 {
+            return Err(refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
+                "unsupported shared locked portfolio schema/version",
+            ));
+        }
+        if self.canonical_json.len() > MAX_PROMOTION_CANDIDATE_HANDOFF_BYTES_V1 {
+            return Err(refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::HandoffTooLarge,
+                "shared locked portfolio exceeds the handoff byte cap",
+            ));
+        }
+        let receipt = self.shared_receipt.as_deref().ok_or_else(|| {
+            refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::InputReceiptMismatch,
+                "shared locked portfolio lacks its exact receipt",
+            )
+        })?;
+        #[cfg(test)]
+        SHARED_PORTFOLIO_DECODE_COUNT.with(|count| count.set(count.get() + 1));
+        let body: neoethos_search::live_portfolio::LivePortfolioSharedReceiptBodyV1 =
+            serde_json::from_str(&self.canonical_json).map_err(|error| {
+                refusal_v1(
+                    PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
+                    error.to_string(),
+                )
+            })?;
+        if body.portfolio_identity_sha256() != self.identity_sha256 {
+            return Err(refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
+                "shared locked portfolio identity differs from its envelope",
+            ));
+        }
+        body.attach(receipt).map_err(|error| {
+            refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::InputReceiptMismatch,
+                error.to_string(),
+            )
+        })
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct PromotionCandidateTrainingHandoffV1 {
     schema: String,
     version: u16,
     canonical_series: CanonicalDatasetSeriesReceiptV1,
-    #[serde(
-        serialize_with = "serialize_timeframe_v1",
-        deserialize_with = "deserialize_timeframe_v1"
-    )]
     base_timeframe: CanonicalTimeframe,
     search_input_receipt: CanonicalSearchInputReceiptV2,
+    // Preserve the received V3 bytes; re-compressing with a future backend must
+    // not change a saved handoff's canonical bytes or identity.
+    compressed_search_input_receipt: Option<codec::CompressedReceipt>,
     screening_contract: CanonicalTrendbarResearchExecutionContractV3,
     locked_portfolio: PromotionCandidateLockedPortfolioV1,
     oos_cutoff_ms: i64,
     purge_bars: usize,
     broker_authority: PromotionCandidateBrokerAuthorityIdentityV1,
     training_config: PromotionCandidateTrainingConfigIdentityV1,
+    /// Discovery receipts describe the whole source, including the untouched
+    /// tail. Only this independently validated split permits such a receipt;
+    /// the trainer still purges and truncates strictly before `oos_cutoff_ms`.
+    discovery_holdout_scope:
+        Option<neoethos_search::data_selection::CanonicalSearchArtifactScopeV2>,
 }
 
 impl PromotionCandidateTrainingHandoffV1 {
@@ -298,22 +412,129 @@ impl PromotionCandidateTrainingHandoffV1 {
             canonical_series,
             base_timeframe,
             search_input_receipt,
+            compressed_search_input_receipt: None,
             screening_contract,
             locked_portfolio,
             oos_cutoff_ms,
             purge_bars,
             broker_authority,
             training_config,
+            discovery_holdout_scope: None,
         };
         value.validate()?;
         Ok(value)
     }
 
+    /// Connect the existing bar-OOS portfolio to candidate training. This is
+    /// training authority only, not combined-model validation or live admission.
+    pub fn from_discovery_portfolio(
+        canonical_series: CanonicalDatasetSeriesReceiptV1,
+        screening_contract: CanonicalTrendbarResearchExecutionContractV3,
+        portfolio: &neoethos_search::live_portfolio::LivePortfolioArtifact,
+        settings: &Settings,
+    ) -> Result<Self, PromotionCandidateTrainingRefusalV1> {
+        let holdout = portfolio
+            .sizing_evidence
+            .first()
+            .ok_or_else(|| {
+                refusal_v1(
+                    PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
+                    "candidate training requires a nonempty portfolio with exact calibration evidence",
+                )
+            })?
+            .forward_test
+            .scope()
+            .clone();
+        let mut value = Self {
+            schema: HANDOFF_SCHEMA_V2.to_owned(),
+            version: 2,
+            base_timeframe: canonical_series.anchor().identity().timeframe(),
+            canonical_series,
+            search_input_receipt: screening_contract.input_receipt().clone(),
+            compressed_search_input_receipt: None,
+            // This identifies the captured broker/cost source, not a financial
+            // truth permit. Current metadata remains a screening assumption.
+            broker_authority: PromotionCandidateBrokerAuthorityIdentityV1::checked_new(
+                screening_contract.assumption_source_sha256().to_owned(),
+            )?,
+            screening_contract,
+            locked_portfolio: PromotionCandidateLockedPortfolioV1::from_live_portfolio(portfolio)?,
+            oos_cutoff_ms: holdout.evaluated_window().timestamp_start_ms(),
+            purge_bars: effective_label_horizon_bars_v1(settings),
+            training_config: resolve_promotion_candidate_training_config_identity_v1(settings)?,
+            discovery_holdout_scope: Some(holdout),
+        };
+        // Keep existing V2 bytes/identity whenever they already fit. Only the
+        // transport changes for an otherwise valid oversized shared handoff.
+        match value.validate_against_settings_v1(settings) {
+            Ok(()) => return Ok(value),
+            Err(error)
+                if error.code() == PromotionCandidateTrainingRefusalCodeV1::HandoffTooLarge => {}
+            Err(error) => return Err(error),
+        }
+        value.compressed_search_input_receipt =
+            Some(codec::CompressedReceipt::new(&value.search_input_receipt)?);
+        value.schema = HANDOFF_SCHEMA_V3.to_owned();
+        value.version = SCHEMA_VERSION_V3;
+        value.validate_against_settings_v1(settings)?;
+        Ok(value)
+    }
+
+    fn validate_discovery_holdout(
+        &self,
+        portfolio: &neoethos_search::live_portfolio::LivePortfolioArtifact,
+    ) -> Result<(), PromotionCandidateTrainingRefusalV1> {
+        let Some(holdout) = &self.discovery_holdout_scope else {
+            return Ok(());
+        };
+        if portfolio.genes.is_empty()
+            || portfolio.search_scope.receipt() != &self.search_input_receipt
+            || holdout.evaluated_window().role()
+                != neoethos_search::data_selection::CanonicalSearchWindowRoleV1::SelectionValidation
+            || holdout.evaluated_window().timestamp_start_ms() != self.oos_cutoff_ms
+            || portfolio
+                .sizing_evidence
+                .iter()
+                .any(|evidence| evidence.forward_test.scope() != holdout)
+        {
+            return Err(refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::OosCutoffLeakage,
+                "training cutoff must be the start of the exact shared selection-validation calibration interval; neither calibration nor reserved final rows may fit models",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(&self) -> Result<(), PromotionCandidateTrainingRefusalV1> {
-        if self.schema != HANDOFF_SCHEMA_V1 || self.version != SCHEMA_VERSION_V1 {
+        self.validate_semantics()?;
+        codec::check_bounded(self)
+    }
+
+    // Retain the validated value for callers that need it in this operation.
+    // This is never stored on the handoff or reused across public boundaries.
+    fn validate_semantics(
+        &self,
+    ) -> Result<
+        Option<neoethos_search::live_portfolio::LivePortfolioArtifact>,
+        PromotionCandidateTrainingRefusalV1,
+    > {
+        if !matches!(
+            (self.schema.as_str(), self.version),
+            (HANDOFF_SCHEMA_V1, 1) | (HANDOFF_SCHEMA_V2, 2) | (HANDOFF_SCHEMA_V3, 3)
+        ) || self.locked_portfolio.version != if self.version == 1 { 1 } else { 2 }
+            || self.compressed_search_input_receipt.is_some() != (self.version == 3)
+        {
             return Err(refusal_v1(
                 PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
                 "unsupported promotion-candidate handoff schema/version",
+            ));
+        }
+        if self.version >= 2
+            && self.locked_portfolio.shared_receipt.as_deref() != Some(&self.search_input_receipt)
+        {
+            return Err(refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::InputReceiptMismatch,
+                "locked portfolio receipt differs from the single handoff receipt",
             ));
         }
         self.canonical_series.validate().map_err(|error| {
@@ -353,7 +574,9 @@ impl PromotionCandidateTrainingHandoffV1 {
         }
         for binding in self.search_input_receipt.source_bindings() {
             for segment in binding.segments() {
-                if segment.timestamp_end_ms() >= self.oos_cutoff_ms {
+                if self.discovery_holdout_scope.is_none()
+                    && segment.timestamp_end_ms() >= self.oos_cutoff_ms
+                {
                     return Err(refusal_v1(
                         PromotionCandidateTrainingRefusalCodeV1::OosCutoffLeakage,
                         format!(
@@ -366,39 +589,104 @@ impl PromotionCandidateTrainingHandoffV1 {
                 }
             }
         }
-        if self.purge_bars > 1_000_000 {
+        let mut validated_portfolio = None;
+        if self.discovery_holdout_scope.is_some() {
+            // One immutable decoded value supplies BOTH the locked identity and
+            // discovery-cutoff checks. Shared attachment already validates the
+            // complete V6 artifact before returning it; legacy generic decoding
+            // validates bytes/hash only, so it still needs the semantic check.
+            let portfolio = self.locked_portfolio.deserialize_live_portfolio()?;
+            if self.locked_portfolio.version == SCHEMA_VERSION_V1 {
+                portfolio.validate().map_err(|error| {
+                    refusal_v1(
+                        PromotionCandidateTrainingRefusalCodeV1::OosCutoffLeakage,
+                        error.to_string(),
+                    )
+                })?;
+            }
+            self.validate_discovery_holdout(&portfolio)?;
+            validated_portfolio = Some(portfolio);
+        }
+        if !(1..=1_000_000).contains(&self.purge_bars) {
             return Err(refusal_v1(
                 PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
-                "purge bars must not exceed 1,000,000",
+                "purge bars must be within 1..=1,000,000 because labels always look forward",
             ));
         }
-        self.locked_portfolio.validate()?;
+        if self.discovery_holdout_scope.is_none() {
+            // Shared attachment validates the complete live artifact even for
+            // non-Discovery handoffs. Legacy generic payloads remain generic.
+            if self.locked_portfolio.version == SCHEMA_VERSION_V2 {
+                validated_portfolio = Some(self.locked_portfolio.deserialize_live_portfolio()?);
+            } else {
+                self.locked_portfolio.validate()?;
+            }
+        }
         self.broker_authority.validate()?;
         self.training_config.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|error| {
-            refusal_v1(
-                PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
-                format!("encode promotion-candidate handoff: {error}"),
-            )
-        })?;
-        if bytes.len() > MAX_PROMOTION_CANDIDATE_HANDOFF_BYTES_V1 {
-            return Err(refusal_v1(
-                PromotionCandidateTrainingRefusalCodeV1::HandoffTooLarge,
-                format!("promotion-candidate handoff is {} bytes", bytes.len()),
-            ));
-        }
-        Ok(())
+        Ok(validated_portfolio)
     }
 
     pub fn identity_sha256(&self) -> Result<String, PromotionCandidateTrainingRefusalV1> {
-        self.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|error| {
-            refusal_v1(
-                PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
-                format!("encode promotion-candidate handoff identity: {error}"),
-            )
-        })?;
-        Ok(domain_sha256_v1(HANDOFF_IDENTITY_DOMAIN_V1, &bytes))
+        self.canonical_bytes_and_identity_sha256()
+            .map(|(_, identity)| identity)
+    }
+
+    /// Validate once and return the exact bounded canonical encoding together
+    /// with its identity. Publication must hash these same bytes, not re-encode.
+    pub fn canonical_bytes_and_identity_sha256(
+        &self,
+    ) -> Result<(Vec<u8>, String), PromotionCandidateTrainingRefusalV1> {
+        let bytes = self.to_json_bytes()?;
+        let identity = self.identity_for_canonical_bytes(&bytes);
+        Ok((bytes, identity))
+    }
+
+    fn identity_for_canonical_bytes(&self, bytes: &[u8]) -> String {
+        let domain = match self.version {
+            1 => HANDOFF_IDENTITY_DOMAIN_V1,
+            2 => HANDOFF_IDENTITY_DOMAIN_V2,
+            _ => HANDOFF_IDENTITY_DOMAIN_V3,
+        };
+        domain_sha256_v1(domain, bytes)
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, PromotionCandidateTrainingRefusalV1> {
+        self.validate_semantics()?;
+        // The retaining encoder enforces exactly the same cap as validate's
+        // counting encoder, without first serializing solely to count bytes.
+        codec::encode_bounded(self)
+    }
+
+    /// Validate the full handoff and return its exact live portfolio and
+    /// canonical identity without decoding that portfolio a second time.
+    /// Generic legacy payloads must also pass typed live-portfolio validation;
+    /// this method does not grant model, promotion or live-trading authority.
+    pub fn validated_live_portfolio_and_identity_sha256(
+        &self,
+    ) -> Result<
+        (
+            neoethos_search::live_portfolio::LivePortfolioArtifact,
+            String,
+        ),
+        PromotionCandidateTrainingRefusalV1,
+    > {
+        let portfolio = self.validate_semantics()?;
+        let bytes = codec::encode_bounded(self)?;
+        let portfolio = match portfolio {
+            Some(portfolio) => portfolio,
+            None => {
+                let portfolio = self.locked_portfolio.deserialize_live_portfolio()?;
+                portfolio.validate().map_err(|error| {
+                    refusal_v1(
+                        PromotionCandidateTrainingRefusalCodeV1::InvalidHandoff,
+                        error.to_string(),
+                    )
+                })?;
+                portfolio
+            }
+        };
+        Ok((portfolio, self.identity_for_canonical_bytes(&bytes)))
     }
 
     pub fn validate_against_config_identity_v1(
@@ -428,13 +716,48 @@ impl PromotionCandidateTrainingHandoffV1 {
         &self,
         settings: &Settings,
     ) -> Result<(), PromotionCandidateTrainingRefusalV1> {
+        let actual = self.resolve_settings_with_sealed_plan_v1(settings)?;
+        self.validate_against_config_identity_v1(&actual)
+    }
+
+    /// Validate an installed candidate's model plan for inference on a different
+    /// runtime host or data/cache location. The original runtime hash remains
+    /// sealed training provenance; it is not the inference directory identity.
+    ///
+    /// This checks the full handoff, purge, effective model parameters and exact
+    /// planned inventory using the original training hardware plan. The caller
+    /// must still load the verified tree and its persisted model-input recipe;
+    /// this method does not validate an ambient feature cube, combining policy,
+    /// accelerator availability, or deployment permission.
+    pub fn validate_inference_settings_v1(
+        &self,
+        settings: &Settings,
+    ) -> Result<(), PromotionCandidateTrainingRefusalV1> {
+        let actual = self.resolve_settings_with_sealed_plan_v1(settings)?;
+        if self.training_config.model_config_sha256 != actual.model_config_sha256
+            || self.training_config.planned_models != actual.planned_models
+        {
+            return Err(refusal_v1(
+                PromotionCandidateTrainingRefusalCodeV1::ModelConfigMismatch,
+                "effective model configuration changed after handoff sealing",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_settings_with_sealed_plan_v1(
+        &self,
+        settings: &Settings,
+    ) -> Result<PromotionCandidateTrainingConfigIdentityV1, PromotionCandidateTrainingRefusalV1>
+    {
         self.validate()?;
-        if self.purge_bars != settings.models.label_horizon_bars {
+        let effective_horizon = effective_label_horizon_bars_v1(settings);
+        if self.purge_bars != effective_horizon {
             return Err(refusal_v1(
                 PromotionCandidateTrainingRefusalCodeV1::ModelConfigMismatch,
                 format!(
-                    "handoff purge {} differs from configured label horizon {}",
-                    self.purge_bars, settings.models.label_horizon_bars
+                    "handoff purge {} differs from effective label horizon {}",
+                    self.purge_bars, effective_horizon
                 ),
             ));
         }
@@ -447,9 +770,7 @@ impl PromotionCandidateTrainingHandoffV1 {
                     "promotion training handoff lacks its exact sealed hardware plan",
                 )
             })?;
-        let actual =
-            resolve_promotion_candidate_training_config_with_plan_v1(settings, sealed_plan)?;
-        self.validate_against_config_identity_v1(&actual)
+        resolve_promotion_candidate_training_config_with_plan_v1(settings, sealed_plan)
     }
 
     pub const fn canonical_series(&self) -> &CanonicalDatasetSeriesReceiptV1 {
@@ -682,7 +1003,10 @@ where
     }
 }
 
-fn validate_series_against_search_v1(
+/// Bind already-validated series/receipt values without reopening data or
+/// recomputing the feature-content identity. Shared by the sealed handoff and
+/// the public canonical training entry points.
+pub(crate) fn validate_series_against_search_v1(
     series: &CanonicalDatasetSeriesReceiptV1,
     receipt: &CanonicalSearchInputReceiptV2,
 ) -> Result<(), PromotionCandidateTrainingRefusalV1> {

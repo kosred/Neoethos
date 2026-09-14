@@ -198,7 +198,7 @@ pub async fn place(State(_state): State<AppApiState>, Json(body): Json<NewOrderB
         // `None`: the operator's own manual order. Deliberately not bound to
         // any engine's admission decision — the operator ruled that manual
         // trading respects the operator.
-        submit_market_order_blocking(&symbol, side, volume_lots, sl, tp, comment, None)
+        submit_market_order_blocking(&symbol, side, volume_lots, sl, tp, comment, None, None)
     })
     .await;
 
@@ -493,9 +493,10 @@ pub async fn close_position(
     }
     let position_id = body.position_id;
     let volume = body.volume;
-    let result =
-        tokio::task::spawn_blocking(move || close_position_blocking(position_id, volume, None))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        close_position_blocking(position_id, volume, None, None)
+    })
+    .await;
     outcome_to_response(result)
 }
 

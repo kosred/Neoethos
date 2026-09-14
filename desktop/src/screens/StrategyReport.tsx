@@ -1,27 +1,27 @@
 import { useMemo, useState } from "react";
 import { strategyList, strategyReport, type StrategyEntry, type StrategyReport as Report } from "../api";
 import { usePoll } from "../hooks";
-import { FilterChips, ago, stamp, tfRank, toggleIn } from "../components/filters";
+import { FilterChips } from "../components/FilterChips";
+import { ago, stamp, tfRank, toggleIn } from "../components/filterUtils";
 
-const eur = (v: number) => `€${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
-const Badge = ({ ok, label }: { ok: boolean | null; label: string }) => (
-  <span className={`badge ${ok ? "demo" : "live"}`} title={label}>{ok ? "✓" : "✗"} {label}</span>
-);
-
+const normalizedUnits = (v: number) => `${v.toLocaleString(undefined, { maximumFractionDigits: 0 })} units`;
+const recordedModeLabels: Record<string, string> = { risky: "Risky", prop_firm: "Prop-firm", strict: "Strict" };
+const recordedModeLabel = (mode: string) => recordedModeLabels[mode] ?? "Unavailable";
+const recordedPercent = (fraction: number) =>
+  `${(fraction * 100).toLocaleString(undefined, { maximumFractionDigits: 3 })}%`;
 type SortKey = "discovered" | "cagr" | "dd" | "trades" | "symbol";
 
 export default function StrategyReport() {
-  const { data, error } = usePoll(strategyList, 0);
+  const { data, error, loading, reload } = usePoll(strategyList, 0);
   const [rep, setRep] = useState<Report | null>(null);
   const [busy, setBusy] = useState(false);
+  const [reportError, setReportError] = useState("");
 
   // ── Filters (operator request: "I can't tell what happened per pair / per
   // timeframe, and I can't see WHEN anything was discovered") ──────────────
   const [symFilter, setSymFilter] = useState<string[]>([]);
   const [tfFilter, setTfFilter] = useState<string[]>([]);
-  const [modeFilter, setModeFilter] = useState<"all" | "risky" | "prop_firm">("all");
-  const [validOnly, setValidOnly] = useState(false);
-  const [hideFlagged, setHideFlagged] = useState(false);
+  const [modeFilter, setModeFilter] = useState<"all" | "risky" | "prop_firm" | "strict" | "unknown">("all");
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState<SortKey>("discovered");
 
@@ -43,30 +43,27 @@ export default function StrategyReport() {
       if (symFilter.length && !symFilter.includes(s.symbol)) return false;
       if (tfFilter.length && !tfFilter.includes(s.timeframe)) return false;
       if (modeFilter !== "all" && s.mode !== modeFilter) return false;
-      if (validOnly && !(s.cpcvPassed && s.walkforwardPassed)) return false;
-      if (hideFlagged && s.flags.length > 0) return false;
-      if (q && !`${s.symbol} ${s.timeframe} ${s.mode}`.toUpperCase().includes(q)) return false;
+      if (q && !`${s.symbol} ${s.timeframe} ${s.mode} ${s.strategyId}`.toUpperCase().includes(q)) return false;
       return true;
     });
     const cmp: Record<SortKey, (a: StrategyEntry, b: StrategyEntry) => number> = {
       discovered: (a, b) => (b.discoveredAtMs ?? 0) - (a.discoveredAtMs ?? 0),
-      cagr: (a, b) => b.cagrPct - a.cagrPct,
+      cagr: (a, b) => a.cagrPct == null ? (b.cagrPct == null ? 0 : 1) : b.cagrPct == null ? -1 : b.cagrPct - a.cagrPct,
       dd: (a, b) => a.maxDdPct - b.maxDdPct,
       trades: (a, b) => b.trades - a.trades,
       symbol: (a, b) => a.symbol.localeCompare(b.symbol) || tfRank(a.timeframe) - tfRank(b.timeframe),
     };
     return [...out].sort(cmp[sortBy]);
-  }, [all, symFilter, tfFilter, modeFilter, validOnly, hideFlagged, search, sortBy]);
+  }, [all, symFilter, tfFilter, modeFilter, search, sortBy]);
 
   // Per-timeframe rollup of the FILTERED set — answers "what is happening per
   // group" without reading every row.
   const byTf = useMemo(() => {
-    const m = new Map<string, { n: number; valid: number; best: number }>();
+    const m = new Map<string, { n: number; best: number }>();
     for (const s of rows) {
-      const e = m.get(s.timeframe) ?? { n: 0, valid: 0, best: -Infinity };
+      const e = m.get(s.timeframe) ?? { n: 0, best: -Infinity };
       e.n += 1;
-      if (s.cpcvPassed && s.walkforwardPassed) e.valid += 1;
-      if (Math.abs(s.cagrPct) <= 1000) e.best = Math.max(e.best, s.cagrPct);
+      if (s.cagrPct != null && Math.abs(s.cagrPct) <= 1000) e.best = Math.max(e.best, s.cagrPct);
       m.set(s.timeframe, e);
     }
     return [...m.entries()].sort((a, b) => tfRank(a[0]) - tfRank(b[0]));
@@ -79,18 +76,21 @@ export default function StrategyReport() {
 
   const clearAll = () => {
     setSymFilter([]); setTfFilter([]); setModeFilter("all");
-    setValidOnly(false); setHideFlagged(false); setSearch("");
+    setSearch("");
   };
   const filtersOn =
     symFilter.length > 0 || tfFilter.length > 0 || modeFilter !== "all" ||
-    validOnly || hideFlagged || search.trim() !== "";
+    search.trim() !== "";
 
   const open = async (s: StrategyEntry) => {
+    if (busy) return;
     setBusy(true);
+    setRep(null);
+    setReportError("");
     try {
-      setRep(await strategyReport(s.dir, s.base));
-    } catch {
-      setRep(null);
+      setRep(await strategyReport(s.dir, s.base, s.strategyId, s.exactGeneHash));
+    } catch (reason) {
+      setReportError(`Could not load ${s.symbol} ${s.timeframe} (${s.base}): ${reason}`);
     } finally {
       setBusy(false);
     }
@@ -100,10 +100,17 @@ export default function StrategyReport() {
     <div className="screen">
       <h1>Strategy Report</h1>
       <p className="sub">
-        Monthly journal · €1000 growth · validation verdict · honest flags — from the stored backtests
+        One selected representative per portfolio · unsealed IS journal · normalized 1,000-unit curve, not portfolio PnL
         {newest && <> · newest discovery <b>{stamp(newest)}</b> ({ago(newest)})</>}
       </p>
-      {error && <div className="banner warn">{error}</div>}
+      <div className="btn-row"><button disabled={loading} onClick={() => void reload()}>{loading ? "Refreshing…" : "Refresh strategies"}</button></div>
+      {error && <div className="banner warn" role="alert">Strategy inventory could not refresh. Retained entries may be stale. {error}</div>}
+      {(data?.unavailable?.length ?? 0) > 0 && <div className="banner warn" role="alert">
+        {data!.unavailable.length} stored reports unavailable: missing, inconsistent or ambiguous evidence is not replaced with another strategy's results.
+        <details><summary>Details</summary>{data!.unavailable.map((reason, index) => <div key={index}>{reason}</div>)}</details>
+      </div>}
+      {reportError && <div className="banner warn" role="alert">{reportError} Retry the report from its row.</div>}
+      {busy && <p className="muted" role="status">Loading the selected strategy report…</p>}
 
       {/* ── Filters ───────────────────────────────────────────────────────── */}
       <div className="ticket">
@@ -118,11 +125,13 @@ export default function StrategyReport() {
             />
           </label>
           <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-            Mode
+            Recorded mode
             <select value={modeFilter} onChange={(e) => setModeFilter(e.target.value as typeof modeFilter)}>
               <option value="all">All</option>
-              <option value="risky">🚀 Risky</option>
-              <option value="prop_firm">🛡 Prop-firm</option>
+              <option value="risky">Risky</option>
+              <option value="prop_firm">Prop-firm</option>
+              <option value="strict">Strict</option>
+              <option value="unknown">Unavailable</option>
             </select>
           </label>
           <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
@@ -135,29 +144,23 @@ export default function StrategyReport() {
               <option value="symbol">Symbol · TF</option>
             </select>
           </label>
-          <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }} title="Passed CPCV + Walkforward out-of-sample">
-            <input type="checkbox" checked={validOnly} onChange={(e) => setValidOnly(e.target.checked)} /> Validated only
-          </label>
-          <label style={{ flexDirection: "row", alignItems: "center", gap: 6 }} title="Hide anything carrying an honesty flag">
-            <input type="checkbox" checked={hideFlagged} onChange={(e) => setHideFlagged(e.target.checked)} /> Hide flagged
-          </label>
           {filtersOn && <button className="link" onClick={clearAll}>clear filters</button>}
-          <span className="muted small">{rows.length} of {all.length}</span>
+          <span className="muted small">{data ? `${rows.length} of ${all.length}` : "Inventory unknown"}</span>
         </div>
 
-        <FilterChips label="Pairs" opts={symbols} sel={symFilter} onToggle={toggleIn(setSymFilter)} />
-        <FilterChips label="Timeframes" opts={timeframes} sel={tfFilter} onToggle={toggleIn(setTfFilter)} />
+        <FilterChips label="Pairs" options={symbols} selected={symFilter} onToggle={toggleIn(setSymFilter)} />
+        <FilterChips label="Timeframes" options={timeframes} selected={tfFilter} onToggle={toggleIn(setTfFilter)} />
       </div>
 
       {/* ── Per-timeframe rollup of what is currently shown ────────────────── */}
       {byTf.length > 1 && (
         <div className="cards" style={{ gridTemplateColumns: `repeat(${Math.min(6, byTf.length)}, 1fr)` }}>
           {byTf.map(([tf, e]) => (
-            <div className="card" key={tf} title={`${e.n} strategies on ${tf}, ${e.valid} passed out-of-sample`}>
+            <div className="card" key={tf} title={`${e.n} selected-strategy IS diagnostics on ${tf}`}>
               <div className="card-label">{tf}</div>
               <div className="card-value">{e.n}</div>
               <div className="muted small">
-                {e.valid} validated{isFinite(e.best) ? ` · best ${e.best.toFixed(0)}%` : ""}
+                Unsealed IS{isFinite(e.best) ? ` · best diagnostic CAGR ${e.best.toFixed(0)}%` : ""}
               </div>
             </div>
           ))}
@@ -166,7 +169,9 @@ export default function StrategyReport() {
 
       {rows.length === 0 ? (
         <p className="muted">
-          {all.length === 0
+          {error ? "Strategy inventory unavailable." : !data ? "Loading strategy inventory…" : all.length === 0 && data.unavailable.length > 0
+            ? "Stored reports are unavailable; see the reasons above."
+            : all.length === 0
             ? "No strategies stored yet — run Discovery first."
             : "No strategies match the current filters."}
         </p>
@@ -174,27 +179,27 @@ export default function StrategyReport() {
         <table className="tbl">
           <thead>
             <tr>
-              <th>Discovered</th><th>Mode</th><th>Symbol</th><th>TF</th><th>Trades</th><th>Win%</th>
-              <th>CAGR%</th><th>maxDD%</th><th>€1k→</th><th>Validation</th><th></th>
+              <th>Discovered</th><th>Mode</th><th>Symbol</th><th>TF</th><th>Selected strategy</th><th>Trades</th><th>Win%</th>
+              <th>CAGR%</th><th>maxDD%</th><th>1k units→</th><th>Research evidence</th><th></th>
             </tr>
           </thead>
           <tbody>
             {rows.map((s) => (
-              <tr key={s.dir + s.base} className={rep?.base === s.base && rep?.dir === s.dir ? "row-sel" : ""}>
+              <tr key={JSON.stringify([s.dir, s.base, s.exactGeneHash])} className={rep?.exactGeneHash === s.exactGeneHash && rep?.base === s.base && rep?.dir === s.dir ? "row-sel" : ""}>
                 <td className="muted small" style={{ whiteSpace: "nowrap" }} title={ago(s.discoveredAtMs)}>
                   {stamp(s.discoveredAtMs)}
                 </td>
-                <td><span className={`badge ${s.mode === "risky" ? "live" : "demo"}`}>{s.mode}</span></td>
+                <td><span className="badge" title="Recorded search mode, not live-trading status">{recordedModeLabel(s.mode)}</span></td>
                 <td><b>{s.symbol}</b></td>
                 <td>{s.timeframe}</td>
+                <td className="mono small" title={s.exactGeneHash}>{s.strategyId}</td>
                 <td>{s.trades}</td>
                 <td>{s.winRate != null ? (s.winRate * 100).toFixed(1) : "—"}</td>
-                <td className={s.cagrPct >= 0 ? "buy" : "sell"}>{Math.abs(s.cagrPct) > 1000 ? "🚩" : s.cagrPct.toFixed(1)}</td>
+                <td className={s.cagrPct == null ? "muted" : s.cagrPct >= 0 ? "buy" : "sell"}>{s.cagrPct == null ? "—" : Math.abs(s.cagrPct) > 1000 ? "🚩" : s.cagrPct.toFixed(1)}</td>
                 <td>{s.maxDdPct.toFixed(1)}</td>
-                <td>{Math.abs(s.cagrPct) > 1000 ? "—" : eur(s.finalFrom1000)}</td>
+                <td>{normalizedUnits(s.finalFrom1000)}</td>
                 <td>
-                  <span className={`badge ${s.cpcvPassed ? "demo" : "live"}`} title="CPCV">C{s.cpcvPassed ? "✓" : "✗"}</span>{" "}
-                  <span className={`badge ${s.walkforwardPassed ? "demo" : "live"}`} title="Walkforward (OOS)">W{s.walkforwardPassed ? "✓" : "✗"}</span>
+                  <span className="badge">Unsealed IS</span>
                   {s.flags.length > 0 && <span className="sell small" title={s.flags.join("\n")}> 🚩{s.flags.length}</span>}
                 </td>
                 <td><button disabled={busy} onClick={() => open(s)}>Report</button></td>
@@ -206,46 +211,54 @@ export default function StrategyReport() {
 
       {rep && (
         <>
-          <h2>{rep.symbol} {rep.timeframe} <span className={`badge ${rep.mode === "risky" ? "live" : "demo"}`}>{rep.mode}</span></h2>
+          <h2>{rep.symbol} {rep.timeframe} <span className="badge" title="Recorded search mode, not live-trading status">{recordedModeLabel(rep.mode)}</span></h2>
           <p className="muted small">
+            <span className="mono" title={rep.exactGeneHash}>{rep.strategyId}</span> ·
             {rep.spanStart} → {rep.spanEnd} · {rep.years}y · {rep.trades} trades
             {rep.discoveredAtMs ? <> · discovered {stamp(rep.discoveredAtMs)}</> : null}
           </p>
 
-          {(() => {
-            const oos = !!rep.cpcvPassed && !!rep.walkforwardPassed;
-            const full = oos && !!rep.validationComplete;
-            const txt = full
-              ? "✅ FULLY VALIDATED — passed CPCV + Walkforward, evidence complete"
-              : oos
-                ? "✅ PASSED out-of-sample (CPCV + Walkforward) — full-evidence check still pending"
-                : "⚠️ NOT validated out-of-sample — not safe to trade live";
-            return (
-              <div className={`banner ${oos ? "info" : "warn"}`} style={{ fontWeight: 600 }}>
-                {txt}
-              </div>
-            );
-          })()}
-
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "8px 0" }}>
-            <Badge ok={rep.cpcvPassed} label="CPCV" />
-            <Badge ok={rep.walkforwardPassed} label="Walkforward (out-of-sample)" />
-            <Badge ok={rep.validationComplete} label="Full evidence" />
+          <div className="banner info">
+            Unsealed IS diagnostics only. This report does not establish whether independent final-window
+            validation passed or failed; it cannot authorize promotion. Read saved final-window research
+            for an exact selected handoff in the Final evaluation tab.
           </div>
           {rep.flags.map((f, i) => <div className="banner warn" key={i}>🚩 {f}</div>)}
 
+          <h3>Recorded evaluation settings</h3>
+          <p className="muted small">Saved with this research run; today's settings are not substituted. The recorded mode is a search label, not live-trading or promotion approval.</p>
+          {rep.recordedEvaluation ? <>
+            <div className="cards">
+              <div className="card"><div className="card-label">STARTING CAPITAL</div><div className="card-value" style={{ fontSize: 18 }}>{rep.recordedEvaluation.initialCapital.toLocaleString(undefined, { maximumFractionDigits: 2 })} {rep.recordedEvaluation.accountCurrency}</div></div>
+              <div className="card"><div className="card-label">RISK PER TRADE</div><div className="card-value" style={{ fontSize: 18 }}>{recordedPercent(rep.recordedEvaluation.riskPerTradeMin)}–{recordedPercent(rep.recordedEvaluation.riskPerTradeMax)}</div><div className="muted small">Planned risk at the stop, as a fraction of entry equity. Costs and execution can change the realized loss.</div></div>
+              <div className="card"><div className="card-label">FULL-RISK CONFIDENCE</div><div className="card-value" style={{ fontSize: 18 }}>{rep.recordedEvaluation.highQualityConfidence.toLocaleString(undefined, { maximumFractionDigits: 3 })}</div><div className="muted small">Signal-strength score on a 0–1 scale, not a win probability.</div></div>
+            </div>
+            <p className="muted small">
+              Confidence measures the weighted signal's distance beyond its entry threshold, divided by the long/short threshold gap and clamped to 0–1.
+              Risk scales from the recorded minimum to maximum as confidence / full-risk confidence reaches 1.
+              This does not estimate the probability of a profitable trade.
+            </p>
+            <p className="muted small mono">Saved policy: {rep.recordedEvaluation.policyIdentityHash}</p>
+          </> : <p className="muted">Unavailable: this saved policy does not record starting capital, currency, risk band or signal-confidence settings.</p>}
+          {rep.recordedEvaluation?.growthGoal ? <p className="muted small">
+            Reference growth goal: {rep.recordedEvaluation.growthGoal.referenceStartBalance.toLocaleString()} → {rep.recordedEvaluation.growthGoal.targetBalance.toLocaleString()} reference units in {rep.recordedEvaluation.growthGoal.horizonDays.toLocaleString()} days.
+            This capital ratio guides the realized-balance pace score; it does not change the simulated starting capital.
+            It is not a probability or evidence that the target was reached.
+          </p> : <p className="muted small">Growth target and horizon: unavailable in the saved evaluation policy.</p>}
+          <p className="muted small">Diagnostic return base: {rep.diagnosticInitialCapital.toLocaleString(undefined, { maximumFractionDigits: 2 })} account units from the selected journal; the chart below is rescaled to 1,000 units.</p>
+
           <div className="cards">
-            <div className="card"><div className="card-label">CAGR</div><div className="card-value">{Math.abs(rep.cagrPct) > 1000 ? "🚩 bug" : `${rep.cagrPct.toFixed(1)}%`}</div></div>
-            <div className="card accent"><div className="card-label">€1000 →</div><div className="card-value" style={{ fontSize: 18 }}>{Math.abs(rep.cagrPct) > 1000 ? "—" : eur(rep.finalFrom1000)}</div></div>
+            <div className="card"><div className="card-label">DIAGNOSTIC CAGR</div><div className="card-value">{rep.cagrPct == null ? "—" : Math.abs(rep.cagrPct) > 1000 ? "🚩 extreme" : `${rep.cagrPct.toFixed(1)}%`}</div></div>
+            <div className="card accent"><div className="card-label">1,000 UNITS →</div><div className="card-value" style={{ fontSize: 18 }}>{normalizedUnits(rep.finalFrom1000)}</div></div>
             <div className="card"><div className="card-label">MAX DD</div><div className="card-value">{rep.maxDdPct.toFixed(1)}%</div></div>
             <div className="card"><div className="card-label">WIN RATE</div><div className="card-value">{rep.winRate != null ? `${(rep.winRate * 100).toFixed(1)}%` : "—"}</div></div>
           </div>
 
-          {Math.abs(rep.cagrPct) <= 1000 && rep.yearly.length > 0 && (
+          {rep.yearly.length > 0 && (
             <>
-              <h2>Year-end balance (from €1000)</h2>
+              <h2>Year-end balance (from 1,000 normalized units)</h2>
               <div className="ticker" style={{ flexWrap: "wrap" }}>
-                {rep.yearly.map((y) => <span className="tick" key={y.month}>{y.month}: <b>{eur(y.balance)}</b></span>)}
+                {rep.yearly.map((y) => <span className="tick" key={y.month}>{y.month}: <b>{normalizedUnits(y.balance)}</b></span>)}
               </div>
               <h2>Monthly journal</h2>
               <table className="tbl">
@@ -255,7 +268,7 @@ export default function StrategyReport() {
                     <tr key={m.month}>
                       <td>{m.month}</td>
                       <td className={m.returnPct >= 0 ? "buy" : "sell"}>{m.returnPct >= 0 ? "+" : ""}{m.returnPct.toFixed(1)}</td>
-                      <td className="mono">{eur(m.balance)}</td>
+                      <td className="mono">{normalizedUnits(m.balance)}</td>
                       <td>{m.trades}</td>
                     </tr>
                   ))}

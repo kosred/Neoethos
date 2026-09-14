@@ -95,6 +95,11 @@ fn success_receipt_is_derived_from_the_returned_publication_manifest() {
 
 #[test]
 fn lean_crate_has_no_model_search_app_or_tauri_dependency() {
+    let active_manifest = MANIFEST
+        .lines()
+        .map(|line| line.split_once('#').map_or(line, |(active, _)| active))
+        .collect::<Vec<_>>()
+        .join("\n");
     for forbidden in [
         "neoethos-app",
         "neoethos-models",
@@ -102,7 +107,7 @@ fn lean_crate_has_no_model_search_app_or_tauri_dependency() {
         "tauri",
     ] {
         assert!(
-            !MANIFEST.contains(forbidden),
+            !active_manifest.contains(forbidden),
             "historical broker crate depends on forbidden graph edge {forbidden}"
         );
     }

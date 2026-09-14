@@ -247,6 +247,103 @@ fn long_uses_an_ask_entry_reference_and_a_bid_exit_reference() {
 }
 
 #[test]
+fn indexed_exit_preserves_source_order_latency_and_inclusive_deadline() {
+    for (exit_latency, exit_wait, expected) in [
+        (0, 3, Some((DECISION_AT_MS + 2, 1.0110))),
+        (1, 3, Some((DECISION_AT_MS + 3, 1.0150))),
+        (2, 3, Some((DECISION_AT_MS + 5, 1.0200))),
+        (2, 2, None),
+    ] {
+        let replay_policy = QuoteValidatedResearchReplayPolicyV1::new(
+            2_000,
+            1_000,
+            exit_wait,
+            VersionedLatencySlippagePolicyV1::new(
+                "indexed-exit-fixture",
+                1,
+                exit_latency,
+                SLIPPAGE_PIPS_PER_FILL,
+                PIP_SIZE,
+            )
+            .expect("explicit latency assumptions"),
+            None,
+        )
+        .expect("bounded replay timing policy");
+        let quotes = evidence(
+            vec![
+                quote(DECISION_AT_MS - 100, 0.9998, 0),
+                quote(DECISION_AT_MS + 2, 1.0090, 1),
+                quote(DECISION_AT_MS + 2, 1.0110, 2),
+                quote(DECISION_AT_MS + 2, 0.9800, 3),
+                quote(DECISION_AT_MS + 3, 1.0150, 4),
+                quote(DECISION_AT_MS + 5, 1.0200, 5),
+            ],
+            vec![quote(DECISION_AT_MS + 1, 1.0000, 0)],
+        );
+        let replay = replay_quote_validated_research_v1(
+            &plan_with_policy(
+                decision(ResearchPositionDirectionV1::Long, 0.99, 1.01),
+                replay_policy,
+            ),
+            quotes,
+        );
+        if let Some((timestamp, price)) = expected {
+            let ledger = replay.expect("first eligible source-ordered quote within the deadline");
+            let position = &ledger.positions()[0];
+            let reference = position.exit_reference().expect("modeled exit reference");
+            assert_eq!(reference.timestamp_unix_ms(), timestamp);
+            assert_eq!(reference.price(), price);
+            assert_eq!(
+                position.exit_reason(),
+                Some(QuoteValidatedResearchExitReasonV1::Target)
+            );
+        } else {
+            assert_eq!(
+                replay
+                    .expect_err("no quote after latency but inside deadline")
+                    .code(),
+                QuoteValidatedResearchReplayErrorCodeV1::ExitReferenceUnavailable
+            );
+        }
+    }
+}
+
+#[test]
+fn indexed_entry_accepts_exact_latency_wait_and_staleness_boundaries() {
+    let replay_policy = QuoteValidatedResearchReplayPolicyV1::new(
+        2_000,
+        1_000,
+        2_000,
+        VersionedLatencySlippagePolicyV1::new("indexed-entry-boundary", 2_000, 0, 0.0, PIP_SIZE)
+            .expect("explicit entry latency"),
+        None,
+    )
+    .expect("latency exactly equals the allowed entry wait");
+    let quotes = evidence(
+        vec![quote(DECISION_AT_MS + 1_000, 0.9998, 0)],
+        vec![
+            quote(DECISION_AT_MS + 1_999, 1.0000, 0),
+            quote(DECISION_AT_MS + 2_000, 1.0001, 1),
+            quote(DECISION_AT_MS + 2_001, 1.0002, 2),
+        ],
+    );
+    let ledger = replay_quote_validated_research_v1(
+        &plan_with_policy(
+            decision(ResearchPositionDirectionV1::Long, 0.99, 1.01),
+            replay_policy,
+        ),
+        quotes,
+    )
+    .expect("inclusive entry and opposite-side age boundaries are retained");
+    assert!(ledger.entry_unavailable().is_empty());
+    assert_eq!(
+        ledger.positions()[0].entry_reference().timestamp_unix_ms(),
+        DECISION_AT_MS + 2_000
+    );
+    assert_eq!(ledger.positions()[0].modeled_entry_price(), 1.0001);
+}
+
+#[test]
 fn short_uses_a_bid_entry_reference_and_an_ask_exit_reference() {
     let quotes = evidence(
         vec![quote(DECISION_AT_MS + 1, 1.0000, 0)],

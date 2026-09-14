@@ -1,4 +1,8 @@
 // Persistent native-CUDA Prototype B population engine.
+#include "resident_backend_identity_v3.cuh"
+#if defined(__HIP_PLATFORM_AMD__)
+#include "resident_search_hip_v1_abi.cuh"
+#endif
 //
 // One session owns one non-default stream, one logical dataset upload and every
 // device workspace. `evaluate` runs the complete canonical chain on that
@@ -24,8 +28,10 @@
 
 #include "neoethos_gpu_cuda.h"
 #include "resident_exact_log_v3.cuh"
+#include "resident_host_staging_v1.hpp"
 #include "resident_generation_v1_abi.cuh"
 #include "resident_generation_v2_abi.cuh"
+#include "resident_generation_v2_internal.cuh"
 #include "resident_search_generation_v2_abi.cuh"
 #include "resident_archive_knn_v2_abi.cuh"
 #include "resident_scoring_novelty_v2_internal.cuh"
@@ -34,8 +40,11 @@
 #include <cuda.h>
 
 #include <climits>
+#include <cstdio>
 #include <cstring>
 #include <new>
+
+namespace backend_identity_v3 = ::neoethos::resident_backend_identity_v3;
 
 namespace {
 
@@ -257,10 +266,6 @@ __device__ inline double guarded_pip(double pip_value) {
   return (fabs(pip_value) < 1.0e-12) ? 1.0e-12 : pip_value;
 }
 
-__device__ inline double sanitize(double value) {
-  return isfinite(value) ? value : 0.0;
-}
-
 __device__ inline double invalid_monthly_return_sharpe_v1() {
   return -__longlong_as_double(static_cast<long long>(0x7ff0000000000000ULL));
 }
@@ -422,8 +427,10 @@ __device__ inline bool resident_gene_view_is_valid_v2(const DeviceGenes& genes,
     }
   }
   const auto& scalar = seal->scalar_store[seal->current_store_index][candidate];
+  // Survivors retain their birth generation. The authenticated evaluation
+  // store/epoch above is current; ancestry may be older, never from the future.
   if (scalar.term_count == 0u || scalar.term_count > seal->max_terms_per_gene ||
-      scalar.generation != static_cast<unsigned int>(seal->generation_index) ||
+      scalar.generation > seal->generation_index ||
       (scalar.smc_flags >> seal->smc_flag_count) != 0u ||
       !isfinite(scalar.long_threshold) || !isfinite(scalar.short_threshold) ||
       !isfinite(scalar.target_pips) || !isfinite(scalar.stop_pips) ||
@@ -477,6 +484,18 @@ struct DeviceScenarios {
   const long long* commission_micros;
   int count;
 };
+
+// Only the two ordinal fields vary in the sealed canonical base work list.
+// All other descriptors are uploaded once into the retained C-slot workspace.
+__global__ void resident_base_scenario_ids_kernel_v3(
+    unsigned long long* base_ids, unsigned long long* scenario_ids,
+    std::uint64_t logical_offset, std::uint64_t active_count) {
+  const std::uint64_t local = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (local < active_count) {
+    base_ids[local] = logical_offset + local;
+    scenario_ids[local] = logical_offset + local;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Stage 0: one-off layout change, feature-major -> bar-major
@@ -770,46 +789,57 @@ __device__ inline signed char synthesize_signal(const DeviceDataset& dataset,
 // Stage 2: entry levels
 // ---------------------------------------------------------------------------
 
-__device__ inline void entry_stop_target_pips(const DeviceDataset& dataset,
+__device__ inline bool entry_stop_target_pips(const DeviceDataset& dataset,
                                               const NeoPopulationSettings& settings,
                                               const SignalPlan& plan,
                                               int signal_bar,
                                               double* stop_pips,
                                               double* target_pips) {
+  // The same perturbed pair is used on both fixed and adaptive paths. For an
+  // adaptive gene its absolute pips are replaced, but their dimensionless
+  // target/stop ratio remains an active, scenario-perturbed gene parameter.
+  double gene_stop = plan.stop_pips;
+  double gene_target = plan.target_pips;
+  if (plan.perturbed != 0) {
+    const unsigned long long terms =
+        static_cast<unsigned long long>(plan.term_end - plan.term_start);
+    if (isfinite(gene_stop) && gene_stop > 0.0) {
+      gene_stop *=
+          perturb_factor(plan.rng_counter, kDrawWeightBase + terms, kMcStopAmplitude);
+    }
+    if (isfinite(gene_target) && gene_target > 0.0) {
+      gene_target *= perturb_factor(plan.rng_counter, kDrawWeightBase + terms + 1ull,
+                                    kMcStopAmplitude);
+    }
+  }
+
   const double multiplier = plan.stop_vol_multiplier;
-  if (multiplier > 0.0 && dataset.has_adaptive_base != 0 && signal_bar < dataset.bars) {
+  if (multiplier > 0.0 && dataset.has_adaptive_base != 0) {
+    if (dataset.adaptive_base_pips == nullptr || signal_bar < 0 || signal_bar >= dataset.bars) {
+      return false;
+    }
     const double distance = dataset.adaptive_base_pips[signal_bar];
     const double stop = multiplier * distance;
-    const double target = settings.adaptive_rr * stop;
+    double reward_risk = settings.adaptive_rr;
+    if (isfinite(gene_stop) && gene_stop > 0.0 && isfinite(gene_target) && gene_target > 0.0) {
+      const double gene_reward_risk = gene_target / gene_stop;
+      if (isfinite(gene_reward_risk) && gene_reward_risk > 0.0) {
+        reward_risk = gene_reward_risk;
+      }
+    }
+    const double target = reward_risk * stop;
     if (isfinite(stop) && stop > 0.0 && isfinite(target) && target > 0.0) {
       *stop_pips = stop;
       *target_pips = target;
-      return;
+      return true;
     }
+    // An enabled but unavailable adaptive bracket forbids entry. It does not
+    // authorize substituting the gene's fixed bracket (CPU resolve_entry_stop_target_pips).
+    return false;
   }
-  double stop = plan.stop_pips;
-  double target = plan.target_pips;
-  if (plan.perturbed != 0) {
-    // The draws come AFTER the weights, so their indices depend on this gene's
-    // term count — which is why the plan carries the CSR window rather than the
-    // caller passing a constant. The finite-and-positive guards mirror the host
-    // screen's exactly: a gene with no fixed stop must not acquire one by being
-    // multiplied, and NaN * factor is a stop the walk would then act on.
-    //
-    // Note the adaptive branch above returns first. That is correct and matches
-    // the host: when volatility-scaled stops are active the gene's fixed pips
-    // are not used at all, so perturbing them changes nothing on either lane.
-    const unsigned long long terms =
-        static_cast<unsigned long long>(plan.term_end - plan.term_start);
-    if (isfinite(stop) && stop > 0.0) {
-      stop *= perturb_factor(plan.rng_counter, kDrawWeightBase + terms, kMcStopAmplitude);
-    }
-    if (isfinite(target) && target > 0.0) {
-      target *= perturb_factor(plan.rng_counter, kDrawWeightBase + terms + 1ull, kMcStopAmplitude);
-    }
-  }
-  *stop_pips = stop;
-  *target_pips = target;
+  *stop_pips = gene_stop;
+  *target_pips = gene_target;
+  return true;
 }
 
 // The event-stream kernels are GONE: population_count_events_kernel,
@@ -832,14 +862,28 @@ constexpr int kResidentAdaptiveTailWindowV1 = 100;
 constexpr int kResidentAdaptiveTailQuantileIndexV1 = 2;
 constexpr double kAdaptiveBaseDegenerateSentinelV1 = -1.0;
 
-struct alignas(8) ResidentAdaptiveControlV1 {
-  double median;
-  std::int32_t status;
-  std::uint32_t reserved;
+enum class ResidentAdaptiveCellClassV1 {
+  Available,
+  Unavailable,
+  ArithmeticFault,
 };
 
-static_assert(sizeof(ResidentAdaptiveControlV1) == 16,
-              "resident adaptive control must fit the pre-gap lifetime");
+__device__ inline double resident_adaptive_unavailable_v1() {
+  return __longlong_as_double(static_cast<long long>(0x7ff8000000000000ULL));
+}
+
+// Only this producer's explicit causal-unavailability marker is exempt from
+// the normalized arithmetic check. No host-supplied base uses this exemption.
+__device__ inline ResidentAdaptiveCellClassV1 classify_resident_adaptive_cell_v1(
+    double value) {
+  if (static_cast<unsigned long long>(__double_as_longlong(value)) ==
+      0x7ff8000000000000ULL) {
+    return ResidentAdaptiveCellClassV1::Unavailable;
+  }
+  return isfinite(value) && value > 0.0
+             ? ResidentAdaptiveCellClassV1::Available
+             : ResidentAdaptiveCellClassV1::ArithmeticFault;
+}
 
 __device__ inline double resident_adaptive_safe_log_v1(double value) {
   double output = 0.0;
@@ -936,14 +980,14 @@ __device__ inline double resident_adaptive_tail_es_v1(const DeviceDataset& datas
 __global__ void resident_adaptive_distance_kernel_v1(
     DeviceDataset dataset,
     NeoResidentAdaptiveBaseRequestV1 request,
-    const ResidentAdaptiveControlV1* control,
-    bool finalize,
     double* output) {
   const double scale = sqrt(static_cast<double>(request.vol_horizon_bars));
   for (int bar = blockIdx.x * blockDim.x + threadIdx.x; bar < dataset.bars;
        bar += blockDim.x * gridDim.x) {
-    if (finalize && control->status != NEO_POPULATION_STATUS_OK) {
-      output[bar] = kAdaptiveBaseDegenerateSentinelV1;
+    // CPU compute_stop_distance_series requires both enabled components to be
+    // available. Warm-up is not a zero-risk observation or a future median.
+    if (bar < kResidentAdaptiveTailWindowV1) {
+      output[bar] = resident_adaptive_unavailable_v1();
       continue;
     }
     const double sigma = output[bar];
@@ -953,102 +997,45 @@ __global__ void resident_adaptive_distance_kernel_v1(
         resident_adaptive_tail_es_v1(dataset, bar, request.tail_step);
     const double vol_distance = close * sigma * scale;
     const double tail_distance = close * expected_shortfall * scale;
+    if (!isfinite(close) || close <= 0.0 || !isfinite(vol_distance) ||
+        vol_distance < 0.0 || !isfinite(tail_distance) || tail_distance < 0.0) {
+      output[bar] = resident_adaptive_unavailable_v1();
+      continue;
+    }
     double distance = fmax(request.stop_k_vol * vol_distance,
                            request.stop_k_tail * tail_distance);
     distance = fmax(distance, request.meta_label_min_dist);
-    if (finalize) {
-      if (!isfinite(distance)) {
-        distance = control->median;
-      }
-      output[bar] = fmax(distance / request.pip_size, 1.0e-9);
-    } else {
-      output[bar] = distance;
-    }
+    // Ready values preserve the CPU operation order and are never clamped.
+    // A positive finite distance that overflows/underflows during division is
+    // left visible to the final validator, not relabelled as unavailable.
+    output[bar] = isfinite(distance) && distance > 0.0
+                      ? distance / request.pip_size
+                      : resident_adaptive_unavailable_v1();
   }
 }
 
-// The host view contract rejects every non-finite adaptive base. A finite
-// distance divided by a positive but subnormal pip size can still overflow,
-// so validate the normalized result as a separate same-stream phase. The
-// sentinel is consumed by population_reduce_kernel before stop selection;
-// invalid adaptive values therefore cannot fall through to fixed stops.
+// Keep the existing explicit native normalized-arithmetic refusal: unlike the
+// CPU evaluator, which omits an overflowing bracket per row, CUDA rejects the
+// whole view. Expected causal NaNs are different: they only forbid entries at
+// those rows. An entirely unavailable series remains a degenerate failure.
+// The sentinel is consumed before any scenario can fall back to fixed stops.
 __global__ void resident_adaptive_validate_normalized_kernel_v1(double* output,
                                                                  int rows) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
+  bool any_available = false;
   for (int row = 0; row < rows; ++row) {
-    if (!isfinite(output[row])) {
+    const auto cell = classify_resident_adaptive_cell_v1(output[row]);
+    if (cell == ResidentAdaptiveCellClassV1::ArithmeticFault) {
       output[0] = kAdaptiveBaseDegenerateSentinelV1;
       return;
     }
+    any_available |= cell == ResidentAdaptiveCellClassV1::Available;
   }
-}
-
-__device__ double resident_adaptive_select_v1(double* values, int count, int kth) {
-  int left = 0;
-  int right = count - 1;
-  while (left < right) {
-    const double pivot = values[left + (right - left) / 2];
-    int low = left;
-    int high = right;
-    while (low <= high) {
-      while (low <= right && values[low] < pivot) {
-        low += 1;
-      }
-      while (high >= left && values[high] > pivot) {
-        high -= 1;
-      }
-      if (low <= high) {
-        const double temporary = values[low];
-        values[low] = values[high];
-        values[high] = temporary;
-        low += 1;
-        high -= 1;
-      }
-    }
-    if (kth <= high) {
-      right = high;
-    } else if (kth >= low) {
-      left = low;
-    } else {
-      return values[kth];
-    }
+  if (!any_available) {
+    output[0] = kAdaptiveBaseDegenerateSentinelV1;
   }
-  return values[kth];
-}
-
-__global__ void resident_adaptive_median_kernel_v1(double* values,
-                                                    int rows,
-                                                    ResidentAdaptiveControlV1* control) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  int finite_count = 0;
-  for (int row = 0; row < rows; ++row) {
-    if (isfinite(values[row])) {
-      values[finite_count] = values[row];
-      finite_count += 1;
-    }
-  }
-  if (finite_count == 0) {
-    control->median = __longlong_as_double(static_cast<long long>(0x7ff8000000000000ULL));
-    control->status = NEO_POPULATION_STATUS_ADAPTIVE_BASE_DEGENERATE;
-    control->reserved = 0u;
-    return;
-  }
-  const int middle = finite_count / 2;
-  const double upper = resident_adaptive_select_v1(values, finite_count, middle);
-  const double median = finite_count % 2 == 0
-                            ? (resident_adaptive_select_v1(values, finite_count, middle - 1) +
-                               upper) /
-                                  2.0
-                            : upper;
-  control->median = median;
-  control->status = isfinite(median) && median > 0.0
-                        ? NEO_POPULATION_STATUS_OK
-                        : NEO_POPULATION_STATUS_ADAPTIVE_BASE_DEGENERATE;
-  control->reserved = 0u;
 }
 
 __device__ inline bool adaptive_base_failed_v1(const DeviceDataset& dataset) {
@@ -1129,7 +1116,10 @@ __device__ inline void update_realized_risk(double equity,
 __device__ inline double risk_based_position_lots(double confidence,
                                                   double equity,
                                                   double stop_pips,
-                                                  const NeoPopulationSettings& settings) {
+                                                  const NeoPopulationSettings& settings,
+                                                  bool* arithmetic_fault) {
+  *arithmetic_fault = *arithmetic_fault || !isfinite(confidence) || !isfinite(equity) ||
+                      !isfinite(stop_pips);
   confidence = fmin(fmax(confidence, 0.0), 1.0);
   double confidence_scale = 1.0;
   if (isfinite(settings.high_quality_confidence) && settings.high_quality_confidence > 0.0) {
@@ -1138,12 +1128,17 @@ __device__ inline double risk_based_position_lots(double confidence,
   const double risk =
       settings.risk_per_trade_min +
       (settings.risk_per_trade_max - settings.risk_per_trade_min) * confidence_scale;
-  const double denominator = fmax(stop_pips, 1.0) * settings.pip_value_per_lot;
+  // Size against the actual entry stop, including legitimate sub-pip stops.
+  const double denominator = stop_pips * settings.pip_value_per_lot;
+  *arithmetic_fault = *arithmetic_fault || !isfinite(risk) || !isfinite(denominator);
   double lots = 0.0;
-  if (equity > 0.0 && fabs(denominator) > 1.0e-12 && isfinite(denominator)) {
+  if (isfinite(equity) && equity > 0.0 && isfinite(stop_pips) && stop_pips > 0.0 &&
+      isfinite(settings.pip_value_per_lot) && settings.pip_value_per_lot > 0.0 &&
+      isfinite(denominator) && denominator > 0.0) {
     lots = risk * equity / denominator;
   }
   if (!isfinite(lots)) {
+    *arithmetic_fault = true;
     return 0.0;
   }
   return fmin(fmax(lots, 0.0), 100.0);
@@ -1321,6 +1316,10 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   double* monthly = monthly_pnls + static_cast<long long>(scenario) * month_capacity;
   double* month_start = month_start_equities + static_cast<long long>(scenario) * month_capacity;
   const double initial_equity = settings.initial_equity;
+  // A finite loss may make equity nonpositive; that is not an arithmetic
+  // failure. Retain failures separately so the economic marker cannot hide NaN
+  // or overflow in an earlier part of the chronological walk.
+  bool arithmetic_fault = !isfinite(initial_equity) || initial_equity <= 0.0;
   for (int index = 0; index < month_capacity; ++index) {
     monthly[index] = 0.0;
     month_start[index] = initial_equity;
@@ -1465,6 +1464,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                                                       position_event.direction, entry_timestamp,
                                                       exit_timestamp, settings);
         equity += pnl;
+        arithmetic_fault = arithmetic_fault || !isfinite(pnl) || !isfinite(equity);
         // The per-trade record is completed here because this is the only place
         // that knows position size, carry and the conversion fee. R-multiple
         // mirrors eval.rs exactly — realised P&L over the entry stop distance,
@@ -1486,6 +1486,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
               pnl / fmax(position_stop_pips * settings.pip_value_per_lot, 1.0e-9);
         }
         current_month_pnl += pnl;
+        arithmetic_fault = arithmetic_fault || !isfinite(current_month_pnl);
         trade_count += 1;
         if (pnl > 0.0) {
           wins += 1;
@@ -1510,6 +1511,8 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
         }
         worst *= position_lots;
         best *= position_lots;
+        arithmetic_fault = arithmetic_fault || !isfinite(worst) || !isfinite(best) ||
+                           !isfinite(equity + worst) || !isfinite(equity + best);
 
         if (equity + best > peak_equity) {
           peak_equity = equity + best;
@@ -1616,6 +1619,8 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                                            entry_timestamp, exit_timestamp, settings);
             equity += pnl;
             current_month_pnl += pnl;
+            arithmetic_fault = arithmetic_fault || !isfinite(pnl) || !isfinite(equity) ||
+                               !isfinite(current_month_pnl);
             trade_count += 1;
             if (pnl > 0.0) {
               wins += 1;
@@ -1690,8 +1695,10 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       }
       double entry_stop_pips = 0.0;
       double entry_target_pips = 0.0;
-      entry_stop_target_pips(dataset, settings, signal_plan, signal_bar,
-                             &entry_stop_pips, &entry_target_pips);
+      if (!entry_stop_target_pips(dataset, settings, signal_plan, signal_bar,
+                                  &entry_stop_pips, &entry_target_pips)) {
+        continue;
+      }
       NeoPopulationEvent event;
       event.candidate_id = static_cast<unsigned long long>(candidate);
       event.scenario_id = scenario_id;
@@ -1709,7 +1716,11 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       const double stop_pips = entry_stop_pips;
       double lots = 1.0;
       if ((settings.flags & kFlagRiskBasedSizing) != 0u) {
-        lots = risk_based_position_lots(signal_confidence_here, equity, stop_pips, settings);
+        lots = risk_based_position_lots(signal_confidence_here, equity, stop_pips, settings,
+                                        &arithmetic_fault);
+      }
+      if (!isfinite(lots) || lots <= 0.0) {
+        continue;
       }
       position_event = event;
       position_entry_price = entry_price;
@@ -1800,11 +1811,13 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
     }
   }
   if (!isfinite(monthly_mean) || !isfinite(monthly_std)) {
+    arithmetic_fault = true;
     monthly_mean = 0.0;
     monthly_std = 0.0;
   }
 
   bool monthly_return_inputs_valid = true;
+  bool nonpositive_month_equity = false;
   double monthly_return_mean = 0.0;
   double monthly_return_std = 0.0;
   if (limit >= 0) {
@@ -1812,15 +1825,21 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
     double monthly_return_sum = 0.0;
     for (long long index = 0; index <= limit; ++index) {
       const double start_equity = month_start[index];
-      if (!isfinite(monthly[index]) || !isfinite(start_equity) || start_equity <= 0.0) {
+      if (!isfinite(monthly[index]) || !isfinite(start_equity)) {
+        arithmetic_fault = true;
+        monthly_return_inputs_valid = false;
+      } else if (start_equity <= 0.0) {
+        nonpositive_month_equity = true;
         monthly_return_inputs_valid = false;
       } else {
         const double period_return = monthly[index] / start_equity;
         if (!isfinite(period_return)) {
+          arithmetic_fault = true;
           monthly_return_inputs_valid = false;
         } else {
           monthly_return_sum += period_return;
           if (!isfinite(monthly_return_sum)) {
+            arithmetic_fault = true;
             monthly_return_inputs_valid = false;
           }
         }
@@ -1829,6 +1848,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
     if (monthly_return_inputs_valid && count >= 2) {
       monthly_return_mean = monthly_return_sum / static_cast<double>(count);
       if (!isfinite(monthly_return_mean)) {
+        arithmetic_fault = true;
         monthly_return_inputs_valid = false;
       }
     }
@@ -1840,10 +1860,12 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
         const double delta = period_return - monthly_return_mean;
         const double squared_delta = delta * delta;
         if (!isfinite(squared_delta)) {
+          arithmetic_fault = true;
           monthly_return_inputs_valid = false;
         } else {
           monthly_return_variance += squared_delta;
           if (!isfinite(monthly_return_variance)) {
+            arithmetic_fault = true;
             monthly_return_inputs_valid = false;
           }
         }
@@ -1852,6 +1874,7 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
         monthly_return_std =
             sqrt(fmax(monthly_return_variance / static_cast<double>(count - 1), 0.0));
         if (!isfinite(monthly_return_std)) {
+          arithmetic_fault = true;
           monthly_return_inputs_valid = false;
         }
       }
@@ -1864,11 +1887,18 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                               : 0.0)
                        : invalid_monthly_return_sharpe_v1();
   if (!isfinite(sharpe) && sharpe != invalid_monthly_return_sharpe_v1()) {
-    sharpe = invalid_monthly_return_sharpe_v1();
+    arithmetic_fault = true;
+  }
+  // A calculated -infinity is also arithmetic failure, unless the validated
+  // completed-month inputs identified finite nonpositive equity explicitly.
+  if (!isfinite(sharpe) && !nonpositive_month_equity) {
+    arithmetic_fault = true;
   }
   double consistency = 0.0;
   if (monthly_std > 0.0) {
-    consistency = fmin(fmax(monthly_mean / monthly_std, 0.0), 1.0);
+    const double raw_consistency = monthly_mean / monthly_std;
+    arithmetic_fault = arithmetic_fault || !isfinite(raw_consistency);
+    consistency = fmin(fmax(raw_consistency, 0.0), 1.0);
   } else if (monthly_mean > 0.0 && limit < 1) {
     consistency = 1.0;
   }
@@ -1902,17 +1932,28 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
                 .gene_identity
           : genes.candidate_ids[candidate];
   row.scenario_id = scenario_id;
-  row.values[0] = sanitize(net_profit);
+  row.values[0] = net_profit;
   row.values[1] = sharpe;
-  row.values[2] = sanitize(peak_equity);
-  row.values[3] = sanitize(max_drawdown);
-  row.values[4] = sanitize(win_rate);
-  row.values[5] = sanitize(profit_factor);
-  row.values[6] = sanitize(expectancy);
-  row.values[7] = sanitize(monthly_target_hit_rate);
+  row.values[2] = peak_equity;
+  row.values[3] = max_drawdown;
+  row.values[4] = win_rate;
+  row.values[5] = profit_factor;
+  row.values[6] = expectancy;
+  row.values[7] = monthly_target_hit_rate;
   row.values[8] = static_cast<double>(trade_count);
-  row.values[9] = sanitize(consistency);
-  row.values[10] = sanitize(max_daily_drawdown);
+  row.values[9] = consistency;
+  row.values[10] = max_daily_drawdown;
+  arithmetic_fault = arithmetic_fault || !isfinite(gross_profit) || !isfinite(gross_loss);
+  for (int metric = 0; metric < 11; ++metric) {
+    if (metric != 1 && !isfinite(row.values[metric])) {
+      arithmetic_fault = true;
+    }
+  }
+  if (arithmetic_fault) {
+    // Preserve the raw failing slots and make failure dominant over any
+    // otherwise legitimate economic -infinity marker. Never sanitize to zero.
+    row.values[1] = __longlong_as_double(0x7ff8000000000000ull);
+  }
   rows[scenario] = row;
 
   if (accepted_trade_total != nullptr) {
@@ -1942,19 +1983,14 @@ std::int32_t device_alloc(T** pointer, std::size_t count) {
 }
 
 template <typename T>
-void device_free(T*& pointer) {
-  if (pointer != nullptr) {
-    cudaFree(pointer);
-    pointer = nullptr;
-  }
-}
-
-template <typename T>
 bool device_free_checked(T*& pointer) {
   if (pointer == nullptr) {
     return true;
   }
-  if (cudaFree(pointer) != cudaSuccess) {
+  const auto status = cudaFree(pointer);
+  if (status != cudaSuccess) {
+    std::fprintf(stderr, "population device free failed (%d); allocation retained\n",
+                 static_cast<int>(status));
     return false;
   }
   pointer = nullptr;
@@ -2006,6 +2042,14 @@ struct NeoCudaPopulationSession {
   bool resident_search_runtime_reserved_v2 = false;
   neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2
       resident_search_runtime_facts_v2{};
+#if defined(__HIP_PLATFORM_AMD__)
+  std::uint64_t hip_lease_id_v1 = 0;
+  std::uint64_t hip_parent_borrower_v1 = 0;
+  std::uint64_t hip_search_borrower_v1 = 0;
+  NeoHipRuntimeFactsV1 hip_parent_identity_v1{};
+  neoethos::resident_search_hip_v1::NeoResidentSearchHipRuntimeFactsV1
+      resident_search_hip_runtime_v1{};
+#endif
   bool resident_search_slice2_binding_sealed_v3 = false;
   neoethos::resident_archive_knn_v2::NeoResidentArchiveKnnBindV2
       resident_search_slice2_binding_v3{};
@@ -2017,6 +2061,11 @@ struct NeoCudaPopulationSession {
   int timestamp_mode = static_cast<int>(NEO_POPULATION_TIMESTAMP_CANONICAL);
   int population = 0;
   int resident_planned_population_v2 = 0;
+  int resident_retained_evaluation_capacity_v3 = 0;
+  bool resident_canonical_base_scenarios_v3 = false;
+  int resident_canonical_base_rows_v3 = 0;
+  neoethos::resident_generation_v2::NeoResidentGenerationGeneViewV2
+      resident_metrics_view_v3{};
   /// Threads the walk launches, and the extent of every workspace array.
   ///
   /// This used to be implicitly equal to `population` — one scenario per gene,
@@ -2037,8 +2086,9 @@ struct NeoCudaPopulationSession {
   // only `metric_rows == nullptr` and `month_capacity`, so a session built for
   // a small workload and reused for a large one wrote past the end of it —
   // into `monthly_pnls` and `month_start_equities`, which are the arrays
-  // sharpe and consistency are computed from, and `sanitize()` then turns any
-  // non-finite consequence into 0.0.
+  // sharpe and consistency are computed from. The former non-finite-to-zero
+  // sanitization hid that corruption; current reductions preserve explicit
+  // arithmetic faults separately from authenticated economic rejections.
   int workspace_scenarios = 0;
   int workspace_bars = 0;
   PopulationWorkspaceModeV1 workspace_mode = PopulationWorkspaceModeV1::Uninitialized;
@@ -2148,37 +2198,20 @@ struct NeoCudaPopulationSession {
   NeoPopulationMetricRow* metric_rows = nullptr;
   unsigned long long* accepted_trade_total = nullptr;
 
-  void release_scenarios() {
-    device_free(scenario_base_candidate_ids);
-    device_free(scenario_ids);
-    device_free(scenario_rng_counters);
-    device_free(scenario_window_offsets);
-    device_free(scenario_window_lens);
-    device_free(scenario_types);
-    device_free(scenario_spread_ticks);
-    device_free(scenario_slippage_ticks);
-    device_free(scenario_commission_micros);
+  bool release_scenarios() {
+    if (!release_scenarios_checked_v2()) {
+      strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      return false;
+    }
+    return true;
   }
 
-  void release_workspace() {
-    device_free(outcomes);
-    device_free(monthly_pnls);
-    device_free(month_start_equities);
-    device_free(metric_rows);
-    device_free(accepted_trade_total);
-    // The EXTENTS die with the memory they describe.
-    //
-    // Leaving them set is safe today only because `metric_rows == nullptr` is
-    // the FIRST term of the re-allocation predicate, so the stale numbers are
-    // never consulted. Reorder that predicate — or free `metric_rows` from any
-    // other place — and a session claims a workspace it does not own, which is
-    // an out-of-bounds write into freed device memory rather than an error.
-    workspace_scenarios = 0;
-    workspace_bars = 0;
-    month_capacity = 0;
-    // Deliberately retain `workspace_mode`. A run-owned session may grow or be
-    // destroyed, but it may never relabel compatibility allocations as strict
-    // resident authority (or vice versa).
+  bool release_workspace() {
+    if (!release_workspace_checked_v2()) {
+      strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      return false;
+    }
+    return true;
   }
 
   bool release_scenarios_checked_v2() {
@@ -2203,6 +2236,8 @@ struct NeoCudaPopulationSession {
     workspace_scenarios = 0;
     workspace_bars = 0;
     month_capacity = 0;
+    // Extents die only with acknowledged frees. Preserve workspace_mode so a
+    // strict owner cannot relabel compatibility allocations after replacement.
     return true;
   }
 
@@ -2277,73 +2312,32 @@ struct NeoCudaPopulationSession {
         return false;
       }
     }
+#if defined(__HIP_PLATFORM_AMD__)
+    NeoHipRuntimeErrorV1 hip_error{};
+    if (hip_search_borrower_v1 != 0) {
+      if (neoethos_hip_runtime_borrow_release_v1(
+              hip_lease_id_v1, hip_search_borrower_v1, &hip_error) !=
+          NEO_HIP_RUNTIME_OK_V1) return false;
+      hip_search_borrower_v1 = 0;
+    }
+    if (hip_parent_borrower_v1 != 0) {
+      if (neoethos_hip_runtime_borrow_release_v1(
+              hip_lease_id_v1, hip_parent_borrower_v1, &hip_error) !=
+          NEO_HIP_RUNTIME_OK_V1) return false;
+      hip_parent_borrower_v1 = 0;
+    }
+#endif
     stream = nullptr;
     return true;
   }
 
-  void release() {
-    release_workspace();
-    if (parent_ownership == NEO_POPULATION_PARENT_OWNED_V1) {
-      device_free(close);
-      device_free(high);
-      device_free(low);
-      device_free(indicators_bar_major);
-      device_free(indicators_feature_major);
-      device_free(months);
-      device_free(days);
-      device_free(timestamps);
-      device_free(smc_rows);
-    } else {
-      close = nullptr;
-      high = nullptr;
-      low = nullptr;
-      indicators_bar_major = nullptr;
-      indicators_feature_major = nullptr;
-      months = nullptr;
-      days = nullptr;
-      timestamps = nullptr;
-      smc_rows = nullptr;
+  bool release() {
+    if (!release_terminal_checked_v2()) {
+      strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      std::fprintf(stderr, "population failed-construction cleanup incomplete; native owner retained\n");
+      return false;
     }
-    indicators_validity_u4 = nullptr;
-    indicators_validity_u4_bytes = 0;
-    device_free(view_indices);
-    view_indices_capacity = 0;
-    device_free(adaptive_base_pips);
-    adaptive_base_pips_capacity = 0;
-    device_free(gap_flags);
-    device_free(candidate_ids);
-    device_free(gene_offsets);
-    device_free(gene_indices);
-    device_free(gene_weights);
-    device_free(long_thresholds);
-    device_free(short_thresholds);
-    device_free(stop_pips);
-    device_free(target_pips);
-    device_free(stop_vol_multipliers);
-    device_free(smc_flags);
-    device_free(smc_weights);
-    release_scenarios();
-    if (event != nullptr) {
-      cudaEventDestroy(event);
-      event = nullptr;
-    }
-    if (generation_ready_event_v2 != nullptr) {
-      cudaEventDestroy(generation_ready_event_v2);
-      generation_ready_event_v2 = nullptr;
-    }
-    if (scoring_ready_event_v2 != nullptr) {
-      cudaEventDestroy(scoring_ready_event_v2);
-      scoring_ready_event_v2 = nullptr;
-    }
-    if (resident_search_terminal_host_receipt_v2 != nullptr &&
-        resident_generation_run_v2 == nullptr) {
-      cudaFreeHost(resident_search_terminal_host_receipt_v2);
-      resident_search_terminal_host_receipt_v2 = nullptr;
-    }
-    if (stream != nullptr && stream_ownership == NEO_POPULATION_STREAM_OWNED) {
-      cudaStreamDestroy(stream);
-    }
-    stream = nullptr;
+    return true;
   }
 };
 
@@ -2397,11 +2391,12 @@ std::int32_t population_status_from_scoring_v2(std::int32_t native_status) {
   return native_status;
 }
 
+#if !defined(__HIP_PLATFORM_AMD__)
 bool runtime_facts_equal_v2(
     const neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2& left,
     const neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2& right) {
   return left.abi_version == right.abi_version &&
-         left.selected_cuda_ordinal == right.selected_cuda_ordinal &&
+         backend_identity_v3::selected_device_ordinal(left) == backend_identity_v3::selected_device_ordinal(right) &&
          left.run_admission_ordinal == right.run_admission_ordinal &&
          std::memcmp(left.device_uuid, right.device_uuid, sizeof(left.device_uuid)) == 0 &&
          left.compute_capability_major == right.compute_capability_major &&
@@ -2483,7 +2478,7 @@ std::int32_t read_resident_search_runtime_facts_v2(
   *facts = {};
   facts->abi_version =
       neoethos::resident_search_generation_v2::NEO_RESIDENT_SEARCH_GENERATION_ABI_V2;
-  facts->selected_cuda_ordinal = static_cast<std::uint32_t>(session->device);
+  backend_identity_v3::selected_device_ordinal(*facts) = static_cast<std::uint32_t>(session->device);
   facts->run_admission_ordinal = admission_ordinal;
   std::memcpy(facts->device_uuid, session->device_identity.uuid,
               sizeof(facts->device_uuid));
@@ -2511,6 +2506,35 @@ std::int32_t read_resident_search_runtime_facts_v2(
               sizeof(facts->run_stream_process_token));
   return NEO_POPULATION_STATUS_OK;
 }
+
+#else
+bool hip_runtime_identity_equal_v1(NeoHipRuntimeFactsV1 left,
+                                   NeoHipRuntimeFactsV1 right) {
+  left.free_memory_bytes = right.free_memory_bytes = 0;
+  left.pool_reserved_bytes = right.pool_reserved_bytes = 0;
+  left.pool_used_bytes = right.pool_used_bytes = 0;
+  return std::memcmp(&left, &right, sizeof(left)) == 0;
+}
+
+bool revalidate_hip_population_v1(NeoCudaPopulationSession* session) {
+  if (session == nullptr || session->hip_lease_id_v1 == 0 ||
+      session->hip_parent_borrower_v1 == 0 || session->stream == nullptr ||
+      session->strict_execution_state == PopulationStrictExecutionStateV1::Poisoned)
+    return false;
+  NeoHipRuntimeFactsV1 current{};
+  NeoHipRuntimeErrorV1 error{};
+  if (neoethos_hip_runtime_borrow_query_v1(
+          session->hip_lease_id_v1, session->hip_parent_borrower_v1,
+          &current, &error) != NEO_HIP_RUNTIME_OK_V1 ||
+      !hip_runtime_identity_equal_v1(current, session->hip_parent_identity_v1) ||
+      current.device_ordinal != session->device ||
+      current.stream_handle != reinterpret_cast<std::uint64_t>(session->stream)) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return false;
+  }
+  return true;
+}
+#endif
 
 struct GeneHostStagingV1 {
   unsigned long long* candidate_ids = nullptr;
@@ -2564,26 +2588,58 @@ struct ScenarioHostStagingV1 {
   }
 };
 
-void CUDART_CB release_gene_host_staging_v1(void* opaque) {
-  delete static_cast<GeneHostStagingV1*>(opaque);
+// Bounded by the already-validated view row count. Both legacy host inputs
+// need owned staging: cudaMemcpyAsync returning does not prove source retirement.
+struct ViewHostStagingV1 {
+  unsigned long long* ordered_indices = nullptr;
+  double* adaptive_base_pips = nullptr;
+
+  ~ViewHostStagingV1() {
+    delete[] ordered_indices;
+    delete[] adaptive_base_pips;
+  }
+};
+
+// HIP's hipHostFn_t is a plain function pointer. CUDA retains its platform ABI.
+#if defined(__HIP_PLATFORM_AMD__)
+#define NEO_POPULATION_HOST_CALLBACK_V1
+#else
+#define NEO_POPULATION_HOST_CALLBACK_V1 CUDART_CB
+#endif
+
+void NEO_POPULATION_HOST_CALLBACK_V1 release_gene_host_staging_v1(void* opaque) {
+  neoethos_host_staging_v1::CallbackTicketV1<GeneHostStagingV1>::complete(opaque);
 }
 
-void CUDART_CB release_scenario_host_staging_v1(void* opaque) {
-  delete static_cast<ScenarioHostStagingV1*>(opaque);
+void NEO_POPULATION_HOST_CALLBACK_V1 release_scenario_host_staging_v1(void* opaque) {
+  neoethos_host_staging_v1::CallbackTicketV1<ScenarioHostStagingV1>::complete(opaque);
 }
+
+void NEO_POPULATION_HOST_CALLBACK_V1 release_view_host_staging_v1(void* opaque) {
+  neoethos_host_staging_v1::CallbackTicketV1<ViewHostStagingV1>::complete(opaque);
+}
+
+#undef NEO_POPULATION_HOST_CALLBACK_V1
 
 template <typename T>
 std::int32_t release_staging_after_stream_v1(cudaStream_t stream,
                                              T* staging,
                                              cudaHostFn_t release) {
-  if (cudaLaunchHostFunc(stream, release, staging) == cudaSuccess) {
-    return NEO_POPULATION_STATUS_OK;
+  using neoethos_host_staging_v1::RetirementResultV1;
+  const auto retired = neoethos_host_staging_v1::retire_after_stream_v1(
+      staging,
+      [=](void* ticket) {
+        return cudaLaunchHostFunc(stream, release, ticket) == cudaSuccess;
+      },
+      [=] { return cudaStreamSynchronize(stream) == cudaSuccess; });
+  switch (retired) {
+    case RetirementResultV1::Queued:
+      return NEO_POPULATION_STATUS_OK;
+    case RetirementResultV1::TicketAllocationFailed:
+      return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
+    case RetirementResultV1::SubmissionFailed:
+      return NEO_POPULATION_STATUS_TRANSFER_FAILED;
   }
-  // The enqueue failed after earlier copies may have been accepted. This is an
-  // error-only teardown barrier: never free a host source while DMA can still
-  // read it, and never count the failed path as resident success evidence.
-  cudaStreamSynchronize(stream);
-  delete staging;
   return NEO_POPULATION_STATUS_TRANSFER_FAILED;
 }
 
@@ -2628,7 +2684,9 @@ std::int32_t ensure_device_capacity_v3(T** pointer,
   if (required <= *capacity) {
     return NEO_POPULATION_STATUS_OK;
   }
-  device_free(*pointer);
+  if (!device_free_checked(*pointer)) {
+    return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+  }
   *capacity = 0;
   const auto status = device_alloc(pointer, required);
   if (status == NEO_POPULATION_STATUS_OK) {
@@ -2639,6 +2697,7 @@ std::int32_t ensure_device_capacity_v3(T** pointer,
 
 }  // namespace
 
+#if !defined(__HIP_PLATFORM_AMD__)
 extern "C" NeoCudaPopulationSession* neoethos_gpu_cuda_population_create(
     std::uint32_t abi_version,
     std::int32_t device,
@@ -2710,14 +2769,12 @@ extern "C" NeoCudaPopulationSession* neoethos_gpu_cuda_population_create(
               sizeof(session->device_identity.name));
   if (cudaStreamCreateWithFlags(&session->stream, cudaStreamNonBlocking) != cudaSuccess ||
       cudaEventCreateWithFlags(&session->event, cudaEventDisableTiming) != cudaSuccess) {
-    session->release();
-    delete session;
+    if (session->release()) delete session;
     return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
   }
   if (cuCtxGetCurrent(&session->admitted_primary_context_v3) != CUDA_SUCCESS ||
       session->admitted_primary_context_v3 == nullptr) {
-    session->release();
-    delete session;
+    if (session->release()) delete session;
     return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
   }
   // Mint a process-lifetime stream token from the actual device UUID and
@@ -2749,7 +2806,124 @@ extern "C" NeoCudaPopulationSession* neoethos_gpu_cuda_population_create(
   }
   return session;
 }
+#endif
 
+#if defined(__HIP_PLATFORM_AMD__)
+bool neoethos::resident_search_hip_v1::validate_population_owner_v1(
+    void* population_owner,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2& binding,
+    cudaStream_t retained_stream) {
+  auto* session = static_cast<NeoCudaPopulationSession*>(population_owner);
+  return revalidate_hip_population_v1(session) &&
+         retained_stream == session->stream &&
+         binding.abi_version == resident_archive_knn_v2::NEO_RESIDENT_ARCHIVE_KNN_ABI_V2 &&
+         binding.backend_kind == kBackendV1 &&
+         binding.hip_lease_identity == session->hip_lease_id_v1 &&
+         binding.search_stream_identity == session->hip_parent_identity_v1.stream_id &&
+         binding.active_pool_identity == session->hip_parent_identity_v1.current_pool_handle &&
+         std::memcmp(binding.device_uuid, session->hip_parent_identity_v1.uuid, 16) == 0;
+}
+
+extern "C" NeoCudaPopulationSession*
+neoethos::resident_search_hip_v1::neoethos_hip_population_bind_resident_feature_store_v1(
+    const NeoHipResidentFeatureStoreV1* resident, std::int32_t* status) {
+  const auto fail = [&](std::int32_t code) -> NeoCudaPopulationSession* {
+    if (status != nullptr) *status = code;
+    return nullptr;
+  };
+  if (status == nullptr || resident == nullptr || resident->abi_version != kAbiV1 ||
+      resident->backend_kind != kBackendV1 || resident->lease_id == 0 ||
+      resident->row_count == 0 || resident->row_count > INT_MAX ||
+      resident->feature_count == 0 || resident->feature_count > INT_MAX ||
+      resident->smc_slots != kSmcSlots || resident->allocator_reserve_bytes == 0 ||
+      !hash_is_nonzero_v3(resident->admission_identity_sha256, 32) ||
+      !hash_is_nonzero_v3(resident->canonical_content_merkle, 32) ||
+      !hash_is_nonzero_v3(resident->run_stream_process_token, 32))
+    return fail(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  const auto rows = resident->row_count;
+  if (rows > SIZE_MAX / sizeof(double) || rows > SIZE_MAX / kSmcSlots ||
+      rows > SIZE_MAX / resident->feature_count)
+    return fail(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  const auto cells = rows * resident->feature_count;
+  if (cells > SIZE_MAX / sizeof(double)) return fail(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  const auto logical_validity = cells / 2 + cells % 2;
+  if (logical_validity > SIZE_MAX - 3) return fail(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  const auto validity_bytes = (logical_validity + 3) / 4 * 4;
+  const std::uint64_t sizes[9] = {
+      rows * 8, rows * 8, rows * 8, cells * 8, validity_bytes,
+      rows * 8, rows * 8, rows * 8, rows * kSmcSlots};
+  auto* session = new (std::nothrow) NeoCudaPopulationSession();
+  if (session == nullptr) return fail(NEO_POPULATION_STATUS_ALLOCATION_FAILED);
+  NeoHipRuntimeErrorV1 error{};
+  if (neoethos_hip_runtime_borrow_v1(resident->lease_id,
+          &session->hip_parent_borrower_v1, &session->hip_parent_identity_v1,
+          &error) != NEO_HIP_RUNTIME_OK_V1) {
+    delete session;
+    return fail(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  }
+  session->hip_lease_id_v1 = resident->lease_id;
+  const auto reject_before_work = [&](std::int32_t code) -> NeoCudaPopulationSession* {
+    if (neoethos_hip_runtime_borrow_release_v1(session->hip_lease_id_v1,
+            session->hip_parent_borrower_v1, &error) == NEO_HIP_RUNTIME_OK_V1) {
+      delete session;
+    } else {
+      // Registry and native tombstone retain any ambiguous pin/resource.
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    }
+    return fail(code);
+  };
+  std::uint64_t addresses[9]{};
+  for (std::size_t index = 0; index < 9; ++index) {
+    if (neoethos_hip_runtime_borrow_buffer_v1(resident->lease_id,
+            session->hip_parent_borrower_v1, resident->buffer_keys[index],
+            sizes[index], &addresses[index], &error) != NEO_HIP_RUNTIME_OK_V1 ||
+        addresses[index] == 0)
+      return reject_before_work(NEO_POPULATION_STATUS_INVALID_ARGUMENT);
+  }
+  const auto& identity = session->hip_parent_identity_v1;
+  session->device = identity.device_ordinal;
+  session->stream = reinterpret_cast<cudaStream_t>(identity.stream_handle);
+  session->stream_ownership = NEO_POPULATION_STREAM_BORROWED;
+  session->parent_ownership = NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3;
+  session->allocator_context_reserve_bytes_v3 = resident->allocator_reserve_bytes;
+  std::memcpy(session->run_stream_process_token_v3, resident->run_stream_process_token, 32);
+  cudaDeviceProp properties{};
+  if (!revalidate_hip_population_v1(session) ||
+      cudaGetDeviceProperties(&properties, session->device) != cudaSuccess ||
+      properties.multiProcessorCount <= 0 || properties.totalGlobalMem == 0)
+    return reject_before_work(NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE);
+  session->close = reinterpret_cast<double*>(addresses[0]);
+  session->high = reinterpret_cast<double*>(addresses[1]);
+  session->low = reinterpret_cast<double*>(addresses[2]);
+  session->indicators_bar_major = reinterpret_cast<double*>(addresses[3]);
+  session->indicators_validity_u4 = reinterpret_cast<unsigned char*>(addresses[4]);
+  session->indicators_validity_u4_bytes = validity_bytes;
+  session->months = reinterpret_cast<std::int64_t*>(addresses[5]);
+  session->days = reinterpret_cast<std::int64_t*>(addresses[6]);
+  session->timestamps = reinterpret_cast<std::int64_t*>(addresses[7]);
+  session->smc_rows = reinterpret_cast<signed char*>(addresses[8]);
+  session->parent_rows = static_cast<int>(rows);
+  session->feature_count = static_cast<int>(resident->feature_count);
+  session->sm_count = properties.multiProcessorCount;
+  session->has_parent_v1 = true;
+  // No HIP UUID/architecture is represented as CUDA compute capability.
+  // A real evaluation view must still be bound before Search can start.
+  const auto quarantine = [&](std::int32_t code) -> NeoCudaPopulationSession* {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return fail(code);  // Do not free or retry ambiguous Runtime API outputs.
+  };
+  if (cudaEventCreateWithFlags(&session->event, cudaEventDisableTiming) != cudaSuccess)
+    return quarantine(NEO_POPULATION_STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN);
+  const auto allocated = device_alloc(&session->gap_flags, static_cast<std::size_t>(rows));
+  if (allocated != NEO_POPULATION_STATUS_OK) return quarantine(allocated);
+  if (cudaEventRecord(session->event, session->stream) != cudaSuccess)
+    return quarantine(NEO_POPULATION_STATUS_LAUNCH_FAILED);
+  *status = NEO_POPULATION_STATUS_OK;
+  return session;
+}
+#endif
+
+#if !defined(__HIP_PLATFORM_AMD__)
 extern "C" NeoCudaPopulationSession*
 neoethos_gpu_cuda_population_bind_resident_feature_store_v3(
     const NeoPopulationResidentFeatureStoreV3* resident,
@@ -2832,8 +3006,7 @@ neoethos_gpu_cuda_population_bind_resident_feature_store_v3(
   session->stream_ownership = NEO_POPULATION_STREAM_BORROWED;
   session->parent_ownership = NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3;
   const auto fail_session = [&](std::int32_t code) -> NeoCudaPopulationSession* {
-    session->release();
-    delete session;
+    if (session->release()) delete session;
     return fail(code);
   };
   if (cudaEventCreateWithFlags(&session->event, cudaEventDisableTiming) != cudaSuccess) {
@@ -2891,6 +3064,7 @@ neoethos_gpu_cuda_population_bind_resident_feature_store_v3(
   }
   return session;
 }
+#endif
 
 extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
     NeoCudaPopulationSession* session,
@@ -2989,7 +3163,10 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
     status = copy_to_device(staging, dataset->indicators, features * bars * sizeof(double),
                             session->stream);
     if (status != NEO_POPULATION_STATUS_OK) {
-      device_free(staging);
+      // Submission may have been accepted. Keep the staging in the actual
+      // owner and forbid cleanup/reuse while completion is unproved.
+      session->indicators_feature_major = staging;
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
       return status;
     }
     const dim3 transpose_block(kTransposeTile, kTransposeTile);
@@ -3004,11 +3181,16 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_dataset(
     // freed until the transpose has read it, and this is also what makes every
     // other copy above complete before any evaluate can observe them.
     if (cudaStreamSynchronize(session->stream) != cudaSuccess) {
-      device_free(staging);
+      session->indicators_feature_major = staging;
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
       return NEO_POPULATION_STATUS_TRANSFER_FAILED;
     }
     session->synchronization_events += 1;
-    device_free(staging);
+    if (!device_free_checked(staging)) {
+      session->indicators_feature_major = staging;
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+    }
     if (cudaGetLastError() != cudaSuccess) {
       return NEO_POPULATION_STATUS_LAUNCH_FAILED;
     }
@@ -3103,12 +3285,6 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_parent_v1(
   if (status != NEO_POPULATION_STATUS_OK) return status;
   status = device_alloc(&session->smc_rows, parent_rows * kSmcSlots);
   if (status != NEO_POPULATION_STATUS_OK) return status;
-  status = device_alloc(&session->view_indices, parent_rows);
-  if (status != NEO_POPULATION_STATUS_OK) return status;
-  session->view_indices_capacity = parent_rows;
-  status = device_alloc(&session->adaptive_base_pips, parent_rows);
-  if (status != NEO_POPULATION_STATUS_OK) return status;
-  session->adaptive_base_pips_capacity = parent_rows;
   status = device_alloc(&session->gap_flags, parent_rows);
   if (status != NEO_POPULATION_STATUS_OK) return status;
 
@@ -3238,29 +3414,88 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_bind_view_v1(
   if (cudaSetDevice(session->device) != cudaSuccess) {
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
   }
+  // Growth replaces storage still named by the prior view. Remember it before
+  // either capacity is updated so later host-staging OOM cannot revive that view.
+  const bool replacing_view_storage =
+      (view->view_kind == NEO_POPULATION_VIEW_ORDERED_INDICES &&
+       rows > session->view_indices_capacity) ||
+      (view->adaptive_base_pips != nullptr &&
+       rows > session->adaptive_base_pips_capacity);
   std::int32_t status = NEO_POPULATION_STATUS_OK;
   if (view->view_kind == NEO_POPULATION_VIEW_ORDERED_INDICES) {
     status = ensure_device_capacity_v3(&session->view_indices,
                                        &session->view_indices_capacity,
                                        rows);
-    if (status != NEO_POPULATION_STATUS_OK) return status;
-    const std::size_t bytes = rows * sizeof(unsigned long long);
-    status = copy_to_device(session->view_indices, view->ordered_indices, bytes, session->stream);
-    if (status != NEO_POPULATION_STATUS_OK) return status;
-    session->residency_counters.ordered_index_upload_bytes += ordered_upload_bytes;
+    if (status != NEO_POPULATION_STATUS_OK) {
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      return status;
+    }
   }
   if (view->adaptive_base_pips != nullptr) {
     status = ensure_device_capacity_v3(&session->adaptive_base_pips,
                                        &session->adaptive_base_pips_capacity,
                                        rows);
+    if (status != NEO_POPULATION_STATUS_OK) {
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      return status;
+    }
+  }
+
+  if (ordered_upload_bytes != 0ull || adaptive_upload_bytes != 0ull) {
+    auto* staging = new (std::nothrow) ViewHostStagingV1{};
+    if (staging == nullptr) {
+      if (replacing_view_storage) {
+        session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      }
+      return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
+    }
+    if (ordered_upload_bytes != 0ull) {
+      staging->ordered_indices = new (std::nothrow) unsigned long long[rows];
+    }
+    if (adaptive_upload_bytes != 0ull) {
+      staging->adaptive_base_pips = new (std::nothrow) double[rows];
+    }
+    if ((ordered_upload_bytes != 0ull && staging->ordered_indices == nullptr) ||
+        (adaptive_upload_bytes != 0ull && staging->adaptive_base_pips == nullptr)) {
+      delete staging;
+      if (replacing_view_storage) {
+        session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      }
+      return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
+    }
+    // Finish both immediate host copies before queuing either DMA. The Rust
+    // view Arc is an identity/lifetime owner, not an assumed CUDA completion.
+    if (ordered_upload_bytes != 0ull) {
+      std::memcpy(staging->ordered_indices, view->ordered_indices,
+                  static_cast<std::size_t>(ordered_upload_bytes));
+    }
+    if (adaptive_upload_bytes != 0ull) {
+      std::memcpy(staging->adaptive_base_pips, view->adaptive_base_pips,
+                  static_cast<std::size_t>(adaptive_upload_bytes));
+    }
+    const auto retire_staging = [&](std::int32_t copy_status) {
+      const auto release_status = release_staging_after_stream_v1(
+          session->stream, staging, release_view_host_staging_v1);
+      if (copy_status != NEO_POPULATION_STATUS_OK ||
+          release_status != NEO_POPULATION_STATUS_OK) {
+        session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      }
+      return copy_status == NEO_POPULATION_STATUS_OK ? release_status : copy_status;
+    };
+    if (ordered_upload_bytes != 0ull) {
+      status = copy_to_device(session->view_indices, staging->ordered_indices,
+                              static_cast<std::size_t>(ordered_upload_bytes), session->stream);
+      if (status != NEO_POPULATION_STATUS_OK) return retire_staging(status);
+      session->residency_counters.ordered_index_upload_bytes += ordered_upload_bytes;
+    }
+    if (adaptive_upload_bytes != 0ull) {
+      status = copy_to_device(session->adaptive_base_pips, staging->adaptive_base_pips,
+                              static_cast<std::size_t>(adaptive_upload_bytes), session->stream);
+      if (status != NEO_POPULATION_STATUS_OK) return retire_staging(status);
+      session->residency_counters.adaptive_upload_bytes += adaptive_upload_bytes;
+    }
+    status = retire_staging(NEO_POPULATION_STATUS_OK);
     if (status != NEO_POPULATION_STATUS_OK) return status;
-    const std::size_t bytes = rows * sizeof(double);
-    status = copy_to_device(session->adaptive_base_pips,
-                            view->adaptive_base_pips,
-                            bytes,
-                            session->stream);
-    if (status != NEO_POPULATION_STATUS_OK) return status;
-    session->residency_counters.adaptive_upload_bytes += adaptive_upload_bytes;
   }
 
   session->view_kind = static_cast<int>(view->view_kind);
@@ -3298,9 +3533,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_bind_resident_adaptive_view
       session->parent_ownership != NEO_POPULATION_PARENT_BORROWED_RESIDENT_V3 ||
       session->close == nullptr || session->high == nullptr || session->low == nullptr ||
       session->gap_flags == nullptr || view->adaptive_base_pips != nullptr ||
-      view->adaptive_base_pips_len != 0 || view->ordered_indices != nullptr ||
-      view->ordered_index_count != 0 ||
-      view->view_kind == NEO_POPULATION_VIEW_ORDERED_INDICES) {
+      view->adaptive_base_pips_len != 0) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
   if (request->abi_version != NEOETHOS_GPU_ABI_VERSION ||
@@ -3312,7 +3545,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_bind_resident_adaptive_view
       request->vol_horizon_bars != 5u ||
       request->tail_window != kResidentAdaptiveTailWindowV1 ||
       request->tail_quantile_index != kResidentAdaptiveTailQuantileIndexV1 ||
-      request->tail_step == 0ull || !isfinite(request->pip_size) ||
+      request->tail_step == 0ull || !std::isfinite(request->pip_size) ||
       request->pip_size <= 0.0 || request->stop_k_vol != 1.0 ||
       request->stop_k_tail != 1.25 || request->meta_label_min_dist != 0.0 ||
       view->row_count < 101ull ||
@@ -3320,11 +3553,10 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_bind_resident_adaptive_view
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
   if (view->row_count > static_cast<std::uint64_t>(INT_MAX) ||
-      view->parent_row_count > static_cast<std::uint64_t>(INT_MAX) ||
-      view->parent_row_count < sizeof(ResidentAdaptiveControlV1)) {
+      view->parent_row_count > static_cast<std::uint64_t>(INT_MAX)) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
-  if (session->kernel_submissions > UINT64_MAX - 8ull) {
+  if (session->kernel_submissions > UINT64_MAX - 4ull) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
   if (cudaSetDevice(session->device) != cudaSuccess) {
@@ -3332,14 +3564,19 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_bind_resident_adaptive_view
   }
 
   const std::size_t rows = static_cast<std::size_t>(view->row_count);
+  const bool replacing_adaptive_storage = rows > session->adaptive_base_pips_capacity;
   std::int32_t status = ensure_device_capacity_v3(&session->adaptive_base_pips,
                                                    &session->adaptive_base_pips_capacity,
                                                    rows);
   if (status != NEO_POPULATION_STATUS_OK) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
     return status;
   }
   status = neoethos_gpu_cuda_population_bind_view_v1(session, view);
   if (status != NEO_POPULATION_STATUS_OK) {
+    if (replacing_adaptive_storage) {
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    }
     return status;
   }
 
@@ -3353,7 +3590,9 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_bind_resident_adaptive_view
   dataset.days = session->days;
   dataset.timestamps = session->timestamps;
   dataset.smc_rows = session->smc_rows;
-  dataset.view_indices = nullptr;
+  dataset.view_indices = session->view_kind == NEO_POPULATION_VIEW_ORDERED_INDICES
+                             ? session->view_indices
+                             : nullptr;
   dataset.adaptive_base_pips = session->adaptive_base_pips;
   dataset.has_adaptive_base = 1;
   dataset.bars = static_cast<int>(rows);
@@ -3363,25 +3602,15 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_bind_resident_adaptive_view
   dataset.view_start = session->view_start;
   dataset.timestamp_mode = session->timestamp_mode;
 
-  // resident_adaptive_control shares gap_flags only before gap generation.
-  // The admitted plan already charges the full parent-sized gap allocation;
-  // these 16 bytes have a disjoint same-stream lifetime and add no allocation.
-  auto* control = reinterpret_cast<ResidentAdaptiveControlV1*>(session->gap_flags);
+  // Four same-stream phases, one retained output, no future median and no
+  // repeated expected-shortfall scan. Ordered HLC reads use the uploaded map.
   const unsigned int blocks = static_cast<unsigned int>((rows + 255u) / 256u);
   resident_adaptive_parkinson_kernel_v1<<<blocks, 256, 0, session->stream>>>(
       dataset, session->adaptive_base_pips);
   resident_adaptive_rolling_sigma_kernel_v1<<<1, 1, 0, session->stream>>>(
       session->adaptive_base_pips, static_cast<int>(rows));
   resident_adaptive_distance_kernel_v1<<<blocks, 256, 0, session->stream>>>(
-      dataset, *request, control, false, session->adaptive_base_pips);
-  resident_adaptive_median_kernel_v1<<<1, 1, 0, session->stream>>>(
-      session->adaptive_base_pips, static_cast<int>(rows), control);
-  resident_adaptive_parkinson_kernel_v1<<<blocks, 256, 0, session->stream>>>(
-      dataset, session->adaptive_base_pips);
-  resident_adaptive_rolling_sigma_kernel_v1<<<1, 1, 0, session->stream>>>(
-      session->adaptive_base_pips, static_cast<int>(rows));
-  resident_adaptive_distance_kernel_v1<<<blocks, 256, 0, session->stream>>>(
-      dataset, *request, control, true, session->adaptive_base_pips);
+      dataset, *request, session->adaptive_base_pips);
   resident_adaptive_validate_normalized_kernel_v1<<<1, 1, 0, session->stream>>>(
       session->adaptive_base_pips, static_cast<int>(rows));
   if (cudaGetLastError() != cudaSuccess) {
@@ -3389,7 +3618,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_bind_resident_adaptive_view
     return NEO_POPULATION_STATUS_LAUNCH_FAILED;
   }
 
-  session->kernel_submissions += 8ull;
+  session->kernel_submissions += 4ull;
   session->has_adaptive_base = 1;
   // adaptive_upload_bytes must remain zero: the base was produced from the
   // resident parent and never crossed a host/device transfer boundary.
@@ -3462,6 +3691,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_read_residency_counters_v1(
   return NEO_POPULATION_STATUS_OK;
 }
 
+#if !defined(__HIP_PLATFORM_AMD__)
 extern "C" std::int32_t neoethos_gpu_cuda_population_read_device_identity_v1(
     NeoCudaPopulationSession* session,
     NeoPopulationDeviceIdentityV1* identity) {
@@ -3477,6 +3707,7 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_read_device_identity_v1(
   *identity = session->device_identity;
   return NEO_POPULATION_STATUS_OK;
 }
+#endif
 
 extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
     NeoCudaPopulationSession* session,
@@ -3534,12 +3765,13 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
   // parent + NEW genes + NEW strict scenario plan. Keeping the old workspace
   // alive here made a smaller next batch coexist with a larger previous batch,
   // which no steady-state byte plan could represent safely.
-  session->release_scenarios();
-  session->release_workspace();
   session->scenario_count = 0;
   session->scenario_upload_bytes = 0ull;
   session->has_scenarios = false;
   session->metrics_ready = false;
+  session->resident_canonical_base_scenarios_v3 = false;
+  if (!session->release_scenarios() || !session->release_workspace())
+    return NEO_POPULATION_STATUS_LAUNCH_FAILED;
   // Host-side staging of the descriptor-derived arrays keeps the device layout
   // flat and coalesced without changing canonical identity or ordering.
   auto* staging = new (std::nothrow) GeneHostStagingV1();
@@ -3588,17 +3820,26 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
               population * kSmcSlots * sizeof(signed char));
   std::memcpy(staging->smc_weights, genes->smc_weights, kSmcSlots * sizeof(double));
 
-  device_free(session->candidate_ids);
-  device_free(session->gene_offsets);
-  device_free(session->gene_indices);
-  device_free(session->gene_weights);
-  device_free(session->long_thresholds);
-  device_free(session->short_thresholds);
-  device_free(session->stop_pips);
-  device_free(session->target_pips);
-  device_free(session->stop_vol_multipliers);
-  device_free(session->smc_flags);
-  device_free(session->smc_weights);
+  // From this point a failed replacement must not advertise the prior genes.
+  session->has_genes = false;
+  session->population = 0;
+  session->gene_upload_bytes = 0ull;
+  session->uses_resident_gene_view_v2 = false;
+  if (!device_free_checked(session->candidate_ids) ||
+      !device_free_checked(session->gene_offsets) ||
+      !device_free_checked(session->gene_indices) ||
+      !device_free_checked(session->gene_weights) ||
+      !device_free_checked(session->long_thresholds) ||
+      !device_free_checked(session->short_thresholds) ||
+      !device_free_checked(session->stop_pips) ||
+      !device_free_checked(session->target_pips) ||
+      !device_free_checked(session->stop_vol_multipliers) ||
+      !device_free_checked(session->smc_flags) ||
+      !device_free_checked(session->smc_weights)) {
+    delete staging; // No upload references this host staging yet.
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+  }
 
   std::int32_t status = NEO_POPULATION_STATUS_OK;
   const auto guard = [&](std::int32_t code) {
@@ -3647,13 +3888,19 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_genes(
                             population * kSmcSlots * sizeof(signed char), session->stream)) ||
       !guard(copy_to_device(session->smc_weights, staging->smc_weights,
                             kSmcSlots * sizeof(double), session->stream))) {
-    cudaStreamSynchronize(session->stream);
-    delete staging;
+    // Earlier copies may still reference staging. Retire it safely without
+    // replacing the original copy failure with the cleanup result.
+    release_staging_after_stream_v1(session->stream, staging,
+                                  release_gene_host_staging_v1);
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
     return status;
   }
   status = release_staging_after_stream_v1(session->stream, staging,
                                             release_gene_host_staging_v1);
-  if (status != NEO_POPULATION_STATUS_OK) return status;
+  if (status != NEO_POPULATION_STATUS_OK) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return status;
+  }
 
   session->population = static_cast<int>(population);
   session->gate_threshold = genes->gate_threshold;
@@ -3773,7 +4020,17 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
     staging->commissions[index] = descriptor.commission_micros;
   }
 
-  session->release_scenarios();
+  // Validation and host staging above preserve the prior valid upload. Once
+  // device replacement begins, no failure may expose its old success flags.
+  session->has_scenarios = false;
+  session->scenario_count = 0;
+  session->scenario_upload_bytes = 0ull;
+  session->metrics_ready = false;
+  session->resident_canonical_base_scenarios_v3 = false;
+  if (!session->release_scenarios()) {
+    delete staging;
+    return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+  }
   std::int32_t status = NEO_POPULATION_STATUS_OK;
   const auto guard = [&](std::int32_t code) {
     if (code != NEO_POPULATION_STATUS_OK) {
@@ -3791,7 +4048,11 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
       !guard(device_alloc(&session->scenario_slippage_ticks, count)) ||
       !guard(device_alloc(&session->scenario_commission_micros, count))) {
     delete staging;
-    session->release_scenarios();
+    if (!session->release_scenarios()) {
+      // Preserve the original allocation failure. The helper has poisoned
+      // the owner; no failed free is retried or allocation overwritten.
+      return status;
+    }
     return status;
   }
 
@@ -3816,18 +4077,24 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_scenarios(
                             session->stream)) ||
       !guard(copy_to_device(session->scenario_commission_micros, staging->commissions, i64_bytes,
                             session->stream))) {
-    cudaStreamSynchronize(session->stream);
-    delete staging;
+    // Preserve the first transfer failure even if callback retirement succeeds.
+    release_staging_after_stream_v1(session->stream, staging,
+                                  release_scenario_host_staging_v1);
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
     return status;
   }
   status = release_staging_after_stream_v1(session->stream, staging,
                                             release_scenario_host_staging_v1);
-  if (status != NEO_POPULATION_STATUS_OK) return status;
+  if (status != NEO_POPULATION_STATUS_OK) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return status;
+  }
 
   session->scenario_count = static_cast<int>(count);
   session->scenario_upload_bytes =
       static_cast<std::uint64_t>(4 * u64_bytes + 2 * u32_bytes + 2 * i32_bytes + i64_bytes);
   session->has_scenarios = true;
+  session->resident_canonical_base_scenarios_v3 = false;
   session->metrics_ready = false;
   return NEO_POPULATION_STATUS_OK;
 }
@@ -3863,6 +4130,163 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_upload_resident_scenarios_v
   return NEO_POPULATION_STATUS_OK;
 }
 
+extern "C" std::int32_t neoethos_gpu_cuda_population_upload_resident_base_scenarios_v3(
+    NeoCudaPopulationSession* session,
+    const NeoPopulationScenarioView* scenarios,
+    std::uint64_t planned_population,
+    std::uint64_t retained_capacity) {
+  if (session == nullptr) return NEO_POPULATION_STATUS_NULL_SESSION;
+  if (strict_population_work_blocks_host_boundary_v1(session)) {
+    return strict_population_host_boundary_status_v1(session);
+  }
+  if (scenarios == nullptr || scenarios->descriptors == nullptr ||
+      planned_population == 0 || planned_population > INT_MAX ||
+      scenarios->count != planned_population || retained_capacity == 0 ||
+      retained_capacity > planned_population ||
+      session->resident_generation_run_v2 == nullptr ||
+      session->resident_scoring_run_v2 == nullptr || session->has_scenarios ||
+      session->bars <= 0 ||
+      planned_population != static_cast<std::uint64_t>(session->resident_planned_population_v2) ||
+      retained_capacity != static_cast<std::uint64_t>(session->resident_retained_evaluation_capacity_v3)) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  // This additive path accepts exactly the immutable base work list validated
+  // by the compact Search factory. It does not reinterpret arbitrary scenarios
+  // as offsets or discard cost/perturbation controls from the legacy uploader.
+  for (std::size_t ordinal = 0; ordinal < scenarios->count; ++ordinal) {
+    const NeoScenarioDescriptor& descriptor = scenarios->descriptors[ordinal];
+    if (descriptor.base_candidate_id != ordinal || descriptor.scenario_id != ordinal ||
+        descriptor.rng_counter != 0 || descriptor.window_offset != 0 ||
+        descriptor.window_len != static_cast<std::uint32_t>(session->bars) ||
+        descriptor.scenario_type != kScenarioBase ||
+        descriptor.spread_ticks != kNoTickOverride || descriptor.slippage_ticks != 0 ||
+        descriptor.commission_micros != kNoMicroOverride ||
+        descriptor.perturbation_offset != 0 || descriptor.perturbation_count != 0 ||
+        descriptor.reserved != 0) {
+      return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+    }
+  }
+  const NeoPopulationScenarioView retained{
+      scenarios->descriptors, static_cast<std::size_t>(retained_capacity)};
+  const std::int32_t status = neoethos_gpu_cuda_population_upload_resident_scenarios_v2(
+      session, &retained, planned_population);
+  if (status != NEO_POPULATION_STATUS_OK) return status;
+  session->resident_canonical_base_scenarios_v3 = true;
+  session->resident_canonical_base_rows_v3 = session->bars;
+  return NEO_POPULATION_STATUS_OK;
+}
+
+template <class Runtime> struct ResidentRuntimeTraitsV3;
+
+#if !defined(__HIP_PLATFORM_AMD__)
+template <> struct ResidentRuntimeTraitsV3<
+    neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2> {
+  using Runtime = neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2;
+  using Admission = neoethos::resident_search_generation_v2::NeoResidentSearchCombinedAdmissionV2;
+  static constexpr std::uint32_t abi = 2u;
+  static Runtime& stored(NeoCudaPopulationSession* session) { return session->resident_search_runtime_facts_v2; }
+  static bool equal(const Runtime& left, const Runtime& right) { return runtime_facts_equal_v2(left, right); }
+  static std::int32_t revalidate(NeoCudaPopulationSession* session, std::uint64_t ordinal, Runtime* current) {
+    return read_resident_search_runtime_facts_v2(session, ordinal, current);
+  }
+  static bool snapshot(const Runtime&, std::size_t* free, std::size_t* total) {
+    return cudaMemGetInfo(free, total) == cudaSuccess;
+  }
+  static std::uint32_t device(const Runtime& facts) { return facts.selected_cuda_ordinal; }
+  static cudaStream_t stream(const Runtime& facts) { return facts.admitted_run_stream; }
+  static std::uint64_t pool_reserved(const Runtime& facts) { return facts.pool_reserved_current_bytes; }
+  static std::uint64_t pool_used(const Runtime& facts) { return facts.pool_used_current_bytes; }
+  static std::uint64_t& free_bytes(Admission& value) { return value.same_context_free_bytes; }
+  static const std::uint64_t& free_bytes(const Admission& value) { return value.same_context_free_bytes; }
+  static std::uint64_t& total_bytes(Admission& value) { return value.same_context_total_bytes; }
+};
+#else
+template <> struct ResidentRuntimeTraitsV3<
+    neoethos::resident_search_hip_v1::NeoResidentSearchHipRuntimeFactsV1> {
+  using Runtime = neoethos::resident_search_hip_v1::NeoResidentSearchHipRuntimeFactsV1;
+  using Admission = neoethos::resident_search_hip_v1::NeoResidentSearchHipCombinedAdmissionV1;
+  static constexpr std::uint32_t abi = 1u;
+  static Runtime& stored(NeoCudaPopulationSession* session) { return session->resident_search_hip_runtime_v1; }
+  static bool equal(const Runtime& left, const Runtime& right) {
+    return left.abi_version == 1u && right.abi_version == 1u &&
+           left.backend_kind == 2u && right.backend_kind == 2u &&
+           std::memcmp(&left, &right, sizeof(left)) == 0;
+  }
+  static std::int32_t revalidate(NeoCudaPopulationSession* session, std::uint64_t ordinal, Runtime* current) {
+    if (current == nullptr || session->hip_search_borrower_v1 == 0 ||
+        stored(session).run_admission_ordinal != ordinal ||
+        !revalidate_hip_population_v1(session)) return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+    NeoHipRuntimeFactsV1 identity{};
+    NeoHipRuntimeErrorV1 error{};
+    if (neoethos_hip_runtime_borrow_query_v1(session->hip_lease_id_v1,
+            session->hip_search_borrower_v1, &identity, &error) != NEO_HIP_RUNTIME_OK_V1 ||
+        !hip_runtime_identity_equal_v1(identity, stored(session).owner)) {
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+    }
+    // Preserve the one admission snapshot, not the identity query's zero
+    // dynamic fields. This method performs no additional memory query.
+    *current = stored(session);
+    return NEO_POPULATION_STATUS_OK;
+  }
+  static bool snapshot(const Runtime& facts, std::size_t* free, std::size_t* total) {
+    static_assert(sizeof(std::size_t) == sizeof(std::uint64_t),
+                  "the HIP resident runtime requires a 64-bit host");
+    *free = static_cast<std::size_t>(facts.owner.free_memory_bytes);
+    *total = static_cast<std::size_t>(facts.owner.total_memory_bytes);
+    return *total != 0 && *free <= *total;
+  }
+  static std::uint32_t device(const Runtime& facts) { return static_cast<std::uint32_t>(facts.owner.device_ordinal); }
+  static cudaStream_t stream(const Runtime& facts) { return reinterpret_cast<cudaStream_t>(facts.owner.stream_handle); }
+  static std::uint64_t pool_reserved(const Runtime& facts) { return facts.owner.pool_reserved_bytes; }
+  static std::uint64_t pool_used(const Runtime& facts) { return facts.owner.pool_used_bytes; }
+  static std::uint64_t& free_bytes(Admission& value) { return value.same_lease_free_bytes; }
+  static const std::uint64_t& free_bytes(const Admission& value) { return value.same_lease_free_bytes; }
+  static std::uint64_t& total_bytes(Admission& value) { return value.same_lease_total_bytes; }
+};
+
+extern "C" std::int32_t
+neoethos::resident_search_hip_v1::neoethos_hip_population_reserve_resident_search_runtime_v1(
+    void* opaque_session, NeoResidentSearchHipRuntimeFactsV1* facts) {
+  auto* session = static_cast<NeoCudaPopulationSession*>(opaque_session);
+  if (session == nullptr) return NEO_POPULATION_STATUS_NULL_SESSION;
+  if (facts == nullptr || session->resident_search_runtime_reserved_v2 ||
+      session->resident_generation_run_v2 != nullptr || session->resident_scoring_run_v2 != nullptr ||
+      strict_population_work_blocks_host_boundary_v1(session) ||
+      session->next_resident_search_admission_ordinal_v2 == UINT64_MAX ||
+      !revalidate_hip_population_v1(session)) return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  *facts = {};
+  NeoHipRuntimeErrorV1 error{};
+  if (session->hip_search_borrower_v1 != 0) {
+    if (neoethos_hip_runtime_borrow_release_v1(session->hip_lease_id_v1,
+            session->hip_search_borrower_v1, &error) != NEO_HIP_RUNTIME_OK_V1) {
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+    }
+    session->hip_search_borrower_v1 = 0;
+  }
+  NeoHipRuntimeFactsV1 snapshot{};
+  if (neoethos_hip_runtime_borrow_v1(session->hip_lease_id_v1,
+          &session->hip_search_borrower_v1, &snapshot, &error) != NEO_HIP_RUNTIME_OK_V1 ||
+      !hip_runtime_identity_equal_v1(snapshot, session->hip_parent_identity_v1)) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+  facts->abi_version = kAbiV1;
+  facts->backend_kind = kBackendV1;
+  facts->run_admission_ordinal = session->next_resident_search_admission_ordinal_v2++;
+  facts->owner = snapshot;
+  facts->allocator_context_reserve_bytes = session->allocator_context_reserve_bytes_v3;
+  std::memcpy(facts->run_stream_process_token, session->run_stream_process_token_v3, 32);
+  session->resident_search_hip_runtime_v1 = *facts;
+  session->resident_search_runtime_reserved_v2 = true;
+  session->resident_search_slice2_binding_sealed_v3 = false;
+  session->resident_search_slice2_binding_v3 = {};
+  return NEO_POPULATION_STATUS_OK;
+}
+#endif
+
+#if !defined(__HIP_PLATFORM_AMD__)
 extern "C" std::int32_t
 neoethos_gpu_cuda_population_reserve_resident_search_runtime_v2(
     void* opaque_session,
@@ -3892,17 +4316,20 @@ neoethos_gpu_cuda_population_reserve_resident_search_runtime_v2(
   return NEO_POPULATION_STATUS_OK;
 }
 
-extern "C" std::int32_t
-neoethos_gpu_cuda_population_query_resident_search_combined_v2(
+#endif
+
+template <class Runtime>
+static std::int32_t query_resident_search_combined_impl_v3(
     void* opaque_session,
     const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
         generation_plan,
+    const neoethos::resident_generation_v1::NeoResidentAdaptivePolicyV3*
+        adaptive_policy,
     const neoethos::resident_scoring_novelty_v1::
         NeoResidentScoringNoveltyPlanV1* scoring_plan,
-    const neoethos::resident_search_generation_v2::
-        NeoResidentSearchRuntimeFactsV2* expected_runtime,
-    neoethos::resident_search_generation_v2::
-        NeoResidentSearchCombinedAdmissionV2* admission) {
+    const Runtime* expected_runtime,
+    typename ResidentRuntimeTraitsV3<Runtime>::Admission* admission) {
+  using RuntimeTraits = ResidentRuntimeTraitsV3<Runtime>;
   using namespace neoethos::resident_generation_v1;
   using namespace neoethos::resident_scoring_novelty_v1;
   using namespace neoethos::resident_search_generation_v2;
@@ -3913,7 +4340,7 @@ neoethos_gpu_cuda_population_query_resident_search_combined_v2(
   if (generation_plan == nullptr || scoring_plan == nullptr ||
       expected_runtime == nullptr || admission == nullptr ||
       !session->resident_search_runtime_reserved_v2 ||
-      !runtime_facts_equal_v2(session->resident_search_runtime_facts_v2,
+      !RuntimeTraits::equal(RuntimeTraits::stored(session),
                               *expected_runtime) ||
       session->resident_generation_run_v2 != nullptr ||
       session->resident_scoring_run_v2 != nullptr || !session->has_dataset ||
@@ -3927,22 +4354,30 @@ neoethos_gpu_cuda_population_query_resident_search_combined_v2(
           static_cast<std::uint64_t>(session->feature_count)) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
-  NeoResidentSearchRuntimeFactsV2 current_runtime{};
-  std::int32_t status = read_resident_search_runtime_facts_v2(
+  Runtime current_runtime{};
+  std::int32_t status = RuntimeTraits::revalidate(
       session, expected_runtime->run_admission_ordinal, &current_runtime);
   if (status != NEO_POPULATION_STATUS_OK ||
-      !runtime_facts_equal_v2(current_runtime, *expected_runtime)) {
+      !RuntimeTraits::equal(current_runtime, *expected_runtime)) {
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
   }
+#if defined(__HIP_PLATFORM_AMD__)
+  const auto* native_build = neoethos::resident_search_hip_v1::
+      neoethos_hip_native_build_manifest_sha256_v1();
+  if (native_build == nullptr ||
+      std::memcmp(backend_identity_v3::build_identity(*generation_plan), native_build, 32) != 0 ||
+      std::memcmp(backend_identity_v3::build_identity(*scoring_plan), native_build, 32) != 0)
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+#endif
   std::size_t same_context_free = 0;
   std::size_t same_context_total = 0;
   // This is the sole free-memory snapshot for both device stores.
-  if (cudaMemGetInfo(&same_context_free, &same_context_total) != cudaSuccess) {
+  if (!RuntimeTraits::snapshot(*expected_runtime, &same_context_free, &same_context_total)) {
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
   }
   NeoResidentGenerationAllocationReceiptV1 generation{};
-  status = calculate_resident_generation_allocation_v2(
-      generation_plan, session->stream, same_context_free,
+  status = calculate_resident_generation_allocation_v3(
+      generation_plan, adaptive_policy, session->stream, same_context_free,
       expected_runtime->allocator_context_reserve_bytes, &generation);
   if (status != NEO_RESIDENT_STATUS_OK_V1) {
     return status;
@@ -3966,7 +4401,7 @@ neoethos_gpu_cuda_population_query_resident_search_combined_v2(
     return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
   }
   *admission = {};
-  admission->abi_version = NEO_RESIDENT_SEARCH_GENERATION_ABI_V2;
+  admission->abi_version = RuntimeTraits::abi;
   admission->free_memory_snapshot_count = 1u;
   admission->generation_allocation_count = 1u;
   admission->scoring_allocation_count = 1u;
@@ -3974,23 +4409,162 @@ neoethos_gpu_cuda_population_query_resident_search_combined_v2(
   admission->terminal_host_receipt_bytes =
       sizeof(neoethos::resident_generation_v2::
                  NeoResidentSearchTerminalReceiptV2);
-  admission->same_context_free_bytes = same_context_free;
-  admission->same_context_total_bytes = same_context_total;
+  RuntimeTraits::free_bytes(*admission) = same_context_free;
+  RuntimeTraits::total_bytes(*admission) = same_context_total;
   admission->full_discovery_reserve_bytes =
       expected_runtime->allocator_context_reserve_bytes;
   admission->generation_device_bytes = generation.total_device_bytes;
   admission->scoring_device_bytes = scoring.total_device_bytes;
   admission->total_device_bytes = total_device_bytes;
   admission->pool_reserved_current_bytes =
-      expected_runtime->pool_reserved_current_bytes;
+      RuntimeTraits::pool_reserved(*expected_runtime);
   admission->pool_used_current_bytes =
-      expected_runtime->pool_used_current_bytes;
+      RuntimeTraits::pool_used(*expected_runtime);
   admission->runtime = *expected_runtime;
   admission->generation = generation;
   admission->scoring = scoring;
   return NEO_POPULATION_STATUS_OK;
 }
+#if !defined(__HIP_PLATFORM_AMD__)
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_query_resident_search_combined_adaptive_v3(
+    void* opaque_session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
+        generation_plan,
+    const neoethos::resident_generation_v1::NeoResidentAdaptivePolicyV3*
+        adaptive_policy,
+    const neoethos::resident_scoring_novelty_v1::
+        NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const neoethos::resident_search_generation_v2::
+        NeoResidentSearchRuntimeFactsV2* expected_runtime,
+    neoethos::resident_search_generation_v2::
+        NeoResidentSearchCombinedAdmissionV2* admission) {
+  return query_resident_search_combined_impl_v3(opaque_session, generation_plan, adaptive_policy,
+      scoring_plan, expected_runtime, admission);
+}
+#endif
 
+
+#if !defined(__HIP_PLATFORM_AMD__)
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_query_resident_search_combined_v2(
+    void* opaque_session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
+        generation_plan,
+    const neoethos::resident_scoring_novelty_v1::
+        NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const neoethos::resident_search_generation_v2::
+        NeoResidentSearchRuntimeFactsV2* expected_runtime,
+    neoethos::resident_search_generation_v2::
+        NeoResidentSearchCombinedAdmissionV2* admission) {
+  return neoethos_gpu_cuda_population_query_resident_search_combined_adaptive_v3(
+      opaque_session, generation_plan, nullptr, scoring_plan, expected_runtime,
+      admission);
+}
+#endif
+
+template <class Runtime>
+static std::int32_t query_resident_search_slice2_impl_v3(
+    void* opaque_session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
+        generation_plan,
+    const neoethos::resident_generation_v1::NeoResidentAdaptivePolicyV3*
+        adaptive_policy,
+    const neoethos::resident_scoring_novelty_v1::
+        NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const Runtime* expected_runtime,
+    const neoethos::resident_archive_knn_v2::NeoResidentArchiveKnnBindV2*
+        binding,
+    typename ResidentRuntimeTraitsV3<Runtime>::Admission* admission) {
+  using RuntimeTraits = ResidentRuntimeTraitsV3<Runtime>;
+  using namespace neoethos::resident_scoring_novelty_v1;
+  using namespace neoethos::resident_search_generation_v2;
+  auto* session = static_cast<NeoCudaPopulationSession*>(opaque_session);
+  if (session == nullptr) {
+    return NEO_POPULATION_STATUS_NULL_SESSION;
+  }
+  if (binding == nullptr || admission == nullptr) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+#if defined(__HIP_PLATFORM_AMD__)
+  if (!neoethos::resident_search_hip_v1::validate_population_owner_v1(
+          session, *binding, session->stream))
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+#endif
+  std::int32_t status =
+      query_resident_search_combined_impl_v3(
+          opaque_session, generation_plan, adaptive_policy, scoring_plan,
+          expected_runtime, admission);
+  if (status != NEO_POPULATION_STATUS_OK) {
+    return status;
+  }
+  NeoResidentScoringAdmissionV2 scoring_admission{};
+  scoring_admission.abi_version = NEO_RESIDENT_SCORING_ADMISSION_ABI_V3;
+  backend_identity_v3::selected_device_ordinal(scoring_admission) =
+      RuntimeTraits::device(admission->runtime);
+  scoring_admission.admitted_run_stream =
+      RuntimeTraits::stream(admission->runtime);
+  scoring_admission.full_discovery_reserve_bytes =
+      admission->full_discovery_reserve_bytes;
+  std::memcpy(backend_identity_v3::device_identity(scoring_admission),
+              backend_identity_v3::device_identity(*scoring_plan), 32);
+  std::memcpy(backend_identity_v3::owner_identity(scoring_admission),
+              backend_identity_v3::owner_identity(*scoring_plan), 32);
+  std::memcpy(scoring_admission.run_stream_identity_sha256,
+              scoring_plan->run_stream_identity_sha256, 32);
+  NeoResidentScoringNoveltyAllocationReceiptV1 scoring{};
+  status = neoethos::resident_scoring_novelty_v2_internal::
+      query_slice2_combined_scoring_archive_run_v2(
+          &scoring_admission, scoring_plan, binding,
+          RuntimeTraits::free_bytes(*admission), &scoring);
+  if (status != NEO_SCORING_STATUS_OK_V1) {
+    *admission = {};
+    return population_status_from_scoring_v2(status);
+  }
+  if (admission->generation_device_bytes >
+      UINT64_MAX - scoring.total_device_bytes) {
+    *admission = {};
+    return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
+  }
+  const std::uint64_t total_device_bytes =
+      admission->generation_device_bytes + scoring.total_device_bytes;
+  if (admission->full_discovery_reserve_bytes >
+          RuntimeTraits::free_bytes(*admission) ||
+      total_device_bytes > RuntimeTraits::free_bytes(*admission) -
+                               admission->full_discovery_reserve_bytes) {
+    *admission = {};
+    return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
+  }
+  admission->scoring = scoring;
+  admission->scoring_device_bytes = scoring.total_device_bytes;
+  admission->total_device_bytes = total_device_bytes;
+  session->resident_search_slice2_binding_v3 = *binding;
+  session->resident_search_slice2_binding_sealed_v3 = true;
+  return NEO_POPULATION_STATUS_OK;
+}
+#if !defined(__HIP_PLATFORM_AMD__)
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_query_resident_search_slice2_adaptive_v3(
+    void* opaque_session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
+        generation_plan,
+    const neoethos::resident_generation_v1::NeoResidentAdaptivePolicyV3*
+        adaptive_policy,
+    const neoethos::resident_scoring_novelty_v1::
+        NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const neoethos::resident_search_generation_v2::
+        NeoResidentSearchRuntimeFactsV2* expected_runtime,
+    const neoethos::resident_archive_knn_v2::NeoResidentArchiveKnnBindV2*
+        binding,
+    neoethos::resident_search_generation_v2::
+        NeoResidentSearchCombinedAdmissionV2* admission) {
+  return query_resident_search_slice2_impl_v3(opaque_session, generation_plan, adaptive_policy,
+      scoring_plan, expected_runtime, binding, admission);
+}
+#endif
+
+
+#if !defined(__HIP_PLATFORM_AMD__)
 extern "C" std::int32_t
 neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
     void* opaque_session,
@@ -4004,80 +4578,28 @@ neoethos_gpu_cuda_population_query_resident_search_slice2_v3(
         binding,
     neoethos::resident_search_generation_v2::
         NeoResidentSearchCombinedAdmissionV2* admission) {
-  using namespace neoethos::resident_scoring_novelty_v1;
-  using namespace neoethos::resident_search_generation_v2;
-  auto* session = static_cast<NeoCudaPopulationSession*>(opaque_session);
-  if (session == nullptr) {
-    return NEO_POPULATION_STATUS_NULL_SESSION;
-  }
-  if (binding == nullptr || admission == nullptr) {
-    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
-  }
-  std::int32_t status =
-      neoethos_gpu_cuda_population_query_resident_search_combined_v2(
-          opaque_session, generation_plan, scoring_plan, expected_runtime,
-          admission);
-  if (status != NEO_POPULATION_STATUS_OK) {
-    return status;
-  }
-  NeoResidentScoringAdmissionV2 scoring_admission{};
-  scoring_admission.abi_version = 2u;
-  scoring_admission.selected_cuda_ordinal =
-      admission->runtime.selected_cuda_ordinal;
-  scoring_admission.admitted_run_stream =
-      admission->runtime.admitted_run_stream;
-  scoring_admission.full_discovery_reserve_bytes =
-      admission->full_discovery_reserve_bytes;
-  std::memcpy(scoring_admission.cuda_device_identity_sha256,
-              scoring_plan->cuda_device_identity_sha256, 32);
-  std::memcpy(scoring_admission.primary_context_identity_sha256,
-              scoring_plan->primary_context_identity_sha256, 32);
-  std::memcpy(scoring_admission.run_stream_identity_sha256,
-              scoring_plan->run_stream_identity_sha256, 32);
-  NeoResidentScoringNoveltyAllocationReceiptV1 scoring{};
-  status = neoethos::resident_scoring_novelty_v2_internal::
-      query_slice2_combined_scoring_archive_run_v2(
-          &scoring_admission, scoring_plan, binding,
-          admission->same_context_free_bytes, &scoring);
-  if (status != NEO_SCORING_STATUS_OK_V1) {
-    *admission = {};
-    return population_status_from_scoring_v2(status);
-  }
-  if (admission->generation_device_bytes >
-      UINT64_MAX - scoring.total_device_bytes) {
-    *admission = {};
-    return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
-  }
-  const std::uint64_t total_device_bytes =
-      admission->generation_device_bytes + scoring.total_device_bytes;
-  if (admission->full_discovery_reserve_bytes >
-          admission->same_context_free_bytes ||
-      total_device_bytes > admission->same_context_free_bytes -
-                               admission->full_discovery_reserve_bytes) {
-    *admission = {};
-    return NEO_POPULATION_STATUS_ALLOCATION_FAILED;
-  }
-  admission->scoring = scoring;
-  admission->scoring_device_bytes = scoring.total_device_bytes;
-  admission->total_device_bytes = total_device_bytes;
-  session->resident_search_slice2_binding_v3 = *binding;
-  session->resident_search_slice2_binding_sealed_v3 = true;
-  return NEO_POPULATION_STATUS_OK;
+  return neoethos_gpu_cuda_population_query_resident_search_slice2_adaptive_v3(
+      opaque_session, generation_plan, nullptr, scoring_plan, expected_runtime,
+      binding, admission);
 }
+#endif
 
+template <class Runtime>
 static std::int32_t create_resident_search_combined_impl_v3(
     void* opaque_session,
     const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
         generation_plan,
+    const neoethos::resident_generation_v1::NeoResidentAdaptivePolicyV3*
+        adaptive_policy,
     const neoethos::resident_scoring_novelty_v1::
         NeoResidentScoringNoveltyPlanV1* scoring_plan,
-    const neoethos::resident_search_generation_v2::
-        NeoResidentSearchCombinedAdmissionV2* admission,
+    const typename ResidentRuntimeTraitsV3<Runtime>::Admission* admission,
     const neoethos::resident_archive_knn_v2::NeoResidentArchiveKnnBindV2*
         slice2_binding,
     neoethos::resident_generation_v1::NeoResidentGenerationRunV1** generation,
     neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1**
         scoring) {
+  using RuntimeTraits = ResidentRuntimeTraitsV3<Runtime>;
   using namespace neoethos::resident_generation_v1;
   using namespace neoethos::resident_generation_v2;
   using namespace neoethos::resident_scoring_novelty_v1;
@@ -4097,7 +4619,7 @@ static std::int32_t create_resident_search_combined_impl_v3(
       session->generation_ready_event_v2 != nullptr ||
       session->scoring_ready_event_v2 != nullptr ||
       session->resident_search_terminal_host_receipt_v2 != nullptr ||
-      admission->abi_version != NEO_RESIDENT_SEARCH_GENERATION_ABI_V2 ||
+      admission->abi_version != RuntimeTraits::abi ||
       admission->flags != 0u || admission->free_memory_snapshot_count != 1u ||
       admission->generation_allocation_count != 1u ||
       admission->scoring_allocation_count != 1u ||
@@ -4115,16 +4637,38 @@ static std::int32_t create_resident_search_combined_impl_v3(
           admission->runtime.allocator_context_reserve_bytes ||
       !bytes_nonzero_v2(admission->receipt_identity_sha256,
                         sizeof(admission->receipt_identity_sha256)) ||
-      !runtime_facts_equal_v2(session->resident_search_runtime_facts_v2,
+      !RuntimeTraits::equal(RuntimeTraits::stored(session),
                               admission->runtime)) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
-  NeoResidentSearchRuntimeFactsV2 current_runtime{};
-  std::int32_t status = read_resident_search_runtime_facts_v2(
+  Runtime current_runtime{};
+  std::int32_t status = RuntimeTraits::revalidate(
       session, admission->runtime.run_admission_ordinal, &current_runtime);
   if (status != NEO_POPULATION_STATUS_OK ||
-      !runtime_facts_equal_v2(current_runtime, admission->runtime)) {
+      !RuntimeTraits::equal(current_runtime, admission->runtime)) {
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  }
+#if defined(__HIP_PLATFORM_AMD__)
+  const auto* native_build = neoethos::resident_search_hip_v1::
+      neoethos_hip_native_build_manifest_sha256_v1();
+  if (native_build == nullptr ||
+      std::memcmp(backend_identity_v3::build_identity(*generation_plan), native_build, 32) != 0 ||
+      std::memcmp(backend_identity_v3::build_identity(*scoring_plan), native_build, 32) != 0)
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+#endif
+  // Recheck the exact admitted generation layout before any allocation. In
+  // adaptive mode this includes policy state, templates and seen-memory, not
+  // a post-create allocation outside the combined free-memory snapshot.
+  NeoResidentGenerationAllocationReceiptV1 expected_generation{};
+  const std::int32_t generation_preflight_status =
+      calculate_resident_generation_allocation_v3(
+          generation_plan, adaptive_policy, session->stream,
+          RuntimeTraits::free_bytes(*admission),
+          admission->full_discovery_reserve_bytes, &expected_generation);
+  if (generation_preflight_status != NEO_RESIDENT_STATUS_OK_V1 ||
+      std::memcmp(&expected_generation, &admission->generation,
+                  sizeof(expected_generation)) != 0) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
   if (slice2_binding != nullptr) {
     if (!session->resident_search_slice2_binding_sealed_v3 ||
@@ -4133,17 +4677,17 @@ static std::int32_t create_resident_search_combined_impl_v3(
       return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
     }
     NeoResidentScoringAdmissionV2 preflight_scoring{};
-    preflight_scoring.abi_version = 2u;
-    preflight_scoring.selected_cuda_ordinal =
-        admission->runtime.selected_cuda_ordinal;
+    preflight_scoring.abi_version = NEO_RESIDENT_SCORING_ADMISSION_ABI_V3;
+    backend_identity_v3::selected_device_ordinal(preflight_scoring) =
+        RuntimeTraits::device(admission->runtime);
     preflight_scoring.admitted_run_stream =
-        admission->runtime.admitted_run_stream;
+        RuntimeTraits::stream(admission->runtime);
     preflight_scoring.full_discovery_reserve_bytes =
         admission->full_discovery_reserve_bytes;
-    std::memcpy(preflight_scoring.cuda_device_identity_sha256,
-                scoring_plan->cuda_device_identity_sha256, 32);
-    std::memcpy(preflight_scoring.primary_context_identity_sha256,
-                scoring_plan->primary_context_identity_sha256, 32);
+    std::memcpy(backend_identity_v3::device_identity(preflight_scoring),
+                backend_identity_v3::device_identity(*scoring_plan), 32);
+    std::memcpy(backend_identity_v3::owner_identity(preflight_scoring),
+                backend_identity_v3::owner_identity(*scoring_plan), 32);
     std::memcpy(preflight_scoring.run_stream_identity_sha256,
                 scoring_plan->run_stream_identity_sha256, 32);
     NeoResidentScoringNoveltyAllocationReceiptV1 expected_scoring{};
@@ -4151,7 +4695,7 @@ static std::int32_t create_resident_search_combined_impl_v3(
         neoethos::resident_scoring_novelty_v2_internal::
             query_slice2_combined_scoring_archive_run_v2(
                 &preflight_scoring, scoring_plan, slice2_binding,
-                admission->same_context_free_bytes, &expected_scoring);
+                RuntimeTraits::free_bytes(*admission), &expected_scoring);
     if (preflight_status != NEO_SCORING_STATUS_OK_V1 ||
         std::memcmp(&expected_scoring, &admission->scoring,
                     sizeof(expected_scoring)) != 0) {
@@ -4225,7 +4769,7 @@ static std::int32_t create_resident_search_combined_impl_v3(
     *scoring = nullptr;
     if (cleanup_complete && !stream_state_unknown) {
       session->resident_search_runtime_reserved_v2 = false;
-      session->resident_search_runtime_facts_v2 = {};
+      RuntimeTraits::stored(session) = {};
       session->strict_execution_state =
           PopulationStrictExecutionStateV1::StrictIdle;
       return primary_status;
@@ -4276,26 +4820,26 @@ static std::int32_t create_resident_search_combined_impl_v3(
   }
   NeoResidentGenerationPopulationSessionImportV1 generation_import{};
   generation_import.abi_version = NEO_RESIDENT_GENERATION_ABI_V1;
-  generation_import.selected_cuda_ordinal =
-      admission->runtime.selected_cuda_ordinal;
+  backend_identity_v3::selected_device_ordinal(generation_import) =
+      RuntimeTraits::device(admission->runtime);
   generation_import.admitted_run_stream = session->stream;
   generation_import.resident_parent_ready_event = session->event;
   generation_import.generation_ready_event = created_generation_ready_event;
   generation_import.population_lifetime_owner = session;
   generation_import.full_discovery_reserve_bytes =
       admission->full_discovery_reserve_bytes;
-  std::memcpy(generation_import.cuda_device_identity_sha256,
-              scoring_plan->cuda_device_identity_sha256, 32);
-  std::memcpy(generation_import.primary_context_identity_sha256,
-              scoring_plan->primary_context_identity_sha256, 32);
+  std::memcpy(backend_identity_v3::device_identity(generation_import),
+              backend_identity_v3::device_identity(*scoring_plan), 32);
+  std::memcpy(backend_identity_v3::owner_identity(generation_import),
+              backend_identity_v3::owner_identity(*scoring_plan), 32);
   std::memcpy(generation_import.run_stream_identity_sha256,
               scoring_plan->run_stream_identity_sha256, 32);
-  std::memcpy(generation_import.cuda_build_manifest_sha256,
-              generation_plan->cuda_build_manifest_sha256, 32);
+  std::memcpy(backend_identity_v3::build_identity(generation_import),
+              backend_identity_v3::build_identity(*generation_plan), 32);
   std::memcpy(generation_import.resident_input_content_sha256,
               generation_plan->strategy_gene_schema_sha256, 32);
-  status = create_resident_generation_run_from_import_v1(
-      &generation_import, generation_plan, &admission->generation,
+  status = create_resident_generation_run_from_import_v3(
+      &generation_import, generation_plan, adaptive_policy, &admission->generation,
       &created_generation);
   if (status != NEO_RESIDENT_STATUS_OK_V1) {
     const bool stream_state_unknown =
@@ -4312,18 +4856,18 @@ static std::int32_t create_resident_search_combined_impl_v3(
     return unwind_combined_create(status, false);
   }
   NeoResidentScoringAdmissionV2 scoring_admission{};
-  scoring_admission.abi_version = 2u;
-  scoring_admission.selected_cuda_ordinal =
-      admission->runtime.selected_cuda_ordinal;
+  scoring_admission.abi_version = NEO_RESIDENT_SCORING_ADMISSION_ABI_V3;
+  backend_identity_v3::selected_device_ordinal(scoring_admission) =
+      RuntimeTraits::device(admission->runtime);
   scoring_admission.admitted_run_stream = session->stream;
   scoring_admission.scoring_novelty_ready_event =
       created_scoring_ready_event;
   scoring_admission.full_discovery_reserve_bytes =
       admission->full_discovery_reserve_bytes;
-  std::memcpy(scoring_admission.cuda_device_identity_sha256,
-              scoring_plan->cuda_device_identity_sha256, 32);
-  std::memcpy(scoring_admission.primary_context_identity_sha256,
-              scoring_plan->primary_context_identity_sha256, 32);
+  std::memcpy(backend_identity_v3::device_identity(scoring_admission),
+              backend_identity_v3::device_identity(*scoring_plan), 32);
+  std::memcpy(backend_identity_v3::owner_identity(scoring_admission),
+              backend_identity_v3::owner_identity(*scoring_plan), 32);
   std::memcpy(scoring_admission.run_stream_identity_sha256,
               scoring_plan->run_stream_identity_sha256, 32);
   status = slice2_binding == nullptr
@@ -4352,12 +4896,48 @@ static std::int32_t create_resident_search_combined_impl_v3(
   *scoring = created_scoring;
   session->resident_planned_population_v2 =
       static_cast<int>(generation_plan->logical_population_count);
+  session->resident_retained_evaluation_capacity_v3 =
+      static_cast<int>(generation_plan->retained_evaluation_capacity);
   session->population = session->resident_planned_population_v2;
   session->resident_search_slice2_binding_sealed_v3 = false;
   session->resident_search_slice2_binding_v3 = {};
   return NEO_POPULATION_STATUS_OK;
 }
+#if defined(__HIP_PLATFORM_AMD__)
+extern "C" std::int32_t
+neoethos::resident_search_hip_v1::neoethos_hip_population_query_resident_search_v1(
+    void* session,
+    const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
+    const resident_generation_v1::NeoResidentAdaptivePolicyV3* adaptive_policy,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const NeoResidentSearchHipRuntimeFactsV1* runtime,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
+    NeoResidentSearchHipCombinedAdmissionV1* admission) {
+  return binding == nullptr
+      ? query_resident_search_combined_impl_v3(session, generation_plan,
+            adaptive_policy, scoring_plan, runtime, admission)
+      : query_resident_search_slice2_impl_v3(session, generation_plan,
+            adaptive_policy, scoring_plan, runtime, binding, admission);
+}
 
+extern "C" std::int32_t
+neoethos::resident_search_hip_v1::neoethos_hip_population_create_resident_search_v1(
+    void* session,
+    const resident_generation_v1::NeoResidentGenerationPlanV1* generation_plan,
+    const resident_generation_v1::NeoResidentAdaptivePolicyV3* adaptive_policy,
+    const resident_scoring_novelty_v1::NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const NeoResidentSearchHipCombinedAdmissionV1* admission,
+    const resident_archive_knn_v2::NeoResidentArchiveKnnBindV2* binding,
+    resident_generation_v1::NeoResidentGenerationRunV1** generation,
+    resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1** scoring) {
+  return create_resident_search_combined_impl_v3<NeoResidentSearchHipRuntimeFactsV1>(
+      session, generation_plan, adaptive_policy, scoring_plan, admission,
+      binding, generation, scoring);
+}
+#endif
+
+
+#if !defined(__HIP_PLATFORM_AMD__)
 extern "C" std::int32_t
 neoethos_gpu_cuda_population_create_resident_search_combined_v2(
     void* opaque_session,
@@ -4370,11 +4950,14 @@ neoethos_gpu_cuda_population_create_resident_search_combined_v2(
     neoethos::resident_generation_v1::NeoResidentGenerationRunV1** generation,
     neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1**
         scoring) {
-  return create_resident_search_combined_impl_v3(
-      opaque_session, generation_plan, scoring_plan, admission, nullptr,
+  return create_resident_search_combined_impl_v3<
+      neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2>(
+      opaque_session, generation_plan, nullptr, scoring_plan, admission, nullptr,
       generation, scoring);
 }
+#endif
 
+#if !defined(__HIP_PLATFORM_AMD__)
 extern "C" std::int32_t
 neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
     void* opaque_session,
@@ -4392,10 +4975,61 @@ neoethos_gpu_cuda_population_create_resident_search_slice2_v3(
   if (binding == nullptr) {
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
-  return create_resident_search_combined_impl_v3(
-      opaque_session, generation_plan, scoring_plan, admission, binding,
+  return create_resident_search_combined_impl_v3<
+      neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2>(
+      opaque_session, generation_plan, nullptr, scoring_plan, admission, binding,
       generation, scoring);
 }
+#endif
+
+#if !defined(__HIP_PLATFORM_AMD__)
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_create_resident_search_combined_adaptive_v3(
+    void* opaque_session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
+        generation_plan,
+    const neoethos::resident_generation_v1::NeoResidentAdaptivePolicyV3*
+        adaptive_policy,
+    const neoethos::resident_scoring_novelty_v1::
+        NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const neoethos::resident_search_generation_v2::
+        NeoResidentSearchCombinedAdmissionV2* admission,
+    neoethos::resident_generation_v1::NeoResidentGenerationRunV1** generation,
+    neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1**
+        scoring) {
+  return create_resident_search_combined_impl_v3<
+      neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2>(
+      opaque_session, generation_plan, adaptive_policy, scoring_plan, admission,
+      nullptr, generation, scoring);
+}
+#endif
+
+#if !defined(__HIP_PLATFORM_AMD__)
+extern "C" std::int32_t
+neoethos_gpu_cuda_population_create_resident_search_slice2_adaptive_v3(
+    void* opaque_session,
+    const neoethos::resident_generation_v1::NeoResidentGenerationPlanV1*
+        generation_plan,
+    const neoethos::resident_generation_v1::NeoResidentAdaptivePolicyV3*
+        adaptive_policy,
+    const neoethos::resident_scoring_novelty_v1::
+        NeoResidentScoringNoveltyPlanV1* scoring_plan,
+    const neoethos::resident_search_generation_v2::
+        NeoResidentSearchCombinedAdmissionV2* admission,
+    const neoethos::resident_archive_knn_v2::NeoResidentArchiveKnnBindV2*
+        binding,
+    neoethos::resident_generation_v1::NeoResidentGenerationRunV1** generation,
+    neoethos::resident_scoring_novelty_v1::NeoResidentScoringNoveltyRunV1**
+        scoring) {
+  if (binding == nullptr) {
+    return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
+  }
+  return create_resident_search_combined_impl_v3<
+      neoethos::resident_search_generation_v2::NeoResidentSearchRuntimeFactsV2>(
+      opaque_session, generation_plan, adaptive_policy, scoring_plan, admission,
+      binding, generation, scoring);
+}
+#endif
 
 extern "C" std::int32_t neoethos_gpu_cuda_population_create_resident_generation_run_v2(
     NeoCudaPopulationSession* session,
@@ -4439,16 +5073,16 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_create_resident_generation_
 
   NeoResidentGenerationPopulationSessionImportV1 import{};
   import.abi_version = NEO_RESIDENT_GENERATION_ABI_V1;
-  import.selected_cuda_ordinal = static_cast<std::uint32_t>(session->device);
+  backend_identity_v3::selected_device_ordinal(import) = static_cast<std::uint32_t>(session->device);
   import.admitted_run_stream = session->stream;
   import.resident_parent_ready_event = session->event;
   import.generation_ready_event = session->generation_ready_event_v2;
   import.population_lifetime_owner = session;
   import.full_discovery_reserve_bytes = 0;
-  std::memcpy(import.cuda_device_identity_sha256, plan->run_identity_sha256, 32);
-  std::memcpy(import.primary_context_identity_sha256, plan->plan_identity_sha256, 32);
+  std::memcpy(backend_identity_v3::device_identity(import), plan->run_identity_sha256, 32);
+  std::memcpy(backend_identity_v3::owner_identity(import), plan->plan_identity_sha256, 32);
   std::memcpy(import.run_stream_identity_sha256, plan->generation_semantics_sha256, 32);
-  std::memcpy(import.cuda_build_manifest_sha256, plan->cuda_build_manifest_sha256, 32);
+  std::memcpy(backend_identity_v3::build_identity(import), backend_identity_v3::build_identity(*plan), 32);
   std::memcpy(import.resident_input_content_sha256,
               plan->strategy_gene_schema_sha256, 32);
 
@@ -4477,6 +5111,8 @@ extern "C" std::int32_t neoethos_gpu_cuda_population_create_resident_generation_
   session->resident_generation_run_v2 = *run;
   session->resident_planned_population_v2 =
       static_cast<int>(plan->logical_population_count);
+  session->resident_retained_evaluation_capacity_v3 =
+      static_cast<int>(plan->retained_evaluation_capacity);
   session->population = session->resident_planned_population_v2;
   return NEO_POPULATION_STATUS_OK;
 }
@@ -4552,15 +5188,15 @@ neoethos_gpu_cuda_population_create_unbound_resident_scoring_run_v2(
     session->scoring_ready_event_v2 = attempted_scoring_ready_event;
   }
   NeoResidentScoringAdmissionV2 admission{};
-  admission.abi_version = 2u;
-  admission.selected_cuda_ordinal = static_cast<std::uint32_t>(session->device);
+  admission.abi_version = neoethos::resident_scoring_novelty_v1::NEO_RESIDENT_SCORING_ADMISSION_ABI_V3;
+  backend_identity_v3::selected_device_ordinal(admission) = static_cast<std::uint32_t>(session->device);
   admission.admitted_run_stream = session->stream;
   admission.scoring_novelty_ready_event = session->scoring_ready_event_v2;
   admission.full_discovery_reserve_bytes = 0;
-  std::memcpy(admission.cuda_device_identity_sha256,
-              plan->cuda_device_identity_sha256, 32);
-  std::memcpy(admission.primary_context_identity_sha256,
-              plan->primary_context_identity_sha256, 32);
+  std::memcpy(backend_identity_v3::device_identity(admission),
+              backend_identity_v3::device_identity(*plan), 32);
+  std::memcpy(backend_identity_v3::owner_identity(admission),
+              backend_identity_v3::owner_identity(*plan), 32);
   std::memcpy(admission.run_stream_identity_sha256,
               plan->run_stream_identity_sha256, 32);
   std::int32_t status =
@@ -4637,17 +5273,18 @@ neoethos_gpu_cuda_population_export_resident_scoring_source_v2(
       session->scoring_ready_event_v2 == nullptr ||
       session->metric_rows == nullptr || session->scenario_ids == nullptr ||
       expected_population == 0 || expected_population > INT_MAX ||
-      expected_population !=
-          static_cast<std::uint64_t>(session->workspace_scenarios) ||
-      expected_population !=
-          static_cast<std::uint64_t>(session->scenario_count) ||
+      (session->resident_canonical_base_scenarios_v3
+           ? (session->workspace_scenarios != session->resident_retained_evaluation_capacity_v3 ||
+              session->scenario_count != session->resident_retained_evaluation_capacity_v3)
+           : (expected_population != static_cast<std::uint64_t>(session->workspace_scenarios) ||
+              expected_population != static_cast<std::uint64_t>(session->scenario_count))) ||
       expected_population !=
           static_cast<std::uint64_t>(session->resident_planned_population_v2) ||
       expected_feature_count !=
           static_cast<std::uint64_t>(session->feature_count) ||
       expected_max_terms == 0 || expected_max_terms > expected_feature_count ||
       session->allocator_context_reserve_bytes_v3 == 0ull ||
-      resident_metrics->scenario_count != expected_population ||
+      resident_metrics->scenario_count != static_cast<std::uint64_t>(session->workspace_scenarios) ||
       resident_metrics->event_id != session->pending_event_id) {
     session->strict_execution_state =
         PopulationStrictExecutionStateV1::Poisoned;
@@ -4655,13 +5292,27 @@ neoethos_gpu_cuda_population_export_resident_scoring_source_v2(
   }
   std::memset(source, 0, sizeof(*source));
   source->abi_version = NEO_RESIDENT_SEARCH_GENERATION_ABI_V2;
-  source->selected_cuda_ordinal = static_cast<std::uint32_t>(session->device);
+  backend_identity_v3::selected_device_ordinal(*source) = static_cast<std::uint32_t>(session->device);
   source->admitted_run_stream = session->stream;
   source->metrics_ready_event = session->event;
   source->scoring_ready_event = session->scoring_ready_event_v2;
   source->receipt_token = resident_metrics;
   source->population_lifetime_owner = session;
-  source->metric_rows_device = session->metric_rows;
+  const neoethos::resident_generation_v1::NeoResidentGenerationMetricRowV1* retained_rows = nullptr;
+  const std::uint64_t* retained_scenario_ids = nullptr;
+  if (session->resident_canonical_base_scenarios_v3) {
+    const std::int32_t status = neoethos::resident_generation_v2_internal::
+        export_resident_generation_metrics_v3(
+            session->resident_generation_run_v2, &session->resident_metrics_view_v3,
+            session->stream, &retained_rows, &retained_scenario_ids);
+    if (status != neoethos::resident_generation_v1::NEO_RESIDENT_STATUS_OK_V1) {
+      session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+      return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
+    }
+  }
+  // Generation aliases the exact metrics-only row ABI, not a second schema.
+  source->metric_rows_device = session->resident_canonical_base_scenarios_v3
+      ? retained_rows : session->metric_rows;
   static_assert(CHAR_BIT == 8);
   static_assert(sizeof(unsigned long long) == sizeof(std::uint64_t));
   static_assert(alignof(unsigned long long) == alignof(std::uint64_t));
@@ -4669,8 +5320,8 @@ neoethos_gpu_cuda_population_export_resident_scoring_source_v2(
   // The allocation is raw CUDA storage written as unsigned 64-bit scenario
   // identities. Linux names the two equal representations differently, so the
   // one authority cast lives only at this private ABI bridge.
-  source->expected_scenario_ids_device =
-      reinterpret_cast<const std::uint64_t*>(session->scenario_ids);
+  source->expected_scenario_ids_device = session->resident_canonical_base_scenarios_v3
+      ? retained_scenario_ids : reinterpret_cast<const std::uint64_t*>(session->scenario_ids);
   source->logical_population_count = expected_population;
   source->feature_count = expected_feature_count;
   source->max_terms_per_gene = expected_max_terms;
@@ -4780,7 +5431,7 @@ std::int32_t ensure_compatibility_workspace_v1(NeoCudaPopulationSession* session
                           session->accepted_trade_total == nullptr;
   if (incomplete || session->month_capacity != month_capacity ||
       session->workspace_scenarios < scenario_count) {
-    session->release_workspace();
+    if (!session->release_workspace()) return NEO_POPULATION_STATUS_LAUNCH_FAILED;
     std::int32_t status = NEO_POPULATION_STATUS_OK;
     const auto guard = [&](std::int32_t code) {
       if (code != NEO_POPULATION_STATUS_OK) {
@@ -4794,7 +5445,7 @@ std::int32_t ensure_compatibility_workspace_v1(NeoCudaPopulationSession* session
         !guard(device_alloc(&session->month_start_equities, scenarios * months)) ||
         !guard(device_alloc(&session->metric_rows, scenarios)) ||
         !guard(device_alloc(&session->accepted_trade_total, 1))) {
-      session->release_workspace();
+      if (!session->release_workspace()) return status; // First allocation error wins.
       return status;
     }
     session->month_capacity = month_capacity;
@@ -4832,7 +5483,7 @@ std::int32_t ensure_metrics_only_workspace_v1(NeoCudaPopulationSession* session,
     // update; rebuild the same metrics-only workspace at the new exact extent.
     // release_workspace deliberately retains StrictMetricsOnly mode, so this
     // cannot relabel compatibility allocations or introduce outcome storage.
-    session->release_workspace();
+    if (!session->release_workspace()) return NEO_POPULATION_STATUS_LAUNCH_FAILED;
   }
   if (session->monthly_pnls != nullptr || session->month_start_equities != nullptr ||
       session->outcomes != nullptr || session->accepted_trade_total != nullptr ||
@@ -4855,7 +5506,7 @@ std::int32_t ensure_metrics_only_workspace_v1(NeoCudaPopulationSession* session,
   if (!guard(device_alloc(&session->monthly_pnls, scenarios * months)) ||
       !guard(device_alloc(&session->month_start_equities, scenarios * months)) ||
       !guard(device_alloc(&session->metric_rows, scenarios))) {
-    session->release_workspace();
+    if (!session->release_workspace()) return status; // First allocation error wins.
     return status;
   }
   session->month_capacity = month_capacity;
@@ -4880,6 +5531,7 @@ std::int32_t enqueue_population_evaluation_v1(
     return strict_population_host_boundary_status_v1(session);
   }
   const bool resident_gene_mode = resident_genes_v2 != nullptr;
+  const bool canonical_base_chunks = session->resident_canonical_base_scenarios_v3;
   const auto* resident_control_v2 =
       resident_gene_mode ? resident_genes_v2->control_device : nullptr;
   if (settings == nullptr ||
@@ -4891,6 +5543,14 @@ std::int32_t enqueue_population_evaluation_v1(
   if (!session->has_dataset || !session->has_scenarios ||
       (!resident_gene_mode && !session->has_genes)) {
     return NEO_POPULATION_STATUS_MISSING_UPLOAD;
+  }
+  if (canonical_base_chunks &&
+      (!resident_gene_mode || mode != PopulationEvaluationModeV1::StrictMetricsOnly ||
+       session->resident_retained_evaluation_capacity_v3 <= 0 ||
+       session->scenario_count != session->resident_retained_evaluation_capacity_v3 ||
+       session->resident_retained_evaluation_capacity_v3 > session->population ||
+       session->resident_canonical_base_rows_v3 != session->bars)) {
+    return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
   }
   if (resident_gene_mode) {
     if (mode != PopulationEvaluationModeV1::StrictMetricsOnly ||
@@ -5012,17 +5672,72 @@ std::int32_t enqueue_population_evaluation_v1(
     if (resident_plan.scenario_descriptor_bytes != session->scenario_upload_bytes) {
       return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
     }
+    if (canonical_base_chunks) {
+      const std::int32_t status = neoethos::resident_generation_v2_internal::
+          begin_resident_generation_metrics_v3(
+              session->resident_generation_run_v2, resident_genes_v2, session->stream);
+      if (status != neoethos::resident_generation_v1::NEO_RESIDENT_STATUS_OK_V1) {
+        return NEO_POPULATION_STATUS_WORKSPACE_PLAN_MISMATCH;
+      }
+    }
     session->strict_execution_state = PopulationStrictExecutionStateV1::InFlight;
     population_gap_flags_kernel<<<gap_blocks == 0u ? 1u : gap_blocks, 256, 0,
                                   session->stream>>>(dataset, *settings, session->gap_flags);
     session->kernel_submissions += 1;
-    population_reduce_kernel<<<reduce_blocks == 0u ? 1u : reduce_blocks, reduce_block, 0,
-                               session->stream>>>(dataset, genes, scenario_view, *settings,
-                                                  session->gap_flags, nullptr,
-                                                  session->monthly_pnls,
-                                                  session->month_start_equities,
-                                                  session->metric_rows, nullptr);
-    session->kernel_submissions += 1;
+    if (canonical_base_chunks) {
+      if (cudaGetLastError() != cudaSuccess) {
+        session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+        return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+      }
+      const std::uint64_t population = static_cast<std::uint64_t>(session->population);
+      const std::uint64_t capacity = static_cast<std::uint64_t>(scenario_count);
+      for (std::uint64_t logical_offset = 0; logical_offset < population;) {
+        const std::uint64_t remaining = population - logical_offset;
+        const std::uint64_t active_count = remaining < capacity ? remaining : capacity;
+        const unsigned int blocks = static_cast<unsigned int>((active_count + 255ull) / 256ull);
+        resident_base_scenario_ids_kernel_v3<<<blocks, 256, 0, session->stream>>>(
+            session->scenario_base_candidate_ids, session->scenario_ids, logical_offset, active_count);
+        ++session->kernel_submissions;
+        if (cudaGetLastError() != cudaSuccess) {
+          session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+          return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+        }
+        DeviceScenarios active_scenarios = scenario_view;
+        active_scenarios.count = static_cast<int>(active_count);
+        const unsigned int active_blocks = static_cast<unsigned int>(
+            (active_count + static_cast<std::uint64_t>(reduce_block) - 1ull) / reduce_block);
+        population_reduce_kernel<<<active_blocks, reduce_block, 0, session->stream>>>(
+            dataset, genes, active_scenarios, *settings, session->gap_flags, nullptr,
+            session->monthly_pnls, session->month_start_equities, session->metric_rows, nullptr);
+        ++session->kernel_submissions;
+        if (cudaGetLastError() != cudaSuccess) {
+          session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+          return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+        }
+        const std::int32_t status = neoethos::resident_generation_v2_internal::
+            append_resident_generation_metrics_v3(
+                session->resident_generation_run_v2, resident_genes_v2, session->stream,
+                logical_offset, active_count,
+                session->metric_rows,
+                reinterpret_cast<const std::uint64_t*>(session->scenario_ids));
+        if (status != neoethos::resident_generation_v1::NEO_RESIDENT_STATUS_OK_V1) {
+          session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+          return NEO_POPULATION_STATUS_LAUNCH_FAILED;
+        }
+        logical_offset += active_count;
+      }
+      session->resident_metrics_view_v3 = *resident_genes_v2;
+      // The source exporter consumes the full-coverage proof exactly once,
+      // after this function records the event behind every appended chunk.
+    } else {
+      population_reduce_kernel<<<reduce_blocks == 0u ? 1u : reduce_blocks, reduce_block, 0,
+                                 session->stream>>>(dataset, genes, scenario_view, *settings,
+                                                    session->gap_flags, nullptr,
+                                                    session->monthly_pnls,
+                                                    session->month_start_equities,
+                                                    session->metric_rows, nullptr);
+      session->kernel_submissions += 1;
+    }
   } else {
     if (session->workspace_mode == PopulationWorkspaceModeV1::StrictMetricsOnly) {
       return NEO_POPULATION_STATUS_WORKSPACE_MODE_MISMATCH;
@@ -5521,6 +6236,15 @@ neoethos_gpu_cuda_population_destroy_terminal_checked_v2(
     session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
     return NEO_POPULATION_STATUS_INVALID_ARGUMENT;
   }
+#if defined(__HIP_PLATFORM_AMD__)
+  if (!revalidate_hip_population_v1(session))
+    return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;
+  // Prove all owned-stream work retired before releasing imported Data pins.
+  if (cudaStreamSynchronize(session->stream) != cudaSuccess) {
+    session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
+    return NEO_POPULATION_STATUS_SYNC_FAILED;
+  }
+#endif
   if (cudaSetDevice(session->device) != cudaSuccess) {
     session->strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;
     return NEO_POPULATION_STATUS_DEVICE_UNAVAILABLE;

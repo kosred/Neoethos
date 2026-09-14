@@ -279,6 +279,18 @@ impl BatchSearchResult for DiscoveryResult {
     }
 }
 
+impl BatchSearchResult
+    for crate::canonical_trendbar_research::CanonicalTrendbarResearchDiscoveryResultV3
+{
+    fn local_feature_names(&self) -> &[String] {
+        &self.discovery_result().effective_feature_names
+    }
+
+    fn portfolio_genes(&self) -> &[Gene] {
+        &self.discovery_result().portfolio
+    }
+}
+
 /// Whether to stream, and for how long.
 ///
 /// The batch WIDTH is deliberately absent: it comes from
@@ -330,6 +342,15 @@ pub struct StreamingBatchSurvivor<R> {
     pub canonical_portfolio: Vec<Gene>,
 }
 
+/// A batch that completed its discovery cycle but produced no promotable
+/// survivor.  The result is retained because a ResearchOnly run must preserve
+/// the exact receipt-bound negative evidence as well as successful batches.
+pub struct StreamingBatchWithoutSurvivors<R> {
+    pub cursor: usize,
+    pub pairs: usize,
+    pub result: R,
+}
+
 /// Everything a streaming run produced, including everything it threw away.
 pub struct StreamingRunOutcome<R> {
     /// When `streamed` is true: the batches that produced survivors.
@@ -340,6 +361,9 @@ pub struct StreamingRunOutcome<R> {
     /// empty-portfolio guard is the one that fires. That is what keeps the
     /// non-streaming path byte-for-byte today's path.
     pub batches: Vec<StreamingBatchSurvivor<R>>,
+    /// Completed negative batches. Ordinary portfolio export may ignore these;
+    /// canonical research persists every one as its own exact evidence envelope.
+    pub completed_without_survivors: Vec<StreamingBatchWithoutSurvivors<R>>,
     pub canonical: CanonicalFeatureIndex,
     pub ledger: StreamingRunLedger,
     /// True only if at least one real working set was installed.
@@ -369,10 +393,24 @@ impl<R> std::fmt::Debug for StreamingBatchSurvivor<R> {
     }
 }
 
+impl<R> std::fmt::Debug for StreamingBatchWithoutSurvivors<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingBatchWithoutSurvivors")
+            .field("cursor", &self.cursor)
+            .field("pairs", &self.pairs)
+            .field("result", &format_args!("<{}>", std::any::type_name::<R>()))
+            .finish()
+    }
+}
+
 impl<R> std::fmt::Debug for StreamingRunOutcome<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamingRunOutcome")
             .field("batches", &self.batches)
+            .field(
+                "completed_without_survivors",
+                &self.completed_without_survivors,
+            )
             .field("canonical", &self.canonical)
             .field("ledger", &self.ledger)
             .field("streamed", &self.streamed)
@@ -440,7 +478,7 @@ fn assert_working_set_observed(
     batch: &neoethos_data::core::hpc_ta::SweepBatch,
     feature_names: &[String],
 ) -> Result<usize> {
-    if batch.pairs.is_empty() {
+    if batch.is_empty() {
         return Ok(0);
     }
     let name_segments: Vec<Vec<&str>> = feature_names
@@ -448,6 +486,15 @@ fn assert_working_set_observed(
         .map(|n| n.split('_').collect::<Vec<&str>>())
         .collect();
     let mut matched = 0usize;
+    for id in &batch.base_indicator_ids {
+        let stem_segments: Vec<&str> = id.split('_').collect();
+        if name_segments
+            .iter()
+            .any(|segments| column_addresses_stem(segments, &stem_segments))
+        {
+            matched += 1;
+        }
+    }
     for pair in &batch.pairs {
         let stem = format!("{}_{}", pair.id, pair.period);
         let stem_segments: Vec<&str> = stem.split('_').collect();
@@ -460,21 +507,29 @@ fn assert_working_set_observed(
     }
     if matched == 0 {
         let sample: Vec<String> = batch
-            .pairs
+            .base_indicator_ids
             .iter()
             .take(6)
-            .map(|p| format!("{}_{}", p.id, p.period))
+            .map(|id| (*id).to_string())
+            .chain(
+                batch
+                    .pairs
+                    .iter()
+                    .take(6)
+                    .map(|pair| format!("{}_{}", pair.id, pair.period)),
+            )
+            .take(6)
             .collect();
         bail!(
-            "streaming batch at cursor {} planned {} (indicator, period) pairs ({} columns) but \
+            "streaming batch at cursor {} planned {} base ids plus {} (indicator, period) pairs ({} columns) but \
              the feature build emitted NOT ONE column addressing ANY of them (frame has {} \
              columns; wanted e.g. {:?}). The working set was not observed by the build — either \
-             `neoethos_data::with_extended_sweep_working_set` / \
-             `prepare_multitimeframe_features_batch` was bypassed, or the sweep still takes the \
+             `neoethos_data::prepare_multitimeframe_features_batch` was bypassed, or the sweep still takes the \
              budget-capped prefix and ignores the installed batch. Refusing to continue: every \
              batch would compute the same columns and the run would report a sweep it never \
              performed.",
             batch.cursor,
+            batch.base_indicator_ids.len(),
             batch.pairs.len(),
             batch.planned_columns,
             feature_names.len(),
@@ -493,10 +548,10 @@ fn assert_working_set_observed(
 ///   is being built (per-TF widths must stay equal or the cube cannot be
 ///   assembled).
 /// * `build_features` — must route through
-///   `neoethos_data::prepare_multitimeframe_features_batch` (or
-///   `with_extended_sweep_working_set`) so the batch it is handed is actually
-///   installed. Handed `None` for the non-streaming pass, which that function
-///   documents as byte-identical to `prepare_multitimeframe_features`.
+///   `neoethos_data::prepare_multitimeframe_features_batch` so the immutable
+///   batch it is handed is captured by that build's run plan. Handed `None` for
+///   the non-streaming pass, which that function documents as byte-identical to
+///   `prepare_multitimeframe_features`.
 /// * `run_cycle` — one discovery cycle on the built frame.
 ///
 /// Failure policy, stated rather than implied:
@@ -626,6 +681,7 @@ where
     let mut canonical = CanonicalFeatureIndex::new();
     let mut ledger = StreamingRunLedger::new();
     let mut batches: Vec<StreamingBatchSurvivor<R>> = Vec::new();
+    let mut completed_without_survivors: Vec<StreamingBatchWithoutSurvivors<R>> = Vec::new();
 
     // The hardware probe + space enumeration happen ONLY when streaming was
     // asked for, so today's path does not acquire a new dependency on free-RAM
@@ -650,16 +706,16 @@ where
                 space_len,
                 budget_rows,
                 "streaming was requested but no working set could be sized (batch_columns == 0 \
-                 means free RAM affords no extension beyond the resident vocabulary; \
-                 space_len == 0 means the (indicator, period) space is empty). Falling back to \
+                 means free RAM affords no variable vocabulary beyond the resident historical \
+                 columns; space_len == 0 means the searchable base/period space is empty). Falling back to \
                  the single whole-vocabulary pass — nothing is lost, but this run did NOT sweep."
             );
         }
-        let rejected_before = crate::discovery::batch_rejection_ledger().batches_rejected;
         let payload = build_payload(None)?;
-        let result = run(payload)?;
-        let rejected_after = crate::discovery::batch_rejection_ledger().batches_rejected;
-        let predicate_fired = rejected_after > rejected_before;
+        let (result, batch_verdict) =
+            crate::discovery::with_streaming_batch_context(0, || run(payload));
+        let result = result?;
+        let predicate_fired = batch_verdict.is_some_and(|verdict| verdict.is_reject());
         let canonical_portfolio =
             canonical.remap_portfolio(result.portfolio_genes(), result.local_feature_names(), 0)?;
         let outcome = if plan.enabled {
@@ -714,6 +770,7 @@ where
         canonical.assert_indices_in_range(&all, "streaming_working_set run end")?;
         return Ok(StreamingRunOutcome {
             batches,
+            completed_without_survivors,
             canonical,
             ledger,
             streamed: false,
@@ -768,7 +825,6 @@ where
         let planned_columns = batch.planned_columns;
         ran += 1;
 
-        let rejected_before = crate::discovery::batch_rejection_ledger().batches_rejected;
         let payload = match build_payload(Some(Arc::clone(&batch))) {
             Ok(f) => f,
             Err(err) => {
@@ -794,7 +850,9 @@ where
         // Fatal by design — see `assert_working_set_observed`.
         let matched_pairs = assert_working_set_observed(&batch, feature_names(&payload))?;
 
-        let result = match run(payload) {
+        let (result, batch_verdict) =
+            crate::discovery::with_streaming_batch_context(cursor, || run(payload));
+        let result = match result {
             Ok(r) => r,
             Err(err) => {
                 tracing::warn!(
@@ -815,9 +873,7 @@ where
                 continue;
             }
         };
-        let rejected_after = crate::discovery::batch_rejection_ledger().batches_rejected;
-
-        if rejected_after > rejected_before {
+        if batch_verdict.is_some_and(|verdict| verdict.is_reject()) {
             ledger.record(BatchLedgerEntry::new(
                 cursor,
                 next_cursor,
@@ -830,6 +886,11 @@ where
                  census for the expectancy, payoff and trade counts behind the verdict"
                     .to_string(),
             ));
+            completed_without_survivors.push(StreamingBatchWithoutSurvivors {
+                cursor,
+                pairs,
+                result,
+            });
             continue;
         }
         if result.portfolio_genes().is_empty() {
@@ -844,6 +905,11 @@ where
                  for the full screen — this is NOT a predicate rejection)"
                     .to_string(),
             ));
+            completed_without_survivors.push(StreamingBatchWithoutSurvivors {
+                cursor,
+                pairs,
+                result,
+            });
             continue;
         }
 
@@ -896,6 +962,7 @@ where
 
     Ok(StreamingRunOutcome {
         batches,
+        completed_without_survivors,
         canonical,
         ledger,
         streamed: true,

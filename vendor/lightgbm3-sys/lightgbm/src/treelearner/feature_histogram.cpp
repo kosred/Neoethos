@@ -8,6 +8,44 @@
 
 namespace LightGBM {
 
+namespace {
+
+// The only mixed-width instantiation below widens a signed 16-bit gradient
+// and unsigned 16-bit hessian from int32_t bins into an int64_t accumulator.
+// packed = gradient * 2^16 + hessian. Remove the hessian before scaling the
+// gradient by another 2^16; every intermediate fits int64_t, including -32768.
+// Unlike shifting a negative signed gradient, this is defined in C++11/14.
+constexpr int64_t WidenPackedHistogram16To32(int32_t packed) {
+  return (static_cast<int64_t>(packed) - static_cast<uint16_t>(packed)) * 65536 +
+         static_cast<uint16_t>(packed);
+}
+
+// Independent exact packed-word regressions, evaluated with the production
+// helper whenever this translation unit is compiled (no runtime test ABI).
+static_assert(WidenPackedHistogram16To32(0) == 0, "zero packed histogram");
+static_assert(WidenPackedHistogram16To32(65535) == 65535, "maximum 16-bit hessian");
+static_assert(WidenPackedHistogram16To32(65538) == 4294967298LL,
+              "gradient +1 and hessian 2");
+static_assert(static_cast<uint64_t>(WidenPackedHistogram16To32(-65534)) ==
+                  0xffffffff00000002ULL,
+              "gradient -1 must be sign-extended before packing");
+static_assert(static_cast<uint64_t>(WidenPackedHistogram16To32(-2147483647 - 1)) ==
+                  0xffff800000000000ULL,
+              "minimum gradient and zero hessian");
+static_assert(static_cast<uint64_t>(WidenPackedHistogram16To32(-2147418113)) ==
+                  0xffff80000000ffffULL,
+              "minimum gradient and maximum hessian");
+static_assert(WidenPackedHistogram16To32(2147418112) == 0x00007fff00000000LL,
+              "maximum gradient and zero hessian");
+static_assert(WidenPackedHistogram16To32(2147483647) == 0x00007fff0000ffffLL,
+              "maximum gradient and maximum hessian");
+static_assert(WidenPackedHistogram16To32(65538) + WidenPackedHistogram16To32(-65534) == 4,
+              "opposite gradients cancel while hessians accumulate");
+static_assert(WidenPackedHistogram16To32(65535) + WidenPackedHistogram16To32(1) == 65536,
+              "hessian accumulation uses the widened 32-bit field");
+
+}  // namespace
+
 void FeatureHistogram::FuncForCategorical() {
   if (meta_->config->extra_trees) {
     if (meta_->config->monotone_constraints.empty()) {
@@ -465,8 +503,7 @@ void FeatureHistogram::FindBestThresholdCategoricalIntInner(int64_t int_sum_grad
       }
 
       const PACKED_HIST_ACC_T grad_and_hess_acc = HIST_BITS_ACC != HIST_BITS_BIN ?
-        ((static_cast<PACKED_HIST_ACC_T>(static_cast<HIST_BIN_T>(grad_and_hess >> HIST_BITS_BIN)) << HIST_BITS_ACC) |
-        (static_cast<PACKED_HIST_ACC_T>(grad_and_hess & 0x0000ffff))) :
+        static_cast<PACKED_HIST_ACC_T>(WidenPackedHistogram16To32(static_cast<int32_t>(grad_and_hess))) :
         grad_and_hess;
       const PACKED_HIST_ACC_T sum_other_grad_and_hess = local_int_sum_gradient_and_hessian - grad_and_hess_acc;
       const uint32_t sum_other_hess_int = HIST_BITS_ACC == 16 ?
@@ -589,8 +626,7 @@ void FeatureHistogram::FindBestThresholdCategoricalIntInner(int64_t int_sum_grad
 
         if (HIST_BITS_ACC != HIST_BITS_BIN) {
           PACKED_HIST_ACC_T int_grad_and_hess_acc =
-            (static_cast<PACKED_HIST_ACC_T>(static_cast<int64_t>(int_grad_and_hess & 0xffff0000)) << 32) |
-            (static_cast<PACKED_HIST_ACC_T>(int_grad_and_hess & 0x0000ffff));
+            static_cast<PACKED_HIST_ACC_T>(WidenPackedHistogram16To32(static_cast<int32_t>(int_grad_and_hess)));
           int_sum_left_gradient_and_hessian += int_grad_and_hess_acc;
         } else {
           int_sum_left_gradient_and_hessian += int_grad_and_hess;

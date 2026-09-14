@@ -66,16 +66,30 @@ fn shared_target_uses_typed_identity_and_occupied_root_conflicts() {
 
 #[test]
 fn selected_generation_is_verified_and_pinned_before_network_capture() {
-    let capture = shared_capture();
-    let assertion = capture
-        .find("let _selected_generation_lease")
-        .expect("selected request preflight");
-    let exact_open = capture
+    let preflight = between(
+        SHARED_SERVICE,
+        "fn authenticated_session_request_for_capture",
+        "pub(crate) struct HistoricalSeriesCapture",
+    );
+    let exact_open = preflight
         .find("neoethos_data::open_exact_dataset_generation")
         .expect("selected receipt is verified and pinned");
+    let returned_lease = preflight
+        .find("selected_generation_lease,")
+        .expect("selected generation lease leaves preflight with the session request");
+    assert!(exact_open < returned_lease);
+    assert!(preflight.contains("BrokerHistoryConflict::IdentityMismatch"));
+
+    let capture = shared_capture();
+    let preflight_call = capture
+        .find("let preflight = authenticated_session_request_for_capture")
+        .expect("capture performs selected-generation preflight");
     let connect = capture
-        .find(".connect_authenticated(")
+        .find(".connect_authenticated(&preflight.session_request")
         .expect("one authenticated persistent connection");
+    let lease_transfer = capture
+        .find("preflight.selected_generation_lease")
+        .expect("the selected-generation lease is transferred into capture");
     let resolved_identity = capture
         .find(".validate_resolved_identity")
         .expect("resolved broker identity validation");
@@ -84,14 +98,19 @@ fn selected_generation_is_verified_and_pinned_before_network_capture() {
         .expect("bounded direct-page loop");
 
     assert!(
-        assertion < exact_open
-            && exact_open < connect
-            && connect < resolved_identity
+        preflight_call < connect
+            && connect < lease_transfer
+            && lease_transfer < resolved_identity
             && resolved_identity < first_page
     );
-    let preflight = &capture[assertion..connect];
-    assert!(preflight.contains("BrokerHistoryConflict::IdentityMismatch"));
-    assert!(!preflight.contains("bail!("));
+
+    let session_capture = between(
+        SHARED_SERVICE,
+        "fn capture_with_session_and_publication_hook",
+        "pub fn capture_historical_generation",
+    );
+    assert!(session_capture.contains("_selected_generation_lease: Option<DatasetGenerationLease>"));
+    assert!(!session_capture.contains("open_exact_dataset_generation"));
 }
 
 #[test]

@@ -27,17 +27,12 @@ neoethos-execution-budget = { path = "../crates/neoethos-execution-budget" }
 # loop — a node just starts and joins the swarm.
 iroh = "1.0"
 iroh-gossip = "0.101"
-n0-future = "0.3"
 futures-lite = "2"
 bytes = "1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
-# In-memory tar of the model directory for training-result transfer.
-tar = "0.4"
-base64 = "0.22"
 anyhow = "1"
 rand = "0.8"
-hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP bridge to the LOCAL NeoEthos app (/federation/*). rustls only.

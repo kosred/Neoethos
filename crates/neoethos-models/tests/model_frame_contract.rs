@@ -24,6 +24,7 @@ struct MetadataContract {
     state: String,
     dataset_rows: u64,
     train_rows: u64,
+    embargo_rows: u64,
     val_rows: u64,
 }
 
@@ -258,6 +259,10 @@ fn f64_feature_frame_contract_is_deterministic_and_strict() -> Result<()> {
     assert_eq!(
         metadata["training_summary"]["train_rows"].as_u64(),
         Some(expected.train_rows)
+    );
+    assert_eq!(
+        metadata["training_summary"]["embargo_rows"].as_u64(),
+        Some(expected.embargo_rows)
     );
     assert_eq!(
         metadata["training_summary"]["val_rows"].as_u64(),

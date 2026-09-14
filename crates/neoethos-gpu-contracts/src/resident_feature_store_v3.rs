@@ -470,6 +470,18 @@ impl CudaPrimaryContextBuildIdentityV3 {
         self.ordinal
     }
 
+    pub const fn device_uuid(&self) -> [u8; CUDA_UUID_BYTES] {
+        self.device_uuid
+    }
+
+    pub const fn compute_capability_major(&self) -> u16 {
+        self.compute_capability_major
+    }
+
+    pub const fn compute_capability_minor(&self) -> u16 {
+        self.compute_capability_minor
+    }
+
     pub const fn primary_context_process_token(&self) -> [u8; SHA256_BYTES] {
         self.primary_context_process_token
     }
@@ -478,8 +490,20 @@ impl CudaPrimaryContextBuildIdentityV3 {
         &self.native_sass_target
     }
 
+    pub fn driver_version(&self) -> &str {
+        &self.driver_version
+    }
+
+    pub fn runtime_version(&self) -> &str {
+        &self.runtime_version
+    }
+
     pub const fn vector_ta_build_sha256(&self) -> [u8; SHA256_BYTES] {
         self.vector_ta_build_sha256
+    }
+
+    pub const fn gpu_cuda_build_sha256(&self) -> [u8; SHA256_BYTES] {
+        self.gpu_cuda_build_sha256
     }
 
     pub fn nvcc_version(&self) -> &str {
@@ -583,6 +607,18 @@ impl ResidentFeatureRouteV3 {
 
     pub const fn producer(&self) -> ResidentFeatureProducerV3 {
         self.producer
+    }
+
+    pub fn indicator_id(&self) -> Option<&str> {
+        self.indicator_id.as_deref()
+    }
+
+    pub fn output_id(&self) -> Option<&str> {
+        self.output_id.as_deref()
+    }
+
+    pub const fn stage(&self) -> ResidentFeatureStageV3 {
+        self.stage
     }
 
     pub const fn swept_period(&self) -> Option<u64> {

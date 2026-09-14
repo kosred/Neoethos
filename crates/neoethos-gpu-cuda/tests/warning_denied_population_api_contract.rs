@@ -1,20 +1,8 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn crate_dir() -> PathBuf {
-    let source = PathBuf::from(file!());
-    let source = if source.is_absolute() {
-        source
-    } else {
-        std::env::current_dir()
-            .expect("current directory")
-            .join(source)
-    };
-    source
-        .parent()
-        .and_then(Path::parent)
-        .expect("test lives below the gpu-cuda crate")
-        .to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 fn read(relative: &str) -> String {

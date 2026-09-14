@@ -168,6 +168,27 @@ fn every_direct_timeframe_is_independently_clipped_and_bound_to_the_same_cutoff(
             &expected_binding(&dataset, timeframe, binding.source_node_id())
         );
     }
+    let base_lease = std::sync::Arc::downgrade(dataset.source_artifacts["M5"].lease());
+    let higher_lease = std::sync::Arc::downgrade(dataset.source_artifacts["H1"].lease());
+    let base = dataset
+        .into_canonical_frame("M5")
+        .expect("consume the source dataset");
+    higher_lease
+        .upgrade()
+        .expect("features retain the higher-timeframe lease")
+        .reopen_verified()
+        .expect("the exact higher generation remains usable");
+    drop(frame);
+    assert!(
+        higher_lease.upgrade().is_none(),
+        "the released feature owner must not leak its lease"
+    );
+    assert!(
+        base_lease.upgrade().is_some(),
+        "the transferred base has its own owner"
+    );
+    drop(base);
+    assert!(base_lease.upgrade().is_none());
 }
 
 #[test]

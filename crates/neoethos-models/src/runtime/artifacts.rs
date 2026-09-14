@@ -25,6 +25,7 @@ impl LabelMapping {
 pub struct TrainingSummaryMetadata {
     pub dataset_rows: usize,
     pub train_rows: usize,
+    pub embargo_rows: usize,
     pub val_rows: usize,
 }
 
@@ -33,7 +34,12 @@ impl TrainingSummaryMetadata {
     /// row counts to keep production callers honest. Callers that need
     /// to construct a *deliberately* invalid summary (e.g. drift-
     /// detection unit tests) must use [`Self::new_unchecked`].
-    pub fn new(dataset_rows: usize, train_rows: usize, val_rows: usize) -> Self {
+    pub fn new(
+        dataset_rows: usize,
+        train_rows: usize,
+        embargo_rows: usize,
+        val_rows: usize,
+    ) -> Self {
         assert!(
             dataset_rows > 0,
             "runtime training summary requires a non-zero dataset row count"
@@ -43,12 +49,16 @@ impl TrainingSummaryMetadata {
             "runtime training summary requires a non-zero train row count"
         );
         assert!(
-            train_rows + val_rows == dataset_rows,
-            "runtime training summary requires train_rows + val_rows == dataset_rows"
+            train_rows
+                .checked_add(embargo_rows)
+                .and_then(|rows| rows.checked_add(val_rows))
+                == Some(dataset_rows),
+            "runtime training summary requires train_rows + embargo_rows + val_rows == dataset_rows"
         );
         Self {
             dataset_rows,
             train_rows,
+            embargo_rows,
             val_rows,
         }
     }
@@ -58,10 +68,16 @@ impl TrainingSummaryMetadata {
     /// (`validate_runtime_metadata` in each model crate) still rejects
     /// the result on load, so production code paths cannot smuggle
     /// these in — only tests asserting that rejection.
-    pub fn new_unchecked(dataset_rows: usize, train_rows: usize, val_rows: usize) -> Self {
+    pub fn new_unchecked(
+        dataset_rows: usize,
+        train_rows: usize,
+        embargo_rows: usize,
+        val_rows: usize,
+    ) -> Self {
         Self {
             dataset_rows,
             train_rows,
+            embargo_rows,
             val_rows,
         }
     }
@@ -74,9 +90,10 @@ impl TrainingSummaryMetadata {
     pub(crate) fn raw_for_validation(
         dataset_rows: usize,
         train_rows: usize,
+        embargo_rows: usize,
         val_rows: usize,
     ) -> Self {
-        Self::new_unchecked(dataset_rows, train_rows, val_rows)
+        Self::new_unchecked(dataset_rows, train_rows, embargo_rows, val_rows)
     }
 }
 
@@ -85,10 +102,12 @@ impl TrainingSummaryMetadata {
 /// `crate::deep_models::*::save` / etc. Per D4 versioning policy:
 /// bump only on serialised-field BREAKING changes.
 ///
-/// v1 (current): the pre-versioning shape. New optional fields
-/// stay backward-compatible via `#[serde(default)]`.
+/// v1: the pre-versioning three-way dataset/train/validation shape.
+/// v2 (current): the temporal embargo is a required, explicit row partition.
+/// This is intentionally breaking: a v1 artifact cannot prove how many rows
+/// were excluded between training and validation and therefore fails closed.
 pub const RUNTIME_ARTIFACT_METADATA_SCHEMA_VERSION: neoethos_core::SchemaVersion =
-    neoethos_core::SchemaVersion::new(1);
+    neoethos_core::SchemaVersion::new(2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeArtifactMetadata {
@@ -161,7 +180,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "runtime training summary requires a non-zero train row count")]
     fn training_summary_rejects_zero_train_rows() {
-        let _ = TrainingSummaryMetadata::new(10, 0, 10);
+        let _ = TrainingSummaryMetadata::new(10, 0, 0, 10);
     }
 
     #[test]
@@ -173,7 +192,7 @@ mod tests {
             CapabilityState::Implemented,
             Vec::new(),
             default_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(10, 8, 2),
+            TrainingSummaryMetadata::new(10, 8, 0, 2),
         );
     }
 }

@@ -1,37 +1,68 @@
-//! Opaque, stream-ordered native CUDA generation ownership.
+//! Shared ABI types for the resident CUDA or AMD HIP generation engine.
 //!
-//! This module deliberately has no CPU implementation. When CUDA support is
-//! absent, acquisition fails before a run or store can be minted. The module is
-//! additive until the existing population-session owner can move its private
-//! native session into `ResidentGenerationPopulationSessionImportV1`.
+//! The composite Search V2/V3 owner is the only Rust lifecycle authority. The
+//! superseded standalone generation owner and its post-GA bridge were removed;
+//! this module contains its ABI data and checked fixed generation geometry.
+//! Sealing geometry is not an attestation of CPU adaptive-policy equivalence or
+//! device execution. Philox oracles and synthetic constructors remain fixtures.
 
+use crate::resident_archive_output_v3::RawResidentArchiveGeneScalarV3;
 use sha2::{Digest, Sha256};
-use std::any::Any;
-use std::ffi::c_void;
-use std::ptr::NonNull;
 
-pub const DISCOVERY_GENERATION_SEMANTICS_V1: &str = concat!(
-    "neoethos.discovery-generation.v1;",
-    "fixed-stride-normalized-gene;",
-    "philox4x32-10-address-v1;",
-    "decision-slot-high32-retry-low32;",
-    "rank-weighted-parent-and-survivor-only;",
-    "fixed-original-rank-integer-weights;",
-    "sealed-u64-scoring-novelty-decision-key;",
-    "metric-row-identity-only;",
+// One algorithm description; only the actual primitive/backend binding differs.
+macro_rules! generation_semantics_v1 {
+    ($primitives:literal, $build:literal) => {
+        concat!(
+            "neoethos.discovery-generation.v1;",
+            "fixed-stride-normalized-gene;",
+            "philox4x32-10-address-v1;",
+            "decision-slot-high32-retry-low32;",
+            "rank-weighted-parent-and-survivor-only;",
+            "fixed-original-rank-integer-weights;",
+            "sealed-u64-scoring-novelty-decision-key;",
+            "metric-row-identity-only;",
+            $primitives,
+            $build,
+            "same-admitted-stream;no-floating-decision-reduction;",
+            "resident-global-full-gene-dedup;fnv4-resident-content;",
+            "no-candidate-revival;no-host-decision"
+        )
+    };
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub const DISCOVERY_GENERATION_SEMANTICS_V1: &str = generation_semantics_v1!(
     "stable-cub-radix-u64-key-and-gene-identity-tie;",
-    "cuda-cccl-toolkit-native-build-bound;",
-    "same-admitted-stream;no-floating-decision-reduction;",
-    "resident-global-full-gene-dedup;fnv4-resident-content;",
-    "no-candidate-revival;no-host-decision"
+    "cuda-cccl-toolkit-native-build-bound;"
 );
 
+#[cfg(any(feature = "hip-native-kernels", test))]
+const DISCOVERY_GENERATION_HIP_SEMANTICS_V1: &str = generation_semantics_v1!(
+    "stable-hipcub-rocprim-radix-u64-key-and-gene-identity-tie;",
+    "amd-hip-native-build-bound;generation-abi=65537;"
+);
+
+const RESIDENT_METRIC_ROW_PROTOCOL_V2: &str = concat!(
+    "neoethos.resident-metric-row.v2;repr-c;bytes=104;",
+    "candidate-id=u64-resident-gene-identity;scenario-id=u64-sealed-scenario-identity;",
+    "values=f64[11];",
+    "slots=net,sharpe,peak,max-dd,win-rate,pf,expectancy,monthly-hit,trades,consistency,max-daily-dd"
+);
+
+#[cfg(feature = "cuda")]
 const ABI_VERSION_V1: u32 = 1;
+#[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+const ABI_VERSION_V1: u32 = 0x0001_0001;
+
+/// Mirrors the selected protocol in the original native generation header.
+/// This is a wire selector, not device or run authority.
+pub(crate) const fn selected_generation_abi_v1() -> u32 {
+    ABI_VERSION_V1
+}
+#[cfg(feature = "cuda-device-fixtures")]
 const PARENT_RANK_WEIGHTED_V1: u32 = 1;
+#[cfg(feature = "cuda-device-fixtures")]
 const SURVIVOR_RANK_WEIGHTED_V1: u32 = 1;
-const STATUS_OK_V1: i32 = 0;
-const STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2: i32 = -13;
-const STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2: i32 = -14;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -53,7 +84,6 @@ pub enum SurvivorSelectionPolicyV1 {
 
 #[derive(Debug)]
 pub enum ResidentGenerationDeviceErrorV1 {
-    CudaFeatureNotCompiled,
     UnsupportedUniformSelection,
     UnsupportedTournamentSelection,
     UnsupportedSoftmaxSelection,
@@ -62,41 +92,11 @@ pub enum ResidentGenerationDeviceErrorV1 {
     InvalidPlan(&'static str),
     IdentityMismatch(&'static str),
     ArithmeticOverflow,
-    CapacityUnavailable,
-    AsyncFreeOutcomeUnknownDeliberateLeak {
-        operation: &'static str,
-    },
-    AsyncAllocationOutcomeUnknownDeliberateLeak {
-        operation: &'static str,
-    },
-    Native {
-        operation: &'static str,
-        status: i32,
-    },
-    RunStateViolation,
-    EventIdentityMismatch,
-    DeviceContentFault,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResidentGenerationRunStateV1 {
-    StrictIdle,
-    InFlight,
-    Sealed,
-    PostGaInPlace,
-    Poisoned,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GenerationArtifactClassV1 {
-    ResearchOnly,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GenerationPromotionEligibilityV1 {
-    NotPromotionEligible,
-}
-
+// CPU Philox oracles are used by unit and real-device unit tests only. The
+// production resident algorithm executes its own native device implementation.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum GeneticOperatorIdentityV1 {
@@ -116,12 +116,14 @@ pub enum GeneticOperatorIdentityV1 {
     Survivor = 14,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhiloxDrawAddressV1 {
     counter: [u32; 4],
     key: [u32; 2],
 }
 
+#[cfg(test)]
 impl PhiloxDrawAddressV1 {
     pub const fn counter(&self) -> [u32; 4] {
         self.counter
@@ -132,6 +134,7 @@ impl PhiloxDrawAddressV1 {
     }
 }
 
+#[cfg(test)]
 pub fn checked_philox_counter_mapping_v1(
     search_seed: u64,
     run_identity_sha256: &[u8; 32],
@@ -164,10 +167,12 @@ pub fn checked_philox_counter_mapping_v1(
     })
 }
 
+#[cfg(test)]
 pub fn checked_philox_rejection_draw_index_v1(decision_slot: u32, rejection_attempt: u32) -> u64 {
     (u64::from(decision_slot) << 32) | u64::from(rejection_attempt)
 }
 
+#[cfg(test)]
 pub fn philox4x32_10_reference_v1(mut counter: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
     const M0: u32 = 0xD251_1F53;
     const M1: u32 = 0xCD9E_8D57;
@@ -186,31 +191,6 @@ pub fn philox4x32_10_reference_v1(mut counter: [u32; 4], mut key: [u32; 2]) -> [
         key[1] = key[1].wrapping_add(W1);
     }
     counter
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct RawPopulationSessionImportV1 {
-    pub(crate) abi_version: u32,
-    pub(crate) selected_cuda_ordinal: u32,
-    pub(crate) admitted_run_stream: *mut c_void,
-    pub(crate) resident_parent_ready_event: *mut c_void,
-    pub(crate) generation_ready_event: *mut c_void,
-    pub(crate) population_lifetime_owner: *mut c_void,
-    pub(crate) full_discovery_reserve_bytes: u64,
-    pub(crate) cuda_device_identity_sha256: [u8; 32],
-    pub(crate) primary_context_identity_sha256: [u8; 32],
-    pub(crate) run_stream_identity_sha256: [u8; 32],
-    pub(crate) cuda_build_manifest_sha256: [u8; 32],
-    pub(crate) resident_input_content_sha256: [u8; 32],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(crate) struct RawResidentGenerationMetricRowV1 {
-    pub(crate) candidate_id: u64,
-    pub(crate) scenario_id: u64,
-    pub(crate) values: [f64; 11],
 }
 
 #[repr(C)]
@@ -243,7 +223,10 @@ pub(crate) struct RawGenerationPlanV1 {
     scoring_semantics_sha256: [u8; 32],
     novelty_semantics_sha256: [u8; 32],
     scenario_order_semantics_sha256: [u8; 32],
+    #[cfg(feature = "cuda")]
     cuda_build_manifest_sha256: [u8; 32],
+    #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+    hip_build_manifest_sha256: [u8; 32],
     rng_mapping_sha256: [u8; 32],
     plan_identity_sha256: [u8; 32],
 }
@@ -274,24 +257,6 @@ pub(crate) struct RawAllocationReceiptV1 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct RawMetricRowsImportV1 {
-    pub(crate) abi_version: u32,
-    pub(crate) metric_value_count: u32,
-    pub(crate) metric_rows_device: *const RawResidentGenerationMetricRowV1,
-    pub(crate) resident_decision_keys_device: *const u64,
-    pub(crate) expected_scenario_ids_device: *const u64,
-    pub(crate) logical_offset: u64,
-    pub(crate) active_scenarios: u64,
-    pub(crate) scoring_novelty_ready_event: *mut c_void,
-    pub(crate) metric_semantics_sha256: [u8; 32],
-    pub(crate) scoring_semantics_sha256: [u8; 32],
-    pub(crate) novelty_semantics_sha256: [u8; 32],
-    pub(crate) scenario_order_semantics_sha256: [u8; 32],
-    pub(crate) rank_semantics_sha256: [u8; 32],
-}
-
-#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RawReadyEventV1 {
     pub(crate) abi_version: u32,
@@ -303,183 +268,90 @@ pub(crate) struct RawReadyEventV1 {
     pub(crate) intermediate_readback_count: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct RawContentReceiptV1 {
-    abi_version: u32,
-    reserved: u32,
-    gene_content_identity_handle: u64,
-    metric_content_identity_handle: u64,
-    generation_receipt_identity_handle: u64,
-    ready_event_id: u64,
-    final_compact_readback_count: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct RawPostGaInPlaceReceiptV1 {
-    abi_version: u32,
-    reserved: u32,
-    ready_event_id: u64,
-    current_generation_index: u64,
-    same_stream_enqueue_count: u64,
-    logical_population_count: u64,
-    retained_evaluation_capacity: u64,
-    generation_allocation_total_device_bytes: u64,
-    additional_allocation_count: u64,
-    additional_device_bytes: u64,
-    gene_content_identity_handle: u64,
-    metric_content_identity_handle: u64,
-    generation_receipt_identity_handle: u64,
-}
-
-const _: [(); 208] = [(); std::mem::size_of::<RawPopulationSessionImportV1>()];
-const _: [(); 104] = [(); std::mem::size_of::<RawResidentGenerationMetricRowV1>()];
 const _: [(); 632] = [(); std::mem::size_of::<RawGenerationPlanV1>()];
 const _: [(); 176] = [(); std::mem::size_of::<RawAllocationReceiptV1>()];
-const _: [(); 216] = [(); std::mem::size_of::<RawMetricRowsImportV1>()];
 const _: [(); 48] = [(); std::mem::size_of::<RawReadyEventV1>()];
-const _: [(); 48] = [(); std::mem::size_of::<RawContentReceiptV1>()];
-const _: [(); 96] = [(); std::mem::size_of::<RawPostGaInPlaceReceiptV1>()];
 
 pub(crate) enum NativeResidentGenerationRunV1 {}
 
-#[cfg(feature = "cuda")]
 unsafe extern "C" {
-    #[link_name = "query_resident_generation_allocation_v1"]
-    fn ffi_query_resident_generation_allocation_v1(
-        import: *const RawPopulationSessionImportV1,
-        plan: *const RawGenerationPlanV1,
-        receipt: *mut RawAllocationReceiptV1,
-    ) -> i32;
-    #[link_name = "create_resident_generation_run_from_import_v1"]
-    fn ffi_create_resident_generation_run_from_import_v1(
-        import: *const RawPopulationSessionImportV1,
-        plan: *const RawGenerationPlanV1,
-        receipt: *const RawAllocationReceiptV1,
-        run: *mut *mut NativeResidentGenerationRunV1,
-    ) -> i32;
     #[link_name = "initialize_resident_generation_population_v1"]
     pub(crate) fn ffi_initialize_resident_generation_population_v1(
         run: *mut NativeResidentGenerationRunV1,
         ready: *mut RawReadyEventV1,
     ) -> i32;
-    #[link_name = "enqueue_exact_generation_chunk_v1"]
-    fn ffi_enqueue_exact_generation_chunk_v1(
-        run: *mut NativeResidentGenerationRunV1,
-        metrics: *const RawMetricRowsImportV1,
-        ready: *mut RawReadyEventV1,
-    ) -> i32;
-    #[link_name = "enqueue_resident_rank_selection_offspring_v1"]
-    fn ffi_enqueue_resident_rank_selection_offspring_v1(
-        run: *mut NativeResidentGenerationRunV1,
-        generation_index: u64,
-        ready: *mut RawReadyEventV1,
-    ) -> i32;
-    #[link_name = "seal_resident_generation_content_v1"]
-    fn ffi_seal_resident_generation_content_v1(
-        run: *mut NativeResidentGenerationRunV1,
-        receipt: *mut RawContentReceiptV1,
-        ready: *mut RawReadyEventV1,
-    ) -> i32;
-    #[link_name = "begin_resident_post_ga_in_place_v1"]
-    fn ffi_begin_resident_post_ga_in_place_v1(
-        run: *mut NativeResidentGenerationRunV1,
-        dependency: *const RawReadyEventV1,
-        gene_content_identity_handle: u64,
-        metric_content_identity_handle: u64,
-        generation_receipt_identity_handle: u64,
-        receipt: *mut RawPostGaInPlaceReceiptV1,
-    ) -> i32;
 }
 
-/// One private, move-only import minted by the existing population owner. The
-/// boxed owner keeps the V3 parent, population session, context and stream live.
-pub(crate) struct ResidentGenerationPopulationSessionImportV1 {
-    raw: RawPopulationSessionImportV1,
-    lifetime_owner: Option<Box<dyn Any>>,
+/// Caller-supplied fixed geometry and immutable identity bindings. No defaults
+/// are supplied here: orchestration must resolve real run inputs and separately
+/// reject policies not represented by this ABI (for example dynamic rescue,
+/// convergence, survivor or immigrant schedules). The sealer validates geometry,
+/// not the provenance of arbitrary identity bytes or CPU/native policy parity.
+#[derive(Clone, Debug)]
+pub struct ResidentGenerationPlanAuthorityInputV1 {
+    pub parent_selection: ParentSelectionPolicyV1,
+    pub survivor_selection: SurvivorSelectionPolicyV1,
+    pub max_terms_per_gene: usize,
+    pub minimum_terms_per_gene: usize,
+    pub logical_population_count: usize,
+    pub retained_evaluation_capacity: usize,
+    pub feature_count: usize,
+    pub generation_count: usize,
+    pub survivor_count: usize,
+    pub immigrant_count: usize,
+    pub search_seed: u64,
+    pub mutation_intensity_q32: u64,
+    pub threshold_ladder_bits: [u64; 6],
+    pub stop_bounds_bits: [u64; 6],
+    pub smc_probability_q32: [u64; 11],
+    pub generation_semantics_sha256: [u8; 32],
+    pub run_identity_sha256: [u8; 32],
+    pub strategy_gene_schema_sha256: [u8; 32],
+    pub rank_semantics_sha256: [u8; 32],
+    pub metric_semantics_sha256: [u8; 32],
+    pub scoring_semantics_sha256: [u8; 32],
+    pub novelty_semantics_sha256: [u8; 32],
+    pub scenario_order_semantics_sha256: [u8; 32],
+    #[cfg(feature = "cuda")]
+    pub cuda_build_manifest_sha256: [u8; 32],
+    #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+    pub hip_native_build_manifest_sha256: [u8; 32],
+    pub rng_mapping_sha256: [u8; 32],
 }
 
-impl ResidentGenerationPopulationSessionImportV1 {
-    /// The only intended caller is the existing gpu-cuda population-session
-    /// module after it has validated the exact admitted context and stream.
-    ///
-    /// # Safety
-    ///
-    /// Every raw handle and identity must originate from the one live admitted
-    /// population session retained by `lifetime_owner`. The owner must keep the
-    /// context, stream, parent buffers, parent-ready event and distinct
-    /// generation-ready event alive until terminal stream-ordered consumption.
-    pub(crate) unsafe fn from_population_session_parts_v1<T: Any>(
-        raw: RawPopulationSessionImportV1,
-        lifetime_owner: T,
-    ) -> Result<Self, ResidentGenerationDeviceErrorV1> {
-        if raw.abi_version != ABI_VERSION_V1
-            || raw.admitted_run_stream.is_null()
-            || raw.resident_parent_ready_event.is_null()
-            || raw.generation_ready_event.is_null()
-            || raw.generation_ready_event == raw.resident_parent_ready_event
-            || raw.population_lifetime_owner.is_null()
-            || raw.selected_cuda_ordinal == u32::MAX
-            || identity_is_zero_v1(&raw.cuda_device_identity_sha256)
-            || identity_is_zero_v1(&raw.primary_context_identity_sha256)
-            || identity_is_zero_v1(&raw.run_stream_identity_sha256)
-            || identity_is_zero_v1(&raw.cuda_build_manifest_sha256)
-            || identity_is_zero_v1(&raw.resident_input_content_sha256)
+impl ResidentGenerationPlanAuthorityInputV1 {
+    fn native_build_manifest_sha256_v1(&self) -> [u8; 32] {
+        #[cfg(feature = "cuda")]
         {
-            return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
-                "population import is incomplete",
-            ));
+            self.cuda_build_manifest_sha256
         }
-        Ok(Self {
-            raw,
-            lifetime_owner: Some(Box::new(lifetime_owner)),
-        })
-    }
-}
-
-impl Drop for ResidentGenerationPopulationSessionImportV1 {
-    fn drop(&mut self) {
-        if let Some(owner) = self.lifetime_owner.take() {
-            std::mem::forget(owner);
+        #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+        {
+            self.hip_native_build_manifest_sha256
         }
     }
-}
-
-pub(crate) struct ResidentGenerationPlanAuthorityInputV1 {
-    pub(crate) parent_selection: ParentSelectionPolicyV1,
-    pub(crate) survivor_selection: SurvivorSelectionPolicyV1,
-    pub(crate) max_terms_per_gene: usize,
-    pub(crate) minimum_terms_per_gene: usize,
-    pub(crate) logical_population_count: usize,
-    pub(crate) retained_evaluation_capacity: usize,
-    pub(crate) feature_count: usize,
-    pub(crate) generation_count: usize,
-    pub(crate) survivor_count: usize,
-    pub(crate) immigrant_count: usize,
-    pub(crate) search_seed: u64,
-    pub(crate) mutation_intensity_q32: u64,
-    pub(crate) threshold_ladder_bits: [u64; 6],
-    pub(crate) stop_bounds_bits: [u64; 6],
-    pub(crate) smc_probability_q32: [u64; 11],
-    pub(crate) generation_semantics_sha256: [u8; 32],
-    pub(crate) run_identity_sha256: [u8; 32],
-    pub(crate) strategy_gene_schema_sha256: [u8; 32],
-    pub(crate) rank_semantics_sha256: [u8; 32],
-    pub(crate) metric_semantics_sha256: [u8; 32],
-    pub(crate) scoring_semantics_sha256: [u8; 32],
-    pub(crate) novelty_semantics_sha256: [u8; 32],
-    pub(crate) scenario_order_semantics_sha256: [u8; 32],
-    pub(crate) cuda_build_manifest_sha256: [u8; 32],
-    pub(crate) rng_mapping_sha256: [u8; 32],
 }
 
 pub struct SealedResidentGenerationPlanV1 {
     raw: RawGenerationPlanV1,
     plan_identity_sha256: [u8; 32],
+    adaptive: Option<AdaptiveGenerationControlsV3>,
 }
 
 impl SealedResidentGenerationPlanV1 {
+    pub(crate) fn raw_adaptive_policy_v3(&self) -> Option<&RawResidentAdaptivePolicyV3> {
+        self.adaptive.as_ref().map(|controls| &controls.policy)
+    }
+
+    pub(crate) fn adaptive_policy_identity_sha256_v3(&self) -> Option<[u8; 32]> {
+        self.raw_adaptive_policy_v3()
+            .map(|policy| policy.policy_identity_sha256)
+    }
+
+    pub(crate) fn adaptive_controls_v3(&self) -> Option<&AdaptiveGenerationControlsV3> {
+        self.adaptive.as_ref()
+    }
+
     pub(crate) const fn raw_plan_v1(&self) -> &RawGenerationPlanV1 {
         &self.raw
     }
@@ -492,6 +364,10 @@ impl SealedResidentGenerationPlanV1 {
         self.raw.feature_count
     }
 
+    pub(crate) const fn generation_count_v1(&self) -> u64 {
+        self.raw.generation_count
+    }
+
     pub(crate) const fn retained_evaluation_capacity_v1(&self) -> u64 {
         self.raw.retained_evaluation_capacity
     }
@@ -500,6 +376,7 @@ impl SealedResidentGenerationPlanV1 {
         self.raw.max_terms_per_gene
     }
 
+    #[cfg(feature = "cuda-device-fixtures")]
     pub(crate) const fn survivor_count_v1(&self) -> u64 {
         self.raw.survivor_count
     }
@@ -540,8 +417,20 @@ impl SealedResidentGenerationPlanV1 {
         self.raw.scenario_order_semantics_sha256
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) const fn cuda_build_manifest_sha256_v1(&self) -> [u8; 32] {
         self.raw.cuda_build_manifest_sha256
+    }
+
+    pub(crate) const fn native_build_manifest_sha256_v1(&self) -> [u8; 32] {
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda_build_manifest_sha256_v1()
+        }
+        #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+        {
+            self.raw.hip_build_manifest_sha256
+        }
     }
 
     #[cfg(feature = "cuda-device-fixtures")]
@@ -556,6 +445,7 @@ impl SealedResidentGenerationPlanV1 {
         )
     }
 
+    #[cfg(feature = "cuda-device-fixtures")]
     pub(crate) fn resident_search_scoring_fixture_v2(
         logical_population_count: usize,
         feature_count: usize,
@@ -591,7 +481,7 @@ impl SealedResidentGenerationPlanV1 {
                 run_identity_sha256: [0x62; 32],
                 strategy_gene_schema_sha256: [0x63; 32],
                 rank_semantics_sha256: crate::resident_scoring_v2::rank_semantics_sha256_v2(),
-                metric_semantics_sha256: [0x65; 32],
+                metric_semantics_sha256: resident_metric_semantics_sha256_v2(),
                 scoring_semantics_sha256: crate::resident_scoring_v2::scoring_semantics_sha256_v2(
                     objective,
                 ),
@@ -603,14 +493,25 @@ impl SealedResidentGenerationPlanV1 {
                 plan_identity_sha256,
             },
             plan_identity_sha256,
+            adaptive: None,
         }
     }
 }
 
-pub(crate) fn seal_resident_generation_plan_v1(
+/// Seal checked fixed geometry without granting device admission or claiming
+/// unsupported CPU adaptive policies have been implemented by the native plan.
+pub fn seal_resident_generation_plan_v1(
     input: ResidentGenerationPlanAuthorityInputV1,
 ) -> Result<SealedResidentGenerationPlanV1, ResidentGenerationDeviceErrorV1> {
     validate_rank_weighted_only_v1(input.parent_selection, input.survivor_selection)?;
+    seal_generation_geometry(input, discovery_generation_semantics_sha256_v1(), true)
+}
+
+fn seal_generation_geometry(
+    input: ResidentGenerationPlanAuthorityInputV1,
+    expected_semantics: [u8; 32],
+    thresholds_strictly_increasing: bool,
+) -> Result<SealedResidentGenerationPlanV1, ResidentGenerationDeviceErrorV1> {
     if input.logical_population_count == 0
         || input.retained_evaluation_capacity == 0
         || input.retained_evaluation_capacity > input.logical_population_count
@@ -637,7 +538,7 @@ pub(crate) fn seal_resident_generation_plan_v1(
         || identity_is_zero_v1(&input.scoring_semantics_sha256)
         || identity_is_zero_v1(&input.novelty_semantics_sha256)
         || identity_is_zero_v1(&input.scenario_order_semantics_sha256)
-        || identity_is_zero_v1(&input.cuda_build_manifest_sha256)
+        || identity_is_zero_v1(&input.native_build_manifest_sha256_v1())
         || identity_is_zero_v1(&input.rng_mapping_sha256)
     {
         return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
@@ -653,17 +554,37 @@ pub(crate) fn seal_resident_generation_plan_v1(
             "SMC Q32 probability exceeds one",
         ));
     }
-    let expected_semantics = discovery_generation_semantics_sha256_v1();
     if input.generation_semantics_sha256 != expected_semantics {
         return Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
             "generation semantics",
         ));
     }
-    validate_f64_plan_bits_v1(&input.threshold_ladder_bits, true)?;
+    if input.metric_semantics_sha256 != resident_metric_semantics_sha256_v2() {
+        return Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
+            "resident metric semantics",
+        ));
+    }
+    validate_f64_plan_bits_v1(&input.threshold_ladder_bits, thresholds_strictly_increasing)?;
+    // Adaptive percentiles may tie. Preserve their exact values rather than
+    // sorting, deduplicating, or perturbing the caller's resolved ladder.
+    if !thresholds_strictly_increasing
+        && (input
+            .threshold_ladder_bits
+            .iter()
+            .any(|bits| f64::from_bits(*bits) <= 0.0)
+            || input
+                .threshold_ladder_bits
+                .windows(2)
+                .any(|pair| f64::from_bits(pair[1]) < f64::from_bits(pair[0])))
+    {
+        return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
+            "adaptive threshold ladder must be positive and nondecreasing",
+        ));
+    }
     validate_f64_plan_bits_v1(&input.stop_bounds_bits, false)?;
 
     let mut raw = RawGenerationPlanV1 {
-        abi_version: ABI_VERSION_V1,
+        abi_version: selected_generation_abi_v1(),
         parent_selection_policy: input.parent_selection as u32,
         survivor_selection_policy: input.survivor_selection as u32,
         max_terms_per_gene: checked_u32_v1(input.max_terms_per_gene)?,
@@ -690,7 +611,10 @@ pub(crate) fn seal_resident_generation_plan_v1(
         scoring_semantics_sha256: input.scoring_semantics_sha256,
         novelty_semantics_sha256: input.novelty_semantics_sha256,
         scenario_order_semantics_sha256: input.scenario_order_semantics_sha256,
+        #[cfg(feature = "cuda")]
         cuda_build_manifest_sha256: input.cuda_build_manifest_sha256,
+        #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+        hip_build_manifest_sha256: input.hip_native_build_manifest_sha256,
         rng_mapping_sha256: input.rng_mapping_sha256,
         plan_identity_sha256: [0; 32],
     };
@@ -699,7 +623,465 @@ pub(crate) fn seal_resident_generation_plan_v1(
     Ok(SealedResidentGenerationPlanV1 {
         raw,
         plan_identity_sha256,
+        adaptive: None,
     })
+}
+
+const DISCOVERY_ADAPTIVE_GENERATION_ALGORITHM_V3: &str = concat!(
+    "neoethos.discovery-adaptive-generation.v3;algorithm=1;",
+    "resident-philox;rank-uniform-softmax-tournament-parent;",
+    "rank-elitist-tournament-generational-survivor;",
+    "configured-survivor-immigrant-stagnation-rescue-mutation;",
+    "signed-threshold-ladder;tp-sl-vol-distinct-bounds;",
+    "smc-gate-progress-stagnation;ordered-templates;bounded-seen-retries;",
+    "full-resident-population;checkpoint-control-only;terminal-last-evaluated"
+);
+
+#[cfg(any(feature = "hip-native-kernels", test))]
+fn adaptive_hip_generation_semantics_sha256_v3() -> [u8; 32] {
+    sha256_v1(&[
+        b"neoethos.discovery-adaptive-generation.amd-hip.v1;",
+        DISCOVERY_ADAPTIVE_GENERATION_ALGORITHM_V3.as_bytes(),
+        b"hipcub-rocprim;hip-native-build-bound;generation-abi=65537;",
+    ])
+}
+
+/// Explicitly versioned GPU algorithm and selected backend semantics. CUDA
+/// retains its original identity. HIP binds the same algorithm to AMD HIP,
+/// hipCUB/rocPRIM and the distinct native protocol. The actual build digest is
+/// separately bound by the plan; neither hash attests to device execution.
+pub fn discovery_adaptive_generation_semantics_sha256_v3() -> [u8; 32] {
+    #[cfg(feature = "cuda")]
+    {
+        sha256_v1(&[DISCOVERY_ADAPTIVE_GENERATION_ALGORITHM_V3.as_bytes()])
+    }
+    #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+    {
+        adaptive_hip_generation_semantics_sha256_v3()
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RawResidentAdaptivePolicyV3 {
+    pub(crate) abi_version: u32,
+    pub(crate) algorithm_version: u32,
+    pub(crate) parent_policy: u32,
+    pub(crate) survivor_policy: u32,
+    pub(crate) tournament_size: u32,
+    pub(crate) min_structural_smc_flags: u32,
+    pub(crate) adaptive_stops_enabled: u32,
+    pub(crate) reserved: u32,
+    pub(crate) seen_capacity: u64,
+    pub(crate) seen_retry_attempts: u64,
+    pub(crate) seen_initial_count: u64,
+    pub(crate) seed_template_count: u64,
+    pub(crate) template_count: u64,
+    pub(crate) soft_stagnation_patience: u64,
+    pub(crate) survivor_fraction: f64,
+    pub(crate) immigrant_fraction: f64,
+    pub(crate) selection_temperature: f64,
+    pub(crate) minimum_improvement: f64,
+    pub(crate) gate_start: f64,
+    pub(crate) gate_end: f64,
+    pub(crate) gate_curve: f64,
+    pub(crate) gate_stagnation_step: f64,
+    pub(crate) smc_force_ratio: f64,
+    pub(crate) run_identity_sha256: [u8; 32],
+    pub(crate) policy_identity_sha256: [u8; 32],
+}
+
+const _: [(); 216] = [(); std::mem::size_of::<RawResidentAdaptivePolicyV3>()];
+const _: [(); 8] = [(); std::mem::align_of::<RawResidentAdaptivePolicyV3>()];
+const _: [(); 80] = [(); std::mem::offset_of!(RawResidentAdaptivePolicyV3, survivor_fraction)];
+const _: [(); 184] =
+    [(); std::mem::offset_of!(RawResidentAdaptivePolicyV3, policy_identity_sha256)];
+
+/// Ordinary owned template content. No pointer, receipt or execution authority
+/// can be supplied here. Values are validated and preserved, never normalized.
+#[derive(Clone, Debug)]
+pub struct ResidentGenerationTemplateV3 {
+    pub feature_indices: Vec<u64>,
+    pub weights: Vec<f64>,
+    pub smc_flags: u32,
+    pub long_threshold: f64,
+    pub short_threshold: f64,
+    pub target_pips: f64,
+    pub stop_pips: f64,
+    pub stop_vol_multiplier: f64,
+}
+
+/// Resolved run configuration and bounded immutable seed controls. Runtime
+/// cancellation and wall-clock stopping remain with the orchestration owner.
+#[derive(Clone, Debug)]
+pub struct ResidentAdaptiveGenerationInputsV3 {
+    pub tournament_size: usize,
+    pub min_structural_smc_flags: u32,
+    pub adaptive_stops_enabled: bool,
+    pub seen_capacity: usize,
+    pub seen_retry_attempts: usize,
+    pub seed_template_count: usize,
+    pub soft_stagnation_patience: usize,
+    pub survivor_fraction: f64,
+    pub immigrant_fraction: f64,
+    pub selection_temperature: f64,
+    pub minimum_improvement: f64,
+    pub gate_start: f64,
+    pub gate_end: f64,
+    pub gate_curve: f64,
+    pub gate_stagnation_step: f64,
+    pub smc_force_ratio: f64,
+    pub templates: Vec<ResidentGenerationTemplateV3>,
+    pub initial_seen_hashes: Vec<u64>,
+}
+
+pub(crate) struct AdaptiveGenerationControlsV3 {
+    pub(crate) policy: RawResidentAdaptivePolicyV3,
+    pub(crate) template_scalars: Vec<RawResidentArchiveGeneScalarV3>,
+    pub(crate) template_indices: Vec<u64>,
+    pub(crate) template_weights: Vec<f64>,
+    pub(crate) initial_seen_hashes: Vec<u64>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RawResidentAdaptiveCheckpointV3 {
+    pub(crate) abi_version: u32,
+    pub(crate) algorithm_version: u32,
+    pub(crate) run_identity: u64,
+    pub(crate) evaluated_generation: u64,
+    pub(crate) evaluated_generations: u64,
+    pub(crate) evaluation_slots: u64,
+    pub(crate) evaluated_gate_bits: u64,
+    pub(crate) stagnant_generations: u64,
+    pub(crate) best_score_bits: u64,
+    pub(crate) survivor_count: u64,
+    pub(crate) immigrant_count: u64,
+    pub(crate) rescue_count: u64,
+    pub(crate) mutation_count: u32,
+    pub(crate) reserved: u32,
+    pub(crate) mutation_intensity: f64,
+    pub(crate) control_copy_count: u64,
+    pub(crate) control_copy_bytes: u64,
+    pub(crate) initial_upload_count: u64,
+    pub(crate) initial_upload_bytes: u64,
+}
+const _: [(); 136] = [(); std::mem::size_of::<RawResidentAdaptiveCheckpointV3>()];
+
+/// Small device-produced control state. Population genomes, feature matrices
+/// and metric rows stay resident until terminal export. Only the native owner
+/// can seal this value after checking its actual stream and generation.
+#[derive(Clone, Copy, Debug)]
+pub struct ResidentAdaptiveCheckpointV3 {
+    raw: RawResidentAdaptiveCheckpointV3,
+}
+
+impl ResidentAdaptiveCheckpointV3 {
+    pub(crate) fn seal_v3(
+        raw: RawResidentAdaptiveCheckpointV3,
+        run_identity: u64,
+        completed_generations: u64,
+        population: u64,
+    ) -> Result<Self, ResidentGenerationDeviceErrorV1> {
+        let best = f64::from_bits(raw.best_score_bits);
+        if raw.abi_version != 3
+            || raw.algorithm_version != 1
+            || raw.reserved != 0
+            || raw.run_identity != run_identity
+            || completed_generations == 0
+            || population == 0
+            || raw.evaluated_generations != completed_generations
+            || raw.evaluated_generation.checked_add(1) != Some(completed_generations)
+            || population.checked_mul(completed_generations) != Some(raw.evaluation_slots)
+            || !f64::from_bits(raw.evaluated_gate_bits).is_finite()
+            || (!best.is_finite() && best != f64::NEG_INFINITY)
+            || raw.stagnant_generations > completed_generations
+            || raw
+                .survivor_count
+                .checked_add(raw.immigrant_count)
+                .and_then(|count| count.checked_add(raw.rescue_count))
+                .is_none_or(|count| count > population)
+            || !(1..=3).contains(&raw.mutation_count)
+            || !raw.mutation_intensity.is_finite()
+            || raw.mutation_intensity <= 0.0
+            || raw.control_copy_count == 0
+            || raw.control_copy_count % 2 != 0
+            || raw.control_copy_count.checked_mul(92) != Some(raw.control_copy_bytes)
+            || raw.initial_upload_count > 4
+            || ((raw.initial_upload_count == 0) != (raw.initial_upload_bytes == 0))
+        {
+            return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
+                "invalid native adaptive checkpoint",
+            ));
+        }
+        Ok(Self { raw })
+    }
+    pub const fn run_identity(&self) -> u64 {
+        self.raw.run_identity
+    }
+    pub const fn evaluated_generation(&self) -> u64 {
+        self.raw.evaluated_generation
+    }
+    pub const fn evaluated_generations(&self) -> u64 {
+        self.raw.evaluated_generations
+    }
+    pub const fn evaluation_slots(&self) -> u64 {
+        self.raw.evaluation_slots
+    }
+    pub fn evaluated_gate(&self) -> f64 {
+        f64::from_bits(self.raw.evaluated_gate_bits)
+    }
+    pub const fn stagnant_generations(&self) -> u64 {
+        self.raw.stagnant_generations
+    }
+    pub fn best_score(&self) -> f64 {
+        f64::from_bits(self.raw.best_score_bits)
+    }
+    pub const fn survivor_count(&self) -> u64 {
+        self.raw.survivor_count
+    }
+    pub const fn immigrant_count(&self) -> u64 {
+        self.raw.immigrant_count
+    }
+    pub const fn rescue_count(&self) -> u64 {
+        self.raw.rescue_count
+    }
+    pub const fn mutation_count(&self) -> u32 {
+        self.raw.mutation_count
+    }
+    pub const fn mutation_intensity(&self) -> f64 {
+        self.raw.mutation_intensity
+    }
+    pub const fn control_copy_count(&self) -> u64 {
+        self.raw.control_copy_count
+    }
+    pub const fn control_copy_bytes(&self) -> u64 {
+        self.raw.control_copy_bytes
+    }
+    pub const fn initial_upload_count(&self) -> u64 {
+        self.raw.initial_upload_count
+    }
+    pub const fn initial_upload_bytes(&self) -> u64 {
+        self.raw.initial_upload_bytes
+    }
+}
+
+pub fn seal_adaptive_resident_generation_plan_v3(
+    input: ResidentGenerationPlanAuthorityInputV1,
+    controls: ResidentAdaptiveGenerationInputsV3,
+) -> Result<SealedResidentGenerationPlanV1, ResidentGenerationDeviceErrorV1> {
+    let mut plan = seal_generation_geometry(
+        input,
+        discovery_adaptive_generation_semantics_sha256_v3(),
+        false,
+    )?;
+    let invalid = ResidentGenerationDeviceErrorV1::InvalidPlan;
+    let unit = |value: f64| value.is_finite() && (0.0..=1.0).contains(&value);
+    if controls.tournament_size < 2
+        || controls.tournament_size > u32::MAX as usize
+        || controls.min_structural_smc_flags > 10
+        || controls.seen_retry_attempts == 0
+        || controls.seen_retry_attempts > (u32::MAX / 256) as usize
+        || controls.initial_seen_hashes.len() > controls.seen_capacity
+        || controls.seed_template_count > controls.templates.len()
+        || controls.templates.len() > 50
+        || plan.raw.max_terms_per_gene > 16
+        || controls.seed_template_count as u64 > plan.raw.logical_population_count / 10
+        || !unit(controls.survivor_fraction)
+        || !unit(controls.immigrant_fraction)
+        || controls.survivor_fraction > 0.95
+        || controls.immigrant_fraction > 0.95
+        || !controls.gate_start.is_finite()
+        || !controls.gate_end.is_finite()
+        || !unit(controls.smc_force_ratio)
+        || !controls.selection_temperature.is_finite()
+        || controls.selection_temperature <= 0.0
+        || !controls.minimum_improvement.is_finite()
+        || controls.minimum_improvement < 0.0
+        || !controls.gate_curve.is_finite()
+        || controls.gate_curve <= 0.0
+        || !controls.gate_stagnation_step.is_finite()
+        || controls.gate_stagnation_step < 0.0
+    {
+        return Err(invalid("invalid adaptive generation controls"));
+    }
+    if plan.raw.stop_bounds_bits.chunks_exact(2).any(|pair| {
+        let lo = f64::from_bits(pair[0]);
+        let hi = f64::from_bits(pair[1]);
+        lo <= 0.0 || hi < lo
+    }) {
+        return Err(invalid("invalid adaptive initialization bounds"));
+    }
+    let stride = plan.raw.max_terms_per_gene as usize;
+    let term_extent = controls
+        .templates
+        .len()
+        .checked_mul(stride)
+        .ok_or(ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?;
+    let mut scalars = Vec::new();
+    let mut indices = Vec::new();
+    let mut weights = Vec::new();
+    scalars
+        .try_reserve_exact(controls.templates.len())
+        .map_err(|_| invalid("template allocation failed"))?;
+    indices
+        .try_reserve_exact(term_extent)
+        .map_err(|_| invalid("template allocation failed"))?;
+    weights
+        .try_reserve_exact(term_extent)
+        .map_err(|_| invalid("template allocation failed"))?;
+    for (ordinal, template) in controls.templates.iter().enumerate() {
+        let count = template.feature_indices.len();
+        if count == 0
+            || count > stride
+            || template.weights.len() != count
+            || template.smc_flags & !0x7ff != 0
+            || !template.long_threshold.is_finite()
+            || !template.short_threshold.is_finite()
+            || template.long_threshold <= template.short_threshold
+            || !template.target_pips.is_finite()
+            || template.target_pips <= 0.0
+            || !template.stop_pips.is_finite()
+            || template.stop_pips <= 0.0
+            || !template.stop_vol_multiplier.is_finite()
+            || template.stop_vol_multiplier < 0.0
+            || template
+                .feature_indices
+                .iter()
+                .any(|index| *index >= plan.raw.feature_count)
+            || template.weights.iter().any(|weight| !weight.is_finite())
+            || template
+                .feature_indices
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid("invalid adaptive template genome"));
+        }
+        scalars.push(RawResidentArchiveGeneScalarV3 {
+            gene_identity: ordinal as u64,
+            content_hash: 0,
+            term_count: count as u32,
+            smc_flags: template.smc_flags,
+            long_threshold: template.long_threshold,
+            short_threshold: template.short_threshold,
+            target_pips: template.target_pips,
+            stop_pips: template.stop_pips,
+            stop_vol_multiplier: template.stop_vol_multiplier,
+            generation: 0,
+            reserved: 0,
+        });
+        indices.extend_from_slice(&template.feature_indices);
+        weights.extend_from_slice(&template.weights);
+        indices.resize(indices.len() + stride - count, 0);
+        weights.resize(weights.len() + stride - count, 0.0);
+    }
+    let mut policy = RawResidentAdaptivePolicyV3 {
+        abi_version: 3,
+        algorithm_version: 1,
+        parent_policy: match plan.raw.parent_selection_policy {
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            4 => 3,
+            _ => unreachable!(),
+        },
+        survivor_policy: plan.raw.survivor_selection_policy,
+        tournament_size: checked_u32_v1(controls.tournament_size)?,
+        min_structural_smc_flags: controls.min_structural_smc_flags,
+        adaptive_stops_enabled: u32::from(controls.adaptive_stops_enabled),
+        reserved: 0,
+        seen_capacity: checked_u64_v1(controls.seen_capacity)?,
+        seen_retry_attempts: checked_u64_v1(controls.seen_retry_attempts)?,
+        seen_initial_count: checked_u64_v1(controls.initial_seen_hashes.len())?,
+        seed_template_count: checked_u64_v1(controls.seed_template_count)?,
+        template_count: checked_u64_v1(controls.templates.len())?,
+        soft_stagnation_patience: checked_u64_v1(controls.soft_stagnation_patience)?,
+        survivor_fraction: controls.survivor_fraction,
+        immigrant_fraction: controls.immigrant_fraction,
+        selection_temperature: controls.selection_temperature,
+        minimum_improvement: controls.minimum_improvement,
+        gate_start: controls.gate_start,
+        gate_end: controls.gate_end,
+        gate_curve: controls.gate_curve,
+        gate_stagnation_step: controls.gate_stagnation_step,
+        smc_force_ratio: controls.smc_force_ratio,
+        run_identity_sha256: plan.raw.run_identity_sha256,
+        policy_identity_sha256: [0; 32],
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"neoethos.resident-adaptive-policy.v3\0");
+    hash.update(plan.plan_identity_sha256);
+    for value in [
+        policy.abi_version,
+        policy.algorithm_version,
+        policy.parent_policy,
+        policy.survivor_policy,
+        policy.tournament_size,
+        policy.min_structural_smc_flags,
+        policy.adaptive_stops_enabled,
+        policy.reserved,
+    ] {
+        hash.update(value.to_le_bytes());
+    }
+    for value in [
+        policy.seen_capacity,
+        policy.seen_retry_attempts,
+        policy.seen_initial_count,
+        policy.seed_template_count,
+        policy.template_count,
+        policy.soft_stagnation_patience,
+    ] {
+        hash.update(value.to_le_bytes());
+    }
+    for value in [
+        policy.survivor_fraction,
+        policy.immigrant_fraction,
+        policy.selection_temperature,
+        policy.minimum_improvement,
+        policy.gate_start,
+        policy.gate_end,
+        policy.gate_curve,
+        policy.gate_stagnation_step,
+        policy.smc_force_ratio,
+    ] {
+        hash.update(value.to_bits().to_le_bytes());
+    }
+    hash.update(policy.run_identity_sha256);
+    for scalar in &scalars {
+        hash.update(scalar.gene_identity.to_le_bytes());
+        hash.update(scalar.content_hash.to_le_bytes());
+        hash.update(scalar.term_count.to_le_bytes());
+        hash.update(scalar.smc_flags.to_le_bytes());
+        for value in [
+            scalar.long_threshold,
+            scalar.short_threshold,
+            scalar.target_pips,
+            scalar.stop_pips,
+            scalar.stop_vol_multiplier,
+        ] {
+            hash.update(value.to_bits().to_le_bytes());
+        }
+        hash.update(scalar.generation.to_le_bytes());
+        hash.update(scalar.reserved.to_le_bytes());
+    }
+    for value in &indices {
+        hash.update(value.to_le_bytes());
+    }
+    for value in &weights {
+        hash.update(value.to_bits().to_le_bytes());
+    }
+    for value in &controls.initial_seen_hashes {
+        hash.update(value.to_le_bytes());
+    }
+    policy.policy_identity_sha256 = hash.finalize().into();
+    plan.adaptive = Some(AdaptiveGenerationControlsV3 {
+        policy,
+        template_scalars: scalars,
+        template_indices: indices,
+        template_weights: weights,
+        initial_seen_hashes: controls.initial_seen_hashes,
+    });
+    Ok(plan)
 }
 
 fn validate_rank_weighted_only_v1(
@@ -730,789 +1112,6 @@ fn validate_rank_weighted_only_v1(
             Err(ResidentGenerationDeviceErrorV1::UnsupportedGenerationalSelection)
         }
     }
-}
-
-pub struct ActualResidentGenerationAllocationPlanV1 {
-    raw: RawAllocationReceiptV1,
-    logical_gene_scalar_bytes: u64,
-    logical_gene_index_bytes: u64,
-    logical_gene_weight_bytes: u64,
-    offspring_bytes: u64,
-    metric_row_bytes: u64,
-    rank_key_bytes: u64,
-    selection_bytes: u64,
-    dedup_hash_bytes: u64,
-    cub_scratch_bytes: u64,
-    retained_evaluation_workspace_bytes: u64,
-    terminal_device_receipt_bytes: u64,
-    same_context_free_bytes: u64,
-    full_discovery_reserve_bytes: u64,
-    total_device_bytes: u64,
-}
-
-impl ActualResidentGenerationAllocationPlanV1 {
-    pub const fn retained_batch_capacity(&self) -> usize {
-        self.raw.retained_evaluation_capacity as usize
-    }
-
-    pub const fn same_context_free_bytes(&self) -> u64 {
-        self.same_context_free_bytes
-    }
-
-    pub const fn full_discovery_reserve_bytes(&self) -> u64 {
-        self.full_discovery_reserve_bytes
-    }
-
-    pub const fn total_device_bytes(&self) -> u64 {
-        self.total_device_bytes
-    }
-
-    pub const fn generation_store_allocation_count(&self) -> u32 {
-        self.raw.generation_store_allocation_count
-    }
-}
-
-pub(crate) fn query_actual_resident_generation_allocation_plan_v1(
-    import: &ResidentGenerationPopulationSessionImportV1,
-    plan: &SealedResidentGenerationPlanV1,
-) -> Result<ActualResidentGenerationAllocationPlanV1, ResidentGenerationDeviceErrorV1> {
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (import, plan);
-        Err(ResidentGenerationDeviceErrorV1::CudaFeatureNotCompiled)
-    }
-    #[cfg(feature = "cuda")]
-    {
-        let mut raw = RawAllocationReceiptV1::default();
-        // SAFETY: both sealed inputs and the out-receipt remain live for the
-        // call. The native query reads same-context memory facts itself.
-        let status = unsafe {
-            ffi_query_resident_generation_allocation_v1(&import.raw, &plan.raw, &mut raw)
-        };
-        require_native_ok_v1("query_resident_generation_allocation_v1", status)?;
-        validate_allocation_receipt_v1(import, plan, &raw)
-    }
-}
-
-#[must_use = "resident generation work must be consumed on the admitted run stream"]
-pub struct ResidentGenerationDeviceRunV1 {
-    native: NonNull<NativeResidentGenerationRunV1>,
-    population_session_import: Option<ResidentGenerationPopulationSessionImportV1>,
-    dependency_lifetime_owners: Vec<Box<dyn Any>>,
-    state: ResidentGenerationRunStateV1,
-    selected_cuda_ordinal: u32,
-    primary_context_identity_sha256: [u8; 32],
-    run_stream_identity_sha256: [u8; 32],
-    cuda_build_manifest_sha256: [u8; 32],
-    generation_semantics_sha256: [u8; 32],
-    run_identity_sha256: [u8; 32],
-    plan: SealedResidentGenerationPlanV1,
-    allocation: ActualResidentGenerationAllocationPlanV1,
-}
-
-pub(crate) fn bind_population_session_import_v1(
-    import: ResidentGenerationPopulationSessionImportV1,
-    plan: SealedResidentGenerationPlanV1,
-    allocation: ActualResidentGenerationAllocationPlanV1,
-) -> Result<ResidentGenerationDeviceRunV1, ResidentGenerationDeviceErrorV1> {
-    validate_import_plan_allocation_identity_v1(&import, &plan, &allocation)?;
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (import, plan, allocation);
-        Err(ResidentGenerationDeviceErrorV1::CudaFeatureNotCompiled)
-    }
-    #[cfg(feature = "cuda")]
-    {
-        let mut native = std::ptr::null_mut();
-        // SAFETY: the import retains the population owner and admitted stream;
-        // the native side copies only metadata and aliases that same stream.
-        let status = unsafe {
-            ffi_create_resident_generation_run_from_import_v1(
-                &import.raw,
-                &plan.raw,
-                &allocation.raw,
-                &mut native,
-            )
-        };
-        if status != STATUS_OK_V1 {
-            if !native.is_null() {
-                // Creator failures are forbidden from publishing any pointer.
-                // Do not call/query/free an unexpected identity; the import's
-                // leak-only Drop keeps its session/context/stream alive.
-                return Err(ResidentGenerationDeviceErrorV1::Native {
-                    operation: "create_resident_generation_run_from_import_v1_published_pointer_on_error",
-                    status,
-                });
-            }
-            return Err(native_error_v1(
-                "create_resident_generation_run_from_import_v1",
-                status,
-            ));
-        }
-        let native = NonNull::new(native).ok_or(ResidentGenerationDeviceErrorV1::Native {
-            operation: "create_resident_generation_run_from_import_v1",
-            status,
-        })?;
-        Ok(ResidentGenerationDeviceRunV1 {
-            native,
-            state: ResidentGenerationRunStateV1::StrictIdle,
-            selected_cuda_ordinal: import.raw.selected_cuda_ordinal,
-            primary_context_identity_sha256: import.raw.primary_context_identity_sha256,
-            run_stream_identity_sha256: import.raw.run_stream_identity_sha256,
-            cuda_build_manifest_sha256: import.raw.cuda_build_manifest_sha256,
-            generation_semantics_sha256: plan.raw.generation_semantics_sha256,
-            run_identity_sha256: plan.raw.run_identity_sha256,
-            population_session_import: Some(import),
-            dependency_lifetime_owners: Vec::new(),
-            plan,
-            allocation,
-        })
-    }
-}
-
-#[must_use = "the ready event owns its native run until the next resident stage consumes it"]
-pub struct ResidentGenerationReadyEventV1 {
-    run: Option<ResidentGenerationDeviceRunV1>,
-    raw: RawReadyEventV1,
-}
-
-pub(crate) fn initialize_resident_generation_population_v1(
-    mut run: ResidentGenerationDeviceRunV1,
-) -> Result<ResidentGenerationReadyEventV1, ResidentGenerationDeviceErrorV1> {
-    require_run_state_v1(&run, ResidentGenerationRunStateV1::StrictIdle)?;
-    run.state = ResidentGenerationRunStateV1::InFlight;
-    let mut raw = RawReadyEventV1::default();
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = raw;
-        run.state = ResidentGenerationRunStateV1::Poisoned;
-        Err(ResidentGenerationDeviceErrorV1::CudaFeatureNotCompiled)
-    }
-    #[cfg(feature = "cuda")]
-    {
-        // SAFETY: the move-only run owns the native handle and admitted stream.
-        let status = unsafe {
-            ffi_initialize_resident_generation_population_v1(run.native.as_ptr(), &mut raw)
-        };
-        if status != STATUS_OK_V1 {
-            run.state = ResidentGenerationRunStateV1::Poisoned;
-            return Err(native_error_v1(
-                "initialize_resident_generation_population_v1",
-                status,
-            ));
-        }
-        validate_ready_event_v1(&run, &raw)?;
-        Ok(ResidentGenerationReadyEventV1 {
-            run: Some(run),
-            raw,
-        })
-    }
-}
-
-/// One move-only import minted only by the future strict scoring/novelty GPU
-/// stage. Its owner retains the exact metric rows, integer decision keys,
-/// scenario ordering and ready event until the generation stream consumes them.
-pub(crate) struct ResidentScoredDecisionRowsEventImportV1 {
-    raw: RawMetricRowsImportV1,
-    lifetime_owner: Option<Box<dyn Any>>,
-}
-
-impl ResidentScoredDecisionRowsEventImportV1 {
-    /// # Safety
-    ///
-    /// The metric rows, decision keys and expected scenario IDs must be live
-    /// device allocations in the admitted primary context. The ready event must
-    /// order their final writes, and `lifetime_owner` must retain all of them.
-    pub(crate) unsafe fn from_scoring_novelty_parts_v1<T: Any>(
-        raw: RawMetricRowsImportV1,
-        lifetime_owner: T,
-    ) -> Result<Self, ResidentGenerationDeviceErrorV1> {
-        if raw.abi_version != ABI_VERSION_V1
-            || raw.metric_value_count != 11
-            || raw.metric_rows_device.is_null()
-            || raw.resident_decision_keys_device.is_null()
-            || raw.expected_scenario_ids_device.is_null()
-            || raw.scoring_novelty_ready_event.is_null()
-            || identity_is_zero_v1(&raw.metric_semantics_sha256)
-            || identity_is_zero_v1(&raw.scoring_semantics_sha256)
-            || identity_is_zero_v1(&raw.novelty_semantics_sha256)
-            || identity_is_zero_v1(&raw.scenario_order_semantics_sha256)
-            || identity_is_zero_v1(&raw.rank_semantics_sha256)
-        {
-            return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
-                "scored decision-row event import is incomplete",
-            ));
-        }
-        Ok(Self {
-            raw,
-            lifetime_owner: Some(Box::new(lifetime_owner)),
-        })
-    }
-
-    fn into_raw_and_owner_v1(mut self) -> (RawMetricRowsImportV1, Box<dyn Any>) {
-        let raw = self.raw;
-        let owner = self
-            .lifetime_owner
-            .take()
-            .expect("validated metric import owns its lifetime authority");
-        (raw, owner)
-    }
-}
-
-pub(crate) fn enqueue_exact_generation_chunk_v1(
-    ready: ResidentGenerationReadyEventV1,
-    metrics: ResidentScoredDecisionRowsEventImportV1,
-) -> Result<ResidentGenerationReadyEventV1, ResidentGenerationDeviceErrorV1> {
-    let (mut run, dependency) = ready.into_parts_v1()?;
-    validate_exact_chunk_v1(&run.plan, &metrics.raw)?;
-    let (metrics_raw, metrics_owner) = metrics.into_raw_and_owner_v1();
-    let mut next = RawReadyEventV1::default();
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (dependency, metrics_raw, metrics_owner, next);
-        run.state = ResidentGenerationRunStateV1::Poisoned;
-        Err(ResidentGenerationDeviceErrorV1::CudaFeatureNotCompiled)
-    }
-    #[cfg(feature = "cuda")]
-    {
-        require_dependency_identity_v1(&run, &dependency)?;
-        // SAFETY: both dependency owners remain live through the same-stream
-        // enqueue; native code retains neither Rust address.
-        // The owner is attached before the fallible native enqueue. Any
-        // ambiguous-after-launch failure therefore takes the run's leak-only
-        // Drop path instead of freeing metrics that the stream may still read.
-        run.dependency_lifetime_owners.push(metrics_owner);
-        let status = unsafe {
-            ffi_enqueue_exact_generation_chunk_v1(run.native.as_ptr(), &metrics_raw, &mut next)
-        };
-        if status != STATUS_OK_V1 {
-            run.state = ResidentGenerationRunStateV1::Poisoned;
-            return Err(native_error_v1("enqueue_exact_generation_chunk_v1", status));
-        }
-        validate_ready_event_v1(&run, &next)?;
-        Ok(ResidentGenerationReadyEventV1 {
-            run: Some(run),
-            raw: next,
-        })
-    }
-}
-
-pub(crate) fn enqueue_resident_rank_selection_offspring_v1(
-    ready: ResidentGenerationReadyEventV1,
-    generation_index: usize,
-) -> Result<ResidentGenerationReadyEventV1, ResidentGenerationDeviceErrorV1> {
-    let (mut run, dependency) = ready.into_parts_v1()?;
-    require_dependency_identity_v1(&run, &dependency)?;
-    let generation_index = checked_u64_v1(generation_index)?;
-    if generation_index >= run.plan.raw.generation_count {
-        run.state = ResidentGenerationRunStateV1::Poisoned;
-        return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
-            "generation index is outside the sealed plan",
-        ));
-    }
-    let mut next = RawReadyEventV1::default();
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = next;
-        run.state = ResidentGenerationRunStateV1::Poisoned;
-        Err(ResidentGenerationDeviceErrorV1::CudaFeatureNotCompiled)
-    }
-    #[cfg(feature = "cuda")]
-    {
-        // SAFETY: native work is appended to the run's one admitted stream.
-        let status = unsafe {
-            ffi_enqueue_resident_rank_selection_offspring_v1(
-                run.native.as_ptr(),
-                generation_index,
-                &mut next,
-            )
-        };
-        if status != STATUS_OK_V1 {
-            run.state = ResidentGenerationRunStateV1::Poisoned;
-            return Err(native_error_v1(
-                "enqueue_resident_rank_selection_offspring_v1",
-                status,
-            ));
-        }
-        validate_ready_event_v1(&run, &next)?;
-        Ok(ResidentGenerationReadyEventV1 {
-            run: Some(run),
-            raw: next,
-        })
-    }
-}
-
-pub struct ResidentGenerationContentIdentityV1 {
-    identity_handle: u64,
-    run_identity_sha256: [u8; 32],
-}
-
-pub struct ResidentGenerationReceiptIdentityV1 {
-    identity_handle: u64,
-    run_identity_sha256: [u8; 32],
-}
-
-pub struct SealedResidentGenerationDeviceOutcomeV1 {
-    ready: ResidentGenerationReadyEventV1,
-    resident_gene_content: ResidentGenerationContentIdentityV1,
-    resident_metric_content: ResidentGenerationContentIdentityV1,
-    resident_generation_receipt: ResidentGenerationReceiptIdentityV1,
-    artifact_class: GenerationArtifactClassV1,
-    promotion_eligibility: GenerationPromotionEligibilityV1,
-}
-
-pub(crate) fn seal_content_identities_on_device_v1(
-    ready: ResidentGenerationReadyEventV1,
-) -> Result<SealedResidentGenerationDeviceOutcomeV1, ResidentGenerationDeviceErrorV1> {
-    let (mut run, dependency) = ready.into_parts_v1()?;
-    require_dependency_identity_v1(&run, &dependency)?;
-    let mut raw_receipt = RawContentReceiptV1::default();
-    let mut raw_ready = RawReadyEventV1::default();
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (raw_receipt, raw_ready);
-        run.state = ResidentGenerationRunStateV1::Poisoned;
-        Err(ResidentGenerationDeviceErrorV1::CudaFeatureNotCompiled)
-    }
-    #[cfg(feature = "cuda")]
-    {
-        // SAFETY: content identities and their receipt stay on the owning
-        // device; only opaque native handles are returned.
-        let status = unsafe {
-            ffi_seal_resident_generation_content_v1(
-                run.native.as_ptr(),
-                &mut raw_receipt,
-                &mut raw_ready,
-            )
-        };
-        if status != STATUS_OK_V1 {
-            run.state = ResidentGenerationRunStateV1::Poisoned;
-            return Err(native_error_v1(
-                "seal_resident_generation_content_v1",
-                status,
-            ));
-        }
-        if raw_receipt.abi_version != ABI_VERSION_V1
-            || raw_receipt.ready_event_id != raw_ready.event_id
-            || !(raw_receipt.final_compact_readback_count == 0)
-            || raw_receipt.gene_content_identity_handle == 0
-            || raw_receipt.metric_content_identity_handle == 0
-            || raw_receipt.generation_receipt_identity_handle == 0
-        {
-            run.state = ResidentGenerationRunStateV1::Poisoned;
-            return Err(ResidentGenerationDeviceErrorV1::DeviceContentFault);
-        }
-        validate_ready_event_v1(&run, &raw_ready)?;
-        run.state = ResidentGenerationRunStateV1::Sealed;
-        let run_identity_sha256 = run.run_identity_sha256;
-        Ok(SealedResidentGenerationDeviceOutcomeV1 {
-            ready: ResidentGenerationReadyEventV1 {
-                run: Some(run),
-                raw: raw_ready,
-            },
-            resident_gene_content: ResidentGenerationContentIdentityV1 {
-                identity_handle: raw_receipt.gene_content_identity_handle,
-                run_identity_sha256,
-            },
-            resident_metric_content: ResidentGenerationContentIdentityV1 {
-                identity_handle: raw_receipt.metric_content_identity_handle,
-                run_identity_sha256,
-            },
-            resident_generation_receipt: ResidentGenerationReceiptIdentityV1 {
-                identity_handle: raw_receipt.generation_receipt_identity_handle,
-                run_identity_sha256,
-            },
-            artifact_class: GenerationArtifactClassV1::ResearchOnly,
-            promotion_eligibility: GenerationPromotionEligibilityV1::NotPromotionEligible,
-        })
-    }
-}
-
-pub(crate) struct ResidentGenerationPostGaInputV1 {
-    ready: ResidentGenerationReadyEventV1,
-    gene_content: ResidentGenerationContentIdentityV1,
-    metric_content: ResidentGenerationContentIdentityV1,
-    receipt: ResidentGenerationReceiptIdentityV1,
-}
-
-struct ResidentGenerationPostGaContentAuthorityV1 {
-    gene_content: ResidentGenerationContentIdentityV1,
-    metric_content: ResidentGenerationContentIdentityV1,
-    receipt: ResidentGenerationReceiptIdentityV1,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResidentGenerationPostGaWorkspaceStateV1 {
-    GenerationStoresOnly,
-}
-
-#[must_use = "post-GA in-place work owns the generation run until a resident stage consumes it"]
-pub(crate) struct ResidentGenerationPostGaInPlaceRunV1 {
-    run: Option<ResidentGenerationDeviceRunV1>,
-    dependency: RawReadyEventV1,
-    content_authority: ResidentGenerationPostGaContentAuthorityV1,
-    receipt: RawPostGaInPlaceReceiptV1,
-    workspace_state: ResidentGenerationPostGaWorkspaceStateV1,
-}
-
-impl SealedResidentGenerationDeviceOutcomeV1 {
-    pub(crate) fn consume_into_post_ga_v1(self) -> ResidentGenerationPostGaInputV1 {
-        ResidentGenerationPostGaInputV1 {
-            ready: self.ready,
-            gene_content: self.resident_gene_content,
-            metric_content: self.resident_metric_content,
-            receipt: self.resident_generation_receipt,
-        }
-    }
-}
-
-pub(crate) fn begin_resident_post_ga_in_place_v1(
-    input: ResidentGenerationPostGaInputV1,
-) -> Result<ResidentGenerationPostGaInPlaceRunV1, ResidentGenerationDeviceErrorV1> {
-    let ResidentGenerationPostGaInputV1 {
-        ready,
-        gene_content,
-        metric_content,
-        receipt,
-    } = input;
-    let (mut run, dependency) = ready.into_parts_v1()?;
-    require_run_state_v1(&run, ResidentGenerationRunStateV1::Sealed)?;
-    let content_authority = ResidentGenerationPostGaContentAuthorityV1 {
-        gene_content,
-        metric_content,
-        receipt,
-    };
-    validate_post_ga_content_identity_v1(&run, &content_authority)?;
-    let mut raw_receipt = RawPostGaInPlaceReceiptV1::default();
-
-    // Once native validation is attempted, any failure can be ambiguous with
-    // respect to an enqueued same-stream dependency. Poison before FFI so every
-    // error path retains the run and all evaluator/scoring lifetime owners.
-    run.state = ResidentGenerationRunStateV1::Poisoned;
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (&dependency, &content_authority, &mut raw_receipt);
-        Err(ResidentGenerationDeviceErrorV1::CudaFeatureNotCompiled)
-    }
-    #[cfg(feature = "cuda")]
-    {
-        // SAFETY: the move-only Rust owner retains the sole native generation
-        // run, admitted stream/event and every imported dependency owner. The
-        // native bridge returns identity/count evidence only and allocates no
-        // device or host storage.
-        let status = unsafe {
-            ffi_begin_resident_post_ga_in_place_v1(
-                run.native.as_ptr(),
-                &dependency,
-                content_authority.gene_content.identity_handle,
-                content_authority.metric_content.identity_handle,
-                content_authority.receipt.identity_handle,
-                &mut raw_receipt,
-            )
-        };
-        if status != STATUS_OK_V1 {
-            return Err(native_error_v1(
-                "begin_resident_post_ga_in_place_v1",
-                status,
-            ));
-        }
-        validate_post_ga_in_place_receipt_v1(&run, &dependency, &content_authority, &raw_receipt)?;
-        run.state = ResidentGenerationRunStateV1::PostGaInPlace;
-        Ok(ResidentGenerationPostGaInPlaceRunV1 {
-            run: Some(run),
-            dependency,
-            content_authority,
-            receipt: raw_receipt,
-            workspace_state: ResidentGenerationPostGaWorkspaceStateV1::GenerationStoresOnly,
-        })
-    }
-}
-
-impl ResidentGenerationReadyEventV1 {
-    fn into_parts_v1(
-        mut self,
-    ) -> Result<(ResidentGenerationDeviceRunV1, RawReadyEventV1), ResidentGenerationDeviceErrorV1>
-    {
-        let run = self
-            .run
-            .take()
-            .ok_or(ResidentGenerationDeviceErrorV1::RunStateViolation)?;
-        Ok((run, self.raw))
-    }
-}
-
-impl Drop for ResidentGenerationDeviceRunV1 {
-    fn drop(&mut self) {
-        // No terminal completion lease exists in this additive slice. Even an
-        // idle-looking run may own queued allocation work on the admitted
-        // stream, so ordinary Drop is always leak-only. A later terminal GPU
-        // stage must consume the opaque run and return a completion lease before
-        // the native async release API can be exposed safely.
-        leak_live_native_generation_run_v1(self);
-    }
-}
-
-fn leak_live_native_generation_run_v1(run: &mut ResidentGenerationDeviceRunV1) {
-    for owner in run.dependency_lifetime_owners.drain(..) {
-        std::mem::forget(owner);
-    }
-    if let Some(import) = run.population_session_import.take() {
-        std::mem::forget(import);
-    }
-}
-
-fn checked_generation_chunk_count_v1(
-    logical_population_count: usize,
-    retained_evaluation_capacity: usize,
-) -> Result<usize, ResidentGenerationDeviceErrorV1> {
-    if !(retained_evaluation_capacity >= 1) || logical_population_count == 0 {
-        return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
-            "chunk capacities must be non-zero",
-        ));
-    }
-    logical_population_count
-        .checked_add(retained_evaluation_capacity - 1)
-        .and_then(|value| value.checked_div(retained_evaluation_capacity))
-        .ok_or(ResidentGenerationDeviceErrorV1::ArithmeticOverflow)
-}
-
-fn checked_generation_chunk_range_v1(
-    logical_population_count: usize,
-    retained_evaluation_capacity: usize,
-    chunk_index: usize,
-) -> Result<std::ops::Range<usize>, ResidentGenerationDeviceErrorV1> {
-    let start = chunk_index
-        .checked_mul(retained_evaluation_capacity)
-        .ok_or(ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?;
-    let end = start
-        .checked_add(retained_evaluation_capacity)
-        .ok_or(ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?
-        .min(logical_population_count);
-    let active_scenarios = end.saturating_sub(start);
-    if !(active_scenarios <= retained_evaluation_capacity) || active_scenarios == 0 {
-        return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
-            "chunk is empty or exceeds retained capacity",
-        ));
-    }
-    Ok(start..end)
-}
-
-fn validate_exact_chunk_v1(
-    plan: &SealedResidentGenerationPlanV1,
-    metrics: &RawMetricRowsImportV1,
-) -> Result<(), ResidentGenerationDeviceErrorV1> {
-    let logical_population_count = usize::try_from(plan.raw.logical_population_count)
-        .map_err(|_| ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?;
-    let retained_evaluation_capacity = usize::try_from(plan.raw.retained_evaluation_capacity)
-        .map_err(|_| ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?;
-    let chunk_count =
-        checked_generation_chunk_count_v1(logical_population_count, retained_evaluation_capacity)?;
-    let logical_offset = usize::try_from(metrics.logical_offset)
-        .map_err(|_| ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?;
-    let active_scenarios = usize::try_from(metrics.active_scenarios)
-        .map_err(|_| ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?;
-    let chunk_index = logical_offset
-        .checked_div(retained_evaluation_capacity)
-        .ok_or(ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?;
-    if chunk_index >= chunk_count {
-        return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
-            "chunk index is outside the exact schedule",
-        ));
-    }
-    let exact = checked_generation_chunk_range_v1(
-        logical_population_count,
-        retained_evaluation_capacity,
-        chunk_index,
-    )?;
-    let covered_logical_population = checked_generation_chunk_range_v1(
-        logical_population_count,
-        retained_evaluation_capacity,
-        chunk_count - 1,
-    )?
-    .end;
-    if !(covered_logical_population == logical_population_count)
-        || exact.start != logical_offset
-        || exact.len() != active_scenarios
-        || metrics.metric_value_count != 11
-        || metrics.metric_rows_device.is_null()
-        || metrics.resident_decision_keys_device.is_null()
-        || metrics.expected_scenario_ids_device.is_null()
-        || metrics.scoring_novelty_ready_event.is_null()
-        || metrics.metric_semantics_sha256 != plan.raw.metric_semantics_sha256
-        || metrics.scoring_semantics_sha256 != plan.raw.scoring_semantics_sha256
-        || metrics.novelty_semantics_sha256 != plan.raw.novelty_semantics_sha256
-        || metrics.scenario_order_semantics_sha256 != plan.raw.scenario_order_semantics_sha256
-        || metrics.rank_semantics_sha256 != plan.raw.rank_semantics_sha256
-    {
-        return Err(ResidentGenerationDeviceErrorV1::InvalidPlan(
-            "metric chunk differs from the exact sealed schedule",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_allocation_receipt_v1(
-    import: &ResidentGenerationPopulationSessionImportV1,
-    plan: &SealedResidentGenerationPlanV1,
-    raw: &RawAllocationReceiptV1,
-) -> Result<ActualResidentGenerationAllocationPlanV1, ResidentGenerationDeviceErrorV1> {
-    let expected_chunks = checked_generation_chunk_count_v1(
-        usize::try_from(plan.raw.logical_population_count)
-            .map_err(|_| ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?,
-        usize::try_from(plan.raw.retained_evaluation_capacity)
-            .map_err(|_| ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?,
-    )?;
-    if raw.abi_version != ABI_VERSION_V1
-        || raw.generation_store_allocation_count != 1
-        || raw.logical_population_count != plan.raw.logical_population_count
-        || raw.retained_evaluation_capacity != plan.raw.retained_evaluation_capacity
-        || raw.generation_chunk_count
-            != u64::try_from(expected_chunks)
-                .map_err(|_| ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?
-        || raw.full_discovery_reserve_bytes != import.raw.full_discovery_reserve_bytes
-    {
-        return Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
-            "allocation receipt",
-        ));
-    }
-    let charged = [
-        raw.logical_gene_scalar_bytes,
-        raw.logical_gene_index_bytes,
-        raw.logical_gene_weight_bytes,
-        raw.offspring_bytes,
-        raw.metric_row_bytes,
-        raw.rank_key_bytes,
-        raw.selection_bytes,
-        raw.dedup_hash_bytes,
-        raw.cub_scratch_bytes,
-        raw.retained_evaluation_workspace_bytes,
-        raw.terminal_device_receipt_bytes,
-    ]
-    .into_iter()
-    .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
-    .ok_or(ResidentGenerationDeviceErrorV1::ArithmeticOverflow)?;
-    let reusable = raw
-        .same_context_free_bytes
-        .checked_sub(raw.full_discovery_reserve_bytes)
-        .ok_or(ResidentGenerationDeviceErrorV1::CapacityUnavailable)?;
-    if charged != raw.total_device_bytes || raw.total_device_bytes > reusable {
-        return Err(ResidentGenerationDeviceErrorV1::CapacityUnavailable);
-    }
-    Ok(ActualResidentGenerationAllocationPlanV1 {
-        raw: *raw,
-        logical_gene_scalar_bytes: raw.logical_gene_scalar_bytes,
-        logical_gene_index_bytes: raw.logical_gene_index_bytes,
-        logical_gene_weight_bytes: raw.logical_gene_weight_bytes,
-        offspring_bytes: raw.offspring_bytes,
-        metric_row_bytes: raw.metric_row_bytes,
-        rank_key_bytes: raw.rank_key_bytes,
-        selection_bytes: raw.selection_bytes,
-        dedup_hash_bytes: raw.dedup_hash_bytes,
-        cub_scratch_bytes: raw.cub_scratch_bytes,
-        retained_evaluation_workspace_bytes: raw.retained_evaluation_workspace_bytes,
-        terminal_device_receipt_bytes: raw.terminal_device_receipt_bytes,
-        same_context_free_bytes: raw.same_context_free_bytes,
-        full_discovery_reserve_bytes: raw.full_discovery_reserve_bytes,
-        total_device_bytes: raw.total_device_bytes,
-    })
-}
-
-fn validate_import_plan_allocation_identity_v1(
-    import: &ResidentGenerationPopulationSessionImportV1,
-    plan: &SealedResidentGenerationPlanV1,
-    allocation: &ActualResidentGenerationAllocationPlanV1,
-) -> Result<(), ResidentGenerationDeviceErrorV1> {
-    if import.raw.abi_version != ABI_VERSION_V1
-        || plan.raw.abi_version != ABI_VERSION_V1
-        || allocation.raw.abi_version != ABI_VERSION_V1
-        || import.raw.admitted_run_stream.is_null()
-        || import.raw.selected_cuda_ordinal == u32::MAX
-        || import.raw.cuda_build_manifest_sha256 != plan.raw.cuda_build_manifest_sha256
-        || plan.plan_identity_sha256 != allocation.raw.allocation_plan_sha256
-    {
-        return Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
-            "population import, plan and allocation",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_ready_event_v1(
-    run: &ResidentGenerationDeviceRunV1,
-    ready: &RawReadyEventV1,
-) -> Result<(), ResidentGenerationDeviceErrorV1> {
-    if ready.abi_version != ABI_VERSION_V1
-        || ready.event_id == 0
-        || ready.intermediate_host_wait_count != 0
-        || ready.intermediate_readback_count != 0
-        || ready.generation_index > run.plan.raw.generation_count
-    {
-        return Err(ResidentGenerationDeviceErrorV1::EventIdentityMismatch);
-    }
-    Ok(())
-}
-
-fn require_dependency_identity_v1(
-    run: &ResidentGenerationDeviceRunV1,
-    dependency: &RawReadyEventV1,
-) -> Result<(), ResidentGenerationDeviceErrorV1> {
-    validate_ready_event_v1(run, dependency)
-}
-
-fn require_run_state_v1(
-    run: &ResidentGenerationDeviceRunV1,
-    required: ResidentGenerationRunStateV1,
-) -> Result<(), ResidentGenerationDeviceErrorV1> {
-    if run.state != required {
-        return Err(ResidentGenerationDeviceErrorV1::RunStateViolation);
-    }
-    Ok(())
-}
-
-fn validate_post_ga_content_identity_v1(
-    run: &ResidentGenerationDeviceRunV1,
-    content: &ResidentGenerationPostGaContentAuthorityV1,
-) -> Result<(), ResidentGenerationDeviceErrorV1> {
-    if content.gene_content.identity_handle == 0
-        || content.metric_content.identity_handle == 0
-        || content.receipt.identity_handle == 0
-        || content.gene_content.run_identity_sha256 != run.run_identity_sha256
-        || content.metric_content.run_identity_sha256 != run.run_identity_sha256
-        || content.receipt.run_identity_sha256 != run.run_identity_sha256
-    {
-        return Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
-            "post-GA generation content",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_post_ga_in_place_receipt_v1(
-    run: &ResidentGenerationDeviceRunV1,
-    dependency: &RawReadyEventV1,
-    content: &ResidentGenerationPostGaContentAuthorityV1,
-    receipt: &RawPostGaInPlaceReceiptV1,
-) -> Result<(), ResidentGenerationDeviceErrorV1> {
-    let exact_generation_allocation =
-        receipt.generation_allocation_total_device_bytes == run.allocation.total_device_bytes();
-    if receipt.abi_version != ABI_VERSION_V1
-        || receipt.ready_event_id != dependency.event_id
-        || receipt.current_generation_index != dependency.generation_index
-        || receipt.same_stream_enqueue_count != dependency.same_stream_enqueue_count
-        || receipt.logical_population_count != run.plan.raw.logical_population_count
-        || receipt.retained_evaluation_capacity != run.plan.raw.retained_evaluation_capacity
-        || !exact_generation_allocation
-        || !(receipt.additional_allocation_count == 0)
-        || !(receipt.additional_device_bytes == 0)
-        || receipt.gene_content_identity_handle != content.gene_content.identity_handle
-        || receipt.metric_content_identity_handle != content.metric_content.identity_handle
-        || receipt.generation_receipt_identity_handle != content.receipt.identity_handle
-    {
-        return Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
-            "post-GA in-place bridge receipt",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_f64_plan_bits_v1(
@@ -1573,7 +1172,10 @@ fn hash_raw_plan_v1(plan: &RawGenerationPlanV1) -> [u8; 32] {
     hasher.update(plan.scoring_semantics_sha256);
     hasher.update(plan.novelty_semantics_sha256);
     hasher.update(plan.scenario_order_semantics_sha256);
+    #[cfg(feature = "cuda")]
     hasher.update(plan.cuda_build_manifest_sha256);
+    #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+    hasher.update(plan.hip_build_manifest_sha256);
     hasher.update(plan.rng_mapping_sha256);
     hasher.finalize().into()
 }
@@ -1587,8 +1189,26 @@ fn sha256_v1(fields: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-pub(crate) fn discovery_generation_semantics_sha256_v1() -> [u8; 32] {
-    sha256_v1(&[DISCOVERY_GENERATION_SEMANTICS_V1.as_bytes()])
+pub fn discovery_generation_semantics_sha256_v1() -> [u8; 32] {
+    #[cfg(feature = "cuda")]
+    {
+        sha256_v1(&[DISCOVERY_GENERATION_SEMANTICS_V1.as_bytes()])
+    }
+    #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+    {
+        sha256_v1(&[DISCOVERY_GENERATION_HIP_SEMANTICS_V1.as_bytes()])
+    }
+}
+
+/// Current resident row protocol and producer/scorer rejection interpretation.
+/// This identity does not authenticate caller-supplied rows or grant device
+/// admission: the actual sealed producer and run/scenario bindings remain required.
+pub fn resident_metric_semantics_sha256_v2() -> [u8; 32] {
+    sha256_v1(&[
+        RESIDENT_METRIC_ROW_PROTOCOL_V2.as_bytes(),
+        neoethos_gpu_contracts::resident_search_scoring_v2::RESIDENT_ECONOMIC_REJECTION_V2_SEMANTICS
+            .as_bytes(),
+    ])
 }
 
 fn identity_is_zero_v1(identity: &[u8; 32]) -> bool {
@@ -1603,34 +1223,559 @@ fn checked_u64_v1(value: usize) -> Result<u64, ResidentGenerationDeviceErrorV1> 
     u64::try_from(value).map_err(|_| ResidentGenerationDeviceErrorV1::ArithmeticOverflow)
 }
 
-fn require_native_ok_v1(
-    operation: &'static str,
-    status: i32,
-) -> Result<(), ResidentGenerationDeviceErrorV1> {
-    if status == STATUS_OK_V1 {
-        Ok(())
-    } else {
-        Err(native_error_v1(operation, status))
-    }
-}
-
-fn native_error_v1(operation: &'static str, status: i32) -> ResidentGenerationDeviceErrorV1 {
-    match status {
-        STATUS_ASYNC_FREE_OUTCOME_UNKNOWN_V2 => {
-            ResidentGenerationDeviceErrorV1::AsyncFreeOutcomeUnknownDeliberateLeak { operation }
-        }
-        STATUS_ASYNC_ALLOCATION_OUTCOME_UNKNOWN_V2 => {
-            ResidentGenerationDeviceErrorV1::AsyncAllocationOutcomeUnknownDeliberateLeak {
-                operation,
-            }
-        }
-        _ => ResidentGenerationDeviceErrorV1::Native { operation, status },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checked_geometry_fixture_v1() -> ResidentGenerationPlanAuthorityInputV1 {
+        ResidentGenerationPlanAuthorityInputV1 {
+            parent_selection: ParentSelectionPolicyV1::RankWeighted,
+            survivor_selection: SurvivorSelectionPolicyV1::RankWeighted,
+            max_terms_per_gene: 4,
+            minimum_terms_per_gene: 2,
+            logical_population_count: 37,
+            retained_evaluation_capacity: 37,
+            feature_count: 19,
+            generation_count: 23,
+            survivor_count: 7,
+            immigrant_count: 11,
+            search_seed: 981_234,
+            mutation_intensity_q32: 1_u64 << 30,
+            threshold_ladder_bits: [0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6].map(f64::to_bits),
+            stop_bounds_bits: [0.25_f64, 50.0, 0.5, 100.0, 1.0, 4.0].map(f64::to_bits),
+            smc_probability_q32: std::array::from_fn(|index| (index as u64) << 27),
+            generation_semantics_sha256: discovery_generation_semantics_sha256_v1(),
+            run_identity_sha256: [1; 32],
+            strategy_gene_schema_sha256: [2; 32],
+            rank_semantics_sha256: [3; 32],
+            metric_semantics_sha256: resident_metric_semantics_sha256_v2(),
+            scoring_semantics_sha256: [5; 32],
+            novelty_semantics_sha256: [6; 32],
+            scenario_order_semantics_sha256: [7; 32],
+            #[cfg(feature = "cuda")]
+            cuda_build_manifest_sha256: [8; 32],
+            #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+            hip_native_build_manifest_sha256: [8; 32],
+            rng_mapping_sha256: [9; 32],
+        }
+    }
+
+    fn adaptive_controls_fixture_v3() -> ResidentAdaptiveGenerationInputsV3 {
+        ResidentAdaptiveGenerationInputsV3 {
+            tournament_size: 3,
+            min_structural_smc_flags: 2,
+            adaptive_stops_enabled: true,
+            seen_capacity: 100,
+            seen_retry_attempts: 3,
+            seed_template_count: 1,
+            soft_stagnation_patience: 7,
+            survivor_fraction: 0.8,
+            immigrant_fraction: 0.7,
+            selection_temperature: 0.75,
+            minimum_improvement: 1e-8,
+            gate_start: 1.25,
+            gate_end: -0.1,
+            gate_curve: 1.5,
+            gate_stagnation_step: 0.03,
+            smc_force_ratio: 0.6,
+            templates: vec![ResidentGenerationTemplateV3 {
+                feature_indices: vec![2, 18],
+                weights: vec![-0.0, -0.4],
+                smc_flags: 0x401,
+                long_threshold: 3.0,
+                short_threshold: -3.0,
+                target_pips: 150.0,
+                stop_pips: 75.0,
+                stop_vol_multiplier: 2.5,
+            }],
+            initial_seen_hashes: vec![0, 9, 9, u64::MAX],
+        }
+    }
+
+    fn adaptive_geometry_fixture_v3() -> ResidentGenerationPlanAuthorityInputV1 {
+        let mut input = checked_geometry_fixture_v1();
+        input.generation_semantics_sha256 = discovery_adaptive_generation_semantics_sha256_v3();
+        input
+    }
+
+    #[test]
+    fn selected_generation_backend_preserves_cuda_hashes_and_separates_hip_semantics() {
+        let cuda = sha256_v1(&[DISCOVERY_GENERATION_SEMANTICS_V1.as_bytes()]);
+        let cuda_adaptive = sha256_v1(&[DISCOVERY_ADAPTIVE_GENERATION_ALGORITHM_V3.as_bytes()]);
+        // Frozen pre-HIP identities: changing backend selection must not change
+        // existing CUDA receipts or silently relabel their algorithm.
+        assert_eq!(
+            cuda,
+            [
+                0x9f, 0xb1, 0xd7, 0xbf, 0xbf, 0x6c, 0x12, 0x2a, 0xdc, 0x16, 0x7b, 0x4b, 0x34, 0xdb,
+                0xf4, 0x08, 0xe5, 0x21, 0x7a, 0xe8, 0x65, 0xfd, 0xaf, 0xc6, 0x3f, 0x68, 0xd4, 0x0a,
+                0x8c, 0x43, 0xd6, 0xab,
+            ]
+        );
+        assert_eq!(
+            cuda_adaptive,
+            [
+                0x8d, 0x0b, 0x1f, 0xab, 0xdc, 0xe6, 0x0d, 0x6d, 0xe6, 0xee, 0x21, 0xee, 0xb4, 0x0e,
+                0x45, 0x9a, 0x8f, 0xb6, 0x0e, 0x91, 0x6f, 0xb4, 0x07, 0x7f, 0x2b, 0xb0, 0xcc, 0xe1,
+                0xd2, 0xf0, 0xa8, 0x26,
+            ]
+        );
+        let hip = sha256_v1(&[DISCOVERY_GENERATION_HIP_SEMANTICS_V1.as_bytes()]);
+        let hip_adaptive = adaptive_hip_generation_semantics_sha256_v3();
+        assert_ne!(cuda, hip);
+        assert_ne!(cuda_adaptive, hip_adaptive);
+        assert!(DISCOVERY_GENERATION_HIP_SEMANTICS_V1.contains("amd-hip"));
+        assert!(DISCOVERY_GENERATION_HIP_SEMANTICS_V1.contains("hipcub-rocprim"));
+        assert!(!DISCOVERY_GENERATION_HIP_SEMANTICS_V1.contains("cuda"));
+        assert!(!DISCOVERY_GENERATION_HIP_SEMANTICS_V1.contains("cccl"));
+        let (abi, selected, selected_adaptive, other, other_adaptive) = if cfg!(feature = "cuda") {
+            (1, cuda, cuda_adaptive, hip, hip_adaptive)
+        } else {
+            (0x0001_0001, hip, hip_adaptive, cuda, cuda_adaptive)
+        };
+        assert_eq!(selected_generation_abi_v1(), abi);
+        assert_eq!(discovery_generation_semantics_sha256_v1(), selected);
+        assert_eq!(
+            discovery_adaptive_generation_semantics_sha256_v3(),
+            selected_adaptive
+        );
+        let mut wrong_backend = checked_geometry_fixture_v1();
+        wrong_backend.generation_semantics_sha256 = other;
+        assert!(matches!(
+            seal_resident_generation_plan_v1(wrong_backend),
+            Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
+                "generation semantics"
+            ))
+        ));
+        let mut wrong_backend = adaptive_geometry_fixture_v3();
+        wrong_backend.generation_semantics_sha256 = other_adaptive;
+        assert!(matches!(
+            seal_adaptive_resident_generation_plan_v3(
+                wrong_backend,
+                adaptive_controls_fixture_v3()
+            ),
+            Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
+                "generation semantics"
+            ))
+        ));
+    }
+
+    #[test]
+    fn selected_generation_build_digest_uses_exact_native_slot_and_binds_the_plan() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<RawGenerationPlanV1>(), 632);
+        assert_eq!(align_of::<RawGenerationPlanV1>(), 8);
+        #[cfg(feature = "cuda")]
+        assert_eq!(
+            offset_of!(RawGenerationPlanV1, cuda_build_manifest_sha256),
+            536
+        );
+        #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+        assert_eq!(
+            offset_of!(RawGenerationPlanV1, hip_build_manifest_sha256),
+            536
+        );
+        assert_eq!(offset_of!(RawGenerationPlanV1, rng_mapping_sha256), 568);
+        assert_eq!(offset_of!(RawGenerationPlanV1, plan_identity_sha256), 600);
+        let base = seal_resident_generation_plan_v1(checked_geometry_fixture_v1()).unwrap();
+        assert_eq!(base.raw.abi_version, selected_generation_abi_v1());
+        assert_eq!(base.native_build_manifest_sha256_v1(), [8; 32]);
+        #[cfg(feature = "cuda")]
+        assert_eq!(base.cuda_build_manifest_sha256_v1(), [8; 32]);
+        for digest in [[0; 32], [9; 32]] {
+            let mut input = checked_geometry_fixture_v1();
+            #[cfg(feature = "cuda")]
+            {
+                input.cuda_build_manifest_sha256 = digest;
+            }
+            #[cfg(all(not(feature = "cuda"), feature = "hip-native-kernels"))]
+            {
+                input.hip_native_build_manifest_sha256 = digest;
+            }
+            if digest == [0; 32] {
+                assert!(seal_resident_generation_plan_v1(input).is_err());
+            } else {
+                let changed = seal_resident_generation_plan_v1(input).unwrap();
+                assert_eq!(changed.native_build_manifest_sha256_v1(), digest);
+                assert_ne!(
+                    changed.plan_identity_sha256_v1(),
+                    base.plan_identity_sha256_v1()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_threshold_percentile_ties_preserve_exact_bits_and_identity() {
+        let mut identities = Vec::new();
+        for ladder in [
+            [0.1_f64, 0.1, 0.3, 0.3, 0.5, 0.5],
+            [0.25_f64; 6],
+            [0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6],
+        ] {
+            let exact_bits = ladder.map(f64::to_bits);
+            let mut input = adaptive_geometry_fixture_v3();
+            input.threshold_ladder_bits = exact_bits;
+            let plan =
+                seal_adaptive_resident_generation_plan_v3(input, adaptive_controls_fixture_v3())
+                    .expect("positive nondecreasing adaptive percentiles are valid");
+            assert_eq!(plan.raw.threshold_ladder_bits, exact_bits);
+            let identity = plan.adaptive_policy_identity_sha256_v3().unwrap();
+            assert!(!identities.contains(&identity));
+            identities.push(identity);
+        }
+        let mut legacy = checked_geometry_fixture_v1();
+        legacy.threshold_ladder_bits = [0.25_f64.to_bits(); 6];
+        assert!(seal_resident_generation_plan_v1(legacy).is_err());
+    }
+
+    #[test]
+    fn adaptive_thresholds_reject_descending_zero_and_nonfinite_values_without_repair() {
+        for invalid in [
+            0.0_f64,
+            -0.0,
+            -0.1,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            for index in 0..6 {
+                let mut input = adaptive_geometry_fixture_v3();
+                input.threshold_ladder_bits = [0.25_f64.to_bits(); 6];
+                input.threshold_ladder_bits[index] = invalid.to_bits();
+                assert!(
+                    seal_adaptive_resident_generation_plan_v3(
+                        input,
+                        adaptive_controls_fixture_v3(),
+                    )
+                    .is_err(),
+                    "invalid threshold {invalid:?} at {index}"
+                );
+            }
+        }
+        for index in 1..6 {
+            let mut input = adaptive_geometry_fixture_v3();
+            input.threshold_ladder_bits = [0.25_f64.to_bits(); 6];
+            input.threshold_ladder_bits[index] = 0.2_f64.to_bits();
+            assert!(
+                seal_adaptive_resident_generation_plan_v3(input, adaptive_controls_fixture_v3(),)
+                    .is_err(),
+                "descending threshold at {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_generation_controls_preserve_config_and_exact_ordered_seed_bits() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<RawResidentAdaptivePolicyV3>(), 216);
+        assert_eq!(align_of::<RawResidentAdaptivePolicyV3>(), 8);
+        assert_eq!(
+            offset_of!(RawResidentAdaptivePolicyV3, survivor_fraction),
+            80
+        );
+        assert_eq!(
+            offset_of!(RawResidentAdaptivePolicyV3, policy_identity_sha256),
+            184
+        );
+        for (parent, expected) in [
+            (ParentSelectionPolicyV1::RankWeighted, 1),
+            (ParentSelectionPolicyV1::Uniform, 2),
+            (ParentSelectionPolicyV1::Tournament, 4),
+            (ParentSelectionPolicyV1::Softmax, 3),
+        ] {
+            for survivor in [
+                SurvivorSelectionPolicyV1::RankWeighted,
+                SurvivorSelectionPolicyV1::Elitist,
+                SurvivorSelectionPolicyV1::Tournament,
+                SurvivorSelectionPolicyV1::Generational,
+            ] {
+                let mut input = adaptive_geometry_fixture_v3();
+                input.parent_selection = parent;
+                input.survivor_selection = survivor;
+                let plan = seal_adaptive_resident_generation_plan_v3(
+                    input,
+                    adaptive_controls_fixture_v3(),
+                )
+                .unwrap();
+                let controls = plan.adaptive_controls_v3().unwrap();
+                assert_eq!(plan.raw.parent_selection_policy, parent as u32);
+                assert_eq!(controls.policy.parent_policy, expected);
+                assert_eq!(controls.policy.survivor_policy, survivor as u32);
+                assert_eq!(controls.policy.abi_version, 3);
+                assert_eq!(controls.policy.algorithm_version, 1);
+                assert_eq!(controls.policy.gate_start, 1.25);
+                assert_eq!(controls.policy.gate_end, -0.1);
+                assert_eq!(controls.template_indices, [2, 18, 0, 0]);
+                assert_eq!(
+                    controls
+                        .template_weights
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    [-0.0_f64, -0.4, 0.0, 0.0].map(f64::to_bits)
+                );
+                assert_eq!(controls.template_scalars[0].short_threshold, -3.0);
+                assert_eq!(controls.template_scalars[0].target_pips, 150.0);
+                assert_eq!(controls.initial_seen_hashes, [0, 9, 9, u64::MAX]);
+                assert_ne!(
+                    plan.adaptive_policy_identity_sha256_v3().unwrap(),
+                    plan.plan_identity_sha256_v1()
+                );
+            }
+        }
+        let legacy = seal_resident_generation_plan_v1(checked_geometry_fixture_v1()).unwrap();
+        assert!(legacy.raw_adaptive_policy_v3().is_none());
+    }
+
+    #[test]
+    fn adaptive_generation_identity_binds_policy_templates_seen_order_and_geometry() {
+        let seal = |input, controls| {
+            seal_adaptive_resident_generation_plan_v3(input, controls)
+                .unwrap()
+                .adaptive_policy_identity_sha256_v3()
+                .unwrap()
+        };
+        let base = seal(
+            adaptive_geometry_fixture_v3(),
+            adaptive_controls_fixture_v3(),
+        );
+        for mutate in [
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.tournament_size += 1,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.seen_capacity += 1,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.seen_retry_attempts += 1,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.seed_template_count = 0,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.soft_stagnation_patience += 1,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.survivor_fraction = 0.6,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.immigrant_fraction = 0.9,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.gate_start = 1.3,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].weights[0] = 0.0,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].feature_indices[0] = 1,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].target_pips = 151.0,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.initial_seen_hashes.swap(0, 1),
+        ] {
+            let mut controls = adaptive_controls_fixture_v3();
+            mutate(&mut controls);
+            assert_ne!(base, seal(adaptive_geometry_fixture_v3(), controls));
+        }
+        let mut geometry = adaptive_geometry_fixture_v3();
+        geometry.search_seed += 1;
+        assert_ne!(base, seal(geometry, adaptive_controls_fixture_v3()));
+    }
+
+    #[test]
+    fn adaptive_generation_invalid_controls_fail_before_native_admission() {
+        for mutate in [
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.tournament_size = 1,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.min_structural_smc_flags = 11,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.seen_capacity = 3,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.seen_retry_attempts = 0,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.seed_template_count = 2,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.survivor_fraction = f64::NAN,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.selection_temperature = 0.0,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.gate_end = f64::INFINITY,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].feature_indices[1] = 2,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].feature_indices.swap(0, 1),
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].feature_indices[1] = 19,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].weights.clear(),
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].weights[0] = f64::NAN,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].smc_flags = 0x800,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].stop_pips = 0.0,
+            |c: &mut ResidentAdaptiveGenerationInputsV3| c.templates[0].short_threshold = 3.0,
+        ] {
+            let mut controls = adaptive_controls_fixture_v3();
+            mutate(&mut controls);
+            assert!(
+                seal_adaptive_resident_generation_plan_v3(adaptive_geometry_fixture_v3(), controls)
+                    .is_err()
+            );
+        }
+        assert!(
+            seal_adaptive_resident_generation_plan_v3(
+                checked_geometry_fixture_v1(),
+                adaptive_controls_fixture_v3()
+            )
+            .is_err()
+        );
+        let mut input = adaptive_geometry_fixture_v3();
+        input.stop_bounds_bits[1] = 0.1_f64.to_bits();
+        assert!(
+            seal_adaptive_resident_generation_plan_v3(input, adaptive_controls_fixture_v3())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn adaptive_checkpoint_binds_actual_generation_and_bounded_control_copies() {
+        let raw = RawResidentAdaptiveCheckpointV3 {
+            abi_version: 3,
+            algorithm_version: 1,
+            run_identity: 77,
+            evaluated_generation: 2,
+            evaluated_generations: 3,
+            evaluation_slots: 111,
+            evaluated_gate_bits: 0.43_f64.to_bits(),
+            stagnant_generations: 3,
+            best_score_bits: f64::NEG_INFINITY.to_bits(),
+            survivor_count: 7,
+            immigrant_count: 20,
+            rescue_count: 9,
+            mutation_count: 1,
+            reserved: 0,
+            mutation_intensity: 1.0,
+            control_copy_count: 6,
+            control_copy_bytes: 552,
+            initial_upload_count: 4,
+            initial_upload_bytes: 168,
+        };
+        assert_eq!(std::mem::size_of::<RawResidentAdaptiveCheckpointV3>(), 136);
+        let checkpoint = ResidentAdaptiveCheckpointV3::seal_v3(raw, 77, 3, 37).unwrap();
+        assert_eq!(checkpoint.evaluated_generation(), 2);
+        assert_eq!(checkpoint.evaluated_generations(), 3);
+        assert_eq!(checkpoint.evaluation_slots(), 111);
+        assert_eq!(checkpoint.best_score(), f64::NEG_INFINITY);
+        assert_eq!(
+            checkpoint.evaluated_gate().to_bits(),
+            raw.evaluated_gate_bits
+        );
+        for mutate in [
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.abi_version = 1,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.algorithm_version = 3,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.run_identity += 1,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.evaluated_generation += 1,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.evaluated_generations += 1,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.evaluation_slots -= 1,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.evaluated_gate_bits = f64::NAN.to_bits(),
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.best_score_bits = f64::INFINITY.to_bits(),
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.stagnant_generations = 4,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.survivor_count = 9,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.mutation_count = 0,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.mutation_intensity = f64::NAN,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.control_copy_count = 5,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.control_copy_bytes = 553,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.initial_upload_count = 5,
+            |r: &mut RawResidentAdaptiveCheckpointV3| r.reserved = 1,
+        ] {
+            let mut changed = raw;
+            mutate(&mut changed);
+            assert!(ResidentAdaptiveCheckpointV3::seal_v3(changed, 77, 3, 37).is_err());
+        }
+        assert!(ResidentAdaptiveCheckpointV3::seal_v3(raw, 77, 23, 37).is_err());
+        assert!(ResidentAdaptiveCheckpointV3::seal_v3(raw, 77, 0, 37).is_err());
+        assert!(ResidentAdaptiveCheckpointV3::seal_v3(raw, 77, 3, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn checked_generation_geometry_preserves_explicit_inputs_and_binds_mutations() {
+        let input = checked_geometry_fixture_v1();
+        let sealed = seal_resident_generation_plan_v1(input.clone()).unwrap();
+        let raw = sealed.raw_plan_v1();
+        assert_eq!(raw.logical_population_count, 37);
+        assert_eq!(raw.retained_evaluation_capacity, 37);
+        assert_eq!(raw.generation_count, 23);
+        assert_eq!(raw.survivor_count, 7);
+        assert_eq!(raw.immigrant_count, 11);
+        assert_eq!(raw.search_seed, input.search_seed);
+        assert_eq!(raw.minimum_terms_per_gene, 2);
+        assert_eq!(raw.max_terms_per_gene, 4);
+        assert_eq!(raw.threshold_ladder_bits, input.threshold_ladder_bits);
+        assert_eq!(raw.stop_bounds_bits, input.stop_bounds_bits);
+        assert_eq!(raw.smc_probability_q32, input.smc_probability_q32);
+        assert_eq!(raw.mutation_intensity_q32, input.mutation_intensity_q32);
+        assert_eq!(
+            raw.metric_semantics_sha256,
+            resident_metric_semantics_sha256_v2()
+        );
+        assert_eq!(raw.scoring_semantics_sha256, input.scoring_semantics_sha256);
+        assert_ne!(sealed.plan_identity_sha256_v1(), [0; 32]);
+        for mutate in [
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.search_seed += 1,
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.generation_count += 1,
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.survivor_count += 1,
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.immigrant_count += 1,
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| {
+                i.stop_bounds_bits[0] = 0.3_f64.to_bits()
+            },
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.smc_probability_q32[0] += 1,
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| {
+                i.scenario_order_semantics_sha256[0] ^= 1
+            },
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.scoring_semantics_sha256[0] ^= 1,
+        ] {
+            let mut changed = input.clone();
+            mutate(&mut changed);
+            let changed = seal_resident_generation_plan_v1(changed).unwrap();
+            assert_ne!(
+                changed.plan_identity_sha256_v1(),
+                sealed.plan_identity_sha256_v1()
+            );
+        }
+    }
+
+    #[test]
+    fn checked_generation_geometry_rejects_invalid_extents_and_unsupported_policies() {
+        for mutate in [
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.generation_count = 0,
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.retained_evaluation_capacity = 38,
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.survivor_count = usize::MAX,
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.minimum_terms_per_gene = 5,
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| {
+                i.threshold_ladder_bits[1] = i.threshold_ladder_bits[0]
+            },
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| {
+                i.stop_bounds_bits[0] = f64::NAN.to_bits()
+            },
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| {
+                i.smc_probability_q32[0] = (1_u64 << 32) + 1
+            },
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| {
+                i.mutation_intensity_q32 = (1_u64 << 32) + 1
+            },
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| i.run_identity_sha256 = [0; 32],
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| {
+                i.generation_semantics_sha256 = [1; 32]
+            },
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| {
+                i.parent_selection = ParentSelectionPolicyV1::Tournament
+            },
+            |i: &mut ResidentGenerationPlanAuthorityInputV1| {
+                i.survivor_selection = SurvivorSelectionPolicyV1::Generational
+            },
+        ] {
+            let mut input = checked_geometry_fixture_v1();
+            mutate(&mut input);
+            assert!(seal_resident_generation_plan_v1(input).is_err());
+        }
+    }
+
+    #[test]
+    fn checked_generation_geometry_requires_current_metric_protocol_and_rejection_semantics() {
+        use neoethos_gpu_contracts::device::NeoPopulationMetricRow;
+
+        assert_eq!(std::mem::size_of::<NeoPopulationMetricRow>(), 104);
+        assert_eq!(
+            std::mem::offset_of!(NeoPopulationMetricRow, candidate_id),
+            0
+        );
+        assert_eq!(std::mem::offset_of!(NeoPopulationMetricRow, scenario_id), 8);
+        assert_eq!(std::mem::offset_of!(NeoPopulationMetricRow, values), 16);
+        let protocol_only = sha256_v1(&[RESIDENT_METRIC_ROW_PROTOCOL_V2.as_bytes()]);
+        let legacy_rejection = sha256_v1(&[
+            RESIDENT_METRIC_ROW_PROTOCOL_V2.as_bytes(),
+            b"legacy-nonfinite-arithmetic-and-economic-rejection-indistinguishable",
+        ]);
+        for stale in [[4; 32], protocol_only, legacy_rejection] {
+            assert_ne!(stale, resident_metric_semantics_sha256_v2());
+            let mut input = checked_geometry_fixture_v1();
+            input.metric_semantics_sha256 = stale;
+            assert!(matches!(
+                seal_resident_generation_plan_v1(input),
+                Err(ResidentGenerationDeviceErrorV1::IdentityMismatch(
+                    "resident metric semantics"
+                ))
+            ));
+        }
+    }
 
     #[test]
     fn philox_zero_vector_matches_random123() {
@@ -1675,5 +1820,101 @@ mod tests {
             checked_philox_rejection_draw_index_v1(7, u32::MAX)
                 < checked_philox_rejection_draw_index_v1(8, 0)
         );
+    }
+
+    #[test]
+    fn fixture_policy_and_operator_surface_is_fully_exercised() {
+        for (parent, expected) in [
+            (
+                ParentSelectionPolicyV1::Uniform,
+                ResidentGenerationDeviceErrorV1::UnsupportedUniformSelection,
+            ),
+            (
+                ParentSelectionPolicyV1::Tournament,
+                ResidentGenerationDeviceErrorV1::UnsupportedTournamentSelection,
+            ),
+            (
+                ParentSelectionPolicyV1::Softmax,
+                ResidentGenerationDeviceErrorV1::UnsupportedSoftmaxSelection,
+            ),
+        ] {
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    validate_rank_weighted_only_v1(parent, SurvivorSelectionPolicyV1::RankWeighted)
+                        .expect_err("non-rank parent policy must fail")
+                ),
+                format!("{expected:?}")
+            );
+        }
+        for (survivor, expected) in [
+            (
+                SurvivorSelectionPolicyV1::Elitist,
+                ResidentGenerationDeviceErrorV1::UnsupportedElitistSelection,
+            ),
+            (
+                SurvivorSelectionPolicyV1::Tournament,
+                ResidentGenerationDeviceErrorV1::UnsupportedTournamentSelection,
+            ),
+            (
+                SurvivorSelectionPolicyV1::Generational,
+                ResidentGenerationDeviceErrorV1::UnsupportedGenerationalSelection,
+            ),
+        ] {
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    validate_rank_weighted_only_v1(ParentSelectionPolicyV1::RankWeighted, survivor)
+                        .expect_err("non-rank survivor policy must fail")
+                ),
+                format!("{expected:?}")
+            );
+        }
+
+        let operators = [
+            GeneticOperatorIdentityV1::InitializeTermCount,
+            GeneticOperatorIdentityV1::InitializeIndicator,
+            GeneticOperatorIdentityV1::InitializeWeightLevel,
+            GeneticOperatorIdentityV1::InitializeWeightSign,
+            GeneticOperatorIdentityV1::InitializeThreshold,
+            GeneticOperatorIdentityV1::InitializeStopGeometry,
+            GeneticOperatorIdentityV1::InitializeSmcFlag,
+            GeneticOperatorIdentityV1::ParentA,
+            GeneticOperatorIdentityV1::ParentB,
+            GeneticOperatorIdentityV1::CrossoverScalar,
+            GeneticOperatorIdentityV1::MutationKind,
+            GeneticOperatorIdentityV1::MutationValue,
+            GeneticOperatorIdentityV1::MutationSmc,
+            GeneticOperatorIdentityV1::Survivor,
+        ];
+        assert_eq!(
+            operators.map(|operator| operator as u32),
+            std::array::from_fn(|i| i as u32 + 1)
+        );
+
+        let address = checked_philox_counter_mapping_v1(
+            11,
+            &[7; 32],
+            2,
+            3,
+            GeneticOperatorIdentityV1::ParentA,
+            4,
+        )
+        .expect("valid fixture address");
+        assert_eq!(address.counter()[2], 2);
+        assert_ne!(address.key(), [0; 2]);
+
+        for error in [
+            ResidentGenerationDeviceErrorV1::InvalidPlan("plan"),
+            ResidentGenerationDeviceErrorV1::IdentityMismatch("identity"),
+        ] {
+            match error {
+                ResidentGenerationDeviceErrorV1::InvalidPlan(message)
+                | ResidentGenerationDeviceErrorV1::IdentityMismatch(message) => {
+                    assert!(!message.is_empty());
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 }

@@ -22,15 +22,15 @@ use crate::runtime::artifacts::TrainingSummaryMetadata;
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
-use super::common::build_tree_runtime_predictions;
 #[cfg(feature = "lightgbm")]
 use super::common::{
-    LIGHTGBM_MODEL_FILE_NAME, calibrate_three_class_probabilities, default_training_summary,
-    ensure_feature_columns_match, feature_frame_to_tree_f32_row_major,
-    normalize_three_class_probabilities, read_runtime_metadata, read_tree_json_artifact,
-    remap_labels_to_tree_targets, tree_artifact_paths, tree_runtime_metadata,
+    LIGHTGBM_MODEL_FILE_NAME, calibrate_three_class_probabilities, ensure_feature_columns_match,
+    feature_frame_to_tree_f32_row_major, normalize_three_class_probabilities,
+    read_runtime_metadata, read_tree_json_artifact, remap_labels_to_tree_targets,
+    required_tree_training_summary, tree_artifact_paths, tree_runtime_metadata,
     write_runtime_metadata, write_tree_json_artifact,
 };
+use super::common::{build_tree_runtime_predictions, validate_tree_training_summary};
 #[cfg(feature = "lightgbm")]
 use super::config::{
     DevicePreference, ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
@@ -127,10 +127,8 @@ impl LightGBMExpert {
     }
 
     #[cfg(feature = "lightgbm")]
-    fn stored_training_summary(&self) -> TrainingSummaryMetadata {
-        self.training_summary
-            .clone()
-            .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
+    fn stored_training_summary(&self) -> Result<TrainingSummaryMetadata> {
+        required_tree_training_summary(self.training_summary.as_ref(), "LightGBM")
     }
 
     #[cfg(feature = "lightgbm")]
@@ -245,7 +243,7 @@ impl LightGBMExpert {
             configured_params: self.config.params.clone(),
             resolved_params: self.resolved_params_for(effective_device_type, cuda_ordinal)?,
             feature_columns: self.feature_columns.clone(),
-            training_summary: self.stored_training_summary(),
+            training_summary: self.stored_training_summary()?,
             device_pref: self.config.device_pref,
             requested_device_policy: self.config.requested_device_policy.clone(),
             effective_device_type: effective_device_type.to_string(),
@@ -350,17 +348,7 @@ impl LightGBMExpert {
             .training_summary
             .as_ref()
             .context("LightGBM runtime state is missing training summary metadata")?;
-        if summary.dataset_rows == 0 {
-            bail!("LightGBM runtime state has zero dataset_rows in training summary");
-        }
-        if summary.dataset_rows != summary.train_rows + summary.val_rows {
-            bail!(
-                "LightGBM runtime state has inconsistent training summary: dataset_rows={} train_rows={} val_rows={}",
-                summary.dataset_rows,
-                summary.train_rows,
-                summary.val_rows
-            );
-        }
+        validate_tree_training_summary(summary, "LightGBM runtime state")?;
         if self.model.is_none() {
             bail!("LightGBM runtime state is missing its native booster");
         }
@@ -383,24 +371,14 @@ impl LightGBMExpert {
                 artifact.feature_columns
             );
         }
-        if artifact.training_summary.dataset_rows != expected_training_summary.dataset_rows
-            || artifact.training_summary.train_rows != expected_training_summary.train_rows
-            || artifact.training_summary.val_rows != expected_training_summary.val_rows
-        {
+        if artifact.training_summary != *expected_training_summary {
             bail!(
                 "LightGBM runtime artifact training-summary mismatch: expected {:?}, got {:?}",
                 expected_training_summary,
                 artifact.training_summary
             );
         }
-        if artifact.training_summary.dataset_rows == 0 {
-            bail!("LightGBM runtime artifact must record non-zero dataset_rows");
-        }
-        if artifact.training_summary.dataset_rows
-            != artifact.training_summary.train_rows + artifact.training_summary.val_rows
-        {
-            bail!("LightGBM runtime artifact training summary is inconsistent");
-        }
+        validate_tree_training_summary(&artifact.training_summary, "LightGBM runtime artifact")?;
         if artifact.configured_params.is_empty() {
             bail!("LightGBM runtime artifact must contain configured params");
         }
@@ -557,6 +535,17 @@ impl LightGBMExpert {
             if metadata.feature_columns.is_empty() {
                 bail!("LightGBM runtime metadata must contain at least one feature column");
             }
+            validate_tree_training_summary(
+                &metadata.training_summary,
+                "LightGBM runtime metadata",
+            )?;
+            if let Some(runtime_artifact) = runtime_artifact {
+                Self::validate_runtime_artifact(
+                    runtime_artifact,
+                    &metadata.feature_columns,
+                    &metadata.training_summary,
+                )?;
+            }
             return Ok(metadata);
         }
 
@@ -611,6 +600,7 @@ impl LightGBMExpert {
                     y.len()
                 );
             }
+            let training_feature_columns = feature_columns_from_frame(x);
             self.config.cpu_threads = Some(
                 self.config
                     .cpu_threads
@@ -685,6 +675,9 @@ impl LightGBMExpert {
 
             let valid_dataset = match (val_x, val_y) {
                 (Some(vx), Some(vy)) => {
+                    if vx.n_samples() == 0 || vy.is_empty() {
+                        anyhow::bail!("LightGBM validation features and labels must be non-empty");
+                    }
                     if vx.n_features() != x.n_features() {
                         anyhow::bail!(
                             "LightGBM validation column count mismatch: train {}, val {}",
@@ -697,6 +690,11 @@ impl LightGBMExpert {
                             "LightGBM validation row/label mismatch: {} rows vs {} labels",
                             vx.n_samples(),
                             vy.len()
+                        );
+                    }
+                    if feature_columns_from_frame(vx) != training_feature_columns {
+                        anyhow::bail!(
+                            "LightGBM validation feature names or ordering do not match the training schema"
                         );
                     }
                     let (vflat, _vrows, vcols) = feature_frame_to_tree_f32_row_major(vx)?;
@@ -731,8 +729,16 @@ impl LightGBMExpert {
             let model = lightgbm3::Booster::train_with_valid(dataset, valid_dataset, &params)
                 .context("train LightGBM booster")?;
 
-            self.feature_columns = feature_columns_from_frame(x);
-            self.training_summary = Some(default_training_summary(x));
+            let val_rows = val_x.map_or(0, FeatureFrame::n_samples);
+            let dataset_rows = x
+                .n_samples()
+                .checked_add(val_rows)
+                .context("LightGBM training summary row count overflow")?;
+            let training_summary =
+                TrainingSummaryMetadata::new(dataset_rows, x.n_samples(), 0, val_rows);
+            validate_tree_training_summary(&training_summary, "LightGBM training")?;
+            self.feature_columns = training_feature_columns;
+            self.training_summary = Some(training_summary);
             self.model = Some(model);
             Ok(())
         }
@@ -802,7 +808,7 @@ impl ExpertModel for LightGBMExpert {
             let metadata = tree_runtime_metadata(
                 "lightgbm",
                 self.feature_columns.clone(),
-                self.stored_training_summary(),
+                self.stored_training_summary()?,
             )?;
             let (model_path, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
@@ -810,7 +816,7 @@ impl ExpertModel for LightGBMExpert {
             Self::validate_runtime_artifact(
                 &runtime_profile,
                 &self.feature_columns,
-                &self.stored_training_summary(),
+                &self.stored_training_summary()?,
             )?;
             write_tree_json_artifact(
                 &Self::runtime_profile_path(path),
@@ -1166,14 +1172,9 @@ mod tests {
         // And the artifact must record the same string the trainer was given
         // — the two disagreeing is the defect this replaced.
         //
-        // 2026-08-09: this assertion never ran. `runtime_artifact()` builds
-        // `training_summary` BEFORE resolving the device, and on an unfitted
-        // expert `stored_training_summary()` calls
-        // `TrainingSummaryMetadata::new(0, 0, 0)`, whose `dataset_rows > 0`
-        // assert panics — so the test aborted before it could compare a single
-        // device string. Give the expert the summary a fitted one would carry,
-        // so the device-parity check this test exists for actually executes.
-        expert.training_summary = Some(TrainingSummaryMetadata::new(9, 7, 2));
+        // Give the expert the summary a fitted one would carry so the device
+        // parity check can construct a complete, truthful runtime artifact.
+        expert.training_summary = Some(TrainingSummaryMetadata::new(9, 7, 0, 2));
         assert_eq!(
             expert
                 .runtime_artifact()
@@ -1208,7 +1209,7 @@ mod tests {
                 )]),
                 resolved_params,
                 feature_columns: vec!["momentum".into(), "trend".into()],
-                training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+                training_summary: TrainingSummaryMetadata::new(9, 9, 0, 0),
                 device_pref: DevicePreference::Auto,
                 requested_device_policy: "auto".into(),
                 effective_device_type: device.into(),
@@ -1220,7 +1221,7 @@ mod tests {
             }
         };
         let columns = ["momentum".to_string(), "trend".to_string()];
-        let summary = TrainingSummaryMetadata::new(9, 9, 0);
+        let summary = TrainingSummaryMetadata::new(9, 9, 0, 0);
         for device in ["cpu", "cuda", "gpu"] {
             LightGBMExpert::validate_runtime_artifact(&make(device), &columns, &summary)
                 .unwrap_or_else(|err| panic!("device `{device}` should validate: {err}"));
@@ -1242,7 +1243,7 @@ mod tests {
                 ("cpu_threads".into(), ParamValue::Int(4)),
             ]),
             feature_columns: vec!["momentum".into(), "trend".into()],
-            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+            training_summary: TrainingSummaryMetadata::new(9, 9, 0, 0),
             device_pref: DevicePreference::Cpu,
             requested_device_policy: "cpu".into(),
             effective_device_type: "cpu".into(),
@@ -1256,7 +1257,7 @@ mod tests {
         let err = LightGBMExpert::validate_runtime_artifact(
             &artifact,
             &["momentum".into(), "trend".into()],
-            &TrainingSummaryMetadata::new(9, 9, 0),
+            &TrainingSummaryMetadata::new(9, 9, 0, 0),
         )
         .expect_err("non-positive probability_temperature should fail");
         assert!(err.to_string().contains("probability_temperature"));

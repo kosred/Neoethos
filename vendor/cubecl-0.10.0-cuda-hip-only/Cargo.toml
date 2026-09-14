@@ -1,0 +1,55 @@
+[package]
+name = "cubecl"
+version = "0.10.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "NeoEthos CUDA and future HIP/ROCm-only CubeCL facade."
+repository = "https://github.com/tracel-ai/cubecl"
+resolver = "2"
+
+[features]
+default = [
+    "std",
+    "stdlib",
+    "cubecl-core/default",
+    "cubecl-cuda?/default",
+    "cubecl-hip?/default",
+]
+autotune-checks = ["cubecl-runtime/autotune-checks"]
+cuda = ["dep:cubecl-cuda"]
+cuda-ptx-wmma = ["cubecl-cuda?/ptx-wmma"]
+hip = ["dep:cubecl-hip"]
+hip-rocwmma = ["cubecl-hip?/rocwmma"]
+profile-tracy = ["cubecl-runtime/profile-tracy"]
+rocm = ["hip"]
+std = ["cubecl-core/std", "cubecl-cuda?/std"]
+stdlib = ["dep:cubecl-std"]
+template = ["cubecl-core/template"]
+tracing = [
+    "cubecl-core/tracing",
+    "cubecl-cuda?/tracing",
+    "cubecl-hip?/tracing",
+]
+
+[dependencies]
+cubecl-core = { version = "0.10.0", default-features = false }
+cubecl-cuda = { version = "0.10.0", optional = true, default-features = false }
+cubecl-hip = { version = "0.10.0", optional = true, default-features = false }
+cubecl-ir = { version = "0.10.0", default-features = false }
+cubecl-runtime = { version = "0.10.0", default-features = false }
+cubecl-std = { version = "0.10.0", optional = true }
+half = { version = "2.5", default-features = false, features = [
+    "alloc",
+    "num-traits",
+    "serde",
+] }
+
+[lints.clippy]
+doc_markdown = "warn"
+
+[lints.rust]
+warnings = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+invalid_html_tags = "warn"

@@ -22,6 +22,30 @@ fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .0
 }
 
+fn braced_item<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing source item {signature:?}"));
+    let open = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("missing opening brace for {signature:?}"));
+    let mut depth = 0_u32;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("missing closing brace for {signature:?}");
+}
+
 fn require_all(source: &str, required: &[&str]) {
     for token in required {
         assert!(
@@ -43,19 +67,23 @@ fn require_none(source: &str, forbidden: &[&str]) {
 #[test]
 fn import_is_consumed_exactly_once_into_an_opaque_population_owner() {
     let resident = read("src/resident_feature_store_v3.rs");
-    let consume = section(
+    let consume = braced_item(&resident, "pub fn consume_into_population_session_v3(");
+    let bind_after_retirement = braced_item(
         &resident,
-        "pub fn consume_into_population_session_v3(",
-        "\n    }",
+        "fn bind_population_after_data_transient_retirement_v1(",
     );
     require_all(
         consume,
         &[
             "self",
             "Result<ResidentPopulationSessionV3",
-            "bind_resident_feature_store_v3",
+            "bind_population_after_data_transient_retirement_v1",
             "admitted_run_stream",
         ],
+    );
+    require_all(
+        bind_after_retirement,
+        &["PopulationSession::bind_resident_feature_store_v3(raw)?"],
     );
     assert!(
         !consume.contains("&self"),
@@ -98,11 +126,7 @@ fn resident_bind_marks_the_borrowed_dataset_ready_for_gene_upload() {
 #[test]
 fn consume_revalidates_the_exact_admitted_context_stream_device_and_shape() {
     let resident = read("src/resident_feature_store_v3.rs");
-    let consume = section(
-        &resident,
-        "pub fn consume_into_population_session_v3(",
-        "\n    }",
-    );
+    let consume = braced_item(&resident, "pub fn consume_into_population_session_v3(");
     require_all(
         consume,
         &[
@@ -155,12 +179,16 @@ fn raw_device_handles_never_escape_the_gpu_cuda_owned_consume_boundary() {
 #[test]
 fn retained_run_stream_drops_before_its_primary_context() {
     let resident = read("src/resident_feature_store_v3.rs");
+    let admission = read("src/run_device_admission_v1.rs");
     for declaration in [
-        section(&resident, "pub struct GpuOnlyRunDeviceAdmissionV3 {", "\n}"),
-        section(
+        braced_item(&resident, "pub struct GpuOnlyRunDeviceAdmissionV3 {"),
+        braced_item(
             &resident,
-            "pub(crate) struct FullDiscoveryRunDeviceAdmissionRequestV3 {",
-            "\n}",
+            "pub(crate) struct GpuOnlyRunDeviceAdmissionRequestV3 {",
+        ),
+        braced_item(
+            &admission,
+            "pub struct SealedNativeCudaRunDeviceAdmissionV1 {",
         ),
     ] {
         let stream_at = declaration
@@ -499,11 +527,7 @@ fn resident_bind_has_no_cpu_f32_reprobe_or_fallback_route() {
     let population = read("src/population.rs");
     let native = read("native/prototype_b_population.cu");
     let rust_bind = section(&population, "fn bind_resident_feature_store_v3(", "\n    }");
-    let consume = section(
-        &resident,
-        "pub fn consume_into_population_session_v3(",
-        "\n    }",
-    );
+    let consume = braced_item(&resident, "pub fn consume_into_population_session_v3(");
     let native_bind = section(
         &native,
         "neoethos_gpu_cuda_population_bind_resident_feature_store_v3(",

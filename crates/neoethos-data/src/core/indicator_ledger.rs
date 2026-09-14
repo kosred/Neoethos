@@ -151,6 +151,11 @@ pub const PRODUCTION_OUTPUT_EXCLUSIONS: &[(&str, Option<&str>, &str)] = &[
         "original_rsi is the unmodified RSI auxiliary already emitted by the standalone RSI indicator",
     ),
     (
+        "emd_trend",
+        Some("average"),
+        "default close/SMA average is the standalone SMA feature at the same length; EMD Trend copies that moving-average series unchanged",
+    ),
+    (
         "fibonacci_entry_bands",
         Some("tp_long_band"),
         "default low take-profit aggressiveness assigns tp_long_band directly from lower_2618",
@@ -1244,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn emd_trend_accounting_adds_twenty_three_canonical_columns() {
+    fn emd_trend_accounting_keeps_three_distinct_outputs_and_excludes_sma_aliases() {
         let id = "emd_trend";
         let info = get_indicator(id).expect("EMD Trend must have one canonical registry row");
         assert_eq!(
@@ -1262,18 +1267,17 @@ mod tests {
         );
         assert_eq!(
             output_ids_for(id),
-            ["direction", "average", "upper", "lower"]
-                .map(Some)
-                .to_vec()
+            ["direction", "upper", "lower"].map(Some).to_vec()
         );
-        assert_eq!(planned_output_count(id), 4);
+        assert_eq!(planned_output_count(id), 3);
         let canonical_base_and_length_sweeps =
             planned_output_count(id) * (1 + crate::core::hpc_ta::ALT_PERIODS.len());
-        assert_eq!(canonical_base_and_length_sweeps, 24);
+        assert_eq!(canonical_base_and_length_sweeps, 18);
         assert_eq!(
-            canonical_base_and_length_sweeps - 1,
-            23,
-            "registration intentionally replaces the old anonymous average-only base with four canonical base and twenty exact length-sweep receipts"
+            production_output_exclusion(id, Some("average")),
+            Some(
+                "default close/SMA average is the standalone SMA feature at the same length; EMD Trend copies that moving-average series unchanged"
+            )
         );
     }
 

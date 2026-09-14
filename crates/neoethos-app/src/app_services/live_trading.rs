@@ -3,22 +3,16 @@
 //! Polls the broker for new closed bars, computes features, evaluates gene
 //! signals, and places/closes orders via cTrader.
 //!
-//! PARITY, STATED HONESTLY (corrected 2026-08-09). This header used to claim
-//! the loop "uses the exact same pipeline as
-//! `neoethos_trader::replay_portfolio_from_dir` so live signals are
-//! byte-identical to the offline backtest". Two thirds of that is true and the
-//! third is not, and the difference is where money leaks:
+//! PARITY, STATED HONESTLY. Signal and exit geometry are shared/pinned; broker
+//! execution is deliberately a different boundary:
 //!
-//! - **Direction: shared shape.** Live nets the portfolio's genes with
-//!   `neoethos_trader::combine_gene_signals_with_brackets`; the replay nets the
-//!   same genes over the same feature cube with `combine_gene_signals`. Same
-//!   gene evaluation, one carrying the brackets the live order needs.
-//! - **Exits: NOT shared.** The discovery backtest (`neoethos-search/eval.rs`)
-//!   and this loop both take their break-even/trailing geometry from
-//!   `models.exit_policy`. `neoethos-trader` has **no trailing code at all** —
-//!   zero occurrences of `trail` in the crate — so the Replay screen's exits
-//!   are a different simulator from both. Do not read a replay number as a
-//!   prediction of this loop's exits.
+//! - **Direction: shared implementation.** Live and replay net the same genes with
+//!   `neoethos_trader::combine_gene_signals_with_archived_policy`; the replay nets the
+//!   same genes over the same artifact-bound feature cube.
+//! - **Exits: shared policy and closed-bar causality.** Discovery seals its
+//!   break-even/trailing geometry into live-portfolio schema v4; replay and this
+//!   loop both consume that immutable value. Replay applies the prior-bar stop
+//!   locally; live advances its local stop only after cTrader confirms the amend.
 //! - **Execution: NOT shared.** The replay fills at the mark through
 //!   `MockExecutionAdapter` behind a `PermissiveRiskGate`. This loop pays a
 //!   real broker and passes every gate in this file.
@@ -33,30 +27,82 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+mod candidate_models;
+
 use anyhow::{Context, Result, anyhow};
-use neoethos_data::{Ohlcv, SymbolDataset};
+use neoethos_data::Ohlcv;
 use neoethos_trader::Direction;
 use serde::{Deserialize, Serialize};
 
+use crate::app_services::account_risk::{
+    AccountRiskIdentity, AccountRiskRegistry, AccountRiskSnapshot, AccountRiskSummary,
+    PropFirmPeriod, SharedAccountEntryAuthority, SharedAccountRiskAuthority,
+    fetch_anchor_evidence_blocking, prop_firm_period,
+};
 use crate::app_services::broker_api::{
-    OrderSide, amend_position_sltp_expecting, close_position_blocking,
-    fetch_broker_symbols_blocking, fetch_recent_chart_bars_blocking, submit_market_order_blocking,
+    OrderSide, amend_position_sltp_expecting_account, close_position_blocking,
+    fetch_broker_symbols_blocking, fetch_live_entry_context_blocking,
+    fetch_recent_broker_trendbar_snapshot_blocking,
 };
 use crate::app_services::broker_deal_economics::{
     BrokerDealWireSnapshotV1, BrokerPositionMoneyAccumulatorV1, BrokerSymbolVolumeScaleEvidenceV1,
     build_broker_deal_money_evidence_v1,
 };
+use crate::app_services::ctrader_execution::{CTraderExecutionOutcome, CTraderExecutionStatus};
+use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+use crate::app_services::live_spots::{self, SpotQuoteRefusal, SpotSessionId};
 
-/// Account-wide per-UTC-day entry counter behind `risk.max_trades_per_day`.
-///
-/// ONE `static`, so every engine in the process shares it — engines are
-/// per-portfolio but they all trade the SAME broker account, and a per-engine
-/// counter would quietly turn a cap of "8" into `8 × engines` (the known
-/// weakness of the unmerged 715058fe draft, deliberately not reproduced).
-/// Only refuses entries when `risk.max_trades_per_day_enabled` arms it;
-/// disarmed it still counts, so logs can always say where the day stands.
-static ACCOUNT_DAILY_ENTRIES: neoethos_core::domain::daily_entry_cap::AccountDailyEntryCap =
-    neoethos_core::domain::daily_entry_cap::AccountDailyEntryCap::new();
+/// One entry reserved in the durable account authority shared by every live
+/// portfolio and both risk modes.
+struct EntryReservation {
+    authority: SharedAccountEntryAuthority,
+    day_id: u32,
+    entries_before: usize,
+}
+
+impl EntryReservation {
+    fn entries_before(&self) -> usize {
+        self.entries_before
+    }
+
+    /// Return an unused slot. Failure is deliberately loud and fail-safe: the
+    /// durable counter may over-count after a persistence failure, but can
+    /// never under-count a filled order.
+    fn release(self) {
+        self.release_with(None);
+    }
+
+    /// Called only after the submitting task completed and its marker is false.
+    fn release_unsent(self, client_order_id: &str, marker: &Arc<AtomicBool>) {
+        self.release_with(Some((client_order_id, marker)));
+    }
+
+    fn release_with(self, attempt: Option<(&str, &Arc<AtomicBool>)>) {
+        match self.authority.lock() {
+            Ok(mut guard) => {
+                let released = match attempt {
+                    Some((client_order_id, marker)) => {
+                        guard.release_unsent_entry(self.day_id, client_order_id, marker)
+                    }
+                    None => guard.release_entry(self.day_id),
+                };
+                if let Err(error) = released {
+                    tracing::error!(
+                        target: "neoethos_app::live_trading",
+                        accounting_day = self.day_id,
+                        error = %error,
+                        "unused account entry reservation could not be persisted as released; durable state remains conservative"
+                    );
+                }
+            }
+            Err(_) => tracing::error!(
+                target: "neoethos_app::live_trading",
+                accounting_day = self.day_id,
+                "unused account entry reservation could not be released because the account-entry lock is poisoned; durable state remains conservative"
+            ),
+        }
+    }
+}
 
 // ── Public request type ───────────────────────────────────────────────────────
 
@@ -76,15 +122,14 @@ pub struct StartRequest {
     #[serde(default = "default_warmup_bars")]
     pub warmup_bars: usize,
     /// Auto-cull: after this many CONSECUTIVE losing trades, the engine stops
-    /// itself and permanently retires the strategy (blacklist). Default 6.
-    /// 0 disables auto-cull for this engine.
+    /// itself and permanently retires the strategy (blacklist). Default 0/off:
+    /// a loss streak alone is not evidence of negative expectancy.
     #[serde(default = "default_cull_losses")]
     pub cull_after_consecutive_losses: u32,
     /// Auto-cull, rolling-window criterion: over the last `cull_window_trades`
     /// closed trades, the win rate must stay ≥ this percent or the strategy is
-    /// retired. Catches CHRONIC losers that never lose N in a row (e.g. 40% WR
-    /// alternating wins/losses bleeds the account but never streaks). Default
-    /// 57% — the operator's break-even-plus-margin floor. 0 disables.
+    /// retired. Default 0/off: break-even win rate depends on payoff and costs,
+    /// so no universal 57% floor is imposed on every discovered strategy.
     #[serde(default = "default_cull_min_win_rate_pct")]
     pub cull_min_win_rate_pct: f64,
     /// Rolling window size (closed trades) for the win-rate criterion. The
@@ -100,10 +145,10 @@ pub fn default_warmup_bars() -> usize {
     1000
 }
 pub fn default_cull_losses() -> u32 {
-    6
+    0
 }
 pub fn default_cull_min_win_rate_pct() -> f64 {
-    57.0
+    0.0
 }
 pub fn default_cull_window_trades() -> usize {
     10
@@ -124,6 +169,25 @@ pub struct LiveTradingStatus {
     pub last_signal: Option<String>,
     pub open_position_id: Option<i64>,
     pub bars_evaluated: u64,
+    /// Identity of the immutable discovery policy controlling this position.
+    pub protection_policy_identity: Option<String>,
+    /// `None` before the live artifact is loaded; thereafter the exact value
+    /// discovery priced, not the current Settings value.
+    pub trailing_enabled: Option<bool>,
+    /// Human-readable state: waiting, armed, broker-confirmed, pending, or
+    /// disabled by the validated search policy.
+    pub protection_state: Option<String>,
+    pub position_entry_price: Option<f64>,
+    pub initial_stop_pips: Option<f64>,
+    pub favorable_extreme_price: Option<f64>,
+    pub favorable_move_r: Option<f64>,
+    /// Last stop price acknowledged by an exact cTrader `ORDER_REPLACED`
+    /// response. `None` means no trailing amend has been broker-confirmed.
+    pub confirmed_stop_price: Option<f64>,
+    pub last_protection_error: Option<String>,
+    /// Honest coarse exit attribution. Broker-side SL versus TP is not guessed
+    /// when the reconcile payload does not prove which protection fired.
+    pub last_exit_reason: Option<String>,
     /// Current run of consecutive losing trades (resets to 0 on any win).
     pub consecutive_losses: u32,
     /// Win rate (%) over the rolling cull window, once ≥1 trade closed.
@@ -145,11 +209,37 @@ impl Default for LiveTradingStatus {
             last_signal: None,
             open_position_id: None,
             bars_evaluated: 0,
+            protection_policy_identity: None,
+            trailing_enabled: None,
+            protection_state: None,
+            position_entry_price: None,
+            initial_stop_pips: None,
+            favorable_extreme_price: None,
+            favorable_move_r: None,
+            confirmed_stop_price: None,
+            last_protection_error: None,
+            last_exit_reason: None,
             consecutive_losses: 0,
             window_win_rate_pct: None,
             window_trades: 0,
             retired: false,
         }
+    }
+}
+
+impl LiveTradingStatus {
+    fn clear_position_telemetry(&mut self, trailing_enabled: bool) {
+        self.position_entry_price = None;
+        self.initial_stop_pips = None;
+        self.favorable_extreme_price = None;
+        self.favorable_move_r = None;
+        self.confirmed_stop_price = None;
+        self.last_protection_error = None;
+        self.protection_state = Some(if trailing_enabled {
+            "waiting_for_position".to_string()
+        } else {
+            "disabled_by_search".to_string()
+        });
     }
 }
 
@@ -179,11 +269,10 @@ impl Handle {
 
 /// Spawn the live trading loop and return a [`Handle`].  Returns immediately.
 ///
-/// SAFETY GATE: on a REAL-money (Live) broker environment the strategy must
-/// first clear the demo forward-test gate (≥100 demo fills + live metrics within
-/// tolerance of backtest). A Demo environment is unconditionally allowed — that
-/// is exactly how the demo fills accumulate. See [`crate::app_services::live_gate`].
-pub fn start(req: StartRequest) -> Result<Handle> {
+/// On a Live account the optional demo check applies only when explicitly
+/// enabled. Both environments still require validated portfolio evidence,
+/// broker identity, valid protection and risk-budgeted sizing in the loop.
+pub fn start(req: StartRequest, account_risk: Arc<AccountRiskRegistry>) -> Result<Handle> {
     neoethos_core::current_broker_financial_truth_capability_v1()
         .require(neoethos_core::BrokerFinancialOperationV1::LiveTrading)
         .map_err(anyhow::Error::new)?;
@@ -204,7 +293,7 @@ pub fn start(req: StartRequest) -> Result<Handle> {
         if !decision.eligible {
             anyhow::bail!(
                 "LIVE blocked by the demo forward-test gate — {} \
-                 Run this strategy on a DEMO account until it qualifies, then switch to Live.",
+                 This optional check is enabled in models.demo_forward_gate.",
                 decision.summary
             );
         }
@@ -221,7 +310,18 @@ pub fn start(req: StartRequest) -> Result<Handle> {
     let status_clone = status.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = run(req, stop_clone, status_clone.clone(), gated_env_is_live).await {
+        if let Err(e) = run(
+            req,
+            stop_clone,
+            status_clone.clone(),
+            gated_env_is_live,
+            account_risk,
+        )
+        .await
+        {
+            if let Ok(mut s) = status_clone.lock() {
+                s.last_signal = Some(format!("STOPPED: {e}"));
+            }
             tracing::error!(
                 target: "neoethos_app::live_trading",
                 error = %e,
@@ -250,6 +350,111 @@ fn tf_duration_ms(tf: &str) -> Result<i64> {
     })
 }
 
+fn favorable_excursion_r(
+    entry_price: f64,
+    favorable_extreme_price: f64,
+    initial_stop_pips: f64,
+    pip_size: f64,
+    is_long: bool,
+) -> Option<f64> {
+    if !entry_price.is_finite()
+        || entry_price <= 0.0
+        || !favorable_extreme_price.is_finite()
+        || favorable_extreme_price <= 0.0
+        || !initial_stop_pips.is_finite()
+        || initial_stop_pips <= 0.0
+        || !pip_size.is_finite()
+        || pip_size <= 0.0
+    {
+        return None;
+    }
+    let risk_distance = initial_stop_pips * pip_size;
+    let favorable_move = if is_long {
+        favorable_extreme_price - entry_price
+    } else {
+        entry_price - favorable_extreme_price
+    };
+    Some(favorable_move.max(0.0) / risk_distance)
+}
+
+/// Both risk modes must size against the current admitted account. A failed
+/// fetch is not evidence of zero positions or of an unchanged startup balance.
+fn validate_entry_account_values(
+    environment: &str,
+    account_id: i64,
+    balance: f64,
+    equity: f64,
+    expected_environment: &str,
+    expected_account_id: i64,
+) -> Result<()> {
+    anyhow::ensure!(
+        environment.eq_ignore_ascii_case(expected_environment)
+            && account_id == expected_account_id
+            && balance.is_finite()
+            && balance > 0.0
+            && equity.is_finite()
+            && equity > 0.0,
+        "current entry account snapshot has a foreign identity or invalid balance/equity"
+    );
+    Ok(())
+}
+
+/// Convert a broker response into engine-owned opening facts only after the
+/// private wire proof and the submitting API's volume scope agree. This is not
+/// a durable lifecycle, an admission permit, or proof of account-history coverage.
+pub(super) fn verified_opening_for_engine<'a>(
+    outcome: &'a CTraderExecutionOutcome,
+    environment: &str,
+    account_id: i64,
+    symbol_id: i64,
+    symbol: &str,
+    side: OrderSide,
+) -> Result<(
+    &'a crate::app_services::ctrader_execution::CTraderOpeningFillEvidenceV1,
+    &'a BrokerSymbolVolumeScaleEvidenceV1,
+    f64,
+)> {
+    let opening = outcome
+        .opening_fill_evidence
+        .as_ref()
+        .context("entry response has no complete single-opening broker proof")?;
+    let scale = outcome
+        .volume_scale_evidence
+        .as_ref()
+        .context("entry response has no exact broker volume-scale scope")?;
+    let expected_side = match side {
+        OrderSide::Buy => "BUY",
+        OrderSide::Sell => "SELL",
+    };
+    anyhow::ensure!(
+        outcome.status == CTraderExecutionStatus::Filled
+            && outcome.deal_closes_position == Some(false)
+            && opening.account_id() == account_id
+            && outcome.account_id == account_id
+            && opening.symbol_id() == symbol_id
+            && outcome.symbol_id == Some(symbol_id)
+            && opening.trade_side() == expected_side
+            && outcome.trade_side.as_deref() == Some(expected_side)
+            && outcome.order_id == Some(opening.order_id())
+            && outcome.position_id == Some(opening.position_id())
+            && outcome.deal_id == Some(opening.deal_id())
+            && outcome.filled_volume_raw_centi_units
+                == Some(opening.filled_volume_raw_centi_units())
+            && outcome.timestamp_ms == Some(opening.execution_timestamp_ms())
+            && outcome.execution_price.map(f64::to_bits) == Some(opening.entry_price().to_bits())
+            && scale.environment() == environment
+            && scale.account_id() == account_id
+            && scale.symbol_id() == symbol_id
+            && scale.symbol_name() == symbol,
+        "entry outcome, opening proof and admitted broker identity disagree"
+    );
+    let actual_lots = crate::app_services::broker_deal_economics::broker_lots_from_wire_volume_v1(
+        opening.filled_volume_raw_centi_units(),
+        scale.lot_size_raw_centi_units(),
+    )?;
+    Ok((opening, scale, actual_lots))
+}
+
 /// Does this kill-switch tier justify the PERSISTED 24 h halt, or only a
 /// refusal of the order in hand?
 ///
@@ -258,16 +463,17 @@ fn tf_duration_ms(tf: &str) -> Result<i64> {
 /// account-wide halt because one order arrived with a malformed bracket, and a
 /// safety control the operator learns to distrust is worse than no control.
 ///
-/// - **Account-level** (halt): `PerDay`, `PerStage`, `PerMonth` say the bankroll
-///   itself is in trouble; `Manual` and `HardwareConnLoss` are sticky halts that
-///   already require an explicit clear. All five persist and stop every
-///   Risky-Mode entry until the cooldown elapses or the bridge re-arms.
+/// - **Account-level** (halt): `PerDay`, `PerWeek`, `PerStage`, `PerMonth` say
+///   the bankroll itself is in trouble. Hardware/account disconnects reach the
+///   same durable cooldown through `margin_call`, outside this enum.
 ///
 /// **What can actually fire, as of 2026-08-09** — stated because the first
 /// version of this wiring advertised five halting tiers and three of them were
 /// structurally unreachable:
 /// - `PerDay` — live. Realized loss this UTC day (account-wide, see the journal
 ///   ledger at the entry site) reached `daily_loss_cap_fraction × bankroll`.
+/// - `PerWeek` — live. Realized loss this ISO week reached
+///   `weekly_drawdown_cap_fraction × bankroll`; a day rollover cannot clear it.
 /// - `PerStage` — live as of the high-water fix in
 ///   `neoethos_core::domain::risky_mode`. Was unreachable before it.
 /// - `PerMonth` — live, but INERT at the shipped `monthly_loss_cap_fraction`
@@ -275,29 +481,14 @@ fn tf_duration_ms(tf: &str) -> Result<i64> {
 /// - `PreSendSanity` — live, the most frequently seen refusal.
 /// - `PerTrade` — reachable only via an explicit zero/absent bracket; this loop
 ///   always resolves an SL and a TP, so in practice it does not fire here.
-/// - `HardwareConnLoss` — **acquired a producer on 2026-08-09.** The broker
-///   margin-call / account-disconnect watcher
-///   (`crate::app_services::margin_call`) routes a cTrader margin-call or
-///   account-disconnect event into this tier through
-///   `risky_mode_persistence::record_kill_switch_trip`, so it is now a sticky
-///   24 h halt the operator actually has. This classification did not change —
-///   that was the point of classifying it as halting before a producer existed.
-///   **If that module is ever removed, this bullet becomes a lie: revert it.**
-/// - `Manual` — **still no producer.** `trip_manual_halt` has zero callers in
-///   the workspace, so this tier remains inert. It stays classified as halting
-///   so wiring a producer later needs no change here — but do not describe it to
-///   the operator as protection he currently has.
 /// - **Order-level** (refuse only): `PerTrade` (missing/invalid SL or TP) and
 ///   `PreSendSanity` (this order's implied risk exceeded the ceiling) describe
 ///   THIS order. Both are still refused, and both are logged at `error`.
-/// - `ManualOrderWhileAutonomousOnly` cannot be produced by
-///   `check_trade_allowed`; classified order-level so the match stays
-///   exhaustive without inventing a halt.
 pub(crate) fn tier_halts_for_24h(tier: neoethos_core::domain::risky_mode::KillSwitchTier) -> bool {
     use neoethos_core::domain::risky_mode::KillSwitchTier as T;
     match tier {
-        T::PerDay | T::PerStage | T::PerMonth | T::Manual | T::HardwareConnLoss => true,
-        T::PerTrade | T::PreSendSanity | T::ManualOrderWhileAutonomousOnly => false,
+        T::PerDay | T::PerWeek | T::PerStage | T::PerMonth => true,
+        T::PerTrade | T::PreSendSanity => false,
     }
 }
 
@@ -316,6 +507,13 @@ fn period_starts_ms(now_ms: i64) -> Option<(i64, i64, i64)> {
     let week = to_ms(d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64))?;
     let month = to_ms(NaiveDate::from_ymd_opt(d.year(), d.month(), 1)?)?;
     Some((day, week, month))
+}
+
+fn utc_day_id(now: chrono::DateTime<chrono::Utc>) -> u32 {
+    use chrono::Datelike;
+
+    let date = now.date_naive();
+    (date.year().max(0) as u32) * 10_000 + date.month() * 100 + date.day()
 }
 
 /// The ACCOUNT's realized losses for the UTC day / ISO week / calendar month
@@ -390,6 +588,55 @@ fn weekend_kill_zone(ts_ms: i64) -> (bool, bool) {
     (friday_kill, friday_kill || monday_kill)
 }
 
+/// Commit the locally tracked trail only after the broker confirms the exact
+/// protection operation for this position. On every error the previous value
+/// stays untouched, so the intended stop remains eligible for retry.
+fn commit_broker_confirmed_trail(
+    confirmed_stop_price: &mut f64,
+    intended_stop_price: f64,
+    position_id: i64,
+    outcome: &CTraderExecutionOutcome,
+) -> Result<()> {
+    anyhow::ensure!(
+        intended_stop_price.is_finite() && intended_stop_price > 0.0,
+        "refusing to commit non-finite/non-positive trailing stop {intended_stop_price}"
+    );
+    anyhow::ensure!(
+        outcome.status == CTraderExecutionStatus::Replaced,
+        "broker returned {:?}, not ORDER_REPLACED, for position protection amend",
+        outcome.status
+    );
+    anyhow::ensure!(
+        outcome.position_id == Some(position_id),
+        "broker confirmed protection for position {:?}, expected {position_id}",
+        outcome.position_id
+    );
+    *confirmed_stop_price = intended_stop_price;
+    Ok(())
+}
+
+/// A partial close changes the next close request's exact wire volume. Absence
+/// from a snapshot alone does not settle the trade: the existing close-money
+/// reconciliation must also verify all fills before clearing local ownership.
+fn refresh_tracked_position_volume(
+    tracked: &mut (i64, i64),
+    expected_symbol_id: i64,
+    broker_positions: impl IntoIterator<Item = (i64, i64, i64)>,
+) -> Result<()> {
+    let mut matching = broker_positions
+        .into_iter()
+        .filter(|(position_id, _, _)| *position_id == tracked.0);
+    let Some((position_id, symbol_id, volume)) = matching.next() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        matching.next().is_none() && symbol_id == expected_symbol_id && volume > 0,
+        "invalid or ambiguous remaining broker volume for tracked position {position_id}"
+    );
+    tracked.1 = volume;
+    Ok(())
+}
+
 pub(crate) fn bars_to_ohlcv(bars: &[crate::app_services::ctrader_data::HistoricalBar]) -> Ohlcv {
     Ohlcv {
         timestamp: Some(bars.iter().map(|b| b.timestamp_ms).collect()),
@@ -401,46 +648,78 @@ pub(crate) fn bars_to_ohlcv(bars: &[crate::app_services::ctrader_data::Historica
     }
 }
 
-// ── Risk-based position sizing ──────────────────────────────────────────────────
+// Keep the existing age budget and 2.5x spread threshold. This cache check is
+// entry-only and is not an execution permit or account-specific pip contract.
+const LIVE_ENTRY_SPOT_MAX_AGE_MS: i64 = 120_000;
 
-/// Resolve the `quote → account` FX rate so cross-pair pip values can be
-/// converted into the account currency (e.g. USD→GBP via GBPUSD). Blocking —
-/// fetches a few recent bars of the bridging pair from the broker. Returns
-/// `None` when neither orientation of the bridge pair is fetchable, so the
-/// caller falls back to a fixed lot rather than mis-size.
-fn resolve_quote_to_account_rate(quote: &str, account: &str, tf: &str) -> Option<f64> {
-    let q = quote.trim().to_ascii_uppercase();
-    let a = account.trim().to_ascii_uppercase();
-    if q.is_empty() || a.is_empty() {
-        return None;
-    }
-    if q == a {
-        return Some(1.0);
-    }
-    let last_close = |sym: &str| -> Option<f64> {
-        crate::app_services::broker_api::fetch_recent_chart_bars_blocking(sym, tf, 3)
-            .ok()
-            .and_then(|bars| bars.last().map(|b| b.close))
-            .filter(|c| c.is_finite() && *c > 0.0)
-    };
-    // ACCOUNT+QUOTE (e.g. GBPUSD): price = QUOTE units per 1 ACCOUNT → quote→account = 1/price.
-    if let Some(p) = last_close(&format!("{a}{q}")) {
-        return Some(1.0 / p);
-    }
-    // QUOTE+ACCOUNT (e.g. USDGBP): price = ACCOUNT units per 1 QUOTE → quote→account = price.
-    if let Some(p) = last_close(&format!("{q}{a}")) {
-        return Some(p);
-    }
-    None
+#[derive(Debug, PartialEq)]
+enum LiveEntrySpreadRefusal {
+    Quote(SpotQuoteRefusal),
+    InvalidPipSize,
+    InvalidExpectedSpread,
+    InvalidPrices,
+    InvalidSpread,
+    ExceedsLimit { spread_pips: f64, limit_pips: f64 },
 }
+
+fn evaluate_live_entry_spread(
+    quote: std::result::Result<(f64, f64), SpotQuoteRefusal>,
+    pip_size: f64,
+    expected_spread_pips: f64,
+) -> std::result::Result<f64, LiveEntrySpreadRefusal> {
+    let (bid, ask) = quote.map_err(LiveEntrySpreadRefusal::Quote)?;
+    if !pip_size.is_finite() || pip_size <= 0.0 {
+        return Err(LiveEntrySpreadRefusal::InvalidPipSize);
+    }
+    let limit_pips = expected_spread_pips * 2.5;
+    if !expected_spread_pips.is_finite() || expected_spread_pips < 0.0 || !limit_pips.is_finite() {
+        return Err(LiveEntrySpreadRefusal::InvalidExpectedSpread);
+    }
+    if !bid.is_finite() || !ask.is_finite() || bid <= 0.0 || ask <= 0.0 || bid > ask {
+        return Err(LiveEntrySpreadRefusal::InvalidPrices);
+    }
+    let spread_pips = (ask - bid) / pip_size;
+    if !spread_pips.is_finite() {
+        return Err(LiveEntrySpreadRefusal::InvalidSpread);
+    }
+    if spread_pips > limit_pips {
+        return Err(LiveEntrySpreadRefusal::ExceedsLimit {
+            spread_pips,
+            limit_pips,
+        });
+    }
+    Ok(spread_pips)
+}
+
+fn require_live_entry_spread(
+    account_id: i64,
+    environment: CTraderEnvironment,
+    session: SpotSessionId,
+    symbol_id: i64,
+    pip_size: f64,
+    expected_spread_pips: f64,
+    now_ms: i64,
+) -> std::result::Result<f64, LiveEntrySpreadRefusal> {
+    let quote = live_spots::get_fresh_tick(
+        account_id,
+        environment,
+        session,
+        symbol_id,
+        now_ms,
+        LIVE_ENTRY_SPOT_MAX_AGE_MS,
+    )
+    .map(|quote| (quote.bid, quote.ask));
+    evaluate_live_entry_spread(quote, pip_size, expected_spread_pips)
+}
+
+// ── Risk-based position sizing ──────────────────────────────────────────────────
 
 /// Position size (lots) for one entry, from the account's risk budget and the
 /// strategy's OWN stop distance: `lots = balance × risk% / (sl_pips ×
-/// pip_value_per_lot_in_account)`, snapped to the symbol's lot step and clamped
-/// to `[min_lot, min(max_lot, max_lot_cap)]`. Returns `fallback` whenever a
-/// correct size can't be computed (no balance / risk / stop, missing metadata,
-/// or a cross pair whose pip value collapses to NaN without an FX rate) — it
-/// NEVER returns a wrong size.
+/// pip_value_per_lot_in_account)`, rounded DOWN after all upper bounds apply.
+/// A budget below the broker's minimum is an error, never permission to round
+/// up. Missing financial inputs also refuse the entry in every trading mode.
+/// This bounds the price loss at the requested stop, not gap/slippage or fees.
 #[allow(clippy::too_many_arguments)]
 fn risk_based_lots(
     balance: f64,
@@ -450,55 +729,64 @@ fn risk_based_lots(
     account_ccy: &str,
     fx_quote_to_account: Option<f64>,
     live_price: Option<f64>,
-    fallback: f64,
     max_lot_cap: f64,
-) -> f64 {
-    if !(balance > 0.0 && risk_fraction > 0.0 && sl_pips.is_finite() && sl_pips > 0.0) {
-        return fallback;
+) -> Result<f64> {
+    anyhow::ensure!(
+        balance.is_finite()
+            && balance > 0.0
+            && risk_fraction.is_finite()
+            && risk_fraction > 0.0
+            && risk_fraction <= 1.0,
+        "invalid account balance or risk fraction for position sizing"
+    );
+    let meta = meta.context("missing broker symbol metadata for position sizing")?;
+    for (name, value) in [
+        ("stop distance", sl_pips),
+        ("lot step", meta.lot_step),
+        ("minimum lot", meta.min_lot),
+        ("maximum lot", meta.max_lot),
+        ("operator lot cap", max_lot_cap),
+        ("pip size", meta.pip_size),
+    ] {
+        anyhow::ensure!(value.is_finite() && value > 0.0, "invalid {name}: {value}");
     }
-    let Some(meta) = meta else {
-        return fallback;
-    };
+    let price = live_price
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .context("missing current price for position sizing")?;
     let pip_val = meta.pip_value_in_account(account_ccy, fx_quote_to_account, live_price);
-    if !(pip_val.is_finite() && pip_val > 0.0) {
-        return fallback;
-    }
-    let raw = (balance * risk_fraction) / (sl_pips * pip_val);
-    if !(raw.is_finite() && raw > 0.0) {
-        return fallback;
-    }
-    let step = if meta.lot_step > 0.0 {
-        meta.lot_step
-    } else {
-        0.01
-    };
-    let min_lot = if meta.min_lot > 0.0 {
-        meta.min_lot
-    } else {
-        step
-    };
-    let max_lot = meta.max_lot.min(max_lot_cap).max(min_lot);
-    let mut lots = (raw / step).floor() * step;
+    let risk_budget = balance * risk_fraction;
+    let raw = meta
+        .risk_money_to_lots(
+            risk_budget,
+            sl_pips,
+            account_ccy,
+            fx_quote_to_account,
+            Some(price),
+        )
+        .context("cannot price stop risk in the account currency; check the FX conversion")?;
 
-    // Affordability guard: a small account must NEVER be handed a position it
-    // can't hold (operator saw a 47-lot order). Cap the NOTIONAL to
-    // balance × a conservative max leverage — independent of pip_value, so a
-    // mis-resolved pip value (tiny denominator → huge `raw`) can't blow the lot
-    // count up. Uses live price × contract size × the quote→account FX rate.
-    if let Some(price) = live_price.filter(|p| p.is_finite() && *p > 0.0) {
-        let fx = fx_quote_to_account
-            .filter(|r| r.is_finite() && *r > 0.0)
-            .unwrap_or(1.0);
-        let notional_per_lot = meta.contract_size * price * fx;
-        if notional_per_lot > 0.0 {
-            const MAX_LEVERAGE: f64 = 30.0; // conservative; under-sizes safely
-            let affordable = (balance * MAX_LEVERAGE) / notional_per_lot;
-            if affordable < lots {
-                lots = (affordable / step).floor() * step;
-            }
-        }
-    }
-    lots.clamp(min_lot, max_lot)
+    // Preserve the existing 30x notional ceiling; it is not a broker-margin
+    // estimate. Use the SAME account conversion as pip risk, including when
+    // the account currency is the pair's base. Never assume a missing FX = 1.
+    const MAX_NOTIONAL_MULTIPLE: f64 = 30.0;
+    let notional_per_lot = (pip_val / meta.pip_size) * price;
+    anyhow::ensure!(
+        notional_per_lot.is_finite() && notional_per_lot > 0.0,
+        "cannot value position notional in the account currency"
+    );
+    let notional_cap = (balance / notional_per_lot) * MAX_NOTIONAL_MULTIPLE;
+    let capped = raw.min(meta.max_lot).min(max_lot_cap).min(notional_cap);
+    let lots = (capped / meta.lot_step).floor() * meta.lot_step;
+    anyhow::ensure!(
+        lots.is_finite() && lots >= meta.min_lot,
+        "budget permits {lots:.8} lots, below broker minimum {}; entry skipped, not rounded up",
+        meta.min_lot
+    );
+    anyhow::ensure!(
+        lots * sl_pips * pip_val <= risk_budget * (1.0 + 1e-12),
+        "rounded lot size exceeds the requested stop-risk budget"
+    );
+    Ok(lots)
 }
 
 /// The operator's `models.blend_gate_floor`.
@@ -545,7 +833,7 @@ fn operator_blend_veto_below(settings: Option<&neoethos_core::Settings>) -> Opti
 
 fn budgeted_role_decision_for_last_row(
     ensemble: &neoethos_models::ensemble_inference::SoftVotingEnsemble,
-    features: &neoethos_data::FeatureFrame,
+    dataset: &neoethos_data::SymbolDataset,
 ) -> Result<neoethos_models::ensemble_inference::EnsembleDecision> {
     let installed = neoethos_core::execution_budget::installed_process_budget()
         .context("live ensemble inference requires the immutable process CPU budget")?;
@@ -557,9 +845,102 @@ fn budgeted_role_decision_for_last_row(
         ))
         .context("query live ensemble CPU admission")?
         .context("process CPU budget is busy; live ensemble abstains on this bar")?;
-    neoethos_models::ensemble_inference::bootstrap::role_decision_for_last_row(
-        ensemble, features, &lease,
+    // The Search cube has already been released. Model features use only the
+    // model-owned persisted recipe/fit, under this same admitted CPU lease.
+    let features = Arc::new(lease.scope(|| ensemble.prepare_model_features(dataset))?);
+    ensemble.bind_model_features(&features)?.last_row(
+        features.n_samples(),
+        neoethos_models::ensemble_inference::bootstrap::LIVE_DECISION_TAIL_ROWS,
+        &lease,
     )
+}
+
+/// A requested model decision may shrink or veto a NEW entry, never become
+/// genes-only sizing because inference failed. Called after existing-position
+/// reconciliation/protection and before reserving an entry or sending an order.
+fn checked_live_ml_entry(
+    direction: Direction,
+    decision: Result<neoethos_models::ensemble_inference::EnsembleDecision>,
+    blend: &neoethos_trader::BlendConfig,
+) -> Result<(neoethos_models::ensemble_inference::EnsembleDecision, f64)> {
+    let decision = decision.context("required live model inference is unavailable")?;
+    anyhow::ensure!(
+        decision.validity.is_valid(),
+        "required live model row is ineligible: {:?}",
+        decision.validity
+    );
+    let ml = neoethos_trader::MlDecision {
+        dir_probs: decision.dir_probs,
+        regime_gate: decision.regime_gate,
+        anomaly_scale: decision.anomaly_scale,
+    };
+    let (blended_direction, multiplier) = neoethos_trader::blend_decision(direction, &ml, blend);
+    anyhow::ensure!(
+        direction != Direction::Flat
+            && blended_direction == direction
+            && multiplier.is_finite()
+            && multiplier > 0.0
+            && multiplier <= 1.0,
+        "live ML entry veto: no valid positive size multiplier"
+    );
+    Ok((decision, multiplier))
+}
+
+/// Preserve the mode's risk budget; ML can scale it once, while the confidence
+/// gate receives the independent value measured by the archived gene policy.
+fn live_entry_sizing_inputs(
+    mode_risk: f64,
+    gene_confidence: f64,
+    ml_multiplier: Option<f64>,
+) -> Result<(f64, Option<f64>)> {
+    let scale = ml_multiplier.unwrap_or(1.0);
+    anyhow::ensure!(
+        mode_risk.is_finite()
+            && mode_risk >= 0.0
+            && gene_confidence.is_finite()
+            && (0.0..=1.0).contains(&gene_confidence)
+            && scale.is_finite()
+            && (0.0..=1.0).contains(&scale),
+        "live risk, gene confidence or ML multiplier is invalid"
+    );
+    Ok((mode_risk * scale, Some(gene_confidence)))
+}
+
+/// Refresh the one durable account-risk authority from a broker snapshot. If a
+/// firm-local day has just rolled, the helper first proves that the snapshot's
+/// balance is still the reset-boundary balance; it never manufactures an
+/// anchor from a mid-day value.
+async fn prepare_account_risk_period(
+    authority: &SharedAccountRiskAuthority,
+    identity: &AccountRiskIdentity,
+    period: PropFirmPeriod,
+    snapshot: AccountRiskSnapshot,
+) -> Result<AccountRiskSummary> {
+    let needs_anchor = authority
+        .lock()
+        .map_err(|_| anyhow!("account-risk authority lock is poisoned"))?
+        .needs_period(period);
+    let anchor_evidence = if needs_anchor {
+        let evidence_identity = identity.clone();
+        let to_utc_ms = chrono::Utc::now().timestamp_millis();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                fetch_anchor_evidence_blocking(&evidence_identity, period, to_utc_ms)
+            })
+            .await
+            .map_err(|error| anyhow!("daily-anchor evidence task failed: {error}"))??,
+        )
+    } else {
+        None
+    };
+
+    let mut guard = authority
+        .lock()
+        .map_err(|_| anyhow!("account-risk authority lock is poisoned"))?;
+    guard
+        .prepare_period(period, snapshot, anchor_evidence.as_ref())
+        .context("prepare durable account-wide prop-firm risk period")?;
+    Ok(guard.summary())
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -572,6 +953,7 @@ async fn run(
     // forward-test gate was evaluated against. Re-checked every bar; a change
     // stops the engine (see the check inside the loop).
     gated_env_is_live: bool,
+    account_risk_registry: Arc<AccountRiskRegistry>,
 ) -> Result<()> {
     // Load portfolio artifact (same as replay_portfolio_from_dir)
     let artifact = neoethos_search::load_live_portfolio_json(&req.portfolio_path)
@@ -580,13 +962,9 @@ async fn run(
     if artifact.genes.is_empty() {
         anyhow::bail!("portfolio '{}' has no genes", req.portfolio_path);
     }
-    if artifact.normalize_features {
-        anyhow::bail!(
-            "portfolio was discovered with feature normalisation ON — \
-             normalization stats are not persisted, cannot reproduce live features. \
-             Re-run discovery with normalisation OFF."
-        );
-    }
+    let portfolio_oos_half_kelly = artifact
+        .portfolio_half_kelly_risk_fraction()
+        .context("resolve held-out half-Kelly sizing from live portfolio")?;
 
     // A valid receipt is necessary but not sufficient for real money: the
     // connected broker session must be the same environment/account/symbol id
@@ -621,13 +999,16 @@ async fn run(
     let symbol = artifact.symbol.clone();
     let base_tf = artifact.base_tf.clone();
     let higher_tfs = artifact.higher_tfs.clone();
-    let effective_names = artifact.effective_feature_names.clone();
     let genes = artifact.genes.clone();
+    let live_trading_policy = artifact.live_trading_policy.clone();
 
     if let Ok(mut s) = status.lock() {
         s.symbol = Some(symbol.clone());
         s.base_tf = Some(base_tf.clone());
         s.genes = genes.len();
+        s.protection_policy_identity = Some(live_trading_policy.identity_hash.clone());
+        s.trailing_enabled = Some(live_trading_policy.trailing_enabled);
+        s.clear_position_telemetry(live_trading_policy.trailing_enabled);
     }
 
     let bar_ms = tf_duration_ms(&base_tf)?;
@@ -649,12 +1030,16 @@ async fn run(
     let portfolio_path = req.portfolio_path.clone();
     let mut opened_ids: HashSet<i64> = HashSet::new();
     let mut has_unresolved_broker_entry = false;
+    // Retain the original intent correlation ID while this process is blocked.
+    // A durable restart/recovery registry is not implied by this local state.
+    let mut unresolved_entry_client_order_id: Option<String> = None;
     let mut opened_entry_filled_volumes: HashMap<i64, i64> = HashMap::new();
     let mut opened_volume_scales: HashMap<i64, BrokerSymbolVolumeScaleEvidenceV1> = HashMap::new();
     let mut close_money_accumulators: HashMap<i64, BrokerPositionMoneyAccumulatorV1> =
         HashMap::new();
     let mut unverified_close_positions: HashSet<i64> = HashSet::new();
     let mut consecutive_losses: u32 = 0;
+    let mut pending_retirement_reason: Option<String> = None;
     let mut net_pnl_running: f64 = 0.0;
     // Live-learning foundation (operator 2026-07-02): remember the EXACT
     // feature row each entry acted on; pair it with the realized outcome at
@@ -697,19 +1082,24 @@ async fn run(
     // Size each entry by % of the LIVE account balance in the broker's REAL
     // deposit currency — not a fixed lot. Any piece we can't resolve makes that
     // entry fall back to req.lot_size (never a wrong size).
-    let sizing =
-        neoethos_core::Settings::from_yaml(&crate::server::state::current_config_path()).ok();
+    let live_config_path = crate::server::state::current_config_path();
+    let sizing = Some(
+        neoethos_core::Settings::from_yaml(&live_config_path).with_context(|| {
+            format!(
+                "load live trading settings from {}; refusing to start without one coherent risk/data policy",
+                live_config_path.display()
+            )
+        })?,
+    );
     let risk_fraction = sizing
         .as_ref()
         .map(|s| s.risk.risk_per_trade)
         .unwrap_or(0.0)
         .clamp(0.0, 1.0);
-    // Risky Mode sizing context. When `trading_mode == "risky"` the per-entry
-    // risk comes from the bankroll-stage ladder (30 %→50 %, tapering as the
-    // account grows) instead of the static prop-firm `risk_per_trade`. Read
-    // once here; the actual stage fraction is resolved per entry off the LIVE
-    // balance (the account compounds). The default "prop_firm" mode leaves the
-    // sizing path byte-for-byte unchanged.
+    // Risky Mode sizing comes from this artifact's untouched OOS edge through
+    // the same bounded half-Kelly formula used by Search. Bankroll changes the
+    // dollar amount at risk, not the evidence-derived fraction. PropFirm mode
+    // keeps its separately configured sizing path.
     let trading_mode_risky = sizing
         .as_ref()
         .map(|s| s.system.trading_mode.eq_ignore_ascii_case("risky"))
@@ -810,26 +1200,11 @@ async fn run(
     // and never toward it. The defaults agree (both `true`), which is why it
     // went unseen.
     //
-    // Both sides now read this same field: `DiscoveryConfig::kill_zones_enabled`
-    // is set from `settings.risk.kill_zones_enabled` in
-    // `DiscoveryConfig::from_settings` and consumed by
-    // `discovery_backtest_settings`. Turning it off re-scores against a
-    // different simulator, which is a decision the operator can now actually
-    // make: the value is part of the backtest policy hash and of the run
-    // profile, so artifacts from either side of the switch are distinguishable.
-    let kill_zones_enabled = sizing
-        .as_ref()
-        .map(|s| s.risk.kill_zones_enabled)
-        .unwrap_or(true);
-    // Live spread gate reference: the spread the BACKTEST charged per trade.
-    // When the live spread blows past a multiple of it (rollover, thin books),
-    // entering would pay costs the validated edge never budgeted for.
-    let backtest_spread_pips = sizing
-        .as_ref()
-        .map(|s| s.risk.backtest_spread_pips)
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(1.5);
-    // ── Exit geometry — THE SAME RESOLVED VALUES THE SEARCH READS (#208/#74) ───
+    // Both sides now read the value sealed in the portfolio's immutable search
+    // authority. Editing Settings after discovery cannot silently change the
+    // weekend or spread policy of a strategy that was already validated.
+    let kill_zones_enabled = live_trading_policy.kill_zones_enabled;
+    // ── Exit geometry — THE EXACT VALUES THE SEARCH PRICED (#208/#74) ─────────
     //
     // 2026-08-09. `models.exit_policy` (`neoethos-core/src/config.rs:1642`) is
     // the single recipient for the break-even/trailing geometry. Discovery reads
@@ -842,63 +1217,35 @@ async fn run(
     // 2.0 — every strategy validated from today was scored with the take-profit
     // reachable and then traded with the stop pulled to break-even at +1R.
     //
-    // FAIL-CLOSED. `None` here means the config could not be read at all
-    // (`Settings::from_yaml` failed above). We do NOT fall back to the constant:
-    // an unresolvable policy means we cannot prove parity with what was scored,
-    // so the trail does not arm and positions run to their real SL/TP. That
-    // matches the shipped default, which is also OFF.
+    // The v4 live artifact cannot load without this policy and its identity
+    // hash. Keep the explicit Option type because the config-recipient audit
+    // follows the wrapped `ExitPolicyConfig`; unlike the old path, `Some` here
+    // is guaranteed by artifact validation rather than today's Settings file.
     let exit_policy: Option<neoethos_core::config::ExitPolicyConfig> =
-        sizing.as_ref().map(|s| s.models.exit_policy);
-    let exit_policy_config_path = crate::server::state::current_config_path();
+        Some(live_trading_policy.exit_policy());
     match exit_policy {
         Some(p) if p.trailing_enabled => tracing::warn!(
             target: "neoethos_app::live_trading",
             %symbol,
+            policy_identity = %live_trading_policy.identity_hash,
             trailing_enabled = true,
             be_trigger_r = p.trailing_be_trigger_r,
             stop_multiplier = p.trailing_stop_multiplier,
             min_lock_pips = p.trailing_min_lock_pips,
-            "LIVE TRAILING ARMED from models.exit_policy — stops will be pulled \
-             to break-even once price reaches the trigger. This must match the \
-             policy discovery scored these genes under, or live gives back wins \
-             the backtest was paid for"
+            "LIVE TRAILING ARMED from the portfolio's sealed discovery policy"
         ),
         Some(_) => tracing::info!(
             target: "neoethos_app::live_trading",
             %symbol,
+            policy_identity = %live_trading_policy.identity_hash,
             trailing_enabled = false,
-            "live trailing DISABLED by models.exit_policy.trailing_enabled — \
-             open positions run to their real stop or take-profit, matching \
-             what discovery scored"
+            "live trailing DISABLED by the portfolio's sealed discovery policy"
         ),
-        None => tracing::error!(
-            target: "neoethos_app::live_trading",
-            %symbol,
-            config_path = %exit_policy_config_path.display(),
-            "models.exit_policy is UNRESOLVABLE (Settings failed to load) — \
-             REFUSING TO TRAIL. No stop on any open position will be moved by \
-             this engine. Fix the config to restore configured exit behaviour"
-        ),
+        None => unreachable!("validated live portfolio always carries an exit policy"),
     }
-    // ── Risky-mode per-trade ceiling: config vs constant (#209/#210) ───────────
-    //
-    // 2026-08-09. `risk.risky_max_risk_per_trade` (`config.rs:345`, shipped
-    // 0.30) had exactly one reader in the workspace and it was the SEARCH
-    // (`discovery.rs:820`). The live ladder is bounded by
-    // `RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION = 0.50`
-    // (`domain/risky_mode.rs:136`), and the entry site below takes its base risk
-    // straight from `stage_risk_fraction_for_bankroll`. Twenty percentage points
-    // of the account per trade, with nothing reconciling the two numbers.
-    //
-    // Resolution, deliberately NOT the operator's decision on which number is
-    // "right": THE LOWER ONE BINDS. A limit the operator wrote down is never
-    // silently raised. The constant stays where it is (`server/risky.rs` reports
-    // it as the band's ceiling); this clamp only ever shrinks the entry.
-    //
-    // A non-finite or non-positive configured value is NOT treated as "size
-    // zero" — it is treated as unusable, logged at error, and leaves the ladder
-    // unclamped, because inventing a ceiling from a corrupt field is as wrong as
-    // ignoring a real one.
+    // Risky-mode operator input is a ceiling, never a substitute for measured
+    // edge. A malformed ceiling is ignored loudly; schema-v5 OOS half-Kelly and
+    // the Search-v5 25 % hard cap still bind.
     let risky_configured_ceiling: Option<f64> = match sizing
         .as_ref()
         .and_then(|s| s.risk.risky_max_risk_per_trade)
@@ -909,198 +1256,157 @@ async fn run(
                 target: "neoethos_app::live_trading",
                 %symbol, configured = v,
                 "risk.risky_max_risk_per_trade is set to a value that cannot \
-                 bound anything (non-finite or <= 0) — IGNORING IT. The risky \
-                 ladder ceiling of 0.50 stands unclamped. Set a fraction in \
-                 (0, 1] to bind it"
+                 bound anything (non-finite or <= 0) — IGNORING IT. The \
+                 portfolio's held-out half-Kelly remains authoritative. Set a \
+                 positive fraction to add a lower operator ceiling"
             );
             None
         }
         None => None,
     };
-    if trading_mode_risky {
-        let ladder_ceiling =
-            neoethos_core::domain::risky_mode::RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION;
-        match risky_configured_ceiling {
-            Some(cfg) if cfg < ladder_ceiling => tracing::warn!(
-                target: "neoethos_app::live_trading",
-                %symbol,
-                configured = cfg,
-                ladder_ceiling,
-                effective = cfg,
-                bound_by = "risk.risky_max_risk_per_trade",
-                "RISKY SIZING DISAGREEMENT — the config and the bankroll ladder \
-                 name different per-trade ceilings. The LOWER one binds: every \
-                 entry is capped at the configured fraction, so the early ladder \
-                 rungs size DOWN. Change risk.risky_max_risk_per_trade to lift it"
-            ),
-            Some(cfg) => tracing::warn!(
-                target: "neoethos_app::live_trading",
-                %symbol,
-                configured = cfg,
-                ladder_ceiling,
-                effective = ladder_ceiling,
-                bound_by = "RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION",
-                "RISKY SIZING DISAGREEMENT — the configured ceiling is at or \
-                 above the ladder's. The LOWER one binds, so the ladder's \
-                 constant governs; the config raises nothing"
-            ),
-            None => tracing::warn!(
-                target: "neoethos_app::live_trading",
-                %symbol,
-                ladder_ceiling,
-                effective = ladder_ceiling,
-                bound_by = "RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION",
-                "RISKY MODE with NO configured per-trade ceiling \
-                 (risk.risky_max_risk_per_trade is unset) — only the ladder's \
-                 constant bounds entry size"
-            ),
-        }
-    }
-    // Load the soft-voting ensemble ONCE at engine start (loading ~30 expert
-    // artifacts takes seconds — far too slow per bar). Fail-soft: if the gate
-    // is on but the ensemble can't load (nothing trained yet, wrong symbol/TF
-    // dir), log loudly and run gene-only — never block trading on ML infra.
+    let risky_effective_fraction = if trading_mode_risky {
+        let effective = risky_configured_ceiling
+            .map(|ceiling| portfolio_oos_half_kelly.min(ceiling))
+            .unwrap_or(portfolio_oos_half_kelly);
+        anyhow::ensure!(
+            effective.is_finite() && effective > 0.0,
+            "Risky Mode portfolio has no positive held-out sizing edge"
+        );
+        tracing::warn!(
+            target: "neoethos_app::live_trading",
+            %symbol,
+            oos_half_kelly = portfolio_oos_half_kelly,
+            configured_ceiling = ?risky_configured_ceiling,
+            effective_risk_fraction = effective,
+            "RISKY SIZING ARMED FROM HELD-OUT EDGE — fixed 30-50% ladder is not used"
+        );
+        Some(effective)
+    } else {
+        None
+    };
+    // Match the selected portfolio to its own installed candidate and captured
+    // inference policy. This does not supply financial/deployment permission.
     let live_ensemble: Option<
         std::sync::Arc<neoethos_models::ensemble_inference::soft_voting::SoftVotingEnsemble>,
     > = if live_ml_gate {
-        let sym = symbol.clone();
-        let tf = base_tf.clone();
-        match tokio::task::spawn_blocking(move || {
-            neoethos_models::ensemble_inference::build_ensemble_for_symbol(
-                std::path::Path::new("models"),
-                &sym,
-                &tf,
+        let model_settings = sizing
+            .as_ref()
+            .context("required live ML has no captured settings")?
+            .clone();
+        let portfolio_identity =
+            neoethos_search::canonical_locked_portfolio_identity_sha256_v1(&artifact)?;
+        let loaded = tokio::task::spawn_blocking(move || {
+            candidate_models::load(
+                &model_settings,
+                &std::path::Path::new("models").join("candidates"),
+                &portfolio_identity,
             )
         })
         .await
-        {
-            Ok(Ok(ensemble)) => {
-                let outcome =
-                    neoethos_models::ensemble_inference::EnsemblePredictor::load_outcome(&ensemble);
-                // #166. `loaded` is NOT the number of voters: an expert whose
-                // output kind is not Classification3, or one on the operator's
-                // exclusion list, is held in the outcome and never votes. Log
-                // both, and name the non-voters — "31 loaded" next to "2 voting"
-                // is the difference between a working ensemble and a banner.
-                let unused = {
-                    let mut v = ensemble.experts_unused_for_voting();
-                    v.sort_unstable();
-                    v.join(",")
-                };
-                tracing::info!(
-                    target: "neoethos_app::live_trading",
-                    %symbol, %base_tf,
-                    loaded = outcome.loaded_count(),
-                    missing = outcome.missing_count(),
-                    degraded = outcome.degraded_count(),
-                    voting = ensemble.voting_expert_count(),
-                    unused_for_voting = %unused,
-                    "LIVE ML gate armed — ensemble voters loaded (genes still pick direction; ML only scales size)"
-                );
-                Some(std::sync::Arc::new(ensemble))
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    target: "neoethos_app::live_trading",
-                    %symbol, %base_tf, error = %err,
-                    "models.live_ml_gate is ON but the ensemble failed to load — running gene-only"
-                );
-                None
-            }
-            Err(join_err) => {
-                tracing::warn!(
-                    target: "neoethos_app::live_trading",
-                    %symbol, error = %join_err,
-                    "ensemble loader task failed — running gene-only"
-                );
-                None
-            }
-        }
+        .context("required live ensemble loader task failed; refusing to start")?
+        .context("models.live_ml_gate is ON but its ensemble cannot load; refusing to start")?;
+        let ensemble = loaded.ensemble;
+        let outcome =
+            neoethos_models::ensemble_inference::EnsemblePredictor::load_outcome(&ensemble);
+        // #166. `loaded` is NOT the number of voters: an expert whose
+        // output kind is not Classification3, or one on the operator's
+        // exclusion list, is held in the outcome and never votes. Log
+        // both, and name the non-voters — "31 loaded" next to "2 voting"
+        // is the difference between a working ensemble and a banner.
+        let unused = {
+            let mut v = ensemble.experts_unused_for_voting();
+            v.sort_unstable();
+            v.join(",")
+        };
+        tracing::info!(
+            target: "neoethos_app::live_trading",
+            %symbol, %base_tf,
+            loaded = outcome.loaded_count(),
+            training_handoff = %loaded.training_handoff,
+            candidate_tree = %loaded.candidate_tree,
+            missing = outcome.missing_count(),
+            degraded = outcome.degraded_count(),
+            voting = ensemble.voting_expert_count(),
+            unused_for_voting = %unused,
+            "LIVE ML gate armed — ensemble voters loaded (genes still pick direction; ML only scales size)"
+        );
+        Some(std::sync::Arc::new(ensemble))
     } else {
-        // #240 — MAKE THE WASTE VISIBLE, do not decide it.
-        //
-        // `models.live_ml_gate` is FALSE in the code default (`config.rs:2573`),
-        // in the shipped seed (`desktop/src-tauri/resources/config.yaml:272`)
-        // and in the operator's own store. Training still builds the full
-        // expert fleet on every run, and this engine then consults NONE of it.
-        // That is either an unshipped capability or hours of training spent for
-        // nothing, and only the operator can say which.
-        //
-        // It is deliberately NOT flipped here. Flipping it is coupled to
-        // #299/#310 (three numerically divergent artifacts — `tide` best_loss
-        // 1 308 811.5, `tide_nf` 51 699 690, `sac` final_alpha 5.69e9 — sit in
-        // `DEFAULT_BOOTSTRAP_EXPERT_NAMES` with no sanity check between "on
-        // disk" and "votes") and to #315 (`expert_weights` is empty, so every
-        // voter would weigh 1.0). Turning the gate on without those two would
-        // put those artifacts into a vote that SCALES REAL POSITION SIZE.
-        // Decide them together or not at all.
+        // Explicit genes-only mode does not load or consult trained models.
+        // Report the resolved policy, not stale claims about old artifact
+        // losses, historical defaults, or which models another job trained.
         tracing::warn!(
             target: "neoethos_app::live_trading",
             %symbol, %base_tf,
-            "models.live_ml_gate is OFF — this engine trades on genes alone and reads NOTHING \
-             from the trained ensemble, which is rebuilt on every training run. Turning it on \
-             is gated on audit #299/#310 (no numerical-sanity check between a trained artifact \
-             and a voting one) and #315 (expert_weights empty ⇒ every expert weighs 1.0)"
+            "models.live_ml_gate is OFF — explicit genes-only execution; trained models are not used for entry decisions"
         );
         None
     };
-    let sym_meta = neoethos_core::symbol_metadata::resolve(&symbol);
-    let quote_ccy = sym_meta.as_ref().map(|m| m.quote.clone());
-    let sizing_tf = base_tf.clone();
-    // Balance + REAL account currency + quote→account FX, all on one blocking hop.
-    let (account_balance, account_ccy, fx_quote_to_account) =
-        tokio::task::spawn_blocking(move || -> Result<(f64, String, Option<f64>)> {
-            let snap = crate::app_services::broker_api::fetch_account_runtime_blocking()?;
-            let runtime_is_live = matches!(
-                snap.environment,
-                crate::app_services::ctrader_live_auth::CTraderEnvironment::Live
-            );
-            anyhow::ensure!(
-                runtime_is_live == gated_env_is_live
-                    && snap.trader.account_id == gated_account_id
-                    && snap.reconcile.account_id == gated_account_id,
-                "account-runtime identity differs from the environment/account admitted at engine start"
-            );
-            let balance = snap.trader.balance;
-            let account_currency = snap.deposit_asset_name;
-            let fx = quote_ccy.as_deref().and_then(|quote| {
-                resolve_quote_to_account_rate(quote, &account_currency, &sizing_tf)
-            });
-            Ok((balance, account_currency, fx))
+    let entry_environment = if gated_env_is_live {
+        CTraderEnvironment::Live
+    } else {
+        CTraderEnvironment::Demo
+    };
+    let startup_symbol = symbol.clone();
+    let startup_entry_context: crate::app_services::broker_api::LiveEntryContext =
+        tokio::task::spawn_blocking(move || {
+            fetch_live_entry_context_blocking(
+                &startup_symbol,
+                entry_environment,
+                gated_account_id,
+                gated_symbol_id,
+            )
         })
         .await
-        .map_err(|error| anyhow::anyhow!("account-runtime task failed: {error}"))??;
+        .context("startup broker entry-context task failed")??;
+    let startup_symbol_contract = startup_entry_context.contract().clone();
+    let sym_meta = Some(startup_entry_context.metadata().clone());
+    let exact_pip_size = startup_entry_context.metadata().pip_size;
+    anyhow::ensure!(
+        live_trading_policy.sealed_evaluation_config()?.pip_value == exact_pip_size,
+        "archived strategy pip size differs from the current account-bound broker symbol"
+    );
+    let account_balance = startup_entry_context.margin().balance;
+    let account_ccy = startup_entry_context.account_currency().to_owned();
+    let trader_money_digits = startup_entry_context.trader_money_digits();
     tracing::info!(
         target: "neoethos_app::live_trading",
-        %symbol,
-        balance = account_balance,
-        account_ccy = %account_ccy,
-        risk_fraction,
-        fx_quote_to_account = ?fx_quote_to_account,
-        "risk-sizing context resolved"
+        %symbol, balance = account_balance, account_ccy = %account_ccy,
+        trader_money_digits, risk_fraction,
+        "account-bound broker sizing contract resolved; price and FX are read afresh per entry"
     );
+    drop(startup_entry_context);
+    let resolved_settings = sizing
+        .as_ref()
+        .context("live settings disappeared after successful startup resolution")?;
+    let expected_environment = if gated_env_is_live { "live" } else { "demo" };
+    let account_identity =
+        AccountRiskIdentity::new(expected_environment, gated_account_id, &account_ccy)?;
+    let account_entry_authority = account_risk_registry
+        .acquire_entry(account_identity.clone(), &resolved_settings.system.data_dir)?;
+    {
+        let entry_state = account_entry_authority
+            .lock()
+            .map_err(|_| anyhow!("account-entry authority lock is poisoned"))?;
+        if let Some(client_order_id) = entry_state.unresolved_client_order_id() {
+            has_unresolved_broker_entry = true;
+            unresolved_entry_client_order_id = Some(client_order_id.to_owned());
+            tracing::error!(target: "neoethos_app::live_trading",
+                client_order_id, account_id = gated_account_id,
+                "restored unresolved entry; new entries blocked until exact broker reconciliation, no automatic retry");
+        }
+    }
 
     // ── Risky Mode kill switch (W3, 2026-08-09) ───────────────────────────────
-    // `RiskyModeManager` is 1,848 lines implementing seven kill-switch tiers, a
+    // `RiskyModeManager` implements the kill-switch tiers, a
     // pre-send sanity ceiling and daily/weekly/monthly loss accumulators. Until
-    // now its ONLY construction in the workspace was inside
-    // `GET /risky/scenarios` (`server/risky.rs:144`), which called
-    // `time_to_target_scenarios()` and threw the manager away — while THIS loop
-    // sized entries at 30–50 % of the live balance through the free function
-    // `stage_risk_fraction_for_bankroll` with nothing behind it. The brakes were
-    // compiled and disconnected.
+    // now its ONLY construction in the workspace was inside the scenarios API.
+    // This live manager carries the artifact-derived half-Kelly fraction and
+    // enforces the same kill switches against the actual broker bankroll.
     //
     // Scope: the manager exists ONLY when `system.trading_mode == "risky"`. The
     // default `prop_firm` path constructs nothing and its behaviour is
     // byte-identical to before this change.
-    //
-    // `autonomous_only_contract_accepted: true` is the manager's construction
-    // gate (`RiskyModeManager::new` bails without it). It is factually correct
-    // here and nothing more: this loop IS the autonomous producer — every order
-    // it sends comes from a gene signal, never from an operator click — and the
-    // flag's only behavioural reader, `rejects_manual_orders()`, is not
-    // consulted from this file. It does NOT clamp the manual `POST /orders`
-    // path, which the operator has ruled respects him.
     //
     // Currency note, stated rather than hidden: the manager's fields are named
     // `*_usd`, but the bankroll fed to it is the broker's balance in the
@@ -1120,26 +1426,24 @@ async fn run(
             starting_capital_usd: risky_start_balance,
             target_capital_usd: risky_target_balance,
             stage_doubling_factor: rm::DEFAULT_DOUBLING_FACTOR,
-            stages: rm::build_logarithmic_stages(
+            stages: rm::build_logarithmic_stages_at_risk(
                 risky_start_balance,
                 risky_target_balance,
                 rm::DEFAULT_DOUBLING_FACTOR,
+                risky_effective_fraction
+                    .context("Risky Mode is missing its OOS sizing fraction")?,
             ),
-            autonomous_only_contract_accepted: true,
-            allow_live_broker: true,
             ..rm::RiskyModeConfig::default()
         };
-        // FAIL CLOSED. If the ladder cannot be validated, the 30–50 % sizing it
-        // authorises must not run either. Before this change the same bad
-        // config silently degraded to `risk.risk_per_trade` with no kill switch
-        // at all; now the engine refuses to start and says why.
+        // FAIL CLOSED. If the evidence-sized ladder cannot be validated, no
+        // Risky order may run without its kill switches.
         let manager = rm::RiskyModeManager::new(cfg, bankroll).with_context(|| {
             format!(
                 "Risky Mode is ON (system.trading_mode = \"risky\") but its kill switch could \
                  not be built from system.risky_start_balance_usd = {risky_start_balance} / \
                  system.risky_target_balance_usd = {risky_target_balance} with a live balance \
-                 of {bankroll}. REFUSING TO START: Risky Mode sizes entries at 30-50% of the \
-                 account and will not run without its daily/stage/monthly loss caps and its \
+                 of {bankroll}. REFUSING TO START: Risky Mode will not run without its \
+                 held-out sizing evidence, daily/weekly/stage/monthly loss caps, and its \
                  pre-send ceiling. Fix those two settings, or set \
                  system.trading_mode = \"prop_firm\""
             )
@@ -1152,19 +1456,19 @@ async fn run(
             stage_idx = stage.stage_idx,
             stage_risk_per_trade = stage.risk_per_trade_fraction,
             stage_daily_loss_cap = stage.daily_loss_cap_fraction,
+            stage_weekly_drawdown_cap = stage.weekly_drawdown_cap_fraction,
             presend_ceiling = manager.config().presend_sanity_ceiling_fraction,
             monthly_loss_cap = manager.config().monthly_loss_cap_fraction,
             high_water_stage_idx = manager.high_water_stage_idx(),
-            "RISKY MODE KILL SWITCH ARMED — every entry is checked before the \
-             order is sent. Tiers that can actually fire: PreSendSanity (this \
-             order's risk >= 55% of bankroll), PerDay (the ACCOUNT's realized \
-             loss this UTC day reached the stage cap), PerStage (the bankroll \
+             "RISKY MODE KILL SWITCH ARMED — every entry is checked before the \
+              order is sent. Tiers that can actually fire: PreSendSanity (this \
+              order's risk >= 55% of bankroll), PerDay (the ACCOUNT's realized \
+              loss this UTC day reached the stage cap), PerWeek (the ACCOUNT's \
+              realized loss this ISO week reached the stage cap), PerStage (the bankroll \
              retreated below the rung under the highest stage reached), \
              PerMonth (inert at the shipped 0.99 cap — the day cap binds \
-             first) and HardwareConnLoss (a broker margin-call or \
-             account-disconnect event, produced by app_services::margin_call \
-             as of 2026-08-09 — a sticky 24 h halt). Manual still has no \
-             producer and is inert; do not count on it."
+             first). Broker margin-call/account-disconnect events start the \
+             same durable 24 h cooldown through app_services::margin_call."
         );
         risky_manager = Some(manager);
     }
@@ -1193,36 +1497,104 @@ async fn run(
         None
     };
 
-    // Session-level circuit breakers (audit S03, 2026-07-13): the config has
-    // always carried `risk.daily_drawdown_limit` / `risk.total_drawdown_limit`
-    // (fractions of balance), but NOTHING enforced them live — the autopilot
-    // had per-trade sizing caps yet could bleed the account all day with no
-    // automatic stop. Enforced below at entry time, on the fresh broker
-    // balance (realized PnL — equity-based tracking is a follow-up). The
-    // breakers only BLOCK NEW ENTRIES; exit management is untouched.
-    // `0.0` disables, matching the other risk caps.
-    let daily_dd_limit = sizing
-        .as_ref()
-        .map(|s| s.risk.daily_drawdown_limit)
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
-    let total_dd_limit = sizing
-        .as_ref()
-        .map(|s| s.risk.total_drawdown_limit)
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
-    let initial_balance_cfg = sizing
-        .as_ref()
-        .map(|s| s.risk.initial_balance)
-        .filter(|b| b.is_finite() && *b > 0.0)
-        .unwrap_or(account_balance);
+    // ── Account-wide prop-firm risk authority ────────────────────────────────
+    // Exactly one authority exists per broker account and is shared by every
+    // portfolio engine through AppApiState. Its checkpoint is durable; a
+    // second engine or app restart cannot reset the day anchor, peak,
+    // circuit-breaker latch, targets, or revenge window. The entry count is
+    // owned separately by `account_entry_authority` for both live modes.
+    let mut prop_firm_authority: Option<SharedAccountRiskAuthority> = None;
+    let mut prop_firm_identity: Option<AccountRiskIdentity> = None;
+    let mut active_prop_firm_period: Option<PropFirmPeriod> = None;
+    if !trading_mode_risky {
+        let settings = resolved_settings;
+        let initial_status = tokio::task::spawn_blocking(
+            crate::app_services::broker_api::fetch_margin_status_blocking,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("initial account-equity task failed: {error}"))??;
+        anyhow::ensure!(
+            initial_status
+                .environment_label
+                .eq_ignore_ascii_case(expected_environment)
+                && initial_status.account_id == gated_account_id,
+            "initial prop-firm equity snapshot belongs to {}/account {}, expected {}/account {}",
+            initial_status.environment_label,
+            initial_status.account_id,
+            expected_environment,
+            gated_account_id
+        );
+        let identity = account_identity.clone();
+        let initial_snapshot = AccountRiskSnapshot {
+            balance: initial_status.balance,
+            equity: initial_status.equity,
+        };
+        let authority = account_risk_registry.acquire(
+            identity.clone(),
+            settings,
+            initial_snapshot,
+            &settings.system.data_dir,
+        )?;
+        let initial_period = prop_firm_period(settings.risk.preset, chrono::Utc::now())?;
+        let summary =
+            prepare_account_risk_period(&authority, &identity, initial_period, initial_snapshot)
+                .await?;
+        tracing::warn!(
+            target: "neoethos_app::live_trading",
+            %symbol,
+            preset = summary.preset.as_str(),
+            challenge_phase = %summary.challenge_phase,
+            challenge_mode = summary.challenge_mode,
+            recovery_mode_enabled = summary.recovery_mode_enabled,
+            reset_zone = initial_period.reset_zone,
+            balance = initial_status.balance,
+            equity = initial_status.equity,
+            day_start_balance = summary.day_start_balance,
+            daily_drawdown_limit = summary.daily_drawdown_limit,
+            total_drawdown_limit = summary.total_drawdown_limit,
+            max_risk_per_trade = summary.max_risk_per_trade,
+            phase_advisory_max_risk_per_trade = summary.phase_advisory_max_risk_per_trade,
+            min_confidence_threshold = summary.min_confidence_threshold,
+            "ACCOUNT-WIDE PROP-FIRM RISK AUTHORITY ARMED — shared by every portfolio and \
+             atomically persisted before order send"
+        );
+        if summary.preset != neoethos_core::domain::prop_firm::PropFirmPreset::Ftmo
+            && summary.preset != neoethos_core::domain::prop_firm::PropFirmPreset::None
+        {
+            tracing::error!(
+                target: "neoethos_app::live_trading",
+                preset = summary.preset.as_str(),
+                reset_zone = initial_period.reset_zone,
+                "this preset has no authoritative reset timezone encoded; its daily boundary \
+                 remains UTC until the firm's current contract is evidenced"
+            );
+        }
+        active_prop_firm_period = Some(initial_period);
+        prop_firm_identity = Some(identity);
+        prop_firm_authority = Some(authority);
+    }
+    let initial_entry_day = active_prop_firm_period
+        .map(|period| period.day_id)
+        .unwrap_or_else(|| utc_day_id(chrono::Utc::now()));
+    let initial_entries = account_entry_authority
+        .lock()
+        .map_err(|_| anyhow!("account-entry authority lock is poisoned at startup"))?
+        .prepare_day(initial_entry_day)?;
+    tracing::warn!(
+        target: "neoethos_app::live_trading",
+        %symbol,
+        accounting_day = initial_entry_day,
+        entries_today = initial_entries,
+        mode = if trading_mode_risky { "risky_utc" } else { "prop_firm_local" },
+        "DURABLE ACCOUNT ENTRY AUTHORITY ARMED — shared by every portfolio and preserved across app restarts"
+    );
     // Account-wide daily entry cap (2026-08-08): `risk.max_trades_per_day`
     // sat in the operator config with NOTHING on the entry path reading it —
     // his engines took 20-47 entries/day each against a configured 8. Armed
     // only by `risk.max_trades_per_day_enabled` (default false ⇒ `None` here
     // ⇒ behaviour unchanged); `max_trades_per_day: 0` disables like the other
-    // caps. The counter is the process-wide `ACCOUNT_DAILY_ENTRIES` static —
-    // per ACCOUNT, shared across every running engine, NOT per engine.
+    // caps. Both modes now use the same durable account authority; only the
+    // caller-proved reset calendar differs (firm-local versus UTC).
     let daily_entry_cap: Option<u32> = sizing
         .as_ref()
         .filter(|s| s.risk.max_trades_per_day_enabled)
@@ -1230,21 +1602,25 @@ async fn run(
         .filter(|&cap| cap > 0)
         .map(|cap| u32::try_from(cap).unwrap_or(u32::MAX));
     if let Some(cap) = daily_entry_cap {
-        tracing::warn!(
-            target: "neoethos_app::live_trading",
-            %symbol, cap,
-            "DAILY ENTRY CAP ARMED (risk.max_trades_per_day_enabled) — at most \
-             this many entries per UTC day on the WHOLE account, shared across \
-             every running engine; counter resets at UTC midnight and on app \
-             restart"
-        );
+        if let Some(period) = active_prop_firm_period {
+            tracing::warn!(
+                target: "neoethos_app::live_trading",
+                %symbol,
+                cap,
+                firm_day = period.day_id,
+                reset_zone = period.reset_zone,
+                "DAILY ENTRY CAP ARMED — durable account-wide count shared by every portfolio; resets only at the firm's verified day boundary"
+            );
+        } else {
+            tracing::warn!(
+                target: "neoethos_app::live_trading",
+                %symbol,
+                cap,
+                utc_day = initial_entry_day,
+                "DAILY ENTRY CAP ARMED — Risky Mode uses the durable account-wide count and resets only at UTC midnight, never on app restart"
+            );
+        }
     }
-    // (UTC date id, balance at first entry-consideration of that day).
-    let mut day_start: Option<(u32, f64)> = None;
-    // Log-once latches so a tripped breaker doesn't flood the log every bar.
-    let mut daily_tripped_on: Option<u32> = None;
-    let mut total_tripped = false;
-
     loop {
         if stop.load(Ordering::Relaxed) {
             tracing::info!(target: "neoethos_app::live_trading", "stop requested");
@@ -1333,17 +1709,17 @@ async fn run(
 
         // ── Fetch base-TF bars (with configurable retry) ─────────────────────
         let max_tries = crate::app_services::env_overrides::ctrader_stream_max_attempts();
-        let mut base_bars_opt = None;
+        let mut base_snapshot_opt = None;
         for attempt in 0..max_tries {
             let sym = symbol.clone();
             let tf = base_tf.clone();
             match tokio::task::spawn_blocking(move || {
-                fetch_recent_chart_bars_blocking(&sym, &tf, warmup)
+                fetch_recent_broker_trendbar_snapshot_blocking(&sym, &tf, warmup)
             })
             .await?
             {
-                Ok(b) => {
-                    base_bars_opt = Some(b);
+                Ok(snapshot) => {
+                    base_snapshot_opt = Some(snapshot);
                     break;
                 }
                 Err(e) => {
@@ -1362,13 +1738,17 @@ async fn run(
                 }
             }
         }
-        let base_bars = match base_bars_opt {
-            Some(b) => b,
+        let base_snapshot = match base_snapshot_opt {
+            Some(snapshot) => snapshot,
             None => continue,
         };
 
         // Check if there really is a new bar
-        let latest_ts = base_bars.last().map(|b| b.timestamp_ms).unwrap_or(0);
+        let latest_ts = base_snapshot
+            .bars()
+            .last()
+            .map(|bar| bar.timestamp_ms)
+            .unwrap_or(0);
         if latest_ts <= last_bar_ts {
             tracing::debug!(
                 target: "neoethos_app::live_trading",
@@ -1379,43 +1759,7 @@ async fn run(
         }
         last_bar_ts = latest_ts;
 
-        // ── Weekend kill zone — PARITY with the backtest ──────────────────────
-        // The backtest force-closes every position on Friday ≥ 20:00 UTC (no
-        // validated strategy ever held through a weekend gap). Mirror it live.
-        if kill_zones_enabled {
-            let (force_close, _) = weekend_kill_zone(latest_ts);
-            if force_close {
-                if let Some((pos_id, vol)) = open_position.take() {
-                    let result = tokio::task::spawn_blocking(move || {
-                        // Same guard as the entry submit: never touch an
-                        // account this engine was not admitted to. The
-                        // expectation is validated by the same
-                        // `broker_credentials.toml` read that routes the close,
-                        // so there is no window between check and send.
-                        close_position_blocking(pos_id, vol, Some(gated_env_is_live))
-                    })
-                    .await?;
-                    match result {
-                        Ok(_) => tracing::info!(
-                            target: "neoethos_app::live_trading",
-                            %symbol, position_id = pos_id,
-                            "weekend kill zone — position force-closed (parity with backtest)"
-                        ),
-                        Err(e) => tracing::warn!(
-                            target: "neoethos_app::live_trading",
-                            error = %e, position_id = pos_id,
-                            "weekend kill zone close failed — will retry next bar"
-                        ),
-                    }
-                    pos_sl_pips = 0.0;
-                    if let Ok(mut s) = status.lock() {
-                        s.open_position_id = None;
-                        s.last_signal = Some("weekend kill zone — flat".to_string());
-                    }
-                }
-            }
-        }
-
+        let mut reconciled_open_position = false;
         // ── Broker reconcile: account THIS engine's closed trades ─────────────
         // Reads the broker's signed closing-deal components for positions we
         // opened — catches SL/TP exits, not just engine-initiated closes. Every
@@ -1464,12 +1808,35 @@ async fn run(
                 }
 
                 let canonical_runtime_environment = if runtime_is_live { "live" } else { "demo" };
+                if let Some(tracked) = open_position.as_mut() {
+                    if let Err(error) = refresh_tracked_position_volume(
+                        tracked,
+                        gated_symbol_id,
+                        runtime.reconcile.positions.iter().map(|position| {
+                            (
+                                position.position_id,
+                                position.symbol_id,
+                                position.volume_raw_centi_units,
+                            )
+                        }),
+                    ) {
+                        tracing::error!(
+                            target: "neoethos_app::live_trading",
+                            %error,
+                            "broker remaining-position identity/volume refused; retaining position ownership"
+                        );
+                        continue;
+                    }
+                }
                 let broker_open_position_ids: HashSet<i64> = runtime
                     .reconcile
                     .positions
                     .iter()
                     .map(|position| position.position_id)
                     .collect();
+                reconciled_open_position = open_position.is_some_and(|(position_id, _)| {
+                    broker_open_position_ids.contains(&position_id)
+                });
 
                 for deal in &runtime.recent_deals {
                     if !opened_ids.contains(&deal.position_id) {
@@ -1641,6 +2008,48 @@ async fn run(
                             "risky-mode kill switch: verified closed-position money recorded"
                         );
                     }
+                    // Feed the account-wide prop-firm authority only after the broker has
+                    // proved the whole position flat and the signed monetary
+                    // components complete. The entry snapshot supplies the
+                    // behavioral fields used by the revenge-pattern gate;
+                    // missing fields are left absent rather than invented.
+                    if let Some(authority) = prop_firm_authority.as_ref() {
+                        let snapshot = pending_experience.get(&position_id);
+                        let trade = neoethos_core::domain::risk::ClosedTrade {
+                            entry_time_sec: snapshot
+                                .map(|experience| (experience.entry_ts_ms.max(0) / 1000) as u64)
+                                .unwrap_or((close_timestamp_ms.max(0) / 1000) as u64),
+                            exit_time_sec: (close_timestamp_ms.max(0) / 1000) as u64,
+                            pnl: net,
+                            size: snapshot
+                                .map(|experience| experience.lots)
+                                .unwrap_or_else(|| closed.actual_filled_lots()),
+                            direction: snapshot.map(|experience| i32::from(experience.direction)),
+                        };
+                        match authority.lock() {
+                            Ok(mut guard) => match guard.record_closed_trade(trade) {
+                                Ok(revenge_window) => tracing::info!(
+                                    target: "neoethos_app::live_trading",
+                                    position_id,
+                                    component_sum_account_currency = net,
+                                    had_entry_snapshot = snapshot.is_some(),
+                                    revenge_window,
+                                    "account-wide prop-firm authority: verified closed trade persisted"
+                                ),
+                                Err(error) => tracing::error!(
+                                    target: "neoethos_app::live_trading",
+                                    position_id,
+                                    error = %error,
+                                    "closed trade reached account risk in memory but its durable checkpoint failed; future entries fail closed while persistence remains unavailable"
+                                ),
+                            },
+                            Err(_) => tracing::error!(
+                                target: "neoethos_app::live_trading",
+                                position_id,
+                                "account-risk authority lock is poisoned; no new prop-firm entry can be authorised"
+                            ),
+                        }
+                    }
                     if net < 0.0 {
                         consecutive_losses += 1;
                     } else {
@@ -1661,7 +2070,15 @@ async fn run(
                     // so trailing doesn't try to amend a dead position.
                     if open_position.map(|(id, _)| id) == Some(position_id) {
                         open_position = None;
-                        pos_sl_pips = 0.0;
+                    }
+                    if opened_ids.is_empty() {
+                        if let Ok(mut s) = status.lock() {
+                            s.open_position_id = None;
+                            s.clear_position_telemetry(live_trading_policy.trailing_enabled);
+                            s.last_exit_reason = Some(
+                                "broker_reported_close_unclassified_sl_tp_or_manual".to_string(),
+                            );
+                        }
                     }
                     tracing::info!(
                         target: "neoethos_app::live_trading",
@@ -1687,12 +2104,18 @@ async fn run(
 
                 // Either criterion retires: a losing STREAK, or a FULL window
                 // whose win rate sits under the profitability floor.
-                let mut cull_reason: Option<String> = None;
-                if cull_threshold > 0 && consecutive_losses >= cull_threshold {
+                let mut cull_reason = pending_retirement_reason.clone();
+                if cull_reason.is_none()
+                    && cull_threshold > 0
+                    && consecutive_losses >= cull_threshold
+                {
                     cull_reason = Some(format!(
                         "{consecutive_losses} consecutive losing trades (demo/live auto-cull)"
                     ));
-                } else if cull_min_wr > 0.0 && recent_results.len() >= cull_window {
+                } else if cull_reason.is_none()
+                    && cull_min_wr > 0.0
+                    && recent_results.len() >= cull_window
+                {
                     if let Some(wr) = window_wr_pct {
                         if wr < cull_min_wr {
                             cull_reason = Some(format!(
@@ -1703,12 +2126,58 @@ async fn run(
                     }
                 }
                 if let Some(reason) = cull_reason {
+                    // Retirement is an exit-only decision, not a temporary
+                    // rolling statistic. A profitable final close must not
+                    // reset the loss streak and silently resume entries.
+                    pending_retirement_reason = Some(reason.clone());
                     tracing::warn!(
                         target: "neoethos_app::live_trading",
                         %symbol, portfolio_path = %portfolio_path,
                         %reason, net_pnl = net_pnl_running,
                         "AUTO-CULL: retiring strategy (blacklist)"
                     );
+                    // A close response, including a partial fill, does not
+                    // prove the position is flat. Keep the exit-only loop
+                    // alive until the broker/close-money reconciliation above
+                    // clears ownership, then finalise retirement.
+                    if let Some((pos_id, vol)) = open_position {
+                        let close_report = if reconciled_open_position {
+                            let close_attempt = tokio::task::spawn_blocking(move || {
+                                close_position_blocking(
+                                    pos_id,
+                                    vol,
+                                    Some(gated_env_is_live),
+                                    Some(gated_account_id),
+                                )
+                            })
+                            .await;
+                            match close_attempt {
+                                Ok(Ok(outcome)) => format!(
+                                    "broker returned {:?}; awaiting complete-close reconciliation",
+                                    outcome.status
+                                ),
+                                Ok(Err(error)) => format!("close failed: {error}"),
+                                Err(error) => format!("close task failed: {error}"),
+                            }
+                        } else {
+                            "broker position absent; awaiting verified closing-fill accounting"
+                                .to_string()
+                        };
+                        tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            %symbol, position_id = pos_id, %close_report,
+                            "AUTO-CULL RETIREMENT PENDING — position remains tracked until broker reconciliation proves it flat"
+                        );
+                        if let Ok(mut s) = status.lock() {
+                            s.retired = true;
+                            s.running = true;
+                            s.open_position_id = Some(pos_id);
+                            s.last_signal = Some(format!(
+                                "retirement pending for position {pos_id}: {close_report}; still supervised"
+                            ));
+                        }
+                        continue;
+                    }
                     if let Some(fp) =
                         crate::app_services::strategy_blacklist::fingerprint_file(&portfolio_path)
                     {
@@ -1724,17 +2193,12 @@ async fn run(
                             },
                         );
                     }
-                    // Flatten any position we still hold before retiring.
-                    if let Some((pos_id, vol)) = open_position.take() {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            close_position_blocking(pos_id, vol, Some(gated_env_is_live))
-                        })
-                        .await;
-                    }
                     if let Ok(mut s) = status.lock() {
                         s.retired = true;
                         s.running = false;
                         s.open_position_id = None;
+                        s.clear_position_telemetry(live_trading_policy.trailing_enabled);
+                        s.last_exit_reason = Some("auto_cull_retirement".to_string());
                     }
                     // Close the loop: the retirement left a coverage gap on this
                     // (symbol, base_tf) — queue a fresh Discovery to refill it.
@@ -1753,10 +2217,94 @@ async fn run(
             }
         }
 
-        // ── Build multi-TF SymbolDataset ──────────────────────────────────────
-        let mut frames: HashMap<String, Ohlcv> = HashMap::new();
-        let base_ohlcv = bars_to_ohlcv(&base_bars);
-        frames.insert(base_tf.clone(), base_ohlcv.clone());
+        // Reconcile account identity and exact remaining volume BEFORE sending
+        // a weekend close. A successful response still cannot replace the next
+        // broker/close-money reconciliation's proof of complete closure.
+        if kill_zones_enabled && reconciled_open_position && weekend_kill_zone(latest_ts).0 {
+            if let Some((pos_id, vol)) = open_position {
+                let result = tokio::task::spawn_blocking(move || {
+                    close_position_blocking(
+                        pos_id,
+                        vol,
+                        Some(gated_env_is_live),
+                        Some(gated_account_id),
+                    )
+                })
+                .await;
+                let close_report = match result {
+                    Ok(Ok(outcome)) => format!(
+                        "broker returned {:?}; awaiting verified complete-close reconciliation",
+                        outcome.status
+                    ),
+                    Ok(Err(error)) => format!("close failed: {error}"),
+                    Err(error) => format!("close task failed: {error}"),
+                };
+                tracing::info!(
+                    target: "neoethos_app::live_trading",
+                    %symbol, position_id = pos_id, %close_report,
+                    "weekend close remains supervised until broker reconciliation proves it flat"
+                );
+                if let Ok(mut s) = status.lock() {
+                    s.open_position_id = Some(pos_id);
+                    s.last_signal = Some(format!("weekend close: {close_report}"));
+                }
+                // Do not amend protection or enter again using a snapshot
+                // taken before this close request.
+                continue;
+            }
+        }
+
+        // Keep a plain base frame for exit geometry and broker order pricing.
+        // Feature construction below uses only the canonical snapshot reopened
+        // from the exact broker-bound Vortex publications.
+        let base_ohlcv = bars_to_ohlcv(base_snapshot.bars());
+        let bar_high = base_ohlcv.high.last().copied().unwrap_or(pos_entry_px);
+        let bar_low = base_ohlcv.low.last().copied().unwrap_or(pos_entry_px);
+
+        // Observe maximum favourable excursion even when the validated policy
+        // deliberately has trailing disabled. This is supervision evidence: it
+        // makes a large unrealised win that later closes at SL visible instead
+        // of disappearing from the engine state.
+        if open_position.is_some() && pos_entry_px > 0.0 && pos_sl_pips > 0.0 {
+            if pos_is_long {
+                pos_extreme = pos_extreme.max(bar_high);
+            } else {
+                pos_extreme = if pos_extreme > 0.0 {
+                    pos_extreme.min(bar_low)
+                } else {
+                    bar_low
+                };
+            }
+            let favorable_move_r = favorable_excursion_r(
+                pos_entry_px,
+                pos_extreme,
+                pos_sl_pips,
+                exact_pip_size,
+                pos_is_long,
+            );
+            let protection_state = match exit_policy {
+                Some(policy) if !policy.trailing_enabled => "disabled_by_search",
+                Some(policy)
+                    if favorable_move_r
+                        .is_some_and(|move_r| move_r >= policy.trailing_be_trigger_r) =>
+                {
+                    if pos_trail_px > 0.0 {
+                        "broker_confirmed"
+                    } else {
+                        "trigger_reached_pending_broker"
+                    }
+                }
+                Some(_) => "armed_waiting_trigger",
+                None => "missing_policy",
+            };
+            if let Ok(mut s) = status.lock() {
+                s.position_entry_price = Some(pos_entry_px);
+                s.initial_stop_pips = Some(pos_sl_pips);
+                s.favorable_extreme_price = Some(pos_extreme);
+                s.favorable_move_r = favorable_move_r;
+                s.protection_state = Some(protection_state.to_string());
+            }
+        }
 
         // ── Trailing stop — PARITY with the discovery backtest ────────────────
         //
@@ -1772,8 +2320,9 @@ async fn run(
         // `settings.trailing_enabled` / `trailing_be_trigger_r` /
         // `trailing_atr_multiplier` / `trailing_min_lock_pips`
         // (`neoethos-search/src/eval.rs:1045-1058`, `:1078-1090`), fed from
-        // `models.exit_policy` via `strategy_gene.rs:867`, and the shipped
-        // default is now `trailing_enabled: false`. So "ALWAYS ON" is wrong,
+        // `models.exit_policy` via `strategy_gene.rs:867`, and the exact
+        // resolved values now travel inside the live-portfolio artifact. So
+        // "ALWAYS ON" is wrong,
         // "+1R" and "1×SL" are configured rather than fixed, and the last
         // sentence has its sign backwards for the shipped policy: with the
         // policy OFF, the trades the backtest scores at the take-profit were
@@ -1788,16 +2337,11 @@ async fn run(
         // monotonically and the trail distance is constant, so
         // `max_i(hi_i) - d == max_i(hi_i - d)`.
         //
-        // When the policy is OFF — or unresolvable — NOTHING here runs and no
-        // stop is moved.
+        // When the sealed policy is OFF, NOTHING here runs and no stop is moved.
         let trailing = exit_policy.filter(|p| p.trailing_enabled);
         if let (Some(policy), Some((pos_id, _))) = (trailing, open_position) {
             if pos_sl_pips > 0.0 && pos_entry_px > 0.0 {
-                let pip = sym_meta
-                    .as_ref()
-                    .map(|m| m.pip_size)
-                    .filter(|p| p.is_finite() && *p > 0.0)
-                    .unwrap_or(0.0001);
+                let pip = exact_pip_size;
                 // Guard the three configured numbers the same way the rest of
                 // this loop guards config: a corrupt field must not silently
                 // become "trail at zero distance", which would close every
@@ -1818,17 +2362,13 @@ async fn run(
                         be_trigger_r = trigger_r,
                         stop_multiplier = stop_mult,
                         min_lock_pips = lock_pips,
-                        "models.exit_policy has trailing ENABLED but its geometry \
-                         is unusable — REFUSING TO MOVE THE STOP this bar. Fix \
-                         trailing_be_trigger_r / trailing_stop_multiplier / \
-                         trailing_min_lock_pips"
+                        "sealed live-portfolio policy has trailing ENABLED but its geometry \
+                         is unusable — REFUSING TO MOVE THE STOP this bar"
                     );
                 } else {
                     let r_dist = pos_sl_pips * pip; // 1R in price units
                     let trigger_dist = trigger_r * r_dist;
                     let trail_dist = stop_mult * r_dist;
-                    let hi = base_ohlcv.high.last().copied().unwrap_or(pos_entry_px);
-                    let lo = base_ohlcv.low.last().copied().unwrap_or(pos_entry_px);
                     let mut new_trail: Option<f64> = None;
                     // Same floor the backtest applies (`eval.rs:1052`): once the
                     // trail engages it never sits closer to entry than the locked
@@ -1836,24 +2376,16 @@ async fn run(
                     // than the strategy was scored on.
                     let locked = lock_pips * pip;
                     if pos_is_long {
-                        pos_extreme = pos_extreme.max(hi);
                         if pos_extreme - pos_entry_px >= trigger_dist {
                             let candidate = (pos_extreme - trail_dist).max(pos_entry_px + locked);
                             if pos_trail_px == 0.0 || candidate > pos_trail_px {
-                                pos_trail_px = candidate;
                                 new_trail = Some(candidate);
                             }
                         }
                     } else {
-                        pos_extreme = if pos_extreme > 0.0 {
-                            pos_extreme.min(lo)
-                        } else {
-                            lo
-                        };
                         if pos_entry_px - pos_extreme >= trigger_dist {
                             let candidate = (pos_extreme + trail_dist).min(pos_entry_px - locked);
                             if pos_trail_px == 0.0 || candidate < pos_trail_px {
-                                pos_trail_px = candidate;
                                 new_trail = Some(candidate);
                             }
                         }
@@ -1879,12 +2411,13 @@ async fn run(
                         // the other environment; no request leaves the process.
                         let expected_env = gated_env_is_live;
                         let amend = tokio::task::spawn_blocking(move || {
-                            amend_position_sltp_expecting(
+                            amend_position_sltp_expecting_account(
                                 pos_id,
                                 Some(sl_price),
                                 None,
                                 None,
                                 Some(expected_env),
+                                Some(gated_account_id),
                             )
                         })
                         .await;
@@ -1895,8 +2428,34 @@ async fn run(
                         // "advanced" line below so the log cannot claim a move
                         // that never happened.
                         let advanced = match amend {
-                            Ok(Ok(_)) => true,
+                            Ok(Ok(outcome)) => match commit_broker_confirmed_trail(
+                                &mut pos_trail_px,
+                                sl_price,
+                                pos_id,
+                                &outcome,
+                            ) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    if let Ok(mut s) = status.lock() {
+                                        s.protection_state =
+                                            Some("trigger_reached_pending_broker".to_string());
+                                        s.last_protection_error = Some(error.to_string());
+                                    }
+                                    tracing::error!(
+                                        target: "neoethos_app::live_trading",
+                                        position_id = pos_id, intended_sl = sl_price,
+                                        %error,
+                                        "TRAILING STOP NOT CONFIRMED — local ratchet remains at the last broker-confirmed level and this stop remains retryable"
+                                    );
+                                    false
+                                }
+                            },
                             Ok(Err(error)) => {
+                                if let Ok(mut s) = status.lock() {
+                                    s.protection_state =
+                                        Some("trigger_reached_pending_broker".to_string());
+                                    s.last_protection_error = Some(error.to_string());
+                                }
                                 tracing::error!(
                                     target: "neoethos_app::live_trading",
                                     position_id = pos_id, intended_sl = sl_price,
@@ -1906,6 +2465,11 @@ async fn run(
                                 false
                             }
                             Err(join) => {
+                                if let Ok(mut s) = status.lock() {
+                                    s.protection_state =
+                                        Some("trigger_reached_pending_broker".to_string());
+                                    s.last_protection_error = Some(join.to_string());
+                                }
                                 tracing::error!(
                                     target: "neoethos_app::live_trading",
                                     position_id = pos_id, intended_sl = sl_price,
@@ -1916,13 +2480,18 @@ async fn run(
                             }
                         };
                         if advanced {
+                            if let Ok(mut s) = status.lock() {
+                                s.protection_state = Some("broker_confirmed".to_string());
+                                s.confirmed_stop_price = Some(pos_trail_px);
+                                s.last_protection_error = None;
+                            }
                             tracing::info!(
                                 target: "neoethos_app::live_trading",
                                 position_id = pos_id, new_sl = sl_price, extreme = pos_extreme,
                                 be_trigger_r = trigger_r,
                                 stop_multiplier = stop_mult,
                                 min_lock_pips = lock_pips,
-                                "trailing stop advanced (models.exit_policy geometry)"
+                                "trailing stop advanced (sealed discovery geometry)"
                             );
                         }
                     }
@@ -1930,44 +2499,49 @@ async fn run(
             }
         }
 
+        let mut direct_snapshots = vec![base_snapshot];
+        let mut complete_direct_series = true;
         for htf in &higher_tfs {
             let sym = symbol.clone();
             let tf = htf.clone();
             match tokio::task::spawn_blocking(move || {
-                fetch_recent_chart_bars_blocking(&sym, &tf, warmup)
+                fetch_recent_broker_trendbar_snapshot_blocking(&sym, &tf, warmup)
             })
             .await?
             {
-                Ok(htf_bars) => {
-                    frames.insert(htf.clone(), bars_to_ohlcv(&htf_bars));
-                }
+                Ok(snapshot) => direct_snapshots.push(snapshot),
                 Err(e) => {
                     tracing::warn!(
                         target: "neoethos_app::live_trading",
                         tf = %htf, error = %e,
-                        "failed to fetch higher-TF bars, continuing with partial dataset"
+                        "failed to fetch required higher-TF bars; rejecting the complete live bar"
                     );
+                    complete_direct_series = false;
+                    break;
                 }
             }
         }
+        if !complete_direct_series {
+            continue;
+        }
 
-        let dataset = SymbolDataset {
-            symbol: symbol.clone(),
-            frames,
-            // Recent broker chart bars are not immutable canonical artifacts.
-            // Keep the authority map empty so strict feature construction
-            // refuses them until the live-capture boundary publishes and pins
-            // an exact generation; never fabricate a historical receipt.
-            source_artifacts: HashMap::new(),
+        let canonical_snapshot = match crate::app_services::live_feature_snapshot::LiveCanonicalFeatureSnapshot::publish_for_artifact(
+            &artifact,
+            direct_snapshots,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!(
+                    target: "neoethos_app::live_trading",
+                    error = %e,
+                    "canonical live broker publication failed; rejecting the complete live bar"
+                );
+                continue;
+            }
         };
 
         // ── Feature computation ───────────────────────────────────────────────
-        let higher_refs: Vec<&str> = higher_tfs.iter().map(|s| s.as_str()).collect();
-        let raw_features = match neoethos_data::prepare_multitimeframe_features(
-            &dataset,
-            &base_tf,
-            &higher_refs,
-        ) {
+        let live_features = match artifact.prepare_live_features(canonical_snapshot.dataset()) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(
@@ -1979,18 +2553,17 @@ async fn run(
             }
         };
 
-        let aligned =
-            match neoethos_search::project_features_to_effective(&raw_features, &effective_names) {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "neoethos_app::live_trading",
-                        error = %e,
-                        "feature projection failed (effective_names mismatch?), skipping bar"
-                    );
-                    continue;
-                }
-            };
+        let aligned = match artifact.project_live_features(&live_features) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    target: "neoethos_app::live_trading",
+                    error = %e,
+                    "artifact-bound live feature projection/normalization failed, skipping bar"
+                );
+                continue;
+            }
+        };
 
         if aligned.n_samples() == 0 {
             tracing::warn!(
@@ -2001,26 +2574,34 @@ async fn run(
         }
 
         // ── Gene signal + the strategy's OWN brackets (last bar) ──────────────
-        // Pass the symbol pip size so adaptive-stop genes scale their bracket by
-        // live volatility exactly like the discovery backtest (parity).
-        let bracket_pip_size = sym_meta
-            .as_ref()
-            .map(|m| m.pip_size)
-            .filter(|p| p.is_finite() && *p > 0.0)
-            .unwrap_or(0.0001);
-        let (directions, sl_arr, tp_arr) = neoethos_trader::combine_gene_signals_with_brackets(
+        // Replay the saved SMC/confidence/adaptive recipe, not ambient defaults.
+        let netted = neoethos_trader::combine_gene_signals_with_archived_policy(
             &genes,
             &aligned,
             &base_ohlcv,
-            bracket_pip_size,
+            &live_trading_policy,
         )
         .with_context(|| format!("synthesize live gene signals for {symbol} {base_tf}"))?;
-        let direction = directions.last().copied().unwrap_or(Direction::Flat);
+        // Keep the exact source snapshot alive for model input, but retain no
+        // whole Search cube while preparing a separately fitted model cube.
+        let direction = netted.directions.last().copied().unwrap_or(Direction::Flat);
+        let gene_confidence = netted.confidences.last().copied().unwrap_or(0.0);
         // Gene-derived SL/TP (pips) for THIS bar: we place the STRATEGY'S own
         // brackets, never an imposed stop. 0.0 ⇒ a signal-exit-only strategy, so
         // the live order stays bracket-free (exactly what the backtest does).
-        let gene_sl = sl_arr.last().copied().unwrap_or(0.0);
-        let gene_tp = tp_arr.last().copied().unwrap_or(0.0);
+        let gene_sl = netted.sl_pips.last().copied().unwrap_or(0.0);
+        let gene_tp = netted.tp_pips.last().copied().unwrap_or(0.0);
+        let experience_feature_row = if direction != Direction::Flat {
+            Some(
+                aligned
+                    .dense_window(aligned.n_samples() - 1, aligned.n_samples())
+                    .map(|window| window.values.row(0).iter().copied().collect::<Vec<f64>>()),
+            )
+        } else {
+            None
+        };
+        drop(aligned);
+        drop(live_features);
 
         bars_evaluated += 1;
         let signal_label = format!("{direction:?}");
@@ -2037,7 +2618,9 @@ async fn run(
         if let Ok(mut s) = status.lock() {
             s.last_signal = Some(signal_label);
             s.bars_evaluated = bars_evaluated;
-            s.open_position_id = open_position.map(|(id, _)| id);
+            s.open_position_id = open_position
+                .map(|(id, _)| id)
+                .or_else(|| opened_ids.iter().copied().next());
         }
 
         // ── Execution ─────────────────────────────────────────────────────────
@@ -2054,6 +2637,13 @@ async fn run(
             Direction::Long | Direction::Short => {
                 if open_position.is_some() || !opened_ids.is_empty() || has_unresolved_broker_entry
                 {
+                    if let Some(intent) = unresolved_entry_client_order_id.as_deref() {
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal = Some(format!(
+                                "blocked: unresolved broker entry {intent}; reconciliation required"
+                            ));
+                        }
+                    }
                     // Hold to bracket — the trailing block above keeps the
                     // broker-side stop in sync WHEN the exit policy arms it
                     // (otherwise the original SL/TP stands); nothing to
@@ -2103,44 +2693,51 @@ async fn run(
                     }
                 }
 
-                // Live spread gate: the validated edge budgeted
-                // `backtest_spread_pips` per round trip. If the CURRENT spread
-                // is blown out (rollover, thin book, news aftermath), entering
-                // pays costs the backtest never charged — skip the bar. Uses
-                // the live tick cache; a stale/missing tick fails OPEN (never
-                // blocks on our own data gap).
-                {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    let tick = crate::app_services::live_spots::snapshot_all()
-                        .into_iter()
-                        .find(|t| t.symbol_name.eq_ignore_ascii_case(&symbol));
-                    if let Some(t) = tick {
-                        if now_ms - t.received_at_unix_ms <= 120_000 {
-                            if let (Some(bid), Some(ask)) = (t.bid, t.ask) {
-                                let pip = sym_meta
-                                    .as_ref()
-                                    .map(|m| m.pip_size)
-                                    .filter(|p| p.is_finite() && *p > 0.0)
-                                    .unwrap_or(0.0001);
-                                let spread_pips = (ask - bid) / pip;
-                                let limit = backtest_spread_pips * 2.5;
-                                if spread_pips.is_finite() && spread_pips > limit {
-                                    tracing::warn!(
-                                        target: "neoethos_app::live_trading",
-                                        %symbol, spread_pips, limit,
-                                        "entry blocked — live spread far above the backtest's \
-                                         cost assumption (skipping this bar)"
-                                    );
-                                    if let Ok(mut s) = status.lock() {
-                                        s.last_signal = Some(format!(
-                                            "blocked: spread {spread_pips:.1} pips > {limit:.1}"
-                                        ));
-                                    }
-                                    continue;
-                                }
-                            }
+                // Capture one connection for this entry decision. Both sides must
+                // be causal and fresh for the pinned account/environment/symbol.
+                // A reconnect invalidates this decision, not silently refreshes it.
+                let quote_environment = if gated_env_is_live {
+                    CTraderEnvironment::Live
+                } else {
+                    CTraderEnvironment::Demo
+                };
+                let entry_quote_session = match live_spots::current_session(
+                    gated_account_id,
+                    quote_environment,
+                ) {
+                    Some(session) => session,
+                    None => {
+                        tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            reason = ?SpotQuoteRefusal::NoActiveSession,
+                            "entry blocked — no current quote session for the pinned account/environment"
+                        );
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal = Some("blocked: quote NoActiveSession".to_string());
                         }
+                        continue;
                     }
+                };
+                let quote_now_ms = chrono::Utc::now().timestamp_millis();
+                if let Err(reason) = require_live_entry_spread(
+                    gated_account_id,
+                    quote_environment,
+                    entry_quote_session,
+                    gated_symbol_id,
+                    exact_pip_size,
+                    live_trading_policy.expected_spread_pips_at(quote_now_ms),
+                    quote_now_ms,
+                ) {
+                    tracing::warn!(
+                        target: "neoethos_app::live_trading",
+                        %symbol, ?reason,
+                        "entry blocked — current quote or spread check refused"
+                    );
+                    if let Ok(mut s) = status.lock() {
+                        s.last_signal = Some(format!("blocked: quote/spread {reason:?}"));
+                    }
+                    continue;
                 }
 
                 // Open new position
@@ -2149,82 +2746,221 @@ async fn run(
                 } else {
                     OrderSide::Sell
                 };
-                // Fresh account state at ENTRY time: (a) the balance compounds —
-                // risky mode must size off what the account is NOW, not at engine
-                // start; (b) the broker's live open-position count feeds the
-                // portfolio-level risk budget. Fail-soft to start-time values.
-                let (entry_balance, open_positions_now) = match tokio::task::spawn_blocking(
-                    crate::app_services::broker_api::fetch_account_runtime_blocking,
-                )
-                .await
-                {
-                    Ok(Ok(rt)) => (rt.trader.balance, Some(rt.reconcile.positions.len())),
-                    _ => (account_balance, None),
-                };
+                let now_utc = chrono::Utc::now();
+                let today = utc_day_id(now_utc);
 
-                // ── Session circuit breakers (audit S03) — NEW ENTRIES only ──
-                // Total-drawdown halt: balance at/below
-                // initial_balance × (1 − total_drawdown_limit) stops every
-                // further entry until restart (a blown account must not keep
-                // trading itself deeper). Daily-loss stop: losing more than
-                // daily_drawdown_limit of the day's starting balance blocks
-                // entries until the next UTC day.
-                let today: u32 = {
-                    use chrono::Datelike;
-                    let d = chrono::Utc::now().date_naive();
-                    (d.year().max(0) as u32) * 10_000 + d.month() * 100 + d.day()
-                };
-                match day_start {
-                    Some((d, _)) if d == today => {}
-                    _ => day_start = Some((today, entry_balance)),
-                }
-                if total_dd_limit > 0.0 {
-                    let floor = initial_balance_cfg * (1.0 - total_dd_limit);
-                    if entry_balance <= floor {
-                        if !total_tripped {
-                            total_tripped = true;
+                // Fresh account state at ENTRY time. Both modes MUST use
+                // broker-measured equity, including unrealised P/L; a missing or
+                // foreign snapshot refuses this bar without latching the breaker.
+                // No stale startup balance or missing-position-count fallback.
+                let (entry_balance, entry_equity, open_positions_now, entry_context) = {
+                    let context_symbol = symbol.clone();
+                    let context = match tokio::task::spawn_blocking(move || {
+                        fetch_live_entry_context_blocking(
+                            &context_symbol,
+                            entry_environment,
+                            gated_account_id,
+                            gated_symbol_id,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(context)) => context,
+                        Ok(Err(error)) => {
                             tracing::error!(
                                 target: "neoethos_app::live_trading",
-                                %symbol, balance = entry_balance,
-                                initial_balance = initial_balance_cfg,
-                                limit = total_dd_limit,
-                                "CIRCUIT BREAKER: total drawdown limit hit — ALL new \
-                                 entries halted (exit management continues). Restart \
-                                 the engine after reviewing the account."
+                                %symbol,
+                                rule = "risk.account_snapshot_unresolvable",
+                                error = %error,
+                                "entry refused — broker equity snapshot unavailable; next bar retries"
                             );
+                            if let Ok(mut s) = status.lock() {
+                                s.last_signal =
+                                    Some("blocked: broker equity unavailable".to_string());
+                            }
+                            continue;
                         }
-                        if let Ok(mut s) = status.lock() {
-                            s.last_signal = Some("HALTED: total drawdown limit hit".to_string());
-                        }
-                        continue;
-                    }
-                }
-                if daily_dd_limit > 0.0
-                    && let Some((d, start_bal)) = day_start
-                    && d == today
-                    && start_bal > 0.0
-                {
-                    let floor = start_bal * (1.0 - daily_dd_limit);
-                    if entry_balance <= floor {
-                        if daily_tripped_on != Some(today) {
-                            daily_tripped_on = Some(today);
-                            tracing::warn!(
+                        Err(error) => {
+                            tracing::error!(
                                 target: "neoethos_app::live_trading",
-                                %symbol, balance = entry_balance,
-                                day_start_balance = start_bal,
-                                limit = daily_dd_limit,
-                                "CIRCUIT BREAKER: daily loss limit hit — new entries \
-                                 blocked until the next UTC day (exits continue)"
+                                %symbol,
+                                rule = "risk.account_snapshot_task",
+                                error = %error,
+                                "entry refused — broker equity task failed; next bar retries"
                             );
+                            if let Ok(mut s) = status.lock() {
+                                s.last_signal =
+                                    Some("blocked: broker equity task failed".to_string());
+                            }
+                            continue;
                         }
+                    };
+                    let snapshot = context.margin();
+                    let expected_environment = if gated_env_is_live { "live" } else { "demo" };
+                    if context.account_currency() != account_ccy
+                        || context.contract() != &startup_symbol_contract
+                        || validate_entry_account_values(
+                            snapshot.environment_label,
+                            snapshot.account_id,
+                            snapshot.balance,
+                            snapshot.equity,
+                            expected_environment,
+                            gated_account_id,
+                        )
+                        .is_err()
+                    {
+                        tracing::error!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            rule = "risk.account_snapshot_identity",
+                            snapshot_environment = snapshot.environment_label,
+                            snapshot_account_id = snapshot.account_id,
+                            expected_environment,
+                            expected_account_id = gated_account_id,
+                            balance = snapshot.balance,
+                            equity = snapshot.equity,
+                            "entry refused — broker equity snapshot identity/value is not authoritative"
+                        );
                         if let Ok(mut s) = status.lock() {
-                            s.last_signal = Some(
-                                "blocked: daily loss limit (resumes next UTC day)".to_string(),
-                            );
+                            s.last_signal =
+                                Some("blocked: broker equity identity mismatch".to_string());
                         }
                         continue;
                     }
+                    (
+                        snapshot.balance,
+                        snapshot.equity,
+                        snapshot.open_position_count,
+                        context,
+                    )
+                };
+
+                if let Some(authority) = prop_firm_authority.as_ref() {
+                    let Some(identity) = prop_firm_identity.as_ref() else {
+                        tracing::error!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            rule = "risk.account_authority_identity",
+                            "entry refused — the account-risk authority has no broker identity"
+                        );
+                        continue;
+                    };
+                    let Some(settings) = sizing.as_ref() else {
+                        tracing::error!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            rule = "risk.account_authority_settings",
+                            "entry refused — the account-risk authority has no resolved settings"
+                        );
+                        continue;
+                    };
+                    let current_period = match prop_firm_period(settings.risk.preset, now_utc) {
+                        Ok(period) => period,
+                        Err(error) => {
+                            tracing::error!(
+                                target: "neoethos_app::live_trading",
+                                %symbol,
+                                rule = "risk.firm_period",
+                                error = %error,
+                                "entry refused — firm-local risk period could not be resolved"
+                            );
+                            continue;
+                        }
+                    };
+                    let period_changed = active_prop_firm_period != Some(current_period);
+                    let snapshot = AccountRiskSnapshot {
+                        balance: entry_balance,
+                        equity: entry_equity,
+                    };
+                    match prepare_account_risk_period(authority, identity, current_period, snapshot)
+                        .await
+                    {
+                        Ok(summary) => {
+                            active_prop_firm_period = Some(current_period);
+                            if period_changed {
+                                tracing::warn!(
+                                    target: "neoethos_app::live_trading",
+                                    %symbol,
+                                    firm_day = current_period.day_id,
+                                    firm_month = current_period.month_id,
+                                    reset_zone = current_period.reset_zone,
+                                    day_start_balance = summary.day_start_balance,
+                                    "account-wide prop-firm authority rolled to a broker-evidenced period"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                target: "neoethos_app::live_trading",
+                                %symbol,
+                                rule = "risk.daily_anchor",
+                                error = %error,
+                                firm_day = current_period.day_id,
+                                reset_zone = current_period.reset_zone,
+                                "entry refused — durable account-risk state could not be refreshed; exits and trailing continue"
+                            );
+                            if let Ok(mut s) = status.lock() {
+                                s.last_signal = Some(format!(
+                                    "REFUSED: account-risk anchor/state unavailable for {}",
+                                    current_period.day_id
+                                ));
+                            }
+                            continue;
+                        }
+                    }
                 }
+                let entry_day_id = if trading_mode_risky {
+                    today
+                } else if let Some(period) = active_prop_firm_period {
+                    period.day_id
+                } else {
+                    tracing::error!(
+                        target: "neoethos_app::live_trading",
+                        %symbol,
+                        rule = "risk.daily_entry_period_unprepared",
+                        "entry refused — prop-firm mode has no active firm-local entry day"
+                    );
+                    continue;
+                };
+                match account_entry_authority.lock() {
+                    Ok(mut guard) => {
+                        let previous_day = guard.day_id();
+                        match guard.prepare_day(entry_day_id) {
+                            Ok(count) => {
+                                if previous_day != Some(entry_day_id) {
+                                    tracing::warn!(
+                                        target: "neoethos_app::live_trading",
+                                        %symbol,
+                                        previous_accounting_day = ?previous_day,
+                                        accounting_day = entry_day_id,
+                                        entries_today = count,
+                                        "durable account entry authority rolled to the caller-proved day"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    target: "neoethos_app::live_trading",
+                                    %symbol,
+                                    rule = "risk.state_persistence",
+                                    accounting_day = entry_day_id,
+                                    error = %error,
+                                    "entry refused — daily entry state could not be durably prepared"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            rule = "risk.account_entry_authority_lock",
+                            "entry refused — account-entry authority lock is poisoned"
+                        );
+                        continue;
+                    }
+                };
                 // ── Risky Mode kill switch: period rollover + persisted halt ──
                 // (W3, 2026-08-09). Two things happen here, both before a slot
                 // is reserved so a refusal costs nothing.
@@ -2238,7 +2974,7 @@ async fn run(
                 //    `last_killed_at_utc_ms` timestamp does not. This is what
                 //    makes a tripped kill switch mean "stop for 24 h" instead
                 //    of "stop until someone restarts the app", and it is the
-                //    clock `bridge.rs:240 auto_re_arm_if_ready` clears and the
+                //    clock `bridge.rs` clears after the cooldown expires and the
                 //    Risk screen renders.
                 if let Some(m) = risky_manager.as_mut() {
                     use chrono::Datelike;
@@ -2275,16 +3011,16 @@ async fn run(
                         rule = "risky_mode.kill_switch_cooldown",
                         cooldown_remaining_secs = remaining,
                         cooldown_remaining_hours = remaining / 3600,
-                        "entry refused — the Risky Mode kill switch is TRIPPED. A \
-                         previous entry hit a per-day / per-stage / per-month loss \
+                         "entry refused — the Risky Mode kill switch is TRIPPED. A \
+                          previous entry hit a per-day / per-week / per-stage / per-month loss \
                          tier and started the 24h halt. No Risky-Mode entry will be \
-                         sent until it elapses (the bridge auto re-arms; the Risk \
+                         sent until it elapses (the bridge clears the expired halt; the Risk \
                          screen shows the remaining time). Exits and trailing \
                          continue normally."
                     );
                     if let Ok(mut s) = status.lock() {
                         s.last_signal = Some(format!(
-                            "HALTED: risky-mode kill switch, auto re-arm in {}h {}m",
+                            "HALTED: risky-mode kill switch, cooldown remaining {}h {}m",
                             remaining / 3600,
                             (remaining % 3600) / 60
                         ));
@@ -2292,88 +3028,18 @@ async fn run(
                     continue;
                 }
 
-                // ── Daily entry cap (risk.max_trades_per_day) — same block as
-                // the breakers above so the entry rules live together. The slot
-                // is RESERVED here, before the order exists, so two engines
-                // racing at count = cap−1 cannot both pass; every skip/failure
-                // path between here and a filled order gives the slot back.
-                // Disarmed (`daily_entry_cap = None`) this only counts.
-                match ACCOUNT_DAILY_ENTRIES.try_reserve(today, daily_entry_cap) {
-                    Ok(_) => {}
-                    Err(refusal) => {
-                        // Say WHICH rule fired and WHAT it compared — a refusal
-                        // the operator cannot explain is a control he disables.
-                        tracing::warn!(
-                            target: "neoethos_app::live_trading",
-                            %symbol,
-                            rule = "risk.max_trades_per_day",
-                            entries_today = refusal.count,
-                            cap = refusal.cap,
-                            utc_day = today,
-                            "entry refused — account-wide daily trade cap \
-                             reached (count is shared across every running \
-                             engine; resumes next UTC day, exits continue)"
-                        );
-                        if let Ok(mut s) = status.lock() {
-                            s.last_signal = Some(format!(
-                                "blocked: max_trades_per_day {}/{} account-wide \
-                                 (resumes next UTC day)",
-                                refusal.count, refusal.cap
-                            ));
-                        }
-                        continue;
-                    }
-                }
-
-                // Base per-trade risk. In Risky Mode we size off the bankroll-
-                // stage ladder (50 %→30 % as the account compounds, resolved
-                // from the LIVE balance) rather than the static prop-firm
-                // `risk_per_trade`. Strictly gated on `trading_mode == "risky"`;
-                // the "prop_firm" path is unchanged. Falls back to the
-                // configured fraction when the ladder inputs are degenerate —
-                // never a wrong size.
-                //
-                // THEN CLAMPED (#209/#210, 2026-08-09) by
-                // `risk.risky_max_risk_per_trade` when that is lower than the
-                // rung. Before this the config value had no reader outside the
-                // search, so the operator's written-down 0.30 and the ladder's
-                // 0.50 disagreed with nothing reconciling them.
+                // Base per-trade risk. Risky Mode uses the immutable OOS
+                // half-Kelly fraction resolved once at startup; current balance
+                // determines the money amount only. PropFirm mode retains its
+                // configured fraction.
                 let base_risk = if trading_mode_risky {
-                    let ladder =
-                        neoethos_core::domain::risky_mode::stage_risk_fraction_for_bankroll(
-                            risky_start_balance,
-                            risky_target_balance,
-                            neoethos_core::domain::risky_mode::DEFAULT_DOUBLING_FACTOR,
-                            entry_balance,
-                        )
-                        .unwrap_or(risk_fraction);
-                    // #209/#210 — the config's ceiling binds when it is lower
-                    // than the rung the ladder chose. The disagreement was
-                    // already logged loudly once at engine start; here we only
-                    // record the per-entry effect, so the operator can see the
-                    // rung he would have got next to the size he actually got.
-                    let frac = match risky_configured_ceiling {
-                        Some(cap) if ladder > cap => {
-                            tracing::warn!(
-                                target: "neoethos_app::live_trading",
-                                %symbol, bankroll = entry_balance,
-                                ladder_rung = ladder,
-                                configured_ceiling = cap,
-                                risk_pct = cap,
-                                "risky-mode entry CLAMPED by \
-                                 risk.risky_max_risk_per_trade — the ladder rung \
-                                 is above the configured ceiling and the lower \
-                                 number binds"
-                            );
-                            cap
-                        }
-                        _ => ladder,
-                    };
+                    let frac = risky_effective_fraction
+                        .expect("Risky startup validates an OOS sizing fraction");
                     tracing::info!(
                         target: "neoethos_app::live_trading",
                         %symbol, bankroll = entry_balance, risk_pct = frac,
-                        ladder_rung = ladder,
-                        "risky-mode stage sizing (bankroll-ladder, not the 3% prop cap)"
+                        oos_half_kelly = portfolio_oos_half_kelly,
+                        "risky-mode sizing from held-out Search edge"
                     );
                     frac
                 } else {
@@ -2383,42 +3049,16 @@ async fn run(
                 // LIVE ML gate: the genes chose the direction above; the
                 // ensemble may only SHRINK the size (agreement × regime ×
                 // anomaly, MlScale mode) or skip the bar on a hard collapse.
-                // Any ensemble error ⇒ loud log + unchanged gene-only sizing.
-                let base_risk = if let Some(ens) = live_ensemble.as_deref() {
-                    match budgeted_role_decision_for_last_row(ens, &raw_features) {
-                        Ok(d) => {
-                            let ml = neoethos_trader::MlDecision {
-                                dir_probs: d.dir_probs,
-                                regime_gate: d.regime_gate,
-                                anomaly_scale: d.anomaly_scale,
-                            };
-                            // `live_blend_cfg` was built ONCE at engine start via
-                            // `BlendConfig::from_config_values` (see there). This
-                            // used to be a `..Default::default()` struct literal,
-                            // which hardcoded gate_floor 0.34 / veto_below 0.15
-                            // onto the live sizing path with no seam for config.
-                            let (out_dir, conf) =
-                                neoethos_trader::blend_decision(direction, &ml, &live_blend_cfg);
-                            if matches!(out_dir, Direction::Flat) {
-                                tracing::warn!(
-                                    target: "neoethos_app::live_trading",
-                                    %symbol,
-                                    p_buy = d.dir_probs[1], p_sell = d.dir_probs[2],
-                                    regime_gate = d.regime_gate, anomaly = d.anomaly_scale,
-                                    "entry skipped — ML gate hard collapse (regime/anomaly veto)"
-                                );
-                                if let Ok(mut s) = status.lock() {
-                                    s.last_signal = Some(format!(
-                                        "skipped by ML gate (regime {:.2} × anomaly {:.2})",
-                                        d.regime_gate, d.anomaly_scale
-                                    ));
-                                }
-                                // No entry happened — give the reserved daily
-                                // entry slot back (the cap counts entries, not
-                                // attempts).
-                                ACCOUNT_DAILY_ENTRIES.release(today);
-                                continue;
-                            }
+                // Inference errors or invalid rows skip only this new entry;
+                // existing-position reconciliation and protection ran above.
+                // The ML multiplier is not the strategies' measured confidence.
+                let ml_multiplier = if let Some(ens) = live_ensemble.as_deref() {
+                    match checked_live_ml_entry(
+                        direction,
+                        budgeted_role_decision_for_last_row(ens, canonical_snapshot.dataset()),
+                        &live_blend_cfg,
+                    ) {
+                        Ok((d, conf)) => {
                             tracing::info!(
                                 target: "neoethos_app::live_trading",
                                 %symbol, conf,
@@ -2429,17 +3069,162 @@ async fn run(
                             if let Ok(mut s) = status.lock() {
                                 s.last_signal = Some(format!("{direction:?} · ML×{conf:.2}"));
                             }
-                            base_risk * conf
+                            Some(conf)
                         }
                         Err(err) => {
                             tracing::warn!(
                                 target: "neoethos_app::live_trading",
                                 %symbol, error = %err,
-                                "ML gate abstained (gene-only sizing this bar)"
+                                "entry skipped — required ML decision unavailable or vetoed; no genes-only fallback, exits and protection continue"
                             );
-                            base_risk
+                            if let Ok(mut s) = status.lock() {
+                                s.last_signal = Some(format!("skipped: required ML — {err}"));
+                            }
+                            continue;
                         }
                     }
+                } else {
+                    None
+                };
+                let (base_risk, measured_confidence) =
+                    live_entry_sizing_inputs(base_risk, gene_confidence, ml_multiplier)?;
+
+                // Reserve as late as possible, after feature/ML abstentions but
+                // before the risk decision and broker send. Every mode uses this
+                // same durable counter, atomically shared across portfolio
+                // engines; only `entry_day_id`'s proved calendar differs.
+                let reservation = match account_entry_authority.lock() {
+                    Ok(mut guard) => guard.try_reserve_entry(entry_day_id, daily_entry_cap),
+                    Err(_) => {
+                        tracing::error!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            rule = "risk.account_entry_authority_lock",
+                            "entry refused — account-entry authority lock is poisoned"
+                        );
+                        continue;
+                    }
+                };
+                let entry_reservation = match reservation {
+                    Ok(entries_before) => EntryReservation {
+                        authority: account_entry_authority.clone(),
+                        day_id: entry_day_id,
+                        entries_before,
+                    },
+                    Err(refusal) => {
+                        tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            rule = refusal.rule,
+                            detail = %refusal.detail,
+                            accounting_day = entry_day_id,
+                            mode = if trading_mode_risky { "risky_utc" } else { "prop_firm_local" },
+                            cap = ?daily_entry_cap,
+                            "entry refused by the durable account-wide reservation gate; exits continue"
+                        );
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal =
+                                Some(format!("REFUSED by {}: {}", refusal.rule, refusal.detail));
+                        }
+                        continue;
+                    }
+                };
+
+                // The production recipient for risk.challenge_mode,
+                // risk.challenge_phase and risk.recovery_mode_enabled. The gate
+                // sees exact broker equity and the clamp only shrinks the
+                // already-ML-scaled risk fraction.
+                let base_risk = if let (Some(authority), Some(period)) =
+                    (prop_firm_authority.as_ref(), active_prop_firm_period)
+                {
+                    let gate = neoethos_core::domain::risk::TradeGateInput {
+                        balance: entry_balance,
+                        equity: entry_equity,
+                        confidence: measured_confidence,
+                        current_time_sec: now_utc.timestamp().max(0) as u64,
+                        current_hour: {
+                            use chrono::Timelike;
+                            now_utc.hour()
+                        },
+                        // `gate_and_size` replaces this with the exact durable
+                        // pre-reservation count carried by `entry_reservation`.
+                        entries_today: 0,
+                        open_positions: open_positions_now,
+                    };
+                    let (decision, summary) = match authority.lock() {
+                        Ok(mut guard) => {
+                            let decision = guard.gate_and_size(
+                                period,
+                                gate,
+                                base_risk,
+                                entry_reservation.entries_before(),
+                            );
+                            (decision, guard.summary())
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                target: "neoethos_app::live_trading",
+                                %symbol,
+                                rule = "risk.account_authority_lock",
+                                "entry refused — account-risk authority lock is poisoned"
+                            );
+                            entry_reservation.release();
+                            continue;
+                        }
+                    };
+                    let clamped = match decision {
+                        Ok(clamped) => clamped,
+                        Err(refusal) => {
+                            tracing::warn!(
+                                target: "neoethos_app::live_trading",
+                                %symbol,
+                                rule = refusal.rule,
+                                detail = %refusal.detail,
+                                balance = entry_balance,
+                                equity = entry_equity,
+                                entries_today = entry_reservation.entries_before(),
+                                open_positions = gate.open_positions,
+                                recovery_mode = summary.recovery_mode,
+                                circuit_breaker_latched = summary.circuit_breaker_latched,
+                                "ENTRY REFUSED BY THE ACCOUNT-WIDE PROP-FIRM RISK AUTHORITY (exits and trailing continue)"
+                            );
+                            if let Ok(mut s) = status.lock() {
+                                s.last_signal = Some(format!(
+                                    "REFUSED by {}: {}",
+                                    refusal.rule, refusal.detail
+                                ));
+                            }
+                            entry_reservation.release();
+                            continue;
+                        }
+                    };
+                    if clamped <= f64::EPSILON {
+                        tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            intended_risk_pct = base_risk,
+                            allowed_risk_pct = clamped,
+                            "entry refused — prop-firm size clamp resolved to zero"
+                        );
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal =
+                                Some("REFUSED: prop-firm risk size is zero".to_string());
+                        }
+                        entry_reservation.release();
+                        continue;
+                    }
+                    if clamped < base_risk {
+                        tracing::warn!(
+                            target: "neoethos_app::live_trading",
+                            %symbol,
+                            intended_risk_pct = base_risk,
+                            effective_risk_pct = clamped,
+                            per_trade_ceiling = summary.max_risk_per_trade,
+                            recovery_mode = summary.recovery_mode,
+                            "prop-firm entry risk clamped"
+                        );
+                    }
+                    clamped
                 } else {
                     base_risk
                 };
@@ -2455,7 +3240,7 @@ async fn run(
                 // literally — a cap of 0 permits no concurrent risk and every
                 // entry is refused, which the ERROR at engine start names. "No
                 // ceiling" is spelled 1.0.
-                let open_n = open_positions_now.unwrap_or(0) as f64;
+                let open_n = open_positions_now as f64;
                 let remaining = portfolio_risk_cap - open_n * base_risk;
                 if remaining <= f64::EPSILON {
                     tracing::warn!(
@@ -2469,15 +3254,15 @@ async fn run(
                         s.last_signal = Some("blocked: portfolio risk budget spent".to_string());
                     }
                     // No entry happened — release the daily entry slot.
-                    ACCOUNT_DAILY_ENTRIES.release(today);
+                    entry_reservation.release();
                     continue;
                 }
                 let effective_risk = base_risk.min(remaining);
 
                 // Size by the account's risk %, using the EFFECTIVE stop
                 // distance actually placed on the order (gene SL / override /
-                // default) so risk-per-trade matches the real bracket; falls
-                // back to req.lot_size when not computable.
+                // default). Missing inputs or a budget below the broker's
+                // minimum skip this entry instead of using a fixed fallback.
                 // Default to the strategy's OWN bracket; `req.*` is only an
                 // explicit operator override (Autopilot sends none, so the
                 // gene's discovered SL/TP is what actually gets placed).
@@ -2494,27 +3279,52 @@ async fn run(
                     .take_profit_pips
                     .or((gene_tp > 0.0).then_some(gene_tp))
                     .or(Some(40.0));
-                let last_price = base_ohlcv.close.last().copied();
-                let lot = risk_based_lots(
+                let entry_valuation = match entry_context.valuation(
+                    entry_quote_session,
+                    chrono::Utc::now().timestamp_millis(),
+                    LIVE_ENTRY_SPOT_MAX_AGE_MS,
+                ) {
+                    Ok(valuation) => valuation,
+                    Err(error) => {
+                        tracing::warn!(target: "neoethos_app::live_trading", %symbol, %error,
+                            "entry skipped: current quote/conversion unavailable");
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal = Some(format!("blocked: live conversion — {error}"));
+                        }
+                        entry_reservation.release();
+                        continue;
+                    }
+                };
+                let fx_quote_to_account = Some(entry_valuation.quote_to_account_rate);
+                let last_price = Some(entry_valuation.price_for_risk);
+                let lot = match risk_based_lots(
                     entry_balance,
                     effective_risk,
                     sl.unwrap_or(0.0),
-                    sym_meta.as_ref(),
+                    Some(entry_context.metadata()),
                     &account_ccy,
                     fx_quote_to_account,
                     last_price,
-                    req.lot_size,
                     max_lot_cap,
-                );
+                ) {
+                    Ok(lots) => lots,
+                    Err(error) => {
+                        tracing::warn!(target: "neoethos_app::live_trading", %symbol,
+                            %error, effective_risk, entry_balance,
+                            "entry skipped: cannot satisfy position-sizing budget");
+                        if let Ok(mut s) = status.lock() {
+                            s.last_signal = Some(format!("blocked: position sizing — {error}"));
+                        }
+                        entry_reservation.release();
+                        continue;
+                    }
+                };
 
                 // ── Risky Mode kill switch: THE PRE-SEND CHECK (W3) ──────────
                 // The last thing before the order leaves the process. Checks
-                // the sticky Manual / HardwareConnLoss halts (Manual still has
-                // no producer and cannot arm; HardwareConnLoss gained one on
-                // 2026-08-09 — see `tier_halts_for_24h`), plus
                 // per-trade bracket validity, the pre-send sanity ceiling
-                // (55% of bankroll), the per-day loss cap, the per-stage
-                // retreat trigger and the per-month cap.
+                // (55% of bankroll), the per-day and per-week loss caps, the
+                // per-stage retreat trigger and the per-month cap.
                 //
                 // `size_usd` must be what the manager expects — the money at
                 // risk if the STOP fires — computed from the lot ACTUALLY being
@@ -2569,13 +3379,9 @@ async fn run(
                         })
                         .filter(|v| v.is_finite() && *v > 0.0);
                     let Some(pip_val) = pip_val else {
-                        // FAIL CLOSED. No pip value ⇒ `risk_based_lots` already
-                        // fell back to the fixed `req.lot_size`, so this entry
-                        // is NOT the ladder size the operator authorised, AND
-                        // the pre-send ceiling cannot be evaluated. Sending a
-                        // position whose risk we cannot price, in the mode that
-                        // risks 30-50% per trade, is exactly the shape this
-                        // gate exists to refuse.
+                        // Defence in depth: sizing already requires a priced
+                        // stop. The independent pre-send check must not assume
+                        // that a missing pip value means zero monetary risk.
                         tracing::error!(
                             target: "neoethos_app::live_trading",
                             %symbol,
@@ -2586,10 +3392,9 @@ async fn run(
                             last_price = ?last_price,
                             "entry refused — Risky Mode cannot price this symbol's \
                              pip value in the account currency, so neither the \
-                             30-50% stage size nor the pre-send ceiling can be \
+                             held-out half-Kelly size nor the pre-send ceiling can be \
                              computed. Add the symbol to symbol_metadata.json or \
-                             fix the quote->account FX rate. (prop_firm mode is \
-                             unaffected by this rule.)"
+                             fix the quote->account FX rate."
                         );
                         if let Ok(mut s) = status.lock() {
                             s.last_signal = Some(
@@ -2597,7 +3402,7 @@ async fn run(
                                     .to_string(),
                             );
                         }
-                        ACCOUNT_DAILY_ENTRIES.release(today);
+                        entry_reservation.release();
                         continue;
                     };
                     let size_at_risk = lot * sl_pips * pip_val;
@@ -2661,6 +3466,9 @@ async fn run(
                             daily_loss = m.daily_loss_accumulated_usd(),
                             daily_cap = m.current_stage().daily_loss_cap_fraction
                                 * m.current_bankroll_usd(),
+                            weekly_loss = m.weekly_loss_accumulated_usd(),
+                            weekly_cap = m.current_stage().weekly_drawdown_cap_fraction
+                                * m.current_bankroll_usd(),
                             monthly_loss = m.monthly_loss_accumulated_usd(),
                             stage_idx = m.current_stage().stage_idx,
                             "ENTRY REFUSED BY THE RISKY MODE KILL SWITCH"
@@ -2691,172 +3499,244 @@ async fn run(
                                 if halts_for_24h { " (24h halt)" } else { "" }
                             ));
                         }
-                        ACCOUNT_DAILY_ENTRIES.release(today);
+                        entry_reservation.release();
                         continue;
                     }
                 }
 
-                let sym = symbol.clone();
+                // A reservation taken just before midnight must not authorize
+                // an order in the next accounting day. Re-resolve the boundary
+                // immediately before broker submission; on rollover, release
+                // the old slot and let the next bar rebuild/gate new-day state.
+                let current_entry_day = if trading_mode_risky {
+                    Some(utc_day_id(chrono::Utc::now()))
+                } else {
+                    prop_firm_period(resolved_settings.risk.preset, chrono::Utc::now())
+                        .ok()
+                        .map(|period| period.day_id)
+                };
+                let reservation_period_is_current =
+                    current_entry_day == Some(entry_reservation.day_id);
+                if !reservation_period_is_current {
+                    tracing::warn!(
+                        target: "neoethos_app::live_trading",
+                        %symbol,
+                        rule = "risk.entry_period_rolled_before_send",
+                        reserved_accounting_day = entry_reservation.day_id,
+                        current_accounting_day = ?current_entry_day,
+                        "entry skipped — the accounting day rolled after reservation and before broker submission"
+                    );
+                    entry_reservation.release();
+                    continue;
+                }
 
+                let entry_money_digits = entry_context.trader_money_digits();
+                let entry_client_order_id = entry_context.client_order_id().to_owned();
+                let submission_spread_policy = live_trading_policy.clone();
+                let submission_account_currency = account_ccy.clone();
+                let submission_may_have_started = Arc::new(AtomicBool::new(false));
+                let submission_marker = submission_may_have_started.clone();
+                let submission_entry_authority = account_entry_authority.clone();
+                let submission_day_id = entry_reservation.day_id;
                 let result = match tokio::task::spawn_blocking(move || {
-                    // LAST GUARD BEFORE REAL MONEY (2026-08-09, closed
-                    // 2026-08-09 second pass). The top-of-iteration environment
-                    // check ran many seconds ago — before the bar fetch with
-                    // its retries and the ML pass. Passing the admitted
-                    // environment down makes `resolve_creds` validate it
-                    // against the SAME file read that produces the routing
-                    // environment for this order, so a Demo->Live flip cannot
-                    // land between the check and the send. The previous version
-                    // used a separate `assert_environment()` call, which still
-                    // left two reads with a gap between them.
-                    submit_market_order_blocking(
-                        &sym,
-                        side,
-                        lot,
-                        sl,
-                        tp,
-                        Some("NeoEthos-Auto".to_string()),
-                        Some(gated_env_is_live),
+                    entry_context.submit_market_order_blocking(
+                        entry_quote_session, side, lot, sl, tp,
+                        Some("NeoEthos-Auto".to_owned()), LIVE_ENTRY_SPOT_MAX_AGE_MS,
+                        &submission_marker,
+                        |request| {
+                            submission_entry_authority.lock()
+                                .map_err(|_| anyhow!("account-entry authority lock is poisoned"))?
+                                .begin_submission(submission_day_id, request, &submission_marker)
+                        },
+                        |metadata, valuation| {
+                            let now = chrono::Utc::now();
+                            anyhow::ensure!(
+                                utc_day_id(now) == today,
+                                "UTC day changed during entry preparation; reserve a new decision"
+                            );
+                            evaluate_live_entry_spread(
+                                Ok((valuation.bid, valuation.ask)), metadata.pip_size,
+                                submission_spread_policy.expected_spread_pips_at(now.timestamp_millis()),
+                            ).map_err(|reason| anyhow!("entry quote/spread refused before submission: {reason:?}"))?;
+                            let current_max_lots = risk_based_lots(
+                                entry_balance, effective_risk, sl.unwrap_or(0.0),
+                                Some(metadata), &submission_account_currency,
+                                Some(valuation.quote_to_account_rate), Some(valuation.price_for_risk),
+                                max_lot_cap,
+                            )?;
+                            anyhow::ensure!(
+                                lot <= current_max_lots,
+                                "live quote/conversion changed the permitted size; refuse rather than increase the budget"
+                            );
+                            Ok(())
+                        },
                     )
                 })
                 .await
                 {
                     Ok(r) => r,
                     Err(join_err) => {
-                        // The submit task panicked/was cancelled — no entry
-                        // happened, so free the daily entry slot before the
-                        // engine dies with the error.
-                        ACCOUNT_DAILY_ENTRIES.release(today);
+                        if submission_may_have_started.load(Ordering::Acquire) {
+                            has_unresolved_broker_entry = true;
+                            unresolved_entry_client_order_id = Some(entry_client_order_id.clone());
+                            tracing::error!(target: "neoethos_app::live_trading", %symbol,
+                                error = %join_err, client_order_id = %entry_client_order_id,
+                                "entry submission outcome unknown; keeping reserved slot and blocking new entries until broker reconciliation");
+                            if let Ok(mut s) = status.lock() {
+                                s.last_signal = Some("blocked: unresolved broker entry after submit task failure".to_owned());
+                            }
+                            continue;
+                        }
+                        // The completed task never reached the executor; release only its exact local intent.
+                        entry_reservation.release_unsent(&entry_client_order_id, &submission_may_have_started);
                         return Err(join_err.into());
                     }
                 };
 
                 match result {
                     Ok(outcome) => {
-                        if let Some(pos_id) = outcome.position_id {
-                            // Track the broker position even when exact evidence
-                            // is incomplete. That fail-closed pending state blocks
-                            // another entry and prevents an unverified money
-                            // scalar from reaching risk/learning side effects.
-                            opened_ids.insert(pos_id);
-
-                            match outcome.filled_volume_raw_centi_units.filter(|raw| *raw > 0) {
-                                Some(broker_vol) => {
-                                    open_position = Some((pos_id, broker_vol));
-                                    opened_entry_filled_volumes.insert(pos_id, broker_vol);
-                                }
-                                None => {
-                                    unverified_close_positions.insert(pos_id);
+                        let (opening, volume_scale, actual_filled_lots) =
+                            match verified_opening_for_engine(
+                                &outcome,
+                                if gated_env_is_live { "live" } else { "demo" },
+                                gated_account_id,
+                                gated_symbol_id,
+                                &symbol,
+                                side,
+                            ) {
+                                Ok(verified) => verified,
+                                Err(error) => {
+                                    // Accepted, partial, reducing or incomplete responses may
+                                    // already have changed broker exposure. Retain the reserved
+                                    // slot and original intent; do not invent an owned position.
+                                    has_unresolved_broker_entry = true;
+                                    unresolved_entry_client_order_id =
+                                        Some(entry_client_order_id.clone());
+                                    let recorded = account_entry_authority.lock()
+                                        .map_err(|_| anyhow!("account-entry authority lock is poisoned"))
+                                        .and_then(|mut state| state.record_unresolved_outcome(
+                                            &entry_client_order_id,
+                                            if gated_env_is_live {
+                                                crate::app_services::ctrader_live_auth::CTraderEnvironment::Live
+                                            } else {
+                                                crate::app_services::ctrader_live_auth::CTraderEnvironment::Demo
+                                            },
+                                            &outcome,
+                                        ));
+                                    if let Err(record_error) = recorded {
+                                        tracing::error!(target: "neoethos_app::live_trading",
+                                            client_order_id = %entry_client_order_id, %record_error,
+                                            "known order reference could not be persisted; original entry intent remains unresolved");
+                                    }
                                     tracing::error!(
                                         target: "neoethos_app::live_trading",
-                                        %symbol,
-                                        position_id = pos_id,
-                                        "filled entry omitted its exact raw filledVolume; keeping \
-                                         the broker position pending and refusing monetary authority"
+                                        %symbol, %error,
+                                        client_order_id = %entry_client_order_id,
+                                        execution_status = ?outcome.status,
+                                        order_id = ?outcome.order_id,
+                                        position_id = ?outcome.position_id,
+                                        deal_id = ?outcome.deal_id,
+                                        "entry response lacks exact opening proof; retaining reservation and unresolved intent, no automatic retry"
                                     );
+                                    if let Ok(mut s) = status.lock() {
+                                        s.last_signal = Some(format!(
+                                            "blocked: unresolved broker entry {entry_client_order_id}; opening reconciliation required"
+                                        ));
+                                        s.protection_state = Some("entry_unresolved".to_owned());
+                                        s.last_protection_error = Some(error.to_string());
+                                    }
+                                    continue;
                                 }
-                            }
-
-                            let canonical_gated_environment =
-                                if gated_env_is_live { "live" } else { "demo" };
-                            match outcome.volume_scale_evidence.as_ref() {
-                                Some(volume_scale)
-                                    if outcome.account_id == gated_account_id
-                                        && outcome.symbol_id == Some(gated_symbol_id)
-                                        && volume_scale.environment()
-                                            == canonical_gated_environment
-                                        && volume_scale.account_id() == gated_account_id
-                                        && volume_scale.symbol_id() == gated_symbol_id
-                                        && volume_scale.symbol_name() == symbol =>
-                                {
-                                    opened_volume_scales.insert(pos_id, volume_scale.clone());
-                                }
-                                _ => {
-                                    unverified_close_positions.insert(pos_id);
-                                    tracing::error!(
-                                        target: "neoethos_app::live_trading",
-                                        %symbol,
-                                        position_id = pos_id,
-                                        outcome_account_id = outcome.account_id,
-                                        outcome_symbol_id = ?outcome.symbol_id,
-                                        "filled entry lacks the exact admitted broker lotSize identity; \
-                                         keeping the position pending and refusing monetary authority"
-                                    );
-                                }
-                            }
-
-                            // Seed trailing-stop state (parity with the backtest):
-                            // entry, the EFFECTIVE stop distance (the same one the
-                            // kernel trails with — gene SL, operator override, or
-                            // the 20-pip default), side, running extreme. Seeded
-                            // unconditionally even when `models.exit_policy` has
-                            // trailing OFF, so arming the policy never finds a
-                            // half-initialised position.
-                            pos_entry_px = outcome.execution_price.or(last_price).unwrap_or(0.0);
-                            pos_sl_pips = sl.unwrap_or(0.0);
-                            pos_is_long = direction == Direction::Long;
-                            pos_extreme = pos_entry_px;
-                            pos_trail_px = 0.0;
-                            // Experience snapshot: the exact feature row this
-                            // entry acted on (paired with the outcome at close).
-                            let feature_row = aligned
-                                .dense_window(aligned.n_samples() - 1, aligned.n_samples())
-                                .map(|window| window.values.row(0).iter().copied().collect());
-                            match feature_row {
-                                Ok(features) => {
-                                    pending_experience.insert(
-                                        pos_id,
-                                        crate::app_services::experience_store::LiveExperience {
-                                            schema_version: 1,
-                                            position_id: pos_id,
-                                            symbol: symbol.clone(),
-                                            base_tf: base_tf.clone(),
-                                            portfolio_path: portfolio_path.clone(),
-                                            direction: if pos_is_long { 1 } else { -1 },
-                                            // The EFFECTIVE brackets placed on the order
-                                            // (gene / override / kernel default) — what
-                                            // actually governed this trade's exit.
-                                            sl_pips: sl.unwrap_or(0.0),
-                                            tp_pips: tp.unwrap_or(0.0),
-                                            lots: lot,
-                                            entry_ts_ms: latest_ts,
-                                            entry_price: outcome.execution_price.or(last_price),
-                                            features,
-                                            close_ts_ms: None,
-                                            net_profit: None,
-                                        },
-                                    );
-                                }
-                                Err(error) => tracing::warn!(
-                                    target: "neoethos_app::live_trading",
-                                    %symbol,
-                                    position_id = pos_id,
-                                    error = %error,
-                                    "opened position but refused to persist a non-exact feature experience row"
-                                ),
-                            }
-                        } else {
+                            };
+                        let pos_id = opening.position_id();
+                        let broker_volume = opening.filled_volume_raw_centi_units();
+                        opened_ids.insert(pos_id);
+                        open_position = Some((pos_id, broker_volume));
+                        opened_entry_filled_volumes.insert(pos_id, broker_volume);
+                        opened_volume_scales.insert(pos_id, volume_scale.clone());
+                        // Preserve the exact reference for later recovery, but only
+                        // this unchanged opening proof can clear durable uncertainty.
+                        let confirmed = account_entry_authority
+                            .lock()
+                            .map_err(|_| anyhow!("account-entry authority lock is poisoned"))
+                            .and_then(|mut state| {
+                                state.confirm_verified_opening(&entry_client_order_id, opening)
+                            });
+                        if let Err(error) = confirmed {
                             has_unresolved_broker_entry = true;
-                            tracing::error!(
+                            unresolved_entry_client_order_id = Some(entry_client_order_id.clone());
+                            tracing::error!(target: "neoethos_app::live_trading",
+                                client_order_id = %entry_client_order_id, %error,
+                                "opening is tracked but durable intent could not be resolved; further entries remain blocked");
+                        }
+
+                        // Seed the archived protection using actual opening execution,
+                        // never a historical/current quote substituted for broker fill.
+                        pos_entry_px = opening.entry_price();
+                        pos_sl_pips = sl.unwrap_or(0.0);
+                        pos_is_long = opening.trade_side() == "BUY";
+                        pos_extreme = pos_entry_px;
+                        pos_trail_px = 0.0;
+                        let feature_row = experience_feature_row
+                            .context("entry has no retained Search experience row")
+                            .and_then(|row| row);
+                        match feature_row {
+                            Ok(features) => {
+                                pending_experience.insert(
+                                    pos_id,
+                                    crate::app_services::experience_store::LiveExperience {
+                                        schema_version: 1,
+                                        position_id: pos_id,
+                                        symbol: symbol.clone(),
+                                        base_tf: base_tf.clone(),
+                                        portfolio_path: portfolio_path.clone(),
+                                        direction: if pos_is_long { 1 } else { -1 },
+                                        sl_pips: sl.unwrap_or(0.0),
+                                        tp_pips: tp.unwrap_or(0.0),
+                                        lots: actual_filled_lots,
+                                        entry_ts_ms: opening.execution_timestamp_ms(),
+                                        entry_price: Some(opening.entry_price()),
+                                        features,
+                                        close_ts_ms: None,
+                                        net_profit: None,
+                                    },
+                                );
+                            }
+                            Err(error) => tracing::warn!(
                                 target: "neoethos_app::live_trading",
-                                %symbol,
-                                deal_id = ?outcome.deal_id,
-                                order_id = ?outcome.order_id,
-                                "broker accepted an entry without a position id; blocking all \
-                                 further entries and keeping this fill unresolved"
-                            );
+                                %symbol, position_id = pos_id, error = %error,
+                                "opened position but refused to persist a non-exact feature experience row"
+                            ),
                         }
 
                         if let Ok(mut s) = status.lock() {
-                            s.open_position_id = open_position.map(|(id, _)| id);
+                            s.open_position_id = Some(pos_id);
+                            s.position_entry_price = Some(pos_entry_px);
+                            s.initial_stop_pips = (pos_sl_pips > 0.0).then_some(pos_sl_pips);
+                            s.favorable_extreme_price = Some(pos_extreme);
+                            s.favorable_move_r = Some(0.0);
+                            s.confirmed_stop_price = None;
+                            s.last_protection_error = None;
+                            s.last_exit_reason = None;
+                            s.protection_state = Some(
+                                if live_trading_policy.trailing_enabled {
+                                    "armed_waiting_trigger"
+                                } else {
+                                    "disabled_by_search"
+                                }
+                                .to_owned(),
+                            );
                         }
 
                         tracing::info!(
                             target: "neoethos_app::live_trading",
-                            side = ?side,
-                            position_id = ?open_position.map(|(id, _)| id),
-                            fill_price = ?outcome.execution_price,
-                            "order placed"
+                            side = ?side, position_id = pos_id,
+                            deal_id = opening.deal_id(),
+                            client_order_id = %entry_client_order_id,
+                            fill_price = opening.entry_price(),
+                            fill_timestamp_ms = opening.execution_timestamp_ms(),
+                            trader_money_digits = entry_money_digits,
+                            "exact broker opening fill is tracked; durable lifecycle integration remains pending"
                         );
                     }
                     Err(e) => {
@@ -2864,12 +3744,38 @@ async fn run(
                             target: "neoethos_app::live_trading",
                             error = %e,
                             side = ?side,
-                            "order placement failed"
+                            "order submission returned an error"
                         );
-                        // The broker refused the order — no entry happened, so
-                        // the daily entry slot goes back (the cap counts
-                        // ENTRIES on the account, not attempts).
-                        ACCOUNT_DAILY_ENTRIES.release(today);
+                        if submission_may_have_started.load(Ordering::Acquire) {
+                            has_unresolved_broker_entry = true;
+                            unresolved_entry_client_order_id = Some(entry_client_order_id.clone());
+                            let recorded = account_entry_authority
+                                .lock()
+                                .map_err(|_| anyhow!("account-entry authority lock is poisoned"))
+                                .and_then(|mut state| {
+                                    state.record_unresolved_error(&entry_client_order_id, &e)
+                                });
+                            if let Err(error) = recorded {
+                                tracing::error!(target: "neoethos_app::live_trading",
+                                    client_order_id = %entry_client_order_id, %error,
+                                    "accepted order context could not be persisted; original durable intent remains blocked");
+                            }
+                            tracing::error!(target: "neoethos_app::live_trading", %symbol,
+                                error = %e, client_order_id = %entry_client_order_id,
+                                "entry submission outcome unknown; retaining reserved slot, no automatic retry");
+                            if let Ok(mut s) = status.lock() {
+                                s.last_signal = Some(
+                                    "blocked: unresolved broker entry requires reconciliation"
+                                        .to_owned(),
+                                );
+                            }
+                        } else {
+                            // Local preparation/freshness/budget refusal: completed attempt is definitely unsent.
+                            entry_reservation.release_unsent(
+                                &entry_client_order_id,
+                                &submission_may_have_started,
+                            );
+                        }
                     }
                 }
             }
@@ -2885,7 +3791,12 @@ async fn run(
     // Mark stopped
     if let Ok(mut s) = status.lock() {
         s.running = false;
-        s.open_position_id = None;
+        // Stopping this engine does not close a broker position. Preserve that
+        // fact so the UI cannot display "flat" while a server-side bracket is
+        // still active and needs operator supervision.
+        s.open_position_id = open_position
+            .map(|(id, _)| id)
+            .or_else(|| opened_ids.iter().copied().next());
     }
 
     tracing::info!(target: "neoethos_app::live_trading", "live trading loop exited");
@@ -2894,9 +3805,506 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gene_confidence_is_not_replaced_by_ml_or_applied_twice_to_mode_risk() {
+        for mode_risk in [0.01, 0.035] {
+            assert_eq!(
+                super::live_entry_sizing_inputs(mode_risk, 0.8, None).unwrap(),
+                (mode_risk, Some(0.8))
+            );
+            assert_eq!(
+                super::live_entry_sizing_inputs(mode_risk, 0.8, Some(0.25)).unwrap(),
+                (mode_risk * 0.25, Some(0.8))
+            );
+        }
+        assert!(super::live_entry_sizing_inputs(0.01, f64::NAN, Some(0.5)).is_err());
+        assert!(super::live_entry_sizing_inputs(0.01, 0.8, Some(1.1)).is_err());
+    }
+
     use super::*;
     use crate::app_services::journal_store::ClosedTrade;
     use neoethos_core::domain::risky_mode as rm;
+
+    #[test]
+    fn live_entry_spread_preserves_every_quote_refusal_without_a_fallback() {
+        use SpotQuoteRefusal::*;
+        for reason in [
+            CacheUnavailable,
+            InvalidTimeBudget,
+            NoActiveSession,
+            SessionMismatch,
+            MissingQuote,
+            MissingBid,
+            MissingAsk,
+            MissingBidTimestamp,
+            MissingAskTimestamp,
+            InvalidBidTimestamp,
+            InvalidAskTimestamp,
+            StaleBid,
+            StaleAsk,
+            FutureBid,
+            FutureAsk,
+            InvalidPrices,
+        ] {
+            assert_eq!(
+                evaluate_live_entry_spread(Err(reason), 0.0001, 1.5),
+                Err(LiveEntrySpreadRefusal::Quote(reason))
+            );
+        }
+        assert_eq!(LIVE_ENTRY_SPOT_MAX_AGE_MS, 120_000);
+    }
+
+    #[test]
+    fn live_entry_spread_preserves_exact_threshold_equality_and_zero_spread() {
+        assert_eq!(
+            evaluate_live_entry_spread(Ok((100.0, 105.0)), 1.0, 2.0),
+            Ok(5.0)
+        );
+        assert_eq!(
+            evaluate_live_entry_spread(Ok((100.0, 106.0)), 1.0, 2.0),
+            Err(LiveEntrySpreadRefusal::ExceedsLimit {
+                spread_pips: 6.0,
+                limit_pips: 5.0,
+            })
+        );
+        assert_eq!(
+            evaluate_live_entry_spread(Ok((100.0, 100.0)), 1.0, 0.0),
+            Ok(0.0)
+        );
+    }
+
+    #[test]
+    fn live_entry_spread_refuses_invalid_prices_units_policy_and_overflow() {
+        for pip in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                evaluate_live_entry_spread(Ok((1.0, 2.0)), pip, 1.0),
+                Err(LiveEntrySpreadRefusal::InvalidPipSize)
+            );
+        }
+        for expected in [-1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            assert_eq!(
+                evaluate_live_entry_spread(Ok((1.0, 2.0)), 1.0, expected),
+                Err(LiveEntrySpreadRefusal::InvalidExpectedSpread)
+            );
+        }
+        for quote in [
+            (0.0, 1.0),
+            (1.0, 0.0),
+            (-1.0, 1.0),
+            (2.0, 1.0),
+            (f64::NAN, 1.0),
+            (1.0, f64::NAN),
+            (f64::INFINITY, f64::INFINITY),
+        ] {
+            assert_eq!(
+                evaluate_live_entry_spread(Ok(quote), 1.0, 1.0),
+                Err(LiveEntrySpreadRefusal::InvalidPrices)
+            );
+        }
+        assert_eq!(
+            evaluate_live_entry_spread(Ok((1.0, f64::MAX)), f64::MIN_POSITIVE, 1.0),
+            Err(LiveEntrySpreadRefusal::InvalidSpread)
+        );
+    }
+
+    fn sizing_metadata() -> neoethos_core::symbol_metadata::SymbolMetadata {
+        serde_json::from_value(serde_json::json!({
+            "symbol": "EURUSD", "base": "EUR", "quote": "USD",
+            "pip_size": 0.0001, "contract_size": 100000.0, "pip_value_quote": 10.0,
+            "digits": 5, "min_lot": 0.01, "max_lot": 100.0, "lot_step": 0.01
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn required_live_ml_failure_does_not_return_a_gene_only_multiplier() {
+        let config = neoethos_trader::BlendConfig::from_config_values(
+            neoethos_trader::BlendMode::MlScale,
+            None,
+            None,
+        );
+        let error = checked_live_ml_entry(
+            Direction::Long,
+            Err(anyhow!("CPU permits unavailable")),
+            &config,
+        )
+        .expect_err("a busy or failed inference cannot authorize full-size genes-only entry");
+        assert!(format!("{error:#}").contains("CPU permits unavailable"));
+    }
+
+    #[test]
+    fn entry_sizing_requires_current_account_identity_and_finite_equity_in_both_environments() {
+        for environment in ["demo", "live"] {
+            assert!(
+                validate_entry_account_values(environment, 42, 1000.0, 900.0, environment, 42)
+                    .is_ok()
+            );
+            assert!(
+                validate_entry_account_values(environment, 99, 1000.0, 900.0, environment, 42)
+                    .is_err()
+            );
+            let foreign = if environment == "demo" {
+                "live"
+            } else {
+                "demo"
+            };
+            assert!(
+                validate_entry_account_values(foreign, 42, 1000.0, 900.0, environment, 42).is_err()
+            );
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+                assert!(
+                    validate_entry_account_values(environment, 42, invalid, 900.0, environment, 42)
+                        .is_err()
+                );
+                assert!(
+                    validate_entry_account_values(
+                        environment,
+                        42,
+                        1000.0,
+                        invalid,
+                        environment,
+                        42
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    fn live_test_model_decision() -> neoethos_models::ensemble_inference::EnsembleDecision {
+        neoethos_models::ensemble_inference::EnsembleDecision {
+            dir_probs: [0.05, 0.9, 0.05],
+            regime_gate: 1.0,
+            anomaly_scale: 1.0,
+            validity: neoethos_data::FeatureCellValidity::Valid,
+        }
+    }
+
+    #[test]
+    fn valid_live_ml_keeps_the_gene_direction_and_scales_once() {
+        let config = neoethos_trader::BlendConfig::from_config_values(
+            neoethos_trader::BlendMode::MlScale,
+            None,
+            None,
+        );
+        let decision = live_test_model_decision();
+        let (observed, multiplier) =
+            checked_live_ml_entry(Direction::Long, Ok(decision), &config).unwrap();
+        assert_eq!(observed, decision);
+        assert!((multiplier - 0.9).abs() < 1e-12);
+        assert!((0.03 * multiplier - 0.027).abs() < 1e-12);
+        assert!(checked_live_ml_entry(Direction::Flat, Ok(decision), &config).is_err());
+    }
+
+    #[test]
+    fn invalid_live_ml_rows_are_refused_even_with_finite_payloads() {
+        let config = neoethos_trader::BlendConfig::from_config_values(
+            neoethos_trader::BlendMode::MlScale,
+            None,
+            None,
+        );
+        for validity in [
+            neoethos_data::FeatureCellValidity::Warmup,
+            neoethos_data::FeatureCellValidity::AlignmentMissing,
+        ] {
+            let mut decision = live_test_model_decision();
+            decision.validity = validity;
+            let error = checked_live_ml_entry(Direction::Long, Ok(decision), &config)
+                .expect_err("typed invalidity is not an ordinary neutral vote");
+            assert!(error.to_string().contains("ineligible"));
+        }
+    }
+
+    #[test]
+    fn nonfinite_or_zero_live_ml_cannot_authorize_an_entry() {
+        let config = neoethos_trader::BlendConfig::from_config_values(
+            neoethos_trader::BlendMode::MlScale,
+            Some(0.0),
+            Some(0.0),
+        );
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for field in 0..5 {
+                let mut decision = live_test_model_decision();
+                match field {
+                    0..=2 => decision.dir_probs[field] = value,
+                    3 => decision.regime_gate = value,
+                    _ => decision.anomaly_scale = value,
+                }
+                assert!(checked_live_ml_entry(Direction::Long, Ok(decision), &config).is_err());
+            }
+        }
+        let mut veto = live_test_model_decision();
+        veto.anomaly_scale = 0.0;
+        assert!(checked_live_ml_entry(Direction::Long, Ok(veto), &config).is_err());
+    }
+
+    #[test]
+    fn risk_sizing_never_rounds_a_small_budget_up_to_broker_minimum() {
+        let meta = sizing_metadata();
+        // $0.10 stop budget; the minimum 0.01 lot would lose $2 at 20 pips.
+        let error = risk_based_lots(10.0, 0.01, 20.0, Some(&meta), "USD", None, Some(1.1), 100.0)
+            .unwrap_err();
+        assert!(error.to_string().contains("below broker minimum"));
+    }
+
+    #[test]
+    fn risk_sizing_rounds_down_and_respects_non_step_aligned_caps() {
+        let meta = sizing_metadata();
+        let lots = risk_based_lots(
+            10_000.0,
+            0.01,
+            20.0,
+            Some(&meta),
+            "USD",
+            None,
+            Some(1.1),
+            0.255,
+        )
+        .unwrap();
+        assert!((lots - 0.25).abs() < 1e-12);
+        assert!(lots * 20.0 * 10.0 <= 100.0);
+        assert!(
+            risk_based_lots(
+                10_000.0,
+                0.01,
+                20.0,
+                Some(&meta),
+                "USD",
+                None,
+                Some(1.1),
+                0.005
+            )
+            .is_err(),
+            "an operator cap below minimum is not raised"
+        );
+    }
+
+    #[test]
+    fn risk_sizing_uses_account_currency_and_refuses_missing_conversion() {
+        let meta = sizing_metadata();
+        let lots = risk_based_lots(
+            10_000.0,
+            0.01,
+            20.0,
+            Some(&meta),
+            "GBP",
+            Some(0.8),
+            Some(1.1),
+            100.0,
+        )
+        .unwrap();
+        assert!((lots - 0.62).abs() < 1e-12, "100 / (20 * 8) rounded down");
+        assert!(
+            risk_based_lots(
+                10_000.0,
+                0.01,
+                20.0,
+                Some(&meta),
+                "GBP",
+                None,
+                Some(1.1),
+                100.0
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn base_account_notional_uses_inverse_price_not_an_assumed_fx_one() {
+        let mut meta = sizing_metadata();
+        meta.symbol = "USDJPY".into();
+        meta.base = "USD".into();
+        meta.quote = "JPY".into();
+        meta.pip_size = 0.01;
+        meta.pip_value_quote = 1000.0;
+        let lots = risk_based_lots(
+            10_000.0,
+            0.25,
+            5.0,
+            Some(&meta),
+            "USD",
+            None,
+            Some(150.0),
+            100.0,
+        )
+        .unwrap();
+        // 30 * $10,000 / $100,000 per lot = 3, not 0.02 (the old JPY-as-USD bug).
+        assert!((lots - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn risk_sizing_rejects_non_finite_inputs_instead_of_a_fixed_lot_fallback() {
+        let mut meta = sizing_metadata();
+        for invalid in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            assert!(
+                risk_based_lots(
+                    invalid,
+                    0.01,
+                    20.0,
+                    Some(&meta),
+                    "USD",
+                    None,
+                    Some(1.1),
+                    100.0
+                )
+                .is_err()
+            );
+            assert!(
+                risk_based_lots(
+                    10_000.0,
+                    invalid,
+                    20.0,
+                    Some(&meta),
+                    "USD",
+                    None,
+                    Some(1.1),
+                    100.0
+                )
+                .is_err()
+            );
+        }
+        meta.lot_step = 0.0;
+        assert!(
+            risk_based_lots(
+                10_000.0,
+                0.01,
+                20.0,
+                Some(&meta),
+                "USD",
+                None,
+                Some(1.1),
+                100.0
+            )
+            .is_err()
+        );
+        assert!(
+            risk_based_lots(10_000.0, 0.01, 20.0, None, "USD", None, Some(1.1), 100.0).is_err()
+        );
+    }
+
+    #[test]
+    fn favorable_excursion_is_measured_in_the_positions_own_initial_risk() {
+        let long = favorable_excursion_r(1.1000, 1.1060, 20.0, 0.0001, true)
+            .expect("valid long excursion");
+        let short = favorable_excursion_r(1.1000, 1.0940, 20.0, 0.0001, false)
+            .expect("valid short excursion");
+        assert!(
+            (long - 3.0).abs() < 1e-12,
+            "long MFE should be 3R, got {long}"
+        );
+        assert!(
+            (short - 3.0).abs() < 1e-12,
+            "short MFE should be 3R, got {short}"
+        );
+        assert_eq!(
+            favorable_excursion_r(1.1000, 1.1060, 0.0, 0.0001, true),
+            None,
+            "a position with no proved initial risk has no meaningful R multiple"
+        );
+    }
+
+    #[test]
+    fn live_status_serializes_profit_protection_evidence() {
+        let mut status = LiveTradingStatus::default();
+        status.protection_policy_identity = Some("fnv64:0123456789abcdef".to_string());
+        status.trailing_enabled = Some(true);
+        status.protection_state = Some("broker_confirmed".to_string());
+        status.position_entry_price = Some(1.1);
+        status.initial_stop_pips = Some(20.0);
+        status.favorable_extreme_price = Some(1.106);
+        status.favorable_move_r = Some(3.0);
+        status.confirmed_stop_price = Some(1.104);
+        status.last_exit_reason = Some("broker_reported_close_unclassified".to_string());
+
+        let value = serde_json::to_value(status).expect("serialize live status");
+        assert_eq!(value["protectionState"], "broker_confirmed");
+        assert_eq!(value["favorableMoveR"], 3.0);
+        assert_eq!(value["confirmedStopPrice"], 1.104);
+        assert_eq!(value["protectionPolicyIdentity"], "fnv64:0123456789abcdef");
+    }
+
+    fn protection_outcome(
+        status: CTraderExecutionStatus,
+        position_id: i64,
+    ) -> CTraderExecutionOutcome {
+        CTraderExecutionOutcome {
+            status,
+            account_id: 7,
+            symbol_id: Some(14),
+            order_id: None,
+            position_id: Some(position_id),
+            deal_id: None,
+            trade_side: Some("BUY".to_string()),
+            order_type: None,
+            lot_size: Some(0.01),
+            requested_lot_size: Some(0.01),
+            filled_lot_size: None,
+            filled_volume_raw_centi_units: None,
+            volume_scale_evidence: None,
+            deal_closes_position: None,
+            opening_fill_evidence: None,
+            execution_price: Some(1.10),
+            gross_profit: None,
+            fee: None,
+            swap: None,
+            net_profit: None,
+            timestamp_ms: Some(1_710_000_000_000),
+            error_code: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn local_trail_changes_only_after_exact_broker_confirmation() {
+        let mut confirmed = 1.095;
+
+        let accepted = protection_outcome(CTraderExecutionStatus::Accepted, 42);
+        assert!(commit_broker_confirmed_trail(&mut confirmed, 1.101, 42, &accepted).is_err());
+        assert_eq!(
+            confirmed, 1.095,
+            "transport success is not broker confirmation"
+        );
+
+        let wrong_position = protection_outcome(CTraderExecutionStatus::Replaced, 99);
+        assert!(commit_broker_confirmed_trail(&mut confirmed, 1.101, 42, &wrong_position).is_err());
+        assert_eq!(
+            confirmed, 1.095,
+            "another position's amend must not advance this one"
+        );
+
+        let replaced = protection_outcome(CTraderExecutionStatus::Replaced, 42);
+        commit_broker_confirmed_trail(&mut confirmed, 1.101, 42, &replaced)
+            .expect("matching ORDER_REPLACED is an exact confirmation");
+        assert_eq!(confirmed, 1.101);
+    }
+
+    #[test]
+    fn partial_close_reconciliation_updates_exact_remaining_volume_not_flat_state() {
+        let mut tracked = (42, 100_000);
+        refresh_tracked_position_volume(&mut tracked, 14, [(99, 14, 20_000), (42, 14, 37_001)])
+            .unwrap();
+        assert_eq!(tracked, (42, 37_001));
+        refresh_tracked_position_volume(&mut tracked, 14, []).unwrap();
+        assert_eq!(
+            tracked,
+            (42, 37_001),
+            "absence alone must not bypass verified closing-fill accounting"
+        );
+    }
+
+    #[test]
+    fn invalid_remaining_volume_or_identity_preserves_tracked_position() {
+        for positions in [
+            vec![(42, 15, 10_000)],
+            vec![(42, 14, 0)],
+            vec![(42, 14, -1)],
+            vec![(42, 14, 10_000), (42, 14, 10_000)],
+        ] {
+            let mut tracked = (42, 100_000);
+            assert!(refresh_tracked_position_volume(&mut tracked, 14, positions).is_err());
+            assert_eq!(tracked, (42, 100_000));
+        }
+    }
 
     /// The operator's `models.blend_*` numbers REACH the live blend (audit
     /// #232).
@@ -2953,23 +4361,13 @@ mod tests {
     #[test]
     fn account_level_tiers_halt_for_24h_and_order_level_tiers_do_not() {
         use rm::KillSwitchTier as T;
-        for tier in [
-            T::PerDay,
-            T::PerStage,
-            T::PerMonth,
-            T::Manual,
-            T::HardwareConnLoss,
-        ] {
+        for tier in [T::PerDay, T::PerWeek, T::PerStage, T::PerMonth] {
             assert!(
                 tier_halts_for_24h(tier),
                 "{tier:?} is a bankroll-level event and must start the persisted halt"
             );
         }
-        for tier in [
-            T::PerTrade,
-            T::PreSendSanity,
-            T::ManualOrderWhileAutonomousOnly,
-        ] {
+        for tier in [T::PerTrade, T::PreSendSanity] {
             assert!(
                 !tier_halts_for_24h(tier),
                 "{tier:?} describes one order — refuse it, do not halt the account for a day"
@@ -2986,8 +4384,6 @@ mod tests {
             target_capital_usd: 50_000.0,
             stage_doubling_factor: rm::DEFAULT_DOUBLING_FACTOR,
             stages: rm::build_logarithmic_stages(100.0, 50_000.0, rm::DEFAULT_DOUBLING_FACTOR),
-            autonomous_only_contract_accepted: true,
-            allow_live_broker: true,
             ..rm::RiskyModeConfig::default()
         };
         rm::RiskyModeManager::new(cfg, bankroll).expect("the shipped risky settings must build")
@@ -3002,10 +4398,10 @@ mod tests {
         assert_eq!(m.current_stage().stage_idx, 0);
         assert!(
             (m.current_stage().risk_per_trade_fraction
-                - rm::RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
+                - rm::RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION)
                 .abs()
                 < 1e-9,
-            "stage 0 of the shipped ladder is the 50% rung"
+            "the shipped ladder starts at the default risk, not the absolute safety ceiling"
         );
     }
 
@@ -3156,6 +4552,28 @@ mod tests {
             Err(rm::KillSwitchTier::PerDay)
         );
         m.reset_daily_accumulator();
+        assert!(m.check_trade_allowed(1.0, 20.0, 40.0).is_ok());
+    }
+
+    #[test]
+    fn weekly_account_loss_halts_until_the_iso_week_rolls() {
+        let mut m = operator_manager(100.0);
+        let cap = m.current_stage().weekly_drawdown_cap_fraction * m.current_bankroll_usd();
+        m.raise_period_losses(0.0, cap, 0.0);
+
+        let tier = m
+            .check_trade_allowed(1.0, 20.0, 40.0)
+            .expect_err("a spent ISO week must refuse a new entry");
+        assert_eq!(tier, rm::KillSwitchTier::PerWeek);
+        assert!(tier_halts_for_24h(tier));
+
+        m.reset_daily_accumulator();
+        assert_eq!(
+            m.check_trade_allowed(1.0, 20.0, 40.0),
+            Err(rm::KillSwitchTier::PerWeek),
+            "the UTC-day rollover must not clear the ISO-week cap"
+        );
+        m.reset_weekly_accumulator();
         assert!(m.check_trade_allowed(1.0, 20.0, 40.0).is_ok());
     }
 

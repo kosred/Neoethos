@@ -198,11 +198,6 @@ struct OnDiskTokens {
     refresh_token: Option<String>,
     #[serde(default)]
     id_token: Option<String>,
-    /// The CLI persists this; we don't use it yet but accept it so an
-    /// unknown-field-strict future serde config wouldn't choke.
-    #[serde(default)]
-    #[allow(dead_code)]
-    account_id: Option<String>,
 }
 
 impl OnDiskAuth {

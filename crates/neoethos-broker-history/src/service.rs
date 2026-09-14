@@ -17,6 +17,7 @@ use crate::ctrader_messages::CTraderCannotRouteRequestError;
 use crate::secure_store::production_ctrader_token_store;
 use anyhow::{Context, Result, anyhow, bail};
 use neoethos_core::CanonicalTimeframe;
+use neoethos_data::core::dataset_generation_lease::DatasetGenerationLease;
 use neoethos_data::core::dataset_manifest::PublishResult;
 use neoethos_data::{
     BarTimestampConvention, CanonicalDatasetIdentity, CanonicalOhlcvChunk, CanonicalVolumeChunk,
@@ -630,10 +631,15 @@ where
     }
 }
 
+struct HistoricalCapturePreflight {
+    session_request: AuthenticatedHistoricalSessionRequest,
+    selected_generation_lease: Option<DatasetGenerationLease>,
+}
+
 fn authenticated_session_request_for_capture(
     request: &HistoricalCaptureRequest,
     credentials: &HistoricalCredentials,
-) -> Result<AuthenticatedHistoricalSessionRequest> {
+) -> Result<HistoricalCapturePreflight> {
     if request.to_ms <= request.from_ms {
         bail!(
             "invalid range: from_ms ({}) must be < to_ms ({})",
@@ -648,168 +654,7 @@ fn authenticated_session_request_for_capture(
     if symbol_assertion.is_empty() {
         bail!("cTrader historical symbol must be non-empty");
     }
-    if let Some(selected) = request.target.selected() {
-        if !selected
-            .identity()
-            .symbol_name()
-            .eq_ignore_ascii_case(symbol_assertion)
-        {
-            return Err(BrokerHistoryConflict::IdentityMismatch {
-                detail: format!(
-                    "fetch symbol assertion {:?} does not match selected identity symbol {:?}",
-                    request.symbol,
-                    selected.identity().symbol_name()
-                ),
-            }
-            .into());
-        }
-        if selected.identity().timeframe() != request.timeframe {
-            return Err(BrokerHistoryConflict::IdentityMismatch {
-                detail: format!(
-                    "fetch timeframe assertion {} does not match selected identity timeframe {}",
-                    request.timeframe,
-                    selected.identity().timeframe()
-                ),
-            }
-            .into());
-        }
-        let _ = neoethos_data::open_exact_dataset_generation(&request.data_root, selected)?;
-    }
-    let requested_symbol = request
-        .target
-        .selected()
-        .map_or(symbol_assertion, |selected| {
-            selected.identity().symbol_name()
-        });
-    Ok(AuthenticatedHistoricalSessionRequest {
-        client_id: credentials.client_id.clone(),
-        client_secret: credentials.client_secret.clone(),
-        access_token: credentials.access_token.clone(),
-        environment: credentials.environment,
-        server: credentials.environment.endpoint_host().to_owned(),
-        account_id: credentials.account_id,
-        symbol_name: requested_symbol.to_owned(),
-        timeframe: request.timeframe,
-        from_timestamp_ms: request.from_ms,
-        to_timestamp_ms: ctrader_inclusive_wire_to_ms(request.to_ms)?,
-    })
-}
-
-pub(crate) struct HistoricalSeriesCapture<C: HistoricalSessionConnector> {
-    credentials: HistoricalCredentials,
-    connector: C,
-    session: Option<C::Session>,
-}
-
-impl<C: HistoricalSessionConnector> HistoricalSeriesCapture<C> {
-    pub(crate) fn new(credentials: HistoricalCredentials, connector: C) -> Self {
-        Self {
-            credentials,
-            connector,
-            session: None,
-        }
-    }
-
-    pub(crate) fn capture_with_publication_hook<H>(
-        &mut self,
-        request: HistoricalCaptureRequest,
-        active_fetch: &ActiveHistoricalFetch<'_>,
-        after_publication: H,
-    ) -> Result<HistoricalDownloadOutcome>
-    where
-        H: FnOnce(&PublishResult) -> Result<()>,
-    {
-        let cancellation = active_fetch.cancellation();
-        ensure_not_cancelled(cancellation)?;
-        let session_request =
-            authenticated_session_request_for_capture(&request, &self.credentials)?;
-        let reuse = self.session.as_ref().is_some_and(|session| {
-            let resolved = session.resolved_symbol();
-            resolved.environment == session_request.environment
-                && resolved.server == session_request.server
-                && resolved.account_id == session_request.account_id
-                && resolved
-                    .symbol_name
-                    .eq_ignore_ascii_case(&session_request.symbol_name)
-        });
-        if !reuse {
-            self.session = Some(
-                self.connector
-                    .connect_authenticated(&session_request, cancellation)
-                    .map_err(normalize_historical_request_error)?,
-            );
-        }
-        let session = self
-            .session
-            .as_mut()
-            .context("authenticated historical series session is unavailable")?;
-        capture_with_session_and_publication_hook(request, active_fetch, session, after_publication)
-    }
-
-    pub(crate) fn capture_historical_series_generation(
-        &mut self,
-        request: HistoricalCaptureRequest,
-        active_fetch: &ProcessHistoricalCapture,
-    ) -> Result<HistoricalDownloadOutcome> {
-        active_fetch.active.execute_if_not_cancelled(|active| {
-            self.capture_with_publication_hook(request, active, |_| Ok(()))
-        })?
-    }
-}
-
-pub(crate) fn capture_with_connector_and_publication_hook<C, H>(
-    request: HistoricalCaptureRequest,
-    credentials: HistoricalCredentials,
-    active_fetch: &ActiveHistoricalFetch<'_>,
-    connector: &C,
-    after_publication: H,
-) -> Result<HistoricalDownloadOutcome>
-where
-    C: HistoricalSessionConnector,
-    H: FnOnce(&PublishResult) -> Result<()>,
-{
-    let cancellation = active_fetch.cancellation();
-    ensure_not_cancelled(cancellation)?;
-    let session_request = authenticated_session_request_for_capture(&request, &credentials)?;
-    let mut session = connector
-        .connect_authenticated(&session_request, cancellation)
-        .map_err(normalize_historical_request_error)?;
-    capture_with_session_and_publication_hook(
-        request,
-        active_fetch,
-        &mut session,
-        after_publication,
-    )
-}
-
-fn capture_with_session_and_publication_hook<S, H>(
-    request: HistoricalCaptureRequest,
-    active_fetch: &ActiveHistoricalFetch<'_>,
-    session: &mut S,
-    after_publication: H,
-) -> Result<HistoricalDownloadOutcome>
-where
-    S: HistoricalSession,
-    H: FnOnce(&PublishResult) -> Result<()>,
-{
-    let cancellation = active_fetch.cancellation();
-    ensure_not_cancelled(cancellation)?;
-    if request.to_ms <= request.from_ms {
-        bail!(
-            "invalid range: from_ms ({}) must be < to_ms ({})",
-            request.from_ms,
-            request.to_ms
-        );
-    }
-    if request.from_ms < 0 || request.to_ms > CTRADER_MAX_TIMESTAMP_MS {
-        bail!("cTrader trendbar range must be within 0..={CTRADER_MAX_TIMESTAMP_MS} ms");
-    }
-    let symbol_assertion = request.symbol.trim();
-    if symbol_assertion.is_empty() {
-        bail!("cTrader historical symbol must be non-empty");
-    }
-
-    let _selected_generation_lease = match request.target.selected() {
+    let selected_generation_lease = match request.target.selected() {
         Some(selected) => {
             if !selected
                 .identity()
@@ -841,6 +686,150 @@ where
         }
         None => None,
     };
+    let requested_symbol = request
+        .target
+        .selected()
+        .map_or(symbol_assertion, |selected| {
+            selected.identity().symbol_name()
+        });
+    Ok(HistoricalCapturePreflight {
+        session_request: AuthenticatedHistoricalSessionRequest {
+            client_id: credentials.client_id.clone(),
+            client_secret: credentials.client_secret.clone(),
+            access_token: credentials.access_token.clone(),
+            environment: credentials.environment,
+            server: credentials.environment.endpoint_host().to_owned(),
+            account_id: credentials.account_id,
+            symbol_name: requested_symbol.to_owned(),
+            timeframe: request.timeframe,
+            from_timestamp_ms: request.from_ms,
+            to_timestamp_ms: ctrader_inclusive_wire_to_ms(request.to_ms)?,
+        },
+        selected_generation_lease,
+    })
+}
+
+pub(crate) struct HistoricalSeriesCapture<C: HistoricalSessionConnector> {
+    credentials: HistoricalCredentials,
+    connector: C,
+    session: Option<C::Session>,
+}
+
+impl<C: HistoricalSessionConnector> HistoricalSeriesCapture<C> {
+    pub(crate) fn new(credentials: HistoricalCredentials, connector: C) -> Self {
+        Self {
+            credentials,
+            connector,
+            session: None,
+        }
+    }
+
+    pub(crate) fn capture_with_publication_hook<H>(
+        &mut self,
+        request: HistoricalCaptureRequest,
+        active_fetch: &ActiveHistoricalFetch<'_>,
+        after_publication: H,
+    ) -> Result<HistoricalDownloadOutcome>
+    where
+        H: FnOnce(&PublishResult) -> Result<()>,
+    {
+        let cancellation = active_fetch.cancellation();
+        ensure_not_cancelled(cancellation)?;
+        let preflight = authenticated_session_request_for_capture(&request, &self.credentials)?;
+        let reuse = self.session.as_ref().is_some_and(|session| {
+            let resolved = session.resolved_symbol();
+            resolved.environment == preflight.session_request.environment
+                && resolved.server == preflight.session_request.server
+                && resolved.account_id == preflight.session_request.account_id
+                && resolved
+                    .symbol_name
+                    .eq_ignore_ascii_case(&preflight.session_request.symbol_name)
+        });
+        if !reuse {
+            self.session = Some(
+                self.connector
+                    .connect_authenticated(&preflight.session_request, cancellation)
+                    .map_err(normalize_historical_request_error)?,
+            );
+        }
+        let session = self
+            .session
+            .as_mut()
+            .context("authenticated historical series session is unavailable")?;
+        capture_with_session_and_publication_hook(
+            request,
+            active_fetch,
+            session,
+            preflight.selected_generation_lease,
+            after_publication,
+        )
+    }
+
+    pub(crate) fn capture_historical_series_generation(
+        &mut self,
+        request: HistoricalCaptureRequest,
+        active_fetch: &ProcessHistoricalCapture,
+    ) -> Result<HistoricalDownloadOutcome> {
+        active_fetch.active.execute_if_not_cancelled(|active| {
+            self.capture_with_publication_hook(request, active, |_| Ok(()))
+        })?
+    }
+}
+
+pub(crate) fn capture_with_connector_and_publication_hook<C, H>(
+    request: HistoricalCaptureRequest,
+    credentials: HistoricalCredentials,
+    active_fetch: &ActiveHistoricalFetch<'_>,
+    connector: &C,
+    after_publication: H,
+) -> Result<HistoricalDownloadOutcome>
+where
+    C: HistoricalSessionConnector,
+    H: FnOnce(&PublishResult) -> Result<()>,
+{
+    let cancellation = active_fetch.cancellation();
+    ensure_not_cancelled(cancellation)?;
+    let preflight = authenticated_session_request_for_capture(&request, &credentials)?;
+    let mut session = connector
+        .connect_authenticated(&preflight.session_request, cancellation)
+        .map_err(normalize_historical_request_error)?;
+    capture_with_session_and_publication_hook(
+        request,
+        active_fetch,
+        &mut session,
+        preflight.selected_generation_lease,
+        after_publication,
+    )
+}
+
+fn capture_with_session_and_publication_hook<S, H>(
+    request: HistoricalCaptureRequest,
+    active_fetch: &ActiveHistoricalFetch<'_>,
+    session: &mut S,
+    _selected_generation_lease: Option<DatasetGenerationLease>,
+    after_publication: H,
+) -> Result<HistoricalDownloadOutcome>
+where
+    S: HistoricalSession,
+    H: FnOnce(&PublishResult) -> Result<()>,
+{
+    let cancellation = active_fetch.cancellation();
+    ensure_not_cancelled(cancellation)?;
+    if request.to_ms <= request.from_ms {
+        bail!(
+            "invalid range: from_ms ({}) must be < to_ms ({})",
+            request.from_ms,
+            request.to_ms
+        );
+    }
+    if request.from_ms < 0 || request.to_ms > CTRADER_MAX_TIMESTAMP_MS {
+        bail!("cTrader trendbar range must be within 0..={CTRADER_MAX_TIMESTAMP_MS} ms");
+    }
+    let symbol_assertion = request.symbol.trim();
+    if symbol_assertion.is_empty() {
+        bail!("cTrader historical symbol must be non-empty");
+    }
+
     let requested_symbol = request
         .target
         .selected()

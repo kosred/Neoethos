@@ -36,10 +36,12 @@ export CARGO_BUILD_JOBS=$worker_limit
 case "$accelerator_mode" in
     cpu_only)
         [[ "$cuda_architectures" == none ]] || exit 2
+        unset NEOETHOS_CUDA_BUILD_MODE
         unset NEOETHOS_CUDA_ARCHS
         ;;
     nvidia)
         [[ "$cuda_architectures" =~ ^[1-9][0-9]*(\;[1-9][0-9]*)*$ ]] || exit 2
+        export NEOETHOS_CUDA_BUILD_MODE=cross_release_explicit
         export NEOETHOS_CUDA_ARCHS=$cuda_architectures
         ;;
     *)

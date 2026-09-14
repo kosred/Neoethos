@@ -27,11 +27,6 @@ pub enum FallbackPolicy {
 pub enum AcceleratorHint {
     Any,
     Cuda,
-    Wgpu,
-    Vulkan,
-    Rocm,
-    Metal,
-    Dx12,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,13 +69,6 @@ impl EvaluationBackend {
             "gpu" | "on" | "true" => Self::GPU_REQUIRED,
             "gpu_required" | "gpu-required" => Self::GPU_REQUIRED,
             "cuda" | "cuda_required" | "cuda-required" => Self::gpu_with(AcceleratorHint::Cuda),
-            "wgpu" | "wgpu_required" | "wgpu-required" => Self::gpu_with(AcceleratorHint::Wgpu),
-            "vulkan" | "vulkan_required" | "vulkan-required" => {
-                Self::gpu_with(AcceleratorHint::Vulkan)
-            }
-            "rocm" | "rocm_required" | "rocm-required" => Self::gpu_with(AcceleratorHint::Rocm),
-            "metal" | "metal_required" | "metal-required" => Self::gpu_with(AcceleratorHint::Metal),
-            "dx12" | "dx12_required" | "dx12-required" => Self::gpu_with(AcceleratorHint::Dx12),
             _ => return Err(BackendConfigError::UnknownPreference(raw.trim().to_owned())),
         };
         parsed.validate()?;
@@ -296,9 +284,9 @@ fn evaluate_population_core_with_backend_and_audit_inner(
         "population evaluation requires a run-bound sealed device route; refusing detached CPU/GPU dispatch"
             .to_string()
     })?;
-    if let Ok(no_gpu_receipt) = evidence.require_cpu_route_receipt_v1() {
-        let rows = cpu_strategy::run_with_sealed_no_gpu_receipt(
-            no_gpu_receipt,
+    if let Ok(cpu_route_receipt) = evidence.require_cpu_route_receipt_v1() {
+        let rows = cpu_strategy::run_with_sealed_cpu_route_receipt(
+            cpu_route_receipt,
             audit,
             CpuStrategyCategory::PopulationEvaluation,
             || crate::eval::validation_backtest_population_cpu(inputs),
@@ -339,7 +327,21 @@ pub(crate) fn evaluate_population_core_with_backend_test_oracle(
     backend: EvaluationBackend,
     audit: &crate::gpu_native::cpu_strategy::CpuStrategyAuditContext,
 ) -> Result<Vec<[f64; 11]>, String> {
-    evaluate_population_core_with_backend_and_audit_inner(inputs, backend, audit, None)
+    use crate::gpu_native::cpu_strategy::{self, CpuStrategyCategory, CpuStrategyExecutionMode};
+
+    backend.validate().map_err(|error| error.to_string())?;
+    if audit.mode() == CpuStrategyExecutionMode::ValidationReference {
+        return cpu_strategy::run(
+            backend,
+            audit,
+            CpuStrategyCategory::PopulationEvaluation,
+            "backend::evaluate_population_core_with_backend_test_oracle",
+            || crate::eval::validation_backtest_population_cpu(inputs),
+        )
+        .map_err(|error| error.to_string());
+    }
+
+    evaluate_gpu_required_population(inputs, backend, audit, None)
 }
 
 #[cfg(not(feature = "gpu-b-adapter"))]
@@ -597,7 +599,7 @@ impl fmt::Display for BackendConfigError {
         match self {
             Self::UnknownPreference(value) => write!(
                 f,
-                "unknown discovery compute preference `{value}`; expected cpu, auto, gpu, gpu_required, or a supported accelerator hint"
+                "unknown or retired discovery compute preference `{value}`; expected cpu, auto, gpu, gpu_required, cuda, or cuda_required"
             ),
             Self::InvalidBoolean { key, value } => write!(
                 f,
@@ -701,6 +703,19 @@ mod tests {
         assert_eq!(backend.device, DevicePreference::Gpu);
         assert_eq!(backend.fallback, FallbackPolicy::ForbidCpu);
         assert_eq!(backend.accelerator_hint, AcceleratorHint::Cuda);
+    }
+
+    #[test]
+    fn retired_accelerator_names_are_rejected_instead_of_aliased() {
+        for value in ["vulkan", "wgpu", "rocm", "hip", "metal", "dx12"] {
+            assert!(
+                matches!(
+                    EvaluationBackend::parse(value),
+                    Err(BackendConfigError::UnknownPreference(_))
+                ),
+                "{value} must not resolve to another accelerator"
+            );
+        }
     }
 
     #[test]

@@ -1,24 +1,30 @@
 #[cfg(feature = "gpu-cuda")]
 use super::evolution_math::current_gene_stop_bounds;
+#[cfg(test)]
+use super::evolution_math::gene_signature_hash;
 use super::evolution_math::{
     EvolutionSearchPolicy, SeenSignatureMemory, SurvivorSelectionPolicy, apply_metrics, crossover,
-    gene_signature_hash, generate_random_genes, mutate, new_random_gene, select_parent_index,
-    select_survivor_indices, unique_candidate_or_retry,
+    generate_random_genes, mutate, new_random_gene, select_parent_index, select_survivor_indices,
+    unique_candidate_or_retry,
 };
 use super::runtime_overrides::current_genetic_search_runtime_overrides;
 use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
 use crate::eval::BacktestSettings;
 use crate::stop_target::{StopTargetSettings, infer_stop_target_pips};
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(test, feature = "gpu-cuda"))]
 use anyhow::{Context, ensure};
 use anyhow::{Result, anyhow, bail};
 use chrono::{Datelike, TimeZone, Utc};
 use ndarray::Array2;
 use neoethos_data::{FeatureFrame, Ohlcv};
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+
+#[path = "profitable_archive.rs"]
+mod profitable_archive;
+use profitable_archive::{ArchiveOffer, BoundedProfitableArchive};
 
 /// Build a deterministic RNG by routing the genetic-search runtime
 /// overrides through the canonical
@@ -75,7 +81,7 @@ impl ExactSearchSizingPolicyV1 {
     }
 
     #[cfg(feature = "gpu-cuda")]
-    fn from_resident_population_receipt_v2(
+    pub(crate) fn from_resident_population_receipt_v2(
         receipt: &crate::resident_population_auto_sizing_receipt_v2::ResidentPopulationAutoSizingReceiptV2,
     ) -> Result<Self> {
         if receipt.migration_enabled_for_run() {
@@ -111,6 +117,17 @@ impl ExactSearchSizingPolicyV1 {
                     self.term_cap
                 );
             }
+            if let Some(index) = gene
+                .indices
+                .iter()
+                .copied()
+                .find(|index| *index > i32::MAX as usize)
+            {
+                bail!(
+                    "{context}: gene `{}` feature index {index} exceeds the signed i32 evaluator ABI",
+                    gene.strategy_id
+                );
+            }
             total_terms = total_terms
                 .checked_add(gene.indices.len())
                 .ok_or_else(|| anyhow!("{context}: total gene-term count overflow"))?;
@@ -118,6 +135,11 @@ impl ExactSearchSizingPolicyV1 {
         if total_terms > maximum_terms {
             bail!(
                 "{context}: total terms {total_terms} exceed sealed batch capacity {maximum_terms}"
+            );
+        }
+        if total_terms > i32::MAX as usize {
+            bail!(
+                "{context}: total gene-term count {total_terms} exceeds the signed i32 packed-offset ABI"
             );
         }
         Ok(())
@@ -207,7 +229,37 @@ impl ResidentGenerationZeroRuntimeSnapshotV1 {
         false
     }
 
-    const fn smc_gate_disabled(&self) -> bool {
+    pub(crate) const fn genetic_search(
+        &self,
+    ) -> &super::runtime_overrides::GeneticSearchRuntimeOverrides {
+        &self.genetic_search
+    }
+
+    pub(crate) const fn smc_search(&self) -> &SmcSearchConfig {
+        &self.smc_search
+    }
+
+    pub(crate) const fn gene_stop_bounds(
+        &self,
+    ) -> &super::evolution_math::ResolvedGeneStopBounds {
+        &self.gene_stop_bounds
+    }
+
+    pub(crate) const fn threshold_ladder(&self) -> &[f64; 6] {
+        &self.threshold_ladder
+    }
+
+    pub(crate) const fn seen_memory(
+        &self,
+    ) -> &super::evolution_math::SeenSignatureMemoryRuntimeOverrides {
+        &self.seen_memory
+    }
+
+    pub(crate) const fn migration_enabled(&self) -> bool {
+        self.migration_enabled
+    }
+
+    pub(crate) const fn smc_gate_disabled(&self) -> bool {
         self.smc_gate_disabled
     }
 }
@@ -242,6 +294,135 @@ impl EvalDataCache {
             smc_data,
         })
     }
+}
+
+/// Reusable exact Stage-1 cache plus the CPU throughput/RAM plan measured
+/// against it. The calibration evaluation is discarded; only its elapsed time
+/// and immutable plan enter the run receipt.
+pub(crate) struct PreparedExactCpuPopulationAutoV1 {
+    pub(crate) eval_cache: EvalDataCache,
+    pub(crate) cpu_plan: crate::population_auto_sizing_receipt_v1::CpuPopulationAutoPlanV1,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_exact_cpu_population_auto_v1(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    configured_population: usize,
+    max_indicators: usize,
+    month_capacity: usize,
+    eval_config: &EvaluationConfig,
+    exact_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
+    exact_view: crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1<'_>,
+    route: &crate::population_auto_sizing_receipt_v1::PopulationAutoSizingRouteV1,
+) -> Result<Option<PreparedExactCpuPopulationAutoV1>> {
+    let cpu_route = matches!(
+        route,
+        crate::population_auto_sizing_receipt_v1::PopulationAutoSizingRouteV1::CpuNoCompatibleGpu {
+            ..
+        } | crate::population_auto_sizing_receipt_v1::PopulationAutoSizingRouteV1::CpuExplicitResearch {
+            ..
+        }
+    );
+    if !cpu_route {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        configured_population > 0 && max_indicators > 0,
+        "CPU population-auto calibration requires non-zero configured population and max indicators"
+    );
+    let term_cap = crate::population_auto_sizing_receipt_v1::population_auto_term_cap_v1(
+        features.n_features(),
+        max_indicators,
+    )
+    .map_err(anyhow::Error::new)?;
+    let sizing_policy = ExactSearchSizingPolicyV1::new(false, term_cap)?;
+    let eval_cache = EvalDataCache::build(features, ohlcv)?;
+    let workers = rayon::current_num_threads().max(1);
+    let calibration_candidates = workers
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("CPU calibration worker-count multiplication overflow"))?;
+    let representable_candidates = (i32::MAX as usize) / term_cap;
+    anyhow::ensure!(
+        calibration_candidates <= representable_candidates,
+        "CPU calibration batch {calibration_candidates} exceeds the signed-offset capacity {representable_candidates}"
+    );
+
+    let available_before = neoethos_core::system::available_memory_bytes();
+    let total_memory_bytes = neoethos_core::system::total_memory_bytes();
+    anyhow::ensure!(
+        available_before > 0 && total_memory_bytes > 0,
+        "CPU population-auto cannot obtain a non-zero live RAM snapshot after building the exact Stage-1 cache"
+    );
+    let smc_cfg = SmcSearchConfig::current();
+    let mut calibration_rng = StdRng::seed_from_u64(0x4e45_4f45_5448_4f53);
+    let mut calibration_genes = generate_random_genes(
+        calibration_candidates,
+        features.n_features(),
+        max_indicators,
+        0,
+        &smc_cfg,
+        &mut calibration_rng,
+    );
+    enforce_population_smc_ratio(&mut calibration_genes, &smc_cfg);
+    for gene in &mut calibration_genes {
+        gene.normalize(features.n_features(), 1);
+    }
+
+    let started = Instant::now();
+    let calibration_metrics = evaluate_genes_cached(
+        features,
+        ohlcv,
+        &calibration_genes,
+        eval_config,
+        &eval_cache,
+        &sizing_policy,
+        Some((exact_run, exact_view)),
+    )?;
+    let elapsed_ns = started.elapsed().as_nanos().clamp(1, u64::MAX as u128) as u64;
+    anyhow::ensure!(
+        calibration_metrics.len() == calibration_candidates,
+        "CPU calibration returned {} metrics for {calibration_candidates} candidates",
+        calibration_metrics.len()
+    );
+    drop(calibration_metrics);
+    drop(calibration_genes);
+    let available_after = neoethos_core::system::available_memory_bytes();
+    let available_memory_bytes = available_before.min(available_after.max(1));
+    let cpu_plan = crate::population_auto_sizing_receipt_v1::seal_cpu_population_auto_plan_v1(
+        crate::population_auto_sizing_receipt_v1::CpuPopulationAutoCalibrationV1 {
+            worker_count: workers,
+            calibration_candidates,
+            calibration_elapsed_ns: elapsed_ns,
+            available_memory_bytes,
+            total_memory_bytes,
+        },
+        features.n_samples(),
+        month_capacity,
+        term_cap,
+    )
+    .map_err(anyhow::Error::new)?;
+    tracing::info!(
+        target: "neoethos_search::population_auto",
+        rows = features.n_samples(),
+        features = features.n_features(),
+        workers,
+        calibration_candidates,
+        calibration_elapsed_ms = elapsed_ns as f64 / 1_000_000.0,
+        available_memory_bytes,
+        admitted_memory_bytes = cpu_plan.admitted_memory_bytes(),
+        worker_scratch_bytes = cpu_plan.worker_scratch_bytes(),
+        retained_bytes_per_candidate = cpu_plan.retained_bytes_per_candidate(),
+        memory_population_cap = cpu_plan.memory_population_cap(),
+        raw_time_cap = cpu_plan.raw_time_cap(),
+        representable_population_cap = cpu_plan.representable_population_cap(),
+        growth_cap = cpu_plan.growth_cap(),
+        "CPU population_auto calibrated on the exact Stage-1 timeframe view"
+    );
+    Ok(Some(PreparedExactCpuPopulationAutoV1 {
+        eval_cache,
+        cpu_plan,
+    }))
 }
 
 /// YYYYMMDD calendar key for an epoch-ms timestamp — THE day-bucket key the
@@ -567,6 +748,24 @@ pub fn signals_and_confidence_for_gene_full_with_smc(
     config: &EvaluationConfig,
     smc: &SmcGateArrays,
 ) -> Result<(Vec<i8>, Vec<f64>)> {
+    signals_and_confidence_for_gene_full_with_smc_policy(
+        features,
+        gene,
+        config,
+        smc,
+        super::runtime_overrides::smc_gate_disabled(),
+    )
+}
+
+/// Identical paired signal arithmetic with an explicit, archived SMC bypass.
+/// A replay must not re-read process-global overrides after the run was sealed.
+pub fn signals_and_confidence_for_gene_full_with_smc_policy(
+    features: &FeatureFrame,
+    gene: &Gene,
+    config: &EvaluationConfig,
+    smc: &SmcGateArrays,
+    smc_bypass: bool,
+) -> Result<(Vec<i8>, Vec<f64>)> {
     let n_samples = features.n_samples();
     let mut combined = vec![0.0_f64; n_samples];
     let mut eligible = vec![true; n_samples];
@@ -629,7 +828,6 @@ pub fn signals_and_confidence_for_gene_full_with_smc(
     // `GeneticSearchRuntimeOverrides::from_env`).
     // Perf: only the bool is needed; the full-struct clone allocated a String
     // per gene (see `smc_gate_disabled`).
-    let smc_bypass = super::runtime_overrides::smc_gate_disabled();
     let active_sum = if smc_bypass { 0.0 } else { active_sum };
     let gate = config.smc_gate_threshold.min(active_sum);
 
@@ -704,6 +902,121 @@ pub fn signals_and_confidence_for_gene_full_with_smc(
     Ok((signals, confidences))
 }
 
+/// Build the one Generation-0 backtest policy from its run-scoped evaluation
+/// configuration. This is deliberately fallible: a missing broker financial or
+/// an invalid sizing band must stop the search before NaN PnL can be sanitised
+/// into an apparently ordinary zero-profit candidate.
+pub(crate) fn evaluation_backtest_settings(config: &EvaluationConfig) -> Result<BacktestSettings> {
+    anyhow::ensure!(
+        config.initial_equity.is_finite() && config.initial_equity > 0.0,
+        "evaluation initial equity must be finite and positive"
+    );
+    anyhow::ensure!(
+        config.pip_value.is_finite() && config.pip_value > 0.0,
+        "evaluation pip size must be finite and positive"
+    );
+    anyhow::ensure!(
+        config.pip_value_per_lot.is_finite() && config.pip_value_per_lot > 0.0,
+        "evaluation pip value per lot must be finite and positive"
+    );
+    anyhow::ensure!(
+        config.spread_pips.is_finite() && config.spread_pips >= 0.0,
+        "evaluation spread must be finite and non-negative"
+    );
+    anyhow::ensure!(
+        config.commission_per_trade.is_finite() && config.commission_per_trade >= 0.0,
+        "evaluation commission must be finite and non-negative"
+    );
+    anyhow::ensure!(
+        config.swap_long_pips_per_day.is_finite() && config.swap_short_pips_per_day.is_finite(),
+        "evaluation swap inputs must be finite"
+    );
+    anyhow::ensure!(
+        config.pnl_conversion_fee_rate.is_finite()
+            && (0.0..1.0).contains(&config.pnl_conversion_fee_rate),
+        "evaluation PnL conversion fee must be finite and in [0, 1)"
+    );
+    anyhow::ensure!(
+        config.trailing_atr_multiplier.is_finite()
+            && config.trailing_atr_multiplier >= 0.0
+            && config.trailing_be_trigger_r.is_finite()
+            && config.trailing_be_trigger_r >= 0.0
+            && config.trailing_min_lock_pips.is_finite()
+            && config.trailing_min_lock_pips >= 0.0,
+        "evaluation trailing-stop geometry must be finite and non-negative"
+    );
+    anyhow::ensure!(
+        config.risk_per_trade_min.is_finite()
+            && config.risk_per_trade_max.is_finite()
+            && (0.0..=1.0).contains(&config.risk_per_trade_min)
+            && (config.risk_per_trade_min..=1.0).contains(&config.risk_per_trade_max),
+        "evaluation risk band must satisfy 0 <= min <= max <= 1"
+    );
+    anyhow::ensure!(
+        config.high_quality_confidence.is_finite()
+            && config.high_quality_confidence > 0.0
+            && config.high_quality_confidence <= 1.0,
+        "evaluation high-quality confidence must be in (0, 1]"
+    );
+    let session_spread_profile = match config.session_spread_pips {
+        Some([asian_pips, overlap_pips, late_ny_pips]) => {
+            anyhow::ensure!(
+                [asian_pips, overlap_pips, late_ny_pips]
+                    .into_iter()
+                    .all(|spread| spread.is_finite() && spread >= 0.0),
+                "evaluation session spreads must be finite and non-negative"
+            );
+            Some(crate::eval::SessionSpreadProfile {
+                asian_pips,
+                overlap_pips,
+                late_ny_pips,
+            })
+        }
+        None => None,
+    };
+    anyhow::ensure!(
+        [
+            config.smc_gate_threshold,
+            config.smc_weight_ob,
+            config.smc_weight_fvg,
+            config.smc_weight_liq,
+            config.smc_weight_mtf,
+            config.smc_weight_premium,
+            config.smc_weight_inducement,
+            config.smc_weight_bos,
+            config.smc_weight_choch,
+            config.smc_weight_eqh,
+            config.smc_weight_eql,
+            config.smc_weight_displacement,
+        ]
+        .into_iter()
+        .all(f64::is_finite),
+        "evaluation SMC gate and weights must be finite"
+    );
+
+    Ok(BacktestSettings {
+        initial_equity_override: Some(config.initial_equity),
+        max_hold_bars: config.max_hold_bars,
+        trailing_enabled: config.trailing_enabled,
+        trailing_atr_multiplier: config.trailing_atr_multiplier,
+        trailing_be_trigger_r: config.trailing_be_trigger_r,
+        trailing_min_lock_pips: config.trailing_min_lock_pips,
+        pip_value: config.pip_value,
+        spread_pips: config.spread_pips,
+        commission_per_trade: config.commission_per_trade,
+        pip_value_per_lot: config.pip_value_per_lot,
+        kill_zones_enabled: config.kill_zones_enabled,
+        session_spread_profile,
+        swap_long_pips_per_day: config.swap_long_pips_per_day,
+        swap_short_pips_per_day: config.swap_short_pips_per_day,
+        pnl_conversion_fee_rate: config.pnl_conversion_fee_rate,
+        risk_per_trade_min: config.risk_per_trade_min,
+        risk_per_trade_max: config.risk_per_trade_max,
+        high_quality_confidence: config.high_quality_confidence,
+        ..Default::default()
+    })
+}
+
 /// Evaluate genes using a pre-built EvalDataCache (avoids recomputing stable arrays each generation).
 pub(crate) fn evaluate_genes_cached(
     features: &FeatureFrame,
@@ -766,24 +1079,7 @@ pub(crate) fn evaluate_genes_cached(
         config.smc_weight_displacement,
     ];
 
-    let mut b_settings = BacktestSettings {
-        max_hold_bars: config.max_hold_bars,
-        trailing_enabled: config.trailing_enabled,
-        trailing_atr_multiplier: config.trailing_atr_multiplier,
-        trailing_be_trigger_r: config.trailing_be_trigger_r,
-        // Carried explicitly (2026-08-09): it was inheriting the struct default
-        // here while the other three came from `config`, so a change to the
-        // lock-in floor reached the funnel and not the GA.
-        trailing_min_lock_pips: config.trailing_min_lock_pips,
-        pip_value: config.pip_value,
-        spread_pips: config.spread_pips,
-        commission_per_trade: config.commission_per_trade,
-        pip_value_per_lot: config.pip_value_per_lot,
-        swap_long_pips_per_day: config.swap_long_pips_per_day,
-        swap_short_pips_per_day: config.swap_short_pips_per_day,
-        pnl_conversion_fee_rate: config.pnl_conversion_fee_rate,
-        ..Default::default()
-    };
+    let mut b_settings = evaluation_backtest_settings(config)?;
     let stop_vol_mults = resolve_adaptive_stops(
         genes,
         &ohlcv.high,
@@ -820,6 +1116,11 @@ pub(crate) fn evaluate_genes_cached(
             let evidence = run
                 .seal_evaluation(&b_settings, view)
                 .map_err(|error| anyhow!(error))?;
+            if config.growth_goal.is_some() {
+                evidence.require_cpu_route_receipt_v1().map_err(|error| {
+                    anyhow!("goal-pace v6 requires the validated CPU route; native scoring is not implemented: {error}")
+                })?;
+            }
             crate::backend::evaluate_population_core_with_backend_and_evidence(
                 inputs,
                 crate::backend::current_evaluation_backend(),
@@ -848,7 +1149,7 @@ pub(crate) struct ResidentGenerationZeroEvaluationEvidenceV1 {
 }
 
 #[cfg(feature = "gpu-cuda")]
-struct ResidentGenerationGeneBatchV1 {
+pub(crate) struct ResidentGenerationGeneBatchV1 {
     descriptors: Vec<neoethos_gpu_contracts::device::GeneDescriptor>,
     offsets: Vec<i32>,
     indices: Vec<i32>,
@@ -864,7 +1165,7 @@ struct ResidentGenerationGeneBatchV1 {
 
 #[cfg(feature = "gpu-cuda")]
 impl ResidentGenerationGeneBatchV1 {
-    fn view(&self) -> neoethos_gpu_cuda::PopulationGeneView<'_> {
+    pub(crate) fn view(&self) -> neoethos_gpu_cuda::PopulationGeneView<'_> {
         neoethos_gpu_cuda::PopulationGeneView {
             descriptors: &self.descriptors,
             offsets: &self.offsets,
@@ -889,7 +1190,7 @@ fn try_reserve_exact_v1<T>(values: &mut Vec<T>, additional: usize, context: &str
 }
 
 #[cfg(feature = "gpu-cuda")]
-fn pack_resident_generation_genes_v1(
+pub(crate) fn pack_resident_generation_genes_v1(
     genes: &[Gene],
     feature_count: usize,
     config: &EvaluationConfig,
@@ -1069,23 +1370,31 @@ fn resident_generation_backtest_settings_v1(
             && config.pip_value_per_lot.to_bits() == receipt.pip_value_per_lot().to_bits(),
         "resident Generation-0 evaluation settings drifted from the financial sizing receipt"
     );
-    Ok(BacktestSettings {
-        max_hold_bars: config.max_hold_bars,
-        trailing_enabled: config.trailing_enabled,
-        trailing_atr_multiplier: config.trailing_atr_multiplier,
-        trailing_be_trigger_r: config.trailing_be_trigger_r,
-        trailing_min_lock_pips: config.trailing_min_lock_pips,
-        pip_value: config.pip_value,
-        spread_pips: config.spread_pips,
-        commission_per_trade: config.commission_per_trade,
-        pip_value_per_lot: config.pip_value_per_lot,
-        swap_long_pips_per_day: config.swap_long_pips_per_day,
-        swap_short_pips_per_day: config.swap_short_pips_per_day,
-        pnl_conversion_fee_rate: config.pnl_conversion_fee_rate,
-        adaptive_base_pips: None,
-        adaptive_rr: receipt.adaptive_rr(),
-        ..Default::default()
-    })
+    let mut settings = evaluation_backtest_settings(config)?;
+    settings.adaptive_base_pips = None;
+    settings.adaptive_rr = receipt.adaptive_rr();
+    Ok(settings)
+}
+
+/// Preserve the run's explicit account balance across the legacy native settings
+/// projection. An ambient balance is not authority for a prepared resident run.
+#[cfg(any(test, feature = "gpu-cuda"))]
+pub(crate) fn resident_generation_population_settings_v1(
+    settings: &BacktestSettings,
+) -> Result<neoethos_gpu_contracts::device::NeoPopulationSettings> {
+    let initial_equity = settings
+        .initial_equity_override
+        .context("resident Generation-0 requires an explicit initial equity")?;
+    ensure!(
+        initial_equity.is_finite() && initial_equity > 0.0,
+        "resident Generation-0 initial equity must be finite and positive"
+    );
+    let mut native =
+        crate::gpu_native::prototype_population_oracle::population_settings_for_settings(settings)
+            .map_err(anyhow::Error::new)
+            .context("build exact resident Generation-0 native settings")?;
+    native.initial_equity = initial_equity;
+    Ok(native)
 }
 
 #[cfg(feature = "gpu-cuda")]
@@ -1126,10 +1435,7 @@ fn evaluate_resident_generation_zero_v3(
         runtime_snapshot.smc_gate_disabled(),
     )?;
     let settings = resident_generation_backtest_settings_v1(config, receipt)?;
-    let native_settings =
-        crate::gpu_native::prototype_population_oracle::population_settings_for_settings(&settings)
-            .map_err(anyhow::Error::new)
-            .context("build exact resident Generation-0 native settings")?;
+    let native_settings = resident_generation_population_settings_v1(&settings)?;
     ensure!(
         usize::try_from(native_settings.month_capacity).ok() == Some(receipt.month_capacity()),
         "resident Generation-0 native month capacity drifted from the workspace receipt"
@@ -1332,12 +1638,17 @@ pub(crate) fn evolve_resident_generation_zero_v3<F>(
 where
     F: FnMut(usize, usize, f64, usize, usize),
 {
+    ensure!(
+        evaluation_config.growth_goal.is_none(),
+        "resident Generation-0 v5 does not support goal-pace v6"
+    );
     runtime_snapshot.validate_current("before resident Generation-0")?;
     runtime_snapshot.validate_against_receipt_v2(receipt)?;
     let sizing_policy = ExactSearchSizingPolicyV1::from_resident_population_receipt_v2(receipt)?;
     let mut launch_evidence = None;
     let result = evolve_search_with_generation_evaluator_v1(
         feature_names,
+        0.0, // Legacy native v5 does not consume a goal-pace span.
         receipt.resolved_population(),
         0,
         receipt.requested_max_indicators(),
@@ -1361,6 +1672,7 @@ where
             Ok(metrics)
         },
         progress_fn,
+        search_cancel_requested,
     )?;
     let evidence = launch_evidence.context("resident Generation-0 never reached CUDA")?;
     ensure!(
@@ -1557,23 +1869,13 @@ pub fn prepare_validation_population(
 
 /// ONE LAUNCH FOR THE WHOLE WORK LIST.
 ///
-/// The scenario twin of [`validation_genes_population`]. The gene array and the
-/// descriptor array are independent: 174 genes carrying 17 574 scenarios is one
-/// submission where the population form needed seven — six Monte-Carlo chunks
-/// and a sensitivity pass.
+/// The exact-authority scenario evaluator. The gene array and the descriptor
+/// array are independent: 174 genes carrying 17 574 scenarios is one submission
+/// where the former population form needed seven — six Monte-Carlo chunks and a
+/// sensitivity pass.
 ///
 /// Takes both caches by reference and touches the device exactly once, so a
 /// caller can hold `GPU_LAUNCH_LOCK` across this call and nothing else.
-pub fn validation_genes_scenarios(
-    features: &FeatureFrame,
-    ohlcv: &Ohlcv,
-    prep: &ValidationPrep,
-    prepared: &PreparedValidation,
-    scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
-) -> Result<Vec<[f64; 11]>> {
-    validation_genes_scenarios_inner(features, ohlcv, prep, prepared, scenarios, None)
-}
-
 pub(crate) fn validation_genes_scenarios_exact(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
@@ -1582,7 +1884,7 @@ pub(crate) fn validation_genes_scenarios_exact(
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
     exact_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
 ) -> Result<Vec<[f64; 11]>> {
-    validation_genes_scenarios_inner(features, ohlcv, prep, prepared, scenarios, Some(exact_run))
+    validation_genes_scenarios_inner(features, ohlcv, prep, prepared, scenarios, exact_run)
 }
 
 fn validation_genes_scenarios_inner(
@@ -1591,7 +1893,7 @@ fn validation_genes_scenarios_inner(
     prep: &ValidationPrep,
     prepared: &PreparedValidation,
     scenarios: &[neoethos_gpu_contracts::device::ScenarioDescriptor],
-    exact_run: Option<&crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>>,
+    exact_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
 ) -> Result<Vec<[f64; 11]>> {
     crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
     if scenarios.is_empty() {
@@ -1632,114 +1934,19 @@ fn validation_genes_scenarios_inner(
         weights: &prepared.smc_weights,
         settings: &prepared.settings,
     };
-    match exact_run {
-        Some(run) => {
-            let evidence = run
-                .seal_evaluation(
-                    &prepared.settings,
-                    crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::Full,
-                )
-                .map_err(anyhow::Error::new)?;
-            crate::eval::validation_backtest_scenarios_with_evidence(inputs, scenarios, &evidence)
-        }
-        None => crate::eval::validation_backtest_scenarios(inputs, scenarios),
-    }
-}
-
-pub fn validation_genes_population(
-    features: &FeatureFrame,
-    ohlcv: &Ohlcv,
-    genes: &[Gene],
-    config: &EvaluationConfig,
-    settings_template: &BacktestSettings,
-) -> Result<Vec<[f64; 11]>> {
-    crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
-    // Reports itself on first call — see `eval_telemetry`.
-    //
-    // This function was invisible. Its own in-tree measurement reads "eighteen
-    // of these calls take 413.6 s of a 452.4 s run — 23 s each — while the
-    // device stage timing inside one adds up to 0.30 s", and the only telemetry
-    // covering any of it started AFTER the prep below: the transpose, the
-    // month/day index build, the eleven SMC arrays and the adaptive-stop
-    // resolution were attributed to nothing at all. Two guards, because the
-    // whole-function total and the prep-only total answer different questions
-    // and only their difference names the culprit.
-    let _telemetry_started = std::time::Instant::now();
-    struct TelemetryGuard(&'static str, usize, std::time::Instant);
-    impl Drop for TelemetryGuard {
-        fn drop(&mut self) {
-            crate::eval_telemetry::record(self.0, self.1, self.2.elapsed());
-        }
-    }
-    let _telemetry = TelemetryGuard(
-        "search_engine::validation_genes_population",
-        genes.len(),
-        _telemetry_started,
-    );
-
-    if genes.is_empty() {
-        return Ok(Vec::new());
-    }
-    if features.n_samples() == 0 || features.n_features() == 0 {
-        bail!("empty feature matrix");
-    }
-    let n_samples = features.n_samples();
-    if ohlcv.close.len() != n_samples {
-        bail!("ohlcv length does not match feature rows");
-    }
-
-    let prep_started = std::time::Instant::now();
-    // Both halves, built here because this entry point has nowhere to cache
-    // them. That is the cost this signature imposes and the reason
-    // `ValidationPrep` exists as a separate type: a caller that makes more than
-    // one call — the quality screen made seven — should build the bar-derived
-    // half ONCE and use `validation_genes_scenarios` instead. There is one
-    // implementation of the prep either way, so the two paths cannot drift.
-    let prep = ValidationPrep::build(features, ohlcv)?;
-    let prepared = prepare_validation_population(ohlcv, genes, config, settings_template)?;
-
-    // Everything above — transpose, gene CSR pack, month/day indices, the
-    // eleven SMC arrays, the adaptive-stop resolution — is host work done
-    // BEFORE any device sees anything, on the full series, once per call. It is
-    // recorded separately from the whole-function total so the difference
-    // between the two lines is the evaluation itself; one number for both would
-    // charge the card for work it never did.
-    crate::eval_telemetry::record(
-        "search_engine::validation_genes_population/host_prep",
-        genes.len(),
-        prep_started.elapsed(),
-    );
-
-    Ok(crate::eval::validation_backtest_population(
-        crate::eval::PopulationEvalInputs {
-            close: &ohlcv.close,
-            high: &ohlcv.high,
-            low: &ohlcv.low,
-            indicators: prep.indicators.view(),
-            gene_offsets: &prepared.offsets,
-            gene_indices: &prepared.indices,
-            gene_weights: &prepared.weights,
-            long_thr: &prepared.long_thr,
-            short_thr: &prepared.short_thr,
-            month_idx: &prep.months,
-            day_idx: &prep.days,
-            timestamps: &features.timestamps,
-            sl_pips: &prepared.sl_pips,
-            tp_pips: &prepared.tp_pips,
-            stop_vol_mult: &prepared.stop_vol_mults,
-            smc_data: &prep.smc_data,
-            gene_smc_flags: &prepared.gene_smc_flags,
-            gate_threshold: prepared.gate_threshold,
-            weights: &prepared.smc_weights,
-            settings: &prepared.settings,
-        },
-    ))
+    let evidence = exact_run
+        .seal_evaluation(
+            &prepared.settings,
+            crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::Full,
+        )
+        .map_err(anyhow::Error::new)?;
+    crate::eval::validation_backtest_scenarios_with_evidence(inputs, scenarios, &evidence)
 }
 
 /// AREA 2 / Stage B (2026-06-09) — GPU-routed **CPCV fold** population eval over a
 /// NON-CONTIGUOUS gathered index set.
 ///
-/// This is the CPCV twin of [`validation_genes_population`]. The CPCV gate
+/// This is the CPCV population path used by the exact Discovery authority. The CPCV gate
 /// (`discovery::evaluate_cpcv_gate`) backtests every portfolio gene on each
 /// Combinatorial-Purged-CV fold, where a fold is a set of *gathered*
 /// (re-indexed, non-monotonic) absolute bar indices `absolute_idx`. The serial
@@ -1749,9 +1956,9 @@ pub fn validation_genes_population(
 /// kernel the SAME host-gathered contiguous buffers, so the kernel is byte-
 /// identical to the CPU's gathered-Vec path WITHOUT any kernel change.
 ///
-/// ## Why this can't reuse [`validation_genes_population`]
+/// ## Why this can't reuse the contiguous full-series preparation
 /// Two deliberate differences:
-///  1. **SMC is gathered, NOT recomputed.** `validation_genes_population` calls
+///  1. **SMC is gathered, NOT recomputed.** The full-series preparation calls
 ///     `build_smc_arrays` on the *passed* OHLCV. The SMC primitives in
 ///     `derive_smc_arrays` carry heavy cross-bar LOOKBACK (trend uses
 ///     `close[i-12]`, BoS/EQH/EQL use 12–20-bar windows, FVG/liq use 2–3-bar
@@ -1778,36 +1985,6 @@ pub fn validation_genes_population(
 ///
 /// Returns one `[f64; 11]` metric row per gene (same layout as
 /// [`crate::eval::evaluate_population_core`]).
-#[allow(clippy::too_many_arguments)]
-pub fn validation_genes_population_gathered(
-    full_indicators: ndarray::ArrayView2<'_, f64>,
-    full_smc: &[crate::eval::SmcRow],
-    genes: &[Gene],
-    config: &EvaluationConfig,
-    settings_template: &BacktestSettings,
-    absolute_idx: &[usize],
-    gathered_close: &[f64],
-    gathered_high: &[f64],
-    gathered_low: &[f64],
-    gathered_months: &[i64],
-    gathered_days: &[i64],
-) -> Result<Vec<[f64; 11]>> {
-    validation_genes_population_gathered_inner(
-        full_indicators,
-        full_smc,
-        genes,
-        config,
-        settings_template,
-        absolute_idx,
-        gathered_close,
-        gathered_high,
-        gathered_low,
-        gathered_months,
-        gathered_days,
-        None,
-    )
-}
-
 pub(crate) fn validation_genes_population_gathered_exact(
     full_indicators: ndarray::ArrayView2<'_, f64>,
     full_smc: &[crate::eval::SmcRow],
@@ -1834,7 +2011,7 @@ pub(crate) fn validation_genes_population_gathered_exact(
         gathered_low,
         gathered_months,
         gathered_days,
-        Some(exact_run),
+        exact_run,
     )
 }
 
@@ -1850,7 +2027,7 @@ fn validation_genes_population_gathered_inner(
     gathered_low: &[f64],
     gathered_months: &[i64],
     gathered_days: &[i64],
-    exact_run: Option<&crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>>,
+    exact_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
 ) -> Result<Vec<[f64; 11]>> {
     crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
     if genes.is_empty() || absolute_idx.is_empty() {
@@ -1988,19 +2165,16 @@ fn validation_genes_population_gathered_inner(
         weights: &smc_weights,
         settings: &settings,
     };
-    Ok(match exact_run {
-        Some(run) => {
-            let evidence = run
-                .seal_evaluation_with_timestamp_mode(
-                    &settings,
-                    crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::OrderedIndices(absolute_idx),
-                    crate::population_execution_evidence_v1::ExactPopulationTimestampModeV1::DisabledIndexDelta,
-                )
-                .map_err(anyhow::Error::new)?;
-            crate::eval::validation_backtest_population_with_evidence(inputs, &evidence)
-        }
-        None => crate::eval::validation_backtest_population(inputs),
-    })
+    let evidence = exact_run
+        .seal_evaluation_with_timestamp_mode(
+            &settings,
+            crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::OrderedIndices(absolute_idx),
+            crate::population_execution_evidence_v1::ExactPopulationTimestampModeV1::DisabledIndexDelta,
+        )
+        .map_err(anyhow::Error::new)?;
+    Ok(crate::eval::validation_backtest_population_with_evidence(
+        inputs, &evidence,
+    ))
 }
 
 /// Window-INDEPENDENT, gene-derived population arrays for the walk-forward
@@ -2010,7 +2184,7 @@ fn validation_genes_population_gathered_inner(
 /// This is the gene axis of the walk-forward transpose: the CSR genome arrays,
 /// the per-gene SL/TP (same finite-positive-else-20/40 fallback the rest of the
 /// validation tail uses), the per-gene SMC flags, the SMC weights, and the
-/// fixed-1-lot settings template. None of these depend on which split window is
+/// account-risk settings template. None of these depend on which split window is
 /// being evaluated.
 pub struct WalkforwardPopulationGenePack {
     offsets: Vec<i32>,
@@ -2026,9 +2200,7 @@ pub struct WalkforwardPopulationGenePack {
     gene_smc_flags: Vec<crate::eval::SmcRow>,
     smc_weights: [f64; 11],
     gate_threshold: f64,
-    /// Settings template with `risk_based_sizing` FORCED to `false` — the
-    /// fixed-1-lot semantics the single-gene walk-forward uses (`&[]` confidence
-    /// at validation.rs:1129-1130).
+    /// Unmodified account-risk policy shared with single-gene validation.
     settings: BacktestSettings,
     /// Pip size used to convert this window's adaptive base vol-distance into
     /// pips. Resolved ONCE here, by the same rule the scoring path uses
@@ -2073,10 +2245,8 @@ pub(crate) fn adaptive_pip_size(pip_value: f64, symbol: &str) -> f64 {
 impl WalkforwardPopulationGenePack {
     /// Build the gene-derived arrays ONCE for the walk-forward population.
     ///
-    /// `settings_template` is cloned and FORCED to fixed-1-lot
-    /// (`risk_based_sizing = false`) so the GPU metrics match the single-gene
-    /// walk-forward's legacy fixed-1-lot backtest, regardless of what the caller
-    /// passes (belt-and-suspenders, mirroring [`validation_genes_population`]).
+    /// Preserve the caller's sizing policy. Monte Carlo's explicitly fixed-lot
+    /// preparation is a different consumer and must not dictate account-risk WF.
     pub fn new(
         genes: &[Gene],
         config: &EvaluationConfig,
@@ -2127,8 +2297,7 @@ impl WalkforwardPopulationGenePack {
             config.smc_weight_eql,
             config.smc_weight_displacement,
         ];
-        let mut settings = settings_template.clone();
-        settings.risk_based_sizing = false;
+        let settings = settings_template.clone();
         Self {
             offsets,
             indices,
@@ -2163,59 +2332,12 @@ impl WalkforwardPopulationGenePack {
     }
 }
 
-/// AREA 2 / Stage C (2026-06-09) — GPU-routed population backtest on a single
-/// CONTIGUOUS walk-forward split window `[a, b)`.
-///
-/// The walk-forward population path ([`crate::validation::embargoed_walkforward_population`])
-/// calls this once per qualifying split. It slices the FULL-SERIES indicators +
-/// SMC + OHLCV + calendar arrays contiguously at `[a, b)` (NO gather — the WF
-/// test slice is contiguous by construction) and runs ONE GPU population launch
-/// over all genes in `pack` via [`crate::eval::validation_backtest_population`]
-/// (GPU-try → CPU fallback, fail-loud).
-///
-/// ## Parity with the single-gene walk-forward
-/// The single-gene path slices the PRECOMPUTED full-series `signals[a..b]` and
-/// backtests them with `&[]` confidence (fixed-1-lot). Here the kernel
-/// RE-SYNTHESIZES the signal from `indicators[.., a..b]` + `smc[a..b]`. Signal
-/// synthesis is fully POINTWISE (the SMC arrays carry lookback but are
-/// precomputed on the full series and then sliced, never recomputed on the
-/// slice), so the on-device synth at slice position `k` reads the SAME
-/// indicator + SMC values the full-series synth read at bar `a + k` → identical
-/// per-bar signal → identical metrics. `risk_based_sizing` is forced `false`
-/// (in [`WalkforwardPopulationGenePack::new`]) so sizing is fixed-1-lot, and
-/// `timestamps[a..b]` is passed through so gap/session logic matches the slice.
-///
-/// Returns one `[f64; 11]` metric row per gene (same order as the pack's genes).
-#[allow(clippy::too_many_arguments)]
-pub fn validation_genes_population_window(
-    pack: &WalkforwardPopulationGenePack,
-    full_indicators: ndarray::ArrayView2<'_, f64>,
-    full_smc: &[crate::eval::SmcRow],
-    full_close: &[f64],
-    full_high: &[f64],
-    full_low: &[f64],
-    full_months: &[i64],
-    full_days: &[i64],
-    full_timestamps: &[i64],
-    a: usize,
-    b: usize,
-) -> Result<Vec<[f64; 11]>> {
-    validation_genes_population_window_inner(
-        pack,
-        full_indicators,
-        full_smc,
-        full_close,
-        full_high,
-        full_low,
-        full_months,
-        full_days,
-        full_timestamps,
-        a,
-        b,
-        None,
-    )
-}
-
+/// Sealed-route population backtest on a contiguous walk-forward window.
+/// Full-series features and SMC rows are sliced, not recomputed. Pointwise
+/// synthesis preserves both the signal and its confidence. The pack's account
+/// risk policy and real timestamps are shared by metrics and diagnostics.
+/// CPU execution retains the ledger from that same simulation; native execution
+/// remains native and cannot silently substitute a CPU population evaluation.
 pub(crate) fn validation_genes_population_window_exact(
     pack: &WalkforwardPopulationGenePack,
     full_indicators: ndarray::ArrayView2<'_, f64>,
@@ -2229,7 +2351,7 @@ pub(crate) fn validation_genes_population_window_exact(
     a: usize,
     b: usize,
     exact_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
-) -> Result<Vec<[f64; 11]>> {
+) -> Result<crate::validation::WindowEvaluation> {
     validation_genes_population_window_inner(
         pack,
         full_indicators,
@@ -2242,7 +2364,7 @@ pub(crate) fn validation_genes_population_window_exact(
         full_timestamps,
         a,
         b,
-        Some(exact_run),
+        exact_run,
     )
 }
 
@@ -2258,8 +2380,8 @@ fn validation_genes_population_window_inner(
     full_timestamps: &[i64],
     a: usize,
     b: usize,
-    exact_run: Option<&crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>>,
-) -> Result<Vec<[f64; 11]>> {
+    exact_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
+) -> Result<crate::validation::WindowEvaluation> {
     crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
     // Where a validation window's time actually goes.
     //
@@ -2280,7 +2402,7 @@ fn validation_genes_population_window_inner(
     }
     let _window_timing = WindowTiming(window_started, pack.n_genes);
     if pack.n_genes == 0 {
-        return Ok(Vec::new());
+        return Ok(Vec::new().into());
     }
     let full_samples = full_indicators.ncols();
     if full_smc.len() != full_samples {
@@ -2300,6 +2422,7 @@ fn validation_genes_population_window_inner(
         || full_low.len() != full_samples
         || full_months.len() != full_samples
         || full_days.len() != full_samples
+        || full_timestamps.len() != full_samples
     {
         bail!("walk-forward full-series per-bar arrays must all equal the sample count");
     }
@@ -2314,19 +2437,15 @@ fn validation_genes_population_window_inner(
     let win_low = &full_low[a..b];
     let win_months = &full_months[a..b];
     let win_days = &full_days[a..b];
-    // Pass timestamps only when full-length (same guard as the single-gene path
-    // at validation.rs:1118-1122); otherwise empty ⇒ index-delta carry.
-    let win_ts: &[i64] = if full_timestamps.len() == full_samples {
-        &full_timestamps[a..b]
-    } else {
-        &[]
-    };
+    let win_ts = &full_timestamps[a..b];
 
     // Adaptive stops: scale this window's stop by ITS OWN high/low/close volatility
     // (open-independent base), on a clone of the pack settings. Fixed when no gene
     // is adaptive (byte-identical). Same reward:risk the scoring path uses.
     let mut win_settings = pack.settings.clone();
     if pack.stop_vol_mult.iter().any(|&m| m > 0.0) {
+        // Never index a full-series base from zero inside a shorter window.
+        win_settings.adaptive_base_pips = None;
         // CORRECTED 2026-08-04, twice over, and the two corrections meet here.
         // This block used to resolve its own pip with a `0.0001` fallback — the
         // JPY/metals bug F-761 removed from the scoring path in 2026-05-25,
@@ -2384,21 +2503,25 @@ fn validation_genes_population_window_inner(
         weights: &pack.smc_weights,
         settings: &win_settings,
     };
-    Ok(match exact_run {
-        Some(run) => {
-            let evidence = run
-                .seal_evaluation(
-                    &win_settings,
-                    crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::ContiguousRange {
-                        start: a,
-                        end: b,
-                    },
-                )
-                .map_err(anyhow::Error::new)?;
-            crate::eval::validation_backtest_population_with_evidence(inputs, &evidence)
-        }
-        None => crate::eval::validation_backtest_population(inputs),
-    })
+    let evidence = exact_run
+        .seal_evaluation(
+            &win_settings,
+            crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::ContiguousRange {
+                start: a,
+                end: b,
+            },
+        )
+        .map_err(anyhow::Error::new)?;
+    if evidence.require_cpu_route_receipt_v1().is_ok() {
+        let (metrics, trades) =
+            crate::eval::validation_backtest_population_with_ledger_cpu(inputs, &evidence)?;
+        Ok(crate::validation::WindowEvaluation {
+            metrics,
+            trades: Some(trades),
+        })
+    } else {
+        Ok(crate::eval::validation_backtest_population_with_evidence(inputs, &evidence).into())
+    }
 }
 
 pub fn evaluate_genes(
@@ -2495,24 +2618,7 @@ fn evaluate_genes_impl(
         config.smc_weight_displacement,
     ];
 
-    let mut b_settings = BacktestSettings {
-        max_hold_bars: config.max_hold_bars,
-        trailing_enabled: config.trailing_enabled,
-        trailing_atr_multiplier: config.trailing_atr_multiplier,
-        trailing_be_trigger_r: config.trailing_be_trigger_r,
-        // Carried explicitly (2026-08-09): it was inheriting the struct default
-        // here while the other three came from `config`, so a change to the
-        // lock-in floor reached the funnel and not the GA.
-        trailing_min_lock_pips: config.trailing_min_lock_pips,
-        pip_value: config.pip_value,
-        spread_pips: config.spread_pips,
-        commission_per_trade: config.commission_per_trade,
-        pip_value_per_lot: config.pip_value_per_lot,
-        swap_long_pips_per_day: config.swap_long_pips_per_day,
-        swap_short_pips_per_day: config.swap_short_pips_per_day,
-        pnl_conversion_fee_rate: config.pnl_conversion_fee_rate,
-        ..Default::default()
-    };
+    let mut b_settings = evaluation_backtest_settings(config)?;
     let stop_vol_mults = resolve_adaptive_stops(
         genes,
         &ohlcv.high,
@@ -2773,6 +2879,7 @@ where
         max_runtime,
         eval_config,
         None,
+        None,
         &sizing_policy,
         progress_fn,
     )
@@ -2803,6 +2910,7 @@ where
         None,
         eval_config,
         None,
+        None,
         &sizing_policy,
         progress_fn,
     )
@@ -2820,6 +2928,7 @@ pub(crate) fn evolve_search_with_progress_and_limits_exact<F>(
     exact_run: &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
     exact_view: crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1<'_>,
     search_authority: &crate::run_identity::PopulationAutoSearchAuthorityV1,
+    prepared_eval_cache: Option<EvalDataCache>,
     progress_fn: F,
 ) -> Result<SearchResult>
 where
@@ -2842,6 +2951,7 @@ where
         max_indicators,
         max_runtime,
         eval_config,
+        prepared_eval_cache,
         Some((exact_run, exact_view)),
         &sizing_policy,
         progress_fn,
@@ -2857,6 +2967,7 @@ fn evolve_search_with_progress_impl<F>(
     max_indicators: usize,
     max_runtime: Option<Duration>,
     eval_config: Option<EvaluationConfig>,
+    prepared_eval_cache: Option<EvalDataCache>,
     exact_execution: Option<(
         &crate::population_execution_evidence_v1::ExactPopulationExecutionRunV1<'_>,
         crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1<'_>,
@@ -2871,7 +2982,20 @@ where
     // host route builds its immutable bar cache once and supplies only the
     // generation evaluator closure below; the resident V3 route supplies a
     // purpose-bound session evaluator and never constructs this cache.
-    let eval_cache = EvalDataCache::build(features, ohlcv)?;
+    let eval_cache = match prepared_eval_cache {
+        Some(cache) => {
+            anyhow::ensure!(
+                cache.indicators.nrows() == features.n_features()
+                    && cache.indicators.ncols() == features.n_samples()
+                    && cache.months.len() == features.n_samples()
+                    && cache.days.len() == features.n_samples()
+                    && cache.smc_data.len() == features.n_samples(),
+                "prepared exact Stage-1 cache shape is detached from the search input"
+            );
+            cache
+        }
+        None => EvalDataCache::build(features, ohlcv)?,
+    };
     let mut evaluate_generation = |genes: &[Gene], config: &EvaluationConfig| {
         evaluate_genes_cached(
             features,
@@ -2885,6 +3009,13 @@ where
     };
     evolve_search_with_generation_evaluator_v1(
         &features.names,
+        features
+            .timestamps
+            .last()
+            .zip(features.timestamps.first())
+            .and_then(|(last, first)| last.checked_sub(*first))
+            .map(|milliseconds| milliseconds as f64 / 86_400_000.0)
+            .unwrap_or(0.0),
         population,
         generations,
         max_indicators,
@@ -2893,12 +3024,433 @@ where
         sizing_policy,
         &mut evaluate_generation,
         progress_fn,
+        search_cancel_requested,
     )
+}
+
+/// Exact mean Jaccard distance to the `k` nearest population neighbours.
+///
+/// Gene signatures are sparse feature-index sets. An inverted feature index
+/// therefore finds every candidate with non-zero intersection without
+/// visiting the disjoint Cartesian product. Those overlap candidates have
+/// distance `< 1`; if fewer than `k` exist, the remaining nearest-neighbour
+/// slots are exactly the disjoint distance `1`. Empty signatures retain the
+/// canonical Jaccard convention used by the previous implementation:
+/// empty-to-empty distance is `0`, while empty-to-non-empty is `1`.
+fn exact_sparse_jaccard_knn_novelty_v1(
+    index_sets: &[HashSet<usize>],
+    requested_neighbors: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+
+    let population = index_sets.len();
+    if population <= 1 {
+        return vec![0.0; population];
+    }
+    let neighbors = requested_neighbors.min(population - 1);
+    if neighbors == 0 {
+        return vec![0.0; population];
+    }
+
+    let mut postings: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut empty_signatures = 0usize;
+    for (candidate, signature) in index_sets.iter().enumerate() {
+        if signature.is_empty() {
+            empty_signatures += 1;
+        }
+        for feature in signature {
+            postings.entry(*feature).or_default().push(candidate);
+        }
+    }
+
+    // Candidate IDs are dense in this generation. Reuse bounded counters per
+    // chunk instead of allocating/hashing an intersection map per candidate.
+    // At most the current leased pool's worker count owns scratch buffers; no
+    // population-squared matrix or second pool is created.
+    let chunk_size = population.div_ceil(rayon::current_num_threads().max(1));
+    let mut novelty = vec![0.0; population];
+    novelty
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk, output)| {
+            let mut intersections = vec![0usize; population];
+            let mut touched = Vec::with_capacity(population);
+            let mut overlap_distances = Vec::with_capacity(population);
+            for (offset, value) in output.iter_mut().enumerate() {
+                let candidate = chunk * chunk_size + offset;
+                let signature = &index_sets[candidate];
+                if signature.is_empty() {
+                    let zero_distance_neighbors = empty_signatures.saturating_sub(1).min(neighbors);
+                    *value = (neighbors - zero_distance_neighbors) as f64 / neighbors as f64;
+                    continue;
+                }
+
+                for feature in signature {
+                    if let Some(candidates) = postings.get(feature) {
+                        for &other in candidates {
+                            if other != candidate {
+                                if intersections[other] == 0 {
+                                    touched.push(other);
+                                }
+                                intersections[other] += 1;
+                            }
+                        }
+                    }
+                }
+
+                for other in touched.drain(..) {
+                    let intersection = std::mem::take(&mut intersections[other]);
+                    let union = signature.len() + index_sets[other].len() - intersection;
+                    debug_assert!(union > 0 && intersection <= union);
+                    overlap_distances.push(1.0 - intersection as f64 / union as f64);
+                }
+
+                if overlap_distances.len() > neighbors {
+                    overlap_distances
+                        .select_nth_unstable_by(neighbors - 1, |left, right| left.total_cmp(right));
+                    overlap_distances.truncate(neighbors);
+                }
+                // Signature iteration order is intentionally unspecified. Sorting
+                // the at-most-k selected distances makes the floating-point sum
+                // bitwise deterministic for the same population.
+                overlap_distances.sort_unstable_by(f64::total_cmp);
+                let disjoint_neighbors = neighbors - overlap_distances.len();
+                *value = (overlap_distances.iter().sum::<f64>() + disjoint_neighbors as f64)
+                    / neighbors as f64;
+                overlap_distances.clear();
+            }
+        });
+    novelty
+}
+
+#[cfg(test)]
+mod sparse_novelty_tests {
+    use super::*;
+
+    // Previous production algorithm, retained only as a test/benchmark oracle.
+    fn legacy_sparse_knn(sets: &[HashSet<usize>], requested: usize) -> Vec<f64> {
+        use rayon::prelude::*;
+        let n = sets.len();
+        let k = requested.min(n.saturating_sub(1));
+        if k == 0 {
+            return vec![0.0; n];
+        }
+        let mut postings: HashMap<usize, Vec<usize>> = HashMap::new();
+        let empty = sets.iter().filter(|s| s.is_empty()).count();
+        for (i, set) in sets.iter().enumerate() {
+            for feature in set {
+                postings.entry(*feature).or_default().push(i);
+            }
+        }
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let set = &sets[i];
+                if set.is_empty() {
+                    return (k - empty.saturating_sub(1).min(k)) as f64 / k as f64;
+                }
+                let mut counts: HashMap<usize, usize> = HashMap::new();
+                for feature in set {
+                    for &other in &postings[feature] {
+                        if i != other {
+                            *counts.entry(other).or_default() += 1;
+                        }
+                    }
+                }
+                let mut distances = counts
+                    .into_iter()
+                    .map(|(j, intersection)| {
+                        1.0 - intersection as f64
+                            / (set.len() + sets[j].len() - intersection) as f64
+                    })
+                    .collect::<Vec<_>>();
+                if distances.len() > k {
+                    distances.select_nth_unstable_by(k - 1, f64::total_cmp);
+                    distances.truncate(k);
+                }
+                distances.sort_unstable_by(f64::total_cmp);
+                (distances.iter().sum::<f64>() + (k - distances.len()) as f64) / k as f64
+            })
+            .collect()
+    }
+
+    fn mixed_signatures(count: usize) -> Vec<HashSet<usize>> {
+        let mut rng = StdRng::seed_from_u64(0x4e45_4f);
+        (0..count)
+            .map(|i| {
+                if i % 17 == 0 {
+                    return HashSet::new();
+                }
+                if i % 7 == 0 {
+                    return [0, 1, 2].into_iter().collect();
+                }
+                let width = rng.random_range(1..=12);
+                rand::seq::index::sample(&mut rng, 240, width)
+                    .iter()
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reused_novelty_scratch_is_bit_exact_across_workers_and_neighbourhoods() {
+        let mut sets = mixed_signatures(173);
+        // Sparse feature identifiers must not become dense allocation extents.
+        sets.push([usize::MAX, usize::MAX - 1].into_iter().collect());
+        for workers in [1, 2, 5, 10] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            for k in [0, 1, 5, 20, 173, usize::MAX] {
+                let expected = pool.install(|| legacy_sparse_knn(&sets, k));
+                let actual = pool.install(|| exact_sparse_jaccard_knn_novelty_v1(&sets, k));
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "workers={workers} k={k}"
+                );
+            }
+        }
+        assert!(exact_sparse_jaccard_knn_novelty_v1(&[], 20).is_empty());
+        assert_eq!(
+            exact_sparse_jaccard_knn_novelty_v1(&[HashSet::new()], 20),
+            [0.0]
+        );
+    }
+
+    #[test]
+    #[ignore = "bounded bookkeeping benchmark; run explicitly, not on every test invocation"]
+    fn benchmark_novelty_at_m30_population() {
+        use std::hint::black_box;
+        let sets = mixed_signatures(21_069);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(10)
+            .build()
+            .unwrap();
+        for attempt in 0..2 {
+            let started = Instant::now();
+            let expected = pool.install(|| legacy_sparse_knn(black_box(&sets), 15));
+            let old_elapsed = started.elapsed();
+            let started = Instant::now();
+            let actual = pool.install(|| exact_sparse_jaccard_knn_novelty_v1(black_box(&sets), 15));
+            let new_elapsed = started.elapsed();
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "GA novelty benchmark population=21069 features=240 max_terms=12 workers=10 k=15 attempt={attempt} legacy_s={:.6} optimized_s={:.6} exact_scores=true debug_assertions={}",
+                old_elapsed.as_secs_f64(),
+                new_elapsed.as_secs_f64(),
+                cfg!(debug_assertions)
+            );
+        }
+    }
+
+    fn signature(indices: &[usize]) -> HashSet<usize> {
+        indices.iter().copied().collect()
+    }
+
+    fn brute_force_knn(signatures: &[HashSet<usize>], requested_neighbors: usize) -> Vec<f64> {
+        if signatures.len() <= 1 {
+            return vec![0.0; signatures.len()];
+        }
+        let neighbors = requested_neighbors.min(signatures.len() - 1);
+        if neighbors == 0 {
+            return vec![0.0; signatures.len()];
+        }
+        signatures
+            .iter()
+            .enumerate()
+            .map(|(candidate, signature)| {
+                let mut distances = signatures
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(other, other_signature)| {
+                        (other != candidate).then(|| {
+                            let intersection = signature.intersection(other_signature).count();
+                            let union = signature.union(other_signature).count();
+                            if union == 0 {
+                                0.0
+                            } else {
+                                1.0 - intersection as f64 / union as f64
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                distances.sort_unstable_by(f64::total_cmp);
+                distances[..neighbors].iter().sum::<f64>() / neighbors as f64
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sparse_inverted_index_matches_exact_cartesian_knn() {
+        let signatures = vec![
+            signature(&[1, 2, 3]),
+            signature(&[1, 2, 3]),
+            signature(&[1, 2]),
+            signature(&[2, 4]),
+            signature(&[5]),
+            signature(&[]),
+            signature(&[]),
+        ];
+        for neighbors in [0, 1, 2, 3, 6, 99] {
+            let expected = brute_force_knn(&signatures, neighbors);
+            let actual = exact_sparse_jaccard_knn_novelty_v1(&signatures, neighbors);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "k={neighbors}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_neighbourhood_changes_selection_signal_and_is_deterministic() {
+        let signatures = vec![
+            signature(&[1, 2, 3]),
+            signature(&[1, 2, 3]),
+            signature(&[1]),
+            signature(&[8]),
+        ];
+        let nearest = exact_sparse_jaccard_knn_novelty_v1(&signatures, 1);
+        let complete = exact_sparse_jaccard_knn_novelty_v1(&signatures, usize::MAX);
+        assert_ne!(nearest[0].to_bits(), complete[0].to_bits());
+        let expected_bits = nearest
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        for _ in 0..16 {
+            assert_eq!(
+                exact_sparse_jaccard_knn_novelty_v1(&signatures, 1)
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected_bits
+            );
+        }
+    }
+}
+
+/// Exact behavior key for the bounded final handoff, not the exploration ledger.
+/// The ledger deliberately rounds numeric traits; using it here would discard
+/// different evaluated strategies. Preserve term order and every f64 bit, while
+/// excluding display IDs, ancestry and measured results. HashMap equality also
+/// compares the complete key, so a hash collision cannot discard a candidate.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct EvaluatedGeneBehaviorKey {
+    indices: Vec<usize>,
+    weights: Vec<u64>,
+    numeric_traits: [u64; 5],
+    smc_flags: u16,
+}
+
+impl EvaluatedGeneBehaviorKey {
+    fn new(gene: &Gene) -> Self {
+        Self {
+            indices: gene.indices.clone(),
+            weights: gene.weights.iter().map(|value| value.to_bits()).collect(),
+            numeric_traits: [
+                gene.long_threshold.to_bits(),
+                gene.short_threshold.to_bits(),
+                gene.sl_pips.to_bits(),
+                gene.tp_pips.to_bits(),
+                gene.stop_vol_mult.to_bits(),
+            ],
+            smc_flags: super::diversity::smc_mask(gene),
+        }
+    }
+}
+
+/// Keep the admitted archive AND the complete last evaluated population.
+/// A single profitable archive entry must not suppress all remaining evaluated
+/// candidates. Only compact genes/metrics cross this boundary; downstream
+/// validation still owns its separate RAM-bounded signal and ledger batches.
+/// The existing archive admission/cap policy is unchanged. This union is bounded
+/// by archive length + final population, not population * generations.
+pub(crate) fn finish_evaluated_generation(
+    mut archive: Vec<(Gene, [f64; 11], usize)>,
+    scored: Vec<(f64, usize, Gene, [f64; 11])>,
+    effective_smc_gate_threshold: f64,
+    evaluation_slots: u64,
+) -> SearchResult {
+    let archive_entries = archive.len();
+    let final_population = scored.len();
+    let mut positions = HashMap::with_capacity(archive_entries + final_population);
+    let mut candidates = Vec::with_capacity(archive_entries + final_population);
+    // Preserve archive insertion order for deterministic net-profit ties.
+    archive.sort_by_key(|(_, _, sequence)| *sequence);
+    for (gene, metrics, _) in archive {
+        let key = EvaluatedGeneBehaviorKey::new(&gene);
+        if let std::collections::hash_map::Entry::Vacant(entry) = positions.entry(key) {
+            entry.insert((candidates.len(), false));
+            candidates.push((gene, metrics));
+        }
+    }
+    for (_, _, gene, metrics) in scored {
+        let key = EvaluatedGeneBehaviorKey::new(&gene);
+        match positions.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((candidates.len(), true));
+                candidates.push((gene, metrics));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (index, current_generation) = *entry.get();
+                if !current_generation {
+                    // An archive duplicate must carry the final generation's
+                    // measured metrics and ID, not an earlier annealed gate.
+                    candidates[index] = (gene, metrics);
+                    entry.get_mut().1 = true;
+                }
+            }
+        }
+    }
+    drop(positions);
+    // Keep the former archive's net ordering. Invalid final-population metrics
+    // remain visible to the existing downstream rejection gates, ranked last.
+    candidates.sort_by(|left, right| {
+        let finite_net = |value: f64| {
+            if value == 0.0 {
+                // Match archive retention: signed zero is one economic tie.
+                0.0
+            } else if value.is_finite() {
+                value
+            } else {
+                f64::NEG_INFINITY
+            }
+        };
+        finite_net(right.1[0]).total_cmp(&finite_net(left.1[0]))
+    });
+    tracing::info!(
+        target: "neoethos_search::funnel",
+        evaluation_slots,
+        archive_entries,
+        final_population,
+        returned_exact_unique = candidates.len(),
+        duplicate_handoff_entries = archive_entries + final_population - candidates.len(),
+        whole_run_unique_evaluated_recorded = false,
+        "GA handoff: evaluation slots include repeated survivors; exact uniqueness is measured only for the returned archive/final-population union"
+    );
+    let (genes, metrics) = candidates.into_iter().unzip();
+    SearchResult {
+        genes,
+        metrics,
+        effective_smc_gate_threshold,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn evolve_search_with_generation_evaluator_v1<F, E>(
     feature_names: &[String],
+    evaluation_span_days: f64,
     population: usize,
     generations: usize,
     max_indicators: usize,
@@ -2907,6 +3459,7 @@ fn evolve_search_with_generation_evaluator_v1<F, E>(
     sizing_policy: &ExactSearchSizingPolicyV1,
     mut evaluate_generation: E,
     mut progress_fn: F,
+    mut cancel_requested: impl FnMut() -> bool,
 ) -> Result<SearchResult>
 where
     F: FnMut(usize, usize, f64, usize, usize),
@@ -2935,6 +3488,31 @@ where
     let (gate_lo, gate_hi) = (gate_start.min(gate_end), gate_start.max(gate_end));
 
     let mut eval_cfg = eval_config.unwrap_or_default();
+    if let Some(goal) = eval_cfg.growth_goal {
+        goal.validate().map_err(|error| anyhow!(error))?;
+        anyhow::ensure!(
+            eval_cfg.growth_objective,
+            "goal-pace objective requires Risky growth mode"
+        );
+        anyhow::ensure!(
+            evaluation_span_days.is_finite()
+                && evaluation_span_days > 0.0
+                && eval_cfg.initial_equity.is_finite()
+                && eval_cfg.initial_equity > 0.0,
+            "goal-pace objective requires actual positive evaluation span and starting balance"
+        );
+        tracing::info!(
+            target: "neoethos_search::search_engine",
+            scoring_version = 6,
+            reference_start_balance = goal.start_balance,
+            reference_target_balance = goal.target_balance,
+            horizon_days = goal.horizon_days,
+            simulation_initial_balance = eval_cfg.initial_equity,
+            account_currency = %eval_cfg.account_currency,
+            evaluation_span_days,
+            "Risky GA optimizes realized-balance goal pace (screening proxy, not goal probability or a replay at reference capital)"
+        );
+    }
     eval_cfg.smc_gate_threshold = gate_start.clamp(gate_lo, gate_hi);
 
     let seen_retry_attempts = genetic_runtime_overrides.effective_seen_retry_attempts();
@@ -3036,16 +3614,7 @@ where
         })
         .collect();
 
-    let mut best_metrics = Vec::new();
-    let mut profitable_archive: Vec<(Gene, [f64; 11], usize)> = Vec::new();
-    let mut archive_seq = 0usize;
-    // Item 4 from the search optimization notes: dedupe by `gene_signature_hash`
-    // (a function of the canonical genome — sorted indices, weights, thresholds
-    // and SMC flags) instead of `strategy_id`. The strategy_id is randomly
-    // regenerated by `crossover`/`mutate` every generation, so two genomes
-    // that compute the same signal kept getting archived under different ids.
-    let mut seen_gene_hashes: HashSet<u64> = HashSet::new();
-
+    let mut evaluation_slots = 0_u64;
     // Archive scoring thresholds and selection policy come from the typed
     // overrides resolved above; no further env reads are necessary here.
     let archive_mode = genetic_runtime_overrides.archive_scoring.mode.clone();
@@ -3053,6 +3622,7 @@ where
     let archive_min_pf = genetic_runtime_overrides.archive_scoring.min_pf;
     let archive_min_sharpe = genetic_runtime_overrides.archive_scoring.min_sharpe;
     let archive_cap = genetic_runtime_overrides.effective_archive_cap(population, generations);
+    let mut profitable_archive = BoundedProfitableArchive::new(archive_cap);
     let base_immigrant_ratio = resolved_selection.immigrant_ratio;
     let base_survivor_fraction = resolved_selection.survivor_fraction;
     let parent_selection = resolved_selection.parent;
@@ -3081,10 +3651,51 @@ where
     let convergence_min_elapsed_fraction =
         genetic_runtime_overrides.effective_convergence_min_elapsed_fraction();
 
-    // Default OFF to avoid O(n²) cost; set > 0 only for large populations.
+    // Default OFF. When enabled, exact sparse k-NN novelty uses the configured
+    // neighbourhood instead of averaging the complete population.
     let novelty_weight = genetic_runtime_overrides.novelty_weight;
+    let novelty_neighbors = genetic_runtime_overrides.novelty_neighbors;
+    if !novelty_weight.is_finite() || !(0.0..=1.0).contains(&novelty_weight) {
+        bail!("novelty_weight must be finite and inside 0..=1, got {novelty_weight}");
+    }
+    if novelty_weight > 0.0 && novelty_neighbors == 0 {
+        bail!("novelty_neighbors must be greater than zero when novelty scoring is enabled");
+    }
 
     let started_at = Instant::now();
+    // Disjoint wall-clock regions inside the GA, not summed worker CPU time.
+    // Keep one run-local summary so bookkeeping cannot hide inside a large
+    // unexplained difference between total GA time and evaluator telemetry.
+    struct GenerationTiming {
+        started: Instant,
+        evaluation: Duration,
+        novelty: Duration,
+        archive: Duration,
+        reproduction: Duration,
+    }
+    impl Drop for GenerationTiming {
+        fn drop(&mut self) {
+            let total = self.started.elapsed();
+            let accounted = self.evaluation + self.novelty + self.archive + self.reproduction;
+            tracing::info!(
+                target: "neoethos_search::search_engine",
+                total_s = total.as_secs_f64(),
+                evaluation_s = self.evaluation.as_secs_f64(),
+                novelty_s = self.novelty.as_secs_f64(),
+                archive_s = self.archive.as_secs_f64(),
+                reproduction_s = self.reproduction.as_secs_f64(),
+                other_s = total.saturating_sub(accounted).as_secs_f64(),
+                "GA wall-time breakdown (disjoint regions; includes completed work on early exit)"
+            );
+        }
+    }
+    let mut timing = GenerationTiming {
+        started: started_at,
+        evaluation: Duration::ZERO,
+        novelty: Duration::ZERO,
+        archive: Duration::ZERO,
+        reproduction: Duration::ZERO,
+    };
     let mut best_score_seen = f64::NEG_INFINITY;
     let mut stagnant_gens = 0usize;
     // Wall-clock timestamp of the last *meaningful* top-fitness improvement.
@@ -3099,8 +3710,15 @@ where
     let mut warned_gate_floor = false;
 
     if generations == 0 {
-        let metrics = evaluate_generation(&genes, &eval_cfg)?;
-        apply_metrics(&mut genes, &metrics, eval_cfg.growth_objective);
+        let evaluation_started = Instant::now();
+        let metrics = evaluate_generation(&genes, &eval_cfg);
+        timing.evaluation += evaluation_started.elapsed();
+        let metrics = metrics?;
+        anyhow::ensure!(
+            metrics.len() == genes.len(),
+            "generation evaluator metric count differs from population"
+        );
+        apply_metrics(&mut genes, &metrics, &eval_cfg, evaluation_span_days);
         seen_memory.flush();
         return Ok(SearchResult {
             genes,
@@ -3110,15 +3728,19 @@ where
     }
 
     for generation in 0..generations {
-        // Operator Stop: interrupt the GA mid-search (returns the best-so-far;
-        // the discovery driver then treats the run as cancelled and skips export).
-        if search_cancel_requested() {
+        // A cancelled run must not return the unevaluated next generation with
+        // the previous generation's metrics. The driver retains its cancellation
+        // flag/status and cannot validate/export a successful SearchResult.
+        if cancel_requested() {
             tracing::info!(
                 target: "neoethos_search",
                 generation,
                 "discovery cancelled by operator — stopping GA early"
             );
-            break;
+            bail!(
+                "__DISCOVERY_CANCELLED__: discovery cancelled by operator before generation {}",
+                generation + 1
+            );
         }
         let progress = (generation as f64) / ((generations - 1) as f64).max(1.0);
         let mut gate_now = gate_start + (gate_end - gate_start) * progress.powf(gate_curve);
@@ -3153,8 +3775,20 @@ where
         }
         eval_cfg.smc_gate_threshold = gate_now.clamp(gate_lo, gate_hi);
 
-        let metrics = evaluate_generation(&genes, &eval_cfg)?;
-        apply_metrics(&mut genes, &metrics, eval_cfg.growth_objective);
+        let evaluation_started = Instant::now();
+        let metrics = evaluate_generation(&genes, &eval_cfg);
+        timing.evaluation += evaluation_started.elapsed();
+        let metrics = metrics?;
+        anyhow::ensure!(
+            metrics.len() == genes.len(),
+            "generation evaluator returned {} metric rows for {} candidates",
+            metrics.len(),
+            genes.len()
+        );
+        evaluation_slots = evaluation_slots
+            .checked_add(u64::try_from(genes.len())?)
+            .ok_or_else(|| anyhow!("GA evaluation-slot count overflow"))?;
+        apply_metrics(&mut genes, &metrics, &eval_cfg, evaluation_span_days);
 
         let mut scored: Vec<(f64, usize, Gene, [f64; 11])> = genes
             .iter()
@@ -3165,40 +3799,18 @@ where
             .collect();
 
         // --- Novelty Search: Behavioral Diversity ---
-        // Pre-compute all HashSets once and run the O(n²) Jaccard pass in
-        // parallel — turns a single-threaded bottleneck into Ncores× faster.
+        // Build each sparse signature once. The inverted-index evaluator visits
+        // only candidates sharing at least one feature and then pads any
+        // remaining k-NN slots with the exact disjoint-set distance of one.
         if novelty_weight > 0.0 && scored.len() > 1 {
-            use rayon::prelude::*;
+            let novelty_started = Instant::now();
             let n_pop = scored.len();
             let index_sets: Vec<HashSet<usize>> = scored
                 .iter()
                 .map(|(_, _, g, _)| g.indices.iter().copied().collect())
                 .collect();
-
-            // Parallel: each row i computes its mean Jaccard distance to the
-            // remaining population. Each pair is touched twice (i→j and j→i),
-            // matching the previous semantics exactly while running in parallel.
-            let novelty_scores: Vec<f64> = (0..n_pop)
-                .into_par_iter()
-                .map(|i| {
-                    let sig_i = &index_sets[i];
-                    let mut dist_sum = 0.0;
-                    for (j, sig_j) in index_sets.iter().enumerate() {
-                        if i == j {
-                            continue;
-                        }
-                        let intersection = sig_i.intersection(sig_j).count() as f64;
-                        let union = sig_i.union(sig_j).count() as f64;
-                        let jaccard_dist = if union > 0.0 {
-                            1.0 - (intersection / union)
-                        } else {
-                            0.0
-                        };
-                        dist_sum += jaccard_dist;
-                    }
-                    dist_sum / (n_pop as f64 - 1.0)
-                })
-                .collect();
+            let novelty_scores =
+                exact_sparse_jaccard_knn_novelty_v1(&index_sets, novelty_neighbors);
 
             // Normalize and blend
             let min_fit = scored
@@ -3227,6 +3839,7 @@ where
                 // Modify the sorting score purely for the tournament survival/elites
                 scored[i].0 = (1.0 - novelty_weight) * norm_fit + novelty_weight * norm_nov;
             }
+            timing.novelty += novelty_started.elapsed();
         }
         // ------------------------------------------
 
@@ -3267,14 +3880,15 @@ where
         // other. Measured on M3 (1 757 261 bars): 4 archived from a population
         // of 2 048, and the run finished in 77 s with an empty portfolio
         // because there was nothing to validate.
+        let archive_started = Instant::now();
         let mut rejected_non_finite = 0usize;
         let mut rejected_no_trades = 0usize;
         let mut rejected_threshold = 0usize;
         let mut rejected_duplicate = 0usize;
+        let mut rejected_capacity = 0usize;
+        let mut archive_replaced = 0usize;
+        let mut archive_improved_duplicates = 0usize;
         for (_score, _, gene, m) in scored.iter() {
-            if profitable_archive.len() >= archive_cap {
-                break;
-            }
             let (net, sharpe, pf, trades) = (m[0], m[1], m[5], m[8]);
             if !net.is_finite() || !sharpe.is_finite() || !pf.is_finite() || !trades.is_finite() {
                 rejected_non_finite += 1;
@@ -3294,22 +3908,26 @@ where
                 rejected_threshold += 1;
                 continue;
             }
-            // Hash the canonical genome (after `Gene::normalize`) so two
-            // mutated copies that produce the SAME signal collapse to one
-            // archive entry regardless of their randomly-assigned strategy_id.
-            let mut canonical = gene.clone();
-            canonical.normalize(n_indicators, 1);
-            let hash = gene_signature_hash(&canonical);
-            if !seen_gene_hashes.insert(hash) {
-                rejected_duplicate += 1;
-                continue;
+            // Capacity bounds retention, not consideration. Exact behavior
+            // identity and finite-net ranking retain later better observations
+            // without changing admission thresholds or the final union policy.
+            match profitable_archive.offer(gene, m)? {
+                ArchiveOffer::Inserted => {}
+                ArchiveOffer::ReplacedWorst => archive_replaced += 1,
+                ArchiveOffer::ImprovedDuplicate => archive_improved_duplicates += 1,
+                ArchiveOffer::RejectedDuplicate => rejected_duplicate += 1,
+                ArchiveOffer::RejectedCapacity => rejected_capacity += 1,
+                ArchiveOffer::RejectedNonFinite => rejected_non_finite += 1,
+                ArchiveOffer::RejectedNoTrades => rejected_no_trades += 1,
             }
-            profitable_archive.push((gene.clone(), *m, archive_seq));
-            archive_seq += 1;
         }
         // Say which rule emptied the generation, and only when it matters —
         // a healthy archive does not need narrating every generation.
-        if profitable_archive.len() < scored.len() / 8 {
+        if profitable_archive.len() < scored.len() / 8
+            || archive_replaced > 0
+            || archive_improved_duplicates > 0
+            || rejected_capacity > 0
+        {
             tracing::info!(
                 target: "neoethos_search::funnel",
                 generation = generation + 1,
@@ -3320,13 +3938,17 @@ where
                 rejected_no_trades,
                 rejected_threshold,
                 rejected_duplicate,
+                rejected_capacity,
+                archive_replaced,
+                archive_improved_duplicates,
                 min_net = archive_min_net,
                 min_pf = archive_min_pf,
                 min_sharpe = archive_min_sharpe,
-                "GA archive is nearly empty — this is which rule rejected the rest"
+                "GA archive admission/replacement census — retained observations are not OOS validation"
             );
         }
 
+        timing.archive += archive_started.elapsed();
         progress_fn(
             generation + 1,
             generations,
@@ -3344,7 +3966,7 @@ where
         // analysis: heavy TFs stagnate early and burn ~90% of the budget for
         // nothing). `convergence_patience == 0` disables. Fail-loud: the reason
         // is logged at INFO so this is never mistaken for a crash / silent
-        // truncation. Returns via the SAME archive-or-top_candidates logic as
+        // truncation. Returns via the SAME archive/final-population union as
         // the wall-clock cap below so downstream finalize is byte-identical.
         // Intentionally placed BEFORE the max_runtime check: if a generation is
         // both converged and over-budget, both paths yield identical output and
@@ -3403,150 +4025,41 @@ where
                 "GA converged: early-stopping this combo (flat past the wall-clock \
                  floor); advancing to the next."
             );
-            let best_return_count = population
-                .clamp(2, (population / 2).clamp(100, 500))
-                .min(scored.len());
-            let top_candidates: Vec<Gene> = scored
-                .iter()
-                .take(best_return_count)
-                .map(|(_, _, g, _)| g.clone())
-                .collect();
-            let top_metrics: Vec<[f64; 11]> = scored
-                .iter()
-                .take(best_return_count)
-                .map(|(_, _, _, m)| *m)
-                .collect();
             seen_memory.flush();
-            if !profitable_archive.is_empty() {
-                profitable_archive.sort_by(|a, b| {
-                    b.1[0]
-                        .partial_cmp(&a.1[0])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.2.cmp(&b.2))
-                });
-                return Ok(SearchResult {
-                    genes: profitable_archive
-                        .iter()
-                        .map(|(g, _, _)| g.clone())
-                        .collect(),
-                    metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
-
-                    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
-                });
-            }
-            return Ok(SearchResult {
-                genes: top_candidates,
-                metrics: top_metrics,
-
-                effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
-            });
+            return Ok(finish_evaluated_generation(
+                profitable_archive.into_observations(),
+                scored,
+                eval_cfg.smc_gate_threshold,
+                evaluation_slots,
+            ));
         }
 
         if let Some(max_runtime) = max_runtime
             && started_at.elapsed() >= max_runtime
         {
-            // **F-035 documentation (2026-05-25)** — `best_return_count`
-            // is the number of top-fitness genomes to return when the
-            // wall-clock runtime budget is exhausted. The formula
-            // intentionally:
-            //   1. `population.clamp(2, ...)` — never return fewer than 2
-            //      (caller's expectation: at least a parent + a sibling
-            //      so the downstream genetic operators have material).
-            //   2. `(population / 2).clamp(100, 500)` — upper bound is
-            //      ~half the population but capped at [100, 500] so
-            //      very-small populations don't return everything and
-            //      very-large populations don't drown the caller in
-            //      noise.
-            //   3. `.min(scored.len())` — never exceed what we have.
-            // The bounds [100, 500] are empirical: 100 is the smallest
-            // archive size the diversity-archive can keep meaningful
-            // novelty; 500 is the largest the downstream consumer
-            // (`finalize_candidates_with_progress`) can process without
-            // observable UI lag. Tunable via Settings would be a Phase-C
-            // task — the literal here is a calibration, not a bug.
-            let best_return_count = population
-                .clamp(2, (population / 2).clamp(100, 500))
-                .min(scored.len());
-            let top_candidates: Vec<Gene> = scored
-                .iter()
-                .take(best_return_count)
-                .map(|(_, _, g, _)| g.clone())
-                .collect();
-            let top_metrics: Vec<[f64; 11]> = scored
-                .iter()
-                .take(best_return_count)
-                .map(|(_, _, _, m)| *m)
-                .collect();
             seen_memory.flush();
-            if !profitable_archive.is_empty() {
-                profitable_archive.sort_by(|a, b| {
-                    b.1[0]
-                        .partial_cmp(&a.1[0])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.2.cmp(&b.2))
-                });
-                return Ok(SearchResult {
-                    genes: profitable_archive
-                        .iter()
-                        .map(|(g, _, _)| g.clone())
-                        .collect(),
-                    metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
-
-                    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
-                });
-            }
-            return Ok(SearchResult {
-                genes: top_candidates,
-                metrics: top_metrics,
-
-                effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
-            });
+            return Ok(finish_evaluated_generation(
+                profitable_archive.into_observations(),
+                scored,
+                eval_cfg.smc_gate_threshold,
+                evaluation_slots,
+            ));
         }
-
-        let best_return_count = population
-            .clamp(2, (population / 2).clamp(100, 500))
-            .min(scored.len());
-        let top_candidates: Vec<Gene> = scored
-            .iter()
-            .take(best_return_count)
-            .map(|(_, _, g, _)| g.clone())
-            .collect();
-        best_metrics = scored
-            .iter()
-            .take(best_return_count)
-            .map(|(_, _, _, m)| *m)
-            .collect();
 
         if generation + 1 == generations {
             seen_memory.flush();
-            if !profitable_archive.is_empty() {
-                profitable_archive.sort_by(|a, b| {
-                    b.1[0]
-                        .partial_cmp(&a.1[0])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.2.cmp(&b.2))
-                });
-                return Ok(SearchResult {
-                    genes: profitable_archive
-                        .iter()
-                        .map(|(g, _, _)| g.clone())
-                        .collect(),
-                    metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
-
-                    effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
-                });
-            }
-            return Ok(SearchResult {
-                genes: top_candidates,
-                metrics: best_metrics,
-
-                effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
-            });
+            return Ok(finish_evaluated_generation(
+                profitable_archive.into_observations(),
+                scored,
+                eval_cfg.smc_gate_threshold,
+                evaluation_slots,
+            ));
         }
 
         // Reuse the seeded RNG built at the top of `evolve_search_with_progress_impl`
         // (was `let mut rng = rand::rng();` here, which shadowed the seeded one and
         // broke the determinism work in the GPU path). `rng` is available in scope.
+        let reproduction_started = Instant::now();
         let score_vector: Vec<f64> = scored.iter().map(|(score, _, _, _)| *score).collect();
         let survivor_fraction = if stagnant_gens >= stagnation_patience {
             (search_policy.survivor_fraction * 0.75).clamp(0.0, 0.5)
@@ -3750,20 +4263,37 @@ where
         enforce_population_smc_ratio(&mut next, &smc_cfg);
         genes = next;
         seen_memory.flush();
+        timing.reproduction += reproduction_started.elapsed();
     }
-    seen_memory.flush();
-    Ok(SearchResult {
-        genes,
-        metrics: best_metrics,
-
-        effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
-    })
+    unreachable!("zero generations and every completed final generation return above")
 }
 
 #[cfg(test)]
 mod adaptive_wiring_tests {
     use super::*;
     use rand::SeedableRng;
+
+    #[test]
+    fn generation_and_walkforward_pack_preserve_the_same_account_risk_policy() {
+        let mut config = EvaluationConfig::for_symbol("EURUSD", "USD", Some(1.10), None, None);
+        config.initial_equity = 12_345.0;
+        config.pip_value = 0.0001;
+        config.pip_value_per_lot = 10.0;
+        config.spread_pips = 0.0;
+        config.commission_per_trade = 0.0;
+        config.swap_long_pips_per_day = 0.0;
+        config.swap_short_pips_per_day = 0.0;
+        config.pnl_conversion_fee_rate = 0.0;
+        let settings = evaluation_backtest_settings(&config).expect("explicit mathematical costs");
+        let pack = WalkforwardPopulationGenePack::new(&[Gene::default()], &config, &settings);
+        assert_eq!(settings.initial_equity(), 12_345.0);
+        assert_eq!(pack.settings.initial_equity(), 12_345.0);
+        assert!(settings.risk_based_sizing && pack.settings.risk_based_sizing);
+        assert_eq!(pack.settings.risk_per_trade_min, config.risk_per_trade_min);
+        assert_eq!(pack.settings.risk_per_trade_max, config.risk_per_trade_max);
+        config.initial_equity = f64::NAN;
+        assert!(evaluation_backtest_settings(&config).is_err());
+    }
 
     /// Deterministic synthetic high/low/close long enough for the vol window.
     fn synthetic_hlc(n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -3812,8 +4342,12 @@ mod adaptive_wiring_tests {
             .expect("base series installed when a gene is adaptive");
         assert_eq!(base.len(), n);
         assert!(
-            base.iter().all(|&b| b.is_finite() && b > 0.0),
-            "base pips must be finite and positive"
+            base[..100].iter().all(|value| value.is_nan()),
+            "the shared base must retain unavailable warm-up cells"
+        );
+        assert!(
+            base[100..].iter().all(|&b| b.is_finite() && b > 0.0),
+            "base pips must be finite and positive after the complete lookback"
         );
         assert_eq!(settings.adaptive_rr, 2.0);
 
@@ -4131,6 +4665,48 @@ mod smc_gate_arrays_tests {
     }
 
     #[test]
+    fn archived_bypass_preserves_independently_calculated_confidence() {
+        let ohlcv = ctrader_sample_ohlcv();
+        let frame = frame_with(
+            &ohlcv,
+            &["decision"],
+            |i, _| if i % 2 == 0 { 2.0 } else { -3.0 },
+        );
+        let smc = SmcGateArrays::build(&forced_bullish_ob_frame(&ohlcv), &ohlcv).unwrap();
+        let gene = Gene {
+            indices: vec![2],
+            weights: vec![1.0],
+            long_threshold: 1.0,
+            short_threshold: -1.0,
+            use_ob: true,
+            ..Gene::default()
+        };
+        let (gated, gated_conf) = signals_and_confidence_for_gene_full_with_smc_policy(
+            &frame,
+            &gene,
+            &gate_config(),
+            &smc,
+            false,
+        )
+        .unwrap();
+        let (raw, raw_conf) = signals_and_confidence_for_gene_full_with_smc_policy(
+            &frame,
+            &gene,
+            &gate_config(),
+            &smc,
+            true,
+        )
+        .unwrap();
+        for row in 0..frame.n_samples() {
+            // Threshold gap = 2. Long margin = 1; short margin = 2.
+            assert_eq!(raw[row], if row % 2 == 0 { 1 } else { -1 });
+            assert_eq!(raw_conf[row], if row % 2 == 0 { 0.5 } else { 1.0 });
+            assert_eq!(gated[row], if row % 2 == 0 { 1 } else { 0 });
+            assert_eq!(gated_conf[row], if row % 2 == 0 { 0.5 } else { 0.0 });
+        }
+    }
+
+    #[test]
     fn shared_arrays_reproduce_the_per_gene_rebuild() {
         let ohlcv = ctrader_sample_ohlcv();
         let config = gate_config();
@@ -4323,12 +4899,154 @@ mod exact_search_sizing_policy_tests {
     use super::*;
 
     #[test]
+    fn resident_native_settings_bind_explicit_account_equity_and_risk_policy() {
+        let evaluation = EvaluationConfig {
+            initial_equity: 12_345.25,
+            risk_per_trade_min: 0.0125,
+            risk_per_trade_max: 0.075,
+            high_quality_confidence: 0.8,
+            pip_value: 0.0001,
+            pip_value_per_lot: 7.393,
+            spread_pips: 2.5,
+            commission_per_trade: 7.73,
+            swap_long_pips_per_day: -2.445,
+            swap_short_pips_per_day: -0.105,
+            pnl_conversion_fee_rate: 0.001,
+            ..Default::default()
+        };
+        let settings = evaluation_backtest_settings(&evaluation).unwrap();
+        let native = resident_generation_population_settings_v1(&settings).unwrap();
+        for (actual, expected) in [
+            (native.initial_equity, evaluation.initial_equity),
+            (native.risk_per_trade_min, evaluation.risk_per_trade_min),
+            (native.risk_per_trade_max, evaluation.risk_per_trade_max),
+            (
+                native.high_quality_confidence,
+                evaluation.high_quality_confidence,
+            ),
+            (native.pip_value, evaluation.pip_value),
+            (native.pip_value_per_lot, evaluation.pip_value_per_lot),
+            (native.spread_pips, evaluation.spread_pips),
+            (native.commission_per_trade, evaluation.commission_per_trade),
+            (
+                native.swap_long_pips_per_day,
+                evaluation.swap_long_pips_per_day,
+            ),
+            (
+                native.swap_short_pips_per_day,
+                evaluation.swap_short_pips_per_day,
+            ),
+            (
+                native.pnl_conversion_fee_rate,
+                evaluation.pnl_conversion_fee_rate,
+            ),
+        ] {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        // This exercises only the actual host-to-native ABI projection, not CUDA.
+        for initial_equity_override in [None, Some(0.0), Some(-1.0), Some(f64::NAN)] {
+            let invalid = BacktestSettings {
+                initial_equity_override,
+                ..settings.clone()
+            };
+            assert!(resident_generation_population_settings_v1(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn generation_zero_applies_the_bound_goal_to_actual_metric_rows() {
+        let policy = ExactSearchSizingPolicyV1::new(false, 1).expect("one-term policy");
+        let names = vec!["feature_0".to_owned()];
+        let goal = crate::scoring::RiskyGrowthGoal {
+            start_balance: 100.0,
+            target_balance: 50_000.0,
+            horizon_days: 180.0,
+        };
+        let config = EvaluationConfig {
+            initial_equity: 10_000.0,
+            growth_objective: true,
+            growth_goal: Some(goal),
+            ..Default::default()
+        };
+        let row = [
+            1_000.0, 1.0, 11_000.0, 0.1, 0.6, 2.0, 10.0, 0.5, 100.0, 0.5, 0.05,
+        ];
+        for span in [90.0, 360.0] {
+            let result = evolve_search_with_generation_evaluator_v1(
+                &names,
+                span,
+                4,
+                0,
+                1,
+                None,
+                Some(config.clone()),
+                &policy,
+                |genes, bound| {
+                    assert_eq!(bound.growth_goal, Some(goal));
+                    Ok(vec![row; genes.len()])
+                },
+                |_, _, _, _, _| {},
+                || false,
+            )
+            .expect("goal-bound generation zero");
+            assert_eq!(result.metrics, vec![row; 4]);
+            let expected = crate::scoring::ga_fitness_goal(&row, 10_000.0, span, goal);
+            assert!(result.genes.iter().all(|gene| gene.fitness == expected));
+            assert_ne!(expected, crate::scoring::ga_fitness_growth(&row));
+        }
+    }
+
+    #[test]
+    fn goal_context_errors_stop_before_any_population_evaluation() {
+        let policy = ExactSearchSizingPolicyV1::new(false, 1).expect("one-term policy");
+        let names = vec!["feature_0".to_owned()];
+        let config = EvaluationConfig {
+            initial_equity: 10_000.0,
+            growth_objective: true,
+            growth_goal: Some(crate::scoring::RiskyGrowthGoal {
+                start_balance: 100.0,
+                target_balance: 50_000.0,
+                horizon_days: 180.0,
+            }),
+            ..Default::default()
+        };
+        for (span, bound) in [
+            (0.0, config.clone()),
+            (f64::NAN, config.clone()),
+            (
+                180.0,
+                EvaluationConfig {
+                    growth_objective: false,
+                    ..config.clone()
+                },
+            ),
+        ] {
+            let error = evolve_search_with_generation_evaluator_v1(
+                &names,
+                span,
+                4,
+                0,
+                1,
+                None,
+                Some(bound),
+                &policy,
+                |_, _| panic!("invalid goal context must not run an evaluator"),
+                |_, _, _, _, _| {},
+                || false,
+            )
+            .expect_err("invalid context must fail");
+            assert!(error.to_string().contains("goal-pace"));
+        }
+    }
+
+    #[test]
     fn generation_zero_accepts_a_resident_evaluator_without_host_frames() {
         let policy = ExactSearchSizingPolicyV1::new(false, 1).expect("one-term exact policy");
         let feature_names = vec!["resident_feature_0".to_owned()];
         let mut evaluation_calls = 0usize;
         let result = evolve_search_with_generation_evaluator_v1(
             &feature_names,
+            0.0,
             4,
             0,
             1,
@@ -4345,6 +5063,7 @@ mod exact_search_sizing_policy_tests {
                 Ok(vec![row; genes.len()])
             },
             |_generation, _generations, _best, _stagnant, _archive| {},
+            || false,
         )
         .expect("resident generation-zero evaluator");
 
@@ -4455,5 +5174,234 @@ mod exact_search_sizing_policy_tests {
         assert_eq!(packed.descriptors[0].candidate_id, 0);
         assert_eq!(packed.descriptors[0].term_offset, 0);
         assert_eq!(packed.descriptors[0].term_count, 2);
+    }
+}
+
+#[cfg(test)]
+mod evaluated_generation_handoff_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn candidate(index: usize, net: f64) -> (f64, usize, Gene, [f64; 11]) {
+        let gene = Gene {
+            indices: vec![index],
+            weights: vec![0.4],
+            long_threshold: 0.25,
+            short_threshold: -0.25,
+            sl_pips: 20.0,
+            tp_pips: 40.0,
+            strategy_id: format!("current_{index}"),
+            ..Gene::default()
+        };
+        let mut metrics = [0.0; 11];
+        metrics[0] = net;
+        metrics[1] = 1.0;
+        metrics[5] = 1.2;
+        metrics[8] = 10.0;
+        (net, index, gene, metrics)
+    }
+
+    #[test]
+    fn empty_and_one_entry_archives_both_return_the_complete_evaluated_population() {
+        let scored = (0..200)
+            .map(|index| candidate(index, -1.0))
+            .collect::<Vec<_>>();
+        let empty = finish_evaluated_generation(Vec::new(), scored.clone(), 0.35, 200_000);
+        let mut archived_duplicate = scored[0].2.clone();
+        archived_duplicate.strategy_id = "older_profitable_copy".into();
+        archived_duplicate.generation = 3;
+        archived_duplicate.fitness = 100.0;
+        let mut old_metrics = scored[0].3;
+        old_metrics[0] = 100.0;
+        let one = finish_evaluated_generation(
+            vec![(archived_duplicate, old_metrics, 0)],
+            scored,
+            0.35,
+            200_000,
+        );
+        assert_eq!(empty.genes.len(), 200);
+        assert_eq!(one.genes.len(), 200);
+        assert_eq!(empty.genes, one.genes);
+        assert_eq!(
+            empty.metrics, one.metrics,
+            "current metrics replace the older duplicate"
+        );
+        assert_eq!(one.effective_smc_gate_threshold, 0.35);
+    }
+
+    #[test]
+    fn union_retains_archive_only_genes_and_deduplicates_the_final_population_exactly() {
+        let first = candidate(0, 2.0);
+        let mut duplicate = first.clone();
+        duplicate.2.strategy_id = "same_behavior_different_id".into();
+        duplicate.2.generation = 99;
+        duplicate.2.sharpe_ratio = 7.0;
+        let archived = candidate(2, 3.0);
+        let distinct = candidate(1, 1.0);
+        let result = finish_evaluated_generation(
+            vec![(archived.2, archived.3, 0)],
+            vec![first, duplicate, distinct],
+            0.35,
+            40,
+        );
+        assert_eq!(result.genes.len(), 3);
+        assert_eq!(result.metrics.len(), 3);
+        assert_eq!(
+            result.metrics.iter().map(|row| row[0]).collect::<Vec<_>>(),
+            vec![3.0, 2.0, 1.0]
+        );
+        assert_eq!(result.genes[1].strategy_id, "current_0");
+    }
+
+    #[test]
+    fn exact_union_does_not_merge_numeric_traits_rounded_by_the_seen_ledger() {
+        let base = candidate(0, 1.0);
+        let mut adjacent_weight = base.clone();
+        adjacent_weight.2.weights[0] = f64::from_bits(base.2.weights[0].to_bits() + 1);
+        let mut adjacent_threshold = base.clone();
+        adjacent_threshold.2.long_threshold = f64::from_bits(base.2.long_threshold.to_bits() + 1);
+        let mut adjacent_stop = base.clone();
+        adjacent_stop.2.sl_pips = f64::from_bits(base.2.sl_pips.to_bits() + 1);
+        for other in [&adjacent_weight, &adjacent_threshold, &adjacent_stop] {
+            assert_eq!(gene_signature_hash(&base.2), gene_signature_hash(&other.2));
+            assert_ne!(
+                EvaluatedGeneBehaviorKey::new(&base.2),
+                EvaluatedGeneBehaviorKey::new(&other.2)
+            );
+        }
+        let result = finish_evaluated_generation(
+            Vec::new(),
+            vec![base, adjacent_weight, adjacent_threshold, adjacent_stop],
+            0.35,
+            4,
+        );
+        assert_eq!(result.genes.len(), 4);
+    }
+
+    #[test]
+    fn exact_key_covers_every_signal_and_exit_trait_but_not_measured_metadata() {
+        let base = candidate(0, 1.0).2;
+        let changes: &[fn(&mut Gene)] = &[
+            |gene| gene.indices[0] = 1,
+            |gene| gene.weights[0] = 0.5,
+            |gene| gene.long_threshold = 0.3,
+            |gene| gene.short_threshold = -0.3,
+            |gene| gene.sl_pips = 21.0,
+            |gene| gene.tp_pips = 41.0,
+            |gene| gene.stop_vol_mult = 1.0,
+            |gene| gene.use_ob = true,
+            |gene| gene.use_fvg = true,
+            |gene| gene.use_liq_sweep = true,
+            |gene| gene.mtf_confirmation = true,
+            |gene| gene.use_premium_discount = true,
+            |gene| gene.use_inducement = true,
+            |gene| gene.use_bos = true,
+            |gene| gene.use_choch = true,
+            |gene| gene.use_eqh = true,
+            |gene| gene.use_eql = true,
+            |gene| gene.use_displacement = true,
+        ];
+        for change in changes {
+            let mut different = base.clone();
+            change(&mut different);
+            assert_ne!(
+                EvaluatedGeneBehaviorKey::new(&base),
+                EvaluatedGeneBehaviorKey::new(&different)
+            );
+        }
+        let mut measured = base.clone();
+        measured.strategy_id = "renamed".into();
+        measured.generation = 77;
+        measured.fitness = -2.0;
+        measured.sharpe_ratio = 3.0;
+        measured.win_rate = 0.5;
+        measured.max_drawdown = 0.2;
+        measured.profit_factor = 2.0;
+        measured.expectancy = 1.0;
+        measured.trades_count = 100;
+        measured.slice_pass_rate = 0.8;
+        measured.consistency = 0.7;
+        assert_eq!(
+            EvaluatedGeneBehaviorKey::new(&base),
+            EvaluatedGeneBehaviorKey::new(&measured)
+        );
+    }
+
+    #[test]
+    fn real_generation_loop_evaluates_every_slot_and_returns_last_population_without_archive() {
+        let names = (0..8)
+            .map(|index| format!("feature_{index}"))
+            .collect::<Vec<_>>();
+        let policy = ExactSearchSizingPolicyV1::new(false, 8).expect("bounded policy");
+        let mut calls = Vec::new();
+        let mut last_keys = HashSet::new();
+        let mut progress = Vec::new();
+        let result = evolve_search_with_generation_evaluator_v1(
+            &names,
+            0.0,
+            200,
+            3,
+            4,
+            None,
+            Some(EvaluationConfig::default()),
+            &policy,
+            |genes, _| {
+                calls.push(genes.len());
+                last_keys = genes.iter().map(EvaluatedGeneBehaviorKey::new).collect();
+                Ok(vec![candidate(0, -1.0).3; genes.len()])
+            },
+            |generation, _, _, _, archive| {
+                progress.push((generation, archive));
+            },
+            || false,
+        )
+        .expect("complete generation loop");
+        assert_eq!(
+            calls,
+            vec![200, 200, 200],
+            "600 evaluated slots, not 600 unique genes"
+        );
+        assert_eq!(progress, vec![(1, 0), (2, 0), (3, 0)]);
+        assert_eq!(result.genes.len(), result.metrics.len());
+        assert_eq!(
+            result
+                .genes
+                .iter()
+                .map(EvaluatedGeneBehaviorKey::new)
+                .collect::<HashSet<_>>(),
+            last_keys
+        );
+        assert!(result.metrics.iter().all(|metrics| metrics[0] == -1.0));
+    }
+
+    #[test]
+    fn cancellation_after_evaluation_never_returns_unevaluated_children_with_old_metrics() {
+        let names = vec!["feature_0".into(), "feature_1".into()];
+        let policy = ExactSearchSizingPolicyV1::new(false, 2).expect("bounded policy");
+        let evaluations = Cell::new(0);
+        let cancelled = Cell::new(false);
+        let result = evolve_search_with_generation_evaluator_v1(
+            &names,
+            0.0,
+            12,
+            3,
+            2,
+            None,
+            Some(EvaluationConfig::default()),
+            &policy,
+            |genes, _| {
+                evaluations.set(evaluations.get() + 1);
+                Ok(vec![candidate(0, -1.0).3; genes.len()])
+            },
+            |_, _, _, _, _| cancelled.set(true),
+            || cancelled.get(),
+        );
+        assert_eq!(evaluations.get(), 1);
+        assert!(cancelled.get(), "the caller's cancellation remains set");
+        let error = result
+            .expect_err("cancelled work cannot yield a candidate result")
+            .to_string();
+        assert!(error.starts_with("__DISCOVERY_CANCELLED__"));
+        assert!(error.contains("cancelled by operator before generation 2"));
     }
 }

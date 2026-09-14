@@ -13,6 +13,39 @@ fn parent(rows: usize) -> (CanonicalSearchArtifactScopeV2, FeatureFrame, Ohlcv) 
     parent_with_changed_feature(rows, None)
 }
 
+fn explicit_cpu_research_admission(
+    features: &FeatureFrame,
+) -> crate::SealedStrictDiscoveryDeviceAdmissionV1 {
+    let anchor = features.provenance().bindings()[0]
+        .dataset_identity()
+        .clone();
+    let receipt = CanonicalSearchInputReceiptV2::from_feature_frame(&anchor, features)
+        .expect("canonical explicit-CPU test receipt");
+    let assumption_source_sha256 = "a".repeat(64);
+    let contract = crate::CanonicalTrendbarResearchExecutionContractV3::new(
+        receipt,
+        crate::CanonicalTrendbarResearchCostAssumptionsV2 {
+            symbol: "EURUSD",
+            account_currency: "USD",
+            assumption_source_id: "neoethos.test.population-execution-evidence.v1",
+            assumption_source_sha256: &assumption_source_sha256,
+            pip_size: 0.0001,
+            pip_value_per_lot: 10.0,
+            full_spread_pips_assumption: 1.2,
+            slippage_pips_per_fill_assumption: 0.1,
+            commission_account_per_lot_per_fill_assumption: 3.5,
+            swap_long_pips_per_day: -0.2,
+            swap_short_pips_per_day: -0.1,
+            pnl_conversion_fee_rate: 0.0,
+        },
+    )
+    .expect("valid explicit-CPU research contract");
+    crate::strict_discovery_device_route_v1::SealedStrictDiscoveryDeviceAdmissionV1::from_explicit_canonical_cpu_research_v1(
+        &contract,
+    )
+    .expect("sealed explicit-CPU research admission")
+}
+
 fn parent_with_changed_feature(
     rows: usize,
     changed_row: Option<usize>,
@@ -71,7 +104,7 @@ fn parent_with_changed_feature(
 #[test]
 fn one_run_seals_full_range_and_index_views_against_one_exact_parent() {
     let (scope, features, ohlcv) = parent(12);
-    let admission = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+    let admission = explicit_cpu_research_admission(&features);
     let run =
         begin_exact_population_execution_run_v1(admission, &scope, &features, &ohlcv).unwrap();
     let settings = BacktestSettings::default();
@@ -108,7 +141,7 @@ fn one_run_seals_full_range_and_index_views_against_one_exact_parent() {
 #[test]
 fn population_auto_reads_parent_and_route_facts_from_the_existing_run_without_a_probe() {
     let (scope, features, ohlcv) = parent(12);
-    let admission = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+    let admission = explicit_cpu_research_admission(&features);
     let run =
         begin_exact_population_execution_run_v1(admission, &scope, &features, &ohlcv).unwrap();
     let facts = run
@@ -121,6 +154,7 @@ fn population_auto_reads_parent_and_route_facts_from_the_existing_run_without_a_
     assert!(matches!(
         facts.route,
         crate::PopulationAutoSizingRouteV1::CpuNoCompatibleGpu { .. }
+            | crate::PopulationAutoSizingRouteV1::CpuExplicitResearch { .. }
             | crate::PopulationAutoSizingRouteV1::NativeCuda { .. }
     ));
 
@@ -235,6 +269,7 @@ fn admitted_population_auto_runs_generation_zero_on_real_cuda() {
             parent_dataset_identity_sha256: primitives.parent_dataset_identity_sha256,
             stage1_window,
             route: primitives.route,
+            cpu_plan: None,
         },
     )
     .expect("seal admitted population-auto sizing receipt");
@@ -271,6 +306,7 @@ fn admitted_population_auto_runs_generation_zero_on_real_cuda() {
             end: stage1_end,
         },
         &authority,
+        None,
         |_, _, _, _, _| {},
     )
     .expect("execute exact generation zero on the admitted CUDA route");
@@ -327,8 +363,8 @@ fn one_parent_is_sealed_once_and_views_derive_without_raw_parent_access() {
 fn an_unsampled_parent_mutation_changes_the_native_resident_identity() {
     let (scope_a, features_a, ohlcv_a) = parent_with_changed_feature(600, None);
     let (scope_b, features_b, ohlcv_b) = parent_with_changed_feature(600, Some(417));
-    let admission_a = crate::acquire_strict_discovery_device_admission_v1().unwrap();
-    let admission_b = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+    let admission_a = explicit_cpu_research_admission(&features_a);
+    let admission_b = explicit_cpu_research_admission(&features_b);
     let run_a =
         begin_exact_population_execution_run_v1(admission_a, &scope_a, &features_a, &ohlcv_a)
             .unwrap();
@@ -353,7 +389,7 @@ fn an_unsampled_parent_mutation_changes_the_native_resident_identity() {
 #[test]
 fn evaluation_layout_must_match_the_sealed_view_before_any_engine_call() {
     let (scope, features, ohlcv) = parent(10);
-    let admission = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+    let admission = explicit_cpu_research_admission(&features);
     let run =
         begin_exact_population_execution_run_v1(admission, &scope, &features, &ohlcv).unwrap();
     let evaluation = run
@@ -378,7 +414,7 @@ fn evaluation_layout_must_match_the_sealed_view_before_any_engine_call() {
 #[test]
 fn failed_or_wrong_cardinality_native_output_never_records_cuda() {
     let (scope, features, ohlcv) = parent(8);
-    let admission = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+    let admission = explicit_cpu_research_admission(&features);
     let run =
         begin_exact_population_execution_run_v1(admission, &scope, &features, &ohlcv).unwrap();
     let evaluation = run
@@ -405,8 +441,8 @@ fn failed_or_wrong_cardinality_native_output_never_records_cuda() {
 fn exact_success_is_run_scoped_and_finishes_to_the_existing_receipt() {
     let (scope_a, features_a, ohlcv_a) = parent(8);
     let (scope_b, features_b, ohlcv_b) = parent(9);
-    let admission_a = crate::acquire_strict_discovery_device_admission_v1().unwrap();
-    let admission_b = crate::acquire_strict_discovery_device_admission_v1().unwrap();
+    let admission_a = explicit_cpu_research_admission(&features_a);
+    let admission_b = explicit_cpu_research_admission(&features_b);
     let run_a =
         begin_exact_population_execution_run_v1(admission_a, &scope_a, &features_a, &ohlcv_a)
             .unwrap();

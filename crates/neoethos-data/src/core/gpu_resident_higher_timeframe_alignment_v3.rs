@@ -17,7 +17,8 @@ use neoethos_gpu_cuda::resident_classic_ta_v3::{
     ResidentClassicTaPreDeviceMemoryReceiptV4, ResidentClassicTaRecipeV3,
 };
 use neoethos_gpu_cuda::resident_feature_store_v3::{
-    GpuOnlyRunDeviceAdmissionV3, ResidentFeatureColumnBindingV3, ResidentFeatureStoreAssemblerV3,
+    GpuOnlyRunDeviceAdmissionV3, ResidentFeatureColumnBindingV3, ResidentFeatureScreeningErrorV2,
+    ResidentFeatureScreeningPassV2, ResidentFeatureStoreAssemblerV3,
     ResidentFeatureStoreCudaErrorV3, resident_canonical_content_sha256_capability_v3,
     resident_feature_major_to_bar_major_capability_v3,
 };
@@ -31,6 +32,7 @@ use neoethos_gpu_cuda::resident_higher_timeframe_alignment_v3::{
     seal_resident_higher_timeframe_source_closure_v3,
 };
 use neoethos_gpu_cuda::resident_regime_v3::ResidentRegimePreDeviceMemoryReceiptV4;
+use neoethos_gpu_cuda::resident_robust_normalization_v2::ResidentRobustNormalizationPlanV2;
 use neoethos_gpu_cuda::resident_robust_normalization_v2::resident_robust_normalization_capability_v2;
 use neoethos_gpu_cuda::resident_smc_v3::{
     ResidentSmcMaterializationV3, ResidentSmcPreDeviceMemoryReceiptV4,
@@ -55,13 +57,15 @@ use super::gpu_resident_session_v2::{
 use super::pinned_canonical_series_v1::MaterializedPinnedResidentCanonicalSourceV1;
 use super::timestamps::validate_canonical_millisecond_timestamps;
 
-pub(crate) const HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION_V3: u32 = 3;
+// The CUDA carrier/ABI remains v3; the alignment mathematics carried through
+// it is semantic-v4 after calendar rows gained observed-span expiry.
+pub(crate) const HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION_V3: u32 = 4;
 pub(crate) const RESIDENT_HTF_IMPLEMENTATION_ID_V3: &str =
-    "neoethos.cuda.resident-higher-timeframe-alignment.semantic-v3";
-pub(crate) const RESIDENT_HTF_EXACT_MATH_AUTHORITY_V3: &str = "neoethos.higher-timeframe-alignment.cpu-oracle.semantic-v3;direct-source-only;selected-parent-order;cpu-producer-order;fixed-open-plus-period-v1;calendar-next-direct-bar-open-v1;forward-fill=true;fixed-max-age=2x-period;logical-validity-preserved;zero-feature-d2h";
+    "neoethos.cuda.resident-higher-timeframe-alignment.semantic-v4";
+pub(crate) const RESIDENT_HTF_EXACT_MATH_AUTHORITY_V3: &str = "neoethos.higher-timeframe-alignment.cpu-oracle.semantic-v4;direct-source-only;selected-parent-order;cpu-producer-order;fixed-open-plus-period-v1;calendar-next-direct-bar-open-observed-span-expiry-v1;forward-fill=true;fixed-max-age=2x-period;logical-validity-preserved;zero-feature-d2h";
 const RESIDENT_HTF_ROUTE_DOMAIN_V3: &str =
-    "neoethos.data.resident-higher-timeframe-route.semantic-v3";
-const RESIDENT_HTF_INDICATOR_ID_V3: &str = "neoethos_higher_timeframe_alignment_semantic_v3";
+    "neoethos.data.resident-higher-timeframe-route.semantic-v4";
+const RESIDENT_HTF_INDICATOR_ID_V3: &str = "neoethos_higher_timeframe_alignment_semantic_v4";
 
 const CANONICAL_CPU_PRODUCER_ORDER_V3: [ResidentFeatureProducerV3; 6] = [
     ResidentFeatureProducerV3::Smc,
@@ -775,7 +779,7 @@ fn host_parent_store_identity_sha256_v3(
     expected_retained_parent_device_bytes: u64,
 ) -> Result<[u8; 32]> {
     let mut hash = Sha256::new();
-    hash.update(b"neoethos.data.resident-htf-host-parent-recipe.semantic-v3\0");
+    hash.update(b"neoethos.data.resident-htf-host-parent-recipe.semantic-v4\0");
     hash.update([timeframe.identity_tag()]);
     hash.update(
         u64::try_from(parent_open_ms.len())
@@ -825,7 +829,12 @@ fn parent_availability_v3(
             .map(Some)
             .collect::<Vec<_>>();
         available.push(None);
-        Ok((available, "next_direct_bar_open_v1", None, None))
+        Ok((
+            available,
+            "next_direct_bar_open_observed_span_expiry_v1",
+            None,
+            None,
+        ))
     }
 }
 
@@ -1240,6 +1249,35 @@ impl PreparedResidentHigherTimeframeAppendV3 {
             .map_err(|error| ResidentFeatureStoreCudaErrorV3::InvalidInput(error.to_string()))?;
         Ok((runtime_admission, receipt))
     }
+
+    pub(crate) fn score_to_screening_v2(
+        self,
+        screening: &mut ResidentFeatureScreeningPassV2,
+        normalization_template: &ResidentRobustNormalizationPlanV2,
+    ) -> std::result::Result<
+        (
+            ResidentHigherTimeframeRuntimeAdmissionV3,
+            ResidentHigherTimeframeRuntimeReceiptV3,
+        ),
+        ResidentFeatureScreeningErrorV2,
+    > {
+        let Self {
+            runtime_admission,
+            parents,
+            admitted_global_bindings,
+            launch_authority,
+        } = self;
+        let receipt = screening.score_resident_higher_timeframe_alignment_v3(
+            parents,
+            admitted_global_bindings,
+            launch_authority,
+            normalization_template,
+        )?;
+        runtime_admission
+            .validate_native_receipt(&receipt)
+            .map_err(|error| ResidentFeatureStoreCudaErrorV3::InvalidInput(error.to_string()))?;
+        Ok((runtime_admission, receipt))
+    }
 }
 
 fn validate_resolved_global_bindings_v3<P>(
@@ -1345,7 +1383,7 @@ where
             availability_lag_ms.context("HTF fixed parent lost its availability lag")?,
             max_age_ms.context("HTF fixed parent lost its max age")?,
         ),
-        "next_direct_bar_open_v1" => (
+        "next_direct_bar_open_observed_span_expiry_v1" => (
             ResidentHigherTimeframeAvailabilityRuleV3::NextDirectBarOpen,
             0,
             -1,
@@ -1700,7 +1738,7 @@ fn htf_pointer_schema_bytes_v3(names: &[String]) -> Result<(u64, u64)> {
 
 fn htf_semantic_source_sha256_v3() -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"neoethos.data.resident-higher-timeframe-semantic-source.v3\0");
+    hash.update(b"neoethos.data.resident-higher-timeframe-semantic-source.v4\0");
     hash.update(include_bytes!("features.rs"));
     hash.update(include_bytes!("../lib.rs"));
     hash.update(RESIDENT_HTF_EXACT_MATH_AUTHORITY_V3.as_bytes());
@@ -1722,7 +1760,7 @@ fn htf_input_identity_v3(
     canonical_cpu_producer_order: &str,
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"neoethos.data.resident-higher-timeframe-input.semantic-v3\0");
+    hash.update(b"neoethos.data.resident-higher-timeframe-input.semantic-v4\0");
     hash.update(HIGHER_TIMEFRAME_ALIGNMENT_SEMANTIC_VERSION_V3.to_le_bytes());
     hash.update([base_timeframe.identity_tag()]);
     hash.update((base_open_ms.len() as u64).to_le_bytes());

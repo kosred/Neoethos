@@ -79,6 +79,10 @@ name = "native_cuda_build_harness"
 path = "tests/native_cuda_build_harness.rs"
 harness = false
 
+[[test]]
+name = "natr_nvi_talib_authority_source_contract"
+path = "tests/natr_nvi_talib_authority_source_contract.rs"
+
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

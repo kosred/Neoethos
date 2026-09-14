@@ -8,8 +8,6 @@
 
 __device__ __forceinline__ float dev_nan() { return __int_as_float(0x7fffffff); }
 
-static constexpr double NATR_TA_EPSILON = 1.0e-14;
-
 __device__ __forceinline__ double natr_true_range_f32(
     float high, float low, float previous_close) {
     const double high_value = (double)high;
@@ -45,13 +43,13 @@ __device__ __forceinline__ double natr_wilder_step_f64(
 __device__ __forceinline__ float natr_output_f32(double atr, float close, int period) {
     if (period <= 1) return (float)atr;
     const double close_value = (double)close;
-    if (close_value > -NATR_TA_EPSILON && close_value < NATR_TA_EPSILON) return 0.0f;
+    if (close_value == 0.0) return 0.0f;
     return (float)((atr / close_value) * 100.0);
 }
 
 __device__ __forceinline__ float safe_scale_100_over_close(float c) {
     const double close_value = (double)c;
-    if (close_value > -NATR_TA_EPSILON && close_value < NATR_TA_EPSILON) return 0.0f;
+    if (close_value == 0.0) return 0.0f;
     return (float)(100.0 / close_value);
 }
 
@@ -356,7 +354,7 @@ void natr_neo_batch_f64(const double* __restrict__ high,
     const double c_we = close[warm_end];
     if (period <= 1) {
         o[warm_end] = atr;
-    } else if (c_we > -NATR_TA_EPSILON && c_we < NATR_TA_EPSILON) {
+    } else if (c_we == 0.0) {
         o[warm_end] = 0.0;
     } else {
         o[warm_end] = (atr / c_we) * 100.0;
@@ -368,7 +366,7 @@ void natr_neo_batch_f64(const double* __restrict__ high,
         const double cv = close[idx];
         if (period <= 1) {
             o[idx] = atr;
-        } else if (cv > -NATR_TA_EPSILON && cv < NATR_TA_EPSILON) {
+        } else if (cv == 0.0) {
             o[idx] = 0.0;
         } else {
             o[idx] = (atr / cv) * 100.0;

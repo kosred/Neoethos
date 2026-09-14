@@ -166,8 +166,6 @@ pub async fn stats(State(state): State<AppApiState>, Query(q): Query<JournalQuer
         // filtered to one instrument, so with `symbol` set the equity-derived
         // figures below — max drawdown, recovery factor, Sharpe — still
         // describe the whole account. Only the trade-derived figures narrow.
-        // `journal_stats::max_drawdown_from_trade_pnl` is the symbol-scoped
-        // drawdown when that is what is wanted.
         tracing::debug!(
             target: "neoethos_app::journal",
             symbol = %q.symbol.as_deref().unwrap_or(""),

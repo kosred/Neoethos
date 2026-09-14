@@ -197,9 +197,11 @@ fn independently_stream_identity_with_mutation_v1(value: &impl Serialize, needle
 fn maximum_evaluation_snapshot_v1(
     maximum_general_string: &str,
 ) -> CanonicalNativeGenerationZeroEvaluationSnapshotV1 {
+    // Raw serialization bound probe, not an admitted economic configuration.
     CanonicalNativeGenerationZeroEvaluationSnapshotV1 {
         symbol: maximum_general_string.to_owned(),
         account_currency: maximum_general_string.to_owned(),
+        initial_equity: -f64::MAX,
         max_hold_bars: usize::MAX,
         trailing_enabled: false,
         trailing_atr_multiplier: -f64::MAX,
@@ -212,6 +214,11 @@ fn maximum_evaluation_snapshot_v1(
         swap_long_pips_per_day: -f64::MAX,
         swap_short_pips_per_day: -f64::MAX,
         pnl_conversion_fee_rate: -f64::MAX,
+        kill_zones_enabled: false,
+        session_spread_pips: Some([-f64::MAX; 3]),
+        risk_per_trade_min: -f64::MAX,
+        risk_per_trade_max: -f64::MAX,
+        high_quality_confidence: -f64::MAX,
         smc_gate_threshold: -f64::MAX,
         smc_weight_ob: -f64::MAX,
         smc_weight_fvg: -f64::MAX,
@@ -490,6 +497,7 @@ pub(super) fn with_fully_populated_sealed_result_v1(
             contract_artifact_relative_path_compact_json_bytes,
             source_count,
             total_source_segment_count,
+            feature_metadata_json_upper_bound_bytes: 0,
         },
     )
     .unwrap();
@@ -536,14 +544,14 @@ fn actual_maximum_empty_result_wire_equals_the_independent_analytic_preflight_bo
     let relative_path_json_bytes = independently_stream_compact_json_v1(&relative_path).0;
     let v2_bytes = independently_stream_compact_json_v1(&sizing_receipt).0;
     let v3_bytes = independently_stream_compact_json_v1(&native_receipt).0;
-    assert_eq!(v2_bytes, 7_080_504);
+    assert_eq!(v2_bytes, 7_080_668);
     assert_eq!(v3_bytes, 393_995 + 1_966_378 + 148);
     assert_eq!(
         independently_stream_compact_json_v1(&EVIDENCE_IDENTITY_PLACEHOLDER_V1).0,
         66
     );
 
-    let analytic_b_empty = 8_266_104 + contract_bytes + relative_path_json_bytes + 1_966_378 + 148;
+    let analytic_b_empty = 8_266_579 + contract_bytes + relative_path_json_bytes + 1_966_378 + 148;
     assert_eq!(
         independently_stream_compact_json_v1(&wire).0,
         analytic_b_empty
@@ -553,6 +561,7 @@ fn actual_maximum_empty_result_wire_equals_the_independent_analytic_preflight_bo
         contract_artifact_relative_path_compact_json_bytes: relative_path_json_bytes,
         source_count: 1,
         total_source_segment_count: 1,
+        feature_metadata_json_upper_bound_bytes: 0,
     };
     assert_eq!(
         checked_fixed_metadata_upper_bound_with_empty_arrays_bytes_v1(shape).unwrap(),

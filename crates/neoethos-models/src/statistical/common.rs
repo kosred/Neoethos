@@ -205,6 +205,50 @@ pub fn remap_three_class_labels(labels: &[i32]) -> Result<Vec<usize>> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalTrainValidationSplit {
+    pub train_indices: Vec<usize>,
+    pub embargo_rows: usize,
+    pub validation_indices: Vec<usize>,
+}
+
+/// Canonical chronological 80/20 statistical-model split. The excluded
+/// embargo is retained as a first-class row partition instead of disappearing
+/// between the train and validation index vectors.
+pub fn temporal_train_validation_split(rows: usize) -> TemporalTrainValidationSplit {
+    if rows <= 6 {
+        return TemporalTrainValidationSplit {
+            train_indices: (0..rows).collect(),
+            embargo_rows: 0,
+            validation_indices: Vec::new(),
+        };
+    }
+
+    let val_rows = ((rows as f64) * 0.2).round() as usize;
+    let val_rows = val_rows.clamp(1, rows.saturating_sub(2));
+    let embargo_rows = if rows >= 20 {
+        ((rows as f64) * 0.02).round() as usize
+    } else {
+        0
+    };
+    let embargo_rows = embargo_rows.clamp(0, rows.saturating_sub(val_rows + 1));
+    let train_rows = rows.saturating_sub(val_rows + embargo_rows);
+
+    if train_rows == 0 {
+        return TemporalTrainValidationSplit {
+            train_indices: (0..rows).collect(),
+            embargo_rows: 0,
+            validation_indices: Vec::new(),
+        };
+    }
+
+    TemporalTrainValidationSplit {
+        train_indices: (0..train_rows).collect(),
+        embargo_rows,
+        validation_indices: (train_rows + embargo_rows..rows).collect(),
+    }
+}
+
 pub fn ensure_feature_columns_match(expected: &[String], frame: &FeatureFrame) -> Result<()> {
     if expected.is_empty() {
         bail!("persisted statistical model is missing feature columns");
@@ -271,7 +315,7 @@ pub fn meta_runtime_metadata(
         CapabilityState::Implemented,
         feature_columns,
         default_three_class_label_mapping(),
-        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0),
+        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0, 0),
     )
 }
 

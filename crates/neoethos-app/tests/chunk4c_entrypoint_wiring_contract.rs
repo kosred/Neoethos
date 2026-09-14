@@ -50,16 +50,35 @@ fn headless_flags_form_one_typed_ordered_pipeline_and_retain_the_handle() {
         ],
     );
     assert!(headless.contains("run_headless_execution_pipeline_v1"));
-    assert!(headless.contains("headless_execution.cancel()"));
-    assert!(headless.contains("headless_execution.await_terminal().await"));
-    let cancel = headless.find("headless_execution.cancel()").unwrap();
-    let terminal = headless
-        .find("headless_execution.await_terminal().await")
+    assert!(headless.contains("run_headless_execution_pipeline_v1(state, intent)?"));
+    let natural_completion = between(
+        headless,
+        "_ = interval.tick() =>",
+        "signal = tokio::signal::ctrl_c()",
+    );
+    let finished = natural_completion.find("handle.is_finished()").unwrap();
+    let joined = natural_completion
+        .find("handle.await_terminal().await")
         .unwrap();
+    assert!(finished < joined);
+    assert!(natural_completion.contains("return report_headless_terminal("));
+    assert!(!natural_completion.contains(".cancel()"));
+    let shutdown = between(
+        headless,
+        "signal = tokio::signal::ctrl_c()",
+        "fn report_headless_terminal(",
+    );
+    let cancel = shutdown.find("handle.cancel()").unwrap();
+    let terminal = shutdown.find("handle.await_terminal().await").unwrap();
     assert!(
         cancel < terminal,
         "headless shutdown must cancel before await"
     );
+    assert!(shutdown.contains("return terminal_result"));
+    assert!(headless.contains(
+        "state == app_services::entrypoints::HeadlessExecutionTerminalStateV1::Succeeded"
+    ));
+    assert!(main.contains("run_headless_loop(runtime, headless_state, intent).await?"));
 }
 
 #[test]
@@ -124,14 +143,14 @@ fn validation_uses_typed_start_and_timeout_waits_for_real_release() {
 }
 
 #[test]
-fn indirect_callers_use_typed_starts_without_json_or_prelease_data_work() {
+fn indirect_callers_share_admission_without_ambiguous_supervisor_bypasses() {
     let supervisor = source("src/app_services/supervisor.rs");
     let execute = &supervisor[supervisor
         .find("async fn execute")
         .expect("supervisor execute")..];
     let supervisor_discovery = between(
         execute,
-        "SupervisorAction::StartDiscovery { symbol, base_tf } => {",
+        "SupervisorAction::StartDiscovery { dataset_selection } => {",
         "SupervisorAction::StopDiscovery =>",
     );
     assert_absent(
@@ -141,23 +160,35 @@ fn indirect_callers_use_typed_starts_without_json_or_prelease_data_work() {
             "Settings::from_yaml",
             "resolve_unique_background_dataset_identity",
             "serde_json::from_value",
-            "engines_control::discovery_start(",
+            "start_typed_discovery_execution_v1",
+            "TypedDiscoveryDatasetPolicyV1::Current",
+            "training_after_success: true",
             "\"dataset_identity\"",
         ],
     );
-    assert!(supervisor_discovery.contains("start_typed_discovery_execution_v1"));
+    assert!(supervisor_discovery.contains("engines_control::discovery_start("));
+    assert!(supervisor_discovery.contains("dataset_selection: Some(dataset_selection)"));
+    assert!(supervisor_discovery.contains("action_response(response).await?"));
 
     let supervisor_training = between(
         execute,
-        "SupervisorAction::StartTraining { symbol, base_tf } => {",
+        "SupervisorAction::StartTraining { training_handoff } => {",
         "SupervisorAction::StopTraining =>",
     );
     assert_absent(
         "supervisor training",
         supervisor_training,
-        &["serde_json::from_value", "engines_control::training_start("],
+        &[
+            "serde_json::from_value",
+            "start_typed_training_execution_v1",
+            "TypedTrainingSelectionPolicyV1::Exact",
+        ],
     );
-    assert!(supervisor_training.contains("start_typed_training_execution_v1"));
+    assert!(supervisor_training.contains("engines_control::training_start("));
+    assert!(supervisor_training.contains("TrainingStartBody {"));
+    assert!(supervisor_training.contains("training_handoff,"));
+    assert!(supervisor_training.contains("TrainingMode::TrainModels"));
+    assert!(supervisor_training.contains("action_response(response).await?"));
 
     let rediscovery = source("src/app_services/rediscovery.rs");
     let rediscovery_spawn =
@@ -209,6 +240,7 @@ fn public_headless_adapter_wraps_but_does_not_expose_or_detach_lane_authority() 
     assert!(adapter.contains("start_typed_training_execution_v1"));
     assert!(adapter.contains("training_after_success: intent.auto_training"));
     assert!(adapter.contains("pub fn cancel(&self)"));
+    assert!(adapter.contains("pub fn is_finished(&self)"));
     assert!(adapter.contains("pub async fn await_terminal(self)"));
     assert_absent(
         "public headless adapter",

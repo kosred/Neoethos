@@ -47,6 +47,7 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+rayon = { workspace = true }
 
 [features]
 # Enable the ML-gated blend replay path (genes × SoftVotingEnsemble). Off by

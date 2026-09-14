@@ -1,4 +1,4 @@
-//! RED-only contract for autoresearch's one permitted final OOS quote touch.
+//! Source contracts for autoresearch's one permitted final OOS quote touch.
 //!
 //! Sweeps and finalist selection remain canonical-trendbar research. Only the
 //! already selected, immutable `PromotionPortfolio` may reach this seam, and
@@ -295,6 +295,41 @@ fn judge_recomputes_and_consumes_the_complete_quote_validated_oos_tuple() {
         assert!(
             !derive.contains(forbidden),
             "quote OOS statistics patch/reuse legacy evidence via `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn only_the_final_oos_consumer_uses_the_holdout_receipt_window() {
+    let streaming = read("crates/neoethos-autoresearch/src/runner/streaming.rs");
+    let evaluate = function_body(&streaming, "fn evaluate_oos(");
+    require_tokens(evaluate, &["validate_oos_receipt_against_dataset_receipt("]);
+    assert!(!evaluate.contains("validate_search_receipt_against_dataset_receipt("));
+    let require_replay = evaluate
+        .find("self.quote_validated_oos_replay.is_some()")
+        .unwrap();
+    let preflight = evaluate.find("self.oos_preflight(portfolio)?").unwrap();
+    assert!(require_replay < preflight);
+    let preflight = function_body(&streaming, "fn oos_preflight(");
+    assert!(
+        !preflight.contains("self.quote_validated_oos_replay.is_some()"),
+        "shape preflight must remain usable to request the missing quote coverage"
+    );
+}
+
+#[test]
+fn oos_statistics_use_only_the_capital_sealed_in_the_upstream_evidence() {
+    let source = production_source();
+    let derive = function_body(
+        &source,
+        "fn derive_complete_oos_statistics_from_quote_ledgers_v1(",
+    );
+    require_tokens(derive, &["evidence.metrics().initial_balance().amount()"]);
+    let evaluate = function_body(&source, "pub fn evaluate_quote_validated_oos_touch_v1(");
+    for body in [derive, evaluate] {
+        assert!(
+            !body.contains("initial_balance: f64"),
+            "a detached balance must not change statistics under the same sealed receipt"
         );
     }
 }

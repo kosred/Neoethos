@@ -6,16 +6,24 @@ license.workspace = true
 description = "One-shot fail-closed broker-truth evidence acquisition preflight"
 
 [dependencies]
-anyhow.workspace = true
+anyhow = { workspace = true }
 clap = { version = "4.6.0", features = ["derive"] }
 neoethos-broker-history = { path = "../neoethos-broker-history" }
 neoethos-broker-truth.workspace = true
+neoethos-core = { path = "../neoethos-core" }
 neoethos-data = { path = "../neoethos-data" }
 neoethos-search = { path = "../neoethos-search" }
+neoethos-trader = { path = "../neoethos-trader" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+neoethos-dataset-contracts.workspace = true
+neoethos-feature-contracts = { path = "../neoethos-feature-contracts" }
 tempfile = "3.25.0"
 vortex-array = "0.67.0"
+vortex-file = "=0.67.0"
+vortex-io = "=0.67.0"
+vortex-layout = "=0.67.0"
+vortex-session = "=0.67.0"

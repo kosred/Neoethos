@@ -35,7 +35,7 @@ fn cuda_policy_is_typed_fallible_and_nvidia_only() {
         "malformed gpu:<ordinal> still silently aliases CUDA ordinal zero"
     );
     assert!(
-        COMMON.contains("ROCm device policies cannot select a CUDA backend"),
+        COMMON.contains("non-CUDA device policy cannot select a CUDA backend"),
         "ROCm/vendor-non-CUDA policy must fail instead of selecting CUDA"
     );
 }

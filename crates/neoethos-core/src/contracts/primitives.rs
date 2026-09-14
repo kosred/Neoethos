@@ -115,8 +115,8 @@ impl DeterminismPolicy {
 pub enum BackendKind {
     NativeCpu,
     NativeCuda,
+    NativeRocm,
     CudaKernel,
-    BurnWgpu,
     BurnCpu,
     NativeTreeGpu,
     NativeTreeCpu,

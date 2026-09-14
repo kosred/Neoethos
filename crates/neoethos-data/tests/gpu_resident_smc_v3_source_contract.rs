@@ -14,6 +14,22 @@ fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
+fn normalized(source: &str) -> String {
+    source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let (_, tail) = source
+        .split_once(start)
+        .unwrap_or_else(|| panic!("missing source boundary {start:?}"));
+    tail.split_once(end)
+        .unwrap_or_else(|| panic!("missing source boundary {end:?} after {start:?}"))
+        .0
+}
+
 fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
     let start = source
         .find(signature)
@@ -118,8 +134,9 @@ fn resident_smc_is_one_same_carrier_cuda_parent_and_feature_factory() {
     assert!(!native.contains("smc_parent_rows[cell] = 0"));
     assert!(!native.contains("fallback_"));
     assert!(!runtime.contains("into_resident_sources_v3"));
-    assert!(!runtime.contains("Box<dyn ResidentParentDatasetSourceV3>"));
-    assert!(!runtime.contains("Box<dyn ResidentF64FeatureBatchV3>"));
+    let public_parent_factory = function_body(&runtime, "pub fn prepare_resident_smc_parent_v3(");
+    assert!(!public_parent_factory.contains("Box<dyn ResidentParentDatasetSourceV3>"));
+    assert!(!public_parent_factory.contains("Box<dyn ResidentF64FeatureBatchV3>"));
     assert_eq!(
         runtime.matches("async_copy_from(").count(),
         6,
@@ -331,7 +348,8 @@ fn resident_parent_v4_retains_and_hashes_the_complete_classic_ohlcv_input_once()
             "one-upload SMC parent successor omitted `{token}`"
         );
     }
-    assert!(data.contains("source.volume.as_deref()"));
+    assert!(normalized(&data).contains("letsource=source.ohlcv();"));
+    assert!(normalized(&data).contains("source.volume.as_deref()"));
     assert!(data.contains("volume,"));
     assert!(!runtime.contains("drop(transient_open);"));
 }
@@ -354,24 +372,32 @@ fn resident_smc_rejects_nonfinite_or_negative_volume_before_upload() {
 }
 
 #[test]
-fn only_real_smc_capability_is_admitted_and_the_other_nine_refuse_in_order() {
+fn smc_remains_in_the_complete_ten_producer_capability_census() {
     let data = read("crates/neoethos-data/src/core/gpu_resident_feature_store_v3.rs");
+    let preflight =
+        read("crates/neoethos-data/src/core/gpu_only_feature_workspace_preflight_v3.rs");
+    let census = function_body(&data, "fn current_resident_producer_capabilities_v3()");
     for token in [
-        "resident_smc_capability_v3()",
-        "assert_eq!(missing, EXPECTED_MISSING_AFTER_SMC_V3)",
-        "ClassicTa",
-        "Quant",
-        "Session",
-        "Regime",
-        "Footprint",
-        "HigherTimeframeAlignment",
-        "RobustNormalization",
-        "CanonicalContentSha256",
-        "FeatureMajorToBarMajor",
+        "resident_classic_ta_capability_v3()?",
+        "resident_smc_capability_v3()?",
+        "resident_quant_capability_v3()?",
+        "resident_session_capability_v2()?",
+        "resident_regime_capability_v3()?",
+        "resident_footprint_capability_v2()?",
+        "resident_higher_timeframe_capability_v3()?",
+        "resident_robust_normalization_capability_v2()?",
+        "resident_canonical_content_sha256_capability_v3()?",
+        "resident_feature_major_to_bar_major_capability_v3()?",
     ] {
-        assert!(data.contains(token), "SMC-only census omitted `{token}`");
+        assert!(census.contains(token), "complete census omitted `{token}`");
     }
-    assert!(!data.contains("assert_eq!(missing, ResidentFeatureProducerV3::ALL)"));
+    assert_eq!(census.matches("capability_v").count(), 10);
+    let pending = section(
+        &preflight,
+        "pub const CURRENT_PENDING_RESIDENT_PRODUCERS_V3:",
+        "];",
+    );
+    assert_eq!(pending.matches("ResidentFeatureProducerV3::").count(), 0);
 }
 
 #[test]

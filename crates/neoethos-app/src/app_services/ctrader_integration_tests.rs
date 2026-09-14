@@ -108,9 +108,9 @@ mod ctrader_integration_tests {
         )
     }
 
-    fn symbol_by_id_ok(symbol_id: i64, digits: i32) -> String {
+    fn symbol_by_id_ok(account_id: i64, symbol_id: i64, digits: i32) -> String {
         format!(
-            r#"{{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{{"symbol":[{{"symbolId":{symbol_id},"digits":{digits},"pipPosition":4,"tradingMode":0}}]}}}}"#
+            r#"{{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{{"ctidTraderAccountId":{account_id},"symbol":[{{"symbolId":{symbol_id},"digits":{digits},"pipPosition":4,"tradingMode":0}}]}}}}"#
         )
     }
 
@@ -156,7 +156,7 @@ mod ctrader_integration_tests {
             Ok(symbols_list_ok(712345, &[("EURUSD", 14)])),
             Ok(app_auth_ok()),
             Ok(account_auth_ok(712345)),
-            Ok(symbol_by_id_ok(14, 5)),
+            Ok(symbol_by_id_ok(712345, 14, 5)),
         ]);
 
         let result = resolve_symbol_with_transport(
@@ -192,7 +192,7 @@ mod ctrader_integration_tests {
             Ok(symbols_list_ok(712345, &[("EUR/USD", 14)])),
             Ok(app_auth_ok()),
             Ok(account_auth_ok(712345)),
-            Ok(symbol_by_id_ok(14, 5)),
+            Ok(symbol_by_id_ok(712345, 14, 5)),
         ]);
 
         let result = resolve_symbol_with_transport(
@@ -256,6 +256,220 @@ mod ctrader_integration_tests {
         .expect_err("bad credentials must fail");
 
         assert!(err.to_string().contains("INVALID_CLIENT"));
+    }
+
+    fn account_bound_symbol_transport(
+        account_id: i64,
+        list: String,
+        detail: String,
+    ) -> SequenceTransport {
+        SequenceTransport::with(vec![
+            Ok(app_auth_ok()),
+            Ok(account_auth_ok(account_id)),
+            Ok(list),
+            Ok(app_auth_ok()),
+            Ok(account_auth_ok(account_id)),
+            Ok(detail),
+        ])
+    }
+
+    fn account_bound_symbol_request(
+        account_id: i64,
+        environment: CTraderEnvironment,
+    ) -> CTraderSymbolLookupRequest {
+        CTraderSymbolLookupRequest {
+            client_id: "fixture-client".into(),
+            client_secret: "fixture-secret".into(),
+            access_token: "fixture-token".into(),
+            environment,
+            account_id: account_id.to_string(),
+            symbol_name: "EURUSD".into(),
+        }
+    }
+
+    #[test]
+    fn symbol_resolution_binds_both_response_accounts_in_demo_and_live() {
+        for environment in [CTraderEnvironment::Demo, CTraderEnvironment::Live] {
+            for account_id in [42, 99] {
+                let transport = account_bound_symbol_transport(
+                    account_id,
+                    symbols_list_ok(account_id, &[("EUR/USD", 14)]),
+                    symbol_by_id_ok(account_id, 14, 5),
+                );
+                let resolved = resolve_symbol_with_transport(
+                    &transport,
+                    &account_bound_symbol_request(account_id, environment),
+                )
+                .expect("both actual response envelopes match the requested account");
+                assert_eq!(resolved.account_id, account_id);
+                assert_eq!(resolved.light_symbol.symbol_id, 14);
+                assert_eq!(resolved.symbol.symbol_id, 14);
+                assert_eq!(resolved.symbol.symbol_name, "EUR/USD");
+                assert_eq!(resolved.symbol.digits, 5);
+                assert_eq!(resolved.symbol.pip_position, 4);
+                assert!(resolved.symbol.financials.is_some());
+
+                let sent = transport.sent.lock().expect("sent messages");
+                assert_eq!(sent.len(), 6);
+                for index in [1, 2, 4, 5] {
+                    assert_eq!(
+                        sent[index].payload["ctidTraderAccountId"].as_i64(),
+                        Some(account_id),
+                        "both connections authenticate and request the same account"
+                    );
+                }
+                assert_eq!(sent[5].payload["symbolId"], serde_json::json!([14]));
+                assert!(transport.queue.lock().expect("response queue").is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn symbol_resolution_rejects_foreign_list_before_requesting_detail() {
+        let transport = account_bound_symbol_transport(
+            42,
+            symbols_list_ok(99, &[("EURUSD", 14)]),
+            symbol_by_id_ok(42, 14, 5),
+        );
+        let error = resolve_symbol_with_transport(
+            &transport,
+            &account_bound_symbol_request(42, CTraderEnvironment::Demo),
+        )
+        .expect_err("a valid symbol row from account 99 cannot be relabelled as account 42");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("symbols-list response identity"), "{chain}");
+        assert!(chain.contains("expected 42, received 99"), "{chain}");
+        assert_eq!(transport.sent_count(), 3);
+        assert_eq!(transport.queue.lock().expect("response queue").len(), 3);
+    }
+
+    #[test]
+    fn symbol_resolution_rejects_foreign_detail_before_returning_financials() {
+        let transport = account_bound_symbol_transport(
+            42,
+            symbols_list_ok(42, &[("EURUSD", 14)]),
+            symbol_by_id_ok(99, 14, 5),
+        );
+        let error = resolve_symbol_with_transport(
+            &transport,
+            &account_bound_symbol_request(42, CTraderEnvironment::Demo),
+        )
+        .expect_err("matching symbol ID does not authorize another account's metadata");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("symbol-by-id response identity"), "{chain}");
+        assert!(chain.contains("expected 42, received 99"), "{chain}");
+        assert_eq!(transport.sent_count(), 6);
+        assert!(transport.queue.lock().expect("response queue").is_empty());
+    }
+
+    #[test]
+    fn symbol_resolution_requires_integer_account_on_each_data_envelope() {
+        for detail_stage in [false, true] {
+            for account in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!("42")),
+                Some(serde_json::json!(42.5)),
+                Some(serde_json::json!(u64::MAX)),
+                Some(serde_json::json!(0)),
+                Some(serde_json::json!(-42)),
+            ] {
+                let mut list: serde_json::Value =
+                    serde_json::from_str(&symbols_list_ok(42, &[("EURUSD", 14)])).unwrap();
+                let mut detail: serde_json::Value =
+                    serde_json::from_str(&symbol_by_id_ok(42, 14, 5)).unwrap();
+                let response = if detail_stage { &mut detail } else { &mut list };
+                let payload = response["payload"].as_object_mut().unwrap();
+                match account {
+                    Some(value) => {
+                        payload.insert("ctidTraderAccountId".into(), value);
+                    }
+                    None => {
+                        payload.remove("ctidTraderAccountId");
+                    }
+                }
+                let transport =
+                    account_bound_symbol_transport(42, list.to_string(), detail.to_string());
+                let error = resolve_symbol_with_transport(
+                    &transport,
+                    &account_bound_symbol_request(42, CTraderEnvironment::Demo),
+                )
+                .expect_err("required response account must be an exact matching integer");
+                let chain = format!("{error:#}");
+                let stage = if detail_stage {
+                    "symbol-by-id"
+                } else {
+                    "symbols-list"
+                };
+                assert!(
+                    chain.contains(&format!("{stage} response identity")),
+                    "{chain}"
+                );
+                assert_eq!(transport.sent_count(), if detail_stage { 6 } else { 3 });
+            }
+        }
+    }
+
+    #[test]
+    fn symbol_resolution_checks_account_before_deserializing_symbol_rows() {
+        for detail_stage in [false, true] {
+            let mut list: serde_json::Value =
+                serde_json::from_str(&symbols_list_ok(42, &[("EURUSD", 14)])).unwrap();
+            let mut detail: serde_json::Value =
+                serde_json::from_str(&symbol_by_id_ok(42, 14, 5)).unwrap();
+            let response = if detail_stage { &mut detail } else { &mut list };
+            response["payload"]["ctidTraderAccountId"] = serde_json::json!(99);
+            response["payload"]["symbol"] = serde_json::json!([{"symbolId": "invalid-row"}]);
+            let transport =
+                account_bound_symbol_transport(42, list.to_string(), detail.to_string());
+            let error = resolve_symbol_with_transport(
+                &transport,
+                &account_bound_symbol_request(42, CTraderEnvironment::Demo),
+            )
+            .expect_err("foreign envelope identity must be rejected before parsing its rows");
+            let chain = format!("{error:#}");
+            assert!(chain.contains("expected 42, received 99"), "{chain}");
+            assert!(!chain.contains("invalid-row"), "{chain}");
+            assert_eq!(transport.sent_count(), if detail_stage { 6 } else { 3 });
+        }
+    }
+
+    #[test]
+    fn symbol_resolution_rejects_wrong_data_type_and_preserves_broker_error_code() {
+        for detail_stage in [false, true] {
+            for broker_error in [false, true] {
+                let invalid = if broker_error {
+                    error_response("ACCOUNT_NOT_AUTHORIZED", "fixture account refusal")
+                } else {
+                    // A valid account ID on an unrelated response is not symbol authority.
+                    account_auth_ok(42)
+                };
+                let list = if detail_stage {
+                    symbols_list_ok(42, &[("EURUSD", 14)])
+                } else {
+                    invalid.clone()
+                };
+                let detail = if detail_stage {
+                    invalid
+                } else {
+                    symbol_by_id_ok(42, 14, 5)
+                };
+                let transport = account_bound_symbol_transport(42, list, detail);
+                let error = resolve_symbol_with_transport(
+                    &transport,
+                    &account_bound_symbol_request(42, CTraderEnvironment::Demo),
+                )
+                .expect_err("error or unrelated response must never supply symbol metadata");
+                let chain = format!("{error:#}");
+                if broker_error {
+                    assert!(chain.contains("ACCOUNT_NOT_AUTHORIZED"), "{chain}");
+                    assert!(chain.contains("fixture account refusal"), "{chain}");
+                } else {
+                    assert!(chain.contains("unexpected cTrader payload type"), "{chain}");
+                }
+                assert_eq!(transport.sent_count(), if detail_stage { 6 } else { 3 });
+            }
+        }
     }
 
     // ─── Account discovery flow ─────────────────────────────────────────────
