@@ -39,21 +39,17 @@ use neoethos_gpu_contracts::resident_search_scoring_v2::{
     ResidentScoringOutcomeV2, RiskyGrowthGoal, checked_resident_goal_score_v6,
 };
 use neoethos_gpu_cuda::hip_runtime_v1::{HipRunLeaseV1, hip_native_build_manifest_v1};
-use neoethos_gpu_cuda::resident_generation_v1::{
-    ParentSelectionPolicyV1, ResidentAdaptiveGenerationInputsV3,
-    ResidentGenerationPlanAuthorityInputV1, ResidentGenerationTemplateV3,
-    SurvivorSelectionPolicyV1, discovery_adaptive_generation_semantics_sha256_v3,
-    resident_metric_semantics_sha256_v2, seal_adaptive_resident_generation_plan_v3,
-};
-use neoethos_gpu_cuda::resident_scoring_v2::{
-    ResidentScoringObjectiveV2, novelty_disabled_semantics_sha256_v2, rank_semantics_sha256_v2,
-    scoring_semantics_sha256_v2,
-};
 use neoethos_gpu_cuda::resident_search_slice2_v3::{
     HipResidentSearchTryCompleteV3, ResidentSearchArchivePolicyV3, ResidentSearchExecutionInputsV3,
 };
 use neoethos_gpu_cuda::{
-    PopulationEvaluationViewV1, PopulationGeneView, PopulationTimestampModeV1, SMC_SLOTS,
+    ParentSelectionPolicyV1, PopulationEvaluationViewV1, PopulationGeneView,
+    PopulationTimestampModeV1, ResidentAdaptiveGenerationInputsV3,
+    ResidentGenerationPlanAuthorityInputV1, ResidentGenerationTemplateV3,
+    ResidentScoringObjectiveV2, SMC_SLOTS, SurvivorSelectionPolicyV1,
+    discovery_adaptive_generation_semantics_sha256_v3, novelty_disabled_semantics_sha256_v2,
+    rank_semantics_sha256_v2, resident_metric_semantics_sha256_v2, scoring_semantics_sha256_v2,
+    seal_adaptive_resident_generation_plan_v3,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};

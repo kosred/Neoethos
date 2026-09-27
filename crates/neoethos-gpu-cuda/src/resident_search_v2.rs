@@ -1736,6 +1736,7 @@ impl ResidentSearchRunV2 {
         Ok(self.current_gene_view_summary_v2())
     }
 
+    #[cfg(feature = "cuda-device-fixtures")]
     pub(crate) fn close_v2(mut self) -> Result<PopulationSession, ResidentSearchV2Error> {
         if !matches!(
             self.state,

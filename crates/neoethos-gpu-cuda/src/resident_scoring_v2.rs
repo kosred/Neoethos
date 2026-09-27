@@ -33,6 +33,7 @@ pub(crate) const RESIDENT_RANK_SEMANTICS_V2: &str = concat!(
     "population-ordinal-asc;ordered-f64;positive-zero-canonical;economic-reject-key=1;",
     "defined-sentinel-cub-inputs;fault-gated-semantic-commit"
 );
+#[cfg(not(feature = "hip-native-kernels"))]
 pub(crate) const RESIDENT_CUDA_MATH_SEMANTICS_V2: &str =
     "neoethos.cuda-math.v2;fmad=false;ftz=false;prec-div=true;prec-sqrt=true";
 

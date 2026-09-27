@@ -3028,7 +3028,7 @@ impl PopulationSession {
         self.drop_policy_v3 = PopulationSessionDropPolicyV3::LeakUntilResidentConsumerEvent;
     }
 
-    #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
+    #[cfg(feature = "cuda")]
     pub(crate) fn authorize_resident_session_destroy_v3(&mut self) {
         self.drop_policy_v3 = PopulationSessionDropPolicyV3::DestroyWhenIdle;
     }

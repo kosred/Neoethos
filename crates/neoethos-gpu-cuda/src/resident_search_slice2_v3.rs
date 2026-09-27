@@ -18,8 +18,6 @@ use crate::resident_search_slice2_admission_v2::ResidentSearchCompactInputIdenti
 use crate::resident_search_slice2_admission_v2::ResidentSearchSlice2InputIdentityV3;
 #[cfg(feature = "cuda")]
 type SelectedFeatureStoreCompletionV3 = ResidentFeatureStoreConsumerLeaseV3;
-#[cfg(feature = "hip-native-kernels")]
-type SelectedFeatureStoreCompletionV3 = ();
 #[cfg(any(feature = "cuda", feature = "hip-native-kernels"))]
 use crate::resident_search_v2::{
     ResidentSearchSlice2NativeErrorV3, ResidentSearchSlice2NativeOwnerV3,
@@ -57,6 +55,7 @@ struct ResidentSearchAuthorityStateV3 {
     terminal_candidates: Option<ResidentSearchTerminalCandidatesV3>,
     adaptive_checkpoint: Option<ResidentAdaptiveCheckpointV3>,
     retain_compact_session: bool,
+    #[cfg(feature = "cuda")]
     completion: Option<SelectedFeatureStoreCompletionV3>,
     poisoned: bool,
 }
@@ -1173,6 +1172,7 @@ fn start_resident_population_search_slice2_v3(
             terminal_candidates: None,
             adaptive_checkpoint: None,
             retain_compact_session: false,
+            #[cfg(feature = "cuda")]
             completion: None,
             poisoned: false,
         },
