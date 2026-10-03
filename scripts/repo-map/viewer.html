@@ -1,0 +1,31 @@
+<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NeoEthos repository map</title>
+<style>
+body{font:16px system-ui;background:#101827;color:#e6edf7;margin:0;padding:24px;max-width:1200px;margin:auto}
+input,button,select{font:inherit;padding:10px;background:#202d42;color:#e6edf7;border:1px solid #506080;border-radius:5px}
+input{width:min(90%,600px)}button{cursor:pointer}a{color:#89c7ff}small,.muted{color:#a8b8cf}
+table{width:100%;border-collapse:collapse;margin:20px 0}td,th{padding:9px;text-align:left;border-bottom:1px solid #36445b;overflow-wrap:anywhere}
+td:first-child{max-width:420px}pre{white-space:pre-wrap;overflow-wrap:anywhere}#notice{border-left:4px solid #efb75a;padding:12px}
+</style>
+<h1>NeoEthos repository map</h1><p id="meta"></p>
+<p id="notice">Compact symbol overview. Full call-site records are in graph.sqlite. Syntax/name candidates are possible connections, not verified runtime calls. No-reference findings do not authorize deletion. Coverage is configuration-specific.</p>
+<label>Find a function, type, package, feature or file<br><input id="search" placeholder="resident_search, LiveTrading, training…"></label>
+<select id="kind"><option value="">All kinds</option><option>file</option><option>package</option><option>function_item</option><option>scip_symbol</option><option>call_site</option></select>
+<p id="count"></p><table><thead><tr><th>Name / source</th><th>Kind</th><th>Inspect</th></tr></thead><tbody id="results"></tbody></table>
+<section id="detail"></section><h2>Coverage and limits</h2><pre id="coverage"></pre>
+<script type="module">
+const packed=/*REPO_MAP_DATA*/;
+if(!globalThis.DecompressionStream){document.getElementById('notice').textContent='This browser cannot unpack the map. Use a current browser or query graph.sqlite.';throw new Error('DecompressionStream unavailable')}
+const bytes=Uint8Array.from(atob(packed),c=>c.charCodeAt(0));
+const map=JSON.parse(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).text());
+const $=id=>document.getElementById(id),nodes=new Map(map.nodes.map(n=>[n.id,n]));
+const outgoing=new Map(),incoming=new Map();
+for(const e of map.edges){if(!outgoing.has(e[0]))outgoing.set(e[0],[]);outgoing.get(e[0]).push(e);if(!incoming.has(e[1]))incoming.set(e[1],[]);incoming.get(e[1]).push(e)}
+$('meta').textContent=`Commit ${map.summary.commit}${map.summary.working_tree_dirty?' (modified working tree)':''} · ${map.summary.files.toLocaleString()} tracked files · ${map.summary.nodes.toLocaleString()} graph nodes`;
+$('coverage').textContent=JSON.stringify({coverage:map.summary.coverage,evidence:map.summary.edge_evidence,limits:map.summary.limitations},null,2);
+function sourceLink(n){const a=document.createElement('a');a.textContent=`${n.path}:${n.line||1}`;a.href=`https://github.com/kosred/Neoethos/blob/${map.summary.commit}/${n.path.split('/').map(encodeURIComponent).join('/')}#L${n.line||1}`;a.target='_blank';a.rel='noopener';return a}
+function inspect(id){const n=nodes.get(id),box=$('detail');box.replaceChildren();const title=document.createElement('h2');title.textContent=n.name;box.append(title,sourceLink(n));const context=document.createElement('pre');context.textContent=n.context;box.append(context);for(const [label,items,index]of[['Outgoing',outgoing.get(id)||[],1],['Incoming',incoming.get(id)||[],0]]){const h=document.createElement('h3');h.textContent=`${label} (${items.length})`;box.append(h);for(const e of items.slice(0,200)){const p=document.createElement('p'),b=document.createElement('button'),other=nodes.get(e[index]);b.textContent=other?.name||e[index];b.onclick=()=>inspect(e[index]);p.append(`${e[2]} [${e[3]}] → `,b);if(e[4]){const a=sourceLink({path:e[4],line:e[5]});p.append(' ',a)}box.append(p)}if(items.length>200)box.append('Showing 200 connections; query graph.sqlite for the complete set.')}box.scrollIntoView({behavior:'smooth'})}
+function render(){const q=$('search').value.toLowerCase(),kind=$('kind').value;const hits=map.nodes.filter(n=>(!kind||n.kind===kind)&&(n.name+' '+n.path).toLowerCase().includes(q));$('count').textContent=`${hits.length.toLocaleString()} matches; showing up to 100.`;const body=$('results');body.replaceChildren();for(const n of hits.slice(0,100)){const row=document.createElement('tr'),name=document.createElement('td'),type=document.createElement('td'),act=document.createElement('td'),b=document.createElement('button');name.append(document.createTextNode(n.name));if(n.path){name.append(document.createElement('br'),sourceLink(n))}type.textContent=n.kind;b.textContent='Connections';b.onclick=()=>inspect(n.id);act.append(b);row.append(name,type,act);body.append(row)}}
+let timer;$('search').oninput=()=>{clearTimeout(timer);timer=setTimeout(render,150)};$('kind').onchange=render;render();
+</script></html>
