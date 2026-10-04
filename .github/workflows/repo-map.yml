@@ -23,7 +23,7 @@ jobs:
   structure:
     name: Inventory, syntax graph and duplicates
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -200,15 +200,54 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  semantic-checkpoint:
-    needs: structure
+  static-profiles:
+    name: Static Rust profile (${{ matrix.profile }})
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/codex/repo-map-20261004' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [mcp, mesh, history-probe, boundary-harness, cuda-static, hip-static]
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install exact Rust toolchain and pinned SCIP CLI
+        run: |
+          rustup toolchain install nightly-2026-04-07 --profile minimal --component rust-analyzer --component rust-src
+          mkdir -p "$RUNNER_TEMP/scip-cli"
+          cd "$RUNNER_TEMP/scip-cli"
+          curl --fail --location --retry 3 -O https://github.com/scip-code/scip/releases/download/v0.10.0/scip-linux-amd64.tar.gz
+          curl --fail --location --retry 3 -O https://github.com/scip-code/scip/releases/download/v0.10.0/scip-linux-amd64.tar.gz.sha256
+          sha256sum --check scip-linux-amd64.tar.gz.sha256
+          tar --no-same-owner -xzf scip-linux-amd64.tar.gz
+          echo "$RUNNER_TEMP/scip-cli" >> "$GITHUB_PATH"
+      - name: Index declared cfgs with native build outputs explicitly skipped
+        run: python scripts/repo-map/probe_indices.py --profile "${{ matrix.profile }}" --output "$RUNNER_TEMP/rust-profile"
+      - name: Keep profile, raw index and diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-profile-${{ matrix.profile }}
+          path: ${{ runner.temp }}/rust-profile/
+          if-no-files-found: error
+          retention-days: 30
+
+  semantic-checkpoint:
+    needs: [structure, static-profiles]
+    if: ${{ always() && needs.structure.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/codex/repo-map-20261004' }}
     permissions:
       contents: read
       actions: read
     name: Verify Rust checkpoint and complete architecture reports
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -237,12 +276,17 @@ jobs:
         with:
           name: repository-duplicates-${{ github.sha }}
           path: ${{ runner.temp }}/structure-reports/duplicates
+      - name: Load successful and failed additional profile diagnostics
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: rust-profile-*
+          path: ${{ runner.temp }}/additional-indices
       - name: Fetch index source commit for content comparison
         run: |
           git fetch origin 02f33576b4a3359fc3e2fd2b1c857e79fad6cf3e --depth=1
       - name: Reuse index only after validating unchanged source
         run: |
-          python scripts/repo-map/reuse_scip.py --checkpoint "$RUNNER_TEMP/rust-checkpoint"             --source-commit 02f33576b4a3359fc3e2fd2b1c857e79fad6cf3e --structural "$RUNNER_TEMP/structure-reports" --output "$RUNNER_TEMP/repository-map-rust"
+          python scripts/repo-map/reuse_scip.py --checkpoint "$RUNNER_TEMP/rust-checkpoint"             --source-commit 02f33576b4a3359fc3e2fd2b1c857e79fad6cf3e --structural "$RUNNER_TEMP/structure-reports" --additional-indices "$RUNNER_TEMP/additional-indices" --output "$RUNNER_TEMP/repository-map-rust"
           cat "$RUNNER_TEMP/repository-map-rust/architecture.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Keep semantic coverage, architecture and viewer
         if: always()

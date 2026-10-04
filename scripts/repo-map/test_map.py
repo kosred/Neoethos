@@ -19,6 +19,22 @@ class GraphEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mapper.jsonc_loads(b'{/* missing end')
 
+    def test_multiple_scip_profiles_keep_local_symbols_separate_and_global_definitions_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = Path(tmp) / 'index.json'
+            index.write_text(json.dumps({'documents': [
+                {'relative_path': 'src/lib.rs', 'occurrences': [{'symbol': 'local 0', 'range': [0, 0, 1], 'symbol_roles': 1},
+                                                             {'symbol': 'shared global', 'range': [1, 0, 1], 'symbol_roles': 1}]},
+                {'relative_path': 'src/other.rs', 'occurrences': [{'symbol': 'shared global', 'range': [2, 0, 1], 'symbol_roles': 1}]},
+            ]}))
+            graph = mapper.Graph()
+            mapper.import_scip(graph, index, prefix='mcp', profile='cpu')
+            mapper.import_scip(graph, index, prefix='mcp', profile='gpu')
+            self.assertIn('scip:mcp/src/lib.rs:cpu:local 0', graph.nodes)
+            self.assertIn('scip:mcp/src/lib.rs:gpu:local 0', graph.nodes)
+            self.assertEqual(graph.nodes['scip:shared global']['path'], '')
+            self.assertEqual({e[4] for e in graph.edges if e[1]=='scip:shared global' and e[2]=='defines'}, {'mcp/src/lib.rs','mcp/src/other.rs'})
+
     def test_python_shell_and_workflow_connections_have_explicit_evidence(self):
         graph = mapper.Graph()
         for path, code, language in [('tool.py', b'def helper(): pass\ndef main(): helper()\n', 'python'),
@@ -115,8 +131,8 @@ class GraphEvidenceTests(unittest.TestCase):
             ]}))
             graph = mapper.Graph()
             mapper.import_scip(graph, index)
-            self.assertIn("scip:a.rs:local 0", graph.nodes)
-            self.assertIn("scip:b.rs:local 0", graph.nodes)
+            self.assertIn("scip:a.rs:repo-nightly-default-features:local 0", graph.nodes)
+            self.assertIn("scip:b.rs:repo-nightly-default-features:local 0", graph.nodes)
             self.assertEqual({e[2] for e in graph.edges}, {"defines", "references"})
             summary = mapper.save(graph, Path(tmp) / "out", "abc", dirty=True)
             self.assertFalse(summary["whole_repo_semantically_verified"])

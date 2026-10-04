@@ -5,6 +5,7 @@ import collections
 import base64
 import gzip
 import hashlib
+import fnmatch
 import json
 import sqlite3
 import subprocess
@@ -169,6 +170,30 @@ def manifest_graph(graph, root, paths):
                 graph.coverage.append({"path": path, "status": "manifest_error", "detail": str(error)})
     workspace = manifests.get("Cargo.toml", {}).get("workspace", {}).get("dependencies", {})
     for path, document in manifests.items():
+        if 'workspace' not in document:
+            continue
+        ws = document['workspace']
+        key = graph.node('workspace:' + path, 'cargo_workspace', path, path)
+        parent = Path(path).parent
+        patterns = ws.get('members', ['.'] if document.get('package') else [])
+        for member, member_document in manifests.items():
+            folder = Path(member).parent
+            try:
+                relative = folder.relative_to(parent).as_posix()
+            except ValueError:
+                continue
+            if any(fnmatch.fnmatch(relative, pattern) for pattern in patterns) and not any(
+                    fnmatch.fnmatch(relative, pattern) for pattern in ws.get('exclude', [])):
+                target = graph.node('package:' + member, 'package', member_document.get('package', {}).get('name', member), member)
+                graph.edge(key, target, 'workspace_member', 'toml', path, 0,
+                           json.dumps({'default_members': ws.get('default-members', 'all declared members')}))
+        for registry, patches in document.get('patch', {}).items():
+            for name, spec in patches.items():
+                if isinstance(spec, dict) and 'path' in spec:
+                    target_path = (parent / spec['path'] / 'Cargo.toml').as_posix()
+                    target = graph.node('package:' + target_path, 'package', name, target_path)
+                    graph.edge(key, target, 'patch_override', 'toml', path, 0, registry)
+    for path, document in manifests.items():
         package = document.get("package", {})
         if not package:
             continue
@@ -303,11 +328,14 @@ def field(obj, snake):
     return obj.get(snake, obj.get(camel))
 
 
-def import_scip(graph, index_path):
+def import_scip(graph, index_path, prefix='', profile='repo-nightly-default-features'):
     index = json.loads(index_path.read_text())
     tracked = {f["path"] for f in graph.files}
     for document in index.get("documents", []):
         path = field(document, "relative_path")
+        if path and prefix:
+            import posixpath
+            path = posixpath.normpath(posixpath.join(prefix, path))
         if not path or path.startswith("vendor/"):
             continue
         if tracked and path not in tracked:
@@ -315,20 +343,20 @@ def import_scip(graph, index_path):
             continue
         file_node = graph.node("file:" + path, "file", path, path)
         graph.coverage.append({"path": path, "status": "scip_indexed",
-                               "profile": "repo-nightly-default-features", "runtime_verified": False,
+                               "profile": profile, "runtime_verified": False,
                                "occurrences": len(document.get("occurrences", [])),
                                "definitions": sum(bool((field(o, "symbol_roles") or 0) & 1)
                                                   for o in document.get("occurrences", [])),
                                "diagnostics": [d for o in document.get("occurrences", [])
                                                for d in o.get("diagnostics", [])]})
         def symbol_id(symbol):
-            return "scip:" + (path + ":" if symbol.startswith("local ") else "") + symbol
+            return "scip:" + (path + ":" + profile + ":" if symbol.startswith("local ") else "") + symbol
         for symbol in document.get("symbols", []):
             raw = symbol.get("symbol", "")
             if not raw:
                 continue
             key = graph.node(symbol_id(raw), "scip_symbol", field(symbol, "display_name") or raw,
-                             context="repo-nightly-default-features")
+                             context=profile)
             for relationship in symbol.get("relationships", []):
                 other_raw = relationship.get("symbol", "")
                 if other_raw:
@@ -340,14 +368,22 @@ def import_scip(graph, index_path):
             if not raw:
                 continue
             key = graph.node(symbol_id(raw), "scip_symbol", raw,
-                             context="repo-nightly-default-features")
+                             context=profile)
             span = occurrence.get("range", [])
             line = span[0] + 1 if span else 0
             role = field(occurrence, "symbol_roles") or 0
             if role & 1 and not graph.nodes[key]["path"]:
                 graph.nodes[key].update(path=path, line=line, end_line=line)
             graph.edge(file_node, key, "defines" if role & 1 else "references", "scip", path, line,
-                       "Static symbol reference; not automatically a runtime call")
+                       profile + ": Static symbol reference; not automatically a runtime call")
+    definitions = collections.defaultdict(set)
+    for source, target, kind, evidence, path, line, _ in graph.edges:
+        if kind == 'defines' and evidence == 'scip':
+            definitions[target].add(path)
+    for key, locations in definitions.items():
+        if len(locations) > 1:
+            graph.nodes[key].update(path='', line=0, end_line=0,
+                                    context='Ambiguous SCIP definition across documents; inspect defines edges')
 
 
 def save(graph, output, commit, dirty=False):
@@ -394,7 +430,9 @@ def save(graph, output, commit, dirty=False):
             hashes[item["sha256"]].append(item["path"])
     (output / "identical-files.json").write_text(json.dumps([v for v in hashes.values() if len(v) > 1], indent=2))
     # Standalone HTML: no CDN, server, fetch(), model API, or local-file CORS issue.
-    visible = {key for key, n in graph.nodes.items() if n["kind"] != "call_site"}
+    scip_definitions = {b for _, b, kind, evidence, *_ in graph.edges if kind == 'defines' and evidence == 'scip'}
+    visible = {key for key, n in graph.nodes.items() if n["kind"] != "call_site" and
+               (n['kind'] != 'scip_symbol' or (key in scip_definitions and ':local ' not in key))}
     call_owners = {b: a for a, b, kind, *_ in graph.edges if kind == "calls_syntax"}
     compact_edges = set()
     for a, b, kind, evidence, path, line, _ in graph.edges:
@@ -418,7 +456,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--scip-json", type=Path)
+    parser.add_argument("--scip-json", type=Path, action='append', default=[])
+    parser.add_argument("--scip-prefix", action='append', default=[])
+    parser.add_argument("--scip-profile", action='append', default=[])
     parser.add_argument("--scip-source-commit")
     args = parser.parse_args()
     root = args.root.resolve()
@@ -456,8 +496,9 @@ def main():
             parse_source(graph, path, data, language)
     manifest_graph(graph, root, paths)
     resolve_candidates(graph)
-    if args.scip_json:
-        import_scip(graph, args.scip_json)
+    for i, index_path in enumerate(args.scip_json):
+        import_scip(graph, index_path, args.scip_prefix[i] if i < len(args.scip_prefix) else '',
+                    args.scip_profile[i] if i < len(args.scip_profile) else 'repo-nightly-default-features')
     dirty = bool(git(root, "status", "--porcelain", "--untracked-files=no"))
     summary = save(graph, args.output, commit, dirty)
     from report_map import report

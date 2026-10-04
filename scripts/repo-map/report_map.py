@@ -55,6 +55,7 @@ def report(output):
     adjacency = collections.defaultdict(set)
     cross = collections.Counter()
     with sqlite3.connect('file:' + str((output / 'graph.sqlite').resolve()) + '?mode=ro', uri=True) as db:
+        ambiguities = db.execute("SELECT count(*) FROM (SELECT target FROM edges WHERE kind='defines' AND evidence='scip' GROUP BY target HAVING count(DISTINCT path)>1)").fetchone()[0]
         for source, target in db.execute("SELECT a.path,b.path FROM edges e JOIN nodes a ON a.id=e.source JOIN nodes b ON b.id=e.target WHERE e.kind='declared_dependency' AND b.kind='package'"):
             adjacency[source].add(target)
         # Static references grouped by the document owning a symbol's definition.
@@ -74,7 +75,15 @@ def report(output):
               'parser_and_configuration_errors': [c for c in coverage if c['status'] in ('syntax_with_errors', 'configuration_error', 'manifest_error')],
               'inventory_only_project_files': [c for c in coverage if c['status'] == 'inventory_only'],
               'scip_diagnostics': [{'path': c['path'], 'diagnostics': c['diagnostics']} for c in coverage if c.get('diagnostics')],
+              'ambiguous_scip_definition_symbols': ambiguities,
+              'semantic_profiles': dict(collections.Counter(c.get('profile') for c in coverage if c['status']=='scip_indexed')),
               'limits': summary['limitations']}
+    result['indexer_warnings'] = []
+    for log in sorted(output.rglob('rust-scip.stderr')):
+        content = log.read_text(errors='replace').splitlines()
+        result['indexer_warnings'].append({'log': log.relative_to(output).as_posix(),
+                                          'duplicate_symbol_warnings': sum('Duplicate symbol:' in line for line in content),
+                                          'error_or_failure_lines': [line[:1000] for line in content if any(term in line.lower() for term in ('error:', 'failed to', 'panicked'))]})
     clone_path = output / 'duplicates/jscpd-report.json'
     if clone_path.exists():
         clones = json.loads(clone_path.read_text())
@@ -106,6 +115,8 @@ def report(output):
     lines += ['', '## Evidence gaps', '', f"{len(result['parser_and_configuration_errors'])} files have parser/configuration errors.",
               f"{len(result['inventory_only_project_files'])} project files have inventory only.",
               'Vendor components have exact inventory/hash/line counts; their source has not been semantically analyzed.',
+              f"{ambiguities} SCIP symbols have definitions in multiple documents; these are kept ambiguous rather than selecting one source.",
+              'Static reference observations may repeat across profiles. GPU profiles skip build outputs/proc macros and do not validate a GPU build.',
               'Declared package cycles combine all target/dev/build conditions; they are not proof of a failing build.', '',
               '## Limits', ''] + ['- ' + limit for limit in result['limits']]
     if 'cloc_project_totals' in result:

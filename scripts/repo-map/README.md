@@ -97,6 +97,20 @@ reports. Any changed application/configuration content or incomplete checkpoint
 rejects reuse. This continuation is limited to pushes on the current mapping
 branch; future application changes need a fresh manual semantic run.
 
+Six additional static profiles index `mcp`, `mesh`, the two cTrader tools, CUDA
+features and HIP features. These explicitly skip native build-script outputs
+and proc-macro builds, so they add source visibility without validating a GPU
+build or execution. Each profile retains its exact feature configuration,
+commit, failures and logs. The merged report states unique Rust document
+coverage across profiles and keeps missing files visible. A failed profile
+fails the continuation while retaining the available map.
+
+The original indexer emitted duplicate-symbol warnings. Symbols defined in
+multiple documents remain ambiguous; the graph does not arbitrarily assign
+one definition. Local symbols are scoped to both document and profile.
+The compact viewer omits local variables/external-only symbols; all occurrences
+remain in SQLite.
+
 Rust reports/viewer are in `repository-map-rust-reports-<commit>`. The database
 is gzip-compressed into numbered `repository-map-rust-db-00-<commit>` artifacts,
 each at most 24 MiB. Download all existing parts and unzip them into one folder.
