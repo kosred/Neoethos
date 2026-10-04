@@ -305,6 +305,13 @@ fn stub_refuses_success_and_layout_pins_the_exact_terminal_signature() {
 fn real_device_fixture_uses_one_admission_one_stream_and_releases_after_terminal_result() {
     let resident = read("src/resident_feature_store_v3.rs");
     let device = read("src/resident_population_session_v3_device_tests.rs");
+    // Comment-only lines can describe a forbidden path without executing it.
+    // Keep code and strings in both the required and forbidden-token checks.
+    let device = device
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     require_all(
         &resident,
         &[

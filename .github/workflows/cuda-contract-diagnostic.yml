@@ -7,7 +7,7 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - name: Install mold
@@ -30,6 +30,10 @@ jobs:
             crates/neoethos-gpu-cuda/tests/population_metrics_only_resident_v1_contract.rs
             crates/neoethos-gpu-cuda/tests/portable_native_intrinsics_contract.rs
             crates/neoethos-gpu-cuda/tests/resident_archive_knn_v2_transaction_contract.rs
+            crates/neoethos-gpu-cuda/tests/resident_generation_v1_source_contract.rs
+            crates/neoethos-gpu-cuda/tests/resident_population_session_v3_contract.rs
+            crates/neoethos-gpu-cuda/tests/resident_search_feature_matrix_v1_contract.rs
+            crates/neoethos-gpu-cuda/tests/terminal_compact_population_result_v1_contract.rs
           )
           rustfmt --edition 2024 --config skip_children=true "${contracts[@]}"
           cp "${contracts[@]}" /tmp/cuda-contract-results/
@@ -45,6 +49,49 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p neoethos-gpu-cuda --no-fail-fast 2>&1 | tee /tmp/cuda-contract-results/all-cuda-scaffold.log
+      - name: Verify rented-GPU kit independently
+        if: always()
+        run: |
+          set -o pipefail
+          (
+            set -euo pipefail
+            bash -n \
+              scripts/gpu-bench/preflight.sh \
+              scripts/gpu-bench/remote_bootstrap.sh \
+              scripts/gpu-bench/prepare_worktrees.sh \
+              scripts/gpu-bench/run_rented.sh \
+              scripts/gpu-bench/check_cuda_hardware.sh \
+              scripts/gpu-bench/run_cuda_test_gate.sh \
+              scripts/gpu-bench/run_compute_sanitizer_gate.sh \
+              scripts/gpu-bench/run_cuda_validation.sh \
+              scripts/gpu-bench/run_cuda_memcheck_validation.sh
+            python3 -m py_compile \
+              scripts/gpu-bench/test_prepare_worktrees.py \
+              scripts/gpu-bench/test_cuda_gate_behavior.py \
+              scripts/gpu-bench/test_preflight_contract.py \
+              scripts/gpu-bench/test_remote_bootstrap_contract.py \
+              scripts/gpu-bench/test_stage1_ci_contract.py
+            python3 scripts/gpu-bench/test_prepare_worktrees.py
+            python3 scripts/gpu-bench/test_cuda_gate_behavior.py
+            python3 scripts/gpu-bench/test_preflight_contract.py
+            python3 scripts/gpu-bench/test_remote_bootstrap_contract.py
+            python3 scripts/gpu-bench/test_stage1_ci_contract.py
+            rustc --edition 2024 --test \
+              crates/neoethos-cli/tests/canonical_runtime_source_contract.rs \
+              -D warnings -o /tmp/canonical-runtime-source-contract
+            /tmp/canonical-runtime-source-contract \
+              paid_gpu_preparation_reopens_shared_imported_vortex_only --exact --nocapture
+          ) 2>&1 | tee /tmp/cuda-contract-results/gpu-kit.log
+      - name: Verify search crate independently
+        if: always()
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-search --no-fail-fast 2>&1 | tee /tmp/cuda-contract-results/search.log
+      - name: Check CLI independently
+        if: always()
+        run: |
+          set -o pipefail
+          cargo check -p neoethos-cli 2>&1 | tee /tmp/cuda-contract-results/cli.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
