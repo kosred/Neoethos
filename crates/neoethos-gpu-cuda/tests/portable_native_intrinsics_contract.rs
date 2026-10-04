@@ -383,10 +383,7 @@ fn population_rejects_stale_upload_success_or_reclaiming_poisoned_storage() {
             "if (!device_free_checked(session->candidate_ids)",
             "if (device_free(session->candidate_ids)",
         ),
-        (
-            "if (!session->release_scenarios()) {",
-            "if (false) {",
-        ),
+        ("if (!session->release_scenarios()) {", "if (false) {"),
         (
             "if (!release_scenarios_checked_v2()) {\n      strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;",
             "if (!release_scenarios_checked_v2()) {",
