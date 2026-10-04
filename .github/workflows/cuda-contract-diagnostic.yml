@@ -1,0 +1,108 @@
+name: Temporary CUDA contract diagnostic
+
+on:
+  push:
+    branches: [codex/cuda-workspace-contract-20261005]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+          components: rustfmt
+      - name: Format and compile GPU-independent contracts
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cuda-contract-results
+          contract=crates/neoethos-gpu-cuda/tests/population_metrics_only_resident_v1_contract.rs
+          rustfmt --edition 2024 --config skip_children=true "$contract"
+          cp "$contract" /tmp/cuda-contract-results/
+          rustc --edition 2024 --test "$contract" -D warnings -o /tmp/updated-contract
+          git show ecc236ddb1e82baaf3a1c9744cf4ca8a4ee1fa36:"$contract" > /tmp/original-contract.rs
+          rustc --edition 2024 --test /tmp/original-contract.rs -D warnings -o /tmp/original-contract
+      - name: Verify baseline, repaired contracts, and rejected mutations
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+
+          crate = pathlib.Path('crates/neoethos-gpu-cuda').resolve()
+          output = pathlib.Path('/tmp/cuda-contract-results')
+          env = {**os.environ, 'CARGO_MANIFEST_DIR': str(crate)}
+          baseline = subprocess.run(['/tmp/original-contract'], env=env, text=True, capture_output=True)
+          (output / 'baseline.log').write_text(baseline.stdout + baseline.stderr)
+          print(baseline.stdout, flush=True)
+          assert baseline.returncode == 101 and '10 passed; 3 failed' in baseline.stdout
+          repaired = subprocess.run(['/tmp/updated-contract'], env=env, text=True, capture_output=True)
+          (output / 'repaired.log').write_text(repaired.stdout + repaired.stderr)
+          print(repaired.stdout, flush=True)
+          assert repaired.returncode == 0 and '13 passed; 0 failed' in repaired.stdout
+
+          strict = 'strict_workspace_mode_stays_immutable_while_exact_extent_may_be_rebuilt'
+          capacity = 'resident_search_preserves_full_population_with_exact_admitted_capacity_and_no_orphan_chunk_abi'
+          extent = 'exact_metrics_workspace_reuses_equal_extent_and_rebuilds_changed_extent_without_padding'
+          cases = [
+              ('unchecked release', 'native/prototype_b_population.cu',
+               'if (!session->release_workspace()) return NEO_POPULATION_STATUS_LAUNCH_FAILED;',
+               'session->release_workspace();', extent),
+              ('release failure no longer poisons', 'native/prototype_b_population.cu',
+               'if (!release_workspace_checked_v2()) {\n      strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;',
+               'if (!release_workspace_checked_v2()) {', strict),
+              ('release relabels workspace', 'native/prototype_b_population.cu',
+               'bool release_workspace_checked_v2() {',
+               'bool release_workspace_checked_v2() {\n    workspace_mode = PopulationWorkspaceModeV1::Uninitialized;', strict),
+              ('full-capacity equality regression', 'src/population.rs',
+               'retained_evaluation_capacity > logical_population_count',
+               'retained_evaluation_capacity != logical_population_count', capacity),
+              ('zero capacity accepted', 'src/population.rs',
+               '|| retained_evaluation_capacity == 0', '', capacity),
+              ('full identity count unchecked', 'src/population.rs',
+               '|| self.expected_scenario_identities.len() as u64 != logical_population_count', '', capacity),
+              ('receipt population unchecked', 'src/population.rs',
+               'raw.logical_population_count != logical_population_count', 'false', capacity),
+              ('oversized scoring capacity accepted', 'src/resident_scoring_v2.rs',
+               'population != 0 && capacity != 0 && capacity <= population',
+               'population != 0 && capacity != 0', capacity),
+          ]
+          contract = (crate / 'tests/population_metrics_only_resident_v1_contract.rs').read_text()
+          sources = set(re.findall(r'read\("([^"]+)"\)', contract))
+          evidence = []
+          for label, relative, old, new, test in cases:
+              with tempfile.TemporaryDirectory() as directory:
+                  root = pathlib.Path(directory)
+                  for source in sources:
+                      target = root / source
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copyfile(crate / source, target)
+                  target = root / relative
+                  text = target.read_text()
+                  assert old in text, label
+                  target.write_text(text.replace(old, new, 1))
+                  result = subprocess.run(['/tmp/updated-contract', test, '--exact'],
+                      env={**env, 'CARGO_MANIFEST_DIR': str(root)}, text=True, capture_output=True)
+                  assert result.returncode == 101 and '0 passed; 1 failed' in result.stdout, (label, result.stdout, result.stderr)
+                  evidence.append(f'REJECTED: {label}\n{result.stdout}{result.stderr}')
+                  print(f'REJECTED: {label}', flush=True)
+          (output / 'mutations.log').write_text('\n'.join(evidence))
+          print(f'All {len(cases)} source mutations rejected', flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cuda-contract-results-${{ github.run_id }}
+          path: /tmp/cuda-contract-results
+          if-no-files-found: error
+          retention-days: 3
