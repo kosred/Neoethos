@@ -290,7 +290,7 @@ fn population_upload_failure_state_contract(source: &str) -> bool {
         (
             "genes",
             "scenarios",
-            "device_free(session->candidate_ids);",
+            "if(!device_free_checked(session->candidate_ids)",
             &[
                 "session->has_genes=false;",
                 "session->population=0;",
@@ -301,7 +301,7 @@ fn population_upload_failure_state_contract(source: &str) -> bool {
         (
             "scenarios",
             "resident_scenarios_v2",
-            "session->release_scenarios();",
+            "if(!session->release_scenarios()){",
             &[
                 "session->has_scenarios=false;",
                 "session->scenario_count=0;",
@@ -331,6 +331,25 @@ fn population_upload_failure_state_contract(source: &str) -> bool {
         {
             return false;
         }
+        let release_failure = if kind == "genes" {
+            "session->strict_execution_state=PopulationStrictExecutionStateV1::Poisoned;returnNEO_POPULATION_STATUS_LAUNCH_FAILED;"
+        } else {
+            "if(!session->release_scenarios()){deletestaging;returnNEO_POPULATION_STATUS_LAUNCH_FAILED;}"
+        };
+        if !upload.contains(release_failure) {
+            return false;
+        }
+    }
+    let Some((_, scenario_release)) = source.split_once("boolrelease_scenarios(){") else {
+        return false;
+    };
+    let Some((scenario_release, _)) = scenario_release.split_once("boolrelease_workspace(){")
+    else {
+        return false;
+    };
+    if !scenario_release.contains("if(!release_scenarios_checked_v2()){strict_execution_state=PopulationStrictExecutionStateV1::Poisoned;returnfalse;}")
+    {
+        return false;
     }
     let Some((_, destroy)) =
         source.split_once("neoethos_gpu_cuda_population_destroy_terminal_checked_v2(")
@@ -360,6 +379,18 @@ fn population_replacement_invalidates_old_success_and_quarantines_async_failure(
 #[test]
 fn population_rejects_stale_upload_success_or_reclaiming_poisoned_storage() {
     for (before, after) in [
+        (
+            "if (!device_free_checked(session->candidate_ids)",
+            "if (device_free(session->candidate_ids)",
+        ),
+        (
+            "if (!session->release_scenarios()) {",
+            "if (false) {",
+        ),
+        (
+            "if (!release_scenarios_checked_v2()) {\n      strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;",
+            "if (!release_scenarios_checked_v2()) {",
+        ),
         ("session->has_genes = false;", "session->has_genes = true;"),
         ("session->population = 0;", "session->population = 1;"),
         ("session->gene_upload_bytes = 0ull;", ""),
