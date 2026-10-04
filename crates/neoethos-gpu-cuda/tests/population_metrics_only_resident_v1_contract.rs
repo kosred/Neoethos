@@ -579,7 +579,9 @@ fn dropped_unconsumed_handle_poison_blocks_reuse_and_leaks_native_owner_fail_clo
         native_drop
             .find("strict_population_work_blocks_host_boundary_v1(session)")
             .unwrap()
-            < native_drop.find("session->release_terminal_checked_v2()").unwrap(),
+            < native_drop
+                .find("session->release_terminal_checked_v2()")
+                .unwrap(),
         "native destroy releases strict resident storage before the leak-only guard"
     );
 }
@@ -641,14 +643,18 @@ fn enqueue_state_is_recorded_before_receipt_validation_and_ambiguous_failures_po
 }
 
 #[test]
-fn resident_search_preserves_full_population_with_exact_admitted_capacity_and_no_orphan_chunk_abi() {
+fn resident_search_preserves_full_population_with_exact_admitted_capacity_and_no_orphan_chunk_abi()
+{
     let rust = read("src/population.rs");
     let search = read("src/resident_search_v2.rs");
     let scoring = read("src/resident_scoring_v2.rs");
     let header = read("native/neoethos_gpu_cuda.h");
     let cuda = read("native/prototype_b_population.cu");
 
-    let owned_enqueue = braced_item(&rust, "pub(crate) fn enqueue_resident_gene_metrics_owned_v2(");
+    let owned_enqueue = braced_item(
+        &rust,
+        "pub(crate) fn enqueue_resident_gene_metrics_owned_v2(",
+    );
     require_all(
         owned_enqueue,
         &[
