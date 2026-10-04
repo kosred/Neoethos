@@ -34,6 +34,10 @@ quota; zero AI API calls does not mean zero compute/storage cost.
   Embedded Rust tests still count as code; this is not a production-only metric.
 - `graph.sqlite` / `index.html`: file ownership, definitions, imports/macros,
   call sites, possible name targets, declared Cargo dependencies and features.
+- `architecture.md` / `architecture.json`: every project/vendor component's
+  size, largest project files, declared package dependencies/cycles, indexed
+  Rust document coverage, cross-component static references, duplicate file
+  pairs, and remaining parser/configuration errors with source locations.
 - `coverage.json`: parser coverage, grammar errors, inventory-only files and
   semantic document coverage when requested.
 - `identical-files.json`: exact file matches of at least 20 physical lines.
@@ -49,8 +53,11 @@ quota; zero AI API calls does not mean zero compute/storage cost.
 
 ## Evidence limits
 
-The syntax graph parses Rust, C/C++/CUDA and TypeScript/TSX files. Other languages
-and vendor files are inventoried and explicitly marked, not silently certified.
+The syntax graph parses Rust, C/C++/CUDA, TypeScript/TSX, JavaScript, Python and
+shell files. JSON/TOML/YAML structures, workflow jobs/actions and npm declarations
+are parsed without executing commands. Other formats and vendor source files are
+inventoried and explicitly marked, not silently certified. Invalid configuration
+fixtures remain visible; a parse error is not automatically a production bug.
 Rust cfg attributes and context remain recorded without claiming that every
 branch is active. Macros are recorded without expanding them. CUDA uses the C++
 grammar; unsupported constructs are counted as parse errors.
@@ -80,3 +87,27 @@ The compressed HTML is a compact symbol overview for current browsers with
 Regenerate after source changes; do not use an old map as evidence for new code.
 Reports live in Actions artifacts (30 days), not as generated files committed
 into the already large source tree. Download a checkpoint for longer retention.
+
+## Completed Rust checkpoint
+
+The mapping branch also verifies and reuses the completed index from run
+`37163353874`, generated at `02f33576`. It checks that every non-mapping tracked
+file is unchanged and combines the index with same-commit structural/LOC/clone
+reports. Any changed application/configuration content or incomplete checkpoint
+rejects reuse. This continuation is limited to pushes on the current mapping
+branch; future application changes need a fresh manual semantic run.
+
+Rust reports/viewer are in `repository-map-rust-reports-<commit>`. The database
+is gzip-compressed into numbered `repository-map-rust-db-00-<commit>` artifacts,
+each at most 24 MiB. Download all existing parts and unzip them into one folder.
+An assistant or Python environment can restore and query the full database:
+
+```sh
+python scripts/repo-map/pack_graph.py /tmp/rust-graph.sqlite /tmp/downloaded-parts --restore
+python scripts/repo-map/query_map.py /tmp/rust-graph.sqlite resident_search --limit 20
+```
+
+The viewer works independently of database restoration. A fresh manual semantic
+run additionally retains the raw SCIP index/export as a separate archival
+artifact. Indexer stderr and SCIP diagnostics are retained for investigating
+unresolved native dependencies, proc macros and inactive configurations.

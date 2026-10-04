@@ -47,6 +47,7 @@ def main():
         command = [sys.executable, str(script), "--output", str(output)]
         if checks.get("scip_json", {}).get("status") == "completed":
             command += ["--scip-json", str(output / "scip-json.stdout")]
+            command += ["--scip-source-commit", subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()]
     else:
         files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
         (output / "project-files.txt").write_text("\n".join(p for p in files if p and not p.startswith("vendor/")) + "\n")
@@ -63,6 +64,9 @@ def main():
         checks["rust_scip"] = {"status": "not_requested", "profile": "repo-nightly-default-features"}
         command = [sys.executable, str(script), "--output", str(output)]
     checks["graph"] = run("graph", command, output, 300)
+    if args.semantic and checks["graph"]["status"] == "completed":
+        checks["database_parts"] = run("database-parts", [sys.executable, str(script.with_name("pack_graph.py")),
+                                           str(output / "graph.sqlite"), str(output / "parts")], output, 180)
     (output / "checks.json").write_text(json.dumps(checks, indent=2) + "\n")
     message = "# Repository map\n\n"
     for name, record in checks.items():
@@ -70,6 +74,10 @@ def main():
     if (output / "summary.json").exists():
         summary = json.loads((output / "summary.json").read_text())
         message += f"\nCommit `{summary['commit']}`: {summary['files']} files, {summary['nodes']} nodes, {summary['edges']} edges.\n"
+    if (output / "architecture.json").exists():
+        architecture = json.loads((output / "architecture.json").read_text())
+        rust = architecture["rust_semantic_coverage"]
+        message += f"\nRust documents indexed: {rust['indexed_files']} / {rust['tracked_project_files']}. See `architecture.md` and `architecture.json` for component sizes, dependencies, duplication and gaps.\n"
     message += "\nDownload the map artifact and open `index.html`; the query database and duplication details have separate artifacts. `checks.json` and `coverage.json` record gaps. Syntax candidates are not resolved calls or permission to delete code.\n"
     (output / "README.md").write_text(message)
     if os.environ.get("GITHUB_STEP_SUMMARY"):

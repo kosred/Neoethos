@@ -9,28 +9,34 @@ import json
 import sqlite3
 import subprocess
 import tomllib
+import yaml
 from pathlib import Path
 
 from tree_sitter import Language, Parser
 import tree_sitter_cpp
 import tree_sitter_rust
 import tree_sitter_typescript
+import tree_sitter_python
+import tree_sitter_bash
 
 PARSERS = {
     "rust": Parser(Language(tree_sitter_rust.language())),
     "cpp": Parser(Language(tree_sitter_cpp.language())),
     "typescript": Parser(Language(tree_sitter_typescript.language_typescript())),
     "tsx": Parser(Language(tree_sitter_typescript.language_tsx())),
+    "python": Parser(Language(tree_sitter_python.language())),
+    "bash": Parser(Language(tree_sitter_bash.language())),
 }
 LANGUAGES = {".rs": "rust", ".cu": "cpp", ".cuh": "cpp", ".c": "cpp",
              ".h": "cpp", ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp",
-             ".ts": "typescript", ".tsx": "tsx"}
+             ".ts": "typescript", ".tsx": "tsx", ".js": "typescript",
+             ".py": "python", ".sh": "bash"}
 DEFINITIONS = {"function_item", "function_signature_item", "struct_item", "enum_item",
                "trait_item", "type_item", "const_item", "static_item", "mod_item",
                "function_definition", "class_specifier", "struct_specifier",
                "function_declaration", "method_definition", "class_declaration",
-               "interface_declaration", "type_alias_declaration"}
-CALLS = {"call_expression"}
+               "interface_declaration", "type_alias_declaration", "class_definition"}
+CALLS = {"call_expression", "call", "command"}
 
 
 def git(root, *args):
@@ -62,7 +68,7 @@ def name_of(node, data):
 
 
 def called_name(node, data):
-    if node.type in {"identifier", "field_identifier", "property_identifier"}:
+    if node.type in {"identifier", "field_identifier", "property_identifier", "word", "command_name"}:
         return text(node, data)
     for field_name in ("field", "property", "name", "function"):
         child = node.child_by_field_name(field_name)
@@ -78,6 +84,7 @@ class Graph:
         self.pending = []
         self.files = []
         self.coverage = []
+        self.semantic_source_commit = None
 
     def node(self, key, kind, name, path="", line=0, end_line=0, context=""):
         self.nodes.setdefault(key, {"id": key, "kind": kind, "name": name, "path": path,
@@ -91,8 +98,12 @@ class Graph:
 def parse_source(graph, path, data, language):
     """Syntax edges are NEVER presented as resolved runtime calls."""
     tree = PARSERS[language].parse(data)
-    errors = sum(n.type == "ERROR" or n.is_missing for n in walk(tree.root_node))
+    error_nodes = [n for n in walk(tree.root_node) if n.type == "ERROR" or n.is_missing]
+    errors = len(error_nodes)
     graph.coverage.append({"path": path, "language": language, "parse_errors": errors,
+                           "error_locations": [{"line": n.start_point.row + 1,
+                                                "column": n.start_point.column + 1,
+                                                "kind": n.type} for n in error_nodes],
                            "status": "syntax_with_errors" if errors else "syntax_only"})
     # Attributes remain literal conditions; no cfg/feature branch is assumed active.
     def visit(node, owner, context):
@@ -115,12 +126,12 @@ def parse_source(graph, path, data, language):
                 graph.edge(owner, key, "contains", "syntax", path, node.start_point.row + 1)
                 owner, context = key, ctx
         if node.type in CALLS:
-            target = node.child_by_field_name("function")
+            target = node.child_by_field_name("function") or node.child_by_field_name("name")
             if target:
                 raw = text(target, data)[:240]
                 name = called_name(target, data)
                 graph.pending.append((owner, name or "<unresolved>", raw, path, node.start_point.row + 1))
-        if node.type in {"macro_invocation", "use_declaration", "import_statement"}:
+        if node.type in {"macro_invocation", "use_declaration", "import_statement", "import_from_statement"}:
             raw = text(node, data)
             key = graph.node(f"statement:{path}:{node.start_byte}", node.type, raw[:300],
                              path, node.start_point.row + 1, node.end_point.row + 1, context)
@@ -193,6 +204,99 @@ def manifest_graph(graph, root, paths):
             graph.edge(key, feature, "declares_feature", "toml", path)
 
 
+def jsonc_loads(data):
+    """Allow TS-config comments/trailing commas while preserving quoted strings."""
+    source = data.decode()
+    cleaned, index, quoted, escaped = [], 0, False, False
+    while index < len(source):
+        char = source[index]
+        if quoted:
+            cleaned.append(char)
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+            index += 1
+            continue
+        if char == '"':
+            quoted = True
+        elif source.startswith('//', index):
+            end = source.find('\n', index)
+            end = len(source) if end < 0 else end
+            cleaned.extend(' ' * (end - index)); index = end
+            continue
+        elif source.startswith('/*', index):
+            end = source.find('*/', index + 2)
+            if end < 0:
+                raise ValueError('Unterminated JSONC comment')
+            cleaned.extend('\n' if c == '\n' else ' ' for c in source[index:end + 2])
+            index = end + 2
+            continue
+        elif char == ',':
+            next_index = index + 1
+            while next_index < len(source) and source[next_index].isspace():
+                next_index += 1
+            if next_index < len(source) and source[next_index] in '}]':
+                char = ' '
+        cleaned.append(char); index += 1
+    # Remove commas preceding comments and a closing delimiter after comment stripping.
+    clean = ''.join(cleaned)
+    if clean != source:
+        return jsonc_loads(clean.encode())
+    return json.loads(clean)
+
+
+def parse_configuration(graph, path, data):
+    """Map parsed configuration structure, never execute scripts or expand expressions."""
+    suffix = Path(path).suffix
+    try:
+        if suffix == ".toml":
+            document = tomllib.loads(data.decode())
+        elif suffix == ".json":
+            document = jsonc_loads(data) if Path(path).name.startswith('tsconfig') else json.loads(data)
+        else:
+            # BaseLoader keeps GitHub's 'on' as a string and never constructs Python objects.
+            document = yaml.load(data.decode(), Loader=yaml.BaseLoader)
+    except (ValueError, UnicodeError, yaml.YAMLError) as error:
+        graph.coverage.append({"path": path, "status": "configuration_error", "detail": str(error)})
+        return
+    graph.coverage.append({"path": path, "status": "configuration_parsed", "format": suffix})
+    if not isinstance(document, dict):
+        return
+    for name, value in document.items():
+        key = graph.node("config:" + path + ":" + str(name), "configuration_section", str(name), path)
+        graph.edge("file:" + path, key, "configuration_section", "parsed_configuration", path)
+    if path.startswith(".github/workflows/"):
+        for job, spec in (document.get("jobs") or {}).items():
+            if not isinstance(spec, dict):
+                continue
+            key = graph.node("job:" + path + ":" + str(job), "workflow_job", str(job), path,
+                             context=json.dumps({k: spec[k] for k in ("if", "runs-on", "permissions") if k in spec}))
+            graph.edge("file:" + path, key, "declares_job", "parsed_configuration", path)
+            needs = spec.get("needs", [])
+            if isinstance(needs, str):
+                needs = [needs]
+            for dependency in needs:
+                target = graph.node("job:" + path + ":" + str(dependency), "workflow_job", str(dependency), path)
+                graph.edge(key, target, "needs_job", "parsed_configuration", path)
+            for step in spec.get("steps", []):
+                if isinstance(step, dict) and "uses" in step:
+                    action = str(step["uses"])
+                    target = graph.node("action:" + action, "workflow_action", action)
+                    graph.edge(key, target, "uses_action", "parsed_configuration", path)
+    if Path(path).name == "package.json":
+        for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+            for name, version in (document.get(section) or {}).items():
+                target = graph.node("npm:" + name + ":" + str(version), "npm_dependency", name,
+                                    context=str(version))
+                graph.edge("file:" + path, target, "declared_npm_dependency", "parsed_configuration", path, 0, section)
+        for name, command in (document.get("scripts") or {}).items():
+            key = graph.node("npm-script:" + path + ":" + name, "npm_script", name, path, context=str(command))
+            graph.edge("file:" + path, key, "declares_script", "parsed_configuration", path)
+
+
 def field(obj, snake):
     parts = snake.split("_")
     camel = parts[0] + "".join(p.title() for p in parts[1:])
@@ -211,7 +315,12 @@ def import_scip(graph, index_path):
             continue
         file_node = graph.node("file:" + path, "file", path, path)
         graph.coverage.append({"path": path, "status": "scip_indexed",
-                               "profile": "repo-nightly-default-features", "runtime_verified": False})
+                               "profile": "repo-nightly-default-features", "runtime_verified": False,
+                               "occurrences": len(document.get("occurrences", [])),
+                               "definitions": sum(bool((field(o, "symbol_roles") or 0) & 1)
+                                                  for o in document.get("occurrences", [])),
+                               "diagnostics": [d for o in document.get("occurrences", [])
+                                               for d in o.get("diagnostics", [])]})
         def symbol_id(symbol):
             return "scip:" + (path + ":" if symbol.startswith("local ") else "") + symbol
         for symbol in document.get("symbols", []):
@@ -257,7 +366,8 @@ def save(graph, output, commit, dirty=False):
         """)
         identifiers = {key: index for index, key in enumerate(sorted(graph.nodes))}
         db.executemany("INSERT INTO metadata VALUES (?, ?)", [("commit", commit), ("working_tree_dirty", str(dirty)),
-                       ("schema", "1"), ("scope", "tracked files; vendor inventoried, syntax excluded")])
+                       ("schema", "1"), ("scope", "tracked files; vendor inventoried, syntax excluded"),
+                       ("semantic_source_commit", graph.semantic_source_commit or "")])
         db.executemany("INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?)",
                        ((identifiers[key], key, n["kind"], n["name"], n["path"], n["line"], n["end_line"], n["context"])
                         for key, n in graph.nodes.items()))
@@ -265,6 +375,7 @@ def save(graph, output, commit, dirty=False):
                        ((identifiers[a], identifiers[b], *rest) for a, b, *rest in sorted(graph.edges)))
     summary = {"commit": commit, "working_tree_dirty": dirty, "files": len(graph.files), "nodes": len(graph.nodes),
                "edges": len(graph.edges), "whole_repo_semantically_verified": False,
+               "semantic_source_commit": graph.semantic_source_commit,
                "file_groups": dict(collections.Counter(f["group"] for f in graph.files)),
                "physical_text_lines": sum(f["lines"] for f in graph.files),
                "coverage": dict(collections.Counter(c["status"] for c in graph.coverage)),
@@ -308,11 +419,13 @@ def main():
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scip-json", type=Path)
+    parser.add_argument("--scip-source-commit")
     args = parser.parse_args()
     root = args.root.resolve()
     paths = sorted(p.decode() for p in git(root, "ls-files", "-z").split(b"\0") if p)
     commit = git(root, "rev-parse", "HEAD").decode().strip()
     graph = Graph()
+    graph.semantic_source_commit = args.scip_source_commit
     for path in paths:
         file_node = graph.node("file:" + path, "file", path, path)
         source = root / path
@@ -334,7 +447,9 @@ def main():
                             "lines": 0 if binary else data.count(b"\n") + int(bool(data) and not data.endswith(b"\n")),
                             "group": "vendor" if vendor else "project", "binary": binary})
         language = LANGUAGES.get(Path(path).suffix)
-        if vendor or binary or not language:
+        if not vendor and not binary and Path(path).suffix in {".toml", ".json", ".yml", ".yaml"}:
+            parse_configuration(graph, path, data)
+        elif vendor or binary or not language:
             graph.coverage.append({"path": path, "status": "vendor_inventory_only" if vendor else
                                    "binary_inventory_only" if binary else "inventory_only"})
         else:
@@ -345,6 +460,8 @@ def main():
         import_scip(graph, args.scip_json)
     dirty = bool(git(root, "status", "--porcelain", "--untracked-files=no"))
     summary = save(graph, args.output, commit, dirty)
+    from report_map import report
+    report(args.output)
     print(json.dumps(summary, indent=2))
 
 

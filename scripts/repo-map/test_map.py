@@ -2,13 +2,65 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import map_repo as mapper
 from run_checks import run
+from report_map import cycles
+from pack_graph import pack, restore
+from reuse_scip import check_source
 
 
 class GraphEvidenceTests(unittest.TestCase):
+    def test_tsconfig_comments_and_trailing_commas_preserve_strings(self):
+        self.assertEqual(mapper.jsonc_loads(b'{"url":"https://host/a,}",/* c */"values":[1, // c\n],}'),
+                         {'url': 'https://host/a,}', 'values': [1]})
+        with self.assertRaises(ValueError):
+            mapper.jsonc_loads(b'{/* missing end')
+
+    def test_python_shell_and_workflow_connections_have_explicit_evidence(self):
+        graph = mapper.Graph()
+        for path, code, language in [('tool.py', b'def helper(): pass\ndef main(): helper()\n', 'python'),
+                                     ('tool.sh', b'helper() { echo ok; }\nhelper\n', 'bash')]:
+            graph.node('file:' + path, 'file', path, path)
+            mapper.parse_source(graph, path, code, language)
+        mapper.resolve_candidates(graph)
+        self.assertEqual(len([n for n in graph.nodes.values() if n['name'] == 'helper' and n['kind'] in mapper.DEFINITIONS]), 2)
+        self.assertTrue(any(e[2] == 'possible_target' and e[4] == 'tool.py' for e in graph.edges))
+        self.assertTrue(any(e[2] == 'possible_target' and e[4] == 'tool.sh' for e in graph.edges))
+        mapper.parse_configuration(graph, '.github/workflows/test.yml', b'on: push\njobs:\n  first:\n    steps:\n      - uses: actions/checkout@pinned\n  second:\n    needs: first\n')
+        self.assertTrue(any(e[2] == 'needs_job' for e in graph.edges))
+        self.assertTrue(any(e[2] == 'uses_action' for e in graph.edges))
+        mapper.parse_configuration(graph, 'broken.json', b'{invalid')
+        self.assertEqual(graph.coverage[-1]['status'], 'configuration_error')
+
+    def test_dependency_cycles_include_self_loops_but_not_acyclic_paths(self):
+        self.assertEqual(cycles({'a': {'b'}, 'b': {'a', 'c'}, 'd': {'d'}, 'e': {'c'}}), [['a', 'b'], ['d']])
+
+    def test_database_parts_restore_exactly_and_reject_missing_parts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / 'source.sqlite'; db.write_bytes(bytes(range(256)) * 200)
+            with mock.patch('pack_graph.CHUNK_BYTES', 100):
+                count = pack(db, root / 'parts')
+            self.assertGreater(count, 1)
+            restore(root / 'parts', root / 'restored.sqlite')
+            self.assertEqual(db.read_bytes(), (root / 'restored.sqlite').read_bytes())
+            (root / 'parts/graph.sqlite.gz.part00').unlink()
+            with self.assertRaises(ValueError):
+                restore(root / 'parts', root / 'bad.sqlite')
+
+    def test_checkpoint_reuse_rejects_changed_application_or_dirty_files(self):
+        with mock.patch('reuse_scip.subprocess.check_output', side_effect=[b'scripts/repo-map/report_map.py\n', b'']):
+            self.assertEqual(check_source('abc'), ['scripts/repo-map/report_map.py'])
+        with mock.patch('reuse_scip.subprocess.check_output', side_effect=[b'crates/app/src/lib.rs\n', b'']):
+            with self.assertRaises(ValueError):
+                check_source('abc')
+        with mock.patch('reuse_scip.subprocess.check_output', side_effect=[b'', b' M Cargo.toml']):
+            with self.assertRaises(ValueError):
+                check_source('abc')
+
     def test_trait_methods_cfg_macros_and_generic_call_are_not_falsely_resolved(self):
         source = b'''#[cfg(feature="gpu")]
         mod gpu {
