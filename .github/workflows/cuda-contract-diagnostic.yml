@@ -90,7 +90,7 @@ jobs:
                   target = root / relative
                   text = target.read_text()
                   assert old in text, label
-                  target.write_text(text.replace(old, new, 1))
+                  target.write_text(text.replace(old, new))
                   result = subprocess.run(['/tmp/updated-contract', test, '--exact'],
                       env={**env, 'CARGO_MANIFEST_DIR': str(root)}, text=True, capture_output=True)
                   assert result.returncode == 101 and '0 passed; 1 failed' in result.stdout, (label, result.stdout, result.stderr)
