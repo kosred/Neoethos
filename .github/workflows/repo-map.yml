@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: repo-map-${{ github.ref }}
+  group: repo-map-${{ github.ref }}-${{ inputs.semantic_rust == true && 'semantic' || 'structure' }}
   cancel-in-progress: true
 
 jobs:
@@ -47,14 +47,33 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: repository-map-${{ github.sha }}
-          path: ${{ runner.temp }}/repository-map/
+          path: |
+            ${{ runner.temp }}/repository-map/
+            !${{ runner.temp }}/repository-map/duplicates/**
+            !${{ runner.temp }}/repository-map/graph.sqlite
           if-no-files-found: error
+          retention-days: 30
+      - name: Keep query database separately
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-graph-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map/graph.sqlite
+          compression-level: 9
+          if-no-files-found: error
+          retention-days: 30
+      - name: Keep duplication details separately
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-duplicates-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map/duplicates/
+          if-no-files-found: warn
           retention-days: 30
 
   semantic-rust:
     name: Configuration-specific Rust SCIP graph
-    # The initial branch push also exercises this path; regular master pushes stay lightweight.
-    if: ${{ inputs.semantic_rust == true || startsWith(github.ref, 'refs/heads/codex/repo-map-') }}
+    if: ${{ inputs.semantic_rust == true }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:

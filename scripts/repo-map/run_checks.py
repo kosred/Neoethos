@@ -70,7 +70,7 @@ def main():
     if (output / "summary.json").exists():
         summary = json.loads((output / "summary.json").read_text())
         message += f"\nCommit `{summary['commit']}`: {summary['files']} files, {summary['nodes']} nodes, {summary['edges']} edges.\n"
-    message += "\nDownload the artifact and open `index.html`. `checks.json` and `coverage.json` record gaps. Syntax candidates are not resolved calls or permission to delete code.\n"
+    message += "\nDownload the map artifact and open `index.html`; the query database and duplication details have separate artifacts. `checks.json` and `coverage.json` record gaps. Syntax candidates are not resolved calls or permission to delete code.\n"
     (output / "README.md").write_text(message)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as file:

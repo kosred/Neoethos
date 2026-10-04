@@ -8,15 +8,17 @@ diagnostics without changing the manual-only build/test CI.
 
 After merging the workflow, open **Actions → Repository map → Run workflow**.
 The default run creates the structural map, LOC report and duplication report.
-Select **semantic_rust** for a separate, heavier Rust indexing job. The first
-`codex/repo-map-*` branch push runs both jobs to validate setup before merging.
-Normal master code pushes run only the lightweight structural job.
+Select **semantic_rust** for a separate, heavier Rust indexing job.
+Code pushes on master and `codex/repo-map-*` branches run the structural job.
 
 Open the run summary, download its `repository-map-<commit>` artifact, unzip it
 and open `index.html` in a browser. It is a standalone searchable connection
 viewer: no web server or external JavaScript service. Artifact download/viewing
 support varies between phone browsers. The SQLite/JSON files are also usable by
 code assistants without loading the entire source repository into context.
+The query database is in `repository-graph-<commit>`, while duplication details
+are in `repository-duplicates-<commit>`. The viewer/coverage download stays small;
+an assistant can separately download the database and retrieve bounded results.
 
 The run's `README.md`, `checks.json` and `coverage.json` are authoritative about
 what succeeded, failed, timed out or was not indexed. Check the separate Rust
