@@ -1,0 +1,54 @@
+name: Temporary full CUDA CPU diagnostic
+on:
+  push:
+    branches: [codex/cuda-workspace-contract-20261005]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mold
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpu-native-stage1
+          cache-on-failure: true
+      - name: Format and exercise archive receipt lifetimes
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cuda-contract-results
+          contracts=(
+            crates/neoethos-gpu-cuda/tests/population_metrics_only_resident_v1_contract.rs
+            crates/neoethos-gpu-cuda/tests/portable_native_intrinsics_contract.rs
+            crates/neoethos-gpu-cuda/tests/resident_archive_knn_v2_transaction_contract.rs
+          )
+          rustfmt --edition 2024 --config skip_children=true "${contracts[@]}"
+          cp "${contracts[@]}" /tmp/cuda-contract-results/
+          rustc --edition 2024 --test "${contracts[2]}" -D warnings -o /tmp/archive-contract
+          /tmp/archive-contract | tee /tmp/cuda-contract-results/archive-debug.log
+          for attempt in {1..100}; do
+            /tmp/archive-contract terminal_seal_follows_last_commit_and_only_pending_can_project_the_receipt --exact >> /tmp/cuda-contract-results/archive-repeated.log
+          done
+          rustc --edition 2024 --test -O "${contracts[2]}" -D warnings -o /tmp/archive-contract-optimized
+          /tmp/archive-contract-optimized | tee /tmp/cuda-contract-results/archive-optimized.log
+          echo '100 terminal receipt lifetime repetitions passed'
+      - name: Run all CUDA scaffold targets without stopping at first failure
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-gpu-cuda --no-fail-fast 2>&1 | tee /tmp/cuda-contract-results/all-cuda-scaffold.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cuda-contract-results-${{ github.run_id }}
+          path: /tmp/cuda-contract-results
+          if-no-files-found: error
+          retention-days: 3
