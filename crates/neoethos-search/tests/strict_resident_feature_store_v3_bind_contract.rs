@@ -374,7 +374,11 @@ fn native_bind_waits_on_the_actual_population_stream_and_never_frees_imported_pa
     let release = section(&native, "bool release_terminal_checked_v2() {", "\n  }");
     require_all(
         release,
-        &["parent_ownership", "NEO_POPULATION_PARENT_OWNED_V1", "device_free_checked(close)"],
+        &[
+            "parent_ownership",
+            "NEO_POPULATION_PARENT_OWNED_V1",
+            "device_free_checked(close)",
+        ],
     );
     assert!(
         !release.contains("cudaStreamSynchronize"),

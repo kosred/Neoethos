@@ -5414,7 +5414,9 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
         ),
         (
             "NEOETHOS_TEST_RESEARCH_SCOPE_RECEIPT_FILE",
-            DiagnosticOnly("cfg(test) input path for the explicitly ignored receipt lookup benchmark"),
+            DiagnosticOnly(
+                "cfg(test) input path for the explicitly ignored receipt lookup benchmark",
+            ),
         ),
         (
             "NEOETHOS_TEST_WALKFORWARD_PRE_CANCEL_CHILD",

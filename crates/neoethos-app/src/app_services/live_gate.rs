@@ -90,7 +90,7 @@ mod tests {
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../neoethos-search/test_fixtures/strategy_report_v6/",
-                "8510cec7a31d6c18b3ed61709a9315fee0ea2e4c9b7c4fb2220f73d314d7f02d.research.live_portfolio.json"
+                "a2d3ef812dd8b341f863f7a57df3f71172a94c95269fe51c49ece25e3623d327.research.live_portfolio.json"
             )
         ))
         .expect("the unchanged Search writer fixture must validate")

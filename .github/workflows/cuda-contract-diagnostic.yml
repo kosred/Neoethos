@@ -126,3 +126,51 @@ jobs:
           path: /tmp/search-diagnostics
           if-no-files-found: error
           retention-days: 3
+  app_report:
+    if: contains(github.event.head_commit.message, '[app-diagnostic]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpu-native-stage1
+          cache-on-failure: true
+      - name: Verify embedded fixture consumer
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/app-report-diagnostics
+          cargo test -p neoethos-app --lib app_services::live_gate::tests:: -- --nocapture \
+            2>&1 | tee /tmp/app-report-diagnostics/live-gate.log
+      - name: Verify actual report readers and adversarial fixture mutations
+        if: always()
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/app-report-diagnostics
+          cargo test -p neoethos-app --lib server::strategy_report::tests:: -- --nocapture \
+            2>&1 | tee /tmp/app-report-diagnostics/strategy-report.log
+      - name: Require both test filters to execute real tests
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          for name in ('live-gate.log', 'strategy-report.log'):
+              text = (pathlib.Path('/tmp/app-report-diagnostics') / name).read_text()
+              assert re.search(r'test result: ok\. [1-9][0-9]* passed;', text), name
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-report-diagnostics-${{ github.run_id }}
+          path: /tmp/app-report-diagnostics
+          if-no-files-found: error
+          retention-days: 3

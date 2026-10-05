@@ -282,16 +282,22 @@ fn exact_route_is_owned_by_the_population_run_and_cannot_be_detached_per_evaluat
         "fn run_discovery_cycle_values_with_real_device_admission<F>(",
         "\nfn run_discovery_cycle_values_with_progress<F>(",
     );
-    require_all(acquire, &[
-        "acquire_strict_discovery_device_admission_v1()",
-        "run_discovery_cycle_values_with_progress(strict_device_admission, inputs, config, progress_fn)",
-    ]);
+    require_all(
+        acquire,
+        &[
+            "acquire_strict_discovery_device_admission_v1()",
+            "run_discovery_cycle_values_with_progress(strict_device_admission, inputs, config, progress_fn)",
+        ],
+    );
     let execution = section(
         &discovery,
         "\nfn run_discovery_cycle_values_with_progress<F>(",
         "\npub(crate) fn resolve_prefilter_financial_geometry_v1(",
     );
-    require_all(execution, &["strict_device_admission: crate::SealedStrictDiscoveryDeviceAdmissionV1"]);
+    require_all(
+        execution,
+        &["strict_device_admission: crate::SealedStrictDiscoveryDeviceAdmissionV1"],
+    );
     assert!(!execution.contains("acquire_strict_discovery_device_admission_v1()"));
     let begin_at = execution
         .find("begin_exact_population_execution_run_v1(")
