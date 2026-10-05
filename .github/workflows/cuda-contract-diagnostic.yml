@@ -1,0 +1,81 @@
+name: Temporary Search golden review and CPU diagnostic
+on:
+  push:
+    branches: [codex/cuda-workspace-contract-20261005]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mold
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpu-native-stage1
+          cache-on-failure: true
+      - name: Format census and run explicit golden generator twice
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/search-golden-review /tmp/search-diagnostics
+          rustfmt --edition 2024 --config skip_children=true crates/neoethos-search/src/discovery_tests.rs
+          cp crates/neoethos-search/src/discovery_tests.rs /tmp/search-golden-review/
+          for attempt in 1 2; do
+            cargo test -p neoethos-search --lib live_portfolio::tests::regenerate_report_golden_pair_to_temporary_directory -- --ignored --exact --nocapture \
+              2>&1 | tee "/tmp/search-golden-review/generation-$attempt.log"
+          done
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import shutil
+          root = pathlib.Path('/tmp/search-golden-review')
+          outputs = []
+          for attempt in (1, 2):
+              paths = [pathlib.Path(line.split('=', 1)[1]) for line in
+                  (root / f'generation-{attempt}.log').read_text().splitlines()
+                  if line.startswith('REPORT_GOLDEN_OUTPUT=')]
+              assert len(paths) == 2
+              outputs.append({p.name: p for p in paths})
+          assert outputs[0].keys() == outputs[1].keys()
+          target = root / 'goldens'
+          target.mkdir()
+          for name, path in outputs[0].items():
+              content = path.read_bytes()
+              assert content == outputs[1][name].read_bytes()
+              assert len(content) < 256 * 1024
+              json.loads(content)
+              shutil.copyfile(path, target / name)
+              print(f'DETERMINISTIC_GOLDEN={name} bytes={len(content)}')
+          PY
+      - name: Verify classified test-only environment census
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-search --lib discovery::tests::every_env_knob_is_classified_and_recorded_in_the_run_profile -- --exact --nocapture \
+            2>&1 | tee /tmp/search-golden-review/census.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: search-golden-review-${{ github.run_id }}
+          path: /tmp/search-golden-review
+          if-no-files-found: error
+          retention-days: 3
+      - name: Diagnose other Search targets while golden files await review
+        run: |
+          set -o pipefail
+          cargo test -p neoethos-search --no-fail-fast -- --skip live_portfolio::tests::report_golden_pair_matches_the_real_search_writers_byte_for_byte \
+            2>&1 | tee /tmp/search-diagnostics/other-search-targets.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: other-search-targets-${{ github.run_id }}
+          path: /tmp/search-diagnostics
+          if-no-files-found: error
+          retention-days: 3
