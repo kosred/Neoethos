@@ -691,9 +691,21 @@ fn rank_parent_survivor_and_dedup_decisions_are_integer_and_device_resident() {
     );
     let identities = read_required("native/resident_backend_identity_v3.cuh");
     for (accessor, hip_member, cuda_member) in [
-        ("selected_device_ordinal", "selected_hip_ordinal", "selected_cuda_ordinal"),
-        ("build_identity", "hip_build_manifest_sha256", "cuda_build_manifest_sha256"),
-        ("math_identity", "hip_math_flags_sha256", "cuda_math_flags_sha256"),
+        (
+            "selected_device_ordinal",
+            "selected_hip_ordinal",
+            "selected_cuda_ordinal",
+        ),
+        (
+            "build_identity",
+            "hip_build_manifest_sha256",
+            "cuda_build_manifest_sha256",
+        ),
+        (
+            "math_identity",
+            "hip_math_flags_sha256",
+            "cuda_math_flags_sha256",
+        ),
     ] {
         let signature = format!("NEO_RESIDENT_IDENTITY_HD_V3 decltype(auto) {accessor}(");
         let body = braced_definition(&identities, &signature).expect("backend identity accessor");

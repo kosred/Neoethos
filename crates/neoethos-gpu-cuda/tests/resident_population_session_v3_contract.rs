@@ -387,21 +387,38 @@ fn release_frees_only_owned_parent_and_stream_storage() {
         "if (parent_ownership == NEO_POPULATION_PARENT_OWNED_V1) {",
         "\n    } else {",
     );
-    let borrowed = section(release, "\n    } else {", "indicators_validity_u4 = nullptr");
+    let borrowed = section(
+        release,
+        "\n    } else {",
+        "indicators_validity_u4 = nullptr",
+    );
     for pointer in [
-        "close", "high", "low", "indicators_bar_major", "indicators_feature_major",
-        "months", "days", "timestamps", "smc_rows",
+        "close",
+        "high",
+        "low",
+        "indicators_bar_major",
+        "indicators_feature_major",
+        "months",
+        "days",
+        "timestamps",
+        "smc_rows",
     ] {
         require_all(owned, &[&format!("!device_free_checked({pointer})")]);
         require_all(borrowed, &[&format!("{pointer} = nullptr;")]);
     }
-    assert!(!borrowed.contains("device_free"), "borrowed parent storage must not be freed");
+    assert!(
+        !borrowed.contains("device_free"),
+        "borrowed parent storage must not be freed"
+    );
     let wrapper = section(&native, "  bool release() {", "\n  }");
-    require_all(wrapper, &[
-        "if (!release_terminal_checked_v2())",
-        "strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;",
-        "return false;",
-    ]);
+    require_all(
+        wrapper,
+        &[
+            "if (!release_terminal_checked_v2())",
+            "strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;",
+            "return false;",
+        ],
+    );
     assert!(
         !release.contains("cudaStreamSynchronize"),
         "resident teardown must never insert a host synchronization"

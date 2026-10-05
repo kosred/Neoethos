@@ -75,9 +75,9 @@ run_cubecl() {
 }
 
 run_data() {
-  # Two audit/profiler tests are intentionally ignored; all 67 active tests
+  # Two audit/profiler tests are intentionally ignored; all 192 active tests
   # must execute, including every current resident f64 CUDA family.
-  run_gate data-resident-f64-suite 67 2 \
+  run_gate data-resident-f64-suite 192 2 \
     env NEOETHOS_REQUIRE_GPU=1 \
     cargo test -p neoethos-data --features gpu-cuda --lib \
     core::gpu_indicators::tests:: -- --nocapture --test-threads=1
