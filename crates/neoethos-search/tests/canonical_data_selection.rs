@@ -588,8 +588,9 @@ fn prepared_owner_retains_its_original_receipt_and_revalidates_at_search_binding
         .split("/// The only data shape")
         .next()
         .unwrap();
-    assert!(consumer.contains("return CanonicalSearchRunInputV2::new_with_control("));
+    assert!(consumer.contains("return CanonicalSearchRunInputV2::new_with_execution("));
     assert!(consumer.contains("receipt.clone()"));
+    assert!(consumer.contains("&self.feature_execution"));
 }
 
 #[test]

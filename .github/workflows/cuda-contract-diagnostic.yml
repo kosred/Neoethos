@@ -6,6 +6,7 @@ permissions:
   contents: read
 jobs:
   diagnose:
+    if: contains(github.event.head_commit.message, '[golden-review]')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -67,9 +68,55 @@ jobs:
           path: /tmp/search-golden-review
           if-no-files-found: error
           retention-days: 3
-      - name: Diagnose other Search targets while golden files await review
+  cli_cpu:
+    if: contains(github.event.head_commit.message, '[cli-diagnostic]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold pkg-config libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpu-native-stage1
+          cache-on-failure: true
+      - name: Format changed Rust files for final review
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cli-diagnostics/formatted
+          mapfile -d '' rust_files < <(git diff --name-only -z origin/master...HEAD -- '*.rs')
+          rustfmt --edition 2024 --config skip_children=true "${rust_files[@]}"
+          cp --parents "${rust_files[@]}" /tmp/cli-diagnostics/formatted/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-formatted-tests-${{ github.run_id }}
+          path: /tmp/cli-diagnostics/formatted
+          if-no-files-found: error
+          retention-days: 3
+      - name: Check CLI with required native libraries
         run: |
           set -o pipefail
+          cargo check -p neoethos-cli 2>&1 | tee /tmp/cli-diagnostics/cli.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cli-cpu-diagnostics-${{ github.run_id }}
+          path: /tmp/cli-diagnostics/cli.log
+          if-no-files-found: error
+          retention-days: 3
+      - name: Diagnose other Search targets while golden files await review
+        if: always()
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/search-diagnostics
           cargo test -p neoethos-search --no-fail-fast -- --skip live_portfolio::tests::report_golden_pair_matches_the_real_search_writers_byte_for_byte \
             2>&1 | tee /tmp/search-diagnostics/other-search-targets.log
       - uses: actions/upload-artifact@v4

@@ -23,13 +23,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install mold when missing
+      - name: Install native build dependencies when missing
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v mold >/dev/null 2>&1; then
+          if ! command -v mold >/dev/null 2>&1 || \
+             ! command -v pkg-config >/dev/null 2>&1 || \
+             ! pkg-config --exists dbus-1; then
             sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends mold
+            sudo apt-get install -y --no-install-recommends mold pkg-config libdbus-1-dev
           fi
 
       - name: Install pinned Rust toolchain
