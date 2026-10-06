@@ -11,6 +11,7 @@ Run these commands from `desktop/`:
 
 ```sh
 npm ci
+npm audit
 npm test
 npm run lint
 npm run build
@@ -18,8 +19,8 @@ npm run build
 
 `npm test` runs the existing Node test suite without a broker account or a Tauri
 process. `npm run build` type-checks and bundles the frontend; it does not build
-the native desktop application. Both checks and lint run in the Stage 1 GitHub
-Actions workflow.
+the native desktop application. Tests, dependency auditing, lint and the frontend
+build run in the Stage 1 GitHub Actions workflow.
 
 For desktop development with the engine and hot reload:
 
