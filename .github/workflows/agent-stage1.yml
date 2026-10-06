@@ -149,6 +149,15 @@ jobs:
           set -o pipefail
           cargo check -p neoethos-cli 2>&1 | tee /tmp/stage1-diagnostics/cli-check.log
 
+      - name: Test canonical import boundaries
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p neoethos-data \
+            --test import_contract --test import_bounded_memory \
+            --test import_adversarial_limits --test import_provenance \
+            2>&1 | tee /tmp/stage1-diagnostics/import-test.log
+
       - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4

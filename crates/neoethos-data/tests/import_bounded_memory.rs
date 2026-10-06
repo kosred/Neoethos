@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use neoethos_data::core::dataset_manifest::read_current_manifest;
-use neoethos_data::core::import_limits::ImportLimits;
+use neoethos_data::core::import_limits::{ImportLimitKind, ImportLimits};
 use neoethos_data::core::import_provenance::ImportSourceFormat;
 use neoethos_data::core::import_service::{ImportRequest, import_path_to_vortex};
 use neoethos_data::{
@@ -168,6 +168,66 @@ fn disk_admission_reserves_staging_candidate_and_free_space_margin() {
             .expect("checked disk arithmetic"),
         5_800,
         "peak admission must include source staging + candidate + retained free-space margin"
+    );
+}
+
+#[test]
+fn available_disk_narrows_only_the_candidate_ceiling_and_preserves_the_margin() {
+    let limits =
+        ImportLimits::conservative_for_tests().with_storage_bounds(1_000, 1_000, 2_000, 3_000);
+    let admitted = limits
+        .bounded_by_available_disk(800, 4_300)
+        .expect("admit smaller disk");
+    assert_eq!(admitted.max_candidate_bytes(), 500);
+    assert_eq!(admitted.max_source_bytes(), 1_000);
+    assert_eq!(admitted.max_staging_bytes(), 1_000);
+    assert_eq!(admitted.required_free_disk_bytes(), 3_000);
+    assert_eq!(admitted.required_peak_disk_bytes(800).unwrap(), 4_300);
+    assert!(admitted.check_candidate_bytes(501).is_err());
+    assert_eq!(
+        limits.max_candidate_bytes(),
+        2_000,
+        "caller limits are immutable"
+    );
+    assert_eq!(
+        limits
+            .bounded_by_available_disk(800, 8_000)
+            .unwrap()
+            .max_candidate_bytes(),
+        2_000,
+        "more disk must never relax the configured ceiling"
+    );
+    assert_eq!(
+        limits
+            .bounded_by_available_disk(800, 3_801)
+            .unwrap()
+            .max_candidate_bytes(),
+        1
+    );
+    for available in [0, 3_799, 3_800] {
+        assert_eq!(
+            limits
+                .bounded_by_available_disk(800, available)
+                .unwrap_err()
+                .kind(),
+            ImportLimitKind::CandidateBytes,
+            "no candidate fits without consuming the reserved margin"
+        );
+    }
+    assert_eq!(
+        limits
+            .bounded_by_available_disk(1_001, 8_000)
+            .unwrap_err()
+            .kind(),
+        ImportLimitKind::SourceBytes
+    );
+    let overflow = limits.with_storage_bounds(u64::MAX, u64::MAX, 2_000, u64::MAX);
+    assert_eq!(
+        overflow
+            .bounded_by_available_disk(1, u64::MAX)
+            .unwrap_err()
+            .kind(),
+        ImportLimitKind::CheckedArithmetic
     );
 }
 
