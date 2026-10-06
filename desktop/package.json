@@ -9,6 +9,7 @@
     "predev:tauri": "cargo build --manifest-path ../mcp/Cargo.toml --bin neoethos-mcp",
     "dev:tauri": "vite",
     "build": "tsc -b && vite build",
+    "test": "node --test test/*.test.ts",
     "lint": "eslint .",
     "preview": "vite preview",
     "tauri": "tauri"

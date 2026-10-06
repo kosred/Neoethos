@@ -58,7 +58,7 @@ class PreflightContractTests(unittest.TestCase):
             "cubecl_eval::fused_parity_tests::fused_path_is_byte_identical_to_windowed_path": "1 0",
             "gpu_native::prototype_a::tests::direct_prototype_a_engine_is_resident_and_matches_cpu_fixture": "1 0",
             "gpu_native::prototype_c_engine::device_tests::": "7 0",
-            "core::gpu_indicators::tests::": "67 2",
+            "core::gpu_indicators::tests::": "192 2",
             "core::hpc_ta::tests::gpu_cpu_indicator_sweep_parity": "1 0",
         }
         for test_filter, counts in required_filters.items():
@@ -181,7 +181,7 @@ class PreflightContractTests(unittest.TestCase):
         self.assertEqual(cubecl.count("#[test]"), 7)
         self.assertEqual(native_b.count("#[test]"), 3)
         self.assertEqual(self.prototype_c_tests.count("#[test]"), 7)
-        self.assertEqual(data.count("#[test]"), 69)
+        self.assertEqual(data.count("#[test]"), 194)
         self.assertEqual(data.count("#[ignore"), 2)
 
     def test_rtx_3090_and_a6000_are_supported_without_lowering_the_hardware_floor(self) -> None:

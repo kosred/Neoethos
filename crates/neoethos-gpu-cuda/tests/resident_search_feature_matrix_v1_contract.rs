@@ -36,20 +36,23 @@ fn require_local_cfg_before(source: &str, needle: &str, cfg: &str) {
 }
 
 #[test]
-fn search_only_population_bridge_is_cuda_gated_and_has_one_owned_authority() {
+fn search_population_bridge_is_native_backend_gated_and_has_one_owned_authority() {
     let population = read_required("src/population.rs");
+    let shared_cfg = "#[cfg(any(feature = \"cuda\", feature = \"hip-native-kernels\"))]";
+    let lib = read_required("src/lib.rs");
+    require_local_cfg_before(&lib, "pub mod resident_search_v2;", shared_cfg);
     for (ffi, cfg) in [
         (
             "fn neoethos_gpu_cuda_population_enqueue_resident_gene_metrics_v2(",
-            "#[cfg(feature = \"cuda\")]",
+            shared_cfg,
         ),
         (
             "fn neoethos_gpu_cuda_population_export_resident_scoring_source_v2(",
-            "#[cfg(feature = \"cuda\")]",
+            shared_cfg,
         ),
         (
             "fn neoethos_gpu_cuda_population_finish_resident_scoring_source_v2(",
-            "#[cfg(feature = \"cuda\")]",
+            shared_cfg,
         ),
     ] {
         assert_eq!(
@@ -76,14 +79,14 @@ fn search_only_population_bridge_is_cuda_gated_and_has_one_owned_authority() {
         1,
         "one move-only Search population bridge required"
     );
-    require_local_cfg_before(&population, owned, "#[cfg(feature = \"cuda\")]");
+    require_local_cfg_before(&population, owned, shared_cfg);
 
     for owner in [
         "pub(crate) struct ResidentSearchPopulationCompletionLeaseV2 {",
         "impl ResidentSearchPopulationCompletionLeaseV2 {",
         "impl Drop for ResidentSearchPopulationCompletionLeaseV2 {",
     ] {
-        require_local_cfg_before(&population, owner, "#[cfg(feature = \"cuda\")]");
+        require_local_cfg_before(&population, owner, shared_cfg);
     }
 }
 

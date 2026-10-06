@@ -2420,6 +2420,32 @@ fn terminal_seal_follows_last_commit_and_only_pending_can_project_the_receipt() 
         assert_eq!(rejected_query_authority, candidate);
         pending = restored_pending;
     }
+    // Keep both owners alive when comparing their addresses: completing the
+    // original receipt permits the allocator to reuse its storage.
+    let (mut numeric_foreign_stream, numeric_foreign_final_chain) =
+        run_three_generations_for(STREAM_ID + 2, RUN_TOKEN + 2);
+    let numeric_foreign_boxed_identity = numeric_foreign_final_chain.boxed_receipt_identity();
+    let numeric_foreign_pending = numeric_foreign_stream
+        .enqueue_terminal_seal(numeric_foreign_final_chain)
+        .unwrap();
+    let numeric_foreign_query = TerminalQueryAuthority {
+        receipt_identity: 0x5445_524d_0000_000a,
+        boxed_receipt_identity: numeric_foreign_boxed_identity,
+        run_token: RUN_TOKEN + 2,
+        packed_word: THIRD_WORD,
+        generation: 10,
+        event_identity: 0x4556_454e_5400_0001,
+    };
+    assert_eq!(
+        numeric_foreign_query.receipt_identity,
+        query_authority.receipt_identity
+    );
+    assert_ne!(
+        numeric_foreign_query.boxed_receipt_identity,
+        query_authority.boxed_receipt_identity
+    );
+    assert_ne!(numeric_foreign_query.run_token, query_authority.run_token);
+
     assert_eq!(
         stream.try_complete(pending).unwrap(),
         TerminalProjection {
@@ -2465,29 +2491,6 @@ fn terminal_seal_follows_last_commit_and_only_pending_can_project_the_receipt() 
             event_identity: 0x4556_454e_5400_0001,
         }
     );
-    let (mut numeric_foreign_stream, numeric_foreign_final_chain) =
-        run_three_generations_for(STREAM_ID + 2, RUN_TOKEN + 2);
-    let numeric_foreign_boxed_identity = numeric_foreign_final_chain.boxed_receipt_identity();
-    let numeric_foreign_pending = numeric_foreign_stream
-        .enqueue_terminal_seal(numeric_foreign_final_chain)
-        .unwrap();
-    let numeric_foreign_query = TerminalQueryAuthority {
-        receipt_identity: 0x5445_524d_0000_000a,
-        boxed_receipt_identity: numeric_foreign_boxed_identity,
-        run_token: RUN_TOKEN + 2,
-        packed_word: THIRD_WORD,
-        generation: 10,
-        event_identity: 0x4556_454e_5400_0001,
-    };
-    assert_eq!(
-        numeric_foreign_query.receipt_identity,
-        query_authority.receipt_identity
-    );
-    assert_ne!(
-        numeric_foreign_query.boxed_receipt_identity,
-        query_authority.boxed_receipt_identity
-    );
-    assert_ne!(numeric_foreign_query.run_token, query_authority.run_token);
     let (numeric_foreign_error, returned_numeric_foreign_pending) =
         take_rejection(stream.try_complete(numeric_foreign_pending));
     assert_eq!(

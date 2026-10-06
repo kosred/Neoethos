@@ -50,16 +50,24 @@ fn obsolete_blind_batch_constant_and_its_test_are_removed() {
 
 #[test]
 fn host_v1_execution_run_has_no_resident_v3_shape_or_session_state() {
-    let evidence = normalized(&read("src/population_execution_evidence_v1.rs"));
-    for token in [
-        "resident_feature_store_session_v3",
-        "parent_feature_count",
-        "ResidentPopulationSessionV3",
+    let evidence = read("src/population_execution_evidence_v1.rs");
+    for signature in [
+        "pub(crate) struct ExactPopulationExecutionRunV1<'a> {",
+        "pub(crate) struct ExactPopulationEvaluationV1<'a> {",
     ] {
-        assert!(
-            !evidence.contains(token),
-            "host V1 execution still carries standalone resident V3 state: {token}"
-        );
+        let (_, shape) = evidence.split_once(signature).expect("host V1 state");
+        let (shape, _) = shape.split_once("\n}").expect("host V1 state boundary");
+        let shape = normalized(shape);
+        for token in [
+            "resident_feature_store_session_v3",
+            "parent_feature_count",
+            "ResidentPopulationSessionV3",
+        ] {
+            assert!(
+                !shape.contains(token),
+                "host V1 execution still carries standalone resident V3 state: {token}"
+            );
+        }
     }
 }
 

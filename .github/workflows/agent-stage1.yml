@@ -13,6 +13,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  frontend:
+    name: Desktop frontend checks
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install locked frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Audit frontend dependencies
+        run: npm audit
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Type-check and build frontend
+        run: npm run build
+
   verify:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -23,13 +57,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install mold when missing
+      - name: Install native build dependencies when missing
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v mold >/dev/null 2>&1; then
+          if ! command -v mold >/dev/null 2>&1 || \
+             ! command -v pkg-config >/dev/null 2>&1 || \
+             ! pkg-config --exists dbus-1; then
             sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends mold
+            sudo apt-get install -y --no-install-recommends mold pkg-config libdbus-1-dev
           fi
 
       - name: Install pinned Rust toolchain
