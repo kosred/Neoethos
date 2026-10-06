@@ -369,7 +369,7 @@ fn native_bind_refuses_identity_shape_and_pointer_drift_before_any_wait() {
 #[test]
 fn release_frees_only_owned_parent_and_stream_storage() {
     let native = read("native/prototype_b_population.cu");
-    let release = section(&native, "  void release() {", "\n  }");
+    let release = section(&native, "  bool release_terminal_checked_v2() {", "\n  }");
     require_all(
         release,
         &[
@@ -377,6 +377,46 @@ fn release_frees_only_owned_parent_and_stream_storage() {
             "stream_ownership == NEO_POPULATION_STREAM_OWNED",
             "indicators_validity_u4 = nullptr",
             "stream = nullptr",
+            "if (!release_workspace_checked_v2())",
+            "!release_scenarios_checked_v2()",
+            "cudaStreamDestroy(stream) != cudaSuccess",
+        ],
+    );
+    let owned = section(
+        release,
+        "if (parent_ownership == NEO_POPULATION_PARENT_OWNED_V1) {",
+        "\n    } else {",
+    );
+    let borrowed = section(
+        release,
+        "\n    } else {",
+        "indicators_validity_u4 = nullptr",
+    );
+    for pointer in [
+        "close",
+        "high",
+        "low",
+        "indicators_bar_major",
+        "indicators_feature_major",
+        "months",
+        "days",
+        "timestamps",
+        "smc_rows",
+    ] {
+        require_all(owned, &[&format!("!device_free_checked({pointer})")]);
+        require_all(borrowed, &[&format!("{pointer} = nullptr;")]);
+    }
+    assert!(
+        !borrowed.contains("device_free"),
+        "borrowed parent storage must not be freed"
+    );
+    let wrapper = section(&native, "  bool release() {", "\n  }");
+    require_all(
+        wrapper,
+        &[
+            "if (!release_terminal_checked_v2())",
+            "strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;",
+            "return false;",
         ],
     );
     assert!(

@@ -5403,6 +5403,25 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
                 "compiled only into real-device test gates; it cannot alter a production search",
             ),
         ),
+        // These readers live inside cfg(test) modules, never production Search.
+        (
+            "NEOETHOS_TEST_RECORDED_POLICY_CHILD",
+            DiagnosticOnly("cfg(test) marker for an isolated recorded-policy replay subprocess"),
+        ),
+        (
+            "NEOETHOS_TEST_RESEARCH_SCOPE_ONCE_CHILD",
+            DiagnosticOnly("cfg(test) marker for an isolated research-scope validation subprocess"),
+        ),
+        (
+            "NEOETHOS_TEST_RESEARCH_SCOPE_RECEIPT_FILE",
+            DiagnosticOnly(
+                "cfg(test) input path for the explicitly ignored receipt lookup benchmark",
+            ),
+        ),
+        (
+            "NEOETHOS_TEST_WALKFORWARD_PRE_CANCEL_CHILD",
+            DiagnosticOnly("cfg(test) marker for an isolated walkforward cancellation subprocess"),
+        ),
         (
             "NEOETHOS_BOT_SEARCH_VRAM_LOG",
             DiagnosticOnly(

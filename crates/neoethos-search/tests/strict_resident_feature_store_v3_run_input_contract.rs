@@ -409,7 +409,7 @@ fn native_binding_borrows_parent_and_stream_and_waits_for_the_ready_event() {
             "cudaSetDevice",
         ],
     );
-    let release = section(&native, "void release() {", "\n  }");
+    let release = section(&native, "bool release_terminal_checked_v2() {", "\n  }");
     require_all(
         release,
         &[
@@ -417,6 +417,7 @@ fn native_binding_borrows_parent_and_stream_and_waits_for_the_ready_event() {
             "stream_ownership",
             "NEO_POPULATION_PARENT_OWNED_V1",
             "STREAM_OWNED",
+            "device_free_checked(close)",
         ],
     );
     assert!(

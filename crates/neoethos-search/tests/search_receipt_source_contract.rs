@@ -85,7 +85,9 @@ fn canonical_feature_execution_authority_uses_production_dispatch_and_strict_gpu
 
     for required in [
         "pub fn resolved_canonical_feature_execution_authority_v1(",
-        "let policy = resolved_indicator_compute_policy();",
+        "canonical_feature_execution_authority_for_policy_v1(resolved_indicator_compute_policy())",
+        "pub fn canonical_feature_execution_authority_for_policy_v1(",
+        "policy: IndicatorComputePolicy,",
         "match detect_best_kernel()",
         "Kernel::Scalar => ResolvedCanonicalFeatureMathLaneV1::CpuScalar",
         "Kernel::Avx2 => ResolvedCanonicalFeatureMathLaneV1::CpuAvx2Fma",

@@ -277,17 +277,32 @@ fn exact_route_is_owned_by_the_population_run_and_cannot_be_detached_per_evaluat
         1,
         "Discovery must acquire one and only one strict route admission"
     );
-    let acquire_at = discovery
-        .find("acquire_strict_discovery_device_admission_v1()")
-        .expect("Discovery strict admission acquisition");
-    let begin_at = discovery
+    let acquire = section(
+        &discovery,
+        "fn run_discovery_cycle_values_with_real_device_admission<F>(",
+        "\nfn run_discovery_cycle_values_with_progress<F>(",
+    );
+    require_all(
+        acquire,
+        &[
+            "acquire_strict_discovery_device_admission_v1()",
+            "run_discovery_cycle_values_with_progress(strict_device_admission, inputs, config, progress_fn)",
+        ],
+    );
+    let execution = section(
+        &discovery,
+        "\nfn run_discovery_cycle_values_with_progress<F>(",
+        "\npub(crate) fn resolve_prefilter_financial_geometry_v1(",
+    );
+    require_all(
+        execution,
+        &["strict_device_admission: crate::SealedStrictDiscoveryDeviceAdmissionV1"],
+    );
+    assert!(!execution.contains("acquire_strict_discovery_device_admission_v1()"));
+    let begin_at = execution
         .find("begin_exact_population_execution_run_v1(")
         .expect("Discovery exact population run start");
-    assert!(
-        acquire_at < begin_at,
-        "Discovery must acquire the sealed route before moving it into the run"
-    );
-    let run_start = &discovery[begin_at..];
+    let run_start = &execution[begin_at..];
     require_all(run_start, &["strict_device_admission"]);
     require_all(
         &native,

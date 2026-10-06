@@ -71,7 +71,7 @@ fn validate_host_u32_maxima(source: &str) -> Result<(), String> {
     for (signature, required) in [
         (
             "bool validate_import_v1(",
-            "import->selected_cuda_ordinal != std::numeric_limits<std::uint32_t>::max()",
+            "backend_identity_v3::selected_device_ordinal(*import) != std::numeric_limits<std::uint32_t>::max()",
         ),
         (
             "bool validate_adaptive_policy_v3(",
@@ -473,6 +473,10 @@ fn host_maximum_scope_rejects_device_qualifiers_missing_bounds_and_relocation() 
             "policy->seen_retry_attempts > std::numeric_limits<std::uint32_t>::max()",
         ),
         (
+            "backend_identity_v3::selected_device_ordinal(*import) != std::numeric_limits<std::uint32_t>::max()",
+            "true",
+        ),
+        (
             "return logical_population_count - rank;",
             "return std::numeric_limits<std::uint32_t>::max();",
         ),
@@ -671,8 +675,8 @@ fn rank_parent_survivor_and_dedup_decisions_are_integer_and_device_resident() {
             "resident_decision_keys_device",
             "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending",
             "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs",
-            "identity_equal_v1(import->cuda_build_manifest_sha256,",
-            "plan->cuda_build_manifest_sha256)",
+            "identity_equal_v1(backend_identity_v3::build_identity(*import),",
+            "backend_identity_v3::build_identity(*plan))",
             "rank_weight_v1(",
             "return logical_population_count - rank;",
             "checked_rank_weight_total_v1(",
@@ -685,6 +689,31 @@ fn rank_parent_survivor_and_dedup_decisions_are_integer_and_device_resident() {
             "neoethos_parallel_primitives_v1::DeviceSelect::Flagged",
         ],
     );
+    let identities = read_required("native/resident_backend_identity_v3.cuh");
+    for (accessor, hip_member, cuda_member) in [
+        (
+            "selected_device_ordinal",
+            "selected_hip_ordinal",
+            "selected_cuda_ordinal",
+        ),
+        (
+            "build_identity",
+            "hip_build_manifest_sha256",
+            "cuda_build_manifest_sha256",
+        ),
+        (
+            "math_identity",
+            "hip_math_flags_sha256",
+            "cuda_math_flags_sha256",
+        ),
+    ] {
+        let signature = format!("NEO_RESIDENT_IDENTITY_HD_V3 decltype(auto) {accessor}(");
+        let body = braced_definition(&identities, &signature).expect("backend identity accessor");
+        let hip = section(body, "#if defined(__HIP_PLATFORM_AMD__)", "#else");
+        let cuda = section(body, "#else", "#endif");
+        require_all(hip, &[&format!("return (value.{hip_member});")]);
+        require_all(cuda, &[&format!("return (value.{cuda_member});")]);
+    }
     validate_legacy_integer_and_adaptive_softmax_scopes(&cuda)
         .expect("legacy integer selection and adaptive guarded f64 softmax must remain distinct");
     for forbidden in [
@@ -1096,8 +1125,10 @@ fn slice2_generation_finite_rows_seam_is_exact_and_eventless() {
             "finite_rows->novelty_semantics_sha256",
             "finite_rows->scenario_order_semantics_sha256",
             "finite_rows->rank_semantics_sha256",
-            "finite_rows->cuda_build_manifest_sha256",
-            "finite_rows->cuda_math_flags_sha256",
+            "backend_identity_v3::build_identity(*finite_rows)",
+            "backend_identity_v3::build_identity(generation->plan)",
+            "backend_identity_v3::math_identity(*finite_rows)",
+            "resident_backend_math_v3::expected_math_semantics_sha256_v3()",
             "validate_and_import_scored_rows_kernel_v1<<<",
             "launch_device_parent_selection_v1(",
             "launch_device_crossover_v1(",

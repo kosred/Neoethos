@@ -282,10 +282,25 @@ fn strict_workspace_mode_stays_immutable_while_exact_extent_may_be_rebuilt() {
             "session->workspace_mode = PopulationWorkspaceModeV1::StrictMetricsOnly;",
             "session->workspace_scenarios == scenario_count",
             "session->month_capacity == month_capacity",
-            "session->release_workspace();",
+            "if (!session->release_workspace()) return NEO_POPULATION_STATUS_LAUNCH_FAILED;",
             "session->outcomes != nullptr",
             "session->accepted_trade_total != nullptr",
         ],
+    );
+
+    let release = braced_item(&cuda, "bool release_workspace() {");
+    require_all(
+        release,
+        &[
+            "if (!release_workspace_checked_v2())",
+            "strict_execution_state = PopulationStrictExecutionStateV1::Poisoned;",
+            "return false;",
+        ],
+    );
+    let checked_release = braced_item(&cuda, "bool release_workspace_checked_v2() {");
+    assert!(
+        !checked_release.contains("workspace_mode ="),
+        "checked release must preserve the selected workspace authority"
     );
 
     let implementation = section(
@@ -564,7 +579,9 @@ fn dropped_unconsumed_handle_poison_blocks_reuse_and_leaks_native_owner_fail_clo
         native_drop
             .find("strict_population_work_blocks_host_boundary_v1(session)")
             .unwrap()
-            < native_drop.find("session->release_terminal_checked_v2()").unwrap(),
+            < native_drop
+                .find("session->release_terminal_checked_v2()")
+                .unwrap(),
         "native destroy releases strict resident storage before the leak-only guard"
     );
 }
@@ -626,39 +643,49 @@ fn enqueue_state_is_recorded_before_receipt_validation_and_ambiguous_failures_po
 }
 
 #[test]
-fn resident_search_uses_one_exact_full_population_extent_and_has_no_orphan_chunk_abi() {
+fn resident_search_preserves_full_population_with_exact_admitted_capacity_and_no_orphan_chunk_abi()
+{
     let rust = read("src/population.rs");
     let search = read("src/resident_search_v2.rs");
     let scoring = read("src/resident_scoring_v2.rs");
     let header = read("native/neoethos_gpu_cuda.h");
     let cuda = read("native/prototype_b_population.cu");
 
-    let owned_enqueue = braced_item(&rust, "pub(crate) fn enqueue_resident_gene_metrics_owned_v2(");
+    let owned_enqueue = braced_item(
+        &rust,
+        "pub(crate) fn enqueue_resident_gene_metrics_owned_v2(",
+    );
     require_all(
         owned_enqueue,
         &[
-            "retained_evaluation_capacity != logical_population_count",
-            "self.scenario_count as u64 != logical_population_count",
+            "logical_population_count == 0",
+            "retained_evaluation_capacity == 0",
+            "retained_evaluation_capacity > logical_population_count",
+            "self.scenario_count as u64 != retained_evaluation_capacity",
             "self.population as u64 != logical_population_count",
-            "one immutable full-population chunk",
+            "self.expected_scenario_identities.len() as u64 != logical_population_count",
             "PopulationMetricsOnlyPlanV1::checked_from_session_extents_v1(",
+            "raw.logical_population_count != logical_population_count",
         ],
     );
     let scoring_seal = braced_item(&scoring, "pub(crate) fn seal_resident_scoring_plan_v2(");
     require_all(
         scoring_seal,
         &[
+            "valid_retained_capacity_v3(",
             "generation.retained_evaluation_capacity_v1()",
             "generation.logical_population_count_v1()",
-            "generation/scoring semantics or full-population capacity differ",
+            "generation/scoring semantics or bounded evaluation capacity differ",
         ],
+    );
+    let capacity_guard = braced_item(&scoring, "fn valid_retained_capacity_v3(");
+    require_all(
+        capacity_guard,
+        &["population != 0 && capacity != 0 && capacity <= population"],
     );
     require_all(
         &search,
-        &[
-            "enqueue_full_population_scored_generation_advance_v2(",
-            "Native consumes one full-population device chunk",
-        ],
+        &["enqueue_full_population_scored_generation_advance_v2("],
     );
 
     let combined = format!("{rust}\n{header}\n{cuda}");
@@ -688,7 +715,7 @@ fn exact_metrics_workspace_reuses_equal_extent_and_rebuilds_changed_extent_witho
         &[
             "session->workspace_scenarios == scenario_count",
             "session->month_capacity == month_capacity",
-            "session->release_workspace();",
+            "if (!session->release_workspace()) return NEO_POPULATION_STATUS_LAUNCH_FAILED;",
             "device_alloc(&session->monthly_pnls, scenarios * months)",
             "device_alloc(&session->month_start_equities, scenarios * months)",
             "device_alloc(&session->metric_rows, scenarios)",
@@ -699,7 +726,7 @@ fn exact_metrics_workspace_reuses_equal_extent_and_rebuilds_changed_extent_witho
         .find("session->workspace_scenarios == scenario_count")
         .expect("exact retained extent check");
     let rebuild = workspace
-        .find("session->release_workspace();")
+        .find("if (!session->release_workspace()) return NEO_POPULATION_STATUS_LAUNCH_FAILED;")
         .expect("changed-extent rebuild");
     let allocation = workspace
         .find("device_alloc(&session->monthly_pnls, scenarios * months)")
