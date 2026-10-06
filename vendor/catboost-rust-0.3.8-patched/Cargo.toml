@@ -60,3 +60,6 @@ version = "0.72.0"
 
 [build-dependencies.ureq]
 version = "2.0"
+# Honor managed/corporate HTTPS proxies and their installed CA roots while
+# retaining certificate and hostname verification for upstream downloads.
+features = ["proxy-from-env", "native-certs"]
