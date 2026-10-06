@@ -80,11 +80,17 @@ Notes from real-world experience:
 **Linux (Debian/Ubuntu)**
 ```bash
 sudo apt update && sudo apt install -y \
-  build-essential curl wget file cmake pkg-config \
-  libssl-dev libwebkit2gtk-4.1-dev librsvg2-dev \
+  build-essential curl wget file cmake ninja-build pkg-config libclang-dev \
+  libssl-dev libdbus-1-dev libwebkit2gtk-4.1-dev librsvg2-dev \
   libxdo-dev libayatana-appindicator3-dev
 ```
 (Adjust package names for Fedora/Arch — the equivalents are `webkit2gtk4.1`, `openssl`, `librsvg2`, etc.)
+
+CLI-only builds need the compiler, CMake 3.28+, Ninja, pkg-config, Clang's
+development headers/library, OpenSSL and D-Bus development packages. The
+WebKitGTK, librsvg, xdo and appindicator packages are for the desktop host.
+CatBoost's build downloads use the standard proxy environment variables and
+the operating system's trusted certificate roots; keep TLS verification enabled.
 
 **macOS**
 ```bash
