@@ -13,6 +13,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  frontend:
+    name: Desktop frontend checks
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install locked frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Run frontend tests
+        run: npm test
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Type-check and build frontend
+        run: npm run build
+
   verify:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
