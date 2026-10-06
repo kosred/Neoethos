@@ -1,0 +1,364 @@
+name: Repository map
+
+# This diagnostic is independent of the manual-only build/test CI.
+on:
+  push:
+    branches: [master, 'codex/repo-map-*']
+    paths-ignore: ['docs/**', '**/*.md']
+  workflow_dispatch:
+    inputs:
+      semantic_rust:
+        description: 'Also build a configuration-specific Rust SCIP index (may need native dependencies)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-map-${{ github.ref }}-${{ inputs.semantic_rust == true && 'semantic' || 'structure' }}
+  cancel-in-progress: true
+
+jobs:
+  structure:
+    name: Inventory, syntax graph and duplicates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install static tools
+        run: |
+          python -m pip install -r scripts/repo-map/requirements.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y cloc
+          npm install --prefix "$RUNNER_TEMP/repo-map-tools" jscpd@5.3.3
+          echo "$RUNNER_TEMP/repo-map-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Test evidence and graph handling
+        run: python -m unittest discover -s scripts/repo-map -p 'test_*.py'
+      - name: Generate repository map
+        run: python scripts/repo-map/run_checks.py --output "$RUNNER_TEMP/repository-map"
+      - name: Keep complete reports, including failed-tool coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/repository-map/
+            !${{ runner.temp }}/repository-map/duplicates/**
+            !${{ runner.temp }}/repository-map/graph.sqlite
+          if-no-files-found: error
+          retention-days: 30
+      - name: Keep query database separately
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-graph-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map/graph.sqlite
+          compression-level: 9
+          if-no-files-found: error
+          retention-days: 30
+      - name: Keep duplication details separately
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-duplicates-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map/duplicates/
+          if-no-files-found: warn
+          retention-days: 30
+
+  semantic-rust:
+    name: Configuration-specific Rust SCIP graph
+    if: ${{ inputs.semantic_rust == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install parser and exact project Rust toolchain
+        run: |
+          python -m pip install -r scripts/repo-map/requirements.txt
+          rustup toolchain install nightly-2026-04-07 --profile minimal --component rust-analyzer --component rust-src
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential cmake clang mold pkg-config libssl-dev \
+            libasound2-dev libudev-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libx11-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Install pinned SCIP CLI with release checksum
+        run: |
+          mkdir -p "$RUNNER_TEMP/scip-cli"
+          cd "$RUNNER_TEMP/scip-cli"
+          curl --fail --location --retry 3 -O https://github.com/scip-code/scip/releases/download/v0.10.0/scip-linux-amd64.tar.gz
+          curl --fail --location --retry 3 -O https://github.com/scip-code/scip/releases/download/v0.10.0/scip-linux-amd64.tar.gz.sha256
+          sha256sum --check scip-linux-amd64.tar.gz.sha256
+          tar --no-same-owner -xzf scip-linux-amd64.tar.gz
+          echo "$RUNNER_TEMP/scip-cli" >> "$GITHUB_PATH"
+      - name: Generate semantic index and record incomplete analysis
+        run: python scripts/repo-map/run_checks.py --semantic --output "$RUNNER_TEMP/repository-map-rust"
+      - name: Keep index, graph and diagnostics even when analysis fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-reports-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/repository-map-rust/
+            !${{ runner.temp }}/repository-map-rust/graph.sqlite
+            !${{ runner.temp }}/repository-map-rust/parts/**
+            !${{ runner.temp }}/repository-map-rust/index.scip
+            !${{ runner.temp }}/repository-map-rust/scip-json.stdout
+          if-no-files-found: error
+          retention-days: 30
+      - name: Keep raw semantic index and export separately
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-index-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/repository-map-rust/index.scip
+            ${{ runner.temp }}/repository-map-rust/scip-json.stdout
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 00
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-00-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part00
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 01
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-01-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part01
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 02
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-02-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part02
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 03
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-03-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part03
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 04
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-04-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part04
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 05
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-05-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part05
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 06
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-06-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part06
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 07
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-07-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part07
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+
+  static-profiles:
+    name: Static Rust profile (${{ matrix.profile }})
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/codex/repo-map-') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [cpu-static, mcp, mesh, history-probe, boundary-harness, cuda-static, hip-static]
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install exact Rust toolchain and pinned SCIP CLI
+        run: |
+          rustup toolchain install nightly-2026-04-07 --profile minimal --component rust-analyzer --component rust-src
+          mkdir -p "$RUNNER_TEMP/scip-cli"
+          cd "$RUNNER_TEMP/scip-cli"
+          curl --fail --location --retry 3 -O https://github.com/scip-code/scip/releases/download/v0.10.0/scip-linux-amd64.tar.gz
+          curl --fail --location --retry 3 -O https://github.com/scip-code/scip/releases/download/v0.10.0/scip-linux-amd64.tar.gz.sha256
+          sha256sum --check scip-linux-amd64.tar.gz.sha256
+          tar --no-same-owner -xzf scip-linux-amd64.tar.gz
+          echo "$RUNNER_TEMP/scip-cli" >> "$GITHUB_PATH"
+      - name: Index declared cfgs with native build outputs explicitly skipped
+        run: python scripts/repo-map/probe_indices.py --profile "${{ matrix.profile }}" --output "$RUNNER_TEMP/rust-profile"
+      - name: Keep profile, raw index and diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-profile-${{ matrix.profile }}
+          path: ${{ runner.temp }}/rust-profile/
+          if-no-files-found: error
+          retention-days: 30
+
+  semantic-checkpoint:
+    needs: [structure, static-profiles]
+    if: ${{ always() && needs.structure.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/codex/repo-map-') }}
+    permissions:
+      contents: read
+      actions: read
+    name: Verify current Rust profiles and complete architecture reports
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned parsers
+        run: python -m pip install -r scripts/repo-map/requirements.txt
+      - name: Test evidence and report handling
+        run: python -m unittest discover -s scripts/repo-map -p 'test_*.py'
+      - name: Load same-commit structural reports
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: repository-map-${{ github.sha }}
+          path: ${{ runner.temp }}/structure-reports
+      - name: Load same-commit duplication reports
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: repository-duplicates-${{ github.sha }}
+          path: ${{ runner.temp }}/structure-reports/duplicates
+      - name: Load successful and failed additional profile diagnostics
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: rust-profile-*
+          path: ${{ runner.temp }}/additional-indices
+      - name: Assemble same-commit profiles with explicit static coverage
+        run: |
+          python scripts/repo-map/reuse_scip.py --profiles-only --structural "$RUNNER_TEMP/structure-reports" --additional-indices "$RUNNER_TEMP/additional-indices" --output "$RUNNER_TEMP/repository-map-rust"
+          cat "$RUNNER_TEMP/repository-map-rust/architecture.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep semantic coverage, architecture and viewer
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-reports-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/repository-map-rust/
+            !${{ runner.temp }}/repository-map-rust/graph.sqlite
+            !${{ runner.temp }}/repository-map-rust/parts/**
+            !${{ runner.temp }}/repository-map-rust/duplicates/**
+          if-no-files-found: error
+          retention-days: 30
+      - name: Keep bounded Rust database part 00
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-00-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part00
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 01
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-01-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part01
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 02
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-02-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part02
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 03
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-03-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part03
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 04
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-04-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part04
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 05
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-05-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part05
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 06
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-06-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part06
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Keep bounded Rust database part 07
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: repository-map-rust-db-07-${{ github.sha }}
+          path: ${{ runner.temp }}/repository-map-rust/parts/graph.sqlite.gz.part07
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 30
