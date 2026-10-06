@@ -19,6 +19,119 @@ use vortex_array::{IntoArray, ToCanonical};
 mod common;
 
 #[test]
+fn committed_real_m15_csv_imports_without_rewriting_timestamps_prices_or_volume() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../neoethos-models/tests/fixtures/eurusd_m15_real.csv");
+    let original = fs::read(&source).expect("committed real EURUSD M15 export");
+    let root = temp.path().join("canonical");
+    let identity = CanonicalDatasetIdentity::external(
+        "committed-operator-m15-export-regression",
+        "EURUSD",
+        CanonicalTimeframe::M15,
+        BarTimestampConvention::BarOpen,
+    )
+    .expect("explicit external identity, without broker authority");
+    // Force capacity admission even on a large developer disk. This used to
+    // reject the 377-KB source by reserving an impossible output maximum.
+    let limits =
+        ImportLimits::default().with_storage_bounds(u64::MAX, u64::MAX, u64::MAX, 16 * 1024 * 1024);
+    let grant = common::import_grant();
+    let result = import_path_to_vortex(ImportRequest {
+        source_path: &source,
+        configured_root: &root,
+        identity: &identity,
+        declared_format: ImportSourceFormat::Csv,
+        expected_generation: None,
+        limits: &limits,
+        auxiliary_slot: grant.auxiliary_slot().expect("source-seal slot"),
+    })
+    .expect("import unchanged timestamp_ms CSV with disk-bounded candidate ceiling");
+    let loaded =
+        load_vortex(result.manifest().generation_path()).expect("verified immutable generation");
+    let mut reader = csv::Reader::from_reader(original.as_slice());
+    assert_eq!(reader.headers().unwrap().get(0), Some("timestamp_ms"));
+    for (row, record) in reader.records().enumerate() {
+        let record = record.expect("source record");
+        assert_eq!(
+            loaded.timestamp.as_ref().unwrap()[row],
+            record[0].parse::<i64>().unwrap()
+        );
+        for (field, actual) in [&loaded.open, &loaded.high, &loaded.low, &loaded.close]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                actual[row].to_bits(),
+                record[field + 1].parse::<f64>().unwrap().to_bits()
+            );
+        }
+    }
+    assert_eq!(result.row_count(), 8_192);
+    assert!(
+        loaded.volume.is_none(),
+        "missing volume must never be manufactured"
+    );
+    assert_eq!(result.provenance().source_size(), original.len() as u64);
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        result.provenance().source_sha256().as_slice(),
+        Sha256::digest(&original).as_slice()
+    );
+    assert_eq!(
+        fs::read(&source).unwrap(),
+        original,
+        "original export is untouched"
+    );
+    assert_eq!(
+        fs::read_dir(root.join(".import-staging")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn timestamp_ms_alias_rejects_ambiguous_csv_and_tsv_headers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let grant = common::import_grant();
+    for (index, (format, separator)) in [
+        (ImportSourceFormat::Csv, ','),
+        (ImportSourceFormat::Tsv, '\t'),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = temp.path().join(format!("ambiguous.{}", format.as_str()));
+        let text =
+            "timestamp_ms,time,open,high,low,close\n1700000040000,1700000040000,1.1,1.2,1.0,1.1\n"
+                .replace(',', &separator.to_string());
+        fs::write(&source, text).expect("ambiguous source");
+        let root = temp.path().join(format!("canonical-{index}"));
+        let identity = CanonicalDatasetIdentity::external(
+            format!("ambiguous-ms-{index}"),
+            "EURUSD",
+            CanonicalTimeframe::M1,
+            BarTimestampConvention::BarOpen,
+        )
+        .unwrap();
+        let error = import_path_to_vortex(ImportRequest {
+            source_path: &source,
+            configured_root: &root,
+            identity: &identity,
+            declared_format: format,
+            expected_generation: None,
+            limits: &ImportLimits::conservative_for_tests(),
+            auxiliary_slot: grant.auxiliary_slot().expect("source-seal slot"),
+        })
+        .expect_err("duplicate timestamp aliases cannot select a column silently");
+        assert!(
+            format!("{error:#}").contains("ambiguous duplicate timestamp alias"),
+            "{error:#}"
+        );
+        assert!(read_current_manifest(&root, &identity).is_err());
+    }
+}
+
+#[test]
 fn csv_high_precision_round_trip_publishes_an_independent_verified_generation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let source = temp.path().join("operator.csv");

@@ -101,12 +101,18 @@ pub fn import_path_to_vortex(request: ImportRequest<'_>) -> Result<ImportResult>
         )
     })?;
     let staging_parent = request.configured_root.join(".import-staging");
-    let snapshot = SourceSnapshot::capture_path(
+    let (snapshot, limits) = SourceSnapshot::capture_path_with_storage_budget(
         request.source_path,
         &staging_parent,
         request.limits,
         request.auxiliary_slot,
     )?;
+    // Every format reader and candidate writer must enforce the same ceiling
+    // that was admitted before staging. Do not return to the original limits.
+    let request = ImportRequest {
+        limits: &limits,
+        ..request
+    };
 
     let format = request.declared_format;
     let text_detection = match format {
@@ -2383,7 +2389,7 @@ impl ColumnMap {
         let mut volume = None;
         for (index, header) in headers.iter().enumerate() {
             let canonical = match header.trim().to_ascii_lowercase().as_str() {
-                "timestamp" | "time" => Some(("timestamp", &mut timestamp)),
+                "timestamp" | "timestamp_ms" | "time" => Some(("timestamp", &mut timestamp)),
                 "open" | "o" => Some(("open", &mut open)),
                 "high" | "h" => Some(("high", &mut high)),
                 "low" | "l" => Some(("low", &mut low)),
@@ -2398,7 +2404,8 @@ impl ColumnMap {
             }
         }
         Ok(Self {
-            timestamp: timestamp.context("source header has no timestamp/time column")?,
+            timestamp: timestamp
+                .context("source header has no timestamp/timestamp_ms/time column")?,
             open: open.context("source header has no open/o column")?,
             high: high.context("source header has no high/h column")?,
             low: low.context("source header has no low/l column")?,

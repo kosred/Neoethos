@@ -22,6 +22,24 @@ pub struct SourceSnapshot {
 }
 
 impl SourceSnapshot {
+    /// Admit one import with a candidate ceiling bounded by this filesystem.
+    /// The exact admitted limits must also be passed to the candidate writer.
+    pub fn capture_path_with_storage_budget(
+        source_path: &Path,
+        staging_parent: &Path,
+        limits: &ImportLimits,
+        auxiliary_slot: &AuxiliarySlotLease,
+    ) -> Result<(Self, ImportLimits)> {
+        Self::capture_path_with_admission(
+            source_path,
+            staging_parent,
+            limits,
+            auxiliary_slot,
+            |_| {},
+            true,
+        )
+    }
+
     pub fn capture_path(
         source_path: &Path,
         staging_parent: &Path,
@@ -36,8 +54,27 @@ impl SourceSnapshot {
         staging_parent: &Path,
         limits: &ImportLimits,
         auxiliary_slot: &AuxiliarySlotLease,
-        mut copy_observer: impl FnMut(u64),
+        copy_observer: impl FnMut(u64),
     ) -> Result<Self> {
+        Self::capture_path_with_admission(
+            source_path,
+            staging_parent,
+            limits,
+            auxiliary_slot,
+            copy_observer,
+            false,
+        )
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    fn capture_path_with_admission(
+        source_path: &Path,
+        staging_parent: &Path,
+        limits: &ImportLimits,
+        auxiliary_slot: &AuxiliarySlotLease,
+        mut copy_observer: impl FnMut(u64),
+        narrow_to_available_disk: bool,
+    ) -> Result<(Self, ImportLimits)> {
         let source_metadata = fs::symlink_metadata(source_path)
             .with_context(|| format!("inspect import source {}", source_path.display()))?;
         if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
@@ -47,13 +84,25 @@ impl SourceSnapshot {
             );
         }
         limits.check_source_bytes(source_metadata.len())?;
+        limits.check_staging_bytes(source_metadata.len())?;
         fs::create_dir_all(staging_parent).with_context(|| {
             format!(
                 "create private import staging directory {}",
                 staging_parent.display()
             )
         })?;
-        check_free_disk(staging_parent, source_metadata.len(), limits)?;
+        let available = available_disk_bytes(staging_parent)?;
+        let admitted = if narrow_to_available_disk {
+            limits.bounded_by_available_disk(source_metadata.len(), available)
+                .with_context(|| format!(
+                    "insufficient import disk at {}: available {available}, source {}, retained free-space margin {}",
+                    staging_parent.display(), source_metadata.len(), limits.required_free_disk_bytes()
+                ))?
+        } else {
+            limits.clone()
+        };
+        let limits = &admitted;
+        check_free_disk(staging_parent, source_metadata.len(), limits, available)?;
 
         let mut source = open_source_for_seal(source_path)?;
         let mut source_seal = SourceSeal::acquire(&source, source_path, auxiliary_slot)?;
@@ -126,12 +175,15 @@ impl SourceSnapshot {
             bail!("private import staging hash mismatch after fsync/reopen");
         }
         cleanup.committed = true;
-        Ok(Self {
-            path: staging_path,
-            source_sha256,
-            source_size: total,
-            stable_source_identity: opened_identity,
-        })
+        Ok((
+            Self {
+                path: staging_path,
+                source_sha256,
+                source_size: total,
+                stable_source_identity: opened_identity,
+            },
+            admitted,
+        ))
     }
 
     pub fn path(&self) -> &Path {
@@ -198,11 +250,15 @@ fn hash_file_bounded(path: &Path, limits: &ImportLimits) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn check_free_disk(path: &Path, source_bytes: u64, limits: &ImportLimits) -> Result<()> {
+fn check_free_disk(
+    path: &Path,
+    source_bytes: u64,
+    limits: &ImportLimits,
+    available: u64,
+) -> Result<()> {
     let required = limits
         .required_peak_disk_bytes(source_bytes)
         .context("calculate bounded import peak disk requirement")?;
-    let available = available_disk_bytes(path)?;
     if available < required {
         bail!(
             "insufficient staging disk at {}: available {}, required {}",

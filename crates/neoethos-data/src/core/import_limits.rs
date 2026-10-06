@@ -270,6 +270,35 @@ impl ImportLimits {
         self.max_total_rows
     }
 
+    /// Narrow the candidate writer's ceiling to the measured disk capacity.
+    /// The source snapshot and the configured free-space margin remain fully
+    /// reserved; successful admission never raises any caller-provided limit.
+    pub fn bounded_by_available_disk(
+        &self,
+        source_bytes: u64,
+        available_bytes: u64,
+    ) -> Result<Self, ImportLimitError> {
+        self.check_source_bytes(source_bytes)?;
+        self.check_staging_bytes(source_bytes)?;
+        let reserved = u128::from(source_bytes) + u128::from(self.required_free_disk_bytes);
+        self.check(
+            ImportLimitKind::CheckedArithmetic,
+            reserved,
+            u128::from(u64::MAX),
+        )?;
+        let candidate_bytes = self
+            .max_candidate_bytes
+            .min(available_bytes.saturating_sub(reserved as u64));
+        self.check(
+            ImportLimitKind::CandidateBytes,
+            1,
+            u128::from(candidate_bytes),
+        )?;
+        let mut admitted = self.clone();
+        admitted.max_candidate_bytes = candidate_bytes;
+        Ok(admitted)
+    }
+
     pub fn required_peak_disk_bytes(&self, source_bytes: u64) -> Result<u64, ImportLimitError> {
         let total = u128::from(source_bytes)
             + u128::from(self.max_candidate_bytes)
