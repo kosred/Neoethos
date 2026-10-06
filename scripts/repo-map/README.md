@@ -90,20 +90,24 @@ into the already large source tree. Download a checkpoint for longer retention.
 
 ## Completed Rust checkpoint
 
-The mapping branch also verifies and reuses the completed index from run
-`37163353874`, generated at `02f33576`. It checks that every non-mapping tracked
-file is unchanged and combines the index with same-commit structural/LOC/clone
-reports. Any changed application/configuration content or incomplete checkpoint
-rejects reuse. This continuation is limited to pushes on the current mapping
-branch; future application changes need a fresh manual semantic run.
+Mapping branches (`codex/repo-map-*`) generate seven fresh static profiles for
+the current commit: the root CPU workspace, `mcp`, `mesh`, the two cTrader tools,
+CUDA features and HIP features. The aggregate report validates each profile's
+commit, workspace and name, then combines it with same-commit structural, LOC
+and clone reports. It does not depend on a historical workflow artifact.
 
-Six additional static profiles index `mcp`, `mesh`, the two cTrader tools, CUDA
-features and HIP features. These explicitly skip native build-script outputs
-and proc-macro builds, so they add source visibility without validating a GPU
-build or execution. Each profile retains its exact feature configuration,
-commit, failures and logs. The merged report states unique Rust document
-coverage across profiles and keeps missing files visible. A failed profile
-fails the continuation while retaining the available map.
+These profiles explicitly skip native build-script outputs and proc-macro
+builds. They provide source visibility; they do not validate a CPU/GPU build
+or execution. Each profile retains its exact feature configuration, commit,
+failures and logs. Missing or failed profiles fail the aggregate while retaining
+available diagnostics. The report states unique Rust document coverage and
+keeps missing files visible. The default `master` run remains structural; a
+manual semantic run can include actual build outputs when prerequisites permit.
+
+`reuse_scip.py --checkpoint ... --source-commit ...` remains available for a
+completed historical semantic index. It rejects changed application/configuration
+content, a dirty checkout or incomplete checkpoint checks. Reuse is valid only
+when all non-mapping tracked contents still match the index's source commit.
 
 The original indexer emitted duplicate-symbol warnings. Symbols defined in
 multiple documents remain ambiguous; the graph does not arbitrarily assign

@@ -9,10 +9,17 @@ import map_repo as mapper
 from run_checks import run
 from report_map import cycles
 from pack_graph import pack, restore
-from reuse_scip import check_source
+from reuse_scip import check_source, validate_profile
 
 
 class GraphEvidenceTests(unittest.TestCase):
+    def test_profile_provenance_rejects_stale_commit_wrong_workspace_or_profile(self):
+        valid = {'source_commit': 'current', 'prefix': 'mcp', 'profile': 'mcp'}
+        validate_profile(valid, 'current', 'mcp', 'mcp')
+        for field, value in [('source_commit', 'old'), ('prefix', 'mesh'), ('profile', 'cpu-static')]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate_profile({**valid, field: value}, 'current', 'mcp', 'mcp')
+
     def test_tsconfig_comments_and_trailing_commas_preserve_strings(self):
         self.assertEqual(mapper.jsonc_loads(b'{"url":"https://host/a,}",/* c */"values":[1, // c\n],}'),
                          {'url': 'https://host/a,}', 'values': [1]})

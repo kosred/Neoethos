@@ -8,6 +8,7 @@ from pathlib import Path
 from run_checks import run
 
 PROFILES = {
+    'cpu-static': ('', []),
     'mcp': ('mcp', []),
     'mesh': ('mesh', []),
     'history-probe': ('tools/ctrader-history-probe', []),

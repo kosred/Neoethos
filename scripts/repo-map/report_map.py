@@ -116,7 +116,7 @@ def report(output):
               f"{len(result['inventory_only_project_files'])} project files have inventory only.",
               'Vendor components have exact inventory/hash/line counts; their source has not been semantically analyzed.',
               f"{ambiguities} SCIP symbols have definitions in multiple documents; these are kept ambiguous rather than selecting one source.",
-              'Static reference observations may repeat across profiles. GPU profiles skip build outputs/proc macros and do not validate a GPU build.',
+              'Static reference observations may repeat across profiles. Static profiles skip build outputs/proc macros and do not validate a CPU/GPU build.',
               'Declared package cycles combine all target/dev/build conditions; they are not proof of a failing build.', '',
               '## Limits', ''] + ['- ' + limit for limit in result['limits']]
     if 'cloc_project_totals' in result:

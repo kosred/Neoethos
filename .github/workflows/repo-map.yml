@@ -202,13 +202,13 @@ jobs:
 
   static-profiles:
     name: Static Rust profile (${{ matrix.profile }})
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/codex/repo-map-20261004' }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/codex/repo-map-') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        profile: [mcp, mesh, history-probe, boundary-harness, cuda-static, hip-static]
+        profile: [cpu-static, mcp, mesh, history-probe, boundary-harness, cuda-static, hip-static]
     env:
       CARGO_BUILD_JOBS: '2'
     steps:
@@ -241,11 +241,11 @@ jobs:
 
   semantic-checkpoint:
     needs: [structure, static-profiles]
-    if: ${{ always() && needs.structure.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/codex/repo-map-20261004' }}
+    if: ${{ always() && needs.structure.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/codex/repo-map-') }}
     permissions:
       contents: read
       actions: read
-    name: Verify Rust checkpoint and complete architecture reports
+    name: Verify current Rust profiles and complete architecture reports
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -259,13 +259,6 @@ jobs:
         run: python -m pip install -r scripts/repo-map/requirements.txt
       - name: Test evidence and report handling
         run: python -m unittest discover -s scripts/repo-map -p 'test_*.py'
-      - name: Load completed configuration-specific index
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          github-token: ${{ github.token }}
-          run-id: 37163353874
-          name: repository-map-rust-02f33576b4a3359fc3e2fd2b1c857e79fad6cf3e
-          path: ${{ runner.temp }}/rust-checkpoint
       - name: Load same-commit structural reports
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -281,12 +274,9 @@ jobs:
         with:
           pattern: rust-profile-*
           path: ${{ runner.temp }}/additional-indices
-      - name: Fetch index source commit for content comparison
+      - name: Assemble same-commit profiles with explicit static coverage
         run: |
-          git fetch origin 02f33576b4a3359fc3e2fd2b1c857e79fad6cf3e --depth=1
-      - name: Reuse index only after validating unchanged source
-        run: |
-          python scripts/repo-map/reuse_scip.py --checkpoint "$RUNNER_TEMP/rust-checkpoint"             --source-commit 02f33576b4a3359fc3e2fd2b1c857e79fad6cf3e --structural "$RUNNER_TEMP/structure-reports" --additional-indices "$RUNNER_TEMP/additional-indices" --output "$RUNNER_TEMP/repository-map-rust"
+          python scripts/repo-map/reuse_scip.py --profiles-only --structural "$RUNNER_TEMP/structure-reports" --additional-indices "$RUNNER_TEMP/additional-indices" --output "$RUNNER_TEMP/repository-map-rust"
           cat "$RUNNER_TEMP/repository-map-rust/architecture.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Keep semantic coverage, architecture and viewer
         if: always()
