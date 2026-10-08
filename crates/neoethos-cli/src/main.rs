@@ -2063,7 +2063,7 @@ fn discovery_config_from_cli(
     base: &str,
     higher_timeframes: &[String],
     account_currency: &str,
-) -> neoethos_search::DiscoveryConfig {
+) -> Result<neoethos_search::DiscoveryConfig> {
     let population = parse_flag(args, "--population")
         .and_then(|value| value.parse().ok())
         .unwrap_or(defaults.population);
@@ -2086,7 +2086,7 @@ fn discovery_config_from_cli(
         .and_then(|value| value.parse().ok())
         .unwrap_or(defaults.min_trades_per_day);
 
-    neoethos_search::DiscoveryConfig {
+    let mut config = neoethos_search::DiscoveryConfig {
         timeframe_label: base.to_owned(),
         evaluation_symbol: symbol.to_owned(),
         evaluation_account_currency: account_currency.to_owned(),
@@ -2100,8 +2100,11 @@ fn discovery_config_from_cli(
         higher_timeframes: higher_timeframes.to_vec(),
         filtering: defaults.filtering.clone(),
         ..defaults.clone()
-    }
-    .apply_mode_overrides()
+    };
+    // Share the typed overrides with batch discovery. Receipt-bound research
+    // must not silently inherit population_auto after an explicit false.
+    apply_batch_discover_cli_overrides(args, &mut config)?;
+    Ok(config.apply_mode_overrides())
 }
 
 fn emit_cpu_research_stage(stage: &str) {
@@ -2242,7 +2245,7 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
             &base,
             &higher_list,
             &account_currency,
-        );
+        )?;
         // ── THE STREAMING WORKING-SET SWEEP ─────────────────────────────────
         //
         // `--stream-sweep` advances the working set through the
@@ -2503,7 +2506,7 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
                         &base,
                         &higher_list,
                         &account_currency,
-                    );
+                    )?;
                     emit_cpu_research_stage("search_pipeline_started");
                     neoethos_search::run_canonical_trendbar_research_discovery_with_holdout_and_progress(
                         &run_input,
@@ -5181,6 +5184,43 @@ mod tests {
             std::process::id(),
             nonce
         ))
+    }
+
+    #[test]
+    fn single_discovery_respects_the_explicit_population_budget() {
+        let defaults = neoethos_search::DiscoveryConfig {
+            population: 17,
+            population_auto: true,
+            ..neoethos_search::DiscoveryConfig::default()
+        };
+        let resolve = |args: &[String]| {
+            super::discovery_config_from_cli(
+                args,
+                &defaults,
+                "EURUSD",
+                "H4",
+                &["D1".to_owned()],
+                "GBP",
+            )
+        };
+        let inherited = resolve(&[]).unwrap();
+        assert!(inherited.population_auto);
+        assert_eq!(inherited.population, 17);
+        let bounded = resolve(&[
+            "--population".to_owned(),
+            "64".to_owned(),
+            "--population-auto".to_owned(),
+            "false".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(bounded.population, 64);
+        assert!(!bounded.population_auto);
+        for args in [
+            vec!["--population-auto".to_owned()],
+            vec!["--population-auto".to_owned(), "maybe".to_owned()],
+        ] {
+            assert!(resolve(&args).is_err());
+        }
     }
 
     #[test]
