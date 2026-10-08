@@ -22,6 +22,11 @@ process to manage — the desktop app links the whole engine in-process.
 | CPU host build | `./scripts/build-host.sh build --release -p neoethos-cli` | logical threads minus two; no NVIDIA variables retained on a CPU-only host |
 | NVIDIA host build | `./scripts/build-host.sh build --release -p neoethos-cli --features gpu-nvidia` | CUDA images matched to every visible card plus embedded host-build evidence |
 
+For a bounded historical experiment from exact acquisition receipts, use
+[`canonical-research`](docs/canonical-cpu-research.md). It connects CPU discovery
+and chronological holdout evidence while preserving a negative result and the
+exact input snapshots. Its research artifacts do not authorize trading.
+
 The desktop bundle is self-contained: `npx tauri build` first runs the frontend
 build (`npm run build`) and then compiles the Rust binary with the web assets
 embedded. A plain `cargo build` on `neoethos-desktop` will **not** embed the UI —

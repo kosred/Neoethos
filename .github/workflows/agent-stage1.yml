@@ -149,6 +149,21 @@ jobs:
           set -o pipefail
           cargo check -p neoethos-cli 2>&1 | tee /tmp/stage1-diagnostics/cli-check.log
 
+      - name: Test canonical research entrypoint and CLI consumers
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p neoethos-cli --bin neoethos-cli \
+            2>&1 | tee /tmp/stage1-diagnostics/cli-test.log
+
+      - name: Test training-only normalization support projection
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p neoethos-data --lib \
+            normalization_support_projection_never_looks_into_the_holdout_suffix \
+            2>&1 | tee /tmp/stage1-diagnostics/projection-test.log
+
       - name: Test canonical import boundaries
         shell: bash
         run: |

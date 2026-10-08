@@ -8,6 +8,7 @@ use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod canonical_full_run;
+mod canonical_research;
 mod gpu_bench;
 mod gpu_bench_population;
 mod gpu_bench_prepare;
@@ -51,7 +52,14 @@ fn main() -> Result<()> {
         setup_logging(false)?;
         return neoethos_search::historical_search_cli::run(&raw_args[2..]);
     }
-    let startup_settings = match neoethos_core::Settings::load() {
+    let startup_settings_result = if subcommand == "canonical-research" {
+        let source = canonical_research::settings_path(&raw_args[2..])?;
+        Ok(neoethos_core::Settings::from_yaml(&source)
+            .with_context(|| format!("load explicit research settings {}", source.display()))?)
+    } else {
+        neoethos_core::Settings::load()
+    };
+    let startup_settings = match startup_settings_result {
         Ok(s) => s,
         Err(err) => {
             let path = neoethos_core::config::user_config_path();
@@ -228,6 +236,7 @@ fn main() -> Result<()> {
         "features" => cmd_features(&args[2..]),
         "prepare" => cmd_prepare(&args[2..]),
         "canonical-cost-build" => canonical_full_run::build_cost_assumptions(tail, settings),
+        "canonical-research" => canonical_research::run(tail, settings),
         "canonical-contract-build" => canonical_full_run::build_contract(tail, settings),
         "canonical-train" => canonical_full_run::train_receipt_bound(tail, settings),
         "native-research" => native_research::run(tail),
@@ -2054,7 +2063,7 @@ fn discovery_config_from_cli(
     base: &str,
     higher_timeframes: &[String],
     account_currency: &str,
-) -> neoethos_search::DiscoveryConfig {
+) -> Result<neoethos_search::DiscoveryConfig> {
     let population = parse_flag(args, "--population")
         .and_then(|value| value.parse().ok())
         .unwrap_or(defaults.population);
@@ -2077,7 +2086,7 @@ fn discovery_config_from_cli(
         .and_then(|value| value.parse().ok())
         .unwrap_or(defaults.min_trades_per_day);
 
-    neoethos_search::DiscoveryConfig {
+    let mut config = neoethos_search::DiscoveryConfig {
         timeframe_label: base.to_owned(),
         evaluation_symbol: symbol.to_owned(),
         evaluation_account_currency: account_currency.to_owned(),
@@ -2091,8 +2100,11 @@ fn discovery_config_from_cli(
         higher_timeframes: higher_timeframes.to_vec(),
         filtering: defaults.filtering.clone(),
         ..defaults.clone()
-    }
-    .apply_mode_overrides()
+    };
+    // Share the typed overrides with batch discovery. Receipt-bound research
+    // must not silently inherit population_auto after an explicit false.
+    apply_batch_discover_cli_overrides(args, &mut config)?;
+    Ok(config.apply_mode_overrides())
 }
 
 fn emit_cpu_research_stage(stage: &str) {
@@ -2233,7 +2245,7 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
             &base,
             &higher_list,
             &account_currency,
-        );
+        )?;
         // ── THE STREAMING WORKING-SET SWEEP ─────────────────────────────────
         //
         // `--stream-sweep` advances the working set through the
@@ -2424,6 +2436,10 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
                 higher_tfs: higher_list.clone(),
                 prefix_base_features: settings_ref.system.multi_resolution_prefix_base,
                 normalization_training_rows: Some(normalization_training_rows),
+                // Sparse event outputs can have no finite training cell. Use
+                // the existing train-only projection; the options, retained
+                // names and fitted state are sealed into this batch's receipt.
+                drop_columns_without_normalization_training_support: true,
                 ..neoethos_data::FeatureBuildOptions::default()
             };
 
@@ -2490,7 +2506,7 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
                         &base,
                         &higher_list,
                         &account_currency,
-                    );
+                    )?;
                     emit_cpu_research_stage("search_pipeline_started");
                     neoethos_search::run_canonical_trendbar_research_discovery_with_holdout_and_progress(
                         &run_input,
@@ -2567,11 +2583,26 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
             }
 
             let streaming_path = format!("{out}.streaming.json");
+            let evidence_status = if completed.is_empty() {
+                "Failed"
+            } else if completed.len() < ledger.batches_seen() {
+                "Partial"
+            } else {
+                "Complete"
+            };
+            let selection_outcome = if portfolio_count == 0 {
+                "NoCandidatePortfolio"
+            } else {
+                "CandidatePortfoliosSelected"
+            };
             let streaming_index = serde_json::json!({
                 "schema": "neoethos.canonical-cpu-research-streaming-index.v1",
                 "artifact_class": "ResearchOnly",
                 "promotion_eligibility": "NotPromotionEligible",
                 "authorization_issued": false,
+                "evidence_status": evidence_status,
+                "selection_outcome": selection_outcome,
+                "streaming_space_exhausted": streamed && next_cursor >= space_len,
                 "symbol": &symbol,
                 "base_timeframe": &base,
                 "streamed": streamed,
@@ -2587,7 +2618,12 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
             });
             neoethos_core::storage::json::write_json_atomic(&streaming_path, &streaming_index)?;
 
-            println!("canonical_cpu_research_status=complete");
+            println!("canonical_cpu_research_status={evidence_status}");
+            println!("selection_outcome={selection_outcome}");
+            println!(
+                "streaming_space_exhausted={}",
+                streamed && next_cursor >= space_len
+            );
             println!("artifact_class=ResearchOnly");
             println!("promotion_eligibility=NotPromotionEligible");
             println!("authorization_issued=false");
@@ -2603,9 +2639,11 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
                 !completed.is_empty(),
                 "canonical CPU research completed no receipt-bound batch; inspect {streaming_path} for the per-cursor failure ledger"
             );
+            // A completed negative experiment is a research result. Actual
+            // failed batches still fail the invocation after saving evidence.
             anyhow::ensure!(
-                portfolio_count > 0,
-                "canonical CPU research {symbol} {base} completed the bounded sweep but selected no portfolio; every completed negative envelope and the run ledger were persisted under {out}"
+                evidence_status == "Complete",
+                "canonical CPU research completed only partial evidence; inspect {streaming_path} for failed batches"
             );
             return Ok((symbol, base, portfolio_count, candidate_count));
         }
@@ -4964,6 +5002,12 @@ fn print_help() {
         "  canonical-cost-build --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --basis-timeframe D1 --broker-symbol-contract <json> --settings-source <yaml> --out <json>"
     );
     println!(
+        "  canonical-research --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --broker-symbol-contract <json> --settings-source <yaml> --symbol EURUSD --base-timeframe H4 --out-dir <new-dir> [--higher D1] [--population 64] [--generations 16] [--max-batches 2]"
+    );
+    println!(
+        "                               One bounded CPU research run from exact acquisition receipts through D1 costs, discovery and chronological holdout evidence. Never authorizes promotion."
+    );
+    println!(
         "  canonical-contract-build --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --base-timeframe M1 --cost-assumptions <json> --broker-symbol-contract <json> --settings-source <yaml> --contract-out <json> --receipt-out <json>"
     );
     println!(
@@ -5140,6 +5184,43 @@ mod tests {
             std::process::id(),
             nonce
         ))
+    }
+
+    #[test]
+    fn single_discovery_respects_the_explicit_population_budget() {
+        let defaults = neoethos_search::DiscoveryConfig {
+            population: 17,
+            population_auto: true,
+            ..neoethos_search::DiscoveryConfig::default()
+        };
+        let resolve = |args: &[String]| {
+            super::discovery_config_from_cli(
+                args,
+                &defaults,
+                "EURUSD",
+                "H4",
+                &["D1".to_owned()],
+                "GBP",
+            )
+        };
+        let inherited = resolve(&[]).unwrap();
+        assert!(inherited.population_auto);
+        assert_eq!(inherited.population, 17);
+        let bounded = resolve(&[
+            "--population".to_owned(),
+            "64".to_owned(),
+            "--population-auto".to_owned(),
+            "false".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(bounded.population, 64);
+        assert!(!bounded.population_auto);
+        for args in [
+            vec!["--population-auto".to_owned()],
+            vec!["--population-auto".to_owned(), "maybe".to_owned()],
+        ] {
+            assert!(resolve(&args).is_err());
+        }
     }
 
     #[test]
