@@ -164,6 +164,15 @@ jobs:
             normalization_support_projection_never_looks_into_the_holdout_suffix \
             2>&1 | tee /tmp/stage1-diagnostics/projection-test.log
 
+      - name: Test raw tick archive and offline spread diagnostics
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p neoethos-broker-history --lib tick_archive \
+            2>&1 | tee /tmp/stage1-diagnostics/tick-archive-test.log
+          cargo test --locked -p neoethos-broker-history --test tick_archive_cli \
+            2>&1 | tee /tmp/stage1-diagnostics/tick-archive-cli-test.log
+
       - name: Test canonical import boundaries
         shell: bash
         run: |
