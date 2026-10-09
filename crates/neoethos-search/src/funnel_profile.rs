@@ -31,6 +31,54 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Measured row range used to evolve genes, relative to the selection window.
+/// This is diagnostic metadata, not an additional source or trading authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stage1EvaluationWindow {
+    pub selection_rows: usize,
+    pub start_row: usize,
+    pub end_row_exclusive: usize,
+    pub first_timestamp_ms: Option<i64>,
+    pub last_timestamp_ms: Option<i64>,
+}
+
+/// Internal WF is used for selection. Keep failed candidates as well as winners;
+/// the untouched final holdout and deployment artifacts remain separate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalkforwardSelectionCohort {
+    pub scope: crate::data_selection::CanonicalSearchArtifactScopeRefV1,
+    pub search_config_hash: String,
+    pub trials: Vec<WalkforwardSelectionTrial>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalkforwardSelectionTrial {
+    pub candidate_archive_index: usize,
+    pub strategy_identity: crate::validation::ValidationStrategyIdentityV2,
+    pub tested: bool,
+    pub passed: bool,
+    pub reported_splits: usize,
+    /// None explicitly records a non-finite measurement, never a zero profit.
+    pub avg_pnl: Option<f64>,
+    pub positive_folds: usize,
+    pub trading_folds: usize,
+    pub rejection_reasons: Vec<String>,
+    pub folds: Vec<WalkforwardFoldDiagnostic>,
+}
+
+/// Scalar projections only: retaining every candidate's daily-return arrays
+/// would defeat the validation wave's memory admission and release boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalkforwardFoldDiagnostic {
+    pub split: usize,
+    pub trades: usize,
+    pub pnl: Option<f64>,
+    pub daily_loss_breach: bool,
+    pub consistency_violation: bool,
+    pub trade_limit_violation: bool,
+    pub min_trading_days_ok: bool,
+}
+
 /// Compact research diagnostics for a window explicitly USED FOR SELECTION.
 /// This is not an untouched final test or a portfolio/deployment authority.
 /// The existing result carries the receipt once; each trial links to the full
@@ -193,6 +241,10 @@ pub struct FunnelProfile {
     pub candidate_census: Option<DiscoveryCandidateCensus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_calibration_cohort: Option<SelectionCalibrationCohort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walkforward_selection_cohort: Option<WalkforwardSelectionCohort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage1_evaluation_window: Option<Stage1EvaluationWindow>,
     pub symbol: String,
     pub timeframe: String,
     pub started_at: String,
@@ -233,6 +285,8 @@ impl FunnelProfile {
         Self {
             candidate_census: None,
             selection_calibration_cohort: None,
+            walkforward_selection_cohort: None,
+            stage1_evaluation_window: None,
             symbol: symbol.into(),
             timeframe: timeframe.into(),
             started_at: now_iso8601(),
