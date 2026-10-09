@@ -9,6 +9,10 @@
 
 #[path = "../../neoethos-app/src/app_services/bootstrap_writer.rs"]
 pub mod bootstrap_writer;
+#[path = "../../neoethos-app/src/app_services/broker_deal_economics.rs"]
+pub mod broker_deal_economics;
+#[path = "../../neoethos-app/src/app_services/ctrader_account.rs"]
+pub mod ctrader_account;
 #[path = "../../neoethos-app/src/app_services/ctrader_auth.rs"]
 pub mod ctrader_auth;
 #[path = "../../neoethos-app/src/app_services/ctrader_data.rs"]
@@ -33,6 +37,8 @@ pub mod secure_store;
 /// Compatibility namespace required by the shared cTrader source files while
 /// their physical move out of `neoethos-app` remains pending GREEN proof.
 pub mod app_services {
+    pub use crate::broker_deal_economics;
+    pub use crate::ctrader_account;
     pub use crate::ctrader_auth;
     pub use crate::ctrader_data;
     pub(crate) use crate::ctrader_historical_admission;
@@ -44,6 +50,7 @@ pub mod app_services {
     pub use crate::ctrader_tls;
 }
 
+pub mod account_snapshot_cli;
 pub mod broker_truth_capture;
 pub mod broker_truth_ctrader;
 mod broker_truth_vortex;

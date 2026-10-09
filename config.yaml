@@ -185,7 +185,7 @@ risk:
   preset: none
   total_drawdown_limit: 0.14
 system:
-  account_currency: GBP
+  account_currency: EUR
   device: gpu:0
   enable_gpu_preference: gpu
   higher_timeframes:

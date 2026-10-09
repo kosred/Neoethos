@@ -17,12 +17,13 @@ use neoethos_broker_history::{
 use neoethos_core::Settings;
 use neoethos_data::CanonicalTimeframe;
 
-const REQUIRED: [&str; 9] = [
+const REQUIRED: [&str; 10] = [
     "--authority-root",
     "--plan-sha256",
     "--matrix-sha256",
     "--data-root",
     "--broker-symbol-contract",
+    "--broker-account-snapshot",
     "--settings-source",
     "--symbol",
     "--base-timeframe",
@@ -123,7 +124,16 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
     let plan = CanonicalTrendbarPlanReceiptV1::from_sha256(args.value("--plan-sha256").to_owned())?;
     let matrix_receipt =
         CanonicalTrendbarMatrixReceiptV1::from_sha256(args.value("--matrix-sha256").to_owned())?;
-    store.open_plan(&plan)?;
+    let acquisition_plan = store.open_plan(&plan)?;
+    let broker_environment =
+        neoethos_broker_history::BrokerEnvironment::from_canonical(acquisition_plan.environment());
+    neoethos_broker_history::account_snapshot_cli::validate_saved_account_currency(
+        Path::new(args.value("--broker-account-snapshot")),
+        broker_environment,
+        acquisition_plan.account_id(),
+        &settings.system.account_currency,
+    )
+    .context("verify actual broker account currency before research")?;
     let matrix = store.open_matrix(data_root, &plan, &matrix_receipt)?;
     let series = ensure_unique_series(&matrix, args.value("--symbol"))?;
     let base = args
@@ -154,6 +164,21 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
     let frozen_source = output.join("settings.yaml");
     fs::write(&frozen_source, &settings_bytes).context("preserve exact research settings bytes")?;
     let frozen_settings = Settings::from_yaml(&frozen_source)?;
+    let frozen_account = output.join("broker-account");
+    neoethos_broker_history::account_snapshot_cli::freeze_account_currency_evidence(
+        Path::new(args.value("--broker-account-snapshot")),
+        &frozen_account,
+        broker_environment,
+        acquisition_plan.account_id(),
+        &frozen_settings.system.account_currency,
+    )?;
+    args.0.insert(
+        "--broker-account-snapshot".to_owned(),
+        frozen_account
+            .join("account-snapshot.json")
+            .to_string_lossy()
+            .into_owned(),
+    );
     ensure!(
         serde_json::to_value(&frozen_settings)? == serde_json::to_value(settings)?,
         "frozen settings must resolve to the same startup settings"
