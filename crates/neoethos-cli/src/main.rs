@@ -5002,7 +5002,7 @@ fn print_help() {
         "  canonical-cost-build --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --basis-timeframe D1 --broker-symbol-contract <json> --settings-source <yaml> --out <json>"
     );
     println!(
-        "  canonical-research --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --broker-symbol-contract <json> --settings-source <yaml> --symbol EURUSD --base-timeframe H4 --out-dir <new-dir> [--higher D1] [--population 64] [--generations 16] [--max-batches 2]"
+        "  canonical-research --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --broker-symbol-contract <json> --broker-account-snapshot <account-snapshot.json> --settings-source <yaml> --symbol EURUSD --base-timeframe H4 --out-dir <new-dir> [--higher D1] [--population 64] [--generations 16] [--max-batches 2]"
     );
     println!(
         "                               One bounded CPU research run from exact acquisition receipts through D1 costs, discovery and chronological holdout evidence. Never authorizes promotion."

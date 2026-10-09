@@ -183,6 +183,17 @@ jobs:
             --test canonical_trendbar_bulk_cli_contract \
             2>&1 | tee /tmp/stage1-diagnostics/bulk-cli-contract-test.log
 
+      - name: Test actual broker account evidence and currency binding
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p neoethos-broker-history --lib account_snapshot_cli \
+            2>&1 | tee /tmp/stage1-diagnostics/account-snapshot-test.log
+          cargo test --locked -p neoethos-broker-history --lib ctrader_account \
+            2>&1 | tee /tmp/stage1-diagnostics/account-parser-test.log
+          cargo check --locked -p neoethos-broker-history --bin neoethos-broker-account-snapshot \
+            2>&1 | tee /tmp/stage1-diagnostics/account-snapshot-check.log
+
       - name: Test canonical import boundaries
         shell: bash
         run: |

@@ -5,6 +5,12 @@ symbol snapshot, D1 screening-cost builder, streaming discovery and chronologica
 holdout evaluation in one invocation. It uses the explicitly supplied settings
 file for startup, CPU admission, runtime overrides and discovery.
 
+This command always constructs screening cost assumptions. It does not use the
+existing quote-replay/execution-economics consumer or the desktop's actual deal
+money. A negative screening run is not a verdict on the broker-cost pipeline.
+Use [the account evidence entrypoint](broker-account-evidence.md) to inspect the
+actual account currency, broker PnL and reported commission/swap components.
+
 ```powershell
 cargo build --locked -p neoethos-cli
 & ./target/debug/neoethos-cli.exe canonical-research `
@@ -13,6 +19,7 @@ cargo build --locked -p neoethos-cli
   --plan-sha256 <acquisition-plan-sha256> `
   --matrix-sha256 <acquisition-matrix-sha256> `
   --broker-symbol-contract C:/path/to/bsc1-snapshot.json `
+  --broker-account-snapshot C:/path/to/account/account-snapshot.json `
   --settings-source C:/path/to/config.yaml `
   --symbol EURUSD --base-timeframe H4 --higher D1 `
   --out-dir C:/path/to/new-research-run
@@ -73,6 +80,12 @@ column. The retained schema, projection option and fitted state are bound into
 each batch's content receipt. Raw indicator values and strict GPU recipes retain
 their existing semantics. A discovery failure also preserves its full
 error chain in `failure.json` beside the original run inputs.
+
+The account snapshot and all five broker responses are hash-checked, checked
+against the exact acquisition account, and frozen beside the run. Configured
+account currency must match the observed deposit currency; mismatches are
+refused before creating outputs or building features. This check proves the
+observed account currency, not historical commission or swap policy.
 
 All outputs remain `ResearchOnly` / `NotPromotionEligible`. Candidate selection
 and completing an exploratory budget do not demonstrate net profitability or
