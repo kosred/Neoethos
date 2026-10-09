@@ -37,6 +37,8 @@ const MAX_PAGES: u64 = 250_000;
 const SCHEMA: &str = "neoethos.unreviewed-ctrader-tick-archive.v1";
 const PAGE_BOUNDARY_POLICY: &str = "defer-oldest-millisecond-and-overlap-next-page-v1";
 
+pub mod inspect;
+
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Environment {
@@ -244,19 +246,14 @@ impl TickArchiveSummary {
         // If the broker includes that boundary, it belongs to the following
         // interval (or preceding pagination page), not twice in the counts.
         for tick in &page.ticks {
-            if tick.timestamp_ms == cursor.page_to_ms_exclusive {
+            if tick_ownership(cursor, page, tick) == TickOwnership::UpperBoundary {
                 self.excluded_upper_boundary_ticks += 1;
                 continue;
             }
             // A capped page may cut THROUGH a group of ticks with the same
             // millisecond. Count none of its oldest group yet. The next
             // request ends at oldest+1ms and retrieves that group in full.
-            if page.has_more
-                && page
-                    .ticks
-                    .first()
-                    .is_some_and(|t| t.timestamp_ms == tick.timestamp_ms)
-            {
+            if tick_ownership(cursor, page, tick) == TickOwnership::DeferredOldest {
                 self.deferred_oldest_boundary_ticks += 1;
                 continue;
             }
@@ -278,6 +275,34 @@ impl TickArchiveSummary {
         self.all_requested_windows_visited = next.is_none();
         self.next = next;
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TickOwnership {
+    Retained,
+    UpperBoundary,
+    DeferredOldest,
+}
+
+// Both acquisition totals and offline diagnostics must use the same ownership
+// rule. A capped page's oldest millisecond is owned by its overlapping successor.
+fn tick_ownership(
+    cursor: &Cursor,
+    page: &HistoricalTicksResult,
+    tick: &crate::ctrader_data::HistoricalTick,
+) -> TickOwnership {
+    if tick.timestamp_ms == cursor.page_to_ms_exclusive {
+        TickOwnership::UpperBoundary
+    } else if page.has_more
+        && page
+            .ticks
+            .first()
+            .is_some_and(|first| first.timestamp_ms == tick.timestamp_ms)
+    {
+        TickOwnership::DeferredOldest
+    } else {
+        TickOwnership::Retained
     }
 }
 

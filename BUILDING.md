@@ -27,6 +27,10 @@ For a bounded historical experiment from exact acquisition receipts, use
 and chronological holdout evidence while preserving a negative result and the
 exact input snapshots. Its research artifacts do not authorize trading.
 
+For read-only integrity checks and bounded spread measurements over downloaded
+Bid/Ask pages, use [`neoethos-tick-inspect`](docs/offline-tick-diagnostics.md).
+It verifies the complete archive offline and reports quote ambiguity and gaps.
+
 The desktop bundle is self-contained: `npx tauri build` first runs the frontend
 build (`npm run build`) and then compiles the Rust binary with the web assets
 embedded. A plain `cargo build` on `neoethos-desktop` will **not** embed the UI —
