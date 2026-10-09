@@ -30,6 +30,8 @@ exact input snapshots. Its research artifacts do not authorize trading.
 For read-only integrity checks and bounded spread measurements over downloaded
 Bid/Ask pages, use [`neoethos-tick-inspect`](docs/offline-tick-diagnostics.md).
 It verifies the complete archive offline and reports quote ambiguity and gaps.
+Acquisition can also be [scoped to explicit direct timeframes](docs/scoped-canonical-acquisition.md)
+so a bounded experiment downloads only its required cohort.
 
 The desktop bundle is self-contained: `npx tauri build` first runs the frontend
 build (`npm run build`) and then compiles the Rust binary with the web assets

@@ -56,7 +56,7 @@ fn parse_checkpoint_sha256(value: &str) -> std::result::Result<String, String> {
 #[derive(Debug, Parser)]
 #[command(
     name = "neoethos-canonical-trendbar-bulk",
-    about = "Capture one exact account/symbol matrix in every direct canonical cTrader timeframe"
+    about = "Capture one exact account/symbol matrix in direct canonical cTrader timeframes"
 )]
 pub struct CanonicalTrendbarBulkCli {
     #[arg(long, value_enum)]
@@ -65,6 +65,9 @@ pub struct CanonicalTrendbarBulkCli {
     account_id: i64,
     #[arg(long, required = true)]
     symbol: Vec<String>,
+    /// Repeat for each direct timeframe needed. Omission captures all fourteen.
+    #[arg(long)]
+    timeframe: Vec<CanonicalTimeframe>,
     #[arg(long)]
     to_ms_exclusive: i64,
     #[arg(long)]
@@ -100,6 +103,11 @@ impl CanonicalTrendbarBulkCli {
             .map(parse_symbol_binding)
             .collect::<Result<Vec<_>>>()?;
         let environment = self.environment.broker();
+        let timeframes = if self.timeframe.is_empty() {
+            CanonicalTimeframe::ALL.to_vec()
+        } else {
+            self.timeframe
+        };
         let plan = CanonicalTrendbarAcquisitionPlanV1::new(
             self.environment.canonical(),
             environment.endpoint_host(),
@@ -107,7 +115,7 @@ impl CanonicalTrendbarBulkCli {
             CANONICAL_TRENDBAR_SERIES_FROM_MS_V1,
             self.to_ms_exclusive,
             symbols,
-            CanonicalTimeframe::ALL.to_vec(),
+            timeframes,
         )?;
         let store = CanonicalTrendbarAcquisitionStoreV1::new(&self.authority_root);
         let plan_receipt = store.publish_plan(&plan)?;
@@ -312,6 +320,78 @@ mod tests {
     use anyhow::anyhow;
     use std::cell::{Cell, RefCell};
     use std::time::Duration;
+
+    fn scoped_cli(root: &Path) -> Vec<String> {
+        vec![
+            "neoethos-canonical-trendbar-bulk".into(),
+            "--environment".into(),
+            "demo".into(),
+            "--account-id".into(),
+            "42".into(),
+            "--symbol".into(),
+            "1=EURUSD".into(),
+            "--symbol".into(),
+            "2=GBPUSD".into(),
+            "--to-ms-exclusive".into(),
+            "1788464100000".into(),
+            "--data-root".into(),
+            root.join("data").to_string_lossy().into_owned(),
+            "--authority-root".into(),
+            root.join("authority").to_string_lossy().into_owned(),
+        ]
+    }
+
+    #[test]
+    fn explicit_direct_timeframes_prepare_only_the_requested_account_cohort() {
+        let root = tempfile::tempdir().unwrap();
+        let mut args = scoped_cli(root.path());
+        args.extend([
+            "--timeframe".into(),
+            "D1".into(),
+            "--timeframe".into(),
+            "H4".into(),
+        ]);
+        let prepared = CanonicalTrendbarBulkCli::try_parse_from(args)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_eq!(
+            prepared.plan().timeframes(),
+            &[CanonicalTimeframe::H4, CanonicalTimeframe::D1]
+        );
+        assert_eq!(prepared.plan().cell_count(), 4);
+        assert_eq!(prepared.plan().account_id(), 42);
+        assert!(
+            !root.path().join("data").exists(),
+            "preflight must not capture data"
+        );
+    }
+
+    #[test]
+    fn omitted_timeframes_preserve_all_fourteen_and_invalid_scope_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let prepared = CanonicalTrendbarBulkCli::try_parse_from(scoped_cli(root.path()))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert_eq!(prepared.plan().timeframes(), CanonicalTimeframe::ALL);
+        assert_eq!(prepared.plan().cell_count(), 28);
+        for timeframes in [["H4", "H4"], ["M7", "D1"]] {
+            let invalid_root = tempfile::tempdir().unwrap();
+            let mut args = scoped_cli(invalid_root.path());
+            for timeframe in timeframes {
+                args.extend(["--timeframe".into(), timeframe.into()]);
+            }
+            let result = CanonicalTrendbarBulkCli::try_parse_from(args)
+                .map_err(anyhow::Error::new)
+                .and_then(CanonicalTrendbarBulkCli::prepare);
+            assert!(
+                result.is_err(),
+                "duplicate or noncanonical scope was accepted"
+            );
+            assert!(!invalid_root.path().join("data").exists());
+        }
+    }
 
     fn checkpoint(byte: char) -> CanonicalTrendbarCheckpointReceiptV1 {
         CanonicalTrendbarCheckpointReceiptV1::from_sha256(byte.to_string().repeat(64))

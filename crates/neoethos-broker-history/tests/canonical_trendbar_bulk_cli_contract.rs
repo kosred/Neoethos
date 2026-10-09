@@ -87,7 +87,7 @@ fn cutoff_environment_account_symbols_and_roots_are_all_required() {
 }
 
 #[test]
-fn resampling_tick_current_and_partial_timeframe_flags_do_not_exist() {
+fn resampling_tick_current_and_noncanonical_timeframe_inputs_are_refused() {
     let data = tempfile::tempdir().expect("data root");
     let authority = tempfile::tempdir().expect("authority root");
     let base = required_args(
@@ -98,7 +98,7 @@ fn resampling_tick_current_and_partial_timeframe_flags_do_not_exist() {
         ["--resample-from", "M1"],
         ["--ticks", "true"],
         ["--use-current", "true"],
-        ["--timeframe", "H1"],
+        ["--timeframe", "M7"],
         ["--from-ms", "1451606400000"],
     ] {
         let mut args = base.clone();
