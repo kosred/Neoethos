@@ -241,6 +241,8 @@ fn financial_report(
     // The desktop's legacy Vec view drops hasMore. Keep the existing bundle
     // parser's completeness result in this evidence artifact instead.
     let deals = parse_deal_list_bundle_response(&recorded.responses[4])?;
+    let deal_response: Value = serde_json::from_str(&recorded.responses[4])?;
+    let has_more = deal_response["payload"]["hasMore"].as_bool();
     ensure!(
         deals.account_id == snapshot.trader.account_id && deals.deals == snapshot.recent_deals,
         "deal evidence differs from the validated account snapshot"
@@ -293,8 +295,8 @@ fn financial_report(
         "pending_orders": snapshot.reconcile.pending_orders.len(),
         "unrealized_pnl_by_position": pnl,
         "recent_deal_request": recorded.deal_request,
-        "recent_deals_has_more": deals.has_more,
-        "recent_deals_complete_for_requested_window": !deals.has_more,
+        "recent_deals_has_more": has_more,
+        "recent_deals_complete_for_requested_window": has_more == Some(false),
         "recent_deals": rows,
     }))
 }
@@ -477,6 +479,11 @@ mod tests {
         assert_eq!(report["balance"], 12.34);
         assert_eq!(report["recent_deals_has_more"], true);
         assert_eq!(report["recent_deals_complete_for_requested_window"], false);
+        recorded.responses[4] =
+            json!({"payloadType":2134,"payload":{"ctidTraderAccountId":91,"deal":[]}}).to_string();
+        let omitted = financial_report(&snapshot, &recorded).unwrap();
+        assert!(omitted["recent_deals_has_more"].is_null());
+        assert_eq!(omitted["recent_deals_complete_for_requested_window"], false);
         recorded.responses[4] = json!({"payloadType": 2134, "payload": {"ctidTraderAccountId":92,"deal":[],"hasMore":false}}).to_string();
         assert!(financial_report(&snapshot, &recorded).is_err());
     }

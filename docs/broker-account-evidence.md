@@ -27,7 +27,8 @@ net PnL. Equity is balance plus the broker's net unrealized PnL.
 
 The existing runtime request covers the latest 24 hours with at most 100 deals.
 The snapshot retains that request and `hasMore`; a truncated page is never
-reported as complete. Even a complete page proves only its requested window,
+reported as complete. An omitted `hasMore` remains null and cannot prove
+completeness. Even a complete page proves only its requested window,
 not all account history. No deals in that window does not mean zero costs.
 
 Capture a current full-symbol commission/swap contract separately using the
