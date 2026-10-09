@@ -239,9 +239,7 @@ impl ResidentGenerationZeroRuntimeSnapshotV1 {
         &self.smc_search
     }
 
-    pub(crate) const fn gene_stop_bounds(
-        &self,
-    ) -> &super::evolution_math::ResolvedGeneStopBounds {
+    pub(crate) const fn gene_stop_bounds(&self) -> &super::evolution_math::ResolvedGeneStopBounds {
         &self.gene_stop_bounds
     }
 
@@ -3447,6 +3445,94 @@ pub(crate) fn finish_evaluated_generation(
     }
 }
 
+/// Archive observations were scored under several annealed SMC gates. They
+/// cannot share one final policy while retaining those earlier measurements:
+/// stale profits otherwise control the validation cap before any replay.
+/// Reprice the complete union through the SAME exact generation evaluator,
+/// using population-sized waves already admitted by the search policy.
+#[allow(clippy::too_many_arguments)]
+fn finish_with_final_gate_metrics<E>(
+    archive: Vec<(Gene, [f64; 11], usize)>,
+    scored: Vec<(f64, usize, Gene, [f64; 11])>,
+    config: &EvaluationConfig,
+    evaluation_span_days: f64,
+    population: usize,
+    evaluation_slots: u64,
+    evaluate: &mut E,
+    cancel_requested: &mut impl FnMut() -> bool,
+) -> Result<SearchResult>
+where
+    E: FnMut(&[Gene], &EvaluationConfig) -> Result<Vec<[f64; 11]>>,
+{
+    anyhow::ensure!(
+        population > 0,
+        "final-gate replay requires an admitted population"
+    );
+    if cancel_requested() {
+        bail!("__DISCOVERY_CANCELLED__: cancelled before final-gate archive replay");
+    }
+    let needs_replay = !archive.is_empty();
+    let mut result =
+        finish_evaluated_generation(archive, scored, config.smc_gate_threshold, evaluation_slots);
+    // With no archive the complete last population already has this policy.
+    if !needs_replay {
+        return Ok(result);
+    }
+    let started = Instant::now();
+    let mut replayed = 0usize;
+    for (genes, metrics) in result
+        .genes
+        .chunks_mut(population)
+        .zip(result.metrics.chunks_mut(population))
+    {
+        if cancel_requested() {
+            bail!("__DISCOVERY_CANCELLED__: cancelled during final-gate archive replay");
+        }
+        let measured = evaluate(genes, config)?;
+        anyhow::ensure!(
+            measured.len() == genes.len(),
+            "final-gate evaluator returned {} metric rows for {} candidates",
+            measured.len(),
+            genes.len()
+        );
+        apply_metrics(genes, &measured, config, evaluation_span_days);
+        metrics.copy_from_slice(&measured);
+        replayed = replayed
+            .checked_add(genes.len())
+            .ok_or_else(|| anyhow!("final-gate replay count overflow"))?;
+    }
+    if cancel_requested() {
+        bail!("__DISCOVERY_CANCELLED__: cancelled after final-gate archive replay");
+    }
+    let total_evaluation_slots = evaluation_slots
+        .checked_add(u64::try_from(replayed)?)
+        .ok_or_else(|| anyhow!("final-gate total evaluation count overflow"))?;
+    let mut aligned = result
+        .genes
+        .into_iter()
+        .zip(result.metrics)
+        .collect::<Vec<_>>();
+    aligned.sort_by(|a, b| {
+        let finite = |net: f64| {
+            if net.is_finite() {
+                if net == 0.0 { 0.0 } else { net }
+            } else {
+                f64::NEG_INFINITY
+            }
+        };
+        finite(b.1[0]).total_cmp(&finite(a.1[0]))
+    });
+    (result.genes, result.metrics) = aligned.into_iter().unzip();
+    tracing::info!(target: "neoethos_search::funnel",
+        smc_gate_threshold = config.smc_gate_threshold,
+        final_gate_replayed_candidates = replayed,
+        generation_evaluation_slots = evaluation_slots,
+        total_evaluation_slots,
+        elapsed_ms = started.elapsed().as_millis(),
+        "GA archive and last population now carry measurements from one final execution policy");
+    Ok(result)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evolve_search_with_generation_evaluator_v1<F, E>(
     feature_names: &[String],
@@ -4026,34 +4112,46 @@ where
                  floor); advancing to the next."
             );
             seen_memory.flush();
-            return Ok(finish_evaluated_generation(
+            return finish_with_final_gate_metrics(
                 profitable_archive.into_observations(),
                 scored,
-                eval_cfg.smc_gate_threshold,
+                &eval_cfg,
+                evaluation_span_days,
+                population,
                 evaluation_slots,
-            ));
+                &mut evaluate_generation,
+                &mut cancel_requested,
+            );
         }
 
         if let Some(max_runtime) = max_runtime
             && started_at.elapsed() >= max_runtime
         {
             seen_memory.flush();
-            return Ok(finish_evaluated_generation(
+            return finish_with_final_gate_metrics(
                 profitable_archive.into_observations(),
                 scored,
-                eval_cfg.smc_gate_threshold,
+                &eval_cfg,
+                evaluation_span_days,
+                population,
                 evaluation_slots,
-            ));
+                &mut evaluate_generation,
+                &mut cancel_requested,
+            );
         }
 
         if generation + 1 == generations {
             seen_memory.flush();
-            return Ok(finish_evaluated_generation(
+            return finish_with_final_gate_metrics(
                 profitable_archive.into_observations(),
                 scored,
-                eval_cfg.smc_gate_threshold,
+                &eval_cfg,
+                evaluation_span_days,
+                population,
                 evaluation_slots,
-            ));
+                &mut evaluate_generation,
+                &mut cancel_requested,
+            );
         }
 
         // Reuse the seeded RNG built at the top of `evolve_search_with_progress_impl`
@@ -5199,6 +5297,182 @@ mod evaluated_generation_handoff_tests {
         metrics[5] = 1.2;
         metrics[8] = 10.0;
         (net, index, gene, metrics)
+    }
+
+    #[test]
+    fn archived_gate_profits_are_replayed_before_ranking_at_every_wave_width() -> Result<()> {
+        let first = candidate(0, 1_000.0);
+        let second = candidate(1, 900.0);
+        let last = candidate(2, 10.0);
+        let config = EvaluationConfig {
+            smc_gate_threshold: 0.35,
+            growth_objective: true,
+            growth_goal: Some(crate::scoring::RiskyGrowthGoal {
+                start_balance: 100.0,
+                target_balance: 50_000.0,
+                horizon_days: 180.0,
+            }),
+            initial_equity: 10_000.0,
+            ..EvaluationConfig::default()
+        };
+        for width in [1, 2, 10] {
+            let mut observed = Vec::new();
+            let result = finish_with_final_gate_metrics(
+                vec![
+                    (first.2.clone(), first.3, 0),
+                    (second.2.clone(), second.3, 1),
+                ],
+                vec![last.clone()],
+                &config,
+                3_000.0,
+                width,
+                256,
+                &mut |genes: &[Gene], actual: &EvaluationConfig| {
+                    assert_eq!(actual.smc_gate_threshold, 0.35);
+                    assert!(genes.len() <= width);
+                    observed.extend(genes.iter().map(|g| g.indices[0]));
+                    Ok(genes
+                        .iter()
+                        .map(|g| {
+                            let mut measured =
+                                candidate(g.indices[0], [-100.0, 1.0, 25.0][g.indices[0]]).3;
+                            measured[6] = measured[0] / measured[8];
+                            measured
+                        })
+                        .collect())
+                },
+                &mut || false,
+            )?;
+            observed.sort_unstable();
+            assert_eq!(observed, [0, 1, 2]);
+            assert_eq!(result.effective_smc_gate_threshold, 0.35);
+            assert_eq!(
+                result
+                    .genes
+                    .iter()
+                    .map(|g| g.indices[0])
+                    .collect::<Vec<_>>(),
+                [2, 1, 0]
+            );
+            assert_eq!(
+                result.metrics.iter().map(|m| m[0]).collect::<Vec<_>>(),
+                [25.0, 1.0, -100.0]
+            );
+            for (gene, measured) in result.genes.iter().zip(&result.metrics) {
+                assert_eq!(gene.trades_count, 10);
+                assert_eq!(gene.expectancy, measured[0] / 10.0);
+                assert_eq!(
+                    gene.fitness,
+                    crate::scoring::ga_fitness_goal(
+                        measured,
+                        10_000.0,
+                        3_000.0,
+                        config.growth_goal.unwrap()
+                    )
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn real_generation_loop_hands_off_one_final_gate_for_the_whole_archive() -> Result<()> {
+        let names = vec!["feature_0".to_string(), "feature_1".to_string()];
+        let policy = ExactSearchSizingPolicyV1::new(false, 2)?;
+        let mut evaluations = Vec::new();
+        let result = evolve_search_with_generation_evaluator_v1(
+            &names,
+            30.0,
+            12,
+            3,
+            2,
+            None,
+            Some(EvaluationConfig::default()),
+            &policy,
+            |genes, config| {
+                evaluations.push((genes.len(), config.smc_gate_threshold));
+                let mut measured = candidate(0, config.smc_gate_threshold * 100.0).3;
+                measured[6] = measured[0] / measured[8];
+                Ok(vec![measured; genes.len()])
+            },
+            |_, _, _, _, _| {},
+            || false,
+        )?;
+        assert!(evaluations.len() > 3, "archive must actually be replayed");
+        assert!(evaluations.iter().all(|(width, _)| *width <= 12));
+        assert!(
+            evaluations[..3]
+                .iter()
+                .any(|(_, gate)| *gate != result.effective_smc_gate_threshold)
+        );
+        assert!(
+            evaluations[3..]
+                .iter()
+                .all(|(_, gate)| *gate == result.effective_smc_gate_threshold)
+        );
+        for (gene, measured) in result.genes.iter().zip(&result.metrics) {
+            assert_eq!(measured[0], result.effective_smc_gate_threshold * 100.0);
+            assert_eq!(gene.expectancy, measured[6]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn final_gate_replay_refusals_never_return_stale_or_partial_metrics() {
+        let archive = candidate(0, 1_000.0);
+        let config = EvaluationConfig {
+            smc_gate_threshold: 0.35,
+            ..EvaluationConfig::default()
+        };
+        let inputs = || vec![(archive.2.clone(), archive.3, 0)];
+        let malformed = finish_with_final_gate_metrics(
+            inputs(),
+            Vec::new(),
+            &config,
+            1.0,
+            1,
+            1,
+            &mut |_, _| Ok(Vec::new()),
+            &mut || false,
+        )
+        .unwrap_err();
+        assert!(
+            malformed
+                .to_string()
+                .contains("metric rows for 1 candidates")
+        );
+        let cancelled = Cell::new(false);
+        let interrupted = finish_with_final_gate_metrics(
+            inputs(),
+            Vec::new(),
+            &config,
+            1.0,
+            1,
+            1,
+            &mut |genes, _| {
+                cancelled.set(true);
+                Ok(vec![archive.3; genes.len()])
+            },
+            &mut || cancelled.get(),
+        )
+        .unwrap_err();
+        assert!(
+            interrupted
+                .to_string()
+                .starts_with("__DISCOVERY_CANCELLED__")
+        );
+        let refused = finish_with_final_gate_metrics(
+            inputs(),
+            Vec::new(),
+            &config,
+            1.0,
+            1,
+            1,
+            &mut |_, _| bail!("exact evaluator admission refused"),
+            &mut || false,
+        )
+        .unwrap_err();
+        assert_eq!(refused.to_string(), "exact evaluator admission refused");
     }
 
     #[test]
