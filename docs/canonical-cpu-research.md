@@ -48,6 +48,13 @@ settings file. This changes the search objective's history, not the reserved
 calibration or final holdout. Record every experiment; choosing a profile from
 its results is further selection, not independent validation.
 
+The GA anneals its SMC threshold while evolving. Before finalist ranking, every
+archived candidate and the complete last population are measured again at the
+actual final threshold. Replay uses the same exact evaluator in waves no larger
+than the admitted population; cancellation or a refused/incomplete evaluation
+fails the handoff. Old profits measured at earlier thresholds cannot select the
+validation cohort. This does not relax quality or walk-forward requirements.
+
 `funnel_profile.walkforward_selection_cohort` retains all completed internal WF
 trials, including rejected candidates. Each links to the exact genome and its
 index in `discovery_result.candidates`, selection scope and search config hash.
