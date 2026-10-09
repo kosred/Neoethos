@@ -40,6 +40,25 @@ space was exhausted. A completed experiment with no candidate portfolio exits
 successfully. Missing or failed batch evidence still returns an error after
 preserving available evidence.
 
+Inspect `discovery_result.funnel_profile.stage1_evaluation_window` to see the
+actual row range on which the GA evolved genes. The default fast screen scores
+the earliest 25% of the selection window. To evolve against all selection rows,
+set `models.discovery_runtime.funnel_stage1_pct: 1.0` in the explicit research
+settings file. This changes the search objective's history, not the reserved
+calibration or final holdout. Record every experiment; choosing a profile from
+its results is further selection, not independent validation.
+
+`funnel_profile.walkforward_selection_cohort` retains all completed internal WF
+trials, including rejected candidates. Each links to the exact genome and its
+index in `discovery_result.candidates`, selection scope and search config hash.
+The compact fold records contain actual executed trade counts, PnL and risk
+breaches; return arrays are released with each validation wave. Rejection reasons
+distinguish nonpositive average PnL, fewer than 60% positive folds in Risky mode,
+prop-firm rule failures and invalid/incomplete fold measurements. A zero-trade
+fold remains part of the existing positive-fold denominator. Multiple reasons
+can apply to one candidate. Older profiles omit these diagnostics rather than
+inventing measurements. These selection diagnostics are not deployment artifacts.
+
 CPU research uses the existing normalization projection to exclude columns with
 no valid cell in the in-sample normalization interval. Both base and aligned
 higher-timeframe columns use that same interval. Holdout values cannot rescue a
@@ -61,4 +80,4 @@ continues through the existing sealed `native-research` route. No broker request
 order, model installation or promotion is performed by this command.
 
 Method references: [cTrader historical data](https://help.ctrader.com/open-api/symbol-data/)
-and [the probability of backtest overfitting](https://www.davidhbailey.com/dhbpapers/overfitting.pdf).
+and [Statistical Overfitting and Backtest Performance](https://www.davidhbailey.com/dhbpapers/overfitting.pdf).

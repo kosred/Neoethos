@@ -4265,8 +4265,25 @@ fn embargo_bars_from_timestamps(timestamps: &[i64], embargo_minutes: usize) -> u
 }
 
 fn walkforward_summary_passed(summary: &WalkforwardSummary, mode: DiscoveryMode) -> bool {
-    if summary.walk_forward_splits == 0 {
-        return false;
+    walkforward_rejection_reasons(summary, mode).is_empty()
+}
+
+fn walkforward_rejection_reasons(
+    summary: &WalkforwardSummary,
+    mode: DiscoveryMode,
+) -> Vec<&'static str> {
+    if summary.walk_forward_splits == 0 || summary.splits.is_empty() {
+        return vec!["no_walkforward_folds"];
+    }
+    if summary.walk_forward_splits != summary.splits.len() {
+        return vec!["walkforward_split_count_mismatch"];
+    }
+    if !summary.avg_pnl.is_finite() || summary.splits.iter().any(|s| !s.pnl.is_finite()) {
+        return vec!["nonfinite_walkforward_pnl"];
+    }
+    let mut reasons = Vec::new();
+    if summary.avg_pnl <= 0.0 {
+        reasons.push("nonpositive_average_pnl");
     }
     if matches!(mode, DiscoveryMode::Risky) {
         // Risky = fast capital multiplication, drawdown-agnostic. The prop-firm
@@ -4283,14 +4300,25 @@ fn walkforward_summary_passed(summary: &WalkforwardSummary, mode: DiscoveryMode)
         } else {
             positive_folds as f64 / summary.splits.len() as f64
         };
-        return summary.avg_pnl > 0.0 && positive_frac >= 0.60;
+        if positive_frac < 0.60 {
+            reasons.push("positive_fold_fraction_below_60_percent");
+        }
+        return reasons;
     }
     // PropFirm / Strict: demand full prop-firm robustness across EVERY window.
-    summary.avg_pnl > 0.0
-        && !summary.any_daily_loss_breach
-        && !summary.any_consistency_violation
-        && !summary.any_trade_limit_violation
-        && summary.all_min_trading_days_ok
+    if summary.any_daily_loss_breach {
+        reasons.push("daily_loss_breach");
+    }
+    if summary.any_consistency_violation {
+        reasons.push("consistency_violation");
+    }
+    if summary.any_trade_limit_violation {
+        reasons.push("trade_limit_violation");
+    }
+    if !summary.all_min_trading_days_ok {
+        reasons.push("minimum_trading_days_failed");
+    }
+    reasons
 }
 
 fn evaluate_cpcv_gate(
@@ -5053,6 +5081,43 @@ impl WalkforwardVerdict {
     }
 }
 
+fn walkforward_selection_trial(
+    candidate_archive_index: usize,
+    gene: &Gene,
+    summary: &WalkforwardSummary,
+    mode: DiscoveryMode,
+) -> Result<crate::funnel_profile::WalkforwardSelectionTrial> {
+    use crate::funnel_profile::{WalkforwardFoldDiagnostic, WalkforwardSelectionTrial};
+    let verdict = WalkforwardVerdict::from_summary(summary, mode);
+    Ok(WalkforwardSelectionTrial {
+        candidate_archive_index,
+        strategy_identity: ValidationStrategyIdentityV2::from_gene(gene)?,
+        tested: verdict.tested,
+        passed: verdict.passed,
+        reported_splits: summary.walk_forward_splits,
+        avg_pnl: summary.avg_pnl.is_finite().then_some(summary.avg_pnl),
+        positive_folds: summary.splits.iter().filter(|s| s.pnl > 0.0).count(),
+        trading_folds: summary.splits.iter().filter(|s| s.trades > 0).count(),
+        rejection_reasons: walkforward_rejection_reasons(summary, mode)
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        folds: summary
+            .splits
+            .iter()
+            .map(|s| WalkforwardFoldDiagnostic {
+                split: s.split,
+                trades: s.trades,
+                pnl: s.pnl.is_finite().then_some(s.pnl),
+                daily_loss_breach: s.daily_loss_breach,
+                consistency_violation: s.consistency_violation,
+                trade_limit_violation: s.trade_limit_violation,
+                min_trading_days_ok: s.min_trading_days_ok,
+            })
+            .collect(),
+    })
+}
+
 fn discovery_walkforward_verdicts<F>(
     portfolio: &[Gene],
     features: &FeatureFrame,
@@ -5063,7 +5128,7 @@ fn discovery_walkforward_verdicts<F>(
     mut completed_batch: F,
 ) -> Result<Vec<WalkforwardVerdict>>
 where
-    F: FnMut(&[WalkforwardVerdict]),
+    F: FnMut(std::ops::Range<usize>, &[WalkforwardSummary], &[WalkforwardVerdict]) -> Result<()>,
 {
     let mut verdicts = Vec::with_capacity(portfolio.len());
     discovery_walkforward_batches(
@@ -5074,12 +5139,12 @@ where
         config,
         effective_smc_gate_threshold,
         population_execution_run,
-        |_, summaries| {
+        |range, summaries| {
             let batch = summaries
-                .into_iter()
-                .map(|summary| WalkforwardVerdict::from_summary(&summary, config.mode))
+                .iter()
+                .map(|summary| WalkforwardVerdict::from_summary(summary, config.mode))
                 .collect::<Vec<_>>();
-            completed_batch(&batch);
+            completed_batch(range, &summaries, &batch)?;
             verdicts.extend(batch);
             Ok(())
         },
@@ -5515,6 +5580,85 @@ mod walkforward_wave_tests {
                 passed: false
             }
         );
+    }
+
+    #[test]
+    fn walkforward_diagnostics_preserve_failed_folds_without_return_tapes() -> Result<()> {
+        let gene = Gene {
+            strategy_id: "failed-wf-candidate".to_owned(),
+            ..Gene::default()
+        };
+        let mut sparse = summary(&[50.0, 0.0, 0.0, -10.0, 0.0], false);
+        for split in &mut sparse.splits {
+            if split.pnl == 0.0 {
+                split.trades = 0;
+            }
+        }
+        let trial = walkforward_selection_trial(7, &gene, &sparse, DiscoveryMode::Risky)?;
+        assert!(trial.tested);
+        assert!(!trial.passed);
+        assert_eq!(trial.avg_pnl, Some(8.0));
+        assert_eq!(trial.positive_folds, 1);
+        assert_eq!(trial.trading_folds, 2);
+        assert_eq!(trial.folds.iter().map(|s| s.trades).sum::<usize>(), 4);
+        assert_eq!(
+            trial.rejection_reasons,
+            ["positive_fold_fraction_below_60_percent"]
+        );
+        let wire = serde_json::to_string(&trial)?;
+        assert!(!wire.contains("daily_returns"));
+        let restored: crate::funnel_profile::WalkforwardSelectionTrial =
+            serde_json::from_str(&wire)?;
+        assert_eq!(restored.candidate_archive_index, 7);
+        restored.strategy_identity.validate_against(&gene)?;
+        assert_eq!(restored.folds.len(), 5);
+        assert_eq!(restored.folds[3].pnl, Some(-10.0));
+        let changed = Gene {
+            long_threshold: gene.long_threshold + 0.1,
+            ..gene
+        };
+        assert!(
+            restored
+                .strategy_identity
+                .validate_against(&changed)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn walkforward_rejects_invalid_profit_and_incomplete_fold_payloads() -> Result<()> {
+        let gene = Gene {
+            strategy_id: "invalid-wf".to_owned(),
+            ..Gene::default()
+        };
+        let mut invalid = summary(&[10.0, 10.0, 10.0, 10.0, f64::NAN], false);
+        invalid.avg_pnl = 10.0;
+        // Four positive folds and a positive average previously admitted this
+        // malformed result despite the fifth fold having no finite PnL.
+        for mode in [
+            DiscoveryMode::Risky,
+            DiscoveryMode::PropFirm,
+            DiscoveryMode::Strict,
+        ] {
+            assert!(!walkforward_summary_passed(&invalid, mode));
+        }
+        let trial = walkforward_selection_trial(0, &gene, &invalid, DiscoveryMode::Risky)?;
+        assert_eq!(trial.rejection_reasons, ["nonfinite_walkforward_pnl"]);
+        assert_eq!(trial.folds[4].pnl, None);
+        assert!(serde_json::to_string(&trial)?.contains("\"pnl\":null"));
+        let mut incomplete = summary(&[10.0], false);
+        incomplete.walk_forward_splits = 20;
+        assert_eq!(
+            walkforward_rejection_reasons(&incomplete, DiscoveryMode::Risky),
+            ["walkforward_split_count_mismatch"]
+        );
+        incomplete.splits.clear();
+        assert!(!walkforward_summary_passed(
+            &incomplete,
+            DiscoveryMode::Strict
+        ));
+        Ok(())
     }
 
     #[test]
@@ -8510,6 +8654,16 @@ where
         Stage1Window::MostRecent => (total_rows.saturating_sub(stage1_len), total_rows),
         Stage1Window::Earliest => (0, stage1_len),
     };
+    funnel.stage1_evaluation_window = Some(crate::funnel_profile::Stage1EvaluationWindow {
+        selection_rows: total_rows,
+        start_row: stage1_start,
+        end_row_exclusive: stage1_end,
+        first_timestamp_ms: features.timestamps.get(stage1_start).copied(),
+        last_timestamp_ms: stage1_end
+            .checked_sub(1)
+            .filter(|&last| last >= stage1_start)
+            .and_then(|last| features.timestamps.get(last).copied()),
+    });
     tracing::info!(
         target: "neoethos_search::funnel",
         window = ?stage1_window,
@@ -12404,6 +12558,14 @@ where
             post_prop_firm, config.portfolio_size
         ),
     });
+    let mut wf_cohort = crate::funnel_profile::WalkforwardSelectionCohort {
+        scope: crate::data_selection::CanonicalSearchArtifactScopeRefV1::from_scope(
+            selection_scope,
+        )
+        .map_err(anyhow::Error::new)?,
+        search_config_hash: search_state_config_hash.to_owned(),
+        trials: Vec::with_capacity(wf_candidates.len()),
+    };
     let candidate_wf = discovery_walkforward_verdicts(
         &wf_candidates,
         features,
@@ -12411,7 +12573,18 @@ where
         config,
         effective_smc_gate_threshold,
         population_execution_run,
-        |summaries| {
+        |range, detailed, summaries| {
+            for (gene, summary) in wf_candidates[range].iter().zip(detailed) {
+                let archive_index = ranked_candidate_genes
+                    .iter()
+                    .position(|archived| archived.strategy_id == gene.strategy_id)
+                    .ok_or_else(|| anyhow::anyhow!("WF candidate is absent from its archive"))?;
+                let trial = walkforward_selection_trial(archive_index, gene, summary, config.mode)?;
+                trial
+                    .strategy_identity
+                    .validate_against(&ranked_candidate_genes[archive_index])?;
+                wf_cohort.trials.push(trial);
+            }
             candidate_census.walkforward_tested += summaries.iter().filter(|s| s.tested).count();
             candidate_census.walkforward_passed += summaries.iter().filter(|s| s.passed).count();
             candidate_census.walkforward_failed = candidate_census
@@ -12423,6 +12596,7 @@ where
             progress_fn(DiscoveryProgress::CandidateCensusUpdated {
                 census: candidate_census.clone(),
             });
+            Ok(())
         },
     )?;
     funnel.record_stage(
@@ -12430,13 +12604,16 @@ where
         candidate_census.walkforward_tested,
         candidate_census.walkforward_passed,
     );
-    if candidate_census.walkforward_failed > 0 {
-        funnel.add_reject_reason(
-            "passed_walkforward",
-            "mode_aware_walkforward_failed",
-            candidate_census.walkforward_failed,
-        );
+    let mut wf_reasons = std::collections::BTreeMap::<&str, usize>::new();
+    for trial in &wf_cohort.trials {
+        for reason in &trial.rejection_reasons {
+            *wf_reasons.entry(reason).or_default() += 1;
+        }
     }
+    for (reason, count) in wf_reasons {
+        funnel.add_reject_reason("passed_walkforward", reason, count);
+    }
+    funnel.walkforward_selection_cohort = Some(wf_cohort);
     let profitable_calibration_genes = if let Some(calibration) = calibration_input {
         progress_fn(DiscoveryProgress::StageAdvanced {
             stage: "holdout_forward_test",
