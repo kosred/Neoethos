@@ -173,6 +173,16 @@ jobs:
           cargo test --locked -p neoethos-broker-history --test tick_archive_cli \
             2>&1 | tee /tmp/stage1-diagnostics/tick-archive-cli-test.log
 
+      - name: Test scoped direct trendbar acquisition
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p neoethos-broker-history --lib bulk_cli \
+            2>&1 | tee /tmp/stage1-diagnostics/scoped-acquisition-test.log
+          cargo test --locked -p neoethos-broker-history \
+            --test canonical_trendbar_bulk_cli_contract \
+            2>&1 | tee /tmp/stage1-diagnostics/bulk-cli-contract-test.log
+
       - name: Test canonical import boundaries
         shell: bash
         run: |
