@@ -133,7 +133,7 @@ fn closed_trade_from_deal(
         commission,
         swap,
         net_profit: net,
-        balance_after: None, // balance-after wiring is a follow-up polish
+        balance_after: d.balance_after,
     })
 }
 
@@ -294,6 +294,15 @@ mod entry_time_tests {
                 },
             ),
             component_sum_account_currency: Some(1.0),
+            deal_commission_raw_scaled_signed: None,
+            deal_money_digits: None,
+            balance_after: None,
+            balance_after_raw_scaled: None,
+            balance_version: None,
+            quote_to_deposit_conversion_rate: None,
+            closed_volume_raw_centi_units: None,
+            label: None,
+            comment: None,
         }
     }
 

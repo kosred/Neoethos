@@ -124,6 +124,17 @@ pub struct CTraderDealSnapshot {
     /// Checked sum of signed broker components. This is derived locally and is
     /// deliberately not named or treated as an independently reported net.
     pub component_sum_account_currency: Option<f64>,
+    /// The execution's own commission; closing `fee` above covers the closed
+    /// volume and may include opening commission. Never add both to net PnL.
+    pub deal_commission_raw_scaled_signed: Option<i64>,
+    pub deal_money_digits: Option<u32>,
+    pub balance_after: Option<f64>,
+    pub balance_after_raw_scaled: Option<i64>,
+    pub balance_version: Option<i64>,
+    pub quote_to_deposit_conversion_rate: Option<f64>,
+    pub closed_volume_raw_centi_units: Option<i64>,
+    pub label: Option<String>,
+    pub comment: Option<String>,
 }
 
 /// Account-scoped deal-history response with the broker's truncation bit.
@@ -380,6 +391,8 @@ struct DealPayload {
     money_digits: Option<u32>,
     #[serde(rename = "closePositionDetail")]
     close_position_detail: Option<ClosePositionDetailPayload>,
+    label: Option<String>,
+    comment: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -394,6 +407,13 @@ struct ClosePositionDetailPayload {
     pnl_conversion_fee: Option<i64>,
     #[serde(rename = "moneyDigits")]
     money_digits: Option<u32>,
+    balance: Option<i64>,
+    #[serde(rename = "balanceVersion")]
+    balance_version: Option<i64>,
+    #[serde(rename = "quoteToDepositConversionRate")]
+    quote_to_deposit_conversion_rate: Option<f64>,
+    #[serde(rename = "closedVolume")]
+    closed_volume: Option<i64>,
 }
 
 pub fn parse_trader_response(response_json: &str) -> Result<CTraderTraderSnapshot> {
@@ -664,6 +684,21 @@ pub fn parse_symbol_category_list_response(
 }
 
 fn deal_payload_to_snapshot(account_id: i64, deal: DealPayload) -> Result<CTraderDealSnapshot> {
+    let detail = deal.close_position_detail.as_ref();
+    let quote_to_deposit_conversion_rate = detail.and_then(|d| d.quote_to_deposit_conversion_rate);
+    if let Some(rate) = quote_to_deposit_conversion_rate {
+        anyhow::ensure!(
+            rate.is_finite() && rate > 0.0,
+            "broker closing-deal conversion rate must be finite and positive"
+        );
+    }
+    let closed_volume_raw_centi_units = detail.and_then(|d| d.closed_volume);
+    if let Some(volume) = closed_volume_raw_centi_units {
+        anyhow::ensure!(
+            volume > 0 && volume <= deal.filled_volume,
+            "broker closed volume must be positive and no larger than the filled volume"
+        );
+    }
     let (
         gross_profit,
         close_fee,
@@ -729,6 +764,15 @@ fn deal_payload_to_snapshot(account_id: i64, deal: DealPayload) -> Result<CTrade
             None => (None, None),
         },
     };
+    let balance_after_raw_scaled = detail.and_then(|d| d.balance);
+    let balance_after = balance_after_raw_scaled
+        .map(|balance| {
+            scaled_money(
+                balance,
+                required_money_digits(close_money_digits, "deal.close.money_digits")?,
+            )
+        })
+        .transpose()?;
 
     Ok(CTraderDealSnapshot {
         account_id,
@@ -757,6 +801,15 @@ fn deal_payload_to_snapshot(account_id: i64, deal: DealPayload) -> Result<CTrade
         swap_raw_scaled_signed,
         pnl_conversion_fee_state,
         component_sum_account_currency,
+        deal_commission_raw_scaled_signed: deal.commission,
+        deal_money_digits: deal.money_digits,
+        balance_after,
+        balance_after_raw_scaled,
+        balance_version: detail.and_then(|d| d.balance_version),
+        quote_to_deposit_conversion_rate,
+        closed_volume_raw_centi_units,
+        label: deal.label,
+        comment: deal.comment,
     })
 }
 
