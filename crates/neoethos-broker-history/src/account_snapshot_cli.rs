@@ -18,7 +18,8 @@ use crate::ctrader_account::{
 };
 use crate::ctrader_live_auth::CTraderEnvironment;
 use crate::ctrader_messages::{
-    CTraderOpenApiJsonMessage, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
+    CTraderDealListRequest, CTraderOpenApiJsonMessage, CTraderOpenApiTransport,
+    ProductionCTraderOpenApiTransport, build_deal_list_request,
 };
 use crate::{BrokerEnvironment, load_exact_production_historical_credentials};
 
@@ -198,6 +199,45 @@ pub struct AccountSnapshotCli {
     pub account_id: i64,
     #[arg(long)]
     pub out_dir: PathBuf,
+    /// Explicit inclusive deal-history bounds. Omit both for the desktop's 24-hour query.
+    #[arg(long, requires = "deals_to_ms")]
+    pub deals_from_ms: Option<i64>,
+    #[arg(long, requires = "deals_from_ms")]
+    pub deals_to_ms: Option<i64>,
+    /// Maximum returned rows, not proof of completeness. Inspect the broker's hasMore.
+    #[arg(long, default_value_t = 100)]
+    pub max_deals: i32,
+}
+
+impl AccountSnapshotCli {
+    fn deal_query(&self, now: i64) -> Result<Option<CTraderDealListRequest>> {
+        ensure!(
+            (1..=10_000).contains(&self.max_deals),
+            "max-deals must be in 1..=10000"
+        );
+        match (self.deals_from_ms, self.deals_to_ms) {
+            (Some(from), Some(to)) => {
+                ensure!(
+                    from >= 0 && from <= to && to <= now,
+                    "deal-history bounds must be ordered, non-negative and not in the future"
+                );
+                Ok(Some(CTraderDealListRequest {
+                    account_id: self.account_id,
+                    from_timestamp_ms: Some(from),
+                    to_timestamp_ms: Some(to),
+                    max_rows: Some(self.max_deals),
+                }))
+            }
+            (None, None) => {
+                ensure!(
+                    self.max_deals == 100,
+                    "max-deals requires an explicit deal-history window"
+                );
+                Ok(None)
+            }
+            _ => anyhow::bail!("both deal-history bounds are required"),
+        }
+    }
 }
 
 // Only the last successful response sequence is retained when the shared
@@ -210,16 +250,21 @@ struct RecordedAccountSequence {
 struct RecordingTransport<T> {
     inner: T,
     recorded: RefCell<Option<RecordedAccountSequence>>,
+    deal_query: Option<CTraderDealListRequest>,
 }
 
 impl<T: CTraderOpenApiTransport> CTraderOpenApiTransport for RecordingTransport<T> {
     fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
-        let responses = self.inner.send_sequence(messages)?;
+        ensure!(messages.len() == 7, "unexpected account request sequence");
+        let mut messages = messages.to_vec();
+        if let Some(query) = &self.deal_query {
+            messages[4] = build_deal_list_request(query, &messages[4].client_msg_id);
+        }
+        let responses = self.inner.send_sequence(&messages)?;
         ensure!(
             responses.iter().map(String::len).sum::<usize>() <= MAX_RESPONSE_BYTES,
             "broker account response exceeds capture bound"
         );
-        ensure!(messages.len() == 7, "unexpected account request sequence");
         *self.recorded.borrow_mut() = Some(RecordedAccountSequence {
             responses: responses.clone(),
             deal_request: messages[4].payload.clone(),
@@ -247,6 +292,30 @@ fn financial_report(
         deals.account_id == snapshot.trader.account_id && deals.deals == snapshot.recent_deals,
         "deal evidence differs from the validated account snapshot"
     );
+    let from = recorded.deal_request["fromTimestamp"]
+        .as_i64()
+        .context("missing deal query start")?;
+    let to = recorded.deal_request["toTimestamp"]
+        .as_i64()
+        .context("missing deal query end")?;
+    let max_rows = recorded.deal_request["maxRows"]
+        .as_u64()
+        .context("missing deal query row bound")?;
+    let distinct_ids = deals
+        .deals
+        .iter()
+        .map(|deal| deal.deal_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        from <= to
+            && deals.deals.len() as u64 <= max_rows
+            && distinct_ids.len() == deals.deals.len()
+            && deals
+                .deals
+                .iter()
+                .all(|deal| (from..=to).contains(&deal.execution_timestamp_ms)),
+        "broker deals are duplicated or exceed the exact requested history window or row bound"
+    );
     let mut rows = Vec::with_capacity(deals.deals.len());
     for deal in &deals.deals {
         rows.push(json!({
@@ -269,6 +338,15 @@ fn financial_report(
             "commission_raw_scaled_signed": deal.commission_raw_scaled_signed,
             "swap_raw_scaled_signed": deal.swap_raw_scaled_signed,
             "component_sum_account_currency": deal.component_sum_account_currency,
+            "deal_commission_raw_scaled_signed": deal.deal_commission_raw_scaled_signed,
+            "deal_money_digits": deal.deal_money_digits,
+            "balance_after": deal.balance_after,
+            "balance_after_raw_scaled": deal.balance_after_raw_scaled,
+            "balance_version": deal.balance_version,
+            "quote_to_deposit_conversion_rate": deal.quote_to_deposit_conversion_rate,
+            "closed_volume_raw_centi_units": deal.closed_volume_raw_centi_units,
+            "label": deal.label,
+            "comment": deal.comment,
         }));
     }
     let pnl = snapshot
@@ -304,15 +382,17 @@ fn financial_report(
 pub fn capture(cli: AccountSnapshotCli) -> Result<Value> {
     ensure!(cli.account_id > 0, "broker account id must be positive");
     ensure!(cli.out_dir.is_absolute(), "out-dir must be absolute");
+    let started = now_ms()?;
+    let deal_query = cli.deal_query(started)?;
     // create_dir is deliberately exclusive. A failed run is retained and a
     // later invocation must select a new directory, never overwrite evidence.
     fs::create_dir(&cli.out_dir).context("create new broker account evidence directory")?;
-    let started = now_ms()?;
     let credentials =
         load_exact_production_historical_credentials(cli.environment.broker(), cli.account_id)?;
     let transport = RecordingTransport {
         inner: ProductionCTraderOpenApiTransport::new(cli.environment.broker().endpoint_host()),
         recorded: RefCell::new(None),
+        deal_query,
     };
     let snapshot = load_account_runtime_with_transport(
         &transport,
@@ -367,6 +447,76 @@ mod tests {
     use super::*;
     use crate::ctrader_account::{CTraderReconcileSnapshot, CTraderTraderSnapshot};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn explicit_deal_window_reaches_transport_and_saved_evidence() {
+        struct WindowTransport;
+        impl CTraderOpenApiTransport for WindowTransport {
+            fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
+                assert_eq!(messages[4].payload["ctidTraderAccountId"], 91);
+                assert_eq!(messages[4].payload["fromTimestamp"], 10);
+                assert_eq!(messages[4].payload["toTimestamp"], 20);
+                assert_eq!(messages[4].payload["maxRows"], 1000);
+                assert_eq!(messages[0].payload["test_auth"], "retained");
+                Ok(vec!["{}".to_owned(); 7])
+            }
+        }
+        let cli = AccountSnapshotCli {
+            environment: SnapshotEnvironment::Demo,
+            account_id: 91,
+            out_dir: PathBuf::new(),
+            deals_from_ms: Some(10),
+            deals_to_ms: Some(20),
+            max_deals: 1000,
+        };
+        let transport = RecordingTransport {
+            inner: WindowTransport,
+            recorded: RefCell::new(None),
+            deal_query: cli.deal_query(20).unwrap(),
+        };
+        let messages = vec![
+            CTraderOpenApiJsonMessage {
+                client_msg_id: "fixture".into(),
+                payload_type: 0,
+                payload: json!({"test_auth":"retained"})
+            };
+            7
+        ];
+        transport.send_sequence(&messages).unwrap();
+        let recorded = transport.recorded.into_inner().unwrap();
+        assert_eq!(recorded.deal_request["fromTimestamp"], 10);
+        assert_eq!(recorded.deal_request["toTimestamp"], 20);
+        assert_eq!(recorded.deal_request["maxRows"], 1000);
+    }
+
+    #[test]
+    fn invalid_deal_windows_refuse_before_output_or_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        for (from, to, max_rows) in [
+            (Some(20), Some(10), 100),
+            (Some(-1), Some(10), 100),
+            (Some(0), Some(i64::MAX), 100),
+            (Some(0), None, 100),
+            (None, Some(10), 100),
+            (Some(0), Some(10), 0),
+            (Some(0), Some(10), 10_001),
+            (None, None, 1000),
+        ] {
+            let output = dir.path().join("must-not-exist");
+            assert!(
+                capture(AccountSnapshotCli {
+                    environment: SnapshotEnvironment::Demo,
+                    account_id: 91,
+                    out_dir: output.clone(),
+                    deals_from_ms: from,
+                    deals_to_ms: to,
+                    max_deals: max_rows
+                })
+                .is_err()
+            );
+            assert!(!output.exists());
+        }
+    }
 
     fn saved_currency_fixture(dir: &Path) -> PathBuf {
         use crate::ctrader_messages::CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE;
@@ -446,7 +596,7 @@ mod tests {
 
     #[test]
     fn actual_currency_and_truncated_deals_are_preserved() {
-        let snapshot = CTraderAccountRuntimeSnapshot {
+        let mut snapshot = CTraderAccountRuntimeSnapshot {
             environment: CTraderEnvironment::Demo,
             trader: CTraderTraderSnapshot {
                 account_id: 91,
@@ -486,6 +636,35 @@ mod tests {
         assert_eq!(omitted["recent_deals_complete_for_requested_window"], false);
         recorded.responses[4] = json!({"payloadType": 2134, "payload": {"ctidTraderAccountId":92,"deal":[],"hasMore":false}}).to_string();
         assert!(financial_report(&snapshot, &recorded).is_err());
+        let mut deal = json!({"dealId":1,"orderId":2,"positionId":3,"symbolId":4,"volume":100,"filledVolume":100,"executionTimestamp":3,"executionPrice":1.2,"tradeSide":1,"dealStatus":2});
+        for (rows, limit, accepted) in [
+            (vec![deal.clone()], 100, false),
+            (
+                {
+                    deal["executionTimestamp"] = json!(2);
+                    vec![deal.clone()]
+                },
+                1,
+                true,
+            ),
+            (vec![deal.clone(), deal.clone()], 100, false),
+            (
+                {
+                    let mut second = deal.clone();
+                    second["dealId"] = json!(2);
+                    vec![deal, second]
+                },
+                1,
+                false,
+            ),
+        ] {
+            recorded.responses[4] = json!({"payloadType":2134,"payload":{"ctidTraderAccountId":91,"deal":rows,"hasMore":false}}).to_string();
+            recorded.deal_request["maxRows"] = json!(limit);
+            snapshot.recent_deals = parse_deal_list_bundle_response(&recorded.responses[4])
+                .unwrap()
+                .deals;
+            assert_eq!(financial_report(&snapshot, &recorded).is_ok(), accepted);
+        }
     }
 
     #[test]
@@ -497,7 +676,10 @@ mod tests {
             capture(AccountSnapshotCli {
                 environment: SnapshotEnvironment::Demo,
                 account_id: 91,
-                out_dir: dir.path().to_owned()
+                out_dir: dir.path().to_owned(),
+                deals_from_ms: None,
+                deals_to_ms: None,
+                max_deals: 100,
             })
             .is_err()
         );

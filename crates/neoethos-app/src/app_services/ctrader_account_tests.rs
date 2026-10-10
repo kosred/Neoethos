@@ -274,6 +274,90 @@ fn deal_list_bundle_preserves_broker_pagination_evidence() {
     assert!(bundle.has_more, "hasMore must never be discarded");
 }
 
+fn closing_conversion_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "payloadType": 2134,
+        "payload": {"ctidTraderAccountId": 712345, "hasMore": false, "deal": [{
+            "dealId": 3001, "orderId": 8001, "positionId": 9001,
+            "volume": 10000000, "filledVolume": 10000000, "symbolId": 14,
+            "executionTimestamp": 1710000201000i64, "executionPrice": 1.21,
+            "tradeSide": 2, "dealStatus": 2, "commission": -450, "moneyDigits": 2,
+            "label": "example", "comment": "fixture",
+            "closePositionDetail": {
+                "entryPrice": 1.20, "grossProfit": 82644, "swap": 0,
+                "commission": -900, "moneyDigits": 2, "balance": 1081744,
+                "balanceVersion": 2, "quoteToDepositConversionRate": 0.8264462809917356,
+                "closedVolume": 10000000, "pnlConversionFee": 0
+            }
+        }]}
+    })
+}
+
+#[test]
+fn closing_deal_retains_broker_balance_conversion_and_commission_scopes() {
+    let deals = parse_deal_list_response(&closing_conversion_fixture().to_string()).unwrap();
+    let deal = &deals[0];
+    assert_eq!(deal.deal_commission_raw_scaled_signed, Some(-450));
+    assert_eq!(deal.deal_money_digits, Some(2));
+    assert_eq!(deal.commission_raw_scaled_signed, Some(-900));
+    assert_eq!(deal.component_sum_account_currency, Some(817.44));
+    assert_eq!(deal.balance_after_raw_scaled, Some(1081744));
+    assert_eq!(deal.balance_after, Some(10817.44));
+    assert_eq!(deal.balance_version, Some(2));
+    assert_eq!(
+        deal.quote_to_deposit_conversion_rate,
+        Some(0.8264462809917356)
+    );
+    assert_eq!(deal.closed_volume_raw_centi_units, Some(10000000));
+    assert_eq!(deal.label.as_deref(), Some("example"));
+    assert_eq!(deal.comment.as_deref(), Some("fixture"));
+}
+
+#[test]
+fn absent_close_observations_remain_unknown() {
+    let mut response = closing_conversion_fixture();
+    let detail = response["payload"]["deal"][0]["closePositionDetail"]
+        .as_object_mut()
+        .unwrap();
+    for key in [
+        "balance",
+        "balanceVersion",
+        "quoteToDepositConversionRate",
+        "closedVolume",
+    ] {
+        detail.remove(key);
+    }
+    let deals = parse_deal_list_response(&response.to_string()).unwrap();
+    let deal = &deals[0];
+    assert_eq!(deal.balance_after, None);
+    assert_eq!(deal.balance_after_raw_scaled, None);
+    assert_eq!(deal.balance_version, None);
+    assert_eq!(deal.quote_to_deposit_conversion_rate, None);
+    assert_eq!(deal.closed_volume_raw_centi_units, None);
+}
+
+#[test]
+fn closing_deal_rejects_invalid_conversion_and_closed_volume() {
+    for rate in [0.0, -1.0] {
+        let mut response = closing_conversion_fixture();
+        response["payload"]["deal"][0]["closePositionDetail"]["quoteToDepositConversionRate"] =
+            serde_json::json!(rate);
+        assert!(parse_deal_list_response(&response.to_string()).is_err());
+    }
+    for volume in [0, -1, 10000001] {
+        let mut response = closing_conversion_fixture();
+        response["payload"]["deal"][0]["closePositionDetail"]["closedVolume"] =
+            serde_json::json!(volume);
+        assert!(parse_deal_list_response(&response.to_string()).is_err());
+    }
+    let mut reversal = closing_conversion_fixture();
+    reversal["payload"]["deal"][0]["closePositionDetail"]["closedVolume"] =
+        serde_json::json!(5000000);
+    let deals = parse_deal_list_response(&reversal.to_string()).unwrap();
+    assert_eq!(deals[0].closed_volume_raw_centi_units, Some(5000000));
+    assert_eq!(deals[0].filled_volume_raw_centi_units, 10000000);
+}
+
 #[test]
 fn deal_list_response_scales_close_detail_money_digits_four_fields() {
     let response = serde_json::json!({
