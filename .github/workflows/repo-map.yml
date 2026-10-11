@@ -2,6 +2,8 @@ name: Repository map
 
 # This diagnostic is independent of the manual-only build/test CI.
 on:
+  pull_request:
+    branches: [master]
   push:
     branches: [master, 'codex/repo-map-*']
     paths-ignore: ['docs/**', '**/*.md']
@@ -20,8 +22,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  new-duplicates:
+    name: No new duplicate implementations
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned duplicate detector
+        run: |
+          npm install --prefix "$RUNNER_TEMP/repo-map-tools" --no-audit --no-fund jscpd@5.3.3
+          echo "$RUNNER_TEMP/repo-map-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Reject newly introduced clones
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'origin/master' }}
+        run: python scripts/repo-map/run_checks.py --duplicates-only --baseline-ref "$BASE_REF" --output "$RUNNER_TEMP/duplicate-check"
+      - name: Keep clone locations and tool failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: new-duplicates-${{ github.sha }}
+          path: ${{ runner.temp }}/duplicate-check/
+          retention-days: 14
+
   structure:
     name: Inventory, syntax graph and duplicates
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

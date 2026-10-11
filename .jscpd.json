@@ -1,0 +1,15 @@
+{
+  "path": ["."],
+  "format": ["rust", "typescript", "tsx", "javascript", "python", "cpp", "c"],
+  "formatsExts": {"cpp": ["cpp", "cc", "cxx", "hpp", "hxx", "hh", "cu", "cuh"]},
+  "minLines": 12,
+  "minTokens": 80,
+  "maxSize": "16mb",
+  "mode": "weak",
+  "ignoreIdentifiers": true,
+  "ignore": ["**/target/**", "**/node_modules/**", "vendor/**", "tmp/**", ".git/**"],
+  "reporters": ["json"],
+  "output": ".git/repo-map/duplicates",
+  "noColors": true,
+  "noTips": true
+}

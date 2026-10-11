@@ -1,5 +1,8 @@
 import json
+import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 import sys
@@ -9,7 +12,7 @@ from pathlib import Path
 
 import map_repo as mapper
 import query_map
-from run_checks import run
+from run_checks import duplication_check, run
 from report_map import cycles
 from pack_graph import pack, restore
 from reuse_scip import check_source, validate_profile
@@ -212,6 +215,47 @@ class GraphEvidenceTests(unittest.TestCase):
             record = run("failed", [sys.executable, "-c", "raise SystemExit(7)"], Path(tmp), 1)
             self.assertEqual(record["status"], "failed")
             self.assertEqual(record["exit_code"], 7)
+            timed = run("timeout", [sys.executable, "-c", "import time; time.sleep(10)"], Path(tmp), 0.1)
+            self.assertEqual(timed["status"], "timeout")
+
+    def test_duplicate_gate_allows_old_clones_but_rejects_another_renamed_copy(self):
+        native = Path(os.environ.get('LOCALAPPDATA', '.')) / 'neoethos/tools/code-intelligence/node_modules/jscpd-windows-x64-msvc/bin/jscpd.exe'
+        if not (native.is_file() or shutil.which('jscpd')):
+            self.skipTest('jscpd is required for the duplicate gate integration test')
+        original = Path.cwd()
+        config = json.loads(Path(__file__).resolve().parents[2].joinpath('.jscpd.json').read_text(encoding='utf-8'))
+        config['path'] = ['src']
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            try:
+                os.chdir(root)
+                def git(*args):
+                    subprocess.run(['git', *args], check=True, capture_output=True)
+                git('init', '-q')
+                Path('.jscpd.json').write_text(json.dumps(config), encoding='utf-8')
+                Path('.gitignore').write_text('evidence/\n', encoding='utf-8')
+                Path('src').mkdir()
+                code = 'pub fn transform(input: &[i64]) -> i64 {\n    let mut value = 0;\n'
+                code += ''.join(f'    value += input.get({i}).copied().unwrap_or({i}) * {i + 3};\n' for i in range(18))
+                code += '    value\n}\n'
+                Path('src/original.rs').write_text(code, encoding='utf-8')
+                Path('src/existing.rs').write_text(code.replace('transform', 'existing'), encoding='utf-8')
+                git('add', '.')
+                git('-c', 'user.name=Gate test', '-c', 'user.email=gate@example.invalid', 'commit', '-qm', 'baseline')
+                output = root / 'evidence'
+                output.mkdir()
+                before = duplication_check(output, 'HEAD')
+                self.assertEqual(before['status'], 'completed')
+                self.assertGreater(before['statistics']['clones'], 0)
+                Path('src/new.rs').write_text(code.replace('transform', 'new_copy').replace('value', 'total'), encoding='utf-8')
+                after = duplication_check(output, 'HEAD')
+                self.assertEqual(after['exit_code'], 1)
+                self.assertGreater(after['statistics']['newClones'], 0)
+                missing = duplication_check(output, 'does-not-exist')
+                self.assertEqual(missing['status'], 'failed')
+                self.assertNotIn('statistics', missing)
+            finally:
+                os.chdir(original)
 
 
 if __name__ == "__main__":

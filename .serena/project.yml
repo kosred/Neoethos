@@ -1,0 +1,40 @@
+# Shared navigation settings; keep all keys to avoid automatic template expansion.
+project_name: neoethos
+language_servers:
+- rust
+- typescript
+encoding: utf-8
+ignore_all_files_in_gitignore: true
+ignored_paths:
+- "vendor/**"
+- "tmp/**"
+- "**/target/**"
+- "**/node_modules/**"
+ls_workspace_folders:
+- "."
+read_only: true
+added_modes:
+- no-memories
+default_modes:
+excluded_tools: []
+included_optional_tools: []
+fixed_tools: []
+symbol_info_budget:
+language_backend:
+line_ending:
+read_only_memory_patterns: []
+ignored_memory_patterns: []
+ls_specific_settings:
+  rust:
+    initializationOptions:
+      checkOnSave: false
+      linkedProjects:
+      - Cargo.toml
+      - mcp/Cargo.toml
+      - mesh/Cargo.toml
+      - tools/ctrader-history-probe/Cargo.toml
+      - tools/ctrader-network-boundary-harness/Cargo.toml
+ls_additional_workspace_folders: []
+initial_prompt: ''
+activation_command:
+activation_command_timeout: 180.0

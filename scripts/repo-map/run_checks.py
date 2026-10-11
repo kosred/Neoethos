@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -18,8 +19,12 @@ def run(label, command, output, timeout):
                 code = proc.wait(timeout=timeout)
                 record.update(status="completed" if code == 0 else "failed", exit_code=code)
             except subprocess.TimeoutExpired:
-                import signal
-                os.killpg(proc.pid, signal.SIGKILL)
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                else:
+                    import signal
+                    os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
                 record.update(status="timeout", exit_code=None)
     except OSError as error:
@@ -27,13 +32,42 @@ def run(label, command, output, timeout):
     return record
 
 
+def duplication_check(output, baseline_ref=None):
+    # npm's Windows .cmd shim cannot be launched directly by subprocess.
+    native = Path(os.environ.get("LOCALAPPDATA", ".")) / "neoethos/tools/code-intelligence/node_modules/jscpd-windows-x64-msvc/bin/jscpd.exe"
+    executable = str(native) if os.name == "nt" and native.is_file() else shutil.which("jscpd") or "jscpd"
+    command = [executable, "--config", ".jscpd.json", "--fail-on-empty",
+               "--reporters", "json,html", "--output", str(output / "duplicates")]
+    if baseline_ref:
+        command += ["--baseline-from-ref", baseline_ref, "--fail-on-new-clones", "0"]
+    report = output / "duplicates/jscpd-report.json"
+    report.unlink(missing_ok=True)  # Never attach statistics from an earlier run to a failure.
+    record = run("jscpd", command, output, 300)
+    if record["status"] in {"completed", "failed"} and report.is_file():
+        stats = json.loads(report.read_text(encoding="utf-8"))["statistics"]["total"]
+        record["statistics"] = {key: stats.get(key) for key in
+                                ("sources", "clones", "duplicatedLines", "percentage", "newClones")}
+    return record
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--semantic", action="store_true")
+    parser.add_argument("--duplicates-only", action="store_true", help="Check working-tree duplication without rebuilding the map")
+    parser.add_argument("--baseline-ref", help="Fail on new clones compared with this Git commit/ref")
     args = parser.parse_args()
+    if args.semantic and (args.duplicates_only or args.baseline_ref):
+        parser.error("semantic indexing and duplication checking are separate modes")
+    if args.duplicates_only and not args.baseline_ref:
+        parser.error("--duplicates-only requires --baseline-ref")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    if args.duplicates_only:
+        record = duplication_check(output, args.baseline_ref)
+        (output / "checks.json").write_text(json.dumps({"jscpd": record}, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(record, indent=2))
+        return int(record["status"] != "completed")
     script = Path(__file__).with_name("map_repo.py")
     checks = {}
     if args.semantic:
@@ -54,11 +88,7 @@ def main():
         checks["cloc"] = run("cloc", ["cloc", "--list-file=" + str(output / "project-files.txt"),
                                       "--json", "--by-file", "--skip-uniqueness", "--timeout=0",
                                       "--out=" + str(output / "loc.json")], output, 180)
-        project_paths = [p for p in files if p and not p.startswith("vendor/") and not Path(p).is_symlink()]
-        checks["jscpd"] = run("jscpd", ["jscpd", "--no-gitignore", "--min-lines", "12",
-                                        "--min-tokens", "80", "--max-size", "16mb", "--mode", "weak",
-                                        "--ignore-identifiers", "--fail-on-empty", "--reporters", "json,html",
-                                        "--output", str(output / "duplicates"), *project_paths], output, 300)
+        checks["jscpd"] = duplication_check(output, args.baseline_ref)
         checks["cargo_metadata"] = run("cargo-metadata", ["cargo", "+stable", "metadata", "--no-deps",
                                                            "--format-version", "1", "--frozen"], output, 120)
         checks["rust_scip"] = {"status": "not_requested", "profile": "repo-nightly-default-features"}

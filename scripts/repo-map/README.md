@@ -1,6 +1,6 @@
 # Repository map
 
-Read-only, repeatable mapping on GitHub-hosted runners. No AI API, broker session,
+Local code navigation and repeatable mapping on GitHub-hosted runners. No AI API, broker session,
 GPU execution or production source rewrite is involved. The workflow adds
 diagnostics without changing the manual-only build/test CI.
 
@@ -10,6 +10,7 @@ After merging the workflow, open **Actions → Repository map → Run workflow**
 The default run creates the structural map, LOC report and duplication report.
 Select **semantic_rust** for a separate, heavier Rust indexing job.
 Code pushes on master and `codex/repo-map-*` branches run the structural job.
+Pull requests run the new-duplicate gate without regenerating the full map.
 
 Open the run summary, download its `repository-map-<commit>` artifact, unzip it
 and open `index.html` in a browser. It is a standalone searchable connection
@@ -41,7 +42,8 @@ quota; zero AI API calls does not mean zero compute/storage cost.
 - `coverage.json`: parser coverage, grammar errors, inventory-only files and
   semantic document coverage when requested.
 - `identical-files.json`: exact file matches of at least 20 physical lines.
-- `duplicates/`: jscpd copy/paste/renaming candidates on tracked project paths,
+- `duplicates/`: jscpd copy/paste/renaming candidates under the project root,
+  using `.jscpd.json` and Git ignore rules (local runs also see untracked source),
   ignoring comments and identifier differences (12 lines / 80 tokens minimum,
   16 MB per-file ceiling); no model/semantic embeddings mode. Review reported
   scanner statistics for the actual format coverage. Similarity is not a bug verdict.
@@ -70,6 +72,56 @@ build scripts, proc macros and native dependencies. Failures are retained and
 reported. No mode automatically deletes code or authorizes trading/promotion.
 
 ## Local or assistant queries
+
+Serena 1.7.0 provides local Rust/TypeScript definitions and references through
+language servers. The shared settings are in `.serena/project.yml`; caches stay
+ignored. This checkout has `rust-analyzer` and `rust-src` installed for the pinned
+`nightly-2026-04-07`. Five Cargo workspaces are linked. Build scripts and proc
+macros remain enabled, but automatic check-on-save is disabled. The first Rust
+request can take several minutes; a startup warning or empty result is not proof
+that a symbol has no callers. Native dependencies, inactive GPU features and
+generated code still limit coverage. The existing SCIP profiles cover additional
+configurations explicitly; neither tool is a complete runtime call graph.
+
+The local `.codex/config.toml` registers Serena (read-only tool allowlist,
+`codex` context, `no-memories` mode, 300-second client tool timeout) and jscpd MCP.
+Serena's default response budget is 6,000 characters. Memory/onboarding files and
+browser dashboards are disabled. Codex must load the trusted project config;
+already-running sessions may need a new session to receive the added tools.
+Definitions and cross-file references were tested over MCP for Rust and TS;
+jscpd's snippet and per-file clone queries were also exercised.
+
+Install the pinned tools on another Windows checkout with `uv tool install
+serena-agent==1.7.0`, `rustup component add rust-analyzer rust-src --toolchain
+nightly-2026-04-07`, and `npm install --prefix
+"$env:LOCALAPPDATA/neoethos/tools/code-intelligence" jscpd@5.3.3` (each is one
+command). The Codex server commands here point to the installed `serena.exe` and
+native `jscpd-windows-x64-msvc/bin/jscpd.exe`. Trust only the intended project in
+both Codex and Serena; custom language-server initialization requires Serena trust.
+
+The single `.jscpd.json` covers Rust, TS/TSX, JS, Python, C/C++ and CUDA extensions,
+excluding vendor, temporary and generated build directories. `check_duplication`
+tests a proposed block against current indexed source; `get_file_clones` locates
+existing overlaps. Use a small `limit`, and refresh with
+`check_current_directory(limit=0)` after changes. Token thresholds are 12 lines
+and 80 tokens, so shorter or substantially rewritten equivalents can be missed.
+This token scan uses no model or embeddings API.
+
+To reject newly introduced copies while leaving historical candidates visible:
+
+```sh
+python scripts/repo-map/run_checks.py --duplicates-only --baseline-ref HEAD --output .git/repo-map/duplicate-check
+```
+
+Use `git rev-parse --absolute-git-dir` for the output prefix in linked worktrees.
+CI compares PRs with the base commit and pushes with the previous commit, using
+the same detector/configuration. Baselines are generated from Git; no growing
+baseline file is committed. The local pre-commit hook runs this gate and requires
+tracked working-tree contents to match the index, preventing partially staged
+changes from hiding a duplicate. Stage or stash remaining tracked edits first;
+the hook never does that automatically. Existing Git LFS hooks are preserved.
+Missing tools, failed scans and invalid baseline refs fail the check. CI failure
+does not by itself configure GitHub branch protection.
 
 Python 3.11+ is required (workflow uses 3.12).
 
