@@ -73,6 +73,30 @@ reported. No mode automatically deletes code or authorizes trading/promotion.
 
 Python 3.11+ is required (workflow uses 3.12).
 
+For routine local discovery, reuse this mapper with its automatically refreshed
+cache. No GitHub run or AI API is needed:
+
+```sh
+python scripts/repo-map/query_map.py --local CTraderDealSnapshot --exact
+python scripts/repo-map/query_map.py --local financial_report --direction in
+```
+
+Install the requirements below in a virtual environment first. This Windows
+checkout uses `.git/repo-map-venv/Scripts/python.exe` as its Python interpreter.
+The generated cache stays in the worktree's Git directory under `repo-map/`,
+outside tracked source. Each query checks the commit and hashes of all tracked
+working-tree contents. Unchanged contents reuse the database; changes rebuild
+it with **the existing `map_repo.py`**, not a second indexer. Refresh failures
+refuse to serve stale results; details stay in the cache's `build.log`.
+
+Local results default to 8 matches, 12 connections **total**, and at most 6,000
+characters. Use `--exact`, `--direction`, `--limit`, `--edge-limit`, or
+`--max-chars` to narrow output; `--format json` retains structured details.
+An explicit database remains a read-only historical query with JSON output by
+default. Source reading and reasoning still consume model context; indexing
+itself makes no model calls. Untracked files are excluded until added to Git;
+use `rg` for those. A structural map is not complete semantic/runtime knowledge.
+
 ```sh
 python -m pip install -r scripts/repo-map/requirements.txt
 python scripts/repo-map/map_repo.py --output /tmp/repository-map

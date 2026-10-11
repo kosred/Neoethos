@@ -2,10 +2,13 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import sys
+from contextlib import closing
 from unittest import mock
 from pathlib import Path
 
 import map_repo as mapper
+import query_map
 from run_checks import run
 from report_map import cycles
 from pack_graph import pack, restore
@@ -13,6 +16,61 @@ from reuse_scip import check_source, validate_profile
 
 
 class GraphEvidenceTests(unittest.TestCase):
+    def test_local_digest_detects_unstaged_edits_additions_and_deletions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'sample.py'
+            source.write_bytes(b'first')
+            with mock.patch('query_map.git', return_value=b'sample.py\0'):
+                before = query_map.source_digest(root)
+                source.write_bytes(b'other')  # Same length; content must determine freshness.
+                changed = query_map.source_digest(root)
+                self.assertNotEqual(before, changed)
+                self.assertEqual(changed, query_map.source_digest(root))
+                source.unlink()
+                self.assertNotEqual(changed, query_map.source_digest(root))
+            with mock.patch('query_map.git', return_value=b''):
+                self.assertNotEqual(before, query_map.source_digest(root))
+
+    def test_query_has_global_edge_budget_literal_matching_and_visible_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            graph = mapper.Graph()
+            for i in range(6):
+                graph.node(str(i), 'function_item', 'same', 'sample.py', i + 1, i + 1)
+            for i in range(1, 6):
+                graph.edge('0', str(i), 'contains', 'syntax', 'sample.py', i)
+            mapper.save(graph, output, 'head')
+            result = query_map.query_graph(output / 'graph.sqlite', 'same', limit=3, edge_limit=2)
+            self.assertEqual(len(result['matches']), 3)
+            self.assertEqual(sum(len(n['connections']) for n in result['matches']), 2)
+            self.assertTrue(result['matches_truncated'])
+            self.assertTrue(any(n['connections_truncated'] for n in result['matches']))
+            self.assertLessEqual(len(query_map.compact(result, 300)), 300)
+            self.assertEqual(query_map.query_graph(output / 'graph.sqlite', "' OR 1=1 --")['matches'], [])
+            self.assertEqual(query_map.query_graph(output / 'graph.sqlite', 'sam', exact=True)['matches'], [])
+
+    def test_local_cache_reuses_current_content_and_refuses_failed_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / '.git' / 'repo-map'
+            mapper.save(mapper.Graph(), output, 'head')
+            database = output / 'graph.sqlite'
+            with closing(sqlite3.connect(database)) as db, db:
+                db.execute('INSERT INTO metadata VALUES (?, ?)', ('local_source_digest', 'current'))
+            def git_result(_root, *args):
+                return {'--show-toplevel': str(root), '--absolute-git-dir': str(root / '.git'),
+                        'HEAD': 'head'}[args[-1]].encode()
+            with mock.patch('query_map.git', side_effect=git_result), \
+                    mock.patch('query_map.source_digest', return_value='current') as digest, \
+                    mock.patch('query_map.subprocess.run') as run:
+                self.assertEqual(query_map.local_database(root), database)
+                run.assert_not_called()
+                digest.return_value = 'changed'
+                run.return_value.returncode = 1
+                with self.assertRaisesRegex(RuntimeError, 'no stale result served'):
+                    query_map.local_database(root)
+
     def test_profile_provenance_rejects_stale_commit_wrong_workspace_or_profile(self):
         valid = {'source_commit': 'current', 'prefix': 'mcp', 'profile': 'mcp'}
         validate_profile(valid, 'current', 'mcp', 'mcp')
@@ -143,7 +201,7 @@ class GraphEvidenceTests(unittest.TestCase):
             self.assertEqual({e[2] for e in graph.edges}, {"defines", "references"})
             summary = mapper.save(graph, Path(tmp) / "out", "abc", dirty=True)
             self.assertFalse(summary["whole_repo_semantically_verified"])
-            with sqlite3.connect(Path(tmp) / "out/graph.sqlite") as db:
+            with closing(sqlite3.connect(Path(tmp) / "out/graph.sqlite")) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM edges").fetchone()[0], 2)
                 self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='working_tree_dirty'").fetchone()[0], "True")
 
@@ -151,7 +209,7 @@ class GraphEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             record = run("missing", ["/definitely-absent-repo-map-tool"], Path(tmp), 1)
             self.assertEqual(record["status"], "unavailable")
-            record = run("failed", ["python3", "-c", "raise SystemExit(7)"], Path(tmp), 1)
+            record = run("failed", [sys.executable, "-c", "raise SystemExit(7)"], Path(tmp), 1)
             self.assertEqual(record["status"], "failed")
             self.assertEqual(record["exit_code"], 7)
 

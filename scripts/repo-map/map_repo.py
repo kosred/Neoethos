@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import tomllib
 import yaml
+from contextlib import closing
 from pathlib import Path
 
 from tree_sitter import Language, Parser
@@ -390,7 +391,7 @@ def save(graph, output, commit, dirty=False):
     output.mkdir(parents=True, exist_ok=True)
     db_path = output / "graph.sqlite"
     db_path.unlink(missing_ok=True)
-    with sqlite3.connect(db_path) as db:
+    with closing(sqlite3.connect(db_path)) as db, db:
         db.executescript("""
             CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE nodes(id INTEGER PRIMARY KEY, stable_key TEXT, kind TEXT, name TEXT, path TEXT,

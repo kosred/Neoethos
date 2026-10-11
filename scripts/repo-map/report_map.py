@@ -3,6 +3,7 @@
 import collections
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 
@@ -54,7 +55,7 @@ def report(output):
     rust = [f['path'] for f in inventory if f['group'] == 'project' and f['path'].endswith('.rs')]
     adjacency = collections.defaultdict(set)
     cross = collections.Counter()
-    with sqlite3.connect('file:' + str((output / 'graph.sqlite').resolve()) + '?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect((output / 'graph.sqlite').resolve().as_uri() + '?mode=ro', uri=True)) as db:
         ambiguities = db.execute("SELECT count(*) FROM (SELECT target FROM edges WHERE kind='defines' AND evidence='scip' GROUP BY target HAVING count(DISTINCT path)>1)").fetchone()[0]
         for source, target in db.execute("SELECT a.path,b.path FROM edges e JOIN nodes a ON a.id=e.source JOIN nodes b ON b.id=e.target WHERE e.kind='declared_dependency' AND b.kind='package'"):
             adjacency[source].add(target)
