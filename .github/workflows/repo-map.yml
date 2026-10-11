@@ -37,7 +37,7 @@ jobs:
           python-version: '3.12'
       - name: Install pinned duplicate detector
         run: |
-          npm install --prefix "$RUNNER_TEMP/repo-map-tools" --no-audit --no-fund jscpd@5.3.3
+          npm install --prefix "$RUNNER_TEMP/repo-map-tools" --no-audit --no-fund jscpd@5.4.1
           echo "$RUNNER_TEMP/repo-map-tools/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Reject newly introduced clones
         env:
@@ -68,7 +68,7 @@ jobs:
           python -m pip install -r scripts/repo-map/requirements.txt
           sudo apt-get update -qq
           sudo apt-get install -y cloc
-          npm install --prefix "$RUNNER_TEMP/repo-map-tools" jscpd@5.3.3
+          npm install --prefix "$RUNNER_TEMP/repo-map-tools" jscpd@5.4.1
           echo "$RUNNER_TEMP/repo-map-tools/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Test evidence and graph handling
         run: python -m unittest discover -s scripts/repo-map -p 'test_*.py'

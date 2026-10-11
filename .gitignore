@@ -16,6 +16,7 @@ target/
 /rust_core/
 /data/
 /tmp_upload/
+/tmp/
 /venv/
 /.venv/
 /keys/

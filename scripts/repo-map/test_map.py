@@ -223,8 +223,10 @@ class GraphEvidenceTests(unittest.TestCase):
         if not (native.is_file() or shutil.which('jscpd')):
             self.skipTest('jscpd is required for the duplicate gate integration test')
         original = Path.cwd()
-        config = json.loads(Path(__file__).resolve().parents[2].joinpath('.jscpd.json').read_text(encoding='utf-8'))
-        config['path'] = ['src']
+        project = Path(__file__).resolve().parents[2]
+        config = json.loads(project.joinpath('.jscpd.json').read_text(encoding='utf-8'))
+        gitignore = project.joinpath('.gitignore').read_text(encoding='utf-8')
+        config['path'] = ['.']
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             try:
@@ -233,20 +235,35 @@ class GraphEvidenceTests(unittest.TestCase):
                     subprocess.run(['git', *args], check=True, capture_output=True)
                 git('init', '-q')
                 Path('.jscpd.json').write_text(json.dumps(config), encoding='utf-8')
-                Path('.gitignore').write_text('evidence/\n', encoding='utf-8')
+                Path('.gitignore').write_text(gitignore + '\nevidence/\n', encoding='utf-8')
                 Path('src').mkdir()
                 code = 'pub fn transform(input: &[i64]) -> i64 {\n    let mut value = 0;\n'
                 code += ''.join(f'    value += input.get({i}).copied().unwrap_or({i}) * {i + 3};\n' for i in range(18))
                 code += '    value\n}\n'
                 Path('src/original.rs').write_text(code, encoding='utf-8')
                 Path('src/existing.rs').write_text(code.replace('transform', 'existing'), encoding='utf-8')
+                Path('vendor').mkdir()
+                Path('vendor/ignored.rs').write_text(code, encoding='utf-8')
                 git('add', '.')
                 git('-c', 'user.name=Gate test', '-c', 'user.email=gate@example.invalid', 'commit', '-qm', 'baseline')
+                # Root-only exclusion must not swallow jscpd's Linux /tmp baseline worktree.
+                Path('tmp').mkdir()
+                Path('tmp/ignored.rs').write_text(code, encoding='utf-8')
                 output = root / 'evidence'
                 output.mkdir()
                 before = duplication_check(output, 'HEAD')
                 self.assertEqual(before['status'], 'completed')
                 self.assertGreater(before['statistics']['clones'], 0)
+                self.assertEqual(before['statistics']['sources'], 2)
+                # Baseline worktrees are scanned by absolute path. Exclusions
+                # must select the same source files for either root spelling.
+                config['path'] = [str(root)]
+                Path('.jscpd.json').write_text(json.dumps(config), encoding='utf-8')
+                absolute = duplication_check(output, 'HEAD')
+                self.assertEqual(absolute['status'], 'completed')
+                self.assertEqual(absolute['statistics']['sources'], 2)
+                config['path'] = ['.']
+                Path('.jscpd.json').write_text(json.dumps(config), encoding='utf-8')
                 Path('src/new.rs').write_text(code.replace('transform', 'new_copy').replace('value', 'total'), encoding='utf-8')
                 after = duplication_check(output, 'HEAD')
                 self.assertEqual(after['exit_code'], 1)

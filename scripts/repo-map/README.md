@@ -94,13 +94,17 @@ jscpd's snippet and per-file clone queries were also exercised.
 Install the pinned tools on another Windows checkout with `uv tool install
 serena-agent==1.7.0`, `rustup component add rust-analyzer rust-src --toolchain
 nightly-2026-04-07`, and `npm install --prefix
-"$env:LOCALAPPDATA/neoethos/tools/code-intelligence" jscpd@5.3.3` (each is one
+"$env:LOCALAPPDATA/neoethos/tools/code-intelligence" jscpd@5.4.1` (each is one
 command). The Codex server commands here point to the installed `serena.exe` and
 native `jscpd-windows-x64-msvc/bin/jscpd.exe`. Trust only the intended project in
 both Codex and Serena; custom language-server initialization requires Serena trust.
 
 The single `.jscpd.json` covers Rust, TS/TSX, JS, Python, C/C++ and CUDA extensions,
-excluding vendor, temporary and generated build directories. `check_duplication`
+excluding vendor, temporary and generated build directories. The root `/tmp/`
+exclusion lives in `.gitignore`: jscpd matches its own ignore globs against full
+paths, so `tmp/**` would also exclude Linux baseline checkouts under `/tmp`,
+while `./vendor/**` would miss vendor in an absolute baseline scan. The tests
+exercise both relative and absolute scan roots. `check_duplication`
 tests a proposed block against current indexed source; `get_file_clones` locates
 existing overlaps. Use a small `limit`, and refresh with
 `check_current_directory(limit=0)` after changes. Token thresholds are 12 lines
