@@ -4,6 +4,102 @@ Local code navigation and repeatable mapping on GitHub-hosted runners. No AI API
 GPU execution or production source rewrite is involved. The workflow adds
 diagnostics without changing the manual-only build/test CI.
 
+## Resume without repeating work
+
+Before implementation or reinstalling tooling, use the same query entry point:
+
+```sh
+python scripts/repo-map/query_map.py --resume "duplicate gate" --limit 3
+```
+
+On this Windows checkout use `.git/repo-map-venv/Scripts/python.exe`. This mode
+combines current Git state, Beads Rust in-progress/ready/recently closed work,
+closed-inclusive task search, and read-only CASS session search scoped to the
+configured project workspaces. Text output defaults to 6,000 characters, including
+only short transcript snippets; task notes show their latest recorded tail.
+A failed tool or timed-out
+history lookup returns a nonzero exit; it must not be interpreted as no history.
+The code-map cache and its `--local` interface remain unchanged.
+
+The stores have distinct jobs:
+
+- `.beads/issues.jsonl` is the one Git-tracked task ledger: decisions, attempts,
+  outcomes, validation references and next actions. Use `br show ID --json` for
+  the whole record, `br search "topic" --all --json --limit 3` before opening a
+  new task, and `br ready --json --limit 3` to select unfinished work. Update an
+  existing issue as work changes; close only after its acceptance criteria pass.
+  Run `br sync --flush-only` before committing. Database, locks and tool-generated
+  local backups are ignored. A new checkout can reconstruct them from JSONL with
+  `br sync --import-only`; never replace the ledger with a new empty workspace.
+- CASS indexes existing Codex transcripts locally, including archived sessions.
+  Search results retain the source path and canonical message index for checking
+  what actually happened. Expand a selected hit with `cass view SOURCE
+  --message-index LINE_NUMBER --source SOURCE_ID --conversation-id CONVERSATION_ID
+  -C 0 --json --timeout 5000` (one command, using the installed prefix).
+  Search's `line_number` is **not** a physical JSONL line: `-n` can open unrelated
+  content. A message can be large; inspect only the relevant bounded content.
+  Historical claims are leads; verify the referenced code/commit and distinguish
+  a failed attempt from a proved result. Sessions in another worktree require
+  its exact workspace filter; configure all known project paths. This installation
+  includes the primary checkout and both recorded spellings of phase0-bootstrap.
+  A no-hit search in one workspace is not a global absence.
+- Git and the existing code map establish current source state. Task completion
+  and past transcript claims never substitute for current source or execution
+  evidence. Reopen completed work with the regression/change that justifies it.
+
+Installed versions: Beads Rust **0.7.4** (`br.exe` in the existing user
+`.local/bin`) and CASS **0.10.0** (Linux executable under local WSL). Release
+archives were checked against the SHA-256 digests published by GitHub. Native
+Windows CASS 0.10.0 reports a passing selftest then crashes during thread shutdown;
+the Linux executable passed, so do not reinstall the Windows build to fix PATH.
+These are local tools; no LLM API or remote history service is configured.
+
+Machine-specific executable prefixes live in ignored `.codex/continuity.json`
+as `br_command` and `cass_command` argument arrays. `history_workspaces` contains
+exact workspace paths; `cass_index_report` names the one local JSON index report.
+On a fresh machine, install
+the pinned official releases, set these arrays, configure CASS sources for the
+existing Codex session directories, and save an initial `cass index --json` report.
+Subsequent resume searches use `--no-maintenance`: they cannot rebuild the index,
+download models or launch detached catch-up jobs. This machine stores the
+CASS configuration at `/home/konst/.config/neoethos/cass/sources.toml` and data at
+`/home/konst/.local/share/neoethos/cass` in WSL; command prefixes set those paths.
+`CASS_RAW_MIRROR=0` avoids a second copy of the raw transcripts; `CASS_AUTO_REFRESH=0`
+prevents detached catch-up jobs. Indexing uses the configured local Codex sources;
+retrieval is lexical, with no embedding download.
+The original Codex logs remain necessary evidence; the index is not their backup.
+
+When newer transcript evidence is needed, inspect free disk space and run one
+incremental pass, preserving its JSON result even on nonzero exit. In PowerShell:
+
+```powershell
+$historyConfig = Get-Content .codex/continuity.json -Raw | ConvertFrom-Json
+$historyExe = $historyConfig.cass_command[0]
+$historyArguments = $historyConfig.cass_command | Select-Object -Skip 1
+$historyResult = & $historyExe @historyArguments index --json --background
+$historyExit = $LASTEXITCODE
+$historyResult | Set-Content -LiteralPath $historyConfig.cass_index_report -Encoding utf8
+# Inspect historyExit and the report before retrying.
+```
+
+The resume command exposes that report's coverage warnings separately from index
+freshness. CASS can report a ready index even when some sources were rejected.
+The initial corpus has 12 files above the default 100 MiB source budget; one is
+1.44 GB, beyond this release's maximum configurable budget. Do not rebuild or
+raise the limit repeatedly. Read `indexing_stats.connector_diagnostics` for exact
+paths and use an `rg` excerpt on a relevant rejected original, for example in
+PowerShell: `rg -n -m 3 -o '.{0,100}TechnicalIdentifier.{0,100}' SOURCE |
+Select-Object -First 3` (one command, using a Windows path). Limit displayed matches
+as well as matching lines: one JSONL line can contain many matches.
+Coverage warnings and stale timestamps remain visible at the start of the result.
+These warnings allow useful partial retrieval; unavailable tools and timeouts fail.
+If disk usage grows, `cass index --gc --json` reclaims only merge-retired segments
+after the tool's grace period, without rescanning sources. Never delete original logs.
+
+There is no second handoff/TODO document to maintain. `AGENTS.md` makes this
+resume procedure persistent across sessions, and the same issue is updated during
+work so interruption does not lose the last recorded state.
+
 ## Use from a phone
 
 After merging the workflow, open **Actions → Repository map → Run workflow**.

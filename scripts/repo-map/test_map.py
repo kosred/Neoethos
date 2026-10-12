@@ -19,6 +19,66 @@ from reuse_scip import check_source, validate_profile
 
 
 class GraphEvidenceTests(unittest.TestCase):
+    def test_resume_checks_closed_work_and_surfaces_unavailable_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '.codex').mkdir()
+            (root / '.codex/continuity.json').write_text(
+                json.dumps({'br_command': ['br'], 'cass_command': ['cass']}), encoding='utf-8')
+            def git_result(_root, *args):
+                return str(root).encode() if args[-1] == '--show-toplevel' else b'current-commit'
+            def run_result(command, **kwargs):
+                if command[0] == 'cass':
+                    return subprocess.CompletedProcess(command, 7, '', 'index is busy')
+                issue = {'id': 'neo-old', 'title': 'Already investigated', 'status': 'closed'}
+                return subprocess.CompletedProcess(command, 0, json.dumps({'issues': [issue]}), '')
+            with mock.patch.object(query_map, 'git', side_effect=git_result), \
+                 mock.patch.object(query_map.subprocess, 'run', side_effect=run_result) as commands:
+                result = query_map.resume_context(root, 'duplicate gate')
+            self.assertEqual(result['matching_work_including_closed'][0]['status'], 'closed')
+            calls = [call.args[0] for call in commands.call_args_list]
+            self.assertIn('--all', next(cmd for cmd in calls if cmd[:2] == ['br', 'search']))
+            history = next(cmd for cmd in calls if cmd[0] == 'cass')
+            self.assertIn('--no-maintenance', history)
+            self.assertNotIn('--refresh', history)
+            self.assertEqual(history[history.index('--workspace') + 1], str(root))
+            self.assertTrue(any('index is busy' in error for error in result['errors']))
+
+    def test_resume_output_keeps_failures_visible_when_capped(self):
+        result = {'past_sessions': 'x' * 5000, 'errors': ['History is incomplete'],
+                  'warnings': ['Some source files were skipped']}
+        output = query_map.compact_resume(result, 300)
+        self.assertLessEqual(len(output), 300)
+        self.assertIn('History is incomplete', output)
+        self.assertIn('Some source files were skipped', output)
+
+    def test_ready_history_does_not_hide_rejected_sources_or_latest_task_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '.codex').mkdir()
+            report = root / 'index.json'
+            report.write_text(json.dumps({'success': False, 'indexing_stats': {
+                'connector_diagnostics': [{'source_path': 'oversized.jsonl'}]}}), encoding='utf-8')
+            (root / '.codex/continuity.json').write_text(json.dumps({
+                'br_command': ['br'], 'cass_command': ['cass'], 'cass_index_report': str(report)
+            }), encoding='utf-8')
+            def invoke(command, **kwargs):
+                if command[0] == 'br':
+                    data = [{'id': 'neo-current', 'notes': 'Old checkpoint. ' * 100 + 'NEXT: verify existing caller'}]
+                else:
+                    data = {'hits': [{'source_path': 'past.jsonl', 'line_number': 42,
+                                     'conversation_id': 7, 'source_id': 'local'}],
+                            '_meta': {'index_freshness': {'fresh': True}}}
+                return subprocess.CompletedProcess(command, 0, json.dumps(data), '')
+            with mock.patch.object(query_map, 'git', return_value=str(root).encode()), \
+                 mock.patch.object(query_map.subprocess, 'run', side_effect=invoke):
+                result = query_map.resume_context(root, 'existing caller')
+            self.assertEqual(result['history_coverage']['rejected_sources'], 1)
+            self.assertTrue(any('coverage is incomplete' in warning for warning in result['warnings']))
+            self.assertTrue(result['in_progress'][0]['notes'].endswith('NEXT: verify existing caller'))
+            self.assertEqual(result['past_sessions']['hits'][0]['conversation_id'], 7)
+            self.assertIn('canonical message index', result['past_sessions']['coordinates'])
+
     def test_local_digest_detects_unstaged_edits_additions_and_deletions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -6,6 +6,7 @@
 /logs/
 /.claude/
 /.codex/config.toml
+/.codex/continuity.json
 /.pytest_cache/
 /.ruff_cache/
 /catboost_info/

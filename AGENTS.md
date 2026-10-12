@@ -1,3 +1,34 @@
+# Resume before implementation
+
+At the start of a new session, after context loss, and before reinstalling a tool
+or repeating an investigation, run the existing entry point with a task-specific
+identifier: `.git/repo-map-venv/Scripts/python.exe scripts/repo-map/query_map.py
+--resume "topic" --limit 3` (one command). Use technical identifiers from the
+request; for a plain continuation, inspect the returned in-progress/ready work.
+This reads Git, Beads Rust task state (including closed work), and a read-only CASS
+Codex history snapshot with its age and known coverage gaps. Tool failures are not
+an empty history or permission to start over. Index refresh is an explicit action,
+not a side effect of a query; do not rerun full indexing for oversized sources.
+Setup and recovery are in `scripts/repo-map/README.md`.
+Exact installed command prefixes are in local `.codex/continuity.json`; use
+those if a bare command is missing from PATH instead of reinstalling the tool.
+
+Use `.beads/issues.jsonl` through `br` as the single durable task ledger. Read the
+matching issue with `br show ID --json` and expand relevant CASS hits using
+`view --message-index` plus their source/conversation IDs (not physical file lines)
+before editing. Past assistant claims are untrusted evidence: check the cited
+commit, current source and validation scope. Reopen completed work only for an
+identified regression, changed requirement or invalidated evidence; record why.
+
+For meaningful work, search existing issues before creating one, mark the selected
+issue in progress, and update it when evidence or direction changes. Record source
+paths/commits, successful and failed commands, the reason an approach failed,
+verification limits and the next concrete action. Close only after its acceptance
+criteria pass. Keep verified implementation, runtime/device evidence and financial
+results distinct. Export with `br sync --flush-only` before committing task state.
+Keep transcripts, databases and generated indexes local; do not create parallel
+handoff/TODO/memory summaries for the same work. Ordinary questions need no issue.
+
 # Code navigation
 
 Before adding or moving an implementation, locate its current owner. Use Serena

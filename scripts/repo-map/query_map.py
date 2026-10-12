@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retrieve bounded connections; --local maintains the existing mapper's cache."""
+"""Retrieve code connections or resume from durable tasks and session evidence."""
 import argparse
 import hashlib
 import json
@@ -115,11 +115,99 @@ def compact(result, max_chars=6000):
     return text if len(text) <= max_chars else text[:max_chars - len(suffix)] + suffix
 
 
+def resume_context(root, query, limit=3):
+    """Compose existing tools; their databases remain the only task/history stores."""
+    root = Path(os.fsdecode(git(root, "rev-parse", "--show-toplevel")).strip())
+    settings = json.loads((root / ".codex/continuity.json").read_text(encoding="utf-8"))
+    if not isinstance(settings, dict):
+        raise ValueError("Local continuity configuration must be a JSON object")
+    workspaces = settings.get("history_workspaces", [str(root)])
+    if not isinstance(workspaces, list) or not workspaces or not all(isinstance(path, str) and path for path in workspaces):
+        raise ValueError("history_workspaces must contain exact project workspace paths")
+    result = {
+        "commit": git(root, "rev-parse", "HEAD").decode().strip(),
+        "working_tree": git(root, "status", "--short").decode("utf-8", "replace")[:800],
+        "recent_commits": git(root, "log", "-6", "--format=%h %s").decode("utf-8", "replace"),
+        "notice": "Past sessions are evidence of attempts, not current truth. Verify cited commits and source before reuse. No history hit is not proof that work was never done.",
+        "history_workspaces": workspaces,
+    }
+    try:
+        report_path = Path(settings["cass_index_report"])
+        report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+        diagnostics = report.get("indexing_stats", {}).get("connector_diagnostics", [])
+        result["history_coverage"] = {
+            "last_index_pass_succeeded": report.get("success"),
+            "rejected_sources": len({item["source_path"] for item in diagnostics}),
+            "report": str(report_path),
+        }
+        if report.get("success") is not True:
+            result.setdefault("warnings", []).append(
+                "History coverage is incomplete. Read the local index report and search rejected source files with rg when relevant; do not repeat indexing unchanged oversized files.")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        result.setdefault("warnings", []).append(f"History coverage is unknown: {error}")
+    calls = {
+        "in_progress": ("br", ["list", "--status", "in_progress", "--limit", str(limit), "--json"]),
+        "ready": ("br", ["ready", "--limit", str(limit), "--json"]),
+        "recently_closed": ("br", ["list", "--status", "closed", "--sort", "updated_at", "--limit", str(limit), "--json"]),
+        "matching_work_including_closed": ("br", ["search", query, "--all", "--limit", str(limit), "--json"]),
+        "past_sessions": ("cass", ["search", query, *[arg for path in workspaces for arg in ("--workspace", path)], "--agent", "codex",
+                                  "--mode", "lexical", "--no-maintenance", "--robot", "--robot-meta",
+                                  "--fields", "source_path,line_number,source_id,conversation_id,snippet", "--limit", str(limit), "--max-tokens", "1500",
+                                  "--max-content-length", "250", "--timeout", "5000"]),
+    }
+    for name, (tool, arguments) in calls.items():
+        try:
+            command = settings[tool + "_command"]
+            if not isinstance(command, list) or not command or not all(isinstance(arg, str) for arg in command):
+                raise ValueError(f"Invalid {tool}_command in local continuity configuration")
+            proc = subprocess.run([*command, *arguments], cwd=root, capture_output=True,
+                                  text=True, encoding="utf-8", timeout=20,
+                                  env={**os.environ, "RUST_LOG": "error"})
+            if proc.returncode:
+                raise RuntimeError(f"{tool} exit {proc.returncode}: {proc.stderr[-400:] or proc.stdout[-400:]}")
+            data = json.loads(proc.stdout)
+            if tool == "br":
+                issues = data if isinstance(data, list) else data["issues"]
+                fields = ("id", "title", "status", "updated_at", "external_ref")
+                if name in {"in_progress", "matching_work_including_closed"}:
+                    fields += ("description", "notes")
+                result[name] = [{k: (str(issue[k])[-1000:] if k == "notes" else str(issue[k])[:700])
+                                 for k in fields if issue.get(k)} for issue in issues[:limit]]
+            else:
+                meta = data.get("_meta", {})
+                result[name] = {k: data[k] for k in ("query", "count", "total_matches", "zero_result_diagnosis") if k in data}
+                fields = ("source_path", "line_number", "source_id", "conversation_id", "snippet")
+                result[name]["hits"] = [{k: hit[k] for k in fields if k in hit} for hit in data["hits"][:limit]]
+                result[name]["coordinates"] = "line_number is a canonical message index; use cass view --message-index, not -n."
+                result[name]["freshness"] = meta.get("index_freshness", {})
+                if data.get("budget", {}).get("timed_out") or meta.get("timed_out"):
+                    result.setdefault("errors", []).append("History search timed out; results are incomplete.")
+                freshness = result[name]["freshness"]
+                if freshness.get("stale") or freshness.get("partial") or freshness.get("rebuilding"):
+                    result.setdefault("warnings", []).append(
+                        "History is an older or partial snapshot. Consult the ledger first; refresh explicitly if newer transcript evidence is needed (see README).")
+                if data.get("_warning") and not any(freshness.get(key) for key in ("stale", "partial", "rebuilding")):
+                    result.setdefault("warnings", []).append(str(data["_warning"])[:500])
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, RuntimeError) as error:
+            result.setdefault("errors", []).append(f"{name}: {error}")
+    return result
+
+
+def compact_resume(result, max_chars=6000):
+    # Missing history must stay visible even when the detail budget is exhausted.
+    ordered = {**{k: result[k] for k in ("errors", "warnings") if result.get(k)}, **result}
+    text = json.dumps(ordered, ensure_ascii=False, indent=2)
+    suffix = "\n... output capped; use br show or cass view for the cited record."
+    return text if len(text) <= max_chars else text[:max_chars - len(suffix)] + suffix
+
+
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("database", type=Path, nargs="?")
     parser.add_argument("query", help="Substring of a symbol, package or path")
     parser.add_argument("--local", action="store_true", help="Refresh/reuse .git/repo-map locally")
+    parser.add_argument("--resume", action="store_true", help="Read durable tasks, Git history and the local Codex history snapshot before work")
     parser.add_argument("--direction", choices=["in", "out", "both"], default="both")
     parser.add_argument("--limit", type=int, default=8, help="Maximum matching nodes")
     parser.add_argument("--edge-limit", type=int, default=12, help="Total connection budget across all matches")
@@ -127,14 +215,21 @@ def main():
     parser.add_argument("--format", choices=["text", "json"], help="Default: text for --local, JSON for an explicit database")
     parser.add_argument("--max-chars", type=int, default=6000, help="Text output character budget")
     args = parser.parse_args()
-    if args.local == (args.database is not None):
-        parser.error("Use either --local QUERY or DATABASE QUERY")
+    if sum((args.local, args.resume, args.database is not None)) != 1:
+        parser.error("Use --local QUERY, --resume QUERY, or DATABASE QUERY")
     if not 1 <= args.limit <= 500 or not 0 <= args.edge_limit <= 500 or args.max_chars < 300:
         parser.error("Require limit 1..500, edge-limit 0..500 and max-chars >= 300")
     try:
+        if args.resume:
+            result = resume_context(Path.cwd(), args.query, min(args.limit, 8))
+            print(json.dumps(result, ensure_ascii=True, indent=2) if args.format == "json"
+                  else compact_resume(result, args.max_chars))
+            if result.get("errors"):
+                parser.exit(1, "Continuity lookup incomplete; inspect errors before repeating work.\n")
+            return
         database = local_database(Path.cwd()) if args.local else args.database
         result = query_graph(database, args.query, args.direction, args.limit, args.edge_limit, args.exact)
-    except (OSError, sqlite3.Error, RuntimeError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, sqlite3.Error, RuntimeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"{error}\n")
     output_format = args.format or ("text" if args.local else "json")
     print(compact(result, args.max_chars) if output_format == "text" else json.dumps(result, indent=2))
