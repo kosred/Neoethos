@@ -5,9 +5,10 @@ symbol snapshot, D1 screening-cost builder, streaming discovery and chronologica
 holdout evaluation in one invocation. It uses the explicitly supplied settings
 file for startup, CPU admission, runtime overrides and discovery.
 
-This command always constructs screening cost assumptions. It does not use the
-existing quote-replay/execution-economics consumer or the desktop's actual deal
-money. A negative screening run is not a verdict on the broker-cost pipeline.
+Candidate selection uses screening cost assumptions. By default, so does the
+final holdout. An explicitly supplied saved quote-replay bundle connects the
+existing quote and execution-economics consumer after the portfolio is locked.
+A negative screening run is not a verdict on the broker-cost pipeline.
 Use [the account evidence entrypoint](broker-account-evidence.md) to inspect the
 actual account currency, broker PnL and reported commission/swap components.
 
@@ -37,6 +38,34 @@ batches. Override these explicitly with `--population`, `--generations`,
 `--max-indicators`, `--candidates` and `--max-batches`; each accepts only a
 positive integer. Zero does not mean unlimited work here. `--cpu-threads` is the
 existing process CPU cap. Omitted `--higher` uses the supplied settings' ladder.
+
+For a saved reviewed replay, supply all three flags:
+`--quote-replay-bundle <json> --quote-replay-sha256 <sha256> --quote-replay-store <dir>`
+and `--max-batches 1`. The store is the existing broker-truth acquisition store.
+The bundle is `StoredFinalistQuoteReplayV1` schema 1: the exact acquisition outcome,
+review metadata, and per-position entry financial inputs plus closed execution
+economics. Positions are keyed by strategy lane and canonical decision row, with
+an exact quote-ledger hash check; identical quotes in different lanes retain
+their separate sizing and cash. The input hash and
+acquisition link are checked before feature work. Replay reopens the reviewed
+Vortex evidence and validates the locked portfolio, selection scope, sizing,
+causal conversion and signed cash components. Missing, duplicate, unused or
+inconsistent position inputs are refused. Deserialized metadata grants no
+authority; the existing validator must independently reopen the immutable evidence.
+
+The bundle must match the portfolio selected by this invocation, including its
+final SMC policy. A different selection is refused rather than silently rebinding
+old evidence. This is an explicit continuation interface, not automatic broker
+acquisition. Current account/deal snapshots alone are not sufficient to produce
+this bundle or establish historical fee policy. The local integration regression
+uses synthetic observations in real Vortex storage; it does not establish that a
+broker-backed finalist bundle has been acquired or that a strategy is profitable.
+
+The streaming index records `quote_replay_status`, the input SHA256 and the
+evidence path. `ReplayedResearchOnly` saves the existing V3 evidence to
+`research.json.quote-replay.json`. `NotExecutedNoSelectedPortfolio` means the
+quote consumer did not run; `Failed` preserves the batch failure. Neither is a
+successful quote validation. With no bundle, the status is `NotRequested`.
 
 Each run saves the exact `settings.yaml` and `broker-symbol-contract.json`
 snapshots, `run-arguments.json`, `screening-costs.json`, `discovery-arguments.json`, the exact

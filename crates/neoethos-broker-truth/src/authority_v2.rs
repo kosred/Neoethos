@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fmt;
 
 use neoethos_dataset_contracts::CanonicalDatasetScope;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::acquisition_store_v1::{
     BrokerTruthAcquisitionLinkReceiptV1, BrokerTruthAcquisitionStoreV1,
@@ -129,7 +129,8 @@ fn authority_error(
 /// This value is evidence metadata only. It cannot create a capability or a
 /// permit and is consumed by the validator so a review set cannot be silently
 /// reused for another run.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewedBrokerFinancialTruthEvidenceV2 {
     canonical_run_identity_sha256: String,
     canonical_scope_identity_sha256: String,

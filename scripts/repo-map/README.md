@@ -223,6 +223,17 @@ the hook never does that automatically. Existing Git LFS hooks are preserved.
 Missing tools, failed scans and invalid baseline refs fail the check. CI failure
 does not by itself configure GitHub branch protection.
 
+The scanner can assign a new clone fingerprint to an old pair when other edits
+change its matching boundaries. `run_checks.py` retains the raw scanner report
+and verifies each newly reported pair against unchanged line blocks in the base
+commit. Only pairs where **every line on both sides already exists in the same
+ordered Git blocks** are classified as preexisting. Deleting intervening lines
+can join existing blocks; adding or replacing lines cannot. Inserted copies,
+modified lines and untracked files still fail
+the zero-introduced-clones gate. `checks.json` records the exact baseline commit,
+both current/base ranges and `introduced_clones`. Missing evidence or failed
+source verification fails the gate; no exclusion or baseline reset is applied.
+
 Python 3.11+ is required (workflow uses 3.12).
 
 For routine local discovery, reuse this mapper with its automatically refreshed

@@ -848,6 +848,7 @@ pub fn evaluate_locked_portfolio_outer_holdout_v1(
     evaluate_bound_quote_ledgers_v1(
         initial_balance,
         BoundPipValues::Fixed(pip_value_per_lot),
+        None,
         replay_set,
         canonical_search_input_receipt_sha256,
         canonical_signal_plan_sha256,
@@ -866,12 +867,19 @@ enum BoundPipValues<'a> {
 fn evaluate_bound_quote_ledgers_v1(
     initial_balance: AccountMoneyV1,
     pip_values: BoundPipValues<'_>,
+    prelocked_lanes: Option<&[usize]>,
     replay_set: LockedPortfolioOuterHoldoutReplaySetV1,
     canonical_search_input_receipt_sha256: String,
     canonical_signal_plan_sha256: String,
     portfolio_identity_sha256: String,
     holdout_scope_identity_sha256: String,
 ) -> Result<QuoteValidatedOuterHoldoutResearchEvidenceV1, QuoteValidatedOuterHoldoutErrorV1> {
+    if prelocked_lanes.is_some_and(|lanes| lanes.len() != replay_set.ordered_quote_ledgers.len()) {
+        return Err(outer_error(
+            QuoteValidatedOuterHoldoutErrorCodeV1::BindingMismatch,
+            "prelocked strategy lanes do not cover every quote ledger",
+        ));
+    }
     let valid_pip_values = match &pip_values {
         BoundPipValues::Fixed(value) => value.is_finite() && *value > 0.0,
         BoundPipValues::PerClosedTrade(values) => {
@@ -960,7 +968,10 @@ fn evaluate_bound_quote_ledgers_v1(
                 format!("ordered quote ledger {ordinal} account/symbol/window differs"),
             ));
         }
-        if !observed_quote_ledgers.insert(quote_ledger.ledger_sha256().to_owned()) {
+        // V1 has no verified lane provenance and retains global deduplication.
+        // V3's sealed plan proves independent lanes even for identical quotes.
+        let lane = prelocked_lanes.map_or(0, |lanes| lanes[ordinal]);
+        if !observed_quote_ledgers.insert((lane, quote_ledger.ledger_sha256().to_owned())) {
             return Err(outer_error(
                 QuoteValidatedOuterHoldoutErrorCodeV1::DuplicateReplayReceipt,
                 format!("ordered quote ledger {ordinal} repeats a ledger identity"),

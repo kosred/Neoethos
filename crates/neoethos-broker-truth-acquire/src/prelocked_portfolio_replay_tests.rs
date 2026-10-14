@@ -284,9 +284,6 @@ impl StoredFixture {
             acquisition_link_receipt: authority.link_receipt.clone(),
             replay_binding,
             replay_policy,
-            artifact_class: FinalistQuoteReplayArtifactClassV1::ResearchOnly,
-            semantic_status: BrokerTruthSemanticStatusV1::UnvalidatedEvidenceOnly,
-            promotion_eligibility: BrokerTruthPromotionEligibilityV1::NotPromotionEligible,
             portfolio_identity_sha256: locked.portfolio_identity_sha256().to_owned(),
             search_config_hash: locked.search_config_hash().to_owned(),
             holdout_scope_identity_sha256: locked.scope_identity_sha256().to_owned(),
@@ -359,6 +356,144 @@ fn sized_economics(
         &SignedSwapCashflowV1::new("USD", 0.0, closed_at, &source)?,
         &PnlConversionFeeV1::new("USD", 0.0, &source)?,
     )?)
+}
+
+#[test]
+fn saved_quote_replay_reopens_vortex_and_preserves_exact_money_and_sizing() {
+    assert_saved_quote_replay(SignalFixture::new(), false);
+}
+
+#[test]
+fn saved_quote_replay_distinguishes_identical_quotes_in_separate_strategy_lanes() {
+    let mut fixture = SignalFixture::new();
+    fixture.genes[1] = fixture.genes[0].clone();
+    fixture.genes[1].strategy_id = "coincident-strategy".into();
+    fixture.signals[1] = fixture.signals[0].clone();
+    assert_saved_quote_replay(fixture, true);
+}
+
+fn assert_saved_quote_replay(fixture: SignalFixture, coincident: bool) {
+    let locked = fixture.lock();
+    let stored = StoredFixture::new(&locked);
+    let capture = serde_json::to_value(&stored.capture).unwrap();
+    let reviewed = serde_json::to_value(&stored.authority.reviewed).unwrap();
+    let mut entries = Vec::new();
+    let mut executions = Vec::new();
+    let original = in_leased_pool(|cpu| {
+        stored
+            .capture
+            .replay_reviewed_locked_portfolio_v3(
+                cpu,
+                &stored.authority.store,
+                stored.authority.reviewed,
+                &locked,
+                |ledger, origin| {
+                    let entry = entry_financial_inputs(ledger, origin)?;
+                    entries.push((
+                        origin.portfolio_index,
+                        origin.canonical_source_row,
+                        entry.clone(),
+                    ));
+                    Ok(entry)
+                },
+                |ledger, sizing| {
+                    let execution = sized_economics(ledger, sizing)?;
+                    executions.push(execution.clone());
+                    Ok(execution)
+                },
+            )
+            .unwrap()
+    });
+    assert_eq!(entries.len(), executions.len());
+    let positions: Vec<_> = entries
+        .into_iter()
+        .zip(executions)
+        .map(
+            |((portfolio_index, canonical_source_row, entry), execution)| {
+                StoredQuotePositionEconomicsV1 {
+                    portfolio_index,
+                    canonical_source_row,
+                    entry,
+                    execution,
+                }
+            },
+        )
+        .collect();
+    if coincident {
+        assert_eq!(
+            positions[0].execution.quote_ledger_sha256(),
+            positions[1].execution.quote_ledger_sha256()
+        );
+        assert_ne!(
+            positions[0].execution.filled_lots(),
+            positions[1].execution.filled_lots()
+        );
+    }
+    let json = serde_json::json!({"schema_version":1, "capture":capture,
+        "reviewed":reviewed, "positions":positions});
+    let load = |value: &serde_json::Value| {
+        StoredFinalistQuoteReplayV1::from_json_bytes(&serde_json::to_vec(value).unwrap())
+    };
+    let replay = in_leased_pool(|cpu| {
+        load(&json)
+            .unwrap()
+            .replay(cpu, &stored.authority.store, &locked)
+            .unwrap()
+    });
+    let expected = evaluate_locked_portfolio_outer_holdout_v3(&locked, original).unwrap();
+    let actual = evaluate_locked_portfolio_outer_holdout_v3(&locked, replay).unwrap();
+    if coincident {
+        // Both enter at Ask 1.25 and exit at Bid 1.375. The second entry
+        // sees the first position's -12500 spread mark and -7 entry fee:
+        // 87493 * .125 * .5 / 25000 -> .125 lots on the captured grid.
+        // Independent cash oracle: (12500 - 14) + (1562.5 - 1.75).
+        assert_eq!(actual.metrics().trade_count(), 2);
+        assert_eq!(actual.metrics().net_profit(), 14_046.75);
+        assert_eq!(actual.metrics().ending_balance(), 114_046.75);
+    }
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+
+    // Persisted metadata never gains authority by deserialization. Exercise
+    // wrong identity, invalid lot grid, missing cash and modified cash rows.
+    for field in [
+        "portfolio",
+        "lane",
+        "row",
+        "lots",
+        "missing",
+        "cash",
+        "receipt",
+    ] {
+        let mut altered = json.clone();
+        match field {
+            "portfolio" => altered["capture"]["portfolio_identity_sha256"] = "e".repeat(64).into(),
+            "lane" => altered["positions"][0]["portfolio_index"] = 99.into(),
+            "row" => altered["positions"][0]["canonical_source_row"] = 99.into(),
+            "lots" => altered["positions"][0]["entry"]["lot_constraints"]["lot_step"] = 0.0.into(),
+            "missing" => altered["positions"] = serde_json::json!([]),
+            "cash" => altered["positions"][0]["execution"]["filled_lots"] = 99.0.into(),
+            "receipt" => {
+                altered["capture"]["broker_truth_receipt"]["manifest_sha256"] =
+                    "e".repeat(64).into()
+            }
+            _ => unreachable!(),
+        }
+        let result =
+            in_leased_pool(|cpu| load(&altered)?.replay(cpu, &stored.authority.store, &locked));
+        assert!(result.is_err(), "{field} substitution was accepted");
+    }
+    let mut duplicated = json.clone();
+    let copy = duplicated["positions"][0].clone();
+    duplicated["positions"].as_array_mut().unwrap().push(copy);
+    assert!(load(&duplicated).is_err());
+    assert!(
+        current_broker_financial_truth_capability_v1()
+            .require(BrokerFinancialOperationV1::LiveTrading)
+            .is_err()
+    );
 }
 
 #[test]

@@ -2131,7 +2131,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         .context("acquire the complete process CPU budget for Discovery")?;
 
     executor
-        .execute(lease.into_transfer(), move || {
+        .execute_with_scope(lease.into_transfer(), move |cpu| {
             let observed_width =
                 neoethos_core::execution::BudgetedCpuExecutor::current_pool_width();
             anyhow::ensure!(
@@ -2145,15 +2145,23 @@ fn cmd_discover(args: &[String]) -> Result<()> {
                 rayon_pool_workers = observed_width,
                 "Discovery entered the lease-bound CPU pool"
             );
-            cmd_discover_on_budgeted_pool(args)
+            cmd_discover_on_budgeted_pool(args, cpu)
         })
         .context("execute Discovery on the lease-bound CPU pool")?
 }
 
-fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
+fn cmd_discover_on_budgeted_pool(
+    args: &[String],
+    cpu: &neoethos_core::execution::BudgetedCpuScope<'_>,
+) -> Result<()> {
     let result = (|| -> Result<(String, String, usize, usize)> {
         let settings = resolve_cli_settings(args)?;
         let canonical_cpu_research = parse_canonical_cpu_research_inputs(args)?;
+        let mut quote_replay = canonical_research::QuoteReplayInputs::load(args)?;
+        anyhow::ensure!(
+            quote_replay.is_none() || canonical_cpu_research.is_some(),
+            "quote replay requires receipt-bound canonical CPU research"
+        );
         #[cfg(feature = "gpu-nvidia")]
         anyhow::ensure!(
             canonical_cpu_research.is_none(),
@@ -2457,6 +2465,23 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
                 ],
             )?;
 
+            if let Some(replay) = &quote_replay {
+                for target in [
+                    out.clone(),
+                    format!("{out}.quote-replay.json"),
+                    format!("{out}.streaming.json"),
+                ] {
+                    canonical_full_run::ensure_cpu_research_output_target(
+                        std::path::Path::new(&target),
+                        &[replay.source.as_path()],
+                    )?;
+                }
+            }
+            let mut quote_evidence = Vec::new();
+            anyhow::ensure!(
+                quote_replay.is_none() || stream_max_batches == 1,
+                "a saved quote replay requires --stream-max-batches 1"
+            );
             let mut outcome = neoethos_search::orchestration::run_streaming_working_set(
                 &neoethos_search::orchestration::StreamingPlan::streaming(stream_max_batches),
                 base_ohlcv.close.len(),
@@ -2508,6 +2533,21 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
                         &account_currency,
                     )?;
                     emit_cpu_research_stage("search_pipeline_started");
+                    if let Some(provider) = quote_replay.as_mut() {
+                        let (research, evidence) =
+                            neoethos_search::run_canonical_trendbar_research_with_quote_holdout_v3(
+                                &run_input,
+                                &research_config,
+                                &contract,
+                                neoethos_search::PropFirmRiskRules::default(),
+                                |locked| provider.replay(cpu, locked),
+                                emit_cpu_research_progress,
+                            )?;
+                        if let Some(evidence) = evidence {
+                            quote_evidence.push(evidence);
+                        }
+                        return Ok(research);
+                    }
                     neoethos_search::run_canonical_trendbar_research_discovery_with_holdout_and_progress(
                         &run_input,
                         &research_config,
@@ -2583,6 +2623,30 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
             }
 
             let streaming_path = format!("{out}.streaming.json");
+            let quote_replay_status = if quote_replay.is_none() {
+                "NotRequested"
+            } else if !quote_evidence.is_empty() {
+                "ReplayedResearchOnly"
+            } else if completed.is_empty() {
+                "Failed"
+            } else {
+                "NotExecutedNoSelectedPortfolio"
+            };
+            let quote_path = if !quote_evidence.is_empty() {
+                let path = format!("{out}.quote-replay.json");
+                neoethos_core::storage::json::write_json_atomic(
+                    &path,
+                    &serde_json::json!({
+                        "schema": "neoethos.canonical-quote-replay-evidence.v1",
+                        "artifact_class": "ResearchOnly", "promotion_eligibility": "NotPromotionEligible",
+                        "input_sha256": quote_replay.as_ref().map(|input| &input.sha256),
+                        "evidence": quote_evidence,
+                    }),
+                )?;
+                Some(path)
+            } else {
+                None
+            };
             let evidence_status = if completed.is_empty() {
                 "Failed"
             } else if completed.len() < ledger.batches_seen() {
@@ -2602,6 +2666,9 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
                 "authorization_issued": false,
                 "evidence_status": evidence_status,
                 "selection_outcome": selection_outcome,
+                "quote_replay_status": quote_replay_status,
+                "quote_replay_evidence_path": quote_path,
+                "quote_replay_input_sha256": quote_replay.as_ref().map(|input| &input.sha256),
                 "streaming_space_exhausted": streamed && next_cursor >= space_len,
                 "symbol": &symbol,
                 "base_timeframe": &base,
@@ -2620,6 +2687,7 @@ fn cmd_discover_on_budgeted_pool(args: &[String]) -> Result<()> {
 
             println!("canonical_cpu_research_status={evidence_status}");
             println!("selection_outcome={selection_outcome}");
+            println!("quote_replay_status={quote_replay_status}");
             println!(
                 "streaming_space_exhausted={}",
                 streamed && next_cursor >= space_len
@@ -5003,6 +5071,9 @@ fn print_help() {
     );
     println!(
         "  canonical-research --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --broker-symbol-contract <json> --broker-account-snapshot <account-snapshot.json> --settings-source <yaml> --symbol EURUSD --base-timeframe H4 --out-dir <new-dir> [--higher D1] [--population 64] [--generations 16] [--max-batches 2]"
+    );
+    println!(
+        "    saved quote replay: --quote-replay-bundle <json> --quote-replay-sha256 <sha> --quote-replay-store <dir> --max-batches 1"
     );
     println!(
         "                               One bounded CPU research run from exact acquisition receipts through D1 costs, discovery and chronological holdout evidence. Never authorizes promotion."

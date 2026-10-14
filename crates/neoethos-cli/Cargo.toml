@@ -45,6 +45,8 @@ gpu-bench-cuda = ["neoethos-search/gpu-cuda", "gpu-b-native"]
 [dependencies]
 neoethos-core = { path = "../neoethos-core" }
 neoethos-broker-history = { path = "../neoethos-broker-history" }
+neoethos-broker-truth-acquire = { path = "../neoethos-broker-truth-acquire" }
+neoethos-broker-truth.workspace = true
 neoethos-data = { path = "../neoethos-data" }
 neoethos-models = { path = "../neoethos-models", features = ["tree-models", "pure-rust-ml"] }
 neoethos-search = { path = "../neoethos-search" }

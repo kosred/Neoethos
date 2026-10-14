@@ -60,6 +60,7 @@ pub use finalist_quote_replay_acquisition_v1::{
     FinalistQuoteReplayAcquisitionInputV1, FinalistQuoteReplayAcquisitionOutcomeV1,
     FinalistQuoteReplayAcquisitionRequestV1, FinalistQuoteReplayArtifactClassV1,
     FinalistQuoteReplayRestartPolicyV1, MAX_FINALIST_QUOTE_REPLAY_WINDOW_MS_V1,
+    StoredFinalistQuoteReplayV1, StoredQuotePositionEconomicsV1,
     acquire_finalist_quote_replay_v1,
 };
 
