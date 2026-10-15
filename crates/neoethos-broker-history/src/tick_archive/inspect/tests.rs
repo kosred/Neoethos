@@ -15,6 +15,82 @@ fn event(timestamp_ms: i64, side: i32, price_units: i64) -> Event {
     }
 }
 
+fn spreads_only(
+    events: Vec<Event>,
+    from: i64,
+    to: i64,
+    max_age: i64,
+    units_per_pip: f64,
+) -> SpreadDiagnostics {
+    spread_diagnostics(events, from, to, max_age, units_per_pip, &[]).0
+}
+
+#[test]
+fn point_observations_share_grouped_book_without_future_or_tied_timestamp_prices() {
+    let events = vec![
+        event(10, 1, 100),
+        event(10, 2, 110),
+        event(20, 1, 101),
+        event(20, 1, 102),
+        event(25, 1, 120),
+        event(30, 2, 130),
+    ];
+    let times = [0, 10, 11, 20, 21, 25, 26, 30, 31, 45, 55];
+    let (spreads, points) = spread_diagnostics(events.clone(), 0, 60, 20, 10.0, &times);
+    assert_eq!(points.iter().map(|p| p.at_ms).collect::<Vec<_>>(), times);
+    assert_eq!(
+        points.iter().map(|p| &p.status).collect::<Vec<_>>(),
+        [
+            &BookStatus::UnavailableOrStale, // no earlier book
+            &BookStatus::UnavailableOrStale, // quotes at 10 are excluded
+            &BookStatus::Valid,
+            &BookStatus::Valid, // quotes at 20 are excluded
+            &BookStatus::Ambiguous,
+            &BookStatus::Ambiguous, // replacement at 25 is excluded
+            &BookStatus::Crossed,
+            &BookStatus::UnavailableOrStale, // ask age == 20, refresh at 30 excluded
+            &BookStatus::Valid,
+            &BookStatus::UnavailableOrStale, // bid age == 20
+            &BookStatus::UnavailableOrStale,
+        ]
+    );
+    assert!(points[1].same_timestamp_quotes_excluded);
+    assert!(points[3].same_timestamp_quotes_excluded);
+    assert!(!points[4].same_timestamp_quotes_excluded);
+    assert_eq!(points[3].bid.as_ref().unwrap().price_units, Some(100));
+    assert_eq!(points[4].bid.as_ref().unwrap().price_units, None);
+    assert_eq!(points[8].bid.as_ref().unwrap().timestamp_ms, 25);
+    assert_eq!(points[8].bid.as_ref().unwrap().age_ms, 6);
+    assert_eq!(points[8].ask.as_ref().unwrap().price_units, Some(130));
+    for point in &points {
+        for side in [&point.bid, &point.ask].into_iter().flatten() {
+            assert!(side.timestamp_ms < point.at_ms);
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(&spreads).unwrap(),
+        serde_json::to_value(spreads_only(events.clone(), 0, 60, 20, 10.0)).unwrap()
+    );
+    let reversed = spread_diagnostics(events.into_iter().rev().collect(), 0, 60, 20, 10.0, &times);
+    assert_eq!(
+        serde_json::to_value(points).unwrap(),
+        serde_json::to_value(reversed.1).unwrap()
+    );
+    let seeded = spread_diagnostics(
+        vec![event(90, 1, 100), event(95, 2, 110), event(100, 1, 105)],
+        100,
+        120,
+        20,
+        10.0,
+        &[100],
+    );
+    let point = &seeded.1[0];
+    assert_eq!(point.status, BookStatus::Valid);
+    assert_eq!(point.bid.as_ref().unwrap().price_units, Some(100));
+    assert_eq!(point.bid.as_ref().unwrap().age_ms, 10);
+    assert!(point.same_timestamp_quotes_excluded);
+}
+
 fn assert_partition(d: &SpreadDiagnostics) {
     assert_eq!(
         d.valid_book_ms + d.unavailable_or_stale_ms + d.ambiguous_book_ms + d.crossed_book_ms,
@@ -24,7 +100,7 @@ fn assert_partition(d: &SpreadDiagnostics) {
 
 #[test]
 fn spread_quantiles_weight_elapsed_time_instead_of_number_of_updates() {
-    let d = spread_diagnostics(
+    let d = spreads_only(
         vec![
             event(90, 2, 200),
             event(0, 1, 100),
@@ -46,11 +122,11 @@ fn spread_quantiles_weight_elapsed_time_instead_of_number_of_updates() {
 
 #[test]
 fn stale_and_unseeded_intervals_never_borrow_future_quotes() {
-    let d = spread_diagnostics(vec![event(10, 1, 100), event(20, 2, 110)], 0, 100, 30, 10.0);
+    let d = spreads_only(vec![event(10, 1, 100), event(20, 2, 110)], 0, 100, 30, 10.0);
     assert_eq!(d.valid_book_ms, 20);
     assert_eq!(d.unavailable_or_stale_ms, 80);
     assert_partition(&d);
-    let seeded = spread_diagnostics(vec![event(-10, 1, 100), event(-5, 2, 110)], 0, 30, 20, 10.0);
+    let seeded = spreads_only(vec![event(-10, 1, 100), event(-5, 2, 110)], 0, 30, 20, 10.0);
     assert_eq!(seeded.valid_book_ms, 10);
     assert_eq!(seeded.unavailable_or_stale_ms, 20);
     assert_partition(&seeded);
@@ -64,19 +140,19 @@ fn tied_distinct_prices_remain_ambiguous_until_a_new_unique_update() {
         event(0, 2, 110),
         event(50, 1, 100),
     ];
-    let d = spread_diagnostics(events.clone(), 0, 100, 1_000, 10.0);
+    let d = spreads_only(events.clone(), 0, 100, 1_000, 10.0);
     assert_eq!(d.ambiguous_book_ms, 50);
     assert_eq!(d.valid_book_ms, 50);
     assert_eq!(d.ambiguous_side_timestamp_groups, 1);
     assert_eq!(d.time_weighted_mean_pips, Some(1.0));
     assert_partition(&d);
     // Sorting tied events in a different order must not pick a different price.
-    let reversed = spread_diagnostics(events.into_iter().rev().collect(), 0, 100, 1_000, 10.0);
+    let reversed = spreads_only(events.into_iter().rev().collect(), 0, 100, 1_000, 10.0);
     assert_eq!(
         serde_json::to_value(&d).unwrap(),
         serde_json::to_value(&reversed).unwrap()
     );
-    let identical = spread_diagnostics(
+    let identical = spreads_only(
         vec![event(0, 1, 100), event(0, 1, 100), event(0, 2, 110)],
         0,
         100,
@@ -89,7 +165,7 @@ fn tied_distinct_prices_remain_ambiguous_until_a_new_unique_update() {
 
 #[test]
 fn crossed_and_fully_stale_books_cannot_pollute_spread_extrema() {
-    let d = spread_diagnostics(
+    let d = spreads_only(
         vec![
             event(0, 1, 110),
             event(0, 2, 100),
@@ -108,7 +184,7 @@ fn crossed_and_fully_stale_books_cannot_pollute_spread_extrema() {
     assert_eq!(d.min_pips, Some(1.0));
     assert_eq!(d.max_pips, Some(1.0));
     assert_partition(&d);
-    let empty = spread_diagnostics(Vec::new(), 0, 100, 20, 10.0);
+    let empty = spreads_only(Vec::new(), 0, 100, 20, 10.0);
     assert_eq!(empty.time_weighted_mean_pips, None);
     assert_eq!(empty.valid_book_fraction, 0.0);
     assert_partition(&empty);
@@ -184,6 +260,7 @@ fn fixture() -> (tempfile::TempDir, TickInspectCli) {
         to_ms: 2_000,
         max_quote_age_ms: 1_000,
         max_events: 100,
+        at_ms: Vec::new(),
         cpu_threads: None,
     };
     (root, cli)
@@ -201,7 +278,7 @@ fn persist(root: &Path, record: &super::super::PageRecord) {
 
 #[test]
 fn offline_inspection_verifies_real_decoder_pages_and_preserves_all_inputs() {
-    let (root, cli) = fixture();
+    let (root, mut cli) = fixture();
     let before = fs::read_dir(root.path())
         .unwrap()
         .map(|entry| {
@@ -219,6 +296,41 @@ fn offline_inspection_verifies_real_decoder_pages_and_preserves_all_inputs() {
     assert_eq!(report.account_id, 42);
     let again = inspect_archive(&cli, &HistoricalRequestCancellation::new()).unwrap();
     assert_eq!(report.binding_sha256, again.binding_sha256);
+    cli.at_ms = vec![1_100, 1_101, 1_900, 1_901];
+    let observed = inspect_archive(&cli, &HistoricalRequestCancellation::new()).unwrap();
+    assert_ne!(report.binding_sha256, observed.binding_sha256);
+    assert_eq!(
+        observed.point_observations[0].status,
+        BookStatus::UnavailableOrStale
+    );
+    assert!(observed.point_observations[0].same_timestamp_quotes_excluded);
+    assert_eq!(
+        observed.point_observations[1]
+            .bid
+            .as_ref()
+            .unwrap()
+            .price_units,
+        Some(110000)
+    );
+    assert_eq!(
+        observed.point_observations[2]
+            .ask
+            .as_ref()
+            .unwrap()
+            .price_units,
+        Some(110010)
+    );
+    assert_eq!(
+        observed.point_observations[3]
+            .ask
+            .as_ref()
+            .unwrap()
+            .price_units,
+        Some(110020)
+    );
+    cli.at_ms[3] += 1;
+    let changed = inspect_archive(&cli, &HistoricalRequestCancellation::new()).unwrap();
+    assert_ne!(observed.binding_sha256, changed.binding_sha256);
     for (path, bytes) in before {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
@@ -278,13 +390,33 @@ fn incomplete_corrupt_gapped_or_digest_mismatched_archives_are_refused() {
 
 #[test]
 fn diagnostic_scope_and_resource_limits_are_validated_before_scanning() {
-    for defect in ["too-wide", "outside", "age", "memory", "metadata", "policy"] {
+    for defect in [
+        "too-wide",
+        "outside",
+        "age",
+        "memory",
+        "metadata",
+        "policy",
+        "point-before",
+        "point-end",
+        "point-duplicate",
+        "point-order",
+        "point-budget",
+    ] {
         let (root, mut cli) = fixture();
         match defect {
             "too-wide" => cli.to_ms = cli.from_ms + WEEK_MS + 1,
             "outside" => cli.from_ms = 999,
             "age" => cli.max_quote_age_ms = 0,
             "memory" => cli.max_events = MAX_EVENTS + 1,
+            "point-before" => cli.at_ms = vec![999],
+            "point-end" => cli.at_ms = vec![2_000],
+            "point-duplicate" => cli.at_ms = vec![1_100, 1_100],
+            "point-order" => cli.at_ms = vec![1_200, 1_100],
+            "point-budget" => {
+                cli.to_ms = 4_000;
+                cli.at_ms = (1_000..1_000 + MAX_POINT_OBSERVATIONS as i64 + 1).collect();
+            }
             "metadata" => fs::write(
                 root.path().join("request.json"),
                 vec![b' '; MAX_METADATA_BYTES as usize + 1],
@@ -300,9 +432,12 @@ fn diagnostic_scope_and_resource_limits_are_validated_before_scanning() {
             }
             _ => unreachable!(),
         }
-        assert!(
-            inspect_archive(&cli, &HistoricalRequestCancellation::new()).is_err(),
-            "{defect}"
-        );
+        let error = inspect_archive(&cli, &HistoricalRequestCancellation::new()).unwrap_err();
+        if defect.starts_with("point-") {
+            assert!(
+                error.to_string().contains("point observations"),
+                "{defect}: {error}"
+            );
+        }
     }
 }

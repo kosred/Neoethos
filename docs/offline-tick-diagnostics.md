@@ -41,6 +41,22 @@ stale, ambiguous and crossed durations are reported, and together with valid
 duration partition the entire requested interval, including market closures.
 Quantiles weight elapsed valid-book milliseconds rather than update count.
 
+For comparison with recorded deal times, repeat `--at-ms <unix-ms>` in strictly
+increasing order (at most 1024 distinct times, all inside the diagnostic interval).
+The v2 report includes `point_observations`, each with its book status, exact
+integer price units (divide by 100000), side timestamps and ages. An ambiguous
+side has a null price; a side with no retained preceding update is null. Both
+the times and the explicit point policy are bound into the report digest.
+
+These observations use the same grouped book as the spread statistics but only
+updates **strictly earlier** than the requested time. All updates in the same
+millisecond are excluded, with `same_timestamp_quotes_excluded` indicating that
+such a group exists. Thus no undocumented ordering against a broker execution
+is inferred. A `valid` observation passes the reconstruction freshness and price
+checks; it is still not an executable quote. Compare a recorded buy with Ask and
+a recorded sell with Bid only when the corresponding book is valid, and report
+any price difference as a diagnostic observation, not measured execution slippage.
+
 These are **ResearchOnly / NotPromotionEligible** diagnostics under an explicit
 reconstruction policy, not exact executable spreads, actual fills, a reviewed
 quote-replay ledger, or an account-profitability result. They do not update

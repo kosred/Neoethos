@@ -37,6 +37,7 @@ fn offline_inspector_requires_bounded_scope_and_independent_digest_without_crede
         "--to-ms",
         "--max-quote-age-ms",
         "--max-events",
+        "--at-ms",
     ] {
         assert!(help.contains(required), "missing {required}");
     }
