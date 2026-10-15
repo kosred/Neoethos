@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 
@@ -331,16 +332,14 @@ impl FinalistQuoteReplayAcquisitionRequestV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FinalistQuoteReplayAcquisitionOutcomeV1 {
     authority_receipt: BrokerTruthAcquisitionAuthorityReceiptV1,
     broker_truth_receipt: BrokerFinancialTruthBundleReceiptV2,
     acquisition_link_receipt: BrokerTruthAcquisitionLinkReceiptV1,
     replay_binding: QuoteValidatedResearchReplayBindingV1,
     replay_policy: QuoteValidatedResearchReplayPolicyV1,
-    artifact_class: FinalistQuoteReplayArtifactClassV1,
-    semantic_status: BrokerTruthSemanticStatusV1,
-    promotion_eligibility: BrokerTruthPromotionEligibilityV1,
     portfolio_identity_sha256: String,
     search_config_hash: String,
     holdout_scope_identity_sha256: String,
@@ -368,15 +367,15 @@ impl FinalistQuoteReplayAcquisitionOutcomeV1 {
     }
 
     pub const fn artifact_class(&self) -> FinalistQuoteReplayArtifactClassV1 {
-        self.artifact_class
+        FinalistQuoteReplayArtifactClassV1::ResearchOnly
     }
 
     pub const fn semantic_status(&self) -> BrokerTruthSemanticStatusV1 {
-        self.semantic_status
+        BrokerTruthSemanticStatusV1::UnvalidatedEvidenceOnly
     }
 
     pub const fn promotion_eligibility(&self) -> BrokerTruthPromotionEligibilityV1 {
-        self.promotion_eligibility
+        BrokerTruthPromotionEligibilityV1::NotPromotionEligible
     }
 
     pub fn portfolio_identity_sha256(&self) -> &str {
@@ -488,6 +487,31 @@ impl FinalistQuoteReplayAcquisitionOutcomeV1 {
             "quote outcomes or execution economics do not match the complete locked signal plan"))
     }
 
+    /// Check persisted receipt metadata before expensive feature/replay work.
+    /// Independent financial review still happens when the snapshot is opened.
+    pub fn validate_stored_receipts(
+        &self,
+        store: &BrokerTruthAcquisitionStoreV1,
+    ) -> Result<(), FinalistQuoteReplayAcquisitionErrorV1> {
+        let link = store
+            .open_link(&self.acquisition_link_receipt)
+            .map_err(|_| {
+                acquisition_error(
+                    FinalistQuoteReplayAcquisitionErrorCodeV1::ReviewValidationFailed,
+                    "captured finalist acquisition link cannot be reopened",
+                )
+            })?;
+        if link.manifest().authority_receipt() != &self.authority_receipt
+            || link.manifest().broker_truth_receipt() != &self.broker_truth_receipt
+        {
+            return Err(acquisition_error(
+                FinalistQuoteReplayAcquisitionErrorCodeV1::TwoPhaseManifestBindingMismatch,
+                "saved capture receipts differ from the immutable acquisition link",
+            ));
+        }
+        Ok(())
+    }
+
     /// Open one exact independently reviewed snapshot for reuse across strategy
     /// lanes inside the caller's existing budgeted worker pool. This does not
     /// capture data, certify costs, or grant live/promotion authority.
@@ -499,6 +523,7 @@ impl FinalistQuoteReplayAcquisitionOutcomeV1 {
         neoethos_broker_truth::SealedHistoricalBidAskQuoteReplayEvidenceV1,
         FinalistQuoteReplayAcquisitionErrorV1,
     > {
+        self.validate_stored_receipts(store)?;
         let authority = validate_reviewed_broker_financial_truth_authority_v2(
             store,
             &self.acquisition_link_receipt,
@@ -593,6 +618,113 @@ impl FinalistQuoteReplayAcquisitionOutcomeV1 {
                 "reviewed finalist quotes cannot replay the exact non-overlapping decision sequence",
             )
         })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredQuotePositionEconomicsV1 {
+    pub portfolio_index: usize,
+    pub canonical_source_row: u64,
+    pub entry: neoethos_search::QuoteEntryFinancialInputsV3,
+    pub execution: neoethos_broker_truth::QuoteValidatedExecutionEconomicsLedgerV1,
+}
+
+impl StoredQuotePositionEconomicsV1 {
+    fn decision_key(&self) -> (usize, u64) {
+        (self.portfolio_index, self.canonical_source_row)
+    }
+}
+
+/// Persisted inputs for the existing replay consumer. Deserialization grants no
+/// authority: replay reopens and reviews the immutable Vortex evidence, checks
+/// the exact locked plan and recomputes account sizing. Monetary rows remain
+/// explicit evidence; a current symbol snapshot cannot fill missing history.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredFinalistQuoteReplayV1 {
+    pub schema_version: u16,
+    pub capture: FinalistQuoteReplayAcquisitionOutcomeV1,
+    pub reviewed: ReviewedBrokerFinancialTruthEvidenceV2,
+    pub positions: Vec<StoredQuotePositionEconomicsV1>,
+}
+
+impl StoredFinalistQuoteReplayV1 {
+    pub fn from_json_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            bytes.len() <= crate::MAX_FROZEN_INPUT_BYTES_V1 as usize,
+            "saved quote replay exceeds the bounded input size"
+        );
+        let input: Self = serde_json::from_slice(bytes)?;
+        anyhow::ensure!(
+            input.schema_version == 1,
+            "unsupported saved quote replay schema"
+        );
+        let mut identities = std::collections::HashSet::new();
+        for position in &input.positions {
+            anyhow::ensure!(
+                identities.insert(position.decision_key()),
+                "duplicate financial inputs for one strategy decision"
+            );
+        }
+        Ok(input)
+    }
+
+    pub fn replay(
+        self,
+        cpu: &neoethos_core::execution::BudgetedCpuScope<'_>,
+        store: &BrokerTruthAcquisitionStoreV1,
+        locked: &neoethos_search::LockedCanonicalSignalPlanV3<'_>,
+    ) -> anyhow::Result<neoethos_search::LockedPortfolioOuterHoldoutReplaySetV3> {
+        anyhow::ensure!(
+            self.schema_version == 1,
+            "unsupported saved quote replay schema"
+        );
+        let mut positions = std::collections::HashMap::new();
+        for position in self.positions {
+            let key = position.decision_key();
+            anyhow::ensure!(
+                positions.insert(key, position).is_none(),
+                "duplicate financial inputs for one strategy decision"
+            );
+        }
+        // The existing money consumer sizes one entry, then consumes its cash
+        // ledger before the next entry. A quote hash alone is not a position ID:
+        // separate strategy lanes can legitimately execute identical quotes.
+        let pending_execution = std::cell::RefCell::new(None);
+        let replay = self.capture.replay_reviewed_locked_portfolio_v3(
+            cpu,
+            store,
+            self.reviewed,
+            locked,
+            |ledger, origin| {
+                let key = (origin.portfolio_index, origin.canonical_source_row);
+                let position = positions.remove(&key).ok_or_else(|| {
+                    anyhow::anyhow!("missing financial inputs for strategy decision {key:?}")
+                })?;
+                anyhow::ensure!(
+                    position.execution.quote_ledger_sha256() == ledger.ledger_sha256(),
+                    "saved financial inputs belong to different quotes"
+                );
+                anyhow::ensure!(
+                    pending_execution.borrow().is_none(),
+                    "previous entry economics were not consumed"
+                );
+                *pending_execution.borrow_mut() = Some(position.execution);
+                Ok(position.entry)
+            },
+            |_, _| {
+                pending_execution
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("execution economics require a matched entry"))
+            },
+        )?;
+        anyhow::ensure!(
+            positions.is_empty() && pending_execution.into_inner().is_none(),
+            "saved financial inputs include positions outside the locked replay"
+        );
+        Ok(replay)
     }
 }
 
@@ -790,9 +922,6 @@ pub fn acquire_finalist_quote_replay_v1(
         acquisition_link_receipt,
         replay_binding,
         replay_policy: request.replay_policy,
-        artifact_class: FinalistQuoteReplayArtifactClassV1::ResearchOnly,
-        semantic_status: BrokerTruthSemanticStatusV1::UnvalidatedEvidenceOnly,
-        promotion_eligibility: BrokerTruthPromotionEligibilityV1::NotPromotionEligible,
         portfolio_identity_sha256: request.portfolio_identity_sha256,
         search_config_hash: request.search_config_hash,
         holdout_scope_identity_sha256: request.holdout_scope_identity_sha256,
@@ -910,9 +1039,6 @@ mod reviewed_replay_tests {
                 acquisition_link_receipt,
                 replay_binding,
                 replay_policy,
-                artifact_class: FinalistQuoteReplayArtifactClassV1::ResearchOnly,
-                semantic_status: BrokerTruthSemanticStatusV1::UnvalidatedEvidenceOnly,
-                promotion_eligibility: BrokerTruthPromotionEligibilityV1::NotPromotionEligible,
                 portfolio_identity_sha256: digest.clone(),
                 search_config_hash: digest.clone(),
                 holdout_scope_identity_sha256: digest,

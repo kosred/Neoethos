@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run independent mapping tools with bounded waits and explicit failure evidence."""
 import argparse
+import difflib
 import json
 import os
 import shutil
@@ -32,6 +33,53 @@ def run(label, command, output, timeout):
     return record
 
 
+def verify_existing_clone_ranges(clones, baseline_ref):
+    """Pairing changes are not new copies when BOTH sides contain only old lines.
+
+    Use unchanged line blocks, not substring existence: inserting a second copy
+    in the same file must still fail. Deletions can join old blocks without
+    introducing a copy. Missing/untracked files cannot be waived.
+    """
+    root = Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel']).decode().strip())
+    commit = subprocess.check_output(['git', 'rev-parse', '--verify', baseline_ref + '^{commit}']).decode().strip()
+    cache = {}
+    verified = []
+    for clone in clones:
+        pair = []
+        for side in ('firstFile', 'secondFile'):
+            location = clone[side]
+            path = Path(location['name'].replace('\\', '/'))
+            absolute = (root / path).resolve()
+            relative = absolute.relative_to(root.resolve()).as_posix()
+            if relative not in cache:
+                previous = subprocess.run(['git', 'show', commit + ':' + relative],
+                                          capture_output=True, check=False)
+                current = absolute.read_text(encoding='utf-8').splitlines()
+                cache[relative] = difflib.SequenceMatcher(
+                    None, previous.stdout.decode('utf-8').splitlines(), current, autojunk=False
+                ).get_matching_blocks() if previous.returncode == 0 else []
+            start, end = location['start'], location['end']
+            if not isinstance(start, int) or not isinstance(end, int) or not 1 <= start <= end:
+                raise ValueError('invalid clone source range')
+            cursor, original_ranges = start - 1, []
+            for block in cache[relative]:
+                lo, hi = max(cursor, block.b), min(end, block.b + block.size)
+                if hi <= lo:
+                    continue
+                if lo != cursor:  # An inserted/replaced current line is not old code.
+                    break
+                original_ranges.append([block.a + lo - block.b + 1, block.a + hi - block.b])
+                cursor = hi
+                if cursor == end:
+                    pair.append({'path': relative, 'current': [start, end],
+                                 'baseline_ranges': original_ranges})
+                    break
+        if len(pair) == 2:
+            verified.append(pair)
+    return {'baseline_commit': commit, 'verified_existing_pairs': verified,
+            'introduced_clones': len(clones) - len(verified)}
+
+
 def duplication_check(output, baseline_ref=None):
     # npm's Windows .cmd shim cannot be launched directly by subprocess.
     native = Path(os.environ.get("LOCALAPPDATA", ".")) / "neoethos/tools/code-intelligence/node_modules/jscpd-windows-x64-msvc/bin/jscpd.exe"
@@ -39,14 +87,29 @@ def duplication_check(output, baseline_ref=None):
     command = [executable, "--config", ".jscpd.json", "--fail-on-empty",
                "--reporters", "json,html", "--output", str(output / "duplicates")]
     if baseline_ref:
-        command += ["--baseline-from-ref", baseline_ref, "--fail-on-new-clones", "0"]
+        # Enforce zero introduced clones below, after verifying unchanged Git
+        # ranges. The scanner's own failures must remain failures independently.
+        command += ["--baseline-from-ref", baseline_ref]
     report = output / "duplicates/jscpd-report.json"
     report.unlink(missing_ok=True)  # Never attach statistics from an earlier run to a failure.
     record = run("jscpd", command, output, 300)
     if record["status"] in {"completed", "failed"} and report.is_file():
-        stats = json.loads(report.read_text(encoding="utf-8"))["statistics"]["total"]
+        evidence = json.loads(report.read_text(encoding="utf-8"))
+        stats = evidence["statistics"]["total"]
         record["statistics"] = {key: stats.get(key) for key in
                                 ("sources", "clones", "duplicatedLines", "percentage", "newClones")}
+        if baseline_ref and record['status'] == 'completed':
+            try:
+                new = [clone for clone in evidence['duplicates'] if clone.get('isNew')]
+                if stats.get('newClones') != len(new):
+                    raise ValueError('scanner omitted or contradicted its new-clone evidence')
+                record['source_verification'] = verify_existing_clone_ranges(new, baseline_ref)
+                if record['source_verification']['introduced_clones']:
+                    record.update(status='failed', exit_code=1)
+            except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+                record.update(status='failed', exit_code=1, detail=str(error))
+    elif record['status'] == 'completed':
+        record.update(status='failed', exit_code=1, detail='scanner produced no report')
     return record
 
 

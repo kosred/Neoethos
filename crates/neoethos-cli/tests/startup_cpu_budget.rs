@@ -73,6 +73,59 @@ fn cli_rejects_zero_before_command_dispatch() {
 }
 
 #[test]
+fn quote_bundle_digest_is_checked_before_broker_inputs_or_output_creation() {
+    let settings = isolated_config("quote-replay-digest");
+    let destination = settings.with_extension("replay-output");
+    let output = Command::new(env!("CARGO_BIN_EXE_neoethos-cli"))
+        .arg("canonical-research")
+        .arg("--settings-source")
+        .arg(&settings)
+        .arg("--quote-replay-bundle")
+        .arg(&settings)
+        .arg("--out-dir")
+        .arg(&destination)
+        .args([
+            "--quote-replay-sha256",
+            &"0".repeat(64),
+            "--quote-replay-store",
+            "absent-store",
+            "--authority-root",
+            "absent-authority",
+            "--data-root",
+            "absent-data",
+            "--plan-sha256",
+            "absent-plan",
+            "--matrix-sha256",
+            "absent-matrix",
+            "--broker-symbol-contract",
+            "absent-contract",
+            "--broker-account-snapshot",
+            "absent-account",
+            "--symbol",
+            "EURUSD",
+            "--base-timeframe",
+            "H4",
+            "--max-batches",
+            "1",
+            "--cpu-threads",
+            "2",
+        ])
+        .output()
+        .expect("launch current CLI");
+    let _ = std::fs::remove_file(settings);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("quote replay bundle SHA256 mismatch"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !destination.exists(),
+        "invalid replay created research output"
+    );
+}
+
+#[test]
 fn discovery_executes_inside_the_exact_installed_cpu_lease() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
     let source = std::fs::read_to_string(&path).expect("read CLI entrypoint");
@@ -80,7 +133,7 @@ fn discovery_executes_inside_the_exact_installed_cpu_lease() {
         .split_once("fn cmd_discover(args: &[String])")
         .expect("discover wrapper")
         .1
-        .split_once("fn cmd_discover_on_budgeted_pool(args: &[String])")
+        .split_once("fn cmd_discover_on_budgeted_pool(")
         .expect("budgeted discover body")
         .0;
 
@@ -89,10 +142,10 @@ fn discovery_executes_inside_the_exact_installed_cpu_lease() {
         "effective_worker_limit",
         "CpuPermitRequest::local(",
         "BudgetedCpuExecutor::new_for_broker",
-        ".execute(lease.into_transfer()",
+        ".execute_with_scope(lease.into_transfer()",
         "BudgetedCpuExecutor::current_pool_width()",
         "observed_width == width.get()",
-        "cmd_discover_on_budgeted_pool(args)",
+        "cmd_discover_on_budgeted_pool(args, cpu)",
     ] {
         assert!(
             wrapper.contains(required),

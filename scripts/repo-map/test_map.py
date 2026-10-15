@@ -12,7 +12,7 @@ from pathlib import Path
 
 import map_repo as mapper
 import query_map
-from run_checks import duplication_check, run
+from run_checks import duplication_check, run, verify_existing_clone_ranges
 from report_map import cycles
 from pack_graph import pack, restore
 from reuse_scip import check_source, validate_profile
@@ -315,6 +315,26 @@ class GraphEvidenceTests(unittest.TestCase):
                 self.assertEqual(before['status'], 'completed')
                 self.assertGreater(before['statistics']['clones'], 0)
                 self.assertEqual(before['statistics']['sources'], 2)
+                # The detector can change pairings of OLD ranges after an
+                # unrelated edit. Verify both sides against exact Git lines.
+                count = len(code.splitlines())
+                def pair(first_start, first_end, second_path='src/existing.rs', second_start=1):
+                    return [{'firstFile': {'name': 'src/original.rs', 'start': first_start, 'end': first_end},
+                             'secondFile': {'name': second_path, 'start': second_start, 'end': second_start + count - 1}}]
+                def introduced(clones):
+                    return verify_existing_clone_ranges(clones, 'HEAD')['introduced_clones']
+                self.assertEqual(introduced(pair(1, count)), 0)
+                Path('src/original.rs').write_text('// inserted heading\n' + code, encoding='utf-8')
+                self.assertEqual(introduced(pair(2, count + 1)), 0)
+                removed_line = code.splitlines(keepends=True)
+                del removed_line[7]
+                Path('src/original.rs').write_text(''.join(removed_line), encoding='utf-8')
+                self.assertEqual(introduced(pair(1, count - 1)), 0)
+                Path('src/original.rs').write_text('// inserted heading\n' + code + '// another copy\n' + code, encoding='utf-8')
+                self.assertEqual(introduced(pair(count + 3, count * 2 + 2)), 1)
+                Path('src/original.rs').write_text(code.replace('value +=', 'value -=', 1), encoding='utf-8')
+                self.assertEqual(introduced(pair(1, count)), 1)
+                Path('src/original.rs').write_text(code, encoding='utf-8')
                 # Baseline worktrees are scanned by absolute path. Exclusions
                 # must select the same source files for either root spelling.
                 config['path'] = [str(root)]
@@ -328,6 +348,7 @@ class GraphEvidenceTests(unittest.TestCase):
                 after = duplication_check(output, 'HEAD')
                 self.assertEqual(after['exit_code'], 1)
                 self.assertGreater(after['statistics']['newClones'], 0)
+                self.assertGreater(after['source_verification']['introduced_clones'], 0)
                 missing = duplication_check(output, 'does-not-exist')
                 self.assertEqual(missing['status'], 'failed')
                 self.assertNotIn('statistics', missing)

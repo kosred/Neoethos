@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 7] = [
+const OPTIONAL: [&str; 10] = [
     "--higher",
     "--population",
     "--generations",
@@ -37,7 +37,86 @@ const OPTIONAL: [&str; 7] = [
     "--candidates",
     "--max-batches",
     "--cpu-threads",
+    "--quote-replay-bundle",
+    "--quote-replay-sha256",
+    "--quote-replay-store",
 ];
+
+const QUOTE_FLAGS: [&str; 3] = [
+    "--quote-replay-bundle",
+    "--quote-replay-sha256",
+    "--quote-replay-store",
+];
+
+/// An explicit, hash-pinned continuation of one locked research batch.
+/// The stored input contains no permission to trade and supplies no defaults.
+pub(crate) struct QuoteReplayInputs {
+    input: Option<neoethos_broker_truth_acquire::StoredFinalistQuoteReplayV1>,
+    store: neoethos_broker_truth::BrokerTruthAcquisitionStoreV1,
+    pub sha256: String,
+    pub source: PathBuf,
+}
+
+impl QuoteReplayInputs {
+    pub fn load(args: &[String]) -> Result<Option<Self>> {
+        let mut values = BTreeMap::new();
+        for flag in QUOTE_FLAGS {
+            let positions: Vec<_> = args
+                .iter()
+                .enumerate()
+                .filter_map(|(i, arg)| (arg == flag).then_some(i))
+                .collect();
+            ensure!(positions.len() <= 1, "{flag} must occur exactly once");
+            if let Some(&i) = positions.first() {
+                let value = args
+                    .get(i + 1)
+                    .filter(|v| !v.is_empty() && !v.starts_with("--"))
+                    .with_context(|| format!("{flag} requires a value"))?;
+                values.insert(flag, value);
+            }
+        }
+        if values.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            values.len() == QUOTE_FLAGS.len(),
+            "quote replay requires bundle, SHA256 and store together"
+        );
+        let bytes = read_bounded_regular_file(Path::new(values[QUOTE_FLAGS[0]]))?;
+        use sha2::{Digest, Sha256};
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        ensure!(
+            &sha256 == values[QUOTE_FLAGS[1]],
+            "quote replay bundle SHA256 mismatch"
+        );
+        let input =
+            neoethos_broker_truth_acquire::StoredFinalistQuoteReplayV1::from_json_bytes(&bytes)?;
+        let store =
+            neoethos_broker_truth::BrokerTruthAcquisitionStoreV1::new(values[QUOTE_FLAGS[2]]);
+        input
+            .capture
+            .validate_stored_receipts(&store)
+            .context("reopen the saved quote replay acquisition link before feature work")?;
+        Ok(Some(Self {
+            input: Some(input),
+            store,
+            sha256,
+            source: PathBuf::from(values[QUOTE_FLAGS[0]]),
+        }))
+    }
+
+    pub fn replay(
+        &mut self,
+        cpu: &neoethos_core::execution::BudgetedCpuScope<'_>,
+        locked: &neoethos_search::LockedCanonicalSignalPlanV3<'_>,
+    ) -> Result<neoethos_search::LockedPortfolioOuterHoldoutReplaySetV3> {
+        self.input
+            .take()
+            .context("quote replay bundle was already consumed")?
+            .replay(cpu, &self.store, locked)
+            .context("replay the exact stored quote and financial evidence")
+    }
+}
 
 struct Arguments(BTreeMap<String, String>);
 
@@ -70,6 +149,20 @@ impl Arguments {
             );
         }
         let parsed = Self(values);
+        let quote_flags = QUOTE_FLAGS
+            .iter()
+            .filter(|flag| parsed.0.contains_key(**flag))
+            .count();
+        ensure!(
+            quote_flags == 0 || quote_flags == QUOTE_FLAGS.len(),
+            "quote replay requires bundle, SHA256 and store together"
+        );
+        if quote_flags != 0 {
+            ensure!(
+                parsed.positive("--max-batches", 2)? == 1,
+                "a saved quote replay binds one exact batch; supply --max-batches 1"
+            );
+        }
         for flag in [
             "--population",
             "--generations",
@@ -116,6 +209,15 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
         "canonical-research is an explicit CPU research command; use a CPU build or the sealed native-research GPU route"
     );
     let mut args = Arguments::parse(args)?;
+    // Reject incomplete/tampered replay packages before creating output files
+    // or starting features. Discovery rechecks the pinned bytes when consumed.
+    QuoteReplayInputs::load(
+        &args
+            .0
+            .iter()
+            .flat_map(|(k, v)| [k.clone(), v.clone()])
+            .collect::<Vec<_>>(),
+    )?;
     let source = Path::new(args.value("--settings-source"));
     let settings_bytes = read_bounded_regular_file(source)?;
     validate_exact_file_settings(settings, source, &settings_bytes)?;
@@ -268,6 +370,11 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
             &args.positive(source_flag, default)?.to_string(),
         );
     }
+    for flag in QUOTE_FLAGS {
+        if let Some(value) = args.0.get(flag) {
+            push(&mut discovery_args, flag, value);
+        }
+    }
     neoethos_core::storage::json::write_json_atomic(
         output.join("discovery-arguments.json"),
         &discovery_args,
@@ -358,5 +465,22 @@ mod tests {
                 assert!(Arguments::parse(&args).is_err());
             }
         }
+    }
+
+    #[test]
+    fn saved_quote_replay_requires_one_batch_and_all_unique_inputs() {
+        let mut args = valid_arguments();
+        push(&mut args, QUOTE_FLAGS[0], "bundle.json");
+        assert!(Arguments::parse(&args).is_err());
+        assert!(QuoteReplayInputs::load(&args).is_err());
+        for flag in &QUOTE_FLAGS[1..] {
+            push(&mut args, flag, "explicit");
+        }
+        assert!(Arguments::parse(&args).is_err());
+        push(&mut args, "--max-batches", "1");
+        assert!(Arguments::parse(&args).is_ok());
+        push(&mut args, QUOTE_FLAGS[0], "duplicate.json");
+        assert!(Arguments::parse(&args).is_err());
+        assert!(QuoteReplayInputs::load(&args).is_err());
     }
 }

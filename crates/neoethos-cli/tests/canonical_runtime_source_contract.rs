@@ -103,7 +103,7 @@ fn cli_never_manufactures_a_timeframe() {
 #[test]
 fn discover_dry_run_still_requires_direct_canonical_generations() {
     let discover = CLI_MAIN
-        .split_once("fn cmd_discover_on_budgeted_pool(args: &[String])")
+        .split_once("fn cmd_discover_on_budgeted_pool(")
         .expect("discover command")
         .1
         .split_once("fn cmd_batch_discover(args: &[String])")

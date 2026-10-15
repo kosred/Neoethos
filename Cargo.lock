@@ -5877,6 +5877,8 @@ dependencies = [
  "dirs 5.0.1",
  "neoethos-autoresearch",
  "neoethos-broker-history",
+ "neoethos-broker-truth",
+ "neoethos-broker-truth-acquire",
  "neoethos-core",
  "neoethos-data",
  "neoethos-models",

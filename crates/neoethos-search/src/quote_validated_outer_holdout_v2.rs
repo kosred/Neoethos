@@ -16,6 +16,7 @@ use neoethos_broker_truth::{
 };
 use neoethos_core::domain::trailing::TrailingPolicy;
 use neoethos_data::{CanonicalDatasetScope, CanonicalTimeframe, Ohlcv};
+use serde::Deserialize;
 
 use super::*;
 use crate::{CanonicalSearchWindowRoleV1, EvaluationConfig, Gene};
@@ -601,7 +602,8 @@ pub struct LockedPortfolioOuterHoldoutReplaySetV3 {
 
 /// Explicit captured/operator-reviewed quantity grid; never infer FX lot sizes.
 /// Evidence remains research-only, as do the separate execution-cost inputs.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuoteReplayLotConstraintsV3 {
     min_lots: f64,
     max_lots: f64,
@@ -634,6 +636,13 @@ impl QuoteReplayLotConstraintsV3 {
     }
 
     fn normalize_down(&self, requested: f64) -> Result<f64, QuoteValidatedOuterHoldoutErrorV1> {
+        // Deserialized replay inputs are metadata, not a checked capability.
+        Self::new(
+            self.min_lots,
+            self.max_lots,
+            self.lot_step,
+            self.source_artifact_sha256.clone(),
+        )?;
         let capped = requested.min(self.max_lots);
         let lots = (capped / self.lot_step).floor() * self.lot_step;
         if !lots.is_finite() || lots < self.min_lots || lots > capped {
@@ -647,7 +656,8 @@ impl QuoteReplayLotConstraintsV3 {
 
 /// Entry-time financial inputs. Exit-time conversion is a DIFFERENT input to
 /// the existing economics builder, and cannot be reused here retroactively.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuoteEntryFinancialInputsV3 {
     pub symbol_contract: ExecutionSymbolContractV1,
     pub entry_conversion: CausalQuoteToAccountConversionV1,
@@ -927,7 +937,7 @@ fn size_locked_account_entries<E, F>(
     )],
     mut entry_inputs: E,
     mut execution_economics: F,
-) -> Result<Vec<QuoteValidatedExecutionEconomicsLedgerV1>, QuoteValidatedOuterHoldoutErrorV1>
+) -> Result<Vec<(usize, QuoteValidatedExecutionEconomicsLedgerV1)>, QuoteValidatedOuterHoldoutErrorV1>
 where
     E: FnMut(
         &SealedHistoricalQuoteValidatedResearchLedgerV1,
@@ -962,7 +972,7 @@ where
         Vec::with_capacity(entries.len());
     let mut open: Vec<usize> = Vec::new();
     let mut contract_identity: Option<String> = None;
-    for (entry_at, _, _, index) in entries {
+    for &(entry_at, _, _, index) in &entries {
         let (origin, ledger) = &mut ordered[index];
         let position = &ledger.positions()[0];
         let financial = entry_inputs(ledger, origin)
@@ -1077,7 +1087,11 @@ where
         open.push(economics.len());
         economics.push(execution);
     }
-    Ok(economics)
+    Ok(entries
+        .into_iter()
+        .map(|(_, _, _, index)| index)
+        .zip(economics)
+        .collect())
 }
 
 impl LockedPortfolioOuterHoldoutReplaySetV3 {
@@ -1161,6 +1175,21 @@ impl LockedPortfolioOuterHoldoutReplaySetV3 {
         }
         let economics =
             size_locked_account_entries(locked, &mut ordered, entry_inputs, execution_economics)?;
+        let mut by_decision = HashMap::with_capacity(economics.len());
+        for (index, execution) in economics {
+            let origin = &ordered[index].0;
+            if by_decision
+                .insert(
+                    (origin.portfolio_index, origin.canonical_source_row),
+                    execution,
+                )
+                .is_some()
+            {
+                return Err(binding_error(
+                    "duplicate economics for one locked strategy decision",
+                ));
+            }
+        }
         // Independent lanes may finish out of order. Order cash observations,
         // retaining the explicit gene/decision origin rather than zipping risk
         // distances against whichever parallel job happens to finish first.
@@ -1182,30 +1211,21 @@ impl LockedPortfolioOuterHoldoutReplaySetV3 {
                 origin.decision_bar_index,
             )
         });
-        let mut by_quote = HashMap::with_capacity(economics.len());
-        for execution in economics {
-            if by_quote
-                .insert(execution.quote_ledger_sha256().to_owned(), execution)
-                .is_some()
-            {
-                return Err(binding_error(
-                    "duplicate execution economics for one quote ledger",
-                ));
-            }
-        }
         let mut ordered_execution_economics_ledgers = Vec::new();
-        for (_, ledger) in &ordered {
+        for (origin, ledger) in &ordered {
             if !ledger.positions().is_empty() {
-                let execution = by_quote.remove(ledger.ledger_sha256()).ok_or_else(|| {
-                    outer_error(
-                        QuoteValidatedOuterHoldoutErrorCodeV1::MissingExecutionEconomics,
-                        "quote position has no matching closed execution economics",
-                    )
-                })?;
+                let execution = by_decision
+                    .remove(&(origin.portfolio_index, origin.canonical_source_row))
+                    .ok_or_else(|| {
+                        outer_error(
+                            QuoteValidatedOuterHoldoutErrorCodeV1::MissingExecutionEconomics,
+                            "quote position has no matching closed execution economics",
+                        )
+                    })?;
                 ordered_execution_economics_ledgers.push(execution);
             }
         }
-        if !by_quote.is_empty() {
+        if !by_decision.is_empty() {
             return Err(binding_error(
                 "execution economics contains outcomes outside the locked replay",
             ));
@@ -1291,6 +1311,13 @@ pub fn evaluate_locked_portfolio_outer_holdout_v3(
     let execution = evaluate_bound_quote_ledgers_v1(
         locked.account_risk_policy.initial_balance.clone(),
         BoundPipValues::PerClosedTrade(&per_trade_pip_values),
+        Some(
+            &replay
+                .provenance
+                .iter()
+                .map(|origin| origin.portfolio_index)
+                .collect::<Vec<_>>(),
+        ),
         replay.replay_set,
         locked.holdout_scope.receipt_sha256().to_owned(),
         locked.identity_sha256.clone(),
