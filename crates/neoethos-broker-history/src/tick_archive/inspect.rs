@@ -21,8 +21,10 @@ use crate::ctrader_data::parse_symbol_by_id_response;
 use crate::ctrader_historical_admission::HistoricalRequestCancellation;
 
 const MAX_EVENTS: usize = 10_000_000;
+const MAX_POINT_OBSERVATIONS: usize = 1_024;
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 const POLICY: &str = "unique-side-price-per-ms-causal-book-strict-age-time-weighted-v1";
+const POINT_POLICY: &str = "strictly-before-ms-same-grouped-book-strict-age-v1";
 
 #[derive(Debug, Parser)]
 #[command(about = "Verify raw tick archive offline and diagnose spreads; never places orders")]
@@ -43,6 +45,10 @@ pub struct TickInspectCli {
     /// Hard memory bound for retained ticks, including causal seed padding.
     #[arg(long, default_value_t = 2_000_000)]
     max_events: usize,
+    /// Observe the book strictly before this time; repeat in increasing order,
+    /// at most 1024 times, within [from-ms, to-ms). Not an execution quote.
+    #[arg(long)]
+    at_ms: Vec<i64>,
     #[arg(long, hide = true)]
     cpu_threads: Option<usize>,
 }
@@ -54,6 +60,7 @@ pub struct TickInspectionReport {
     promotion_eligibility: &'static str,
     authority: &'static str,
     diagnostic_policy: &'static str,
+    point_observation_policy: &'static str,
     binding_sha256: String,
     request_file_sha256: String,
     plan_sha256: String,
@@ -69,6 +76,58 @@ pub struct TickInspectionReport {
     retained_window_and_seed_events: usize,
     verified_archive: TickArchiveSummary,
     spreads: SpreadDiagnostics,
+    point_observations: Vec<PointObservation>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BookStatus {
+    Valid,
+    UnavailableOrStale,
+    Ambiguous,
+    Crossed,
+}
+
+#[derive(Debug, Serialize)]
+struct PointObservation {
+    at_ms: i64,
+    status: BookStatus,
+    /// Quotes stamped at the observation time are excluded, regardless of side.
+    same_timestamp_quotes_excluded: bool,
+    bid: Option<PointSide>,
+    ask: Option<PointSide>,
+}
+
+#[derive(Debug, Serialize)]
+struct PointSide {
+    timestamp_ms: i64,
+    age_ms: i64,
+    /// Exact cTrader price units (1 / 100_000). None denotes a tied-price ambiguity.
+    price_units: Option<i64>,
+}
+
+impl PointObservation {
+    fn capture(
+        sides: &[Option<SideState>; 2],
+        at_ms: i64,
+        max_age: i64,
+        same_timestamp_quotes_excluded: bool,
+    ) -> Self {
+        let side = |state: Option<SideState>| {
+            state.map(|state| PointSide {
+                timestamp_ms: state.timestamp_ms,
+                age_ms: at_ms - state.timestamp_ms,
+                price_units: state.price_units,
+            })
+        };
+        Self {
+            at_ms,
+            status: book_status(sides, at_ms, max_age),
+            same_timestamp_quotes_excluded,
+            bid: side(sides[0]),
+            ask: side(sides[1]),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -161,6 +220,15 @@ fn inspect_archive(
                 .bytes()
                 .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f')),
         "invalid bounded diagnostic interval, freshness, event budget or expected hash chain"
+    );
+    ensure!(
+        cli.at_ms.len() <= MAX_POINT_OBSERVATIONS
+            && cli
+                .at_ms
+                .iter()
+                .all(|&at| (cli.from_ms..cli.to_ms).contains(&at))
+            && cli.at_ms.windows(2).all(|pair| pair[0] < pair[1]),
+        "point observations must be strictly increasing, within the diagnostic interval, and at most 1024"
     );
     // Open the existing lock without creating or changing an archive file.
     let lock = File::open(cli.archive.join("archive.lock"))?;
@@ -277,12 +345,13 @@ fn inspect_archive(
     );
     summary.stop_reason = "offline-verified-against-expected-hash-chain".into();
     let retained_window_and_seed_events = events.len();
-    let spreads = spread_diagnostics(
+    let (spreads, point_observations) = spread_diagnostics(
         events,
         cli.from_ms,
         cli.to_ms,
         cli.max_quote_age_ms,
         units_per_pip,
+        &cli.at_ms,
     );
     require_archive_active(cancel, None)?;
     let request_file_sha256 = sha256(&request_bytes);
@@ -296,13 +365,16 @@ fn inspect_archive(
         cli.from_ms,
         cli.to_ms,
         cli.max_quote_age_ms,
+        POINT_POLICY,
+        &cli.at_ms,
     ))?);
     Ok(TickInspectionReport {
-        schema: "neoethos.offline-tick-spread-diagnostics.v1",
+        schema: "neoethos.offline-tick-spread-diagnostics.v2",
         artifact_class: "ResearchOnly",
         promotion_eligibility: "NotPromotionEligible",
         authority: "unreviewed-raw-market-data-diagnostics-only",
         diagnostic_policy: POLICY,
+        point_observation_policy: POINT_POLICY,
         binding_sha256,
         request_file_sha256,
         plan_sha256,
@@ -318,6 +390,7 @@ fn inspect_archive(
         retained_window_and_seed_events,
         verified_archive: summary,
         spreads,
+        point_observations,
     })
 }
 
@@ -327,7 +400,8 @@ fn spread_diagnostics(
     to: i64,
     max_age: i64,
     units_per_pip: f64,
-) -> SpreadDiagnostics {
+    at_ms: &[i64],
+) -> (SpreadDiagnostics, Vec<PointObservation>) {
     // Archive pages run backwards within each side and forwards across weeks.
     // Sorting is only a diagnostic timestamp grouping operation. No ordering
     // between tied side events is asserted and no execution ledger is emitted.
@@ -340,8 +414,21 @@ fn spread_diagnostics(
     let mut sides: [Option<SideState>; 2] = [None, None];
     let mut last = from;
     let mut index = 0;
+    let mut pending = at_ms.iter().copied().peekable();
+    let mut observations = Vec::with_capacity(at_ms.len());
     while index < events.len() {
         let timestamp = events[index].timestamp_ms;
+        // Observe before applying the entire timestamp group. Side ordering in
+        // archived pages cannot prove ordering relative to a broker execution.
+        while pending.peek().is_some_and(|&at| at <= timestamp) {
+            let at = pending.next().unwrap();
+            observations.push(PointObservation::capture(
+                &sides,
+                at,
+                max_age,
+                at == timestamp,
+            ));
+        }
         let at = timestamp.max(from).min(to);
         include_interval(&mut diagnostics, &mut histogram, &sides, last, at, max_age);
         last = at;
@@ -367,6 +454,7 @@ fn spread_diagnostics(
         diagnostics.both_sides_updated_timestamp_groups += u64::from(changed[0] && changed[1]);
     }
     include_interval(&mut diagnostics, &mut histogram, &sides, last, to, max_age);
+    observations.extend(pending.map(|at| PointObservation::capture(&sides, at, max_age, false)));
     diagnostics.valid_book_fraction =
         diagnostics.valid_book_ms as f64 / diagnostics.interval_ms as f64;
     if diagnostics.valid_book_ms > 0 {
@@ -396,7 +484,23 @@ fn spread_diagnostics(
             .last_key_value()
             .map(|(&units, _)| units as f64 / units_per_pip);
     }
-    diagnostics
+    (diagnostics, observations)
+}
+
+fn book_status(sides: &[Option<SideState>; 2], at: i64, max_age: i64) -> BookStatus {
+    let [Some(bid), Some(ask)] = sides else {
+        return BookStatus::UnavailableOrStale;
+    };
+    if at >= bid.timestamp_ms.saturating_add(max_age)
+        || at >= ask.timestamp_ms.saturating_add(max_age)
+    {
+        return BookStatus::UnavailableOrStale;
+    }
+    match (bid.price_units, ask.price_units) {
+        (Some(bid), Some(ask)) if ask < bid => BookStatus::Crossed,
+        (Some(_), Some(_)) => BookStatus::Valid,
+        _ => BookStatus::Ambiguous,
+    }
 }
 
 fn include_interval(
@@ -426,15 +530,15 @@ fn include_interval(
     if fresh_ms == 0 {
         return;
     }
-    let (Some(bid_units), Some(ask_units)) = (bid.price_units, ask.price_units) else {
-        diagnostics.ambiguous_book_ms += fresh_ms;
-        return;
-    };
-    if ask_units < bid_units {
-        diagnostics.crossed_book_ms += fresh_ms;
-    } else {
-        diagnostics.valid_book_ms += fresh_ms;
-        *histogram.entry(ask_units - bid_units).or_default() += fresh_ms;
+    match book_status(sides, from, max_age) {
+        BookStatus::Ambiguous => diagnostics.ambiguous_book_ms += fresh_ms,
+        BookStatus::Crossed => diagnostics.crossed_book_ms += fresh_ms,
+        BookStatus::Valid => {
+            diagnostics.valid_book_ms += fresh_ms;
+            let spread = ask.price_units.unwrap() - bid.price_units.unwrap();
+            *histogram.entry(spread).or_default() += fresh_ms;
+        }
+        BookStatus::UnavailableOrStale => unreachable!("fresh interval has both sides"),
     }
 }
 

@@ -54,11 +54,18 @@ money nor a current symbol contract proves historical commission/swap policy
 for ten years. Exact historical Bid/Ask replay and causal conversion data have
 their own existing acquisition and validation boundaries.
 
-`canonical-research` is a separate screening command. Its configured spread and
-slippage plus last-D1 conversion are assumptions, even when symbol inputs came
-from the broker. Its candidate rejection is not a broker-cost validation of
-the full trading system. Keep that experiment's evidence, but do not substitute
-its monetary results for an execution through the existing quote/economics path.
+By default, `canonical-research` screens using configured spread/slippage and
+last-D1 conversion assumptions, even when symbol inputs came from the broker.
+It now also accepts the [hash-pinned reviewed quote replay bundle](canonical-cpu-research.md)
+after the final portfolio is locked. That optional path requires matching
+reviewed quotes, per-position sizing and execution economics; an account snapshot
+alone cannot supply them. A rejected portfolio never exercises that provider.
+
+The [existing offline tick inspector](offline-tick-diagnostics.md) can observe
+Bid/Ask strictly before recorded deal times with repeated `--at-ms` arguments.
+Use an archive with the same account, environment, instrument and date scope.
+These observations help compare recorded executions with available market data;
+they do not turn old deals into a strategy replay or establish hypothetical costs.
 
 References: [cTrader currency conversion](https://help.ctrader.com/open-api/symbol-rate-conversion/)
 and [broker model fields](https://help.ctrader.com/open-api/model-messages/).
