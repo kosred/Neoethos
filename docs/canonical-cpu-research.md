@@ -10,6 +10,18 @@ separate final holdout remains reserved until replay is requested. An explicitly
 supplied saved quote-replay bundle connects the existing quote and
 execution-economics consumer after the portfolio is locked.
 A negative screening run is not a verdict on the broker-cost pipeline.
+An empty result names the last observed population that fell to zero, rather
+than the stage with the largest raw rejection count. Missing terminal counters
+leave the cause unknown; the diagnostic points to recorded evidence without
+recommending weaker acceptance criteria.
+
+New CPU trade logs retain `logged_trades[].trades[].exit_reason`: `stop`,
+`target`, `trailing_stop`, `max_hold`, `data_gap` or `session_close`. The existing
+device-outcome adapter also preserves reported exit codes; its generic `stop`
+does not distinguish an original stop from a trailing stop. These are simulated
+exit diagnostics, not broker fills. Legacy logs omit this field and their exit
+cause must not be inferred from duration or PnL.
+
 Use [the account evidence entrypoint](broker-account-evidence.md) to inspect the
 actual account currency, broker PnL and reported commission/swap components.
 

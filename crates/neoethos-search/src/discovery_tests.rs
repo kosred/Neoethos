@@ -3280,6 +3280,49 @@ fn empty_portfolio_diagnosis_falls_back_when_no_bottleneck_set() {
     assert!(msg.contains("max-drawdown") || msg.contains("min-profit"));
 }
 
+#[test]
+fn empty_portfolio_diagnosis_uses_terminal_loss_not_feature_rejection_count() {
+    use crate::funnel_profile::FunnelProfile;
+
+    // Recorded H4/D1 run: 299 features survived the largest reduction;
+    // all eight remaining candidates were lost later in walk-forward.
+    let mut funnel = FunnelProfile::new("EURUSD", "H4");
+    funnel.record_stage("features_after_prefilter", 6786, 299);
+    funnel.record_stage("validation_candidates_admitted", 145, 16);
+    funnel.record_stage("passed_quality", 15, 8);
+    funnel.record_stage("passed_walkforward", 8, 0);
+    funnel.record_stage("portfolio_selected", 0, 0);
+    funnel.finalize("no_candidates");
+    assert_eq!(funnel.bottleneck_stage, "features_after_prefilter");
+
+    let message = describe_empty_portfolio_funnel(&funnel);
+    assert!(message.contains("'passed_walkforward' let 0 of 8 through"));
+    assert!(message.contains("per-fold PnL, trade counts"));
+    assert!(!message.contains("features_after_prefilter"));
+    assert!(!message.contains("widen"));
+    assert!(!message.contains("reduce"));
+}
+
+#[test]
+fn empty_portfolio_diagnosis_does_not_blame_an_earlier_exhausted_population() {
+    use crate::funnel_profile::FunnelProfile;
+
+    let mut funnel = FunnelProfile::new("EURUSD", "M3");
+    funnel.record_stage("profitable_archive_size", 10, 0);
+    funnel.record_stage("validation_candidates_admitted", 10, 4);
+    funnel.record_stage("passed_quality", 4, 2);
+    funnel.finalize("no_candidates");
+
+    let message = describe_empty_portfolio_funnel(&funnel);
+    assert!(message.contains("No terminal rejection was recorded"));
+    assert!(message.contains("'passed_quality' retained 2 of 4"));
+    assert!(!message.contains("profitable_archive_size"));
+    assert!(!message.contains("Next check:"));
+
+    let empty = describe_empty_portfolio_funnel(&FunnelProfile::new("EURUSD", "M3"));
+    assert!(empty.contains("cause of the empty portfolio is unknown"));
+}
+
 /// Reference implementation of the tie-corrected Spearman midrank, written
 /// the naive O(n²) way (rescan the slice for every element). The shipping
 /// `spearman_corr_i8` computes the same quantity from a 256-bucket

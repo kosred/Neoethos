@@ -2636,11 +2636,8 @@ pub fn ensure_non_empty_portfolio(result: &DiscoveryResult, context: &str) -> Re
     if !result.portfolio.is_empty() {
         return Ok(());
     }
-    // F-343 (#14): an empty portfolio is the most common — and most
-    // confusing — discovery outcome. Instead of a generic "produced an
-    // empty portfolio", turn the rejection funnel into an actionable
-    // diagnosis: which stage threw everything away, the reasons it gave,
-    // and a concrete remedy the operator can act on.
+    // Explain the observed terminal rejection, not the largest count loss:
+    // feature, row and candidate counts are different populations.
     let diagnosis = result
         .funnel_profile
         .as_ref()
@@ -2655,33 +2652,29 @@ pub fn ensure_non_empty_portfolio(result: &DiscoveryResult, context: &str) -> Re
     anyhow::bail!("Discovery produced no strategies for {context}. {diagnosis}");
 }
 
-/// Turn a rejection [`FunnelProfile`] into a one-paragraph, operator-
-/// actionable explanation of WHY the portfolio is empty: the bottleneck
-/// stage, the reasons it rejected things, and a concrete remedy.
+/// Describe the last observed population becoming empty. The funnel's
+/// largest-rejection counter is useful for profiling, not causal attribution.
 fn describe_empty_portfolio_funnel(funnel: &crate::funnel_profile::FunnelProfile) -> String {
-    // Prefer the funnel's own bottleneck; fall back to the stage that
-    // rejected the most among stages that actually received input.
-    let bottleneck = if !funnel.bottleneck_stage.is_empty() {
-        funnel
-            .stages
-            .iter()
-            .find(|s| s.name == funnel.bottleneck_stage)
-    } else {
-        None
-    }
-    .or_else(|| {
-        funnel
-            .stages
-            .iter()
-            .filter(|s| s.count_in > 0)
-            .max_by_key(|s| s.rejected)
-    });
-
-    let Some(stage) = bottleneck else {
-        return "The search produced nothing at all — no candidate strategies were \
-                generated. Try a longer history window or more generations."
+    // Zero-to-zero rows include unvisited stages and stages after exhaustion.
+    // A later nonempty population invalidates an earlier exhaustion diagnosis
+    // (for example, an empty profitable archive followed by admitted candidates).
+    let Some(stage) = funnel
+        .stages
+        .iter()
+        .rfind(|stage| stage.count_in > 0 || stage.count_out > 0)
+    else {
+        return "No populated funnel stage was recorded; the cause of the empty \
+                portfolio is unknown. Inspect the saved run and stage logs."
             .to_string();
     };
+    if stage.count_out > 0 {
+        return format!(
+            "No terminal rejection was recorded: the last populated stage '{}' \
+             retained {} of {}. Inspect the subsequent selection/export logs; \
+             earlier rejection counts do not explain the empty portfolio.",
+            stage.name, stage.count_out, stage.count_in,
+        );
+    }
 
     let reasons = if stage.top_reasons.is_empty() {
         String::new()
@@ -2697,7 +2690,7 @@ fn describe_empty_portfolio_funnel(funnel: &crate::funnel_profile::FunnelProfile
     };
 
     format!(
-        "Bottleneck: stage '{}' let {} of {} through (rejected {}).{} Hint: {}",
+        "Terminal rejection: stage '{}' let {} of {} through (rejected {}).{} Next check: {}",
         stage.name,
         stage.count_out,
         stage.count_in,
@@ -2707,61 +2700,48 @@ fn describe_empty_portfolio_funnel(funnel: &crate::funnel_profile::FunnelProfile
     )
 }
 
-/// Map a canonical funnel stage name to a concrete remedy. Stage names
-/// are the 16 defined in [`crate::funnel_profile`].
+/// Point to evidence to inspect; rejection alone does not justify relaxing a gate.
 fn remedy_for_stage(stage: &str) -> &'static str {
     match stage {
         "data_loaded" | "rows_after_trimming" => {
-            "not enough history — fetch more bars (Settings → Data) or pick a higher timeframe."
+            "inspect source coverage, warm-up and the recorded trimming boundaries."
         }
         "features_built" | "features_after_prefilter" => {
-            "the feature prefilter removed everything — widen the indicator set or check the \
-             imported data for gaps."
+            "inspect feature validity, training-window support and the recorded prefilter reasons."
         }
         "stage1_candidates_generated" | "profitable_archive_size" => {
-            "the genetic search found no profitable seeds — raise population / generations, or \
-             allow more indicators per strategy."
+            "inspect the candidate census and measured net results after costs."
         }
         "full_is_evaluated" | "passed_base_filter" => {
-            "every candidate failed the base filter — relax max-drawdown / min-profit in the \
-             discovery filters."
+            "inspect each candidate's measured max-drawdown / min-profit failure and configured limits."
         }
-        "nonzero_signals" => {
-            "strategies generated zero trades — relax entry thresholds or verify indicator \
-             warm-up has enough bars."
-        }
+        "nonzero_signals" => "inspect feature warm-up, signal validity and entry eligibility.",
         "passed_min_trades" => {
-            "candidates traded too rarely — lower the min-trades requirement or use a longer \
-             window."
+            "inspect trade counts, holding durations and the evaluation window's coverage."
         }
         "passed_quality" => {
-            "the quality screen rejected all survivors — lower the min Sharpe / win-rate / \
-             profit-factor, or enable opportunistic mode."
+            "inspect the recorded net expectancy, Sharpe, drawdown and cost-sensitivity failures."
         }
         "passed_prop_firm_window" => {
-            "nothing passed the prop-firm window gate — loosen the FTMO rule set, or switch off \
-             the prop-firm gate if you're not targeting a challenge."
+            "inspect per-window losses and the exact configured prop-firm rules."
         }
         "passed_correlation" => {
-            "survivors were too correlated with each other — raise the correlation threshold to \
-             admit more of them."
+            "inspect measured candidate correlations and portfolio membership decisions."
         }
         "passed_walkforward" => {
-            "strategies didn't hold up out-of-sample (walk-forward) — widen the search or reduce \
-             the number of walk-forward splits."
+            "inspect the saved walk-forward selection cohort: per-fold PnL, trade counts and \
+             rejection reasons. Legacy runs without that cohort cannot explain individual failures."
+        }
+        "passed_selection_calibration" => {
+            "inspect the saved selection-calibration cohort and each rejected sizing result."
         }
         "passed_cpcv" => {
-            "strategies failed CPCV cross-validation — lower the CPCV min-phi tolerance or disable \
-             CPCV for this run."
+            "inspect CPCV fold results, overfitting estimates and the configured acceptance criteria."
         }
         "export_ready" => {
-            "candidates passed every gate but failed final export-readiness — check the \
-             validation-gate configuration."
+            "inspect missing or failed validation evidence and final export-readiness checks."
         }
-        _ => {
-            "review the saved funnel JSON (cache/discovery/<symbol>_<tf>.json) for the full \
-              stage-by-stage breakdown."
-        }
+        _ => "review this run's saved funnel and stage logs for the recorded rejection details.",
     }
 }
 
