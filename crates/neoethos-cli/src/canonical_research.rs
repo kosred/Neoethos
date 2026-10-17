@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use neoethos_broker_history::canonical_research_costs::{
     ensure_unique_selected_timeframe, ensure_unique_series, read_bounded_regular_file,
-    validate_exact_file_settings,
+    read_regular_file_with_limit, validate_exact_file_settings,
 };
 use neoethos_broker_history::{
     CanonicalTrendbarAcquisitionStoreV1, CanonicalTrendbarMatrixReceiptV1,
@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 10] = [
+const OPTIONAL: [&str; 12] = [
     "--higher",
     "--population",
     "--generations",
@@ -40,7 +40,90 @@ const OPTIONAL: [&str; 10] = [
     "--quote-replay-bundle",
     "--quote-replay-sha256",
     "--quote-replay-store",
+    "--resume-research",
+    "--resume-research-sha256",
 ];
+
+const RESUME_FLAGS: [&str; 2] = ["--resume-research", "--resume-research-sha256"];
+
+/// Read optional all-or-none inputs on both the strict operator command and
+/// the lower-level discover entrypoint. Neither accepts a duplicate binding.
+fn optional_inputs<'a>(
+    args: &'a [String],
+    flags: &[&'a str],
+) -> Result<BTreeMap<&'a str, &'a str>> {
+    let mut values = BTreeMap::new();
+    for &flag in flags {
+        for (i, _) in args
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| arg.as_str() == flag)
+        {
+            let value = args
+                .get(i + 1)
+                .filter(|v| !v.trim().is_empty() && !v.starts_with("--"))
+                .with_context(|| format!("{flag} requires a value"))?;
+            ensure!(
+                values.insert(flag, value.as_str()).is_none(),
+                "{flag} must occur exactly once"
+            );
+        }
+    }
+    ensure!(
+        values.is_empty() || values.len() == flags.len(),
+        "{} must be supplied together",
+        flags.join(", ")
+    );
+    Ok(values)
+}
+
+fn read_pinned_input(
+    source: &Path,
+    expected: &str,
+    label: &str,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, String)> {
+    // Complete envelopes are larger than the 64 KiB scalar cost file. The
+    // caller supplies its bounded format limit; no unbounded read is allowed.
+    let bytes = read_regular_file_with_limit(source, max_bytes)?;
+    use sha2::{Digest, Sha256};
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    ensure!(sha256 == expected, "{label} SHA256 mismatch");
+    Ok((bytes, sha256))
+}
+
+pub(crate) struct SavedResearchInputs {
+    pub research: Option<neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3>,
+    pub sha256: String,
+    pub source: PathBuf,
+}
+
+impl SavedResearchInputs {
+    pub fn load(args: &[String]) -> Result<Option<Self>> {
+        let values = optional_inputs(args, &RESUME_FLAGS)?;
+        if values.is_empty() {
+            return Ok(None);
+        }
+        let source = PathBuf::from(values[RESUME_FLAGS[0]]);
+        let (bytes, sha256) = read_pinned_input(
+            &source,
+            values[RESUME_FLAGS[1]],
+            "saved research",
+            512 * 1024 * 1024,
+        )?;
+        let research =
+            neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3::from_json_bytes(&bytes)?;
+        neoethos_search::ensure_non_empty_portfolio(
+            research.discovery_result(),
+            "resume frozen research",
+        )?;
+        Ok(Some(Self {
+            research: Some(research),
+            sha256,
+            source,
+        }))
+    }
+}
 
 const QUOTE_FLAGS: [&str; 3] = [
     "--quote-replay-bundle",
@@ -59,22 +142,7 @@ pub(crate) struct QuoteReplayInputs {
 
 impl QuoteReplayInputs {
     pub fn load(args: &[String]) -> Result<Option<Self>> {
-        let mut values = BTreeMap::new();
-        for flag in QUOTE_FLAGS {
-            let positions: Vec<_> = args
-                .iter()
-                .enumerate()
-                .filter_map(|(i, arg)| (arg == flag).then_some(i))
-                .collect();
-            ensure!(positions.len() <= 1, "{flag} must occur exactly once");
-            if let Some(&i) = positions.first() {
-                let value = args
-                    .get(i + 1)
-                    .filter(|v| !v.is_empty() && !v.starts_with("--"))
-                    .with_context(|| format!("{flag} requires a value"))?;
-                values.insert(flag, value);
-            }
-        }
+        let values = optional_inputs(args, &QUOTE_FLAGS)?;
         if values.is_empty() {
             return Ok(None);
         }
@@ -82,13 +150,12 @@ impl QuoteReplayInputs {
             values.len() == QUOTE_FLAGS.len(),
             "quote replay requires bundle, SHA256 and store together"
         );
-        let bytes = read_bounded_regular_file(Path::new(values[QUOTE_FLAGS[0]]))?;
-        use sha2::{Digest, Sha256};
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
-        ensure!(
-            &sha256 == values[QUOTE_FLAGS[1]],
-            "quote replay bundle SHA256 mismatch"
-        );
+        let (bytes, sha256) = read_pinned_input(
+            Path::new(values[QUOTE_FLAGS[0]]),
+            values[QUOTE_FLAGS[1]],
+            "quote replay bundle",
+            64 * 1024 * 1024,
+        )?;
         let input =
             neoethos_broker_truth_acquire::StoredFinalistQuoteReplayV1::from_json_bytes(&bytes)?;
         let store =
@@ -157,10 +224,31 @@ impl Arguments {
             quote_flags == 0 || quote_flags == QUOTE_FLAGS.len(),
             "quote replay requires bundle, SHA256 and store together"
         );
-        if quote_flags != 0 {
+        let resume_flags = RESUME_FLAGS
+            .iter()
+            .filter(|flag| parsed.0.contains_key(**flag))
+            .count();
+        ensure!(
+            resume_flags == 0 || resume_flags == RESUME_FLAGS.len(),
+            "resume requires the saved research and its SHA256 together"
+        );
+        if resume_flags != 0 {
+            for flag in [
+                "--population",
+                "--generations",
+                "--max-indicators",
+                "--candidates",
+            ] {
+                ensure!(
+                    !parsed.0.contains_key(flag),
+                    "{flag} cannot change an already selected research result"
+                );
+            }
+        }
+        if quote_flags != 0 || resume_flags != 0 {
             ensure!(
                 parsed.positive("--max-batches", 2)? == 1,
-                "a saved quote replay binds one exact batch; supply --max-batches 1"
+                "a saved continuation binds one exact batch; supply --max-batches 1"
             );
         }
         for flag in [
@@ -211,13 +299,13 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
     let mut args = Arguments::parse(args)?;
     // Reject incomplete/tampered replay packages before creating output files
     // or starting features. Discovery rechecks the pinned bytes when consumed.
-    QuoteReplayInputs::load(
-        &args
-            .0
-            .iter()
-            .flat_map(|(k, v)| [k.clone(), v.clone()])
-            .collect::<Vec<_>>(),
-    )?;
+    let input_args = args
+        .0
+        .iter()
+        .flat_map(|(k, v)| [k.clone(), v.clone()])
+        .collect::<Vec<_>>();
+    SavedResearchInputs::load(&input_args)?;
+    QuoteReplayInputs::load(&input_args)?;
     let source = Path::new(args.value("--settings-source"));
     let settings_bytes = read_bounded_regular_file(source)?;
     validate_exact_file_settings(settings, source, &settings_bytes)?;
@@ -370,7 +458,7 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
             &args.positive(source_flag, default)?.to_string(),
         );
     }
-    for flag in QUOTE_FLAGS {
+    for flag in QUOTE_FLAGS.into_iter().chain(RESUME_FLAGS) {
         if let Some(value) = args.0.get(flag) {
             push(&mut discovery_args, flag, value);
         }
@@ -468,19 +556,67 @@ mod tests {
     }
 
     #[test]
-    fn saved_quote_replay_requires_one_batch_and_all_unique_inputs() {
-        let mut args = valid_arguments();
-        push(&mut args, QUOTE_FLAGS[0], "bundle.json");
-        assert!(Arguments::parse(&args).is_err());
-        assert!(QuoteReplayInputs::load(&args).is_err());
-        for flag in &QUOTE_FLAGS[1..] {
-            push(&mut args, flag, "explicit");
+    fn saved_continuations_require_one_batch_and_all_unique_inputs() {
+        for flags in [QUOTE_FLAGS.as_slice(), RESUME_FLAGS.as_slice()] {
+            let mut args = valid_arguments();
+            push(&mut args, flags[0], "saved.json");
+            assert!(Arguments::parse(&args).is_err());
+            assert!(optional_inputs(&args, flags).is_err());
+            for flag in &flags[1..] {
+                push(&mut args, flag, "explicit");
+            }
+            assert!(Arguments::parse(&args).is_err());
+            push(&mut args, "--max-batches", "1");
+            assert!(Arguments::parse(&args).is_ok());
+            if flags == RESUME_FLAGS {
+                let mut retuned = args.clone();
+                push(&mut retuned, "--population", "256");
+                assert!(Arguments::parse(&retuned).is_err());
+            }
+            push(&mut args, flags[0], "duplicate.json");
+            assert!(Arguments::parse(&args).is_err());
+            assert!(optional_inputs(&args, flags).is_err());
         }
-        assert!(Arguments::parse(&args).is_err());
-        push(&mut args, "--max-batches", "1");
-        assert!(Arguments::parse(&args).is_ok());
-        push(&mut args, QUOTE_FLAGS[0], "duplicate.json");
-        assert!(Arguments::parse(&args).is_err());
-        assert!(QuoteReplayInputs::load(&args).is_err());
+    }
+
+    #[test]
+    fn saved_input_hash_is_checked_above_the_scalar_cost_file_limit() {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "neoethos-frozen-{}-{nonce}.json",
+            std::process::id()
+        ));
+        let mut file = fs::File::create_new(&path).unwrap();
+        let contents = vec![b' '; 70 * 1024];
+        file.write_all(&contents).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&contents));
+        assert_eq!(
+            read_pinned_input(&path, &hash, "saved input", 1024 * 1024)
+                .unwrap()
+                .0,
+            contents
+        );
+        assert!(
+            read_pinned_input(&path, &"0".repeat(64), "saved input", 1024 * 1024)
+                .unwrap_err()
+                .to_string()
+                .contains("SHA256 mismatch")
+        );
+        // Correct bytes/hash still cannot masquerade as decoded research.
+        assert!(read_pinned_input(&path, &hash, "saved input", 64 * 1024).is_err());
+        let args = vec![
+            RESUME_FLAGS[0].to_owned(),
+            path.to_string_lossy().into_owned(),
+            RESUME_FLAGS[1].to_owned(),
+            hash,
+        ];
+        assert!(SavedResearchInputs::load(&args).is_err());
+        drop(file);
+        fs::remove_file(path).unwrap();
     }
 }

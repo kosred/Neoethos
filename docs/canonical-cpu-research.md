@@ -5,9 +5,10 @@ symbol snapshot, D1 screening-cost builder, streaming discovery and chronologica
 holdout evaluation in one invocation. It uses the explicitly supplied settings
 file for startup, CPU admission, runtime overrides and discovery.
 
-Candidate selection uses screening cost assumptions. By default, so does the
-final holdout. An explicitly supplied saved quote-replay bundle connects the
-existing quote and execution-economics consumer after the portfolio is locked.
+Candidate selection and sizing calibration use screening cost assumptions. The
+separate final holdout remains reserved until replay is requested. An explicitly
+supplied saved quote-replay bundle connects the existing quote and
+execution-economics consumer after the portfolio is locked.
 A negative screening run is not a verdict on the broker-cost pipeline.
 Use [the account evidence entrypoint](broker-account-evidence.md) to inspect the
 actual account currency, broker PnL and reported commission/swap components.
@@ -53,10 +54,38 @@ causal conversion and signed cash components. Missing, duplicate, unused or
 inconsistent position inputs are refused. Deserialized metadata grants no
 authority; the existing validator must independently reopen the immutable evidence.
 
-The bundle must match the portfolio selected by this invocation, including its
-final SMC policy. A different selection is refused rather than silently rebinding
-old evidence. This is an explicit continuation interface, not automatic broker
-acquisition. Current account/deal snapshots alone are not sufficient to produce
+To continue an existing selection, add
+`--resume-research <research.json> --resume-research-sha256 <file-sha256>` and
+`--max-batches 1` to the same canonical command, with a new output directory.
+Use the original settings, broker snapshots, plan and matrix. The result's file
+hash, internal evidence identity, complete feature receipt and rebuilt cost
+contract must agree. Empty selections cannot be resumed. Search-budget overrides
+(`--population`, `--generations`, `--max-indicators`, `--candidates`) are refused
+because this mode does not run Search or repeat sizing calibration.
+
+Resume reopens the exact recorded feature working set, including a later batch,
+instead of selecting columns from today's free RAM. The existing funnel field
+`live_trading_policy_v1` now persists the archived signal/exit configuration;
+previous writers omitted it from JSON. A legacy result without that policy or
+the recorded recipe/working set is refused. The existing signal producer reconstructs
+the full SMC signals and final plan from canonical data and the archived policy.
+Changed source values, feature math, final windows or policy fail the binding;
+the command never silently reruns selection to repair a mismatch.
+
+Without a replay bundle, this mode records acquisition coordinates in the existing
+`research.json.streaming.json`: `selection_mode: FrozenResearchResumed`, the saved
+file hash, original `source_batch_cursor` and `locked_finalists` containing the
+signal-plan/portfolio/scope identities and exact evaluation window. These
+coordinates are preparation data, not quote evidence. Supply the same saved
+research plus all three quote flags when the reviewed bundle is available.
+Research inputs are bounded to 512 MiB (the complete candidate/evidence ledger
+can exceed 150 MiB); replay bundles retain their 64 MiB decoder limit. Both must
+be regular files.
+
+The bundle must match this frozen portfolio and final SMC policy. Omitting the
+resume flags retains the original new-search behavior, which can select a
+different portfolio and correctly refuse an older bundle. This interface does
+not automatically acquire broker evidence. Current account/deal snapshots alone are not sufficient to produce
 this bundle or establish historical fee policy. The local integration regression
 uses synthetic observations in real Vortex storage; it does not establish that a
 broker-backed finalist bundle has been acquired or that a strategy is profitable.

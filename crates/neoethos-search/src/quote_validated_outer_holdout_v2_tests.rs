@@ -9,83 +9,91 @@ struct Fixture {
     size_multipliers: Vec<Vec<f64>>,
 }
 
+/// Synthetic cTrader identity for immutable input-contract tests only.
+pub(crate) fn explicit_broker_feature_fixture() -> neoethos_data::FeatureFrame {
+    let bars = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+    // Explicit synthetic broker identity for INPUT-contract tests only.
+    // The shared sample feature helper deliberately has External scope;
+    // do not relax production validation or relabel a real stored receipt.
+    use neoethos_feature_contracts::{
+        DatasetFeatureArtifactProvenanceV1, FeatureNodeV1, FeatureOutputV1, FeaturePlanV1,
+        SourceArtifactBindingV1, SourceSegmentV1,
+    };
+    let identity = neoethos_data::CanonicalDatasetIdentity::ctrader(
+        neoethos_data::CTraderEnvironment::Demo,
+        "prelocked-unit-test",
+        101,
+        7,
+        "EURUSD",
+        CanonicalTimeframe::M1,
+        neoethos_data::BarTimestampConvention::BarOpen,
+    )
+    .unwrap();
+    let timestamps = bars.timestamp.as_ref().unwrap();
+    let plan = FeaturePlanV1::new(
+        vec![
+            FeatureNodeV1::source(
+                "test:source",
+                identity.clone(),
+                "test.prelocked-input-only.v1",
+                1,
+                vec![FeatureOutputV1::f64("test_signal_input", 1).unwrap()],
+                [1; 32],
+            )
+            .unwrap(),
+        ],
+        vec!["test_signal_input".to_owned()],
+    )
+    .unwrap();
+    let provenance = DatasetFeatureArtifactProvenanceV1::new(
+        &plan,
+        vec![
+            SourceArtifactBindingV1::new(
+                "test:source",
+                identity.clone(),
+                "test.prelocked-input-only.v1",
+                [1; 32],
+                "test-only-generation",
+                [2; 32],
+                neoethos_data::BarTimestampConvention::BarOpen,
+                vec![
+                    SourceSegmentV1::new(
+                        0,
+                        timestamps.len() as u64,
+                        timestamps[0],
+                        *timestamps.last().unwrap(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let features = neoethos_data::FeatureFrame::from_columns(
+        timestamps.clone(),
+        vec![
+            neoethos_data::FeatureColumnF64::new(
+                "test_signal_input",
+                vec![0.0; timestamps.len()],
+                vec![neoethos_data::FeatureCellValidity::Valid; timestamps.len()],
+            )
+            .unwrap(),
+        ],
+        plan,
+        provenance,
+    )
+    .unwrap();
+    features
+}
+
 impl Fixture {
     fn new() -> Self {
         let bars = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
-        // Explicit synthetic broker identity for INPUT-contract tests only.
-        // The shared sample feature helper deliberately has External scope;
-        // do not relax production validation or relabel a real stored receipt.
-        use neoethos_feature_contracts::{
-            DatasetFeatureArtifactProvenanceV1, FeatureNodeV1, FeatureOutputV1, FeaturePlanV1,
-            SourceArtifactBindingV1, SourceSegmentV1,
-        };
-        let identity = neoethos_data::CanonicalDatasetIdentity::ctrader(
-            neoethos_data::CTraderEnvironment::Demo,
-            "prelocked-unit-test",
-            101,
-            7,
-            "EURUSD",
-            CanonicalTimeframe::M1,
-            neoethos_data::BarTimestampConvention::BarOpen,
-        )
-        .unwrap();
-        let timestamps = bars.timestamp.as_ref().unwrap();
-        let plan = FeaturePlanV1::new(
-            vec![
-                FeatureNodeV1::source(
-                    "test:source",
-                    identity.clone(),
-                    "test.prelocked-input-only.v1",
-                    1,
-                    vec![FeatureOutputV1::f64("test_signal_input", 1).unwrap()],
-                    [1; 32],
-                )
-                .unwrap(),
-            ],
-            vec!["test_signal_input".to_owned()],
-        )
-        .unwrap();
-        let provenance = DatasetFeatureArtifactProvenanceV1::new(
-            &plan,
-            vec![
-                SourceArtifactBindingV1::new(
-                    "test:source",
-                    identity.clone(),
-                    "test.prelocked-input-only.v1",
-                    [1; 32],
-                    "test-only-generation",
-                    [2; 32],
-                    neoethos_data::BarTimestampConvention::BarOpen,
-                    vec![
-                        SourceSegmentV1::new(
-                            0,
-                            timestamps.len() as u64,
-                            timestamps[0],
-                            *timestamps.last().unwrap(),
-                        )
-                        .unwrap(),
-                    ],
-                )
-                .unwrap(),
-            ],
-        )
-        .unwrap();
-        let features = neoethos_data::FeatureFrame::from_columns(
-            timestamps.clone(),
-            vec![
-                neoethos_data::FeatureColumnF64::new(
-                    "test_signal_input",
-                    vec![0.0; timestamps.len()],
-                    vec![neoethos_data::FeatureCellValidity::Valid; timestamps.len()],
-                )
-                .unwrap(),
-            ],
-            plan,
-            provenance,
-        )
-        .unwrap();
+        let features = explicit_broker_feature_fixture();
+        let identity = features.provenance().bindings()[0].dataset_identity();
         let receipt =
-            crate::CanonicalSearchInputReceiptV2::from_feature_frame(&identity, &features).unwrap();
+            crate::CanonicalSearchInputReceiptV2::from_feature_frame(identity, &features).unwrap();
         let scope = CanonicalSearchArtifactScopeV2::for_entire_receipt(
             CanonicalSearchWindowRoleV1::Holdout,
             receipt,

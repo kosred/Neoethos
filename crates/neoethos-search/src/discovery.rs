@@ -1760,7 +1760,82 @@ pub(crate) fn apply_research_contract_to_discovery_config(
     config.pnl_conversion_fee_rate = contract.pnl_conversion_fee_rate();
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Run-level tally of [`CostBandVerdict`] across every screened candidate.
+///
+/// Read `optimistic_edge_only` before reading the survivor count. Those
+/// candidates cleared every configured gate and are still not results: they are
+/// profitable only at the cheap end of a cost the operator cannot pin down to a
+/// tenth of a pip.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostBandCensus {
+    pub survives: usize,
+    pub optimistic_edge_only: usize,
+    pub fails: usize,
+    pub unmeasured: usize,
+    pub not_discriminating: usize,
+}
+
+impl CostBandCensus {
+    pub fn total(&self) -> usize {
+        self.survives
+            + self.optimistic_edge_only
+            + self.fails
+            + self.unmeasured
+            + self.not_discriminating
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryValidationGates {
+    pub walkforward_passed: bool,
+    pub cpcv_passed: bool,
+    pub canonical_backtest_artifacts: usize,
+    pub walkforward_validation_artifacts: usize,
+    pub cpcv_fold_count: usize,
+    pub cpcv_profitable_fold_ratio: f64,
+    /// Probability of Backtest Overfitting (CSCV over the CPCV splits, López
+    /// de Prado): the fraction of splits where the IN-SAMPLE champion of the
+    /// candidate set ranked at-or-below the median OUT-of-sample. `None` when
+    /// not computable (too few candidates or the gate is disabled).
+    pub pbo: Option<f64>,
+    /// False only when PBO was computed AND exceeded `config.max_pbo` —
+    /// a portfolio whose selection process looks like luck is not exportable.
+    pub pbo_passed: bool,
+    /// How many candidate strategies fed the PBO estimate.
+    pub pbo_candidates: usize,
+    /// Honesty counter: how many candidates the whole run RANKED before any
+    /// gate — the selection pressure the survivors' metrics were bought with.
+    pub trials_tested: usize,
+    pub temporal_contract_hash: Option<String>,
+    /// Set when the prop-firm window-pass gate
+    /// (`NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE=1`) replaces the walkforward
+    /// + CPCV consistency gates. Each portfolio member has already passed
+    /// FTMO-style rules on at least `pass_rate` of N random 30-day
+    /// windows from the dataset; this is what an actual prop-firm
+    /// challenge measures, so the much stricter "every walkforward
+    /// split must be profitable" requirement is bypassed here.
+    pub prop_firm_window_passed: bool,
+    pub prop_firm_window_pass_rate: f64,
+    pub prop_firm_window_count: usize,
+    /// NEVER-ZERO (2026-06-09, operator non-negotiable): set when the strict
+    /// funnel rejected EVERY candidate and discovery promoted the best-found
+    /// genes as a best-effort portfolio instead of dying empty. These genes did
+    /// NOT pass the prop bar — `prop_firm_window_passed`/`walkforward_passed`/
+    /// `cpcv_passed` are all forced false so `is_portfolio_export_ready()` stays
+    /// honest. Downstream consumers (the autonomous trader) MUST treat a
+    /// fallback portfolio cautiously (e.g. demo-only / heavily down-sized).
+    #[serde(default)]
+    pub fallback_mode: bool,
+    /// Which strict stage was the bottleneck that emptied the portfolio (e.g.
+    /// `"passed_prop_firm_window"`). Empty unless `fallback_mode`.
+    #[serde(default)]
+    pub fallback_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveryResult {
     /// Immutable identity/generation/manifest/Vortex/feature-plan proof for
     /// every value this run consumed. Persisted outputs must carry this exact
@@ -2270,7 +2345,8 @@ impl DiscoveryResult {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggedStrategyTrades {
     pub strategy_id: String,
     pub opportunistic: bool,
@@ -2304,53 +2380,6 @@ pub struct DiscoveryFilterProfile {
     pub opportunistic_enabled_raw: bool,
     pub anomaly_guard: bool,
     pub elite_mode: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DiscoveryValidationGates {
-    pub walkforward_passed: bool,
-    pub cpcv_passed: bool,
-    pub canonical_backtest_artifacts: usize,
-    pub walkforward_validation_artifacts: usize,
-    pub cpcv_fold_count: usize,
-    pub cpcv_profitable_fold_ratio: f64,
-    /// Probability of Backtest Overfitting (CSCV over the CPCV splits, López
-    /// de Prado): the fraction of splits where the IN-SAMPLE champion of the
-    /// candidate set ranked at-or-below the median OUT-of-sample. `None` when
-    /// not computable (too few candidates or the gate is disabled).
-    pub pbo: Option<f64>,
-    /// False only when PBO was computed AND exceeded `config.max_pbo` —
-    /// a portfolio whose selection process looks like luck is not exportable.
-    pub pbo_passed: bool,
-    /// How many candidate strategies fed the PBO estimate.
-    pub pbo_candidates: usize,
-    /// Honesty counter: how many candidates the whole run RANKED before any
-    /// gate — the selection pressure the survivors' metrics were bought with.
-    pub trials_tested: usize,
-    pub temporal_contract_hash: Option<String>,
-    /// Set when the prop-firm window-pass gate
-    /// (`NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE=1`) replaces the walkforward
-    /// + CPCV consistency gates. Each portfolio member has already passed
-    /// FTMO-style rules on at least `pass_rate` of N random 30-day
-    /// windows from the dataset; this is what an actual prop-firm
-    /// challenge measures, so the much stricter "every walkforward
-    /// split must be profitable" requirement is bypassed here.
-    pub prop_firm_window_passed: bool,
-    pub prop_firm_window_pass_rate: f64,
-    pub prop_firm_window_count: usize,
-    /// NEVER-ZERO (2026-06-09, operator non-negotiable): set when the strict
-    /// funnel rejected EVERY candidate and discovery promoted the best-found
-    /// genes as a best-effort portfolio instead of dying empty. These genes did
-    /// NOT pass the prop bar — `prop_firm_window_passed`/`walkforward_passed`/
-    /// `cpcv_passed` are all forced false so `is_portfolio_export_ready()` stays
-    /// honest. Downstream consumers (the autonomous trader) MUST treat a
-    /// fallback portfolio cautiously (e.g. demo-only / heavily down-sized).
-    #[serde(default)]
-    pub fallback_mode: bool,
-    /// Which strict stage was the bottleneck that emptied the portfolio (e.g.
-    /// `"passed_prop_firm_window"`). Empty unless `fallback_mode`.
-    #[serde(default)]
-    pub fallback_reason: String,
 }
 
 impl DiscoveryValidationGates {
@@ -5988,19 +6017,12 @@ fn evaluate_selection_calibration_cohort(
     crate::post_ga::post_ga_batch_width(rows, jobs.len())?;
     let projected =
         crate::live_portfolio::project_features_to_effective(features, effective_feature_names)?;
-    let (evaluation, bypass) = if let Some(policy) = sealed_policy {
-        let mut evaluation = policy.sealed_evaluation_config()?;
-        evaluation.smc_gate_threshold = effective_smc_gate_threshold;
-        (evaluation, policy.sealed_smc_gate_disabled()?)
-    } else {
-        (
-            config.evaluation_config_with_smc_gate(
-                ohlcv.close.last().copied(),
-                effective_smc_gate_threshold,
-            ),
-            crate::genetic::smc_gate_disabled(),
-        )
-    };
+    let (evaluation, bypass) = locked_holdout_evaluation(
+        config,
+        ohlcv.close.last().copied(),
+        effective_smc_gate_threshold,
+        sealed_policy,
+    )?;
     anyhow::ensure!(
         evaluation.smc_gate_threshold.is_finite() && evaluation.smc_gate_threshold >= 0.0,
         "selection calibration requires a finite non-negative final SMC gate"
@@ -6188,34 +6210,13 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
     ) -> Result<Self> {
         let n = validation_row_count(features, ohlcv)?;
         validate_holdout_values_against_scope(holdout_scope, &features.timestamps, n)?;
-        let projected = if features.names == effective_feature_names {
-            Cow::Borrowed(features)
-        } else {
-            let keep = effective_feature_names
-                .iter()
-                .map(|name| {
-                    features.names.iter().position(|candidate| candidate == name)
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "holdout tail is missing feature '{}' from the discovery effective feature set",
-                            name
-                        ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Cow::Owned(features.select_columns(&keep)?)
-        };
-        let (evaluation, bypass) = if let Some(policy) = sealed_policy {
-            let mut evaluation = policy.sealed_evaluation_config()?;
-            evaluation.smc_gate_threshold = effective_smc_gate_threshold;
-            (evaluation, policy.sealed_smc_gate_disabled()?)
-        } else {
-            (
-                config.evaluation_config_with_smc_gate(
-                    ohlcv.close.last().copied(),
-                    effective_smc_gate_threshold,
-                ),
-                crate::genetic::smc_gate_disabled(),
-            )
-        };
+        let projected = project_locked_holdout_features(features, effective_feature_names)?;
+        let (evaluation, bypass) = locked_holdout_evaluation(
+            config,
+            ohlcv.close.last().copied(),
+            effective_smc_gate_threshold,
+            sealed_policy,
+        )?;
         let (ordered_signals, ordered_confidences) =
             locked_holdout_signals_and_confidences_with_policy(
                 portfolio,
@@ -6735,31 +6736,6 @@ struct QualityScreenRejects {
     mc_near_miss: usize,
     /// Went unprofitable once the stress spread/commission were applied.
     sensitivity: usize,
-}
-
-/// Run-level tally of [`CostBandVerdict`] across every screened candidate.
-///
-/// Read `optimistic_edge_only` before reading the survivor count. Those
-/// candidates cleared every configured gate and are still not results: they are
-/// profitable only at the cheap end of a cost the operator cannot pin down to a
-/// tenth of a pip.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct CostBandCensus {
-    pub survives: usize,
-    pub optimistic_edge_only: usize,
-    pub fails: usize,
-    pub unmeasured: usize,
-    pub not_discriminating: usize,
-}
-
-impl CostBandCensus {
-    pub fn total(&self) -> usize {
-        self.survives
-            + self.optimistic_edge_only
-            + self.fails
-            + self.unmeasured
-            + self.not_discriminating
-    }
 }
 
 /// Can the configured band tell anything apart from the baseline it is measured
@@ -7640,56 +7616,23 @@ where
             contract,
         )?;
     let mut quote_evidence = None;
-    let mut observe = |result: &DiscoveryResult,
-                       prepared: &PreparedLockedHoldoutResearch<'_>|
-     -> Result<()> {
-        // Bind the artifact actually shipped to the model handoff. Its existing
-        // export filter can remove genes; the original prepared array is not an
-        // interchangeable portfolio identity.
-        let artifact = crate::LivePortfolioArtifact::from_discovery(
-            result
-                .search_input_receipt
-                .normalization_fitted_state()
-                .is_some(),
-            result,
-        )?;
-        let full_portfolio_hash = crate::canonical_locked_portfolio_identity_sha256_v1(&artifact)?;
-        let mut signals = Vec::with_capacity(artifact.genes.len());
-        let mut confidences = Vec::with_capacity(artifact.genes.len());
-        for gene in &artifact.genes {
-            let index = prepared
-                .portfolio
-                .iter()
-                .position(|candidate| candidate.strategy_id == gene.strategy_id)
-                .ok_or_else(|| anyhow::anyhow!("shipped gene is absent from prelocked signals"))?;
-            ValidationStrategyIdentityV2::from_gene(gene)?
-                .validate_against(&prepared.portfolio[index])?;
-            signals.push(prepared.ordered_signals[index].clone());
-            confidences.push(prepared.ordered_confidences[index].clone());
-        }
-        let multipliers = vec![vec![1.0; prepared.timestamps.len()]; artifact.genes.len()];
-        let evaluation = artifact.live_trading_policy.sealed_evaluation_config()?;
-        let locked = crate::LockedCanonicalSignalPlanV3::new(
-            &artifact.genes,
-            &full_portfolio_hash,
-            &signals,
-            &confidences,
-            &multipliers,
-            prepared.ohlcv,
-            prepared.holdout_scope,
-            prepared.search_config_hash,
-            crate::CanonicalSignalExitPolicyV2::from_evaluation(&evaluation),
-            crate::CanonicalSignalAccountRiskPolicyV3::from_evaluation(&evaluation)?,
-            artifact
-                .live_trading_policy
-                .sealed_adaptive_stops_policy()?,
-        )?;
-        let replay = replay_provider(&locked)?;
-        quote_evidence = Some(crate::evaluate_locked_portfolio_outer_holdout_v3(
-            &locked, replay,
-        )?);
-        Ok(())
-    };
+    let mut observe =
+        |result: &DiscoveryResult, prepared: &PreparedLockedHoldoutResearch<'_>| -> Result<()> {
+            quote_evidence = Some(with_locked_finalist_plan(
+                result,
+                prepared.ohlcv,
+                prepared.holdout_scope,
+                &prepared.ordered_signals,
+                &prepared.ordered_confidences,
+                |locked| {
+                    let replay = replay_provider(locked)?;
+                    Ok(crate::evaluate_locked_portfolio_outer_holdout_v3(
+                        locked, replay,
+                    )?)
+                },
+            )?);
+            Ok(())
+        };
     let (result, _) = run_discovery_cycle_with_holdout_and_progress_authorized(
         input,
         &research_config,
@@ -7703,6 +7646,147 @@ where
         crate::CanonicalTrendbarResearchDiscoveryResultV3::new(contract.clone(), result)?,
         quote_evidence,
     ))
+}
+
+fn project_locked_holdout_features<'a>(
+    features: &'a FeatureFrame,
+    effective_feature_names: &[String],
+) -> Result<Cow<'a, FeatureFrame>> {
+    if features.names == effective_feature_names {
+        return Ok(Cow::Borrowed(features));
+    }
+    Ok(Cow::Owned(
+        crate::live_portfolio::project_features_to_effective(features, effective_feature_names)?,
+    ))
+}
+
+fn locked_holdout_evaluation(
+    config: &DiscoveryConfig,
+    price_hint: Option<f64>,
+    final_gate: f64,
+    policy: Option<&crate::live_portfolio::LiveTradingPolicyV1>,
+) -> Result<(EvaluationConfig, bool)> {
+    if let Some(policy) = policy {
+        let mut evaluation = policy.sealed_evaluation_config()?;
+        evaluation.smc_gate_threshold = final_gate;
+        Ok((evaluation, policy.sealed_smc_gate_disabled()?))
+    } else {
+        Ok((
+            config.evaluation_config_with_smc_gate(price_hint, final_gate),
+            crate::genetic::smc_gate_disabled(),
+        ))
+    }
+}
+
+/// Continue the exact saved selection without invoking Search or calibration.
+/// Rebuild signals from reopened canonical values and the archived policy;
+/// serialized signals and today's mutable evaluation settings are never used.
+/// The callback may export acquisition coordinates or run reviewed quote replay.
+pub fn with_canonical_research_finalist_v3<T>(
+    input: &CanonicalSearchRunInputV2<'_>,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    consume: impl FnOnce(&crate::LockedCanonicalSignalPlanV3<'_>) -> Result<T>,
+) -> Result<T> {
+    research.validate()?;
+    research
+        .execution_contract()
+        .validate_against_input(input)?;
+    let result = research.discovery_result();
+    ensure_non_empty_portfolio(result, "resume frozen canonical research")?;
+    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let holdout = inputs.holdout().expect("three-way canonical holdout");
+    anyhow::ensure!(
+        &result.selection_scope == inputs.selection().scope()
+            && result.calibration_scope.as_ref()
+                == inputs.calibration().map(ScopedDiscoveryInput::scope)
+            && result.holdout_scope.as_ref() == Some(holdout.scope()),
+        "saved research windows differ from the reopened canonical input"
+    );
+    let policy = result
+        .funnel_profile
+        .as_ref()
+        .and_then(|funnel| funnel.live_trading_policy_v1())
+        .ok_or_else(|| anyhow::anyhow!("saved research lost its sealed Search signal policy"))?;
+    let mut evaluation = policy.sealed_evaluation_config()?;
+    evaluation.smc_gate_threshold = result.effective_smc_gate_threshold;
+    let features =
+        project_locked_holdout_features(holdout.features(), &result.effective_feature_names)?;
+    let (signals, confidences) = locked_holdout_signals_and_confidences_with_policy(
+        &result.portfolio,
+        &features,
+        holdout.ohlcv(),
+        &evaluation,
+        policy.sealed_smc_gate_disabled()?,
+    )?;
+    with_locked_finalist_plan(
+        result,
+        holdout.ohlcv(),
+        holdout.scope(),
+        &signals,
+        &confidences,
+        consume,
+    )
+}
+
+fn with_locked_finalist_plan<T>(
+    result: &DiscoveryResult,
+    ohlcv: &Ohlcv,
+    scope: &CanonicalSearchArtifactScopeV2,
+    ordered_signals: &[Vec<i8>],
+    ordered_confidences: &[Vec<f64>],
+    consume: impl FnOnce(&crate::LockedCanonicalSignalPlanV3<'_>) -> Result<T>,
+) -> Result<T> {
+    // The export filter can remove genes: bind only the exact shipped artifact,
+    // preserving its order and the corresponding full-SMC signal vectors.
+    let artifact = crate::LivePortfolioArtifact::from_discovery(
+        result
+            .search_input_receipt
+            .normalization_fitted_state()
+            .is_some(),
+        result,
+    )?;
+    let full_portfolio_hash = crate::canonical_locked_portfolio_identity_sha256_v1(&artifact)?;
+    let mut signals = Vec::with_capacity(artifact.genes.len());
+    let mut confidences = Vec::with_capacity(artifact.genes.len());
+    for gene in &artifact.genes {
+        let index = result
+            .portfolio
+            .iter()
+            .position(|candidate| candidate.strategy_id == gene.strategy_id)
+            .ok_or_else(|| anyhow::anyhow!("shipped gene is absent from prelocked signals"))?;
+        ValidationStrategyIdentityV2::from_gene(gene)?
+            .validate_against(&result.portfolio[index])?;
+        signals.push(
+            ordered_signals
+                .get(index)
+                .context("missing locked signals")?
+                .clone(),
+        );
+        confidences.push(
+            ordered_confidences
+                .get(index)
+                .context("missing locked confidences")?
+                .clone(),
+        );
+    }
+    let multipliers = vec![vec![1.0; ohlcv.len()]; artifact.genes.len()];
+    let evaluation = artifact.live_trading_policy.sealed_evaluation_config()?;
+    let locked = crate::LockedCanonicalSignalPlanV3::new(
+        &artifact.genes,
+        &full_portfolio_hash,
+        &signals,
+        &confidences,
+        &multipliers,
+        ohlcv,
+        scope,
+        &result.search_config_hash,
+        crate::CanonicalSignalExitPolicyV2::from_evaluation(&evaluation),
+        crate::CanonicalSignalAccountRiskPolicyV3::from_evaluation(&evaluation)?,
+        artifact
+            .live_trading_policy
+            .sealed_adaptive_stops_policy()?,
+    )?;
+    consume(&locked)
 }
 
 fn run_discovery_cycle_with_holdout_and_progress_authorized<F>(

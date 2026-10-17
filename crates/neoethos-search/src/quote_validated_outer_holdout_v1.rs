@@ -1236,6 +1236,8 @@ mod streaming_identity_tests {
 
 #[path = "quote_validated_outer_holdout_v2.rs"]
 mod prelocked;
+#[cfg(test)]
+pub(crate) use prelocked::tests::explicit_broker_feature_fixture;
 pub use prelocked::{
     CanonicalSignalAccountRiskPolicyV3, CanonicalSignalExitPolicyV2, LockedCanonicalSignalPlanV3,
     LockedPortfolioOuterHoldoutReplaySetV3, QuoteEntryFinancialInputsV3,

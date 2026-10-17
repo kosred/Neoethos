@@ -2158,9 +2158,11 @@ fn cmd_discover_on_budgeted_pool(
         let settings = resolve_cli_settings(args)?;
         let canonical_cpu_research = parse_canonical_cpu_research_inputs(args)?;
         let mut quote_replay = canonical_research::QuoteReplayInputs::load(args)?;
+        let mut saved_research = canonical_research::SavedResearchInputs::load(args)?;
         anyhow::ensure!(
-            quote_replay.is_none() || canonical_cpu_research.is_some(),
-            "quote replay requires receipt-bound canonical CPU research"
+            (quote_replay.is_none() && saved_research.is_none())
+                || canonical_cpu_research.is_some(),
+            "saved continuation requires receipt-bound canonical CPU research"
         );
         #[cfg(feature = "gpu-nvidia")]
         anyhow::ensure!(
@@ -2451,6 +2453,42 @@ fn cmd_discover_on_budgeted_pool(
                 ..neoethos_data::FeatureBuildOptions::default()
             };
 
+            // Resume the recorded working set, including a later streaming
+            // batch. Today's free RAM must not select a different vocabulary.
+            let (feature_options, streaming_plan) = if let Some(saved) = &saved_research {
+                let recorded = saved
+                    .research
+                    .as_ref()
+                    .context("saved research missing")?
+                    .discovery_result()
+                    .search_input_receipt
+                    .feature_build_options()
+                    .context("saved research has no exact feature-build recipe")?;
+                let mut expected = feature_options;
+                expected.classic_ta_working_set = recorded.classic_ta_working_set.clone();
+                anyhow::ensure!(
+                    expected == *recorded,
+                    "saved feature-build recipe differs from the requested research inputs"
+                );
+                anyhow::ensure!(
+                    recorded.classic_ta_working_set.is_some(),
+                    "saved research has no exact Classic working set; cannot resume an adaptive prefix"
+                );
+                (
+                    recorded.clone(),
+                    neoethos_search::orchestration::StreamingPlan::disabled(),
+                )
+            } else {
+                (
+                    feature_options,
+                    neoethos_search::orchestration::StreamingPlan::streaming(stream_max_batches),
+                )
+            };
+            let source_batch_cursor = feature_options
+                .classic_ta_working_set
+                .as_ref()
+                .map(|batch| batch.cursor);
+
             if let Some(parent) = std::path::Path::new(&out).parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -2465,7 +2503,12 @@ fn cmd_discover_on_budgeted_pool(
                 ],
             )?;
 
-            if let Some(replay) = &quote_replay {
+            for source in quote_replay
+                .as_ref()
+                .map(|value| &value.source)
+                .into_iter()
+                .chain(saved_research.as_ref().map(|value| &value.source))
+            {
                 for target in [
                     out.clone(),
                     format!("{out}.quote-replay.json"),
@@ -2473,17 +2516,18 @@ fn cmd_discover_on_budgeted_pool(
                 ] {
                     canonical_full_run::ensure_cpu_research_output_target(
                         std::path::Path::new(&target),
-                        &[replay.source.as_path()],
+                        &[source.as_path()],
                     )?;
                 }
             }
             let mut quote_evidence = Vec::new();
+            let mut locked_finalists = Vec::new();
             anyhow::ensure!(
-                quote_replay.is_none() || stream_max_batches == 1,
-                "a saved quote replay requires --stream-max-batches 1"
+                (quote_replay.is_none() && saved_research.is_none()) || stream_max_batches == 1,
+                "a saved continuation requires --stream-max-batches 1"
             );
             let mut outcome = neoethos_search::orchestration::run_streaming_working_set(
-                &neoethos_search::orchestration::StreamingPlan::streaming(stream_max_batches),
+                &streaming_plan,
                 base_ohlcv.close.len(),
                 |batch| {
                     let cursor = batch.as_ref().map(|value| value.cursor).unwrap_or(0);
@@ -2532,6 +2576,39 @@ fn cmd_discover_on_budgeted_pool(
                         &higher_list,
                         &account_currency,
                     )?;
+                    if let Some(saved) = saved_research.as_mut() {
+                        let research = saved
+                            .research
+                            .take()
+                            .context("saved research was already consumed")?;
+                        anyhow::ensure!(
+                            research.execution_contract().identity_sha256()?
+                                == contract.identity_sha256()?,
+                            "saved research contract differs from the reopened sources and settings"
+                        );
+                        emit_cpu_research_stage("frozen_finalist_resume_started");
+                        neoethos_search::discovery::with_canonical_research_finalist_v3(
+                            &run_input,
+                            &research,
+                            |locked| {
+                                locked_finalists.push(serde_json::json!({
+                                    "signal_plan_sha256": locked.identity_sha256(),
+                                    "portfolio_identity_sha256": locked.portfolio_identity_sha256(),
+                                    "scope_identity_sha256": locked.scope_identity_sha256(),
+                                    "search_config_hash": locked.search_config_hash(),
+                                    "holdout_scope": locked.holdout_scope(),
+                                    "evaluation_window": locked.locked_evaluation_window(),
+                                    "portfolio_count": locked.portfolio().len(),
+                                }));
+                                if let Some(provider) = quote_replay.as_mut() {
+                                    let replay = provider.replay(cpu, locked)?;
+                                    quote_evidence.push(neoethos_search::evaluate_locked_portfolio_outer_holdout_v3(locked, replay)?);
+                                }
+                                Ok(())
+                            },
+                        )?;
+                        return Ok(research);
+                    }
                     emit_cpu_research_stage("search_pipeline_started");
                     if let Some(provider) = quote_replay.as_mut() {
                         let (research, evidence) =
@@ -2669,6 +2746,10 @@ fn cmd_discover_on_budgeted_pool(
                 "quote_replay_status": quote_replay_status,
                 "quote_replay_evidence_path": quote_path,
                 "quote_replay_input_sha256": quote_replay.as_ref().map(|input| &input.sha256),
+                "selection_mode": if saved_research.is_some() { "FrozenResearchResumed" } else { "NewSearch" },
+                "saved_research_sha256": saved_research.as_ref().map(|input| &input.sha256),
+                "source_batch_cursor": source_batch_cursor,
+                "locked_finalists": locked_finalists,
                 "streaming_space_exhausted": streamed && next_cursor >= space_len,
                 "symbol": &symbol,
                 "base_timeframe": &base,

@@ -1341,4 +1341,4 @@ pub fn evaluate_locked_portfolio_outer_holdout_v3(
 
 #[cfg(test)]
 #[path = "quote_validated_outer_holdout_v2_tests.rs"]
-mod tests;
+pub(crate) mod tests;
