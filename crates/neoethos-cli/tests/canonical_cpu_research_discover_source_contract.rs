@@ -94,8 +94,9 @@ fn cpu_discover_research_is_exact_receipt_bound_and_never_exports_a_live_portfol
     }
 
     assert!(
-        research.contains("#[derive(Debug, Clone, Serialize)]")
-            && research.contains("pub struct CanonicalTrendbarResearchDiscoveryResultV3"),
+        research.contains("#[derive(Debug, Clone, Serialize, Deserialize)]")
+            && research.contains("pub struct CanonicalTrendbarResearchDiscoveryResultV3")
+            && research.contains("pub fn from_json_bytes(bytes: &[u8])"),
         "the complete research-only result envelope is not serializable"
     );
 }

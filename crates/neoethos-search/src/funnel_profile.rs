@@ -269,10 +269,11 @@ pub struct FunnelProfile {
     #[serde(skip)]
     population_execution_run_receipt_v2:
         Option<crate::population_execution_run_receipt_v2::ExactPopulationExecutionRunReceiptV2>,
-    /// Exact live execution policy resolved from the immutable search
-    /// authority. This is an in-memory carrier only: the dedicated
-    /// `live_portfolio` artifact persists and validates it explicitly.
-    #[serde(skip)]
+    /// Archived signal/exit configuration for exact research continuation.
+    /// Persisting these values grants no execution authority: consumers must
+    /// validate the policy, source receipt and final portfolio independently.
+    /// Legacy profiles without it remain inspectable but cannot resume replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     live_trading_policy_v1: Option<crate::live_portfolio::LiveTradingPolicyV1>,
     /// When the previous stage finished, so each stage can report its own cost.
     /// Not persisted — it only has meaning during the run that set it.

@@ -524,35 +524,59 @@ fn canonical_research_v3_exact_maps_shipped_genes_to_prepared_signals_and_sealed
         &[
             "contract.validate_against_input(input)?",
             "from_explicit_canonical_cpu_research_v1",
+            "with_locked_finalist_plan(",
+            "prepared.ohlcv",
+            "&prepared.ordered_signals",
+            "&prepared.ordered_confidences",
+            "replay_provider(locked)",
+            "evaluate_locked_portfolio_outer_holdout_v3(",
+            "Some(&mut observe)",
+        ],
+    );
+    let resume = function_body(&discovery, "pub fn with_canonical_research_finalist_v3<T>(");
+    require_tokens(
+        resume,
+        &[
+            "research.validate()?",
+            ".validate_against_input(input)?",
+            "ensure_non_empty_portfolio(",
+            "locked_holdout_signals_and_confidences_with_policy(",
+            "with_locked_finalist_plan(",
+        ],
+    );
+    let plan = function_body(&discovery, "fn with_locked_finalist_plan<T>(");
+    require_tokens(
+        plan,
+        &[
             "LivePortfolioArtifact::from_discovery(",
             "canonical_locked_portfolio_identity_sha256_v1(&artifact)",
             "for gene in &artifact.genes",
             "ValidationStrategyIdentityV2::from_gene(gene)?",
-            ".validate_against(&prepared.portfolio[index])?",
-            "signals.push(prepared.ordered_signals[index].clone())",
-            "confidences.push(prepared.ordered_confidences[index].clone())",
+            ".validate_against(&result.portfolio[index])?",
+            "ordered_signals",
+            "ordered_confidences",
+            ".context(\"missing locked signals\")?",
+            ".context(\"missing locked confidences\")?",
             "&artifact.genes",
             "&full_portfolio_hash",
             "&signals",
             "&confidences",
             "&multipliers",
-            "prepared.ohlcv",
             "sealed_evaluation_config()?",
             "CanonicalSignalExitPolicyV2::from_evaluation(&evaluation)",
             "CanonicalSignalAccountRiskPolicyV3::from_evaluation(&evaluation)?",
             ".sealed_adaptive_stops_policy()?",
-            "replay_provider(&locked)",
-            "evaluate_locked_portfolio_outer_holdout_v3(",
-            "Some(&mut observe)",
+            "consume(&locked)",
         ],
     );
     assert!(!entry.contains("current_broker_financial_truth"));
     assert!(!entry.contains("signals_and_confidence_for_gene"));
+    assert!(!plan.contains("current_broker_financial_truth"));
+    assert!(!plan.contains("signals_and_confidence_for_gene"));
     assert!(
-        entry
-            .find(".validate_against(&prepared.portfolio[index])?")
+        plan.find(".validate_against(&result.portfolio[index])?")
             .unwrap()
-            < entry.find("LockedCanonicalSignalPlanV3::new(").unwrap()
+            < plan.find("LockedCanonicalSignalPlanV3::new(").unwrap()
     );
     let body = function_body(
         &discovery,
