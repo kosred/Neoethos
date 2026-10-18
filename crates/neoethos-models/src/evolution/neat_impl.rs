@@ -46,14 +46,6 @@ const MIN_NEAT_GENERATIONS: usize = 8;
 /// Checked, backend-local narrowing for symbios-neat, whose evaluator accepts
 /// f32 inputs. The shared typed frame and scaler remain f64, and values that
 /// cannot survive this explicit boundary fail closed.
-fn neat_backend_f32_matrix(features: &Array2<f64>) -> Result<Array2<f32>> {
-    crate::common::checked_evolution_backend_f32_matrix(
-        features,
-        "NEAT",
-        "shape NEAT f32 backend feature matrix",
-    )
-}
-
 fn default_neat_requested_device_policy() -> String {
     "auto".to_string()
 }
@@ -1230,7 +1222,7 @@ impl ExpertModel for NeatExpert {
 
             let split = temporal_train_validation_split(features.nrows());
             let scaler = FeatureScaler::fit(&features.select(Axis(0), &split.train_indices))?;
-            let scaled = neat_backend_f32_matrix(&scaler.transform(&features)?)?;
+            let scaled = crate::common::checked_evolution_backend_f32_matrix(&scaler.transform(&features)?, "NEAT", "shape NEAT f32 backend feature matrix")?;
 
             self.config = build_neat_config(scaled.ncols());
             self.feature_columns = feature_columns;
@@ -1262,7 +1254,7 @@ impl ExpertModel for NeatExpert {
             ensure_feature_columns_match(&self.feature_columns, x)?;
             let (features, _) = feature_matrix_from_frame(x)?;
             let scaler = self.scaler.as_ref().context("NEAT scaler missing")?;
-            let scaled = neat_backend_f32_matrix(&scaler.transform(&features)?)?;
+            let scaled = crate::common::checked_evolution_backend_f32_matrix(&scaler.transform(&features)?, "NEAT", "shape NEAT f32 backend feature matrix")?;
             let genome = self.best_genome.as_ref().context("NEAT genome missing")?;
             evaluate_probabilities(genome, &scaled)
         })
