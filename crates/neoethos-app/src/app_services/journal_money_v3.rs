@@ -23,8 +23,8 @@ use chrono::{Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::app_services::broker_deal_economics::{
-    append_string, sha256_hex, BROKER_DEAL_MONEY_SCHEMA_VERSION_V1, BrokerDealMoneyEvidenceV1, BrokerPnlConversionFeeV1,
-    BrokerSymbolVolumeScaleEvidenceV1,
+    BROKER_DEAL_MONEY_SCHEMA_VERSION_V1, BrokerDealMoneyEvidenceV1, BrokerPnlConversionFeeV1,
+    BrokerSymbolVolumeScaleEvidenceV1, append_string, sha256_hex,
 };
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeSnapshot, CTraderPositionSnapshot,
