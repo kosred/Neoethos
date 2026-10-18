@@ -2018,6 +2018,24 @@ struct CanonicalCpuResearchInputs {
     settings_source: std::path::PathBuf,
 }
 
+fn canonical_cpu_research_evidence_status(
+    completed: usize,
+    ledger: &neoethos_search::orchestration::StreamingRunLedger,
+) -> &'static str {
+    use neoethos_search::orchestration::BatchOutcome;
+
+    // A budget marker describes unattempted work, not a failed batch. Search
+    // coverage is reported separately through streaming_space_exhausted/cursor.
+    let attempted = ledger.batches_seen() - ledger.count_of(BatchOutcome::BudgetExhausted);
+    if completed == 0 {
+        "Failed"
+    } else if completed != attempted {
+        "Partial"
+    } else {
+        "Complete"
+    }
+}
+
 fn parse_canonical_cpu_research_inputs(
     args: &[String],
 ) -> Result<Option<CanonicalCpuResearchInputs>> {
@@ -2724,13 +2742,7 @@ fn cmd_discover_on_budgeted_pool(
             } else {
                 None
             };
-            let evidence_status = if completed.is_empty() {
-                "Failed"
-            } else if completed.len() < ledger.batches_seen() {
-                "Partial"
-            } else {
-                "Complete"
-            };
+            let evidence_status = canonical_cpu_research_evidence_status(completed.len(), &ledger);
             let selection_outcome = if portfolio_count == 0 {
                 "NoCandidatePortfolio"
             } else {
@@ -5312,6 +5324,54 @@ mod tests {
         select_runtime_timeframe_identities, select_runtime_timeframe_identities_for_base,
     };
     use neoethos_core::sectioned_log::SubsystemSection;
+
+    #[test]
+    fn canonical_cpu_research_budget_stop_preserves_completed_evidence_and_real_failures() {
+        use neoethos_search::orchestration::{
+            BatchLedgerEntry, BatchOutcome::*, StreamingRunLedger,
+        };
+
+        let cases = [
+            (vec![EmptyPortfolio, BudgetExhausted], 1, "Complete"),
+            (vec![SurvivorsPromoted, BudgetExhausted], 1, "Complete"),
+            (vec![PredicateEarlyReject, BudgetExhausted], 1, "Complete"),
+            (vec![StreamingUnavailable], 1, "Complete"),
+            (vec![EmptyPortfolio], 1, "Complete"),
+            (
+                vec![EmptyPortfolio, FeatureBuildFailed, BudgetExhausted],
+                1,
+                "Partial",
+            ),
+            (vec![DiscoveryCycleFailed, EmptyPortfolio], 1, "Partial"),
+            (
+                vec![EmptyPortfolio, EmptyPortfolio, BudgetExhausted],
+                1,
+                "Partial",
+            ),
+            (vec![FeatureBuildFailed, BudgetExhausted], 0, "Failed"),
+            (vec![BudgetExhausted], 0, "Failed"),
+            (vec![], 0, "Failed"),
+        ];
+        for (outcomes, completed, expected) in cases {
+            let mut ledger = StreamingRunLedger::new();
+            for (cursor, outcome) in outcomes.into_iter().enumerate() {
+                ledger.record(BatchLedgerEntry::new(
+                    cursor,
+                    cursor + 1,
+                    0,
+                    0,
+                    outcome,
+                    0,
+                    "test",
+                ));
+            }
+            assert_eq!(
+                super::canonical_cpu_research_evidence_status(completed, &ledger),
+                expected,
+                "completed={completed}, ledger={ledger:?}"
+            );
+        }
+    }
 
     fn external_identity(
         namespace: &str,
