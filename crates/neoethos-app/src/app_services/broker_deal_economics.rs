@@ -98,7 +98,7 @@ fn validate_currency(value: &str) -> Result<(), BrokerDealMoneyErrorV1> {
     Ok(())
 }
 
-fn append_string(bytes: &mut Vec<u8>, value: &str) {
+pub(crate) fn append_string(bytes: &mut Vec<u8>, value: &str) {
     bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
     bytes.extend_from_slice(value.as_bytes());
 }
@@ -113,7 +113,7 @@ fn append_optional_f64(bytes: &mut Vec<u8>, value: Option<f64>) {
     }
 }
 
-fn sha256_hex(domain: &str, payload: &[u8]) -> String {
+pub(crate) fn sha256_hex(domain: &str, payload: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain.as_bytes());
     hasher.update(b"\n");
