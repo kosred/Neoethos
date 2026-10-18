@@ -39,31 +39,17 @@ use crate::statistical::common::{METADATA_FILE_NAME, read_json, write_json};
 /// enough to remain finite and non-zero when the source was non-zero.
 fn exit_backend_f32_matrix(frame: &FeatureFrame) -> Result<Array2<f32>> {
     let dense = feature_frame_to_f64_array(frame)?;
-    let mut values = Vec::with_capacity(dense.len());
-    for ((row, column), value) in dense.indexed_iter() {
-        if value.abs() > f64::from(f32::MAX) {
-            anyhow::bail!(
-                "exit-agent feature `{}` row {row} overflows f32: {value}",
-                frame.names[column]
-            );
-        }
-        let narrowed = *value as f32;
-        if !narrowed.is_finite() {
-            anyhow::bail!(
-                "exit-agent feature `{}` row {row} becomes non-finite in f32",
-                frame.names[column]
-            );
-        }
-        if *value != 0.0 && narrowed == 0.0 {
-            anyhow::bail!(
-                "exit-agent feature `{}` row {row} underflows to zero in f32",
-                frame.names[column]
-            );
-        }
-        values.push(narrowed);
-    }
-    Array2::from_shape_vec(dense.raw_dim(), values)
-        .context("rebuild checked exit-agent f32 backend matrix")
+    crate::common::checked_backend_f32_matrix(
+        &dense,
+        crate::common::F32NarrowPrecheck::F32RangeFirst,
+        "rebuild checked exit-agent f32 backend matrix",
+        |row, column, value, failure| match failure {
+            crate::common::F32NarrowFailure::NonFiniteInput => anyhow::anyhow!("exit-agent feature `{}` row {row} becomes non-finite in f32", frame.names[column]),
+            crate::common::F32NarrowFailure::OutOfRange => anyhow::anyhow!("exit-agent feature `{}` row {row} overflows f32: {value}", frame.names[column]),
+            crate::common::F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!("exit-agent feature `{}` row {row} becomes non-finite in f32", frame.names[column]),
+            crate::common::F32NarrowFailure::Underflow => anyhow::anyhow!("exit-agent feature `{}` row {row} underflows to zero in f32", frame.names[column]),
+        },
+    )
 }
 // ============================================================================
 // BURN Q-NETWORK

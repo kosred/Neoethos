@@ -50,26 +50,17 @@ type NeuroEvoParams = (Array2<f32>, Vec<f32>, Array2<f32>, Vec<f32>);
 /// explicit backend boundary fail closed instead of being silently rounded to
 /// infinity or zero.
 fn neuro_evo_backend_f32_matrix(features: &Array2<f64>) -> Result<Array2<f32>> {
-    let mut narrowed = Vec::with_capacity(features.len());
-    for ((row, column), value) in features.indexed_iter() {
-        if value.abs() > f32::MAX as f64 {
-            bail!(
-                "neuro-evo f32 backend cannot represent feature row {row} column {column}: {value}"
-            );
-        }
-        let converted = *value as f32;
-        if !converted.is_finite() {
-            bail!("neuro-evo f32 backend produced non-finite feature row {row} column {column}");
-        }
-        if *value != 0.0 && converted == 0.0 {
-            bail!(
-                "neuro-evo f32 backend underflowed non-zero feature row {row} column {column}: {value}"
-            );
-        }
-        narrowed.push(converted);
-    }
-    Array2::from_shape_vec(features.dim(), narrowed)
-        .context("shape neuro-evo f32 backend feature matrix")
+    crate::common::checked_backend_f32_matrix(
+        features,
+        crate::common::F32NarrowPrecheck::F32RangeFirst,
+        "shape neuro-evo f32 backend feature matrix",
+        |row, column, value, failure| match failure {
+            crate::common::F32NarrowFailure::NonFiniteInput => anyhow::anyhow!("neuro-evo f32 backend produced non-finite feature row {row} column {column}"),
+            crate::common::F32NarrowFailure::OutOfRange => anyhow::anyhow!("neuro-evo f32 backend cannot represent feature row {row} column {column}: {value}"),
+            crate::common::F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!("neuro-evo f32 backend produced non-finite feature row {row} column {column}"),
+            crate::common::F32NarrowFailure::Underflow => anyhow::anyhow!("neuro-evo f32 backend underflowed non-zero feature row {row} column {column}: {value}"),
+        },
+    )
 }
 
 fn default_neuro_evo_requested_device_policy() -> String {

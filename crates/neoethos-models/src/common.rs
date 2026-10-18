@@ -16,6 +16,49 @@
 use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum F32NarrowPrecheck {
+    FiniteInputFirst,
+    F32RangeFirst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum F32NarrowFailure {
+    NonFiniteInput,
+    OutOfRange,
+    NonFiniteOutput,
+    Underflow,
+}
+
+/// One checked numeric conversion shared by the existing backend adapters.
+/// Preserve precheck order and backend-specific error messages at each caller.
+pub(crate) fn checked_backend_f32_matrix(
+    source: &Array2<f64>,
+    precheck: F32NarrowPrecheck,
+    shape_context: &'static str,
+    mut report: impl FnMut(usize, usize, f64, F32NarrowFailure) -> anyhow::Error,
+) -> Result<Array2<f32>> {
+    let mut converted = Vec::with_capacity(source.len());
+    for ((row, column), &value) in source.indexed_iter() {
+        if precheck == F32NarrowPrecheck::FiniteInputFirst && !value.is_finite() {
+            return Err(report(row, column, value, F32NarrowFailure::NonFiniteInput));
+        }
+        if precheck == F32NarrowPrecheck::F32RangeFirst && value.abs() > f32::MAX as f64 {
+            return Err(report(row, column, value, F32NarrowFailure::OutOfRange));
+        }
+        let narrowed = value as f32;
+        if !narrowed.is_finite() {
+            return Err(report(row, column, value, F32NarrowFailure::NonFiniteOutput));
+        }
+        if value != 0.0 && narrowed == 0.0 {
+            return Err(report(row, column, value, F32NarrowFailure::Underflow));
+        }
+        converted.push(narrowed);
+    }
+    Array2::from_shape_vec(source.raw_dim(), converted).context(shape_context)
+}
+
+
 /// ROCm aliases are intentionally separate from CUDA normalization: explicit
 /// NVIDIA requests must remain visible and fail in a ROCm-only neural build.
 pub fn normalize_rocm_device_policy(policy: &str) -> String {
@@ -252,6 +295,73 @@ pub fn normalize_vendor_device_policy(policy: &str, _extra_prefixes: &[&str]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    fn cast_for_test(value: f64, precheck: F32NarrowPrecheck) -> Result<Array2<f32>> {
+        checked_backend_f32_matrix(
+            &ndarray::array![[value]],
+            precheck,
+            "test reshape",
+            |row, column, value, failure| {
+                anyhow::anyhow!("{failure:?} row {row} column {column} value {value}")
+            },
+        )
+    }
+
+    #[test]
+    fn checked_f32_matrix_retains_shape_finite_bits_and_signed_zero() {
+        let input = ndarray::array![[0.25_f64, -0.5], [0.0, -0.0]];
+        for policy in [
+            F32NarrowPrecheck::FiniteInputFirst,
+            F32NarrowPrecheck::F32RangeFirst,
+        ] {
+            let output = checked_backend_f32_matrix(
+                &input,
+                policy,
+                "test reshape",
+                |_, _, _, issue| anyhow::anyhow!("{issue:?}"),
+            )
+            .unwrap();
+            assert_eq!(output.dim(), (2, 2));
+            assert_eq!(output[(0, 0)].to_bits(), 0.25_f32.to_bits());
+            assert_eq!(output[(0, 1)].to_bits(), (-0.5_f32).to_bits());
+            assert_eq!(output[(1, 0)].to_bits(), 0.0_f32.to_bits());
+            assert_eq!(output[(1, 1)].to_bits(), (-0.0_f32).to_bits());
+        }
+    }
+
+    #[test]
+    fn checked_f32_matrix_rejects_nonfinite_overflow_and_underflow() {
+        let tiny = f64::from(f32::from_bits(1)) / 4.0;
+        let huge = f64::from(f32::MAX) * 2.0;
+        for policy in [
+            F32NarrowPrecheck::FiniteInputFirst,
+            F32NarrowPrecheck::F32RangeFirst,
+        ] {
+            assert!(cast_for_test(tiny, policy).unwrap_err().to_string().contains("Underflow"));
+            assert!(cast_for_test(f64::NAN, policy).unwrap_err().to_string().contains(
+                if policy == F32NarrowPrecheck::FiniteInputFirst {
+                    "NonFiniteInput"
+                } else {
+                    "NonFiniteOutput"
+                }
+            ));
+            assert!(cast_for_test(f64::INFINITY, policy).unwrap_err().to_string().contains(
+                if policy == F32NarrowPrecheck::FiniteInputFirst {
+                    "NonFiniteInput"
+                } else {
+                    "OutOfRange"
+                }
+            ));
+            assert!(cast_for_test(huge, policy).unwrap_err().to_string().contains(
+                if policy == F32NarrowPrecheck::FiniteInputFirst {
+                    "NonFiniteOutput"
+                } else {
+                    "OutOfRange"
+                }
+            ));
+        }
+    }
 
     #[test]
     fn rocm_policy_preserves_vendor_and_exact_representable_ordinal() {
