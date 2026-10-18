@@ -91,16 +91,11 @@ use crate::statistical::common::{
 const NUM_ACTIONS: usize = 3;
 
 fn sac_backend_f32_matrix(values: &Array2<f64>, context: &str) -> Result<Array2<f32>> {
-    crate::common::checked_backend_f32_matrix(
+    crate::common::checked_rl_backend_f32_matrix(
         values,
-        crate::common::F32NarrowPrecheck::FiniteInputFirst,
+        context,
+        "SAC",
         "shape checked SAC f32 backend matrix",
-        |row, column, value, failure| match failure {
-            crate::common::F32NarrowFailure::NonFiniteInput => anyhow::anyhow!("{context} contains non-finite value {value} at row {row}, column {column}"),
-            crate::common::F32NarrowFailure::OutOfRange => anyhow::anyhow!("{context} value {value} at row {row}, column {column} overflows the SAC f32 backend"),
-            crate::common::F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!("{context} value {value} at row {row}, column {column} overflows the SAC f32 backend"),
-            crate::common::F32NarrowFailure::Underflow => anyhow::anyhow!("{context} value {value} at row {row}, column {column} underflows the SAC f32 backend"),
-        },
     )
 }
 

@@ -292,6 +292,56 @@ pub fn normalize_vendor_device_policy(policy: &str, _extra_prefixes: &[&str]) ->
     normalized
 }
 
+
+/// Preserve both precheck order and legacy error messages in the two RL agents.
+pub(crate) fn checked_rl_backend_f32_matrix(
+    values: &Array2<f64>,
+    context: &str,
+    backend: &str,
+    shape_context: &'static str,
+) -> Result<Array2<f32>> {
+    checked_backend_f32_matrix(
+        values,
+        F32NarrowPrecheck::FiniteInputFirst,
+        shape_context,
+        |row, column, value, failure| match failure {
+            F32NarrowFailure::NonFiniteInput => anyhow::anyhow!(
+                "{context} contains non-finite value {value} at row {row}, column {column}"
+            ),
+            F32NarrowFailure::OutOfRange | F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!(
+                "{context} value {value} at row {row}, column {column} overflows the {backend} f32 backend"
+            ),
+            F32NarrowFailure::Underflow => anyhow::anyhow!(
+                "{context} value {value} at row {row}, column {column} underflows the {backend} f32 backend"
+            ),
+        },
+    )
+}
+
+/// One shared implementation of the existing CR-FM-NES and NEAT adapters.
+pub(crate) fn checked_evolution_backend_f32_matrix(
+    features: &Array2<f64>,
+    backend: &str,
+    shape_context: &'static str,
+) -> Result<Array2<f32>> {
+    checked_backend_f32_matrix(
+        features,
+        F32NarrowPrecheck::F32RangeFirst,
+        shape_context,
+        |row, column, value, failure| match failure {
+            F32NarrowFailure::OutOfRange => anyhow::anyhow!(
+                "{backend} f32 backend cannot represent feature row {row} column {column}: {value}"
+            ),
+            F32NarrowFailure::NonFiniteInput | F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!(
+                "{backend} f32 backend produced non-finite feature row {row} column {column}"
+            ),
+            F32NarrowFailure::Underflow => anyhow::anyhow!(
+                "{backend} f32 backend underflowed non-zero feature row {row} column {column}: {value}"
+            ),
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
