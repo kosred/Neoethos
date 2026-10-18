@@ -48,7 +48,12 @@ pub(crate) fn checked_backend_f32_matrix(
         }
         let narrowed = value as f32;
         if !narrowed.is_finite() {
-            return Err(report(row, column, value, F32NarrowFailure::NonFiniteOutput));
+            return Err(report(
+                row,
+                column,
+                value,
+                F32NarrowFailure::NonFiniteOutput,
+            ));
         }
         if value != 0.0 && narrowed == 0.0 {
             return Err(report(row, column, value, F32NarrowFailure::Underflow));
@@ -57,7 +62,6 @@ pub(crate) fn checked_backend_f32_matrix(
     }
     Array2::from_shape_vec(source.raw_dim(), converted).context(shape_context)
 }
-
 
 /// ROCm aliases are intentionally separate from CUDA normalization: explicit
 /// NVIDIA requests must remain visible and fail in a ROCm-only neural build.
@@ -292,7 +296,6 @@ pub fn normalize_vendor_device_policy(policy: &str, _extra_prefixes: &[&str]) ->
     normalized
 }
 
-
 /// Preserve both precheck order and legacy error messages in the two RL agents.
 pub(crate) fn checked_rl_backend_f32_matrix(
     values: &Array2<f64>,
@@ -332,9 +335,11 @@ pub(crate) fn checked_evolution_backend_f32_matrix(
             F32NarrowFailure::OutOfRange => anyhow::anyhow!(
                 "{backend} f32 backend cannot represent feature row {row} column {column}: {value}"
             ),
-            F32NarrowFailure::NonFiniteInput | F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!(
-                "{backend} f32 backend produced non-finite feature row {row} column {column}"
-            ),
+            F32NarrowFailure::NonFiniteInput | F32NarrowFailure::NonFiniteOutput => {
+                anyhow::anyhow!(
+                    "{backend} f32 backend produced non-finite feature row {row} column {column}"
+                )
+            }
             F32NarrowFailure::Underflow => anyhow::anyhow!(
                 "{backend} f32 backend underflowed non-zero feature row {row} column {column}: {value}"
             ),
@@ -345,7 +350,6 @@ pub(crate) fn checked_evolution_backend_f32_matrix(
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     fn cast_for_test(value: f64, precheck: F32NarrowPrecheck) -> Result<Array2<f32>> {
         checked_backend_f32_matrix(
@@ -365,13 +369,11 @@ mod tests {
             F32NarrowPrecheck::FiniteInputFirst,
             F32NarrowPrecheck::F32RangeFirst,
         ] {
-            let output = checked_backend_f32_matrix(
-                &input,
-                policy,
-                "test reshape",
-                |_, _, _, issue| anyhow::anyhow!("{issue:?}"),
-            )
-            .unwrap();
+            let output =
+                checked_backend_f32_matrix(&input, policy, "test reshape", |_, _, _, issue| {
+                    anyhow::anyhow!("{issue:?}")
+                })
+                .unwrap();
             assert_eq!(output.dim(), (2, 2));
             assert_eq!(output[(0, 0)].to_bits(), 0.25_f32.to_bits());
             assert_eq!(output[(0, 1)].to_bits(), (-0.5_f32).to_bits());
@@ -388,28 +390,42 @@ mod tests {
             F32NarrowPrecheck::FiniteInputFirst,
             F32NarrowPrecheck::F32RangeFirst,
         ] {
-            assert!(cast_for_test(tiny, policy).unwrap_err().to_string().contains("Underflow"));
-            assert!(cast_for_test(f64::NAN, policy).unwrap_err().to_string().contains(
-                if policy == F32NarrowPrecheck::FiniteInputFirst {
-                    "NonFiniteInput"
-                } else {
-                    "NonFiniteOutput"
-                }
-            ));
-            assert!(cast_for_test(f64::INFINITY, policy).unwrap_err().to_string().contains(
-                if policy == F32NarrowPrecheck::FiniteInputFirst {
-                    "NonFiniteInput"
-                } else {
-                    "OutOfRange"
-                }
-            ));
-            assert!(cast_for_test(huge, policy).unwrap_err().to_string().contains(
-                if policy == F32NarrowPrecheck::FiniteInputFirst {
-                    "NonFiniteOutput"
-                } else {
-                    "OutOfRange"
-                }
-            ));
+            assert!(
+                cast_for_test(tiny, policy)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Underflow")
+            );
+            assert!(
+                cast_for_test(f64::NAN, policy)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(if policy == F32NarrowPrecheck::FiniteInputFirst {
+                        "NonFiniteInput"
+                    } else {
+                        "NonFiniteOutput"
+                    })
+            );
+            assert!(
+                cast_for_test(f64::INFINITY, policy)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(if policy == F32NarrowPrecheck::FiniteInputFirst {
+                        "NonFiniteInput"
+                    } else {
+                        "OutOfRange"
+                    })
+            );
+            assert!(
+                cast_for_test(huge, policy)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(if policy == F32NarrowPrecheck::FiniteInputFirst {
+                        "NonFiniteOutput"
+                    } else {
+                        "OutOfRange"
+                    })
+            );
         }
     }
 

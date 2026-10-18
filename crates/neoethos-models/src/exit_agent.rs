@@ -44,10 +44,22 @@ fn exit_backend_f32_matrix(frame: &FeatureFrame) -> Result<Array2<f32>> {
         crate::common::F32NarrowPrecheck::F32RangeFirst,
         "rebuild checked exit-agent f32 backend matrix",
         |row, column, value, failure| match failure {
-            crate::common::F32NarrowFailure::NonFiniteInput => anyhow::anyhow!("exit-agent feature `{}` row {row} becomes non-finite in f32", frame.names[column]),
-            crate::common::F32NarrowFailure::OutOfRange => anyhow::anyhow!("exit-agent feature `{}` row {row} overflows f32: {value}", frame.names[column]),
-            crate::common::F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!("exit-agent feature `{}` row {row} becomes non-finite in f32", frame.names[column]),
-            crate::common::F32NarrowFailure::Underflow => anyhow::anyhow!("exit-agent feature `{}` row {row} underflows to zero in f32", frame.names[column]),
+            crate::common::F32NarrowFailure::NonFiniteInput => anyhow::anyhow!(
+                "exit-agent feature `{}` row {row} becomes non-finite in f32",
+                frame.names[column]
+            ),
+            crate::common::F32NarrowFailure::OutOfRange => anyhow::anyhow!(
+                "exit-agent feature `{}` row {row} overflows f32: {value}",
+                frame.names[column]
+            ),
+            crate::common::F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!(
+                "exit-agent feature `{}` row {row} becomes non-finite in f32",
+                frame.names[column]
+            ),
+            crate::common::F32NarrowFailure::Underflow => anyhow::anyhow!(
+                "exit-agent feature `{}` row {row} underflows to zero in f32",
+                frame.names[column]
+            ),
         },
     )
 }

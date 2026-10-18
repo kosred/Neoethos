@@ -201,10 +201,18 @@ fn deep_backend_f32_matrix(frame: &FeatureFrame) -> Result<Array2<f32>> {
         crate::common::F32NarrowPrecheck::F32RangeFirst,
         "shape deep backend f32 feature matrix",
         |row, column, value, failure| match failure {
-            crate::common::F32NarrowFailure::NonFiniteInput => anyhow::anyhow!("deep backend f32 adapter produced non-finite feature row {row} column {column}"),
-            crate::common::F32NarrowFailure::OutOfRange => anyhow::anyhow!("deep backend f32 adapter cannot represent feature row {row} column {column}: {value}"),
-            crate::common::F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!("deep backend f32 adapter produced non-finite feature row {row} column {column}"),
-            crate::common::F32NarrowFailure::Underflow => anyhow::anyhow!("deep backend f32 adapter underflowed non-zero feature row {row} column {column}: {value}"),
+            crate::common::F32NarrowFailure::NonFiniteInput => anyhow::anyhow!(
+                "deep backend f32 adapter produced non-finite feature row {row} column {column}"
+            ),
+            crate::common::F32NarrowFailure::OutOfRange => anyhow::anyhow!(
+                "deep backend f32 adapter cannot represent feature row {row} column {column}: {value}"
+            ),
+            crate::common::F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!(
+                "deep backend f32 adapter produced non-finite feature row {row} column {column}"
+            ),
+            crate::common::F32NarrowFailure::Underflow => anyhow::anyhow!(
+                "deep backend f32 adapter underflowed non-zero feature row {row} column {column}: {value}"
+            ),
         },
     )
 }

@@ -1212,7 +1212,11 @@ impl ExpertModel for NeuroEvoExpert {
             ensure_feature_columns_match(&self.feature_columns, x)?;
             let (features, _) = feature_matrix_from_frame(x)?;
             let scaler = self.scaler.as_ref().context("neuro-evo scaler missing")?;
-            let scaled = crate::common::checked_evolution_backend_f32_matrix(&scaler.transform(&features)?, "neuro-evo", "shape neuro-evo f32 backend feature matrix")?;
+            let scaled = crate::common::checked_evolution_backend_f32_matrix(
+                &scaler.transform(&features)?,
+                "neuro-evo",
+                "shape neuro-evo f32 backend feature matrix",
+            )?;
             let logits = self
                 .logits_from_params(&self.params, &scaled)?
                 .mapv(f64::from);
