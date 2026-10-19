@@ -245,7 +245,11 @@ pub fn run(args: &[String]) -> Result<()> {
         },
     };
     let artifact_bytes = serde_json::to_vec(&artifact).context("serialize historical-search v2")?;
-    atomic_write_create_new(&args.output, &artifact_bytes, HistoricalOutputKind::CandidateSearch)?;
+    atomic_write_create_new(
+        &args.output,
+        &artifact_bytes,
+        HistoricalOutputKind::CandidateSearch,
+    )?;
 
     println!("receipt_sha256={receipt_sha256}");
     println!(
