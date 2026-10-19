@@ -309,49 +309,7 @@ impl SnapshotPopulationFixture {
         PrototypeAGeneUpload,
         PrototypeAScenarioUpload,
     ) {
-        let candidate_ids = (0..self.population())
-            .map(|index| index as u64)
-            .collect::<Vec<_>>();
-        let scenarios = candidate_ids
-            .iter()
-            .copied()
-            // Through the ONE builder. A hand-written descriptor with
-            // `..default()` wrote `spread_ticks: 0, commission_micros: 0`, which
-            // stopped meaning "use the settings' costs" and started meaning
-            // "charge nothing" when the sentinel became -1.
-            .map(|candidate_id| {
-                crate::gpu_native::scenario::base_scenario(candidate_id, candidate_id, self.bars())
-            })
-            .collect();
-        (
-            PrototypeADatasetUpload {
-                close: self.close.clone(),
-                high: self.high.clone(),
-                low: self.low.clone(),
-                indicators: self.indicators.iter().copied().collect(),
-                feature_count: self.features(),
-                months: self.months.clone(),
-                days: self.days.clone(),
-                timestamps: self.timestamps.clone(),
-                smc_data: self.smc_data.clone(),
-                settings: SnapshotSettingsDto::from_settings(&self.settings),
-            },
-            PrototypeAGeneUpload {
-                candidate_ids,
-                offsets: self.gene_offsets.clone(),
-                indices: self.gene_indices.clone(),
-                weights: self.gene_weights.clone(),
-                long_thresholds: self.long_thresholds.clone(),
-                short_thresholds: self.short_thresholds.clone(),
-                stop_pips: self.stop_pips.clone(),
-                target_pips: self.target_pips.clone(),
-                stop_vol_multipliers: self.stop_vol_multipliers.clone(),
-                smc_flags: self.gene_smc_flags.clone(),
-                smc_weights: self.smc_weights,
-                gate_threshold: 0.0,
-            },
-            PrototypeAScenarioUpload { scenarios },
-        )
+        crate::gpu_native::prototype_a::fixture_uploads_from_eval(self.inputs())
     }
 
     pub fn population_workload(
@@ -362,13 +320,8 @@ impl SnapshotPopulationFixture {
         PrototypePopulationWorkload::from_uploads(dataset, genes, scenarios, requirements)
     }
 
-    pub fn evaluate(
-        &self,
-        backend: EvaluationBackend,
-        audit: &CpuStrategyAuditContext,
-    ) -> Result<Vec<[f64; 11]>, String> {
-        evaluate_population_core_with_backend_and_audit(
-            PopulationEvalInputs {
+    fn inputs(&self) -> PopulationEvalInputs<'_> {
+        PopulationEvalInputs {
                 close: &self.close,
                 high: &self.high,
                 low: &self.low,
@@ -390,9 +343,15 @@ impl SnapshotPopulationFixture {
                 weights: &self.smc_weights,
                 settings: &self.settings,
             },
-            backend,
-            audit,
-        )
+        }
+    }
+
+    pub fn evaluate(
+        &self,
+        backend: EvaluationBackend,
+        audit: &CpuStrategyAuditContext,
+    ) -> Result<Vec<[f64; 11]>, String> {
+        evaluate_population_core_with_backend_and_audit(self.inputs(), backend, audit)
     }
 
     pub fn compare_final_metrics(
@@ -455,6 +414,39 @@ mod tests {
                 adaptive_rr: 2.0,
             },
         }
+    }
+
+    #[test]
+    fn real_snapshot_upload_projection_preserves_all_bytes_and_economics() {
+        let input = dto();
+        let original = input.clone();
+        let fixture = SnapshotPopulationFixture::from_dto(input).unwrap();
+        let (dataset, genes, scenarios) = fixture.prototype_a_uploads();
+        assert_eq!(dataset.close, original.close);
+        assert_eq!(dataset.high, original.high);
+        assert_eq!(dataset.low, original.low);
+        assert_eq!(dataset.indicators, original.indicators);
+        assert_eq!(dataset.feature_count, original.feature_count);
+        assert_eq!(dataset.months, original.months);
+        assert_eq!(dataset.days, original.days);
+        assert_eq!(dataset.timestamps, original.timestamps);
+        assert_eq!(dataset.smc_data, original.smc_data);
+        assert_eq!(genes.offsets, original.gene_offsets);
+        assert_eq!(genes.indices, original.gene_indices);
+        assert_eq!(genes.weights, original.gene_weights);
+        assert_eq!(genes.long_thresholds, original.long_thresholds);
+        assert_eq!(genes.short_thresholds, original.short_thresholds);
+        assert_eq!(genes.stop_pips, original.stop_pips);
+        assert_eq!(genes.target_pips, original.target_pips);
+        assert_eq!(genes.stop_vol_multipliers, original.stop_vol_multipliers);
+        assert_eq!(genes.smc_flags, original.gene_smc_flags);
+        assert_eq!(genes.smc_weights, original.smc_weights);
+        assert_eq!(genes.gate_threshold, 0.0);
+        assert_eq!(genes.candidate_ids, vec![0]);
+        assert_eq!(dataset.settings, original.settings);
+        assert_eq!(scenarios.scenarios.len(), 1);
+        let expected_scenario = crate::gpu_native::scenario::base_scenario(0, 0, fixture.bars());
+        assert_eq!(scenarios.scenarios[0], expected_scenario);
     }
 
     #[test]

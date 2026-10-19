@@ -202,47 +202,7 @@ impl TinyPopulationFixture {
         PrototypeAGeneUpload,
         PrototypeAScenarioUpload,
     ) {
-        let candidate_ids = (0..self.population())
-            .map(|index| index as u64)
-            .collect::<Vec<_>>();
-        let scenarios = candidate_ids
-            .iter()
-            .copied()
-            // Through the ONE builder — see `snapshot_fixture` for why
-            // `..ScenarioDescriptor::default()` was a free-trading backtest.
-            .map(|candidate_id| {
-                crate::gpu_native::scenario::base_scenario(candidate_id, candidate_id, self.bars())
-            })
-            .collect();
-        (
-            PrototypeADatasetUpload {
-                close: self.close.clone(),
-                high: self.high.clone(),
-                low: self.low.clone(),
-                indicators: self.indicators.iter().copied().collect(),
-                feature_count: self.features(),
-                months: self.months.clone(),
-                days: self.days.clone(),
-                timestamps: self.timestamps.clone(),
-                smc_data: self.smc_data.clone(),
-                settings: SnapshotSettingsDto::from_settings(&self.settings),
-            },
-            PrototypeAGeneUpload {
-                candidate_ids,
-                offsets: self.gene_offsets.clone(),
-                indices: self.gene_indices.clone(),
-                weights: self.gene_weights.clone(),
-                long_thresholds: self.long_thresholds.clone(),
-                short_thresholds: self.short_thresholds.clone(),
-                stop_pips: self.stop_pips.clone(),
-                target_pips: self.target_pips.clone(),
-                stop_vol_multipliers: self.stop_vol_multipliers.clone(),
-                smc_flags: self.gene_smc_flags.clone(),
-                smc_weights: self.smc_weights,
-                gate_threshold: 0.0,
-            },
-            PrototypeAScenarioUpload { scenarios },
-        )
+        crate::gpu_native::prototype_a::fixture_uploads_from_eval(self.inputs())
     }
 
     pub fn population_workload(

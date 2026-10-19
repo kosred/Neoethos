@@ -1,6 +1,6 @@
 //! Honest status and measured transfer evidence for the existing fused CubeCL baseline.
 
-use crate::eval::SmcRow;
+use crate::eval::{PopulationEvalInputs, SmcRow};
 use crate::gpu_native::engine::{EngineCapabilities, EngineStatus, TransferSnapshot};
 use crate::gpu_native::snapshot_fixture::SnapshotSettingsDto;
 use neoethos_gpu_contracts::device::ScenarioDescriptor;
@@ -13,6 +13,64 @@ use std::ops::Range;
 pub use crate::gpu_native::prototype_a_engine::create_prototype_a_engine;
 
 pub const PROTOTYPE_A_UPLOAD_SCHEMA_VERSION: u32 = 2;
+
+/// One projection of the established evaluation inputs into Prototype A's
+/// immutable, owned upload DTOs. Synthetic and real-data fixtures keep their
+/// distinct input construction and validation; only the byte-bearing
+/// projection is shared.
+pub(crate) fn fixture_uploads_from_eval(
+    input: PopulationEvalInputs<'_>,
+) -> (
+    PrototypeADatasetUpload,
+    PrototypeAGeneUpload,
+    PrototypeAScenarioUpload,
+) {
+    let candidate_ids = (0..input.long_thr.len())
+        .map(|index| index as u64)
+        .collect::<Vec<_>>();
+    let scenarios = candidate_ids
+        .iter()
+        .copied()
+        // Always use the canonical builder: default spread/commission zeros
+        // mean 'charge nothing', not 'inherit the configured costs'.
+        .map(|candidate_id| {
+            crate::gpu_native::scenario::base_scenario(
+                candidate_id,
+                candidate_id,
+                input.close.len(),
+            )
+        })
+        .collect();
+    (
+        PrototypeADatasetUpload {
+            close: input.close.to_vec(),
+            high: input.high.to_vec(),
+            low: input.low.to_vec(),
+            indicators: input.indicators.iter().copied().collect(),
+            feature_count: input.indicators.nrows(),
+            months: input.month_idx.to_vec(),
+            days: input.day_idx.to_vec(),
+            timestamps: input.timestamps.to_vec(),
+            smc_data: input.smc_data.to_vec(),
+            settings: SnapshotSettingsDto::from_settings(input.settings),
+        },
+        PrototypeAGeneUpload {
+            candidate_ids,
+            offsets: input.gene_offsets.to_vec(),
+            indices: input.gene_indices.to_vec(),
+            weights: input.gene_weights.to_vec(),
+            long_thresholds: input.long_thr.to_vec(),
+            short_thresholds: input.short_thr.to_vec(),
+            stop_pips: input.sl_pips.to_vec(),
+            target_pips: input.tp_pips.to_vec(),
+            stop_vol_multipliers: input.stop_vol_mult.to_vec(),
+            smc_flags: input.gene_smc_flags.to_vec(),
+            smc_weights: *input.weights,
+            gate_threshold: 0.0,
+        },
+        PrototypeAScenarioUpload { scenarios },
+    )
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PrototypeAUploadEnvelope<T> {
