@@ -11,9 +11,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, ensure};
 use neoethos_data::{FeatureFrame, Ohlcv};
-use neoethos_search::genetic::{
-    SmcGateArrays, signals_and_confidence_for_gene_full_with_smc,
-};
+use neoethos_search::genetic::{SmcGateArrays, signals_and_confidence_for_gene_full_with_smc};
 use neoethos_search::{EvaluationConfig, Gene, signals_for_gene, signals_for_gene_full_with_smc};
 
 use crate::contracts::{Direction, LiveBar, PortfolioEntry, Signal, SignalEngine, SignalSource};
@@ -238,9 +236,8 @@ pub fn combine_gene_signals(
     let mut net = vec![0i32; n];
     for gene in genes {
         let sigs = if gene_uses_smc(gene) {
-            cached_smc_gate(&mut smc_cache, aligned_features, base_ohlcv).and_then(|smc| {
-                signals_for_gene_full_with_smc(aligned_features, gene, &cfg, smc)
-            })
+            cached_smc_gate(&mut smc_cache, aligned_features, base_ohlcv)
+                .and_then(|smc| signals_for_gene_full_with_smc(aligned_features, gene, &cfg, smc))
         } else {
             signals_for_gene(aligned_features, gene)
         }
@@ -339,9 +336,8 @@ pub fn combine_gene_signals_with_brackets(
 
     for gene in genes {
         let sigs = if gene_uses_smc(gene) {
-            cached_smc_gate(&mut smc_cache, aligned_features, base_ohlcv).and_then(|smc| {
-                signals_for_gene_full_with_smc(aligned_features, gene, &cfg, smc)
-            })
+            cached_smc_gate(&mut smc_cache, aligned_features, base_ohlcv)
+                .and_then(|smc| signals_for_gene_full_with_smc(aligned_features, gene, &cfg, smc))
         } else {
             signals_for_gene(aligned_features, gene)
         }
@@ -421,16 +417,16 @@ pub fn combine_gene_signals_with_confidence(
     let mut cnt_short = vec![0u32; n];
 
     for gene in genes {
-        let (sigs, confs) =
-            cached_smc_gate(&mut smc_cache, aligned_features, base_ohlcv).and_then(|smc| {
+        let (sigs, confs) = cached_smc_gate(&mut smc_cache, aligned_features, base_ohlcv)
+            .and_then(|smc| {
                 signals_and_confidence_for_gene_full_with_smc(aligned_features, gene, &cfg, smc)
             })
-                .with_context(|| {
-                    format!(
-                        "failed to synthesize signals and confidence for gene `{}`",
-                        gene.strategy_id
-                    )
-                })?;
+            .with_context(|| {
+                format!(
+                    "failed to synthesize signals and confidence for gene `{}`",
+                    gene.strategy_id
+                )
+            })?;
         ensure!(
             sigs.len() == n && confs.len() == n,
             "gene `{}` returned {} signals and {} confidences for {n} feature rows",
@@ -633,11 +629,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let expected = (0..features.n_samples())
-            .map(|row| {
-                dir_from_net(per_gene.iter().map(|signals| i32::from(signals[row])).sum())
-            })
+            .map(|row| dir_from_net(per_gene.iter().map(|signals| i32::from(signals[row])).sum()))
             .collect::<Vec<_>>();
-        assert_eq!(combine_gene_signals(&genes, &features, &ohlcv).unwrap(), expected);
+        assert_eq!(
+            combine_gene_signals(&genes, &features, &ohlcv).unwrap(),
+            expected
+        );
         assert_eq!(
             combine_gene_signals_with_confidence(&genes, &features, &ohlcv)
                 .unwrap()
