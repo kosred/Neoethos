@@ -154,16 +154,6 @@ pub(crate) struct ExactPopulationEvaluationV1<'a> {
     source_lifetime: PhantomData<&'a ()>,
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
 fn resident_execution_identity(
     authority: &ExactResidentDatasetAuthorityV1,
     timestamp_mode: ExactPopulationTimestampModeV1,
@@ -176,7 +166,7 @@ fn resident_execution_identity(
         ExactPopulationTimestampModeV1::Canonical => 0,
         ExactPopulationTimestampModeV1::DisabledIndexDelta => 1,
     }]);
-    hex_lower(&hasher.finalize())
+    crate::artifact_io::hex_lower(&hasher.finalize())
 }
 
 pub(crate) fn begin_exact_population_execution_run_v1<'a>(
@@ -1047,7 +1037,7 @@ pub(crate) mod retained_compact_v3 {
         }
         Ok(ExactResidentCompactMetricsV3 {
             authority,
-            execution_identity_sha256: hex_lower(&hash.finalize()),
+            execution_identity_sha256: crate::artifact_io::hex_lower(&hash.finalize()),
             metrics,
             batch_receipts,
             counters_before,

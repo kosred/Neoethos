@@ -22,6 +22,7 @@ use neoethos_gpu_cuda::{
     SealedDataPopulationGpuWorkspacePlanV1, SealedNativeCudaDataPopulationPreflightFactsV1,
 };
 
+use crate::artifact_io::hex_lower;
 #[cfg(any(test, target_os = "linux"))]
 use crate::resident_selection_scope_v2::ResidentFeatureScreeningScopeV2;
 
@@ -1489,16 +1490,6 @@ impl ResidentPopulationAutoSizingReceiptV2 {
         }
         Ok(())
     }
-}
-
-fn hex_lower(bytes: [u8; 32]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 fn is_nonzero_sha256(value: &str) -> bool {

@@ -169,16 +169,6 @@ impl StrictResidentPopulationExecutionRunV3 {
     }
 }
 
-fn hex_lower(bytes: [u8; 32]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
 pub(crate) fn validate_strict_resident_feature_store_v3(
     sealed_store: &SealedGpuResidentFeatureStoreV3,
     scope: &CanonicalGpuResidentSearchArtifactScopeV3,
@@ -224,10 +214,12 @@ pub(crate) fn validate_strict_resident_feature_store_v3(
         || normalization == [0; 32]
         || provenance == [0; 32]
         || content == [0; 32]
-        || hex_lower(feature_plan) != scope.receipt().feature_plan_identity()
-        || hex_lower(provenance) != scope.receipt().feature_provenance_identity()
-        || hex_lower(content) != scope.receipt().feature_content_merkle_sha256()
-        || hex_lower(normalization) != scope.receipt().normalization_fit_sha256()
+        || crate::artifact_io::hex_lower(feature_plan) != scope.receipt().feature_plan_identity()
+        || crate::artifact_io::hex_lower(provenance)
+            != scope.receipt().feature_provenance_identity()
+        || crate::artifact_io::hex_lower(content) != scope.receipt().feature_content_merkle_sha256()
+        || crate::artifact_io::hex_lower(normalization)
+            != scope.receipt().normalization_fit_sha256()
         || u64::try_from(resident_rows).ok() != Some(scope.receipt().row_count())
         || u64::try_from(resident_columns).ok() != Some(scope.receipt().column_count())
         || scope_rows != resident_rows

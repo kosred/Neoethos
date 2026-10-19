@@ -237,18 +237,8 @@ impl ExactHasherV1 {
     }
 
     fn finish(self) -> String {
-        hex_lower(&self.0.finalize())
+        crate::artifact_io::hex_lower(&self.0.finalize())
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 fn usize_to_u64(value: usize) -> Result<u64, ExactResidentDatasetAuthorityErrorV1> {
@@ -700,7 +690,8 @@ pub(crate) fn seal_exact_resident_compact_parent_v3(
     anyhow::ensure!(
         receipt.row_count() == u64::try_from(owner.rows)?
             && receipt.column_count() == u64::try_from(owner.columns)?
-            && receipt.feature_content_merkle_sha256() == hex_lower(&owner.content),
+            && receipt.feature_content_merkle_sha256()
+                == crate::artifact_io::hex_lower(&owner.content),
         "retained compact Data owner differs from the actual native Search receipt"
     );
     let scope_identity = scope.identity_sha256()?;
