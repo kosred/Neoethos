@@ -123,16 +123,6 @@ fn lock_state(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
 fn receipt_identity(
     canonical_scope_identity_sha256: &str,
     engines: &[PopulationEvalEngine],
@@ -148,7 +138,7 @@ fn receipt_identity(
         hasher.update([engine_bit(*engine)]);
     }
     hasher.update(successful_population_count.to_le_bytes());
-    hex_lower(&hasher.finalize())
+    crate::artifact_io::hex_lower(&hasher.finalize())
 }
 
 pub(crate) fn begin_population_engine_run_v1(

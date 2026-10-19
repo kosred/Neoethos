@@ -67,16 +67,6 @@ impl ExactPopulationExecutionRunReceiptV2 {
     }
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
 pub(crate) fn seal_exact_population_execution_run_receipt_v2(
     engine_receipt_v1: PopulationEngineRunReceiptV1,
     native_residency_receipt_v1: Option<NativePopulationResidencyReceiptV1>,
@@ -117,7 +107,7 @@ pub(crate) fn seal_exact_population_execution_run_receipt_v2(
             hasher.update(receipt.identity_sha256().as_bytes());
         }
     }
-    let identity_sha256 = hex_lower(&hasher.finalize());
+    let identity_sha256 = crate::artifact_io::hex_lower(&hasher.finalize());
     Ok(ExactPopulationExecutionRunReceiptV2 {
         schema_version: EXACT_POPULATION_EXECUTION_RUN_RECEIPT_SCHEMA_VERSION_V2,
         engine_receipt_v1,

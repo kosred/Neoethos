@@ -217,17 +217,6 @@ impl NativePopulationResidencyReceiptV1 {
 }
 
 #[cfg(feature = "gpu-b-adapter")]
-fn hex_lower(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-#[cfg(feature = "gpu-b-adapter")]
 fn manifest_error(message: impl Into<String>) -> NativePopulationResidencyReceiptErrorV1 {
     error(
         NativePopulationResidencyReceiptErrorCodeV1::InvalidCudaBuildManifest,
@@ -588,7 +577,7 @@ pub(crate) fn seal_native_population_residency_receipt_v1(
     }
     validate_cuda_build_manifest_v1(cuda_build_manifest_v1, device_identity)?;
 
-    let device_uuid_hex = hex_lower(device_identity.uuid());
+    let device_uuid_hex = crate::artifact_io::hex_lower(device_identity.uuid());
     let mut device_hasher = Sha256::new();
     device_hasher.update(b"neoethos.search.native-population-device.v1\0");
     device_hasher.update(device_identity.selected_device_ordinal().to_le_bytes());
@@ -602,8 +591,8 @@ pub(crate) fn seal_native_population_residency_receipt_v1(
     device_hasher.update(device_identity.uuid());
     device_hasher.update((device_identity.name_bytes().len() as u64).to_le_bytes());
     device_hasher.update(device_identity.name_bytes());
-    let device_identity_sha256 = hex_lower(&device_hasher.finalize());
-    let cuda_build_manifest_sha256 = hex_lower(&Sha256::digest(cuda_build_manifest_v1.as_bytes()));
+    let device_identity_sha256 = crate::artifact_io::hex_lower(&device_hasher.finalize());
+    let cuda_build_manifest_sha256 = crate::artifact_io::hex_lower(&Sha256::digest(cuda_build_manifest_v1.as_bytes()));
 
     let mut hasher = Sha256::new();
     hasher.update(NATIVE_RESIDENCY_HASH_DOMAIN_V1);
@@ -638,7 +627,7 @@ pub(crate) fn seal_native_population_residency_receipt_v1(
     hasher.update(native_abi_version.to_le_bytes());
     hasher.update((cuda_build_manifest_sha256.len() as u64).to_le_bytes());
     hasher.update(cuda_build_manifest_sha256.as_bytes());
-    let identity_sha256 = hex_lower(&hasher.finalize());
+    let identity_sha256 = crate::artifact_io::hex_lower(&hasher.finalize());
 
     Ok(NativePopulationResidencyReceiptV1 {
         schema_version: NATIVE_POPULATION_RESIDENCY_RECEIPT_SCHEMA_VERSION_V1,
