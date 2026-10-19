@@ -175,7 +175,11 @@ pub fn run(args: &[String]) -> Result<()> {
     let bytes = receipt
         .to_json_bytes()
         .context("serialize prepared canonical search input receipt")?;
-    atomic_write_create_new(&args.output, &bytes, HistoricalOutputKind::ReceiptPreparation)?;
+    atomic_write_create_new(
+        &args.output,
+        &bytes,
+        HistoricalOutputKind::ReceiptPreparation,
+    )?;
 
     println!("receipt_sha256={receipt_sha256}");
     println!("output={}", args.output.display());
@@ -352,7 +356,11 @@ struct TemporaryOutput {
 
 impl TemporaryOutput {
     fn new(path: PathBuf, cleanup_label: &'static str) -> Self {
-        Self { path, armed: true, cleanup_label }
+        Self {
+            path,
+            armed: true,
+            cleanup_label,
+        }
     }
 
     fn disarm(&mut self) {
@@ -362,7 +370,9 @@ impl TemporaryOutput {
 
 impl Drop for TemporaryOutput {
     fn drop(&mut self) {
-        if self.armed && let Err(error) = fs::remove_file(&self.path) {
+        if self.armed
+            && let Err(error) = fs::remove_file(&self.path)
+        {
             eprintln!(
                 "ERROR failed to clean {} temporary output {}: {error}",
                 self.cleanup_label,
@@ -395,7 +405,6 @@ fn parse_positive_worker_limit(value: &str, flag: &str) -> Result<WorkerLimit> {
     WorkerLimit::new(parsed).map_err(|error| anyhow::anyhow!("{flag}: {error}"))
 }
 
-
 #[cfg(test)]
 mod create_new_output_tests {
     use super::*;
@@ -419,7 +428,11 @@ mod create_new_output_tests {
             assert_eq!(fs::read(&output).unwrap(), payload);
             let failure = atomic_write_create_new(&output, b"changed", kind)
                 .expect_err("never overwrite existing historical output");
-            assert!(failure.to_string().contains("refusing to overwrite existing output"));
+            assert!(
+                failure
+                    .to_string()
+                    .contains("refusing to overwrite existing output")
+            );
             assert_eq!(fs::read(&output).unwrap(), payload);
             let temporary_files = fs::read_dir(&folder).unwrap().count();
             assert_eq!(temporary_files, 1, "no abandoned temporary file");
