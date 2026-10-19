@@ -382,13 +382,13 @@ impl Drop for TemporaryOutput {
     }
 }
 
-fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<()> {
+pub(crate) fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<()> {
     ensure!(slot.is_none(), "{flag} may be supplied only once");
     *slot = Some(value);
     Ok(())
 }
 
-fn set_once_path(slot: &mut Option<PathBuf>, flag: &str, value: &str) -> Result<()> {
+pub(crate) fn set_once_path(slot: &mut Option<PathBuf>, flag: &str, value: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{flag} path is empty");
     set_once(slot, flag, PathBuf::from(value))
 }

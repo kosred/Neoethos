@@ -36,7 +36,7 @@ use crate::historical_research::{
 };
 use crate::historical_search_receipt_prep::{
     ExactSelectedFeatureInput, HistoricalOutputKind, atomic_write_create_new,
-    build_exact_selected_feature_input,
+    build_exact_selected_feature_input, set_once, set_once_path,
 };
 
 const HISTORICAL_SEARCH_CLI_SCHEMA_VERSION: u16 = 2;
@@ -618,17 +618,6 @@ fn derive_candidate_seed(
             .try_into()
             .expect("SHA-256 prefix is eight bytes"),
     )
-}
-
-fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<()> {
-    ensure!(slot.is_none(), "{flag} may be supplied only once");
-    *slot = Some(value);
-    Ok(())
-}
-
-fn set_once_path(slot: &mut Option<PathBuf>, flag: &str, value: &str) -> Result<()> {
-    ensure!(!value.trim().is_empty(), "{flag} path is empty");
-    set_once(slot, flag, PathBuf::from(value))
 }
 
 fn required<T>(value: Option<T>, flag: &str) -> Result<T> {
