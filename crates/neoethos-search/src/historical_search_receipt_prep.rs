@@ -175,7 +175,11 @@ pub fn run(args: &[String]) -> Result<()> {
     let bytes = receipt
         .to_json_bytes()
         .context("serialize prepared canonical search input receipt")?;
-    atomic_write_create_new(&args.output, &bytes)?;
+    atomic_write_create_new(
+        &args.output,
+        &bytes,
+        HistoricalOutputKind::ReceiptPreparation,
+    )?;
 
     println!("receipt_sha256={receipt_sha256}");
     println!("output={}", args.output.display());
@@ -272,7 +276,36 @@ fn preflight_create_new_output(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn atomic_write_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Select the original temp-file namespace and cleanup diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HistoricalOutputKind {
+    CandidateSearch,
+    ReceiptPreparation,
+}
+
+impl HistoricalOutputKind {
+    fn temp_prefix(self) -> &'static str {
+        match self {
+            Self::CandidateSearch => "neoethos",
+            Self::ReceiptPreparation => "neoethos-receipt-prep",
+        }
+    }
+
+    fn cleanup_label(self) -> &'static str {
+        match self {
+            Self::CandidateSearch => "historical-search",
+            Self::ReceiptPreparation => "historical-search receipt",
+        }
+    }
+}
+
+/// Shared create-new publication. The hard-link is intentional: unlike
+/// rename-over-existing, it must fail rather than overwrite another receipt.
+pub(crate) fn atomic_write_create_new(
+    path: &Path,
+    bytes: &[u8],
+    kind: HistoricalOutputKind,
+) -> Result<()> {
     preflight_create_new_output(path)?;
     let parent = output_parent(path);
     let file_name = path
@@ -281,10 +314,11 @@ fn atomic_write_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .context("output path has no UTF-8 file name")?;
     let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(
-        ".{file_name}.neoethos-receipt-prep-{}-{sequence}.tmp",
-        std::process::id()
+        ".{file_name}.{}-{}-{sequence}.tmp",
+        kind.temp_prefix(),
+        std::process::id(),
     ));
-    let mut cleanup = TemporaryOutput::new(temporary.clone());
+    let mut cleanup = TemporaryOutput::new(temporary.clone(), kind.cleanup_label());
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -317,11 +351,16 @@ fn output_parent(path: &Path) -> &Path {
 struct TemporaryOutput {
     path: PathBuf,
     armed: bool,
+    cleanup_label: &'static str,
 }
 
 impl TemporaryOutput {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+    fn new(path: PathBuf, cleanup_label: &'static str) -> Self {
+        Self {
+            path,
+            armed: true,
+            cleanup_label,
+        }
     }
 
     fn disarm(&mut self) {
@@ -335,20 +374,21 @@ impl Drop for TemporaryOutput {
             && let Err(error) = fs::remove_file(&self.path)
         {
             eprintln!(
-                "ERROR failed to clean historical-search receipt temporary output {}: {error}",
+                "ERROR failed to clean {} temporary output {}: {error}",
+                self.cleanup_label,
                 self.path.display()
             );
         }
     }
 }
 
-fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<()> {
+pub(crate) fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<()> {
     ensure!(slot.is_none(), "{flag} may be supplied only once");
     *slot = Some(value);
     Ok(())
 }
 
-fn set_once_path(slot: &mut Option<PathBuf>, flag: &str, value: &str) -> Result<()> {
+pub(crate) fn set_once_path(slot: &mut Option<PathBuf>, flag: &str, value: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{flag} path is empty");
     set_once(slot, flag, PathBuf::from(value))
 }
@@ -363,4 +403,40 @@ fn parse_positive_worker_limit(value: &str, flag: &str) -> Result<WorkerLimit> {
         .with_context(|| format!("{flag} expects a positive integer, got `{value}`"))?;
     ensure!(parsed > 0, "{flag} must be greater than zero");
     WorkerLimit::new(parsed).map_err(|error| anyhow::anyhow!("{flag}: {error}"))
+}
+
+#[cfg(test)]
+mod create_new_output_tests {
+    use super::*;
+
+    #[test]
+    fn both_historical_output_kinds_preserve_bytes_and_refuse_overwrite() {
+        for kind in [
+            HistoricalOutputKind::CandidateSearch,
+            HistoricalOutputKind::ReceiptPreparation,
+        ] {
+            let folder = std::env::temp_dir().join(format!(
+                "neoethos-historical-atomic-output-{}-{:?}-{}",
+                std::process::id(),
+                kind,
+                NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&folder).expect("create unique output directory");
+            let output = folder.join("receipt.json");
+            let payload = br#"{"identity":"unchanged"}"#;
+            atomic_write_create_new(&output, payload, kind).expect("publish once");
+            assert_eq!(fs::read(&output).unwrap(), payload);
+            let failure = atomic_write_create_new(&output, b"changed", kind)
+                .expect_err("never overwrite existing historical output");
+            assert!(
+                failure
+                    .to_string()
+                    .contains("refusing to overwrite existing output")
+            );
+            assert_eq!(fs::read(&output).unwrap(), payload);
+            let temporary_files = fs::read_dir(&folder).unwrap().count();
+            assert_eq!(temporary_files, 1, "no abandoned temporary file");
+            fs::remove_dir_all(&folder).unwrap();
+        }
+    }
 }

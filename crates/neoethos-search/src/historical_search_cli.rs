@@ -6,10 +6,8 @@
 //! the operator-supplied canonical receipt before a candidate is generated.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
 use neoethos_core::execution::BudgetedCpuExecutor;
@@ -37,7 +35,8 @@ use crate::historical_research::{
     scan_historical_candidates_v2,
 };
 use crate::historical_search_receipt_prep::{
-    ExactSelectedFeatureInput, build_exact_selected_feature_input,
+    ExactSelectedFeatureInput, HistoricalOutputKind, atomic_write_create_new,
+    build_exact_selected_feature_input, set_once, set_once_path,
 };
 
 const HISTORICAL_SEARCH_CLI_SCHEMA_VERSION: u16 = 2;
@@ -46,7 +45,6 @@ const CANDIDATE_GENERATOR_POLICY_ID: &str =
 const DISTANCE_POLICY_ID: &str = "canonical.reference-ohlc.true-range-causal-carry-forward.v1";
 const MIN_VALID_CANDIDATE_ROWS: usize = 32;
 const MAX_GENERATION_ATTEMPTS_PER_CANDIDATE: usize = 512;
-static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct HistoricalSearchArgs {
@@ -247,7 +245,11 @@ pub fn run(args: &[String]) -> Result<()> {
         },
     };
     let artifact_bytes = serde_json::to_vec(&artifact).context("serialize historical-search v2")?;
-    atomic_write_create_new(&args.output, &artifact_bytes)?;
+    atomic_write_create_new(
+        &args.output,
+        &artifact_bytes,
+        HistoricalOutputKind::CandidateSearch,
+    )?;
 
     println!("receipt_sha256={receipt_sha256}");
     println!(
@@ -616,93 +618,6 @@ fn derive_candidate_seed(
             .try_into()
             .expect("SHA-256 prefix is eight bytes"),
     )
-}
-
-fn atomic_write_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    ensure!(
-        parent.is_dir(),
-        "output parent {} does not exist",
-        parent.display()
-    );
-    ensure!(
-        !path.exists(),
-        "refusing to overwrite existing output {}",
-        path.display()
-    );
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("output path has no UTF-8 file name")?;
-    let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(
-        ".{file_name}.neoethos-{}-{sequence}.tmp",
-        std::process::id()
-    ));
-    let mut cleanup = TemporaryOutput::new(temporary.clone());
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .with_context(|| format!("create temporary output {}", temporary.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("write temporary output {}", temporary.display()))?;
-    file.sync_all()
-        .with_context(|| format!("sync temporary output {}", temporary.display()))?;
-    drop(file);
-    fs::hard_link(&temporary, path).with_context(|| {
-        format!(
-            "atomically install create-new output {} from {}",
-            path.display(),
-            temporary.display()
-        )
-    })?;
-    fs::remove_file(&temporary)
-        .with_context(|| format!("remove linked temporary output {}", temporary.display()))?;
-    cleanup.disarm();
-    Ok(())
-}
-
-struct TemporaryOutput {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl TemporaryOutput {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TemporaryOutput {
-    fn drop(&mut self) {
-        if self.armed
-            && let Err(error) = fs::remove_file(&self.path)
-        {
-            eprintln!(
-                "ERROR failed to clean historical-search temporary output {}: {error}",
-                self.path.display()
-            );
-        }
-    }
-}
-
-fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<()> {
-    ensure!(slot.is_none(), "{flag} may be supplied only once");
-    *slot = Some(value);
-    Ok(())
-}
-
-fn set_once_path(slot: &mut Option<PathBuf>, flag: &str, value: &str) -> Result<()> {
-    ensure!(!value.trim().is_empty(), "{flag} path is empty");
-    set_once(slot, flag, PathBuf::from(value))
 }
 
 fn required<T>(value: Option<T>, flag: &str) -> Result<T> {
