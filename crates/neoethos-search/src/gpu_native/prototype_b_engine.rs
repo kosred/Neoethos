@@ -785,7 +785,10 @@ mod tests {
             assert_eq!(descriptor.short_threshold, genes.short_thresholds[index]);
             assert_eq!(descriptor.stop_ticks, 0);
             assert_eq!(descriptor.target_ticks, 0);
-            assert_eq!(descriptor.stop_vol_multiplier, genes.stop_vol_multipliers[index]);
+            assert_eq!(
+                descriptor.stop_vol_multiplier,
+                genes.stop_vol_multipliers[index]
+            );
             assert_eq!(descriptor.flags, 0);
             assert_eq!(descriptor.reserved, 0);
         }
