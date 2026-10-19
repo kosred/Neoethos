@@ -991,9 +991,14 @@ fn rolling_validity_v5_reuses_the_correction_without_migrating_other_quant_math(
         CanonicalTimeframe::D1,
     ] {
         let mut bars = zero_range_recovery_fixture();
+        // Canonical timestamps must be in-range Unix milliseconds; row 0 at
+        // epoch 0 is rejected by the production timestamp validator.
         bars.timestamp = Some(
             (0..bars.len())
-                .map(|i| i as i64 * timeframe.fixed_duration_ms().unwrap())
+                .map(|i| {
+                    1_577_836_800_000
+                        + i as i64 * timeframe.fixed_duration_ms().unwrap_or(UTC_DAY_MILLIS)
+                })
                 .collect(),
         );
         let legacy = compute_quant_feature_columns_f64(&bars).unwrap();
