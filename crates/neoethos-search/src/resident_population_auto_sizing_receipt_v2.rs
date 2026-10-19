@@ -22,6 +22,7 @@ use neoethos_gpu_cuda::{
     SealedDataPopulationGpuWorkspacePlanV1, SealedNativeCudaDataPopulationPreflightFactsV1,
 };
 
+use crate::artifact_io::hex_lower;
 #[cfg(any(test, target_os = "linux"))]
 use crate::resident_selection_scope_v2::ResidentFeatureScreeningScopeV2;
 
@@ -1207,10 +1208,10 @@ impl ResidentPopulationAutoSizingReceiptV2 {
             && self.resident_parent_rows == parent_rows
             && self.feature_count == feature_count
             && self.workspace_plan_identity_sha256
-                == crate::artifact_io::hex_lower(limits.workspace_plan_identity_sha256())
+                == hex_lower(limits.workspace_plan_identity_sha256())
             && self.population_sizing_authority_sha256
-                == crate::artifact_io::hex_lower(limits.population_sizing_authority_sha256())
-            && self.data_extent_identity_sha256 == crate::artifact_io::hex_lower(limits.data_extent_identity_sha256())
+                == hex_lower(limits.population_sizing_authority_sha256())
+            && self.data_extent_identity_sha256 == hex_lower(limits.data_extent_identity_sha256())
             && self.resident_parent_rows == limits.parent_row_count()
             && self.feature_count == limits.feature_count()
             && self.max_ordered_index_count == limits.max_ordered_index_count()
@@ -1415,7 +1416,7 @@ impl ResidentPopulationAutoSizingReceiptV2 {
         let mut hasher = Sha256::new();
         hasher.update(RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_HASH_DOMAIN_V2);
         hasher.update(encoded);
-        Ok(crate::artifact_io::hex_lower(hasher.finalize().into()))
+        Ok(hex_lower(hasher.finalize().into()))
     }
 
     pub fn validate_against_workspace_plan_v2(
@@ -1429,13 +1430,13 @@ impl ResidentPopulationAutoSizingReceiptV2 {
             == RESIDENT_POPULATION_AUTO_SIZING_RECEIPT_SCHEMA_VERSION_V2
             && self.identity_sha256 == identity
             && self.admission_identity_sha256
-                == crate::artifact_io::hex_lower(native_facts.admission_identity_sha256())
+                == hex_lower(native_facts.admission_identity_sha256())
             && self.native_preflight_facts_identity_sha256
-                == crate::artifact_io::hex_lower(native_facts.facts_identity_sha256())
+                == hex_lower(native_facts.facts_identity_sha256())
             && self.cuda_build_manifest_sha256
-                == crate::artifact_io::hex_lower(native_facts.cuda_build_manifest_sha256())
+                == hex_lower(native_facts.cuda_build_manifest_sha256())
             && self.cuda_build_artifact_sha256
-                == crate::artifact_io::hex_lower(native_facts.cuda_build_artifact_sha256())
+                == hex_lower(native_facts.cuda_build_artifact_sha256())
             && self.selected_device_ordinal == native_facts.selected_device_ordinal()
             && self.pre_materialization_free_bytes_snapshot
                 == native_facts.pre_materialization_free_bytes_snapshot()
@@ -1444,10 +1445,10 @@ impl ResidentPopulationAutoSizingReceiptV2 {
             && self.allocator_context_reserve_policy
                 == native_facts.allocator_context_reserve_policy()
             && self.workspace_plan_identity_sha256
-                == crate::artifact_io::hex_lower(limits.workspace_plan_identity_sha256())
+                == hex_lower(limits.workspace_plan_identity_sha256())
             && self.population_sizing_authority_sha256
-                == crate::artifact_io::hex_lower(limits.population_sizing_authority_sha256())
-            && self.data_extent_identity_sha256 == crate::artifact_io::hex_lower(limits.data_extent_identity_sha256())
+                == hex_lower(limits.population_sizing_authority_sha256())
+            && self.data_extent_identity_sha256 == hex_lower(limits.data_extent_identity_sha256())
             && self.resident_parent_rows == limits.parent_row_count()
             && self.feature_count == limits.feature_count()
             && self.max_ordered_index_count == limits.max_ordered_index_count()
@@ -1890,10 +1891,10 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2<
         allocator_context_reserve_policy: native_facts
             .allocator_context_reserve_policy()
             .to_owned(),
-        admission_identity_sha256: crate::artifact_io::hex_lower(native_facts.admission_identity_sha256()),
-        native_preflight_facts_identity_sha256: crate::artifact_io::hex_lower(native_facts.facts_identity_sha256()),
-        cuda_build_manifest_sha256: crate::artifact_io::hex_lower(native_facts.cuda_build_manifest_sha256()),
-        cuda_build_artifact_sha256: crate::artifact_io::hex_lower(native_facts.cuda_build_artifact_sha256()),
+        admission_identity_sha256: hex_lower(native_facts.admission_identity_sha256()),
+        native_preflight_facts_identity_sha256: hex_lower(native_facts.facts_identity_sha256()),
+        cuda_build_manifest_sha256: hex_lower(native_facts.cuda_build_manifest_sha256()),
+        cuda_build_artifact_sha256: hex_lower(native_facts.cuda_build_artifact_sha256()),
         data_peak_device_bytes: workspace_plan.data_peak_device_bytes(),
         data_steady_device_bytes: workspace_plan.data_steady_device_bytes(),
         gene_store_device_bytes: workspace_plan.gene_store_device_bytes(),
@@ -1918,9 +1919,9 @@ fn seal_resident_population_auto_sizing_receipt_with_hard_cap_v2<
         )?,
         growth_cap: checked_u64(resolution.growth_cap, "growth cap")?,
         resolution_reason: resolution_reason.to_owned(),
-        workspace_plan_identity_sha256: crate::artifact_io::hex_lower(limits.workspace_plan_identity_sha256()),
-        population_sizing_authority_sha256: crate::artifact_io::hex_lower(limits.population_sizing_authority_sha256()),
-        data_extent_identity_sha256: crate::artifact_io::hex_lower(limits.data_extent_identity_sha256()),
+        workspace_plan_identity_sha256: hex_lower(limits.workspace_plan_identity_sha256()),
+        population_sizing_authority_sha256: hex_lower(limits.population_sizing_authority_sha256()),
+        data_extent_identity_sha256: hex_lower(limits.data_extent_identity_sha256()),
         identity_sha256: String::new(),
     };
     receipt.identity_sha256 = receipt.computed_identity_sha256()?;
