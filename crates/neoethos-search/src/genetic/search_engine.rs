@@ -554,19 +554,7 @@ pub fn signals_and_confidence_for_gene_with_config(
     // evaluator. If no flag is enabled we short-circuit to the simple
     // threshold path so callers that build a `Gene` with no SMC flags get
     // the same fast path as before this change.
-    let flags: [i8; 11] = [
-        gene.use_ob as i8,
-        gene.use_fvg as i8,
-        gene.use_liq_sweep as i8,
-        gene.mtf_confirmation as i8,
-        gene.use_premium_discount as i8,
-        gene.use_inducement as i8,
-        gene.use_bos as i8,
-        gene.use_choch as i8,
-        gene.use_eqh as i8,
-        gene.use_eql as i8,
-        gene.use_displacement as i8,
-    ];
+    let flags: [i8; 11] = smc_gene_flags(gene);
     let _any_flag = flags.iter().any(|f| *f != 0);
 
     // Need OHLCV-derived SMC indicator series — compute the same way the
@@ -783,32 +771,8 @@ pub fn signals_and_confidence_for_gene_full_with_smc_policy(
         }
     }
 
-    let flags: [i8; 11] = [
-        gene.use_ob as i8,
-        gene.use_fvg as i8,
-        gene.use_liq_sweep as i8,
-        gene.mtf_confirmation as i8,
-        gene.use_premium_discount as i8,
-        gene.use_inducement as i8,
-        gene.use_bos as i8,
-        gene.use_choch as i8,
-        gene.use_eqh as i8,
-        gene.use_eql as i8,
-        gene.use_displacement as i8,
-    ];
-    let smc_weights = [
-        config.smc_weight_ob,
-        config.smc_weight_fvg,
-        config.smc_weight_liq,
-        config.smc_weight_mtf,
-        config.smc_weight_premium,
-        config.smc_weight_inducement,
-        config.smc_weight_bos,
-        config.smc_weight_choch,
-        config.smc_weight_eqh,
-        config.smc_weight_eql,
-        config.smc_weight_displacement,
-    ];
+    let flags: [i8; 11] = smc_gene_flags(gene);
+    let smc_weights = smc_config_weights(config);
     let active_sum: f64 = flags
         .iter()
         .enumerate()
@@ -1046,36 +1010,8 @@ pub(crate) fn evaluate_genes_cached(
     sizing_policy.validate_gene_batch_v1(genes, "exact generation upload")?;
     let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
     let (sl_pips, tp_pips) = resolve_stop_target_arrays(genes, ohlcv, config);
-    let mut gene_smc_flags = Vec::with_capacity(genes.len());
-    for g in genes {
-        gene_smc_flags.push([
-            g.use_ob as i8,
-            g.use_fvg as i8,
-            g.use_liq_sweep as i8,
-            g.mtf_confirmation as i8,
-            g.use_premium_discount as i8,
-            g.use_inducement as i8,
-            g.use_bos as i8,
-            g.use_choch as i8,
-            g.use_eqh as i8,
-            g.use_eql as i8,
-            g.use_displacement as i8,
-        ]);
-    }
-
-    let smc_weights = [
-        config.smc_weight_ob,
-        config.smc_weight_fvg,
-        config.smc_weight_liq,
-        config.smc_weight_mtf,
-        config.smc_weight_premium,
-        config.smc_weight_inducement,
-        config.smc_weight_bos,
-        config.smc_weight_choch,
-        config.smc_weight_eqh,
-        config.smc_weight_eql,
-        config.smc_weight_displacement,
-    ];
+    let gene_smc_flags = smc_gene_flag_rows(genes);
+    let smc_weights = smc_config_weights(config);
 
     let mut b_settings = evaluation_backtest_settings(config)?;
     let stop_vol_mults = resolve_adaptive_stops(
@@ -1310,34 +1246,10 @@ pub(crate) fn pack_resident_generation_genes_v1(
         stop_pips.push(gene.sl_pips);
         target_pips.push(gene.tp_pips);
         stop_vol_multipliers.push(gene.stop_vol_mult);
-        smc_flags.extend_from_slice(&[
-            gene.use_ob as i8,
-            gene.use_fvg as i8,
-            gene.use_liq_sweep as i8,
-            gene.mtf_confirmation as i8,
-            gene.use_premium_discount as i8,
-            gene.use_inducement as i8,
-            gene.use_bos as i8,
-            gene.use_choch as i8,
-            gene.use_eqh as i8,
-            gene.use_eql as i8,
-            gene.use_displacement as i8,
-        ]);
+        smc_flags.extend_from_slice(&smc_gene_flags(gene));
     }
 
-    let smc_weights = [
-        config.smc_weight_ob,
-        config.smc_weight_fvg,
-        config.smc_weight_liq,
-        config.smc_weight_mtf,
-        config.smc_weight_premium,
-        config.smc_weight_inducement,
-        config.smc_weight_bos,
-        config.smc_weight_choch,
-        config.smc_weight_eqh,
-        config.smc_weight_eql,
-        config.smc_weight_displacement,
-    ];
+    let smc_weights = smc_config_weights(config);
     ensure!(
         smc_weights.iter().all(|weight| weight.is_finite())
             && config.smc_gate_threshold.is_finite(),
@@ -1760,6 +1672,89 @@ impl ValidationPrep {
     }
 }
 
+/// Canonical ordered SMC flag projection. Both the native upload ABI and
+/// the CPU population evaluation consume these same eleven feature switches.
+fn smc_gene_flags(gene: &Gene) -> crate::eval::SmcRow {
+    [
+        gene.use_ob as i8,
+        gene.use_fvg as i8,
+        gene.use_liq_sweep as i8,
+        gene.mtf_confirmation as i8,
+        gene.use_premium_discount as i8,
+        gene.use_inducement as i8,
+        gene.use_bos as i8,
+        gene.use_choch as i8,
+        gene.use_eqh as i8,
+        gene.use_eql as i8,
+        gene.use_displacement as i8,
+    ]
+}
+
+fn smc_gene_flag_rows(genes: &[Gene]) -> Vec<crate::eval::SmcRow> {
+    genes.iter().map(smc_gene_flags).collect()
+}
+
+/// Canonical eleven weights in the same order as the flags.
+fn smc_config_weights(config: &EvaluationConfig) -> [f64; 11] {
+    [
+        config.smc_weight_ob,
+        config.smc_weight_fvg,
+        config.smc_weight_liq,
+        config.smc_weight_mtf,
+        config.smc_weight_premium,
+        config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
+    ]
+}
+
+#[cfg(test)]
+mod smc_projection_consolidation_tests {
+    use super::*;
+
+    #[test]
+    fn native_and_cpu_flags_preserve_full_order_and_empty_batch() {
+        let gene = Gene {
+            use_ob: true,
+            use_liq_sweep: true,
+            use_premium_discount: true,
+            use_bos: true,
+            use_eqh: true,
+            use_displacement: true,
+            ..Gene::default()
+        };
+        let expected = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
+        assert_eq!(smc_gene_flags(&gene), expected);
+        assert_eq!(smc_gene_flag_rows(&[gene]), vec![expected]);
+        assert!(smc_gene_flag_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn configured_weights_preserve_full_order() {
+        let config = EvaluationConfig {
+            smc_weight_ob: 1.0,
+            smc_weight_fvg: 2.0,
+            smc_weight_liq: 3.0,
+            smc_weight_mtf: 4.0,
+            smc_weight_premium: 5.0,
+            smc_weight_inducement: 6.0,
+            smc_weight_bos: 7.0,
+            smc_weight_choch: 8.0,
+            smc_weight_eqh: 9.0,
+            smc_weight_eql: 10.0,
+            smc_weight_displacement: 11.0,
+            ..EvaluationConfig::default()
+        };
+        assert_eq!(
+            smc_config_weights(&config),
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]
+        );
+    }
+}
+
 /// The per-CALL half: the gene CSR pack, the per-gene SL/TP fallbacks, the SMC
 /// flag rows and the adaptive-stop resolution.
 ///
@@ -1808,35 +1803,8 @@ pub fn prepare_validation_population(
             40.0
         });
     }
-    let mut gene_smc_flags = Vec::with_capacity(genes.len());
-    for g in genes {
-        gene_smc_flags.push([
-            g.use_ob as i8,
-            g.use_fvg as i8,
-            g.use_liq_sweep as i8,
-            g.mtf_confirmation as i8,
-            g.use_premium_discount as i8,
-            g.use_inducement as i8,
-            g.use_bos as i8,
-            g.use_choch as i8,
-            g.use_eqh as i8,
-            g.use_eql as i8,
-            g.use_displacement as i8,
-        ]);
-    }
-    let smc_weights = [
-        config.smc_weight_ob,
-        config.smc_weight_fvg,
-        config.smc_weight_liq,
-        config.smc_weight_mtf,
-        config.smc_weight_premium,
-        config.smc_weight_inducement,
-        config.smc_weight_bos,
-        config.smc_weight_choch,
-        config.smc_weight_eqh,
-        config.smc_weight_eql,
-        config.smc_weight_displacement,
-    ];
+    let gene_smc_flags = smc_gene_flag_rows(genes);
+    let smc_weights = smc_config_weights(config);
     // Use the caller's settings verbatim, but FORCE fixed-1-lot sizing so the
     // metrics[0] sign matches the serial `simulate_trades_core` reference.
     let mut settings = settings_template.clone();
@@ -2096,36 +2064,8 @@ fn validation_genes_population_gathered_inner(
         });
     }
 
-    let mut gene_smc_flags = Vec::with_capacity(genes.len());
-    for g in genes {
-        gene_smc_flags.push([
-            g.use_ob as i8,
-            g.use_fvg as i8,
-            g.use_liq_sweep as i8,
-            g.mtf_confirmation as i8,
-            g.use_premium_discount as i8,
-            g.use_inducement as i8,
-            g.use_bos as i8,
-            g.use_choch as i8,
-            g.use_eqh as i8,
-            g.use_eql as i8,
-            g.use_displacement as i8,
-        ]);
-    }
-
-    let smc_weights = [
-        config.smc_weight_ob,
-        config.smc_weight_fvg,
-        config.smc_weight_liq,
-        config.smc_weight_mtf,
-        config.smc_weight_premium,
-        config.smc_weight_inducement,
-        config.smc_weight_bos,
-        config.smc_weight_choch,
-        config.smc_weight_eqh,
-        config.smc_weight_eql,
-        config.smc_weight_displacement,
-    ];
+    let gene_smc_flags = smc_gene_flag_rows(genes);
+    let smc_weights = smc_config_weights(config);
 
     // Use the caller's settings — but resolve adaptive stops onto a CLONE so the
     // gathered validation scales the stop by volatility exactly like scoring (the
@@ -2266,35 +2206,8 @@ impl WalkforwardPopulationGenePack {
             });
         }
         let stop_vol_mult: Vec<f64> = genes.iter().map(|g| g.stop_vol_mult).collect();
-        let mut gene_smc_flags = Vec::with_capacity(genes.len());
-        for g in genes {
-            gene_smc_flags.push([
-                g.use_ob as i8,
-                g.use_fvg as i8,
-                g.use_liq_sweep as i8,
-                g.mtf_confirmation as i8,
-                g.use_premium_discount as i8,
-                g.use_inducement as i8,
-                g.use_bos as i8,
-                g.use_choch as i8,
-                g.use_eqh as i8,
-                g.use_eql as i8,
-                g.use_displacement as i8,
-            ]);
-        }
-        let smc_weights = [
-            config.smc_weight_ob,
-            config.smc_weight_fvg,
-            config.smc_weight_liq,
-            config.smc_weight_mtf,
-            config.smc_weight_premium,
-            config.smc_weight_inducement,
-            config.smc_weight_bos,
-            config.smc_weight_choch,
-            config.smc_weight_eqh,
-            config.smc_weight_eql,
-            config.smc_weight_displacement,
-        ];
+        let gene_smc_flags = smc_gene_flag_rows(genes);
+        let smc_weights = smc_config_weights(config);
         let settings = settings_template.clone();
         Self {
             offsets,
@@ -2585,36 +2498,8 @@ fn evaluate_genes_impl(
             disp[i],
         ]);
     }
-    let mut gene_smc_flags = Vec::with_capacity(genes.len());
-    for g in genes {
-        gene_smc_flags.push([
-            g.use_ob as i8,
-            g.use_fvg as i8,
-            g.use_liq_sweep as i8,
-            g.mtf_confirmation as i8,
-            g.use_premium_discount as i8,
-            g.use_inducement as i8,
-            g.use_bos as i8,
-            g.use_choch as i8,
-            g.use_eqh as i8,
-            g.use_eql as i8,
-            g.use_displacement as i8,
-        ]);
-    }
-
-    let smc_weights = [
-        config.smc_weight_ob,
-        config.smc_weight_fvg,
-        config.smc_weight_liq,
-        config.smc_weight_mtf,
-        config.smc_weight_premium,
-        config.smc_weight_inducement,
-        config.smc_weight_bos,
-        config.smc_weight_choch,
-        config.smc_weight_eqh,
-        config.smc_weight_eql,
-        config.smc_weight_displacement,
-    ];
+    let gene_smc_flags = smc_gene_flag_rows(genes);
+    let smc_weights = smc_config_weights(config);
 
     let mut b_settings = evaluation_backtest_settings(config)?;
     let stop_vol_mults = resolve_adaptive_stops(
