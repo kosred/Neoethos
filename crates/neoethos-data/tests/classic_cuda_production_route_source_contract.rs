@@ -7042,14 +7042,32 @@ fn classic_dual_ulcer_index_uses_one_shared_resident_exact_f64_launch() {
         "short_sq_sum -= leaving_short_sq",
         "long_sq_sum += long_sq",
         "short_sq_sum += short_sq",
-        "sqrt(long_sq_sum) / denom",
-        "sqrt(short_sq_sum) / denom",
+        // Classic-v9 repair: the rolling square sum can round slightly below
+        // zero, so the shared authority clamps before sqrt() instead of
+        // emitting a NaN that would poison the cumulative threshold forever.
+        "sqrt(fmax(long_sq_sum, 0.0)) / denom",
+        "sqrt(fmax(short_sq_sum, 0.0)) / denom",
         "diff_sum += diff",
         "diff_count += 1",
     ] {
         assert!(
             shared.contains(required),
             "shared Dual Ulcer Index row authority is missing exact operation `{required}`"
+        );
+    }
+
+    // The CPU reference must keep the same rounded-negative clamp, or the
+    // CUDA lane and the reference would silently diverge at that row.
+    let cpu_reference =
+        source("../../vendor/vector-ta-0.2.9-patched/src/indicators/dual_ulcer_index.rs");
+    let cpu_row = function_body(&cpu_reference, "fn compute_dual_ulcer_index_row(");
+    for required in [
+        "long_sq_sum.max(0.0).sqrt() / denom",
+        "short_sq_sum.max(0.0).sqrt() / denom",
+    ] {
+        assert!(
+            cpu_row.contains(required),
+            "CPU Dual Ulcer Index reference is missing the Classic-v9 clamp `{required}`"
         );
     }
     assert_eq!(
