@@ -21,11 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::app_services::broker_deal_economics::{
     BROKER_DEAL_MONEY_SCHEMA_VERSION_V1, BrokerDealMoneyEvidenceV1, BrokerPnlConversionFeeV1,
-    BrokerSymbolVolumeScaleEvidenceV1,
+    BrokerSymbolVolumeScaleEvidenceV1, append_string, sha256_hex,
 };
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeSnapshot, CTraderPositionSnapshot,
@@ -145,11 +144,6 @@ fn validate_hash(label: &str, value: &str) -> Result<(), JournalMoneyErrorV3> {
     Ok(())
 }
 
-fn append_string(bytes: &mut Vec<u8>, value: &str) {
-    bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
-    bytes.extend_from_slice(value.as_bytes());
-}
-
 fn append_optional_i64(bytes: &mut Vec<u8>, value: Option<i64>) {
     match value {
         Some(value) => {
@@ -158,14 +152,6 @@ fn append_optional_i64(bytes: &mut Vec<u8>, value: Option<i64>) {
         }
         None => bytes.push(0),
     }
-}
-
-fn sha256_hex(domain: &str, payload: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(domain.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(payload);
-    format!("{:x}", hasher.finalize())
 }
 
 fn checked_add(left: i64, right: i64, label: &str) -> Result<i64, JournalMoneyErrorV3> {

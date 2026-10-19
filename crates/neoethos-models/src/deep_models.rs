@@ -196,25 +196,25 @@ fn mlp_host_bytes(rows: usize, input: usize, bytes_per_cell: usize) -> Result<us
 /// values that cannot survive this explicit boundary fail closed.
 fn deep_backend_f32_matrix(frame: &FeatureFrame) -> Result<Array2<f32>> {
     let source = feature_frame_to_f64_array(frame).context("materialize typed deep-model frame")?;
-    let mut narrowed = Vec::with_capacity(source.len());
-    for ((row, column), value) in source.indexed_iter() {
-        if value.abs() > f32::MAX as f64 {
-            bail!(
+    crate::common::checked_backend_f32_matrix(
+        &source,
+        crate::common::F32NarrowPrecheck::F32RangeFirst,
+        "shape deep backend f32 feature matrix",
+        |row, column, value, failure| match failure {
+            crate::common::F32NarrowFailure::NonFiniteInput => anyhow::anyhow!(
+                "deep backend f32 adapter produced non-finite feature row {row} column {column}"
+            ),
+            crate::common::F32NarrowFailure::OutOfRange => anyhow::anyhow!(
                 "deep backend f32 adapter cannot represent feature row {row} column {column}: {value}"
-            );
-        }
-        let converted = *value as f32;
-        if !converted.is_finite() {
-            bail!("deep backend f32 adapter produced non-finite feature row {row} column {column}");
-        }
-        if *value != 0.0 && converted == 0.0 {
-            bail!(
+            ),
+            crate::common::F32NarrowFailure::NonFiniteOutput => anyhow::anyhow!(
+                "deep backend f32 adapter produced non-finite feature row {row} column {column}"
+            ),
+            crate::common::F32NarrowFailure::Underflow => anyhow::anyhow!(
                 "deep backend f32 adapter underflowed non-zero feature row {row} column {column}: {value}"
-            );
-        }
-        narrowed.push(converted);
-    }
-    Array2::from_shape_vec(source.dim(), narrowed).context("shape deep backend f32 feature matrix")
+            ),
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
