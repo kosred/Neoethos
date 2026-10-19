@@ -290,52 +290,19 @@ fn render_status(area: Rect, buf: &mut Buffer, shared: &AppShared) {
 
 /// Page-local key handler. Returns true if consumed.
 pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
-    let form = &mut shared.discover_form;
-
-    if form.editing {
-        return super::handle_editing_form_key(code, form, &mut shared.status);
+    let action = super::handle_form_key(code, &mut shared.discover_form, &mut shared.status);
+    if action == super::FormKeyAction::Launch {
+        launch_now(shared);
+    } else if action == super::FormKeyAction::Stop {
+        // Discovery must still confirm killing an active subprocess.
+        if shared.jobs.has_running(JOB_LABEL_PREFIX) {
+            shared.pending_confirmation = Some(crate::tui::app::PendingAction::DiscoverStop);
+            shared.status = "Confirm stop discovery? [Y]es / [N]o".to_string();
+        } else {
+            shared.status = "No running discovery to stop".to_string();
+        }
     }
-
-    match code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            form.focus_prev();
-            true
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            form.focus_next();
-            true
-        }
-        KeyCode::Enter => {
-            // Enter on a focused field → start editing. Launch is
-            // bound to 'l' (or the clickable [Launch] pill).
-            let label = form.fields[form.focused].label;
-            form.start_editing();
-            shared.status = format!("Editing {} (Esc to cancel)", label);
-            true
-        }
-        KeyCode::Char('x') => {
-            form.clear_focused();
-            shared.status = "Field cleared".to_string();
-            true
-        }
-        KeyCode::Char('l') | KeyCode::Char('L') => {
-            launch_now(shared);
-            true
-        }
-        KeyCode::Char('K') => {
-            // Stopping a discovery kills the subprocess — stage a Y/N
-            // confirmation rather than killing immediately (FIX A). Only prompt
-            // if there's actually a running job to stop.
-            if shared.jobs.has_running(JOB_LABEL_PREFIX) {
-                shared.pending_confirmation = Some(crate::tui::app::PendingAction::DiscoverStop);
-                shared.status = "Confirm stop discovery? [Y]es / [N]o".to_string();
-            } else {
-                shared.status = "No running discovery to stop".to_string();
-            }
-            true
-        }
-        _ => false,
-    }
+    action != super::FormKeyAction::Ignored
 }
 
 /// Stop the running discovery (called once the user confirms — FIX A).

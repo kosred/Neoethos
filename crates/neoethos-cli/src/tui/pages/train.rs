@@ -331,46 +331,17 @@ fn render_registry(area: Rect, buf: &mut Buffer) {
 }
 
 pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
-    let form = &mut shared.train_form;
-
-    if form.editing {
-        return super::handle_editing_form_key(code, form, &mut shared.status);
+    let action = super::handle_form_key(code, &mut shared.train_form, &mut shared.status);
+    if action == super::FormKeyAction::Launch {
+        launch_now(shared);
+    } else if action == super::FormKeyAction::Stop {
+        shared.status = if shared.jobs.stop_latest(JOB_LABEL_PREFIX) {
+            "Stopping training…".to_string()
+        } else {
+            "No running training to stop".to_string()
+        };
     }
-
-    match code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            form.focus_prev();
-            true
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            form.focus_next();
-            true
-        }
-        KeyCode::Enter => {
-            let label = form.fields[form.focused].label;
-            form.start_editing();
-            shared.status = format!("Editing {} (Esc to cancel)", label);
-            true
-        }
-        KeyCode::Char('x') => {
-            form.clear_focused();
-            shared.status = "Field cleared".to_string();
-            true
-        }
-        KeyCode::Char('l') | KeyCode::Char('L') => {
-            launch_now(shared);
-            true
-        }
-        KeyCode::Char('K') => {
-            shared.status = if shared.jobs.stop_latest(JOB_LABEL_PREFIX) {
-                "Stopping training…".to_string()
-            } else {
-                "No running training to stop".to_string()
-            };
-            true
-        }
-        _ => false,
-    }
+    action != super::FormKeyAction::Ignored
 }
 
 fn build_launch_args(form: &FormState) -> Result<Vec<String>, String> {
