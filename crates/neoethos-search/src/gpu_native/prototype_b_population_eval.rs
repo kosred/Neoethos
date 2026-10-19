@@ -26,10 +26,11 @@ use anyhow::{Context, Result, bail};
 // deleted event budget could take its size, and the population lane touches no
 // event record anywhere else — the type stays alive for the diagnostic readback
 // contract, which is a different lane.
-use neoethos_gpu_contracts::device::{GeneDescriptor, ScenarioDescriptor};
+use neoethos_gpu_contracts::device::ScenarioDescriptor;
 
 use crate::eval::SmcRow;
 use crate::gpu_native::prototype_a::PrototypeAGeneUpload;
+use crate::gpu_native::prototype_b_engine::prototype_b_gene_descriptors;
 use crate::gpu_native::prototype_population_oracle::population_settings_for_settings;
 use crate::gpu_native::scenario;
 use crate::population_auto_sizing_receipt_v1::{
@@ -1857,28 +1858,7 @@ fn evaluate_population_b_batch(
         smc_weights: *smc_weights,
         gate_threshold,
     };
-    let descriptors = genes
-        .candidate_ids
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, candidate_id)| {
-            let start = genes.offsets[index] as u32;
-            let end = genes.offsets[index + 1] as u32;
-            GeneDescriptor {
-                candidate_id,
-                term_offset: start,
-                term_count: end.saturating_sub(start),
-                long_threshold: genes.long_thresholds[index],
-                short_threshold: genes.short_thresholds[index],
-                stop_ticks: 0,
-                target_ticks: 0,
-                stop_vol_multiplier: genes.stop_vol_multipliers[index],
-                flags: 0,
-                reserved: 0,
-            }
-        })
-        .collect::<Vec<_>>();
+    let descriptors = prototype_b_gene_descriptors(&genes);
     let smc_flags = genes
         .smc_flags
         .iter()
