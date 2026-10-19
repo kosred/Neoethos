@@ -528,24 +528,8 @@ pub fn signals_and_confidence_for_gene_with_config(
     gene: &Gene,
     config: &EvaluationConfig,
 ) -> Result<(Vec<i8>, Vec<f64>)> {
-    let n_samples = features.n_samples();
-    let mut combined = vec![0.0_f64; n_samples];
-    let mut eligible = vec![true; n_samples];
-    for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
-        anyhow::ensure!(
-            *idx < features.n_features(),
-            "gene feature index {idx} is outside the {}-column frame",
-            features.n_features()
-        );
-        let col = features.feature_column(*idx)?;
-        for i in 0..n_samples {
-            if col.validity[i].is_valid() {
-                combined[i] += *weight * col.values[i];
-            } else {
-                eligible[i] = false;
-            }
-        }
-    }
+    let (combined, eligible) = gene_weighted_features(features, gene)?;
+    let n_samples = combined.len();
     let mut signals = vec![0_i8; n_samples];
     let mut confidences = vec![0.0_f64; n_samples];
     let gap = (gene.long_threshold - gene.short_threshold).abs().max(1e-6);
@@ -752,24 +736,8 @@ pub fn signals_and_confidence_for_gene_full_with_smc_policy(
     smc: &SmcGateArrays,
     smc_bypass: bool,
 ) -> Result<(Vec<i8>, Vec<f64>)> {
-    let n_samples = features.n_samples();
-    let mut combined = vec![0.0_f64; n_samples];
-    let mut eligible = vec![true; n_samples];
-    for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
-        anyhow::ensure!(
-            *idx < features.n_features(),
-            "gene feature index {idx} is outside the {}-column frame",
-            features.n_features()
-        );
-        let col = features.feature_column(*idx)?;
-        for i in 0..n_samples {
-            if col.validity[i].is_valid() {
-                combined[i] += *weight * col.values[i];
-            } else {
-                eligible[i] = false;
-            }
-        }
-    }
+    let (combined, eligible) = gene_weighted_features(features, gene)?;
+    let n_samples = combined.len();
 
     let flags: [i8; 11] = smc_gene_flags(gene);
     let smc_weights = smc_config_weights(config);
@@ -1010,18 +978,8 @@ pub(crate) fn evaluate_genes_cached(
     sizing_policy.validate_gene_batch_v1(genes, "exact generation upload")?;
     let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
     let (sl_pips, tp_pips) = resolve_stop_target_arrays(genes, ohlcv, config);
-    let gene_smc_flags = smc_gene_flag_rows(genes);
-    let smc_weights = smc_config_weights(config);
-
-    let mut b_settings = evaluation_backtest_settings(config)?;
-    let stop_vol_mults = resolve_adaptive_stops(
-        genes,
-        &ohlcv.high,
-        &ohlcv.low,
-        &ohlcv.close,
-        config,
-        &mut b_settings,
-    )?;
+    let (gene_smc_flags, smc_weights, b_settings, stop_vol_mults) =
+        prepare_population_smc_and_stops(genes, ohlcv, config)?;
 
     let inputs = crate::eval::PopulationEvalInputs {
         close: &ohlcv.close,
@@ -1755,6 +1713,99 @@ mod smc_projection_consolidation_tests {
     }
 }
 
+/// One source for thresholded gene projections used by un-gated and SMC-gated
+/// signals. Each caller still evaluates only once per invocation.
+fn gene_weighted_features(features: &FeatureFrame, gene: &Gene) -> Result<(Vec<f64>, Vec<bool>)> {
+    let n_samples = features.n_samples();
+    let mut combined = vec![0.0_f64; n_samples];
+    let mut eligible = vec![true; n_samples];
+    for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
+        anyhow::ensure!(
+            *idx < features.n_features(),
+            "gene feature index {idx} is outside the {}-column frame",
+            features.n_features()
+        );
+        let col = features.feature_column(*idx)?;
+        for i in 0..n_samples {
+            if col.validity[i].is_valid() {
+                combined[i] += *weight * col.values[i];
+            } else {
+                eligible[i] = false;
+            }
+        }
+    }
+    Ok((combined, eligible))
+}
+
+/// Validation is intentionally fixed-pip with 20/40 fallbacks; this differs
+/// from the OHLCV-inferred defaults of the exact generation scoring path.
+fn validation_stop_target_fallbacks(genes: &[Gene]) -> (Vec<f64>, Vec<f64>) {
+    let mut sl_pips = Vec::with_capacity(genes.len());
+    let mut tp_pips = Vec::with_capacity(genes.len());
+    for g in genes {
+        sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
+            g.sl_pips
+        } else {
+            20.0
+        });
+        tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
+            g.tp_pips
+        } else {
+            40.0
+        });
+    }
+    (sl_pips, tp_pips)
+}
+
+/// The cached-generation and standalone-oracle routes use exactly the same
+/// host settings and gene metadata. Prepare them once per evaluation call.
+fn prepare_population_smc_and_stops(
+    genes: &[Gene],
+    ohlcv: &Ohlcv,
+    config: &EvaluationConfig,
+) -> Result<(
+    Vec<crate::eval::SmcRow>,
+    [f64; 11],
+    BacktestSettings,
+    Vec<f64>,
+)> {
+    let gene_smc_flags = smc_gene_flag_rows(genes);
+    let smc_weights = smc_config_weights(config);
+    let mut b_settings = evaluation_backtest_settings(config)?;
+    let stop_vol_mults = resolve_adaptive_stops(
+        genes,
+        &ohlcv.high,
+        &ohlcv.low,
+        &ohlcv.close,
+        config,
+        &mut b_settings,
+    )?;
+    Ok((gene_smc_flags, smc_weights, b_settings, stop_vol_mults))
+}
+
+#[cfg(test)]
+mod validation_fallback_consolidation_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_pip_validation_fallbacks_do_not_infer_market_defaults() {
+        let genes = [
+            Gene {
+                sl_pips: 0.0,
+                tp_pips: f64::NAN,
+                ..Gene::default()
+            },
+            Gene {
+                sl_pips: 5.0,
+                tp_pips: 12.0,
+                ..Gene::default()
+            },
+        ];
+        assert_eq!(validation_stop_target_fallbacks(&genes), (vec![20.0, 5.0], vec![40.0, 12.0]));
+        assert_eq!(validation_stop_target_fallbacks(&[]), (vec![], vec![]));
+    }
+}
+
 /// The per-CALL half: the gene CSR pack, the per-gene SL/TP fallbacks, the SMC
 /// flag rows and the adaptive-stop resolution.
 ///
@@ -1789,20 +1840,7 @@ pub fn prepare_validation_population(
     let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
     // Per-gene SL/TP resolved the SAME way `discovery_backtest_settings` does:
     // the gene's own finite-positive value, else the 20/40-pip fallback.
-    let mut sl_pips = Vec::with_capacity(genes.len());
-    let mut tp_pips = Vec::with_capacity(genes.len());
-    for g in genes {
-        sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
-            g.sl_pips
-        } else {
-            20.0
-        });
-        tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
-            g.tp_pips
-        } else {
-            40.0
-        });
-    }
+    let (sl_pips, tp_pips) = validation_stop_target_fallbacks(genes);
     let gene_smc_flags = smc_gene_flag_rows(genes);
     let smc_weights = smc_config_weights(config);
     // Use the caller's settings verbatim, but FORCE fixed-1-lot sizing so the
@@ -2049,20 +2087,7 @@ fn validation_genes_population_gathered_inner(
 
     let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
     // Per-gene SL/TP resolved the SAME way `discovery_backtest_settings` does.
-    let mut sl_pips = Vec::with_capacity(genes.len());
-    let mut tp_pips = Vec::with_capacity(genes.len());
-    for g in genes {
-        sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
-            g.sl_pips
-        } else {
-            20.0
-        });
-        tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
-            g.tp_pips
-        } else {
-            40.0
-        });
-    }
+    let (sl_pips, tp_pips) = validation_stop_target_fallbacks(genes);
 
     let gene_smc_flags = smc_gene_flag_rows(genes);
     let smc_weights = smc_config_weights(config);
@@ -2191,20 +2216,7 @@ impl WalkforwardPopulationGenePack {
         settings_template: &BacktestSettings,
     ) -> Self {
         let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
-        let mut sl_pips = Vec::with_capacity(genes.len());
-        let mut tp_pips = Vec::with_capacity(genes.len());
-        for g in genes {
-            sl_pips.push(if g.sl_pips.is_finite() && g.sl_pips > 0.0 {
-                g.sl_pips
-            } else {
-                20.0
-            });
-            tp_pips.push(if g.tp_pips.is_finite() && g.tp_pips > 0.0 {
-                g.tp_pips
-            } else {
-                40.0
-            });
-        }
+        let (sl_pips, tp_pips) = validation_stop_target_fallbacks(genes);
         let stop_vol_mult: Vec<f64> = genes.iter().map(|g| g.stop_vol_mult).collect();
         let gene_smc_flags = smc_gene_flag_rows(genes);
         let smc_weights = smc_config_weights(config);
@@ -2498,18 +2510,8 @@ fn evaluate_genes_impl(
             disp[i],
         ]);
     }
-    let gene_smc_flags = smc_gene_flag_rows(genes);
-    let smc_weights = smc_config_weights(config);
-
-    let mut b_settings = evaluation_backtest_settings(config)?;
-    let stop_vol_mults = resolve_adaptive_stops(
-        genes,
-        &ohlcv.high,
-        &ohlcv.low,
-        &ohlcv.close,
-        config,
-        &mut b_settings,
-    )?;
+    let (gene_smc_flags, smc_weights, b_settings, stop_vol_mults) =
+        prepare_population_smc_and_stops(genes, ohlcv, config)?;
 
     let inputs = crate::eval::PopulationEvalInputs {
         close: &ohlcv.close,
