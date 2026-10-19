@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, ensure};
 use neoethos_data::{FeatureFrame, Ohlcv};
-use neoethos_search::genetic::signals_and_confidence_for_gene_full;
-use neoethos_search::{EvaluationConfig, Gene, signals_for_gene, signals_for_gene_full};
+use neoethos_search::genetic::{SmcGateArrays, signals_and_confidence_for_gene_full_with_smc};
+use neoethos_search::{EvaluationConfig, Gene, signals_for_gene, signals_for_gene_full_with_smc};
 
 use crate::contracts::{Direction, LiveBar, PortfolioEntry, Signal, SignalEngine, SignalSource};
 
@@ -28,6 +28,19 @@ fn gene_uses_smc(gene: &Gene) -> bool {
         || gene.use_eqh
         || gene.use_eql
         || gene.use_displacement
+}
+
+/// Rebuild SMC indicators only on the first gated gene of a fixed aligned
+/// feature/OHLCV series; subsequent genes read the same immutable rows.
+fn cached_smc_gate<'a>(
+    cache: &'a mut Option<SmcGateArrays>,
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+) -> Result<&'a SmcGateArrays> {
+    if cache.is_none() {
+        *cache = Some(SmcGateArrays::build(features, ohlcv)?);
+    }
+    Ok(cache.as_ref().expect("built SMC gate before use"))
 }
 
 fn dir_from_net(v: i32) -> Direction {
@@ -219,10 +232,12 @@ pub fn combine_gene_signals(
 ) -> Result<Vec<Direction>> {
     let n = aligned_features.n_samples();
     let cfg = EvaluationConfig::default();
+    let mut smc_cache = None;
     let mut net = vec![0i32; n];
     for gene in genes {
         let sigs = if gene_uses_smc(gene) {
-            signals_for_gene_full(aligned_features, base_ohlcv, gene, &cfg)
+            cached_smc_gate(&mut smc_cache, aligned_features, base_ohlcv)
+                .and_then(|smc| signals_for_gene_full_with_smc(aligned_features, gene, &cfg, smc))
         } else {
             signals_for_gene(aligned_features, gene)
         }
@@ -259,6 +274,7 @@ pub fn combine_gene_signals_with_brackets(
 ) -> Result<(Vec<Direction>, Vec<f64>, Vec<f64>)> {
     let n = aligned_features.n_samples();
     let cfg = EvaluationConfig::default();
+    let mut smc_cache = None;
     let mut net = vec![0i32; n];
     let mut sl_long = vec![0.0f64; n];
     let mut tp_long = vec![0.0f64; n];
@@ -320,7 +336,8 @@ pub fn combine_gene_signals_with_brackets(
 
     for gene in genes {
         let sigs = if gene_uses_smc(gene) {
-            signals_for_gene_full(aligned_features, base_ohlcv, gene, &cfg)
+            cached_smc_gate(&mut smc_cache, aligned_features, base_ohlcv)
+                .and_then(|smc| signals_for_gene_full_with_smc(aligned_features, gene, &cfg, smc))
         } else {
             signals_for_gene(aligned_features, gene)
         }
@@ -391,6 +408,7 @@ pub fn combine_gene_signals_with_confidence(
 ) -> Result<(Vec<Direction>, Vec<f64>)> {
     let n = aligned_features.n_samples();
     let cfg = EvaluationConfig::default();
+    let mut smc_cache = None;
     let mut net = vec![0i32; n];
     // Per-bar accumulators of confidence on each side.
     let mut conf_long = vec![0.0f64; n];
@@ -399,14 +417,16 @@ pub fn combine_gene_signals_with_confidence(
     let mut cnt_short = vec![0u32; n];
 
     for gene in genes {
-        let (sigs, confs) =
-            signals_and_confidence_for_gene_full(aligned_features, base_ohlcv, gene, &cfg)
-                .with_context(|| {
-                    format!(
-                        "failed to synthesize signals and confidence for gene `{}`",
-                        gene.strategy_id
-                    )
-                })?;
+        let (sigs, confs) = cached_smc_gate(&mut smc_cache, aligned_features, base_ohlcv)
+            .and_then(|smc| {
+                signals_and_confidence_for_gene_full_with_smc(aligned_features, gene, &cfg, smc)
+            })
+            .with_context(|| {
+                format!(
+                    "failed to synthesize signals and confidence for gene `{}`",
+                    gene.strategy_id
+                )
+            })?;
         ensure!(
             sigs.len() == n && confs.len() == n,
             "gene `{}` returned {} signals and {} confidences for {n} feature rows",
@@ -577,6 +597,49 @@ mod tests {
                 .chain()
                 .any(|cause| cause.to_string().contains(expected)),
             "expected `{expected}` in error chain: {error:#}"
+        );
+    }
+
+    #[test]
+    fn two_smc_genes_share_one_gate_and_match_independent_ga_signals() {
+        let features = feature_frame(
+            ndarray::array![[1.0_f64, -1.0], [1.0, -1.0], [-1.0, -1.0], [1.0, -1.0]],
+            &["f0", "smc_ob"],
+        );
+        let ohlcv = flat_ohlcv(4);
+        let mut first = Gene::default();
+        first.indices = vec![0];
+        first.weights = vec![1.0];
+        first.long_threshold = 0.5;
+        first.short_threshold = -0.5;
+        first.use_ob = true;
+        let mut second = first.clone();
+        second.strategy_id = "second".into();
+        let genes = [first, second];
+        let config = EvaluationConfig::default();
+        // Independent original entrypoint: each gene builds its own gate.
+        let per_gene = genes
+            .iter()
+            .map(|gene| {
+                neoethos_search::genetic::signals_and_confidence_for_gene_full(
+                    &features, &ohlcv, gene, &config,
+                )
+                .expect("original per-gene path")
+                .0
+            })
+            .collect::<Vec<_>>();
+        let expected = (0..features.n_samples())
+            .map(|row| dir_from_net(per_gene.iter().map(|signals| i32::from(signals[row])).sum()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            combine_gene_signals(&genes, &features, &ohlcv).unwrap(),
+            expected
+        );
+        assert_eq!(
+            combine_gene_signals_with_confidence(&genes, &features, &ohlcv)
+                .unwrap()
+                .0,
+            expected
         );
     }
 
