@@ -10,7 +10,6 @@ pub use neoethos_core::storage::json::temporary_path;
 pub use neoethos_core::storage::json::{read_json, stable_json_hash, write_json_atomic};
 pub use neoethos_core::utils::fnv1a64;
 
-
 /// The single lower-hex encoder for Search identity and receipt digests.
 /// Accepts both raw fixed-size SHA-256 arrays and borrowed digest buffers.
 pub(crate) fn hex_lower(bytes: impl AsRef<[u8]>) -> String {

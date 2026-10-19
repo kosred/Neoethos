@@ -592,7 +592,8 @@ pub(crate) fn seal_native_population_residency_receipt_v1(
     device_hasher.update((device_identity.name_bytes().len() as u64).to_le_bytes());
     device_hasher.update(device_identity.name_bytes());
     let device_identity_sha256 = crate::artifact_io::hex_lower(&device_hasher.finalize());
-    let cuda_build_manifest_sha256 = crate::artifact_io::hex_lower(&Sha256::digest(cuda_build_manifest_v1.as_bytes()));
+    let cuda_build_manifest_sha256 =
+        crate::artifact_io::hex_lower(&Sha256::digest(cuda_build_manifest_v1.as_bytes()));
 
     let mut hasher = Sha256::new();
     hasher.update(NATIVE_RESIDENCY_HASH_DOMAIN_V1);

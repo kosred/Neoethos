@@ -690,7 +690,8 @@ pub(crate) fn seal_exact_resident_compact_parent_v3(
     anyhow::ensure!(
         receipt.row_count() == u64::try_from(owner.rows)?
             && receipt.column_count() == u64::try_from(owner.columns)?
-            && receipt.feature_content_merkle_sha256() == crate::artifact_io::hex_lower(&owner.content),
+            && receipt.feature_content_merkle_sha256()
+                == crate::artifact_io::hex_lower(&owner.content),
         "retained compact Data owner differs from the actual native Search receipt"
     );
     let scope_identity = scope.identity_sha256()?;
