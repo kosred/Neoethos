@@ -6,6 +6,178 @@ use crossterm::event::KeyCode;
 use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::tui::app::AppShared;
+use crate::tui::form::FormState;
+
+/// A normal form key either mutates the fields or leaves one page-specific
+/// action for its owner. Editing mode never leaks keystrokes to Launch/Stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FormKeyAction {
+    Handled,
+    Launch,
+    Stop,
+    Ignored,
+}
+
+pub(super) fn handle_form_key(
+    code: KeyCode,
+    form: &mut FormState,
+    status: &mut String,
+) -> FormKeyAction {
+    if form.editing {
+        return if handle_editing_form_key(code, form, status) {
+            FormKeyAction::Handled
+        } else {
+            FormKeyAction::Ignored
+        };
+    }
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            form.focus_prev();
+            FormKeyAction::Handled
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            form.focus_next();
+            FormKeyAction::Handled
+        }
+        KeyCode::Enter => {
+            let label = form.fields[form.focused].label;
+            form.start_editing();
+            *status = format!("Editing {} (Esc to cancel)", label);
+            FormKeyAction::Handled
+        }
+        KeyCode::Char('x') => {
+            form.clear_focused();
+            *status = "Field cleared".to_string();
+            FormKeyAction::Handled
+        }
+        KeyCode::Char('l') | KeyCode::Char('L') => FormKeyAction::Launch,
+        KeyCode::Char('K') => FormKeyAction::Stop,
+        _ => FormKeyAction::Ignored,
+    }
+}
+
+/// Shared editing-mode handler for the existing Discover and Train form pages.
+/// Page-specific launch/stop commands remain in each page's normal key handler.
+pub(super) fn handle_editing_form_key(
+    code: KeyCode,
+    form: &mut FormState,
+    status: &mut String,
+) -> bool {
+    match code {
+        KeyCode::Esc => {
+            form.stop_editing(false);
+            *status = "Edit cancelled".to_string();
+            true
+        }
+        KeyCode::Enter => {
+            form.stop_editing(true);
+            *status = format!(
+                "Saved {} = {}",
+                form.fields[form.focused].label,
+                form.fields[form.focused].effective()
+            );
+            true
+        }
+        KeyCode::Backspace => {
+            form.backspace();
+            true
+        }
+        KeyCode::Char(c) => {
+            form.type_char(c);
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod shared_editing_tests {
+    use super::*;
+    use crate::tui::form::Field;
+
+    #[test]
+    fn navigation_and_launch_are_separate_from_editing() {
+        let mut form = FormState::new(vec![
+            Field::new("First", "1", "first"),
+            Field::new("Second", "2", "second"),
+        ]);
+        let mut status = String::new();
+        assert_eq!(
+            handle_form_key(KeyCode::Down, &mut form, &mut status),
+            FormKeyAction::Handled
+        );
+        assert_eq!(form.focused, 1);
+        assert_eq!(
+            handle_form_key(KeyCode::Char('l'), &mut form, &mut status),
+            FormKeyAction::Launch
+        );
+        assert_eq!(
+            handle_form_key(KeyCode::Char('K'), &mut form, &mut status),
+            FormKeyAction::Stop
+        );
+        assert_eq!(
+            handle_form_key(KeyCode::Enter, &mut form, &mut status),
+            FormKeyAction::Handled
+        );
+        assert!(form.editing);
+        assert_eq!(
+            handle_form_key(KeyCode::Char('l'), &mut form, &mut status),
+            FormKeyAction::Handled
+        );
+        assert_eq!(form.fields[1].effective(), "2l");
+    }
+
+    #[test]
+    fn editing_keystrokes_preserve_save_and_cancel_contract() {
+        let mut form = FormState::new(vec![Field::new("Name", "base", "hint")]);
+        let mut status = String::new();
+
+        form.start_editing();
+        assert!(handle_editing_form_key(
+            KeyCode::Char('!'),
+            &mut form,
+            &mut status
+        ));
+        assert!(handle_editing_form_key(
+            KeyCode::Esc,
+            &mut form,
+            &mut status
+        ));
+        assert_eq!(form.fields[0].effective(), "base");
+        assert_eq!(status, "Edit cancelled");
+        assert!(!form.editing);
+
+        form.start_editing();
+        assert!(handle_editing_form_key(
+            KeyCode::Char('!'),
+            &mut form,
+            &mut status
+        ));
+        assert!(handle_editing_form_key(
+            KeyCode::Backspace,
+            &mut form,
+            &mut status
+        ));
+        assert!(handle_editing_form_key(
+            KeyCode::Char('?'),
+            &mut form,
+            &mut status
+        ));
+        assert!(!handle_editing_form_key(
+            KeyCode::Up,
+            &mut form,
+            &mut status
+        ));
+        assert!(handle_editing_form_key(
+            KeyCode::Enter,
+            &mut form,
+            &mut status
+        ));
+        assert_eq!(form.fields[0].effective(), "base?");
+        assert_eq!(status, "Saved Name = base?");
+        assert!(!form.editing);
+    }
+}
 
 pub mod auto_loop;
 pub mod chart;

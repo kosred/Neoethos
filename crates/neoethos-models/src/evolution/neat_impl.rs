@@ -46,27 +46,6 @@ const MIN_NEAT_GENERATIONS: usize = 8;
 /// Checked, backend-local narrowing for symbios-neat, whose evaluator accepts
 /// f32 inputs. The shared typed frame and scaler remain f64, and values that
 /// cannot survive this explicit boundary fail closed.
-fn neat_backend_f32_matrix(features: &Array2<f64>) -> Result<Array2<f32>> {
-    let mut narrowed = Vec::with_capacity(features.len());
-    for ((row, column), value) in features.indexed_iter() {
-        if value.abs() > f32::MAX as f64 {
-            bail!("NEAT f32 backend cannot represent feature row {row} column {column}: {value}");
-        }
-        let converted = *value as f32;
-        if !converted.is_finite() {
-            bail!("NEAT f32 backend produced non-finite feature row {row} column {column}");
-        }
-        if *value != 0.0 && converted == 0.0 {
-            bail!(
-                "NEAT f32 backend underflowed non-zero feature row {row} column {column}: {value}"
-            );
-        }
-        narrowed.push(converted);
-    }
-    Array2::from_shape_vec(features.dim(), narrowed)
-        .context("shape NEAT f32 backend feature matrix")
-}
-
 fn default_neat_requested_device_policy() -> String {
     "auto".to_string()
 }
@@ -1013,9 +992,7 @@ impl NeatExpert {
             .checked_add(artifact.embargo_rows)
             .and_then(|rows| rows.checked_add(artifact.val_rows));
         if accounted_rows != Some(artifact.dataset_rows) {
-            bail!(
-                "NEAT artifact train_rows + embargo_rows + val_rows must equal dataset_rows"
-            );
+            bail!("NEAT artifact train_rows + embargo_rows + val_rows must equal dataset_rows");
         }
         if artifact.runtime_backend.trim().is_empty() {
             bail!("NEAT artifact must persist a runtime backend label");
@@ -1243,7 +1220,11 @@ impl ExpertModel for NeatExpert {
 
             let split = temporal_train_validation_split(features.nrows());
             let scaler = FeatureScaler::fit(&features.select(Axis(0), &split.train_indices))?;
-            let scaled = neat_backend_f32_matrix(&scaler.transform(&features)?)?;
+            let scaled = crate::common::checked_evolution_backend_f32_matrix(
+                &scaler.transform(&features)?,
+                "NEAT",
+                "shape NEAT f32 backend feature matrix",
+            )?;
 
             self.config = build_neat_config(scaled.ncols());
             self.feature_columns = feature_columns;
@@ -1275,7 +1256,11 @@ impl ExpertModel for NeatExpert {
             ensure_feature_columns_match(&self.feature_columns, x)?;
             let (features, _) = feature_matrix_from_frame(x)?;
             let scaler = self.scaler.as_ref().context("NEAT scaler missing")?;
-            let scaled = neat_backend_f32_matrix(&scaler.transform(&features)?)?;
+            let scaled = crate::common::checked_evolution_backend_f32_matrix(
+                &scaler.transform(&features)?,
+                "NEAT",
+                "shape NEAT f32 backend feature matrix",
+            )?;
             let genome = self.best_genome.as_ref().context("NEAT genome missing")?;
             evaluate_probabilities(genome, &scaled)
         })

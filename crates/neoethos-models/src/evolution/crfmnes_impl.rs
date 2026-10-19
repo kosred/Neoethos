@@ -49,29 +49,6 @@ type NeuroEvoParams = (Array2<f32>, Vec<f32>, Array2<f32>, Vec<f32>);
 /// shared typed frame and scaler remain f64; values that cannot survive this
 /// explicit backend boundary fail closed instead of being silently rounded to
 /// infinity or zero.
-fn neuro_evo_backend_f32_matrix(features: &Array2<f64>) -> Result<Array2<f32>> {
-    let mut narrowed = Vec::with_capacity(features.len());
-    for ((row, column), value) in features.indexed_iter() {
-        if value.abs() > f32::MAX as f64 {
-            bail!(
-                "neuro-evo f32 backend cannot represent feature row {row} column {column}: {value}"
-            );
-        }
-        let converted = *value as f32;
-        if !converted.is_finite() {
-            bail!("neuro-evo f32 backend produced non-finite feature row {row} column {column}");
-        }
-        if *value != 0.0 && converted == 0.0 {
-            bail!(
-                "neuro-evo f32 backend underflowed non-zero feature row {row} column {column}: {value}"
-            );
-        }
-        narrowed.push(converted);
-    }
-    Array2::from_shape_vec(features.dim(), narrowed)
-        .context("shape neuro-evo f32 backend feature matrix")
-}
-
 fn default_neuro_evo_requested_device_policy() -> String {
     "auto".to_string()
 }
@@ -1069,7 +1046,7 @@ impl ExpertModel for NeuroEvoExpert {
 
         let split = temporal_train_validation_split(features.nrows());
         let scaler = FeatureScaler::fit(&features.select(Axis(0), &split.train_indices))?;
-        let scaled = neuro_evo_backend_f32_matrix(&scaler.transform(&features)?)?;
+        let scaled = crate::common::checked_evolution_backend_f32_matrix(&scaler.transform(&features)?, "neuro-evo", "shape neuro-evo f32 backend feature matrix")?;
 
         self.input_dim = scaled.ncols().max(1);
         self.feature_columns = feature_columns;
@@ -1235,7 +1212,11 @@ impl ExpertModel for NeuroEvoExpert {
             ensure_feature_columns_match(&self.feature_columns, x)?;
             let (features, _) = feature_matrix_from_frame(x)?;
             let scaler = self.scaler.as_ref().context("neuro-evo scaler missing")?;
-            let scaled = neuro_evo_backend_f32_matrix(&scaler.transform(&features)?)?;
+            let scaled = crate::common::checked_evolution_backend_f32_matrix(
+                &scaler.transform(&features)?,
+                "neuro-evo",
+                "shape neuro-evo f32 backend feature matrix",
+            )?;
             let logits = self
                 .logits_from_params(&self.params, &scaled)?
                 .mapv(f64::from);

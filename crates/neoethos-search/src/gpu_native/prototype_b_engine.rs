@@ -36,6 +36,33 @@ pub struct PrototypeBPopulationInputs {
     pub settings: NeoPopulationSettings,
 }
 
+/// Canonical Prototype B descriptor projection shared by fixture and live evaluation.
+/// Preserve the existing CSR narrowing and every native ABI field verbatim.
+pub(crate) fn prototype_b_gene_descriptors(genes: &PrototypeAGeneUpload) -> Vec<GeneDescriptor> {
+    genes
+        .candidate_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, candidate_id)| {
+            let start = genes.offsets[index] as u32;
+            let end = genes.offsets[index + 1] as u32;
+            GeneDescriptor {
+                candidate_id,
+                term_offset: start,
+                term_count: end.saturating_sub(start),
+                long_threshold: genes.long_thresholds[index],
+                short_threshold: genes.short_thresholds[index],
+                stop_ticks: 0,
+                target_ticks: 0,
+                stop_vol_multiplier: genes.stop_vol_multipliers[index],
+                flags: 0,
+                reserved: 0,
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
 impl PrototypeBPopulationInputs {
     pub fn from_uploads(
         dataset: &PrototypeADatasetUpload,
@@ -43,28 +70,7 @@ impl PrototypeBPopulationInputs {
     ) -> Result<Self, EngineError> {
         let settings = population_settings_for_dataset(dataset)
             .map_err(|error| EngineError::Backend(error.to_string()))?;
-        let descriptors = genes
-            .candidate_ids
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, candidate_id)| {
-                let start = genes.offsets[index] as u32;
-                let end = genes.offsets[index + 1] as u32;
-                GeneDescriptor {
-                    candidate_id,
-                    term_offset: start,
-                    term_count: end.saturating_sub(start),
-                    long_threshold: genes.long_thresholds[index],
-                    short_threshold: genes.short_thresholds[index],
-                    stop_ticks: 0,
-                    target_ticks: 0,
-                    stop_vol_multiplier: genes.stop_vol_multipliers[index],
-                    flags: 0,
-                    reserved: 0,
-                }
-            })
-            .collect::<Vec<_>>();
+        let descriptors = prototype_b_gene_descriptors(genes);
         let smc_flags = genes
             .smc_flags
             .iter()
@@ -777,6 +783,14 @@ mod tests {
             );
             assert_eq!(descriptor.long_threshold, genes.long_thresholds[index]);
             assert_eq!(descriptor.short_threshold, genes.short_thresholds[index]);
+            assert_eq!(descriptor.stop_ticks, 0);
+            assert_eq!(descriptor.target_ticks, 0);
+            assert_eq!(
+                descriptor.stop_vol_multiplier,
+                genes.stop_vol_multipliers[index]
+            );
+            assert_eq!(descriptor.flags, 0);
+            assert_eq!(descriptor.reserved, 0);
         }
         assert_eq!(inputs.smc_flags.len(), genes.population() * 11);
         assert_eq!(inputs.smc_rows.len(), dataset.bars() * 11);
