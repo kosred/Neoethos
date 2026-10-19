@@ -1801,7 +1801,10 @@ mod validation_fallback_consolidation_tests {
                 ..Gene::default()
             },
         ];
-        assert_eq!(validation_stop_target_fallbacks(&genes), (vec![20.0, 5.0], vec![40.0, 12.0]));
+        assert_eq!(
+            validation_stop_target_fallbacks(&genes),
+            (vec![20.0, 5.0], vec![40.0, 12.0])
+        );
         assert_eq!(validation_stop_target_fallbacks(&[]), (vec![], vec![]));
     }
 }
