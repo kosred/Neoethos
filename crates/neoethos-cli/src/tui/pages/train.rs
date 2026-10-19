@@ -334,31 +334,7 @@ pub fn handle_key(code: KeyCode, shared: &mut AppShared) -> bool {
     let form = &mut shared.train_form;
 
     if form.editing {
-        match code {
-            KeyCode::Esc => {
-                form.stop_editing(false);
-                shared.status = "Edit cancelled".to_string();
-                return true;
-            }
-            KeyCode::Enter => {
-                form.stop_editing(true);
-                shared.status = format!(
-                    "Saved {} = {}",
-                    form.fields[form.focused].label,
-                    form.fields[form.focused].effective()
-                );
-                return true;
-            }
-            KeyCode::Backspace => {
-                form.backspace();
-                return true;
-            }
-            KeyCode::Char(c) => {
-                form.type_char(c);
-                return true;
-            }
-            _ => return false,
-        }
+        return super::handle_editing_form_key(code, form, &mut shared.status);
     }
 
     match code {

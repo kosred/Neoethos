@@ -6,6 +6,71 @@ use crossterm::event::KeyCode;
 use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::tui::app::AppShared;
+use crate::tui::form::FormState;
+
+
+/// Shared editing-mode handler for the existing Discover and Train form pages.
+/// Page-specific launch/stop commands remain in each page's normal key handler.
+pub(super) fn handle_editing_form_key(
+    code: KeyCode,
+    form: &mut FormState,
+    status: &mut String,
+) -> bool {
+    match code {
+        KeyCode::Esc => {
+            form.stop_editing(false);
+            *status = "Edit cancelled".to_string();
+            true
+        }
+        KeyCode::Enter => {
+            form.stop_editing(true);
+            *status = format!(
+                "Saved {} = {}",
+                form.fields[form.focused].label,
+                form.fields[form.focused].effective()
+            );
+            true
+        }
+        KeyCode::Backspace => {
+            form.backspace();
+            true
+        }
+        KeyCode::Char(c) => {
+            form.type_char(c);
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod shared_editing_tests {
+    use super::*;
+    use crate::tui::form::Field;
+
+    #[test]
+    fn editing_keystrokes_preserve_save_and_cancel_contract() {
+        let mut form = FormState::new(vec![Field::new("Name", "base", "hint")]);
+        let mut status = String::new();
+
+        form.start_editing();
+        assert!(handle_editing_form_key(KeyCode::Char('!'), &mut form, &mut status));
+        assert!(handle_editing_form_key(KeyCode::Esc, &mut form, &mut status));
+        assert_eq!(form.fields[0].effective(), "base");
+        assert_eq!(status, "Edit cancelled");
+        assert!(!form.editing);
+
+        form.start_editing();
+        assert!(handle_editing_form_key(KeyCode::Char('!'), &mut form, &mut status));
+        assert!(handle_editing_form_key(KeyCode::Backspace, &mut form, &mut status));
+        assert!(handle_editing_form_key(KeyCode::Char('?'), &mut form, &mut status));
+        assert!(!handle_editing_form_key(KeyCode::Up, &mut form, &mut status));
+        assert!(handle_editing_form_key(KeyCode::Enter, &mut form, &mut status));
+        assert_eq!(form.fields[0].effective(), "base?");
+        assert_eq!(status, "Saved Name = base?");
+        assert!(!form.editing);
+    }
+}
 
 pub mod auto_loop;
 pub mod chart;
