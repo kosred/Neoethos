@@ -178,6 +178,20 @@ impl FromStr for FeatureProfile {
     }
 }
 
+/// Quant recipes remain explicit so replay cannot silently change validity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantitativeFeatureSemantics {
+    #[default]
+    LegacyV2,
+    RollingValidityV5,
+}
+
+impl QuantitativeFeatureSemantics {
+    fn is_legacy(&self) -> bool {
+        *self == Self::LegacyV2
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureBuildOptions {
     pub profile: FeatureProfile,
@@ -197,6 +211,11 @@ pub struct FeatureBuildOptions {
     /// the legacy adaptive-prefix recipe; replay never invents a missing batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classic_ta_working_set: Option<super::hpc_ta::SweepBatch>,
+    #[serde(
+        default,
+        skip_serializing_if = "QuantitativeFeatureSemantics::is_legacy"
+    )]
+    pub quantitative_semantics: QuantitativeFeatureSemantics,
 }
 
 impl Default for FeatureBuildOptions {
@@ -208,6 +227,7 @@ impl Default for FeatureBuildOptions {
             normalization_training_rows: None,
             drop_columns_without_normalization_training_support: false,
             classic_ta_working_set: None,
+            quantitative_semantics: QuantitativeFeatureSemantics::LegacyV2,
         }
     }
 }
@@ -2072,6 +2092,16 @@ mod fitted_model_view_tests {
         let options: FeatureBuildOptions = serde_json::from_slice(legacy).unwrap();
         assert_eq!(options, FeatureBuildOptions::default());
         assert_eq!(serde_json::to_vec(&options).unwrap(), legacy);
+        let current = FeatureBuildOptions {
+            quantitative_semantics: QuantitativeFeatureSemantics::RollingValidityV5,
+            ..options
+        };
+        let encoded = serde_json::to_vec(&current).unwrap();
+        assert_ne!(encoded, legacy);
+        assert_eq!(
+            serde_json::from_slice::<FeatureBuildOptions>(&encoded).unwrap(),
+            current
+        );
     }
 
     fn raw_frame(offset: f64) -> Arc<FeatureFrame> {

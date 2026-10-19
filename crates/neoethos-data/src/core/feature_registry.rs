@@ -123,6 +123,26 @@ static QUANTITATIVE_FEATURE_PRODUCER_MANIFEST_V4: OnceLock<
     std::result::Result<ProductionFeatureProducerManifestRowV1, FeatureContractError>,
 > = OnceLock::new();
 
+pub fn quantitative_feature_producer_manifest_v5()
+-> std::result::Result<&'static ProductionFeatureProducerManifestRowV1, FeatureContractError> {
+    static MANIFEST: OnceLock<
+        std::result::Result<ProductionFeatureProducerManifestRowV1, FeatureContractError>,
+    > = OnceLock::new();
+    match MANIFEST.get_or_init(|| {
+        let legacy = production_feature_producer_manifest_v1()?
+            .iter()
+            .find(|row| row.producer == ProductionFeatureProducerId::Quantitative)
+            .expect("production manifest includes Quant");
+        Ok(ProductionFeatureProducerManifestRowV1 {
+            semantic_version: 5,
+            ..legacy.clone()
+        })
+    }) {
+        Ok(row) => Ok(row),
+        Err(error) => Err(error.clone()),
+    }
+}
+
 /// Distinct semantic authority for the corrected typed Quant-v4 CPU reference
 /// used by
 /// the resident GPU exact-parity route. The ordinary production manifest stays

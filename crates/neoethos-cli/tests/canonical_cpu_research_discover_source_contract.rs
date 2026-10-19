@@ -50,6 +50,8 @@ fn cpu_discover_research_is_exact_receipt_bound_and_never_exports_a_live_portfol
         "try_from_settings_for_canonical_trendbar_research",
         "run_canonical_trendbar_research_discovery_with_holdout_and_progress",
         "completed_without_survivors",
+        "neoethos_data::QuantitativeFeatureSemantics::RollingValidityV5",
+        "expected.quantitative_semantics = recorded.quantitative_semantics",
         "write_json_atomic(&path, research)",
         "neoethos.canonical-cpu-research-streaming-index.v1",
         "artifact_class=ResearchOnly",

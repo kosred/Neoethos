@@ -2468,6 +2468,8 @@ fn cmd_discover_on_budgeted_pool(
                 // the existing train-only projection; the options, retained
                 // names and fitted state are sealed into this batch's receipt.
                 drop_columns_without_normalization_training_support: true,
+                quantitative_semantics:
+                    neoethos_data::QuantitativeFeatureSemantics::RollingValidityV5,
                 ..neoethos_data::FeatureBuildOptions::default()
             };
 
@@ -2484,6 +2486,7 @@ fn cmd_discover_on_budgeted_pool(
                     .context("saved research has no exact feature-build recipe")?;
                 let mut expected = feature_options;
                 expected.classic_ta_working_set = recorded.classic_ta_working_set.clone();
+                expected.quantitative_semantics = recorded.quantitative_semantics;
                 anyhow::ensure!(
                     expected == *recorded,
                     "saved feature-build recipe differs from the requested research inputs"
