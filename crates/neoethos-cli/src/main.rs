@@ -2182,6 +2182,24 @@ fn cmd_discover_on_budgeted_pool(
                 || canonical_cpu_research.is_some(),
             "saved continuation requires receipt-bound canonical CPU research"
         );
+        // Research-only saved-candidate cost diagnosis. It reads a saved
+        // research envelope and re-costs its candidates; it never runs Search.
+        let diagnose_cost_out = parse_flag(args, "--diagnose-candidate-costs-out");
+        let diagnose_cost_variants = match parse_flag(args, "--diagnose-cost-variants") {
+            Some(spec) => canonical_research::parse_diagnostic_cost_variants(&spec)?,
+            None => Vec::new(),
+        };
+        if diagnose_cost_out.is_some() {
+            anyhow::ensure!(
+                saved_research.is_some(),
+                "candidate cost diagnosis requires --resume-research and --resume-research-sha256"
+            );
+            anyhow::ensure!(
+                !diagnose_cost_variants.is_empty(),
+                "candidate cost diagnosis requires --diagnose-cost-variants"
+            );
+        }
+        let mut diagnose_cost_written: Option<String> = None;
         #[cfg(feature = "gpu-nvidia")]
         anyhow::ensure!(
             canonical_cpu_research.is_none(),
@@ -2607,6 +2625,67 @@ fn cmd_discover_on_budgeted_pool(
                                 == contract.identity_sha256()?,
                             "saved research contract differs from the reopened sources and settings"
                         );
+                        if let Some(diag_out) = diagnose_cost_out.as_deref() {
+                            let result_ref = research.discovery_result();
+                            let diag_path = std::path::Path::new(diag_out);
+                            anyhow::ensure!(
+                                !diag_path.exists(),
+                                "candidate cost diagnostic output must be a new path: {diag_out}"
+                            );
+                            if let Some(parent) = diag_path.parent()
+                                && !parent.as_os_str().is_empty()
+                            {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let variants = diagnose_cost_variants
+                                .iter()
+                                .map(|(label, pips, commission)| {
+                                    neoethos_search::discovery::CandidateCostVariantV1 {
+                                        label: label.clone(),
+                                        round_trip_cost_pips: *pips,
+                                        round_trip_commission_per_lot: *commission,
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            let rows = neoethos_search::discovery::diagnose_research_candidates_under_cost_variants_v3(
+                                &run_input,
+                                &research_config,
+                                &research,
+                                &result_ref.candidates,
+                                &variants,
+                            )?;
+                            let variants_json = variants
+                                .iter()
+                                .map(|variant| {
+                                    serde_json::json!({
+                                        "label": &variant.label,
+                                        "round_trip_cost_pips": variant.round_trip_cost_pips,
+                                        "round_trip_commission_per_lot": variant.round_trip_commission_per_lot,
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            let document = serde_json::json!({
+                                "schema": "neoethos.research-only.candidate-cost-diagnostic.v1",
+                                "version": 1,
+                                "artifact_class": "ResearchOnly",
+                                "promotion_eligibility": "NotPromotionEligible",
+                                "authorization_issued": false,
+                                "authority": "research-only-raw-metrics-not-cost-band-not-execution-evidence",
+                                "warning": "Raw evaluated metrics for an explicit cost envelope on the saved selection frame. Not a cost-band verdict, not broker-validated execution evidence, and never promotion or live-sizing authority.",
+                                "saved_research_search_config_hash": &result_ref.search_config_hash,
+                                "sealed_policy_parity": "enforced by the research-only seam against policy.sealed_evaluation_config()",
+                                "contract_identity_sha256": contract.identity_sha256()?,
+                                "symbol": &symbol,
+                                "base_timeframe": &base,
+                                "candidates_evaluated": result_ref.candidates.len(),
+                                "variants": variants_json,
+                                "rows": rows,
+                            });
+                            neoethos_core::storage::json::write_json_atomic(diag_path, &document)?;
+                            emit_cpu_research_stage("candidate_cost_diagnostic_written");
+                            diagnose_cost_written = Some(diag_out.to_owned());
+                            return Ok(research);
+                        }
                         emit_cpu_research_stage("frozen_finalist_resume_started");
                         neoethos_search::discovery::with_canonical_research_finalist_v3(
                             &run_input,
@@ -2669,6 +2748,12 @@ fn cmd_discover_on_budgeted_pool(
                     )
                 },
             )?;
+
+            if let Some(diag_out) = diagnose_cost_written {
+                println!("candidate_cost_diagnostic={diag_out}");
+                println!("candidate_cost_diagnostic_status=ResearchOnly");
+                return Ok((symbol.clone(), base.clone(), 0, 0));
+            }
 
             let canonical_survivors = outcome.survivors();
             let canonical_feature_names = outcome.canonical.names().to_vec();
@@ -5184,6 +5269,9 @@ fn print_help() {
     );
     println!(
         "    saved quote replay: --quote-replay-bundle <json> --quote-replay-sha256 <sha> --quote-replay-store <dir> --max-batches 1"
+    );
+    println!(
+        "    research-only saved-candidate cost diagnosis: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-costs-out <new-json> --diagnose-cost-variants label=<round-trip-pips>:<round-trip-commission>,..."
     );
     println!(
         "                               One bounded CPU research run from exact acquisition receipts through D1 costs, discovery and chronological holdout evidence. Never authorizes promotion."

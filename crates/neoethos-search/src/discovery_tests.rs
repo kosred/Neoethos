@@ -2436,6 +2436,42 @@ fn compute_discovery_forward_test_artifacts_produces_one_artifact_per_strategy()
 }
 
 #[test]
+fn replay_config_parity_guard_rejects_a_reconstructed_risk_change() {
+    let mut config = DiscoveryConfig::default();
+    config.evaluation_spread_pips = 0.5;
+    config.evaluation_commission_per_trade = 9.0;
+    config.evaluation_symbol = "EURUSD".to_owned();
+    config.evaluation_account_currency = "USD".to_owned();
+    let price_hint = Some(1.10);
+    let final_gate = 0.5;
+    let sealed = config.evaluation_config_with_smc_gate(price_hint, final_gate);
+    ensure_research_config_matches_sealed_evaluation(&config, price_hint, final_gate, &sealed)
+        .expect("the identical configuration must pass the parity guard");
+    let mut changed = config.clone();
+    changed.initial_balance += 1.0;
+    let error =
+        ensure_research_config_matches_sealed_evaluation(&changed, price_hint, final_gate, &sealed)
+            .expect_err("a changed initial balance must be refused");
+    assert!(
+        error.to_string().contains("initial_equity"),
+        "unexpected guard error: {error}"
+    );
+    let mut changed_risk = config.clone();
+    changed_risk.risk_per_trade_max *= 2.0;
+    let error = ensure_research_config_matches_sealed_evaluation(
+        &changed_risk,
+        price_hint,
+        final_gate,
+        &sealed,
+    )
+    .expect_err("a changed risk band must be refused");
+    assert!(
+        error.to_string().contains("risk_per_trade_max"),
+        "unexpected guard error: {error}"
+    );
+}
+
+#[test]
 fn candidate_cost_variant_diagnostic_matches_the_production_frequency_definition() {
     use chrono::{Datelike, TimeZone, Utc};
     let mut config = DiscoveryConfig::default();

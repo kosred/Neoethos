@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 13] = [
+const OPTIONAL: [&str; 15] = [
     "--higher",
     "--population",
     "--generations",
@@ -43,6 +43,8 @@ const OPTIONAL: [&str; 13] = [
     "--resume-research",
     "--resume-research-sha256",
     "--research-oos-eval",
+    "--diagnose-candidate-costs-out",
+    "--diagnose-cost-variants",
 ];
 
 const RESUME_FLAGS: [&str; 2] = ["--resume-research", "--resume-research-sha256"];
@@ -114,10 +116,19 @@ impl SavedResearchInputs {
         )?;
         let research =
             neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3::from_json_bytes(&bytes)?;
-        neoethos_search::ensure_non_empty_portfolio(
-            research.discovery_result(),
-            "resume frozen research",
-        )?;
+        // The research-only saved-candidate cost diagnostic intentionally reads
+        // zero-portfolio archives: it never resumes a frozen finalist and never
+        // needs a portfolio to exist. Every other continuation still requires
+        // one, because it would otherwise restart a finalist replay over nothing.
+        let cost_diagnostic = args
+            .iter()
+            .any(|arg| arg == "--diagnose-candidate-costs-out");
+        if !cost_diagnostic {
+            neoethos_search::ensure_non_empty_portfolio(
+                research.discovery_result(),
+                "resume frozen research",
+            )?;
+        }
         Ok(Some(Self {
             research: Some(research),
             sha256,
@@ -233,6 +244,24 @@ impl Arguments {
             resume_flags == 0 || resume_flags == RESUME_FLAGS.len(),
             "resume requires the saved research and its SHA256 together"
         );
+        let diagnose_flags = [
+            "--diagnose-candidate-costs-out",
+            "--diagnose-cost-variants",
+        ]
+        .iter()
+        .filter(|flag| parsed.0.contains_key(**flag))
+        .count();
+        ensure!(
+            diagnose_flags == 0 || diagnose_flags == 2,
+            "candidate cost diagnosis requires --diagnose-candidate-costs-out and --diagnose-cost-variants together"
+        );
+        if diagnose_flags != 0 {
+            ensure!(
+                resume_flags != 0,
+                "candidate cost diagnosis requires an exact saved research (--resume-research + --resume-research-sha256)"
+            );
+            parse_diagnostic_cost_variants(parsed.value("--diagnose-cost-variants"))?;
+        }
         if resume_flags != 0 {
             for flag in [
                 "--population",
@@ -285,6 +314,56 @@ impl Arguments {
         ensure!(value > 0, "{flag} requires a positive integer");
         Ok(value)
     }
+}
+
+/// One explicit cost envelope for the research-only saved-candidate cost
+/// diagnostic CLI mode: `label=round_trip_pips:round_trip_commission_per_lot`.
+/// The list is comma separated and explicit on purpose: no cost number is
+/// invented by the CLI, and the caller must state every envelope it compares.
+pub fn parse_diagnostic_cost_variants(spec: &str) -> Result<Vec<(String, f64, f64)>> {
+    let mut variants = Vec::new();
+    for item in spec.split(',') {
+        let item = item.trim();
+        ensure!(!item.is_empty(), "--diagnose-cost-variants contains an empty item");
+        let (label, numbers) = item
+            .split_once('=')
+            .with_context(|| format!("diagnostic cost variant '{item}' must be label=pips:commission"))?;
+        let label = label.trim();
+        ensure!(
+            !label.is_empty()
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "diagnostic cost variant label '{label}' must be non-empty ascii alphanumeric, '-' or '_'"
+        );
+        let (pips, commission) = numbers
+            .split_once(':')
+            .with_context(|| format!("diagnostic cost variant '{item}' must be label=pips:commission"))?;
+        let pips = pips
+            .trim()
+            .parse::<f64>()
+            .with_context(|| format!("diagnostic cost variant '{label}' round-trip pips is not a number"))?;
+        let commission = commission
+            .trim()
+            .parse::<f64>()
+            .with_context(|| format!("diagnostic cost variant '{label}' round-trip commission is not a number"))?;
+        ensure!(
+            pips.is_finite() && pips >= 0.0,
+            "diagnostic cost variant '{label}' round-trip pips must be finite and nonnegative"
+        );
+        ensure!(
+            commission.is_finite() && commission >= 0.0,
+            "diagnostic cost variant '{label}' round-trip commission must be finite and nonnegative"
+        );
+        ensure!(
+            !variants.iter().any(|(existing, _, _)| existing == label),
+            "diagnostic cost variant label '{label}' is duplicated"
+        );
+        variants.push((label.to_owned(), pips, commission));
+    }
+    ensure!(
+        !variants.is_empty(),
+        "--diagnose-cost-variants requires at least one variant"
+    );
+    Ok(variants)
 }
 
 /// Resolve the same explicit settings file before installing the process budget.
@@ -470,6 +549,16 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
     if let Some(path) = args.0.get("--research-oos-eval") {
         push(&mut discovery_args, "--research-oos-eval-out", path);
     }
+    // Research-only saved-candidate cost diagnosis. It reuses the saved
+    // research and its receipt-bound input; it never runs a new Search.
+    for flag in [
+        "--diagnose-candidate-costs-out",
+        "--diagnose-cost-variants",
+    ] {
+        if let Some(value) = args.0.get(flag) {
+            push(&mut discovery_args, flag, value);
+        }
+    }
     neoethos_core::storage::json::write_json_atomic(
         output.join("discovery-arguments.json"),
         &discovery_args,
@@ -586,6 +675,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn diagnostic_cost_variants_are_explicit_and_require_a_saved_research() {
+        let parsed = parse_diagnostic_cost_variants("old=2.5:9.0,broker=0.9:9.0").unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("old".to_owned(), 2.5, 9.0),
+                ("broker".to_owned(), 0.9, 9.0)
+            ]
+        );
+        for bad in ["", "old", "old=2.5", "old=-1:9", "old=2.5:nan", "a=1:1,a=2:2"] {
+            assert!(
+                parse_diagnostic_cost_variants(bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        let mut args = valid_arguments();
+        push(&mut args, "--diagnose-candidate-costs-out", "out.json");
+        push(&mut args, "--diagnose-cost-variants", "old=2.5:9.0");
+        assert!(
+            Arguments::parse(&args).is_err(),
+            "cost diagnosis without an exact saved research must be refused"
+        );
+        push(&mut args, "--resume-research", "saved.json");
+        push(&mut args, "--resume-research-sha256", "explicit");
+        push(&mut args, "--max-batches", "1");
+        assert!(Arguments::parse(&args).is_ok());
+    }
     #[test]
     fn saved_input_hash_is_checked_above_the_scalar_cost_file_limit() {
         use sha2::{Digest, Sha256};

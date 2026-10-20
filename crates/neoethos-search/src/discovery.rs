@@ -6559,6 +6559,10 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
     research.validate()?;
     let contract = research.execution_contract();
     contract.validate_against_input(input)?;
+    // Keep the exact saved execution scope alive for the entire diagnostic: it
+    // pins the contract monetary basis (pip value/conversion, spread, swaps,
+    // fees) while this function builds evaluation config and per-gene settings.
+    let _research_execution = install_research_replay_execution_scope(contract)?;
     anyhow::ensure!(
         !candidates.is_empty(),
         "candidate cost diagnostic requires at least one saved candidate"
@@ -6588,6 +6592,20 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
         .as_ref()
         .and_then(|funnel| funnel.live_trading_policy_v1())
         .ok_or_else(|| anyhow::anyhow!("saved research lost its sealed Search signal policy"))?;
+    policy.validate()?;
+    anyhow::ensure!(
+        policy.source_search_config_hash == result.search_config_hash,
+        "saved research search_config_hash {} disagrees with its sealed policy {} — refusing to price candidates from an inconsistent archive",
+        result.search_config_hash,
+        policy.source_search_config_hash
+    );
+    let sealed_evaluation = policy.sealed_evaluation_config()?;
+    ensure_research_config_matches_sealed_evaluation(
+        &research_config,
+        selection.ohlcv().close.last().copied(),
+        result.effective_smc_gate_threshold,
+        &sealed_evaluation,
+    )?;
     let (evaluation, bypass) = locked_holdout_evaluation(
         &research_config,
         selection.ohlcv().close.last().copied(),
@@ -6664,6 +6682,117 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
         }
     }
     Ok(rows)
+}
+/// Install the saved research execution scope for the diagnostic replay.
+///
+/// Without this RAII scope the discovery evaluation path falls back to ambient
+/// symbol/price metadata: for an EUR account the pip basis (quote pip value
+/// divided by the contract D1 conversion price) would be recomputed from a
+/// different price. The canonical wrappers keep this exact scope alive for
+/// their whole replay; the diagnostic must do the same instead of inventing a
+/// second scope implementation or silently accepting ambient economics.
+pub(crate) fn install_research_replay_execution_scope(
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+) -> Result<crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionScopeV3> {
+    crate::canonical_trendbar_research::install_canonical_trendbar_research_execution_v3(contract)
+}
+
+/// Refuse to price saved candidates under a reconstructed configuration whose
+/// replay-relevant fields differ from the archived sealed Search policy.
+///
+/// The legacy resolved-config stamp and the full Search config hash are
+/// different hash domains, so equality of the two proves nothing. The sealed
+/// policy carries the ACTUAL stage-1 evaluation (initial equity, risk bands,
+/// exit geometry, kill zones, swaps, conversion fee, pip value, session spread,
+/// SMC weights, growth objective). This guard compares exactly those fields and
+/// only leaves the cost envelope to the caller's explicit variants.
+fn ensure_research_config_matches_sealed_evaluation(
+    config: &DiscoveryConfig,
+    price_hint: Option<f64>,
+    final_gate: f64,
+    sealed: &EvaluationConfig,
+) -> Result<()> {
+    let rebuilt = config.evaluation_config_with_smc_gate(price_hint, final_gate);
+    let mismatch = |field: &str, rebuilt: String, sealed: String| -> Result<()> {
+        anyhow::bail!(
+            "reconstructed discovery config field {field} = {rebuilt} differs from the sealed Search policy = {sealed}; refusing to price saved candidates under a configuration that is not the original run"
+        )
+    };
+    if rebuilt.symbol != sealed.symbol {
+        return mismatch("symbol", rebuilt.symbol.clone(), sealed.symbol.clone());
+    }
+    if rebuilt.account_currency != sealed.account_currency {
+        return mismatch(
+            "account_currency",
+            rebuilt.account_currency.clone(),
+            sealed.account_currency.clone(),
+        );
+    }
+    let floats = [
+        ("initial_equity", rebuilt.initial_equity, sealed.initial_equity),
+        ("trailing_atr_multiplier", rebuilt.trailing_atr_multiplier, sealed.trailing_atr_multiplier),
+        ("trailing_be_trigger_r", rebuilt.trailing_be_trigger_r, sealed.trailing_be_trigger_r),
+        ("trailing_min_lock_pips", rebuilt.trailing_min_lock_pips, sealed.trailing_min_lock_pips),
+        ("pip_value", rebuilt.pip_value, sealed.pip_value),
+        ("spread_pips", rebuilt.spread_pips, sealed.spread_pips),
+        ("commission_per_trade", rebuilt.commission_per_trade, sealed.commission_per_trade),
+        ("pip_value_per_lot", rebuilt.pip_value_per_lot, sealed.pip_value_per_lot),
+        ("swap_long_pips_per_day", rebuilt.swap_long_pips_per_day, sealed.swap_long_pips_per_day),
+        ("swap_short_pips_per_day", rebuilt.swap_short_pips_per_day, sealed.swap_short_pips_per_day),
+        ("pnl_conversion_fee_rate", rebuilt.pnl_conversion_fee_rate, sealed.pnl_conversion_fee_rate),
+        ("risk_per_trade_min", rebuilt.risk_per_trade_min, sealed.risk_per_trade_min),
+        ("risk_per_trade_max", rebuilt.risk_per_trade_max, sealed.risk_per_trade_max),
+        ("high_quality_confidence", rebuilt.high_quality_confidence, sealed.high_quality_confidence),
+        ("smc_weight_ob", rebuilt.smc_weight_ob, sealed.smc_weight_ob),
+        ("smc_weight_fvg", rebuilt.smc_weight_fvg, sealed.smc_weight_fvg),
+        ("smc_weight_liq", rebuilt.smc_weight_liq, sealed.smc_weight_liq),
+        ("smc_weight_mtf", rebuilt.smc_weight_mtf, sealed.smc_weight_mtf),
+        ("smc_weight_premium", rebuilt.smc_weight_premium, sealed.smc_weight_premium),
+        ("smc_weight_inducement", rebuilt.smc_weight_inducement, sealed.smc_weight_inducement),
+        ("smc_weight_bos", rebuilt.smc_weight_bos, sealed.smc_weight_bos),
+        ("smc_weight_choch", rebuilt.smc_weight_choch, sealed.smc_weight_choch),
+        ("smc_weight_eqh", rebuilt.smc_weight_eqh, sealed.smc_weight_eqh),
+        ("smc_weight_eql", rebuilt.smc_weight_eql, sealed.smc_weight_eql),
+        ("smc_weight_displacement", rebuilt.smc_weight_displacement, sealed.smc_weight_displacement),
+    ];
+    for (field, rebuilt, sealed) in floats {
+        let scale = rebuilt.abs().max(sealed.abs()).max(1.0);
+        if !(rebuilt.is_finite() && sealed.is_finite())
+            || (rebuilt - sealed).abs() > 1e-9 * scale
+        {
+            return mismatch(field, format!("{rebuilt}"), format!("{sealed}"));
+        }
+    }
+    if rebuilt.max_hold_bars != sealed.max_hold_bars
+        || rebuilt.trailing_enabled != sealed.trailing_enabled
+        || rebuilt.kill_zones_enabled != sealed.kill_zones_enabled
+        || rebuilt.growth_objective != sealed.growth_objective
+    {
+        return mismatch(
+            "replay flags",
+            format!(
+                "max_hold_bars={} trailing_enabled={} kill_zones_enabled={} growth_objective={}",
+                rebuilt.max_hold_bars, rebuilt.trailing_enabled, rebuilt.kill_zones_enabled, rebuilt.growth_objective
+            ),
+            format!(
+                "max_hold_bars={} trailing_enabled={} kill_zones_enabled={} growth_objective={}",
+                sealed.max_hold_bars, sealed.trailing_enabled, sealed.kill_zones_enabled, sealed.growth_objective
+            ),
+        );
+    }
+    if rebuilt.session_spread_pips != sealed.session_spread_pips {
+        return mismatch(
+            "session_spread_pips",
+            format!("{:?}", rebuilt.session_spread_pips),
+            format!("{:?}", sealed.session_spread_pips),
+        );
+    }
+    let rebuilt_goal = serde_json::to_string(&rebuilt.growth_goal).unwrap_or_default();
+    let sealed_goal = serde_json::to_string(&sealed.growth_goal).unwrap_or_default();
+    if rebuilt_goal != sealed_goal {
+        return mismatch("growth_goal", rebuilt_goal, sealed_goal);
+    }
+    Ok(())
 }
 /// Replay each portfolio gene on a held-out tail window and produce one
 /// ForwardTestValidationArtifactFile per strategy. The caller passes

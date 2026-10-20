@@ -529,3 +529,79 @@ fn active_research_costs_worker() {
     }
     assert_eq!(contract.identity_sha256().unwrap(), identity);
 }
+
+fn eur_account_research_contract() -> CanonicalTrendbarResearchExecutionContractV3 {
+    let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+    let anchor = features.provenance().bindings()[0].dataset_identity();
+    let receipt = CanonicalSearchInputReceiptV2::from_feature_frame(anchor, &features)
+        .expect("receipt for the EUR sealed-basis fixture");
+    CanonicalTrendbarResearchExecutionContractV3::new(
+        receipt,
+        CanonicalTrendbarResearchCostAssumptionsV2 {
+            symbol: "EURUSD",
+            account_currency: "EUR",
+            assumption_source_id: "neoethos.test.eur-sealed-basis.v1",
+            assumption_source_sha256: &"b".repeat(64),
+            pip_size: 0.0001,
+            // 10 USD quote pip value per lot converted at the sealed D1 basis.
+            pip_value_per_lot: 10.0 / 1.16268,
+            full_spread_pips_assumption: 1.5,
+            slippage_pips_per_fill_assumption: 0.5,
+            commission_account_per_lot_per_fill_assumption: 4.5,
+            swap_long_pips_per_day: -2.445,
+            swap_short_pips_per_day: -0.105,
+            pnl_conversion_fee_rate: 0.0,
+        },
+    )
+    .expect("explicit research-only EUR cost assumptions")
+}
+
+#[test]
+fn research_replay_scope_pins_eur_contract_basis_and_clears_on_drop() {
+    let contract = eur_account_research_contract();
+    let sealed_pip_value = 10.0 / 1.16268;
+    let mut config = DiscoveryConfig::default();
+    config.evaluation_symbol = "EURUSD".to_owned();
+    config.evaluation_account_currency = "EUR".to_owned();
+    config.evaluation_spread_pips = 0.1;
+    config.evaluation_commission_per_trade = 0.0;
+    // Ambient resolution uses this deliberately different price hint.
+    let ambient_hint = Some(1.10);
+    let ambient = config.evaluation_config_with_smc_gate(ambient_hint, 0.5);
+    assert!(
+        (ambient.pip_value_per_lot - sealed_pip_value).abs() > 1e-6,
+        "the ambient EUR pip basis must differ from the sealed contract basis"
+    );
+    assert!(crate::historical_evaluation_authority::active_research_contract_v1().is_none());
+    {
+        let _scope = crate::discovery::install_research_replay_execution_scope(&contract)
+            .expect("install the saved research execution scope");
+        assert!(
+            crate::historical_evaluation_authority::active_research_contract_v1().is_some(),
+            "the installed scope must be visible to the evaluation path"
+        );
+        let pinned = config.evaluation_config_with_smc_gate(ambient_hint, 0.5);
+        assert!(
+            (pinned.pip_value_per_lot - sealed_pip_value).abs() < 1e-12,
+            "the sealed contract pip basis must replace the ambient basis: {} vs {}",
+            pinned.pip_value_per_lot,
+            sealed_pip_value
+        );
+        assert!(
+            (pinned.spread_pips - contract.screening_spread_and_slippage_round_trip_pips()).abs()
+                < 1e-12,
+            "the contract round-trip spread must replace the ambient scalar"
+        );
+        assert!(
+            (pinned.commission_per_trade - contract.round_trip_commission_account_per_lot()).abs()
+                < 1e-12,
+            "the contract round-trip commission must replace the ambient scalar"
+        );
+        assert_eq!(pinned.symbol, "EURUSD");
+        assert_eq!(pinned.account_currency, "EUR");
+    }
+    assert!(
+        crate::historical_evaluation_authority::active_research_contract_v1().is_none(),
+        "the RAII scope must be dropped at the end of the diagnostic replay"
+    );
+}
