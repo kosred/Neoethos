@@ -6262,6 +6262,86 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
             .collect()
     }
 
+    /// Research-only numerical evaluation of this locked portfolio on the
+    /// provided slice. Deliberately NOT an artifact file: it carries no scope
+    /// authority and cannot enter promotion or live validation.
+    ///
+    /// 2026-10-20: the reserved final holdout stays reserved for quote replay,
+    /// but the operator needs a clearly-labelled numerical OOS report that is
+    /// not admissible for promotion. This produces exactly that: one forward
+    /// summary and one FTMO-rule summary per strategy under the run's own
+    /// screening cost assumptions and sealed signal policy.
+    fn research_only_oos_document(
+        &self,
+        prop_firm_rules: PropFirmRiskRules,
+    ) -> Result<serde_json::Value> {
+        let (months, days) = month_day_indices(self.timestamps);
+        let mut strategies = Vec::with_capacity(self.portfolio.len());
+        for ((gene, signals), confidences) in self
+            .portfolio
+            .iter()
+            .zip(self.ordered_signals.iter())
+            .zip(self.ordered_confidences.iter())
+        {
+            let settings = self.settings.settings_for_gene(gene);
+            let summary = compute_forward_test_summary(ForwardTestInput {
+                close: &self.ohlcv.close,
+                high: &self.ohlcv.high,
+                low: &self.ohlcv.low,
+                signals,
+                confidences,
+                months: &months,
+                days: &days,
+                timestamps: self.timestamps,
+                settings: &settings,
+            })?;
+            let trades = simulate_trades_with_confidence_core(
+                &self.ohlcv.close,
+                &self.ohlcv.high,
+                &self.ohlcv.low,
+                self.timestamps,
+                signals,
+                confidences,
+                &settings,
+            )?;
+            let prop_firm = compute_prop_firm_risk_summary(PropFirmRiskInput {
+                trades: &trades,
+                initial_balance: self.settings.config.initial_balance,
+                rules: prop_firm_rules,
+            });
+            strategies.push(serde_json::json!({
+                "strategy_id": gene.strategy_id,
+                "exact_gene_hash": crate::artifact_io::stable_json_hash(gene)?,
+                "forward_test": {
+                    "bars": summary.bars,
+                    "span_days": summary.span_days,
+                    "net_profit": summary.metrics.net_profit,
+                    "sharpe": summary.metrics.sharpe,
+                    "max_drawdown": summary.metrics.max_drawdown,
+                    "win_rate": summary.metrics.win_rate,
+                    "profit_factor": summary.metrics.profit_factor,
+                    "expectancy": summary.metrics.expectancy,
+                    "trade_count": summary.metrics.trade_count,
+                },
+                "prop_firm_rules": prop_firm,
+            }));
+        }
+        let window = serde_json::to_value(self.holdout_scope.evaluated_window())?;
+        Ok(serde_json::json!({
+            "schema": "neoethos.research-only.oos-evaluation.v1",
+            "artifact_class": "ResearchOnly",
+            "promotion_eligibility": "NotPromotionEligible",
+            "authorization_issued": false,
+            "warning": "Numerical evaluation on the reserved final holdout using the run's screening cost assumptions and sealed signal policy. It is NOT broker-quote validated and is not admissible for promotion or live trading.",
+            "search_config_hash": self.search_config_hash,
+            "holdout_scope": {
+                "receipt_sha256": self.holdout_scope.receipt_sha256(),
+                "evaluated_window": window,
+            },
+            "strategies": strategies,
+        }))
+    }
+
     fn prop_firm_artifacts(
         &self,
         rules: PropFirmRiskRules,
@@ -7566,6 +7646,68 @@ where
         contract.clone(),
         result,
     )
+}
+
+/// Canonical CPU research plus an explicitly requested research-only numerical
+/// evaluation of the reserved final holdout.
+///
+/// This is the defensive out-of-sample posture: the live export gate (PBO,
+/// quote-validated evidence) is untouched. The produced document is labelled
+/// ResearchOnly / NotPromotionEligible and exists only so an operator can see
+/// how the locked portfolio behaved on the tail that selection never saw. It
+/// must never be fed back into Search or used for promotion/live sizing.
+pub fn run_canonical_trendbar_research_discovery_with_holdout_and_research_oos_v3<F>(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    prop_firm_rules: PropFirmRiskRules,
+    oos_eval_out: &std::path::Path,
+    progress_fn: F,
+) -> Result<crate::canonical_trendbar_research::CanonicalTrendbarResearchDiscoveryResultV3>
+where
+    F: FnMut(DiscoveryProgress),
+{
+    let research = run_canonical_trendbar_research_discovery_with_holdout_and_progress(
+        input,
+        config,
+        contract,
+        prop_firm_rules,
+        progress_fn,
+    )?;
+    let result = research.discovery_result();
+    if !result.portfolio.is_empty() {
+        let mut research_config = config.clone();
+        apply_research_contract_to_discovery_config(&mut research_config, contract);
+        let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+        let holdout = inputs
+            .holdout()
+            .expect("with_holdout always constructs a held-out evidence suffix");
+        let holdout_scope = result
+            .holdout_scope()?
+            .ok_or_else(|| anyhow::anyhow!("research-only OOS lost its holdout scope"))?
+            .clone();
+        let sealed_policy = result
+            .funnel_profile
+            .as_ref()
+            .and_then(|funnel| funnel.live_trading_policy_v1())
+            .ok_or_else(|| {
+                anyhow::anyhow!("research-only OOS lost its sealed Search signal policy")
+            })?;
+        let prepared = PreparedLockedHoldoutResearch::new_with_policy(
+            &result.portfolio,
+            &result.effective_feature_names,
+            holdout.features(),
+            holdout.ohlcv(),
+            &holdout_scope,
+            &result.search_config_hash,
+            &research_config,
+            result.effective_smc_gate_threshold,
+            Some(sealed_policy),
+        )?;
+        let document = prepared.research_only_oos_document(prop_firm_rules)?;
+        write_json_atomic(oos_eval_out, &document)?;
+    }
+    Ok(research)
 }
 
 /// Explicit canonical CPU research plus the prelocked quote/economics

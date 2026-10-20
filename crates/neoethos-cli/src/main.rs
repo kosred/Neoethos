@@ -2646,6 +2646,20 @@ fn cmd_discover_on_budgeted_pool(
                         }
                         return Ok(research);
                     }
+                    // Explicit research-only outer-holdout evaluation. The
+                    // live export gate is untouched: the document is labelled
+                    // ResearchOnly / NotPromotionEligible and cannot feed back
+                    // into Search, promotion or live sizing.
+                    if let Some(oos_eval_out) = parse_flag(args, "--research-oos-eval-out") {
+                        return neoethos_search::discovery::run_canonical_trendbar_research_discovery_with_holdout_and_research_oos_v3(
+                            &run_input,
+                            &research_config,
+                            &contract,
+                            neoethos_search::PropFirmRiskRules::default(),
+                            std::path::Path::new(&oos_eval_out),
+                            emit_cpu_research_progress,
+                        );
+                    }
                     neoethos_search::run_canonical_trendbar_research_discovery_with_holdout_and_progress(
                         &run_input,
                         &research_config,
@@ -5166,7 +5180,7 @@ fn print_help() {
         "  canonical-cost-build --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --basis-timeframe D1 --broker-symbol-contract <json> --settings-source <yaml> --out <json>"
     );
     println!(
-        "  canonical-research --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --broker-symbol-contract <json> --broker-account-snapshot <account-snapshot.json> --settings-source <yaml> --symbol EURUSD --base-timeframe H4 --out-dir <new-dir> [--higher D1] [--population 64] [--generations 16] [--max-batches 2]"
+        "  canonical-research --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --broker-symbol-contract <json> --broker-account-snapshot <account-snapshot.json> --settings-source <yaml> --symbol EURUSD --base-timeframe H4 --out-dir <new-dir> [--higher D1] [--population 64] [--generations 16] [--max-batches 2] [--research-oos-eval <json>]"
     );
     println!(
         "    saved quote replay: --quote-replay-bundle <json> --quote-replay-sha256 <sha> --quote-replay-store <dir> --max-batches 1"

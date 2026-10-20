@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 12] = [
+const OPTIONAL: [&str; 13] = [
     "--higher",
     "--population",
     "--generations",
@@ -42,6 +42,7 @@ const OPTIONAL: [&str; 12] = [
     "--quote-replay-store",
     "--resume-research",
     "--resume-research-sha256",
+    "--research-oos-eval",
 ];
 
 const RESUME_FLAGS: [&str; 2] = ["--resume-research", "--resume-research-sha256"];
@@ -462,6 +463,12 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
         if let Some(value) = args.0.get(flag) {
             push(&mut discovery_args, flag, value);
         }
+    }
+    // Research-only outer-holdout evaluation: the CLI keeps the operator-facing
+    // spelling, the discovery layer receives an explicit output path. This is
+    // NOT a promotion artifact and never feeds back into Search.
+    if let Some(path) = args.0.get("--research-oos-eval") {
+        push(&mut discovery_args, "--research-oos-eval-out", path);
     }
     neoethos_core::storage::json::write_json_atomic(
         output.join("discovery-arguments.json"),

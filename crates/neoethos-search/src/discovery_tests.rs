@@ -2436,6 +2436,52 @@ fn compute_discovery_forward_test_artifacts_produces_one_artifact_per_strategy()
 }
 
 #[test]
+fn research_only_oos_document_is_labelled_and_carries_one_entry_per_strategy() {
+    let mut config = DiscoveryConfig::default();
+    config.runtime_overrides.prefilter_top_k = 0;
+    let portfolio = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
+    let (_, _, holdout_scope, features, ohlcv) = sample_split_search_values();
+    let threshold = config.evaluation_config(None).smc_gate_threshold;
+    let prepared = PreparedLockedHoldoutResearch::new(
+        &portfolio,
+        &features.names,
+        &features,
+        &ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &config,
+        threshold,
+    )
+    .expect("prepared research-only OOS evaluation");
+    let document = prepared
+        .research_only_oos_document(PropFirmRiskRules::default())
+        .expect("research-only OOS document");
+    assert_eq!(document["schema"], "neoethos.research-only.oos-evaluation.v1");
+    assert_eq!(document["artifact_class"], "ResearchOnly");
+    assert_eq!(document["promotion_eligibility"], "NotPromotionEligible");
+    assert_eq!(document["authorization_issued"], false);
+    assert!(
+        document["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("NOT broker-quote validated"))
+    );
+    assert!(document["holdout_scope"]["receipt_sha256"].as_str().is_some());
+    let strategies = document["strategies"]
+        .as_array()
+        .expect("strategies array");
+    assert_eq!(strategies.len(), portfolio.len());
+    for strategy in strategies {
+        assert!(
+            strategy["exact_gene_hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty())
+        );
+        assert!(strategy["forward_test"]["bars"].as_u64().unwrap_or(0) > 0);
+        assert!(strategy["prop_firm_rules"]["all_rules_passed"].is_boolean());
+    }
+}
+
+#[test]
 fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
     let dir = temp_dir("forward-test-validations");
     let config = DiscoveryConfig::default();
