@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn scoring_version_is_six_after_run_bound_goal_pace_objective() {
+    fn scoring_version_is_seven_after_prop_firm_sample_confidence_revision() {
         // 2026-06-06: 2→3 — CONSISTENT-monthly-return GA (dominant reward =
         // monthly_target_hit_rate in metrics[7]; total-net demoted).
         // 2026-07-02: 3→4 — STEADY-INCOME worst-period penalty: ga_fitness now
@@ -146,6 +146,9 @@ mod tests {
         // ga_fitness_growth (Kelly log-growth) objective instead of the
         // prop-firm consistency formula. Artifacts from earlier versions are
         // tagged and NOT directly comparable.
-        assert_eq!(SCORING_VERSION_CURRENT.0, 6);
+        // 2026-10-20: 6→7 — PropFirm/Strict ga_fitness scales its per-trade
+        // quality contributions by `trades_confidence` (sample-confidence-v7),
+        // so one-trade lottery genomes no longer outrank active strategies.
+        assert_eq!(SCORING_VERSION_CURRENT.0, 7);
     }
 }
