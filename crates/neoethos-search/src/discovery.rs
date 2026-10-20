@@ -6390,8 +6390,226 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
     }
 }
 
+/// One cost envelope for the research-only saved-candidate cost diagnostic.
+#[derive(Debug, Clone)]
+pub struct CandidateCostVariantV1 {
+    /// Stable label recorded on every row (e.g. old_unverified / broker_0_5).
+    pub label: String,
+    /// Round-trip spread plus two fills of slippage, in pips. Applied once
+    /// per simulated trade through the simulator spread channel.
+    pub round_trip_cost_pips: f64,
+    /// Round-trip commission per lot. Applied once per simulated trade.
+    pub round_trip_commission_per_lot: f64,
+}
+
+/// One row of the research-only saved-candidate cost diagnostic.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateCostDiagnosticRowV1 {
+    pub variant: String,
+    pub strategy_id: String,
+    pub exact_gene_hash: String,
+    pub simulated_trades: usize,
+    pub trades_per_month: f64,
+    pub win_rate: f64,
+    pub profit_factor: f64,
+    pub net_profit_account: f64,
+    pub expectancy_account: f64,
+    pub span_days: f64,
+}
+
+fn candidate_cost_rows(
+    gene: &Gene,
+    trades: &[crate::quality::Trade],
+    span_days: f64,
+    variant_label: &str,
+) -> Result<CandidateCostDiagnosticRowV1> {
+    let net_profit: f64 = trades.iter().map(|trade| trade.pnl).sum();
+    let wins = trades.iter().filter(|trade| trade.pnl > 0.0).count();
+    let gross_profit: f64 = trades.iter().filter(|trade| trade.pnl > 0.0).map(|t| t.pnl).sum();
+    let gross_loss: f64 = trades.iter().filter(|trade| trade.pnl < 0.0).map(|t| -t.pnl).sum();
+    let profit_factor = if gross_loss > 0.0 {
+        gross_profit / gross_loss
+    } else if gross_profit > 0.0 {
+        10.0
+    } else {
+        0.0
+    };
+    let win_rate = if trades.is_empty() {
+        0.0
+    } else {
+        wins as f64 / trades.len() as f64
+    };
+    let expectancy = if trades.is_empty() {
+        0.0
+    } else {
+        net_profit / trades.len() as f64
+    };
+    let months = span_days / 30.4375;
+    let trades_per_month = if months > 0.0 {
+        trades.len() as f64 / months
+    } else {
+        0.0
+    };
+    Ok(CandidateCostDiagnosticRowV1 {
+        variant: variant_label.to_owned(),
+        strategy_id: gene.strategy_id.clone(),
+        exact_gene_hash: crate::artifact_io::stable_json_hash(gene)?,
+        simulated_trades: trades.len(),
+        trades_per_month,
+        win_rate,
+        profit_factor,
+        net_profit_account: net_profit,
+        expectancy_account: expectancy,
+        span_days,
+    })
+}
+
+fn simulate_gene_under_cost_variant(
+    gene: &Gene,
+    signals: &[i8],
+    confidences: &[f64],
+    ohlcv: &Ohlcv,
+    timestamps: &[i64],
+    base_settings: &crate::eval::BacktestSettings,
+    variant: &CandidateCostVariantV1,
+) -> Result<Vec<crate::quality::Trade>> {
+    anyhow::ensure!(
+        variant.round_trip_cost_pips.is_finite() && variant.round_trip_cost_pips >= 0.0,
+        "candidate-cost variant '{}' has an invalid round-trip cost",
+        variant.label
+    );
+    anyhow::ensure!(
+        variant.round_trip_commission_per_lot.is_finite()
+            && variant.round_trip_commission_per_lot >= 0.0,
+        "candidate-cost variant '{}' has an invalid round-trip commission",
+        variant.label
+    );
+    let mut settings = base_settings.clone();
+    settings.spread_pips = variant.round_trip_cost_pips;
+    settings.session_spread_profile = None;
+    settings.commission_per_trade = variant.round_trip_commission_per_lot;
+    let _ = gene;
+    simulate_trades_with_confidence_core(
+        &ohlcv.close,
+        &ohlcv.high,
+        &ohlcv.low,
+        timestamps,
+        signals,
+        confidences,
+        &settings,
+    )
+}
+
+/// Research-only cost sensitivity for SAVED discovery candidates.
+///
+/// Re-evaluates an explicit candidate list (e.g. loaded from a saved
+/// research.json) on the exact receipt-bound selection frame of this input,
+/// under one or more cost envelopes. It does not run Search, does not touch
+/// the reserved final holdout, produces no artifacts/receipts and grants no
+/// authority: callers persist the returned rows as ResearchOnly.
+///
+/// Candidate gene indices are interpreted ONLY against
+/// research.discovery_result().effective_feature_names, projected by exact
+/// name (never against a differently ordered fresh prefilter). The frame must
+/// contain every saved feature name; a missing name fails loud instead of
+/// silently reinterpreting an index.
+pub fn diagnose_research_candidates_under_cost_variants_v3(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    candidates: &[Gene],
+    variants: &[CandidateCostVariantV1],
+) -> Result<Vec<CandidateCostDiagnosticRowV1>> {
+    research.validate()?;
+    research.execution_contract().validate_against_input(input)?;
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "candidate cost diagnostic requires at least one saved candidate"
+    );
+    anyhow::ensure!(
+        !variants.is_empty(),
+        "candidate cost diagnostic requires at least one cost variant"
+    );
+    let result = research.discovery_result();
+    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let selection = inputs.selection();
+    anyhow::ensure!(
+        &result.selection_scope == selection.scope(),
+        "saved research selection window differs from the reopened canonical input"
+    );
+    let policy = result
+        .funnel_profile
+        .as_ref()
+        .and_then(|funnel| funnel.live_trading_policy_v1())
+        .ok_or_else(|| anyhow::anyhow!("saved research lost its sealed Search signal policy"))?;
+    let (evaluation, bypass) = locked_holdout_evaluation(
+        config,
+        selection.ohlcv().close.last().copied(),
+        result.effective_smc_gate_threshold,
+        Some(policy),
+    )?;
+    let projected =
+        project_locked_holdout_features(selection.features(), &result.effective_feature_names)?;
+    for gene in candidates {
+        if let Some(index) = gene.indices.iter().copied().max() {
+            anyhow::ensure!(
+                (index as usize) < projected.names.len(),
+                "saved candidate '{}' references feature index {} beyond the {} saved effective features",
+                gene.strategy_id,
+                index,
+                projected.names.len()
+            );
+        }
+    }
+    let (signals, confidences) = locked_holdout_signals_and_confidences_with_policy(
+        candidates,
+        &projected,
+        selection.ohlcv(),
+        &evaluation,
+        bypass,
+    )?;
+    let resolver = GeneEvalSettingsResolver::for_slice(
+        config,
+        candidates.iter(),
+        &selection.ohlcv().high,
+        &selection.ohlcv().low,
+        &selection.ohlcv().close,
+    )?;
+    let timestamps = projected.timestamps.as_slice();
+    let span_days = if timestamps.len() >= 2 {
+        let delta = timestamps[timestamps.len() - 1] - timestamps[0];
+        if delta > 0 {
+            delta as f64 / 86_400_000.0
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    let mut rows = Vec::with_capacity(candidates.len() * variants.len());
+    for (gene, (gene_signals, gene_confidences)) in candidates
+        .iter()
+        .zip(signals.iter().zip(confidences.iter()))
+    {
+        let base_settings = resolver.settings_for_gene(gene);
+        for variant in variants {
+            let trades = simulate_gene_under_cost_variant(
+                gene,
+                gene_signals,
+                gene_confidences,
+                selection.ohlcv(),
+                timestamps,
+                &base_settings,
+                variant,
+            )?;
+            rows.push(candidate_cost_rows(gene, &trades, span_days, &variant.label)?);
+        }
+    }
+    Ok(rows)
+}
+
 /// Replay each portfolio gene on a held-out tail window and produce one
-/// [`ForwardTestValidationArtifactFile`] per strategy. The caller passes
+/// ForwardTestValidationArtifactFile per strategy. The caller passes
 /// the *raw* tail (with the same `feature_names` ordering it had before
 /// discovery) and `effective_feature_names` produced by discovery; the
 /// helper aligns the tail's columns to the post-prefilter set so the

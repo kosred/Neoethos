@@ -2436,6 +2436,87 @@ fn compute_discovery_forward_test_artifacts_produces_one_artifact_per_strategy()
 }
 
 #[test]
+fn candidate_cost_variant_diagnostic_prices_the_same_signals_at_different_costs() {
+    let mut config = DiscoveryConfig::default();
+    // Default() deliberately carries NaN cost sentinels; this fixture measures
+    // cost sensitivity, so resolve them to a finite baseline first.
+    config.evaluation_spread_pips = 0.0;
+    config.evaluation_commission_per_trade = 0.0;
+    config.evaluation_symbol = "EURUSD".to_owned();
+    config.evaluation_account_currency = "USD".to_owned();
+    let gene = profitable_gene("cost-diagnostic-alpha");
+    let ohlcv = sample_ohlcv();
+    let timestamps = ohlcv
+        .timestamp
+        .as_deref()
+        .expect("fixture timestamps must be present");
+    let signals: Vec<i8> = (0..timestamps.len())
+        .map(|index| if index % 2 == 0 { 1 } else { -1 })
+        .collect();
+    let confidences = vec![0.9_f64; timestamps.len()];
+    let resolver = GeneEvalSettingsResolver::for_slice(
+        &config,
+        std::iter::once(&gene),
+        &ohlcv.high,
+        &ohlcv.low,
+        &ohlcv.close,
+    )
+    .expect("settings resolver for the diagnostic fixture");
+    let mut settings = resolver.settings_for_gene(&gene);
+    // The 100-bar fixture barely moves; force bracket exits so the cost
+    // difference is measured on actual closed trades instead of open positions.
+    settings.max_hold_bars = 5;
+    settings.sl_pips = 0.2;
+    settings.tp_pips = 0.4;
+    let old_cost = CandidateCostVariantV1 {
+        label: "old_unverified".to_owned(),
+        round_trip_cost_pips: 2.5,
+        round_trip_commission_per_lot: 9.0,
+    };
+    let broker_cost = CandidateCostVariantV1 {
+        label: "broker_verified".to_owned(),
+        round_trip_cost_pips: 0.9,
+        round_trip_commission_per_lot: 9.0,
+    };
+    let old_trades = simulate_gene_under_cost_variant(
+        &gene,
+        &signals,
+        &confidences,
+        &ohlcv,
+        timestamps,
+        &settings,
+        &old_cost,
+    )
+    .expect("old-cost simulation");
+    let broker_trades = simulate_gene_under_cost_variant(
+        &gene,
+        &signals,
+        &confidences,
+        &ohlcv,
+        timestamps,
+        &settings,
+        &broker_cost,
+    )
+    .expect("broker-cost simulation");
+    assert!(
+        !old_trades.is_empty(),
+        "the alternating-signal fixture must produce trades"
+    );
+    let old_net: f64 = old_trades.iter().map(|trade| trade.pnl).sum();
+    let broker_net: f64 = broker_trades.iter().map(|trade| trade.pnl).sum();
+    assert!(
+        broker_net > old_net,
+        "lower verified costs must improve net PnL: old {old_net}, broker {broker_net}"
+    );
+    let row =
+        candidate_cost_rows(&gene, &broker_trades, 30.0, "broker_verified").expect("diagnostic row");
+    assert_eq!(row.variant, "broker_verified");
+    assert_eq!(row.strategy_id, gene.strategy_id);
+    assert!(row.exact_gene_hash.starts_with("fnv64:"));
+    assert!(row.trades_per_month > 0.0);
+}
+
+#[test]
 fn research_only_oos_document_is_labelled_and_carries_one_entry_per_strategy() {
     let mut config = DiscoveryConfig::default();
     config.runtime_overrides.prefilter_top_k = 0;
