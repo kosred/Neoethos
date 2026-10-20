@@ -6058,3 +6058,98 @@ fn the_kill_zone_switch_reaches_the_discovery_backtest() {
         "two runs under opposite weekend policies must not hash identically"
     );
 }
+
+/// The prop-firm gate's zero pass-rate is only actionable if each failing
+/// window is attributed to the rule that denied it. This test pins that
+/// accounting: which rule is counted, that windows with no trades are counted
+/// separately, and that merge() keeps the extremes while summing the rest.
+fn prop_firm_test_summary(
+    net_return_pct: f64,
+    daily_loss_breach: bool,
+    overall_drawdown_breach: bool,
+    consistency_violation: bool,
+    trade_limit_violation: bool,
+    min_trading_days_ok: bool,
+    profit_target_met: bool,
+) -> PropFirmRiskValidationSummary {
+    let all_rules_passed = !daily_loss_breach
+        && !overall_drawdown_breach
+        && !consistency_violation
+        && !trade_limit_violation
+        && min_trading_days_ok
+        && profit_target_met;
+    PropFirmRiskValidationSummary {
+        rules: PropFirmRiskRules::default(),
+        trades_observed: 1,
+        trading_days_observed: if min_trading_days_ok { 4 } else { 1 },
+        max_daily_loss_pct_observed: 0.0,
+        max_overall_drawdown_pct_observed: 0.0,
+        largest_profit_share_observed: 0.0,
+        max_trades_per_day_observed: 0,
+        net_return_pct,
+        daily_loss_breach,
+        overall_drawdown_breach,
+        consistency_violation,
+        trade_limit_violation,
+        min_trading_days_ok,
+        profit_target_met,
+        all_rules_passed,
+    }
+}
+
+#[test]
+fn prop_firm_window_diagnostics_attribute_each_rule() {
+    let mut diag = PropFirmWindowDiagnostics::default();
+    // 1) passes every rule.
+    diag.record(
+        &prop_firm_test_summary(0.10, false, false, false, false, true, true),
+        5,
+    );
+    // 2) target not reached, everything else fine.
+    diag.record(
+        &prop_firm_test_summary(0.02, false, false, false, false, true, false),
+        3,
+    );
+    // 3) consistency + minimum-trading-days violation, no trades in the window.
+    diag.record(
+        &prop_firm_test_summary(-0.05, false, false, true, false, false, false),
+        0,
+    );
+    // 4) daily loss breach.
+    diag.record(
+        &prop_firm_test_summary(-0.09, true, false, false, false, true, false),
+        7,
+    );
+    assert_eq!(diag.windows, 4);
+    assert_eq!(diag.passed, 1);
+    assert_eq!(diag.no_trade_windows, 1);
+    assert_eq!(diag.daily_loss_breaches, 1);
+    assert_eq!(diag.overall_drawdown_breaches, 0);
+    assert_eq!(diag.consistency_violations, 1);
+    assert_eq!(diag.trade_limit_violations, 0);
+    assert_eq!(diag.min_trading_days_failures, 1);
+    assert_eq!(diag.profit_target_failures, 3);
+    assert_eq!(diag.total_trades, 15);
+    assert_eq!(diag.total_trading_days, 13);
+    assert!((diag.best_net_return_pct - 0.10).abs() < 1e-12);
+    assert!((diag.worst_net_return_pct + 0.09).abs() < 1e-12);
+
+    // Merging into an EMPTY aggregate must adopt the other side's extremes
+    // (a plain min/max would leave the +inf/-inf sentinel in place).
+    let mut other = PropFirmWindowDiagnostics::default();
+    other.record(
+        &prop_firm_test_summary(0.20, false, false, false, false, true, true),
+        2,
+    );
+    let mut empty = PropFirmWindowDiagnostics::default();
+    empty.merge(&other);
+    assert_eq!(empty.windows, 1);
+    assert!((empty.best_net_return_pct - 0.20).abs() < 1e-12);
+    assert!((empty.worst_net_return_pct - 0.20).abs() < 1e-12);
+
+    diag.merge(&other);
+    assert_eq!(diag.windows, 5);
+    assert_eq!(diag.passed, 2);
+    assert!((diag.best_net_return_pct - 0.20).abs() < 1e-12);
+    assert!((diag.worst_net_return_pct + 0.09).abs() < 1e-12);
+}

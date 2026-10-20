@@ -19,7 +19,8 @@ use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use crate::validation::{
     CanonicalBacktestArtifactFile, CombinatorialPurgedCV, ForwardTestInput,
     ForwardTestValidationArtifactFile, PropFirmRiskInput, PropFirmRiskRules,
-    PropFirmRiskValidationArtifactFile, ValidationStrategyIdentityV2, WalkforwardSummary,
+    PropFirmRiskValidationArtifactFile, PropFirmRiskValidationSummary,
+    ValidationStrategyIdentityV2, WalkforwardSummary,
     WalkforwardValidationArtifactFile, compute_forward_test_summary,
     compute_prop_firm_risk_summary, write_canonical_backtest_artifact_atomic,
     write_forward_test_validation_artifact_atomic, write_prop_firm_risk_validation_artifact_atomic,
@@ -10302,9 +10303,101 @@ fn plan_prop_firm_windows(
     Ok(windows)
 }
 
+/// Window-level rule-failure accounting for the prop-firm gate.
+///
+/// The gate only reports a pass RATE. When that rate is zero the number alone
+/// cannot distinguish "the profit target is unreachable" from "the consistency
+/// rule rejects every window", and the two call for opposite responses. This
+/// diagnostic attributes each failing window to the rule that denied it, so a
+/// zero pass rate is measured instead of guessed. It changes no decision.
+#[derive(Debug, Default, Clone, Copy)]
+struct PropFirmWindowDiagnostics {
+    windows: usize,
+    no_trade_windows: usize,
+    passed: usize,
+    daily_loss_breaches: usize,
+    overall_drawdown_breaches: usize,
+    consistency_violations: usize,
+    trade_limit_violations: usize,
+    min_trading_days_failures: usize,
+    profit_target_failures: usize,
+    total_trades: usize,
+    total_trading_days: usize,
+    best_net_return_pct: f64,
+    worst_net_return_pct: f64,
+}
+
+impl PropFirmWindowDiagnostics {
+    fn record(&mut self, summary: &PropFirmRiskValidationSummary, trades: usize) {
+        self.windows += 1;
+        self.total_trades += trades;
+        self.total_trading_days += summary.trading_days_observed;
+        if trades == 0 {
+            self.no_trade_windows += 1;
+        }
+        if summary.net_return_pct.is_finite() {
+            if self.windows == 1 {
+                self.best_net_return_pct = summary.net_return_pct;
+                self.worst_net_return_pct = summary.net_return_pct;
+            } else {
+                self.best_net_return_pct = self.best_net_return_pct.max(summary.net_return_pct);
+                self.worst_net_return_pct = self.worst_net_return_pct.min(summary.net_return_pct);
+            }
+        }
+        if summary.all_rules_passed {
+            self.passed += 1;
+            return;
+        }
+        if summary.daily_loss_breach {
+            self.daily_loss_breaches += 1;
+        }
+        if summary.overall_drawdown_breach {
+            self.overall_drawdown_breaches += 1;
+        }
+        if summary.consistency_violation {
+            self.consistency_violations += 1;
+        }
+        if summary.trade_limit_violation {
+            self.trade_limit_violations += 1;
+        }
+        if !summary.min_trading_days_ok {
+            self.min_trading_days_failures += 1;
+        }
+        if !summary.profit_target_met {
+            self.profit_target_failures += 1;
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if other.windows == 0 {
+            return;
+        }
+        let seen_windows = self.windows;
+        self.windows += other.windows;
+        self.no_trade_windows += other.no_trade_windows;
+        self.passed += other.passed;
+        self.daily_loss_breaches += other.daily_loss_breaches;
+        self.overall_drawdown_breaches += other.overall_drawdown_breaches;
+        self.consistency_violations += other.consistency_violations;
+        self.trade_limit_violations += other.trade_limit_violations;
+        self.min_trading_days_failures += other.min_trading_days_failures;
+        self.profit_target_failures += other.profit_target_failures;
+        self.total_trades += other.total_trades;
+        self.total_trading_days += other.total_trading_days;
+        if seen_windows == 0 {
+            self.best_net_return_pct = other.best_net_return_pct;
+            self.worst_net_return_pct = other.worst_net_return_pct;
+        } else {
+            self.best_net_return_pct = self.best_net_return_pct.max(other.best_net_return_pct);
+            self.worst_net_return_pct = self.worst_net_return_pct.min(other.worst_net_return_pct);
+        }
+    }
+}
+
 /// Simulate the candidate on the pre-planned prop-firm windows and check each
 /// against `compute_prop_firm_risk_summary`. Returns the fraction of windows
-/// whose `all_rules_passed` flag is true.
+/// whose `all_rules_passed` flag is true, plus the rule-level failure counts
+/// that explain that fraction.
 ///
 /// This measures what an actual prop-firm challenge measures (one
 /// 30-day window, FTMO rules) — much more directly relevant than the
@@ -10322,7 +10415,7 @@ fn compute_prop_firm_pass_rate(
     overrides: &PropFirmGateOverrides,
     resolver: &GeneEvalSettingsResolver<'_>,
     windows: &[PropFirmWindow],
-) -> Result<(f64, usize)> {
+) -> Result<(f64, usize, PropFirmWindowDiagnostics)> {
     let rows = ohlcv.close.len();
     anyhow::ensure!(
         signals.len() == rows
@@ -10333,13 +10426,14 @@ fn compute_prop_firm_pass_rate(
         "prop-firm windows require exactly aligned OHLC, timestamps, signals and confidence"
     );
     if windows.is_empty() {
-        return Ok((0.0, 0));
+        return Ok((0.0, 0, PropFirmWindowDiagnostics::default()));
     }
     let mut settings = resolver.settings_for_gene(gene);
     let initial_balance = config.initial_account_balance()?.amount();
 
     let mut passes = 0usize;
     let mut counted = 0usize;
+    let mut diagnostics = PropFirmWindowDiagnostics::default();
     for (start_idx, end_idx, window_base) in windows {
         let (start_idx, end_idx) = (*start_idx, *end_idx);
         anyhow::ensure!(
@@ -10366,15 +10460,16 @@ fn compute_prop_firm_pass_rate(
             initial_balance,
             rules: overrides.rules,
         });
+        diagnostics.record(&summary, trades.len());
         if summary.all_rules_passed {
             passes += 1;
         }
         counted += 1;
     }
     if counted == 0 {
-        return Ok((0.0, 0));
+        return Ok((0.0, 0, diagnostics));
     }
-    Ok((passes as f64 / counted as f64, counted))
+    Ok((passes as f64 / counted as f64, counted, diagnostics))
 }
 
 /// AREA 2 / Stage A (2026-06-09) — serializes GPU launches across the
@@ -12495,7 +12590,7 @@ where
                         .expect("screened candidates have shared SMC"),
                     &sig,
                 )?;
-                let (rate, counted) = compute_prop_firm_pass_rate(
+                let (rate, counted, window_diagnostics) = compute_prop_firm_pass_rate(
                     &pair.1,
                     &sig,
                     &confidences,
@@ -12506,15 +12601,17 @@ where
                     &pf_resolver,
                     &pf_windows,
                 )?;
-                Ok((pair, rate, counted))
+                Ok((pair, rate, counted, window_diagnostics))
             })?;
         // Diagnostic: bucket what the gate did to each candidate.
         let mut dbg_counted_zero = 0usize;
         let mut dbg_below_pass_rate = 0usize;
         let mut dbg_counted_sum = 0usize;
         let mut dbg_max_rate: f64 = 0.0;
-        for (_, rate, counted) in &scored_all {
+        let mut rule_diag = PropFirmWindowDiagnostics::default();
+        for (_, rate, counted, window_diagnostics) in &scored_all {
             dbg_counted_sum += *counted;
+            rule_diag.merge(window_diagnostics);
             if *counted == 0 {
                 dbg_counted_zero += 1;
             } else if *rate < pf_pass_rate_floor {
@@ -12548,9 +12645,35 @@ where
             timestamps_len = timestamps_owned.len(),
             "prop-firm gate breakdown — why candidates were rejected"
         );
-        let mut scored: Vec<((usize, Gene), f64, usize)> = scored_all
+        // RULE-LEVEL attribution. A zero `max_rate` says every window failed,
+        // not which rule denied it; the profit target and the consistency ratio
+        // call for opposite corrective actions, so both are counted here.
+        if rule_diag.windows > 0 {
+            tracing::info!(
+                target: "neoethos_search::prop_firm_dbg",
+                candidates_in = candidates_in_count,
+                windows = rule_diag.windows,
+                windows_passed_all_rules = rule_diag.passed,
+                no_trade_windows = rule_diag.no_trade_windows,
+                fail_daily_loss = rule_diag.daily_loss_breaches,
+                fail_overall_drawdown = rule_diag.overall_drawdown_breaches,
+                fail_consistency = rule_diag.consistency_violations,
+                fail_trade_limit = rule_diag.trade_limit_violations,
+                fail_min_trading_days = rule_diag.min_trading_days_failures,
+                fail_profit_target = rule_diag.profit_target_failures,
+                best_window_net_return_pct = rule_diag.best_net_return_pct,
+                worst_window_net_return_pct = rule_diag.worst_net_return_pct,
+                avg_trades_per_window = rule_diag.total_trades as f64 / rule_diag.windows as f64,
+                avg_trading_days_per_window =
+                    rule_diag.total_trading_days as f64 / rule_diag.windows as f64,
+                profit_target_pct = pf.rules.min_profit_target_pct,
+                consistency_ratio = pf.rules.max_profit_consistency_ratio,
+                "prop-firm window rule breakdown - which rule denies every window"
+            );
+        }
+        let mut scored: Vec<((usize, Gene), f64, usize, PropFirmWindowDiagnostics)> = scored_all
             .into_iter()
-            .filter(|(_, rate, counted)| *counted > 0 && *rate >= pf.pass_rate)
+            .filter(|(_, rate, counted, _)| *counted > 0 && *rate >= pf.pass_rate)
             .collect();
         // Sort by pass-rate descending; ties broken by gene fitness.
         scored.sort_by(|a, b| {
@@ -12564,7 +12687,7 @@ where
                 })
         });
         let mut next_filtered: Vec<(usize, Gene)> = Vec::with_capacity(scored.len());
-        for (pair, rate, _) in scored {
+        for (pair, rate, _, _) in scored {
             next_filtered.push(pair);
             prop_firm_pass_rates.push(rate);
         }
