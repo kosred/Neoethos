@@ -6593,6 +6593,18 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
         .and_then(|funnel| funnel.live_trading_policy_v1())
         .ok_or_else(|| anyhow::anyhow!("saved research lost its sealed Search signal policy"))?;
     policy.validate()?;
+    // Adaptive stops are a separate archived recipe from EvaluationConfig. The
+    // simulation reads the process-owned adaptive-base producer, so an ambient
+    // recipe that differs from the sealed Search policy would silently price
+    // every adaptive gene with different stops. Compare the whole policy, not
+    // just one scalar; fail loud instead of falling back to ambient economics.
+    let sealed_adaptive_stops = policy.sealed_adaptive_stops_policy()?;
+    let current_adaptive_stops =
+        crate::stop_target::ResolvedAdaptiveStopsPolicyV1::capture_current()?;
+    anyhow::ensure!(
+        &current_adaptive_stops == sealed_adaptive_stops,
+        "ambient adaptive-stop policy differs from the sealed Search policy — refusing to price saved adaptive candidates under a different stop recipe"
+    );
     anyhow::ensure!(
         policy.source_search_config_hash == result.search_config_hash,
         "saved research search_config_hash {} disagrees with its sealed policy {} — refusing to price candidates from an inconsistent archive",

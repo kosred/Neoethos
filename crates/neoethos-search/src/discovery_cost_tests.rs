@@ -558,6 +558,36 @@ fn eur_account_research_contract() -> CanonicalTrendbarResearchExecutionContract
 
 #[test]
 fn research_replay_scope_pins_eur_contract_basis_and_clears_on_drop() {
+    // The research authority is process-wide. Run its numerical consumer in a
+    // separate copy of this test executable, so ordinary parallel tests cannot
+    // observe the temporary research scope or have their economics changed.
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "discovery::cost_consistency_tests::research_replay_scope_eur_contract_worker",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .expect("isolated replay-scope test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "isolated replay-scope worker failed:
+{stdout}
+{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the isolated worker did not run: {stdout}"
+    );
+}
+
+#[test]
+#[ignore = "invoked in an isolated process by the replay-scope contract test"]
+fn research_replay_scope_eur_contract_worker() {
     let contract = eur_account_research_contract();
     let sealed_pip_value = 10.0 / 1.16268;
     let mut config = DiscoveryConfig::default();
