@@ -63,7 +63,7 @@ impl WeeklyCadenceContractV1 {
             "weekly-cadence trading-days-per-month must be finite and at least one"
         );
         anyhow::ensure!(
-            self.min_trades_per_week.is_finite() && self.min_trades_per_week >= 1.0,
+            self.min_trades_per_week == 1.0,
             "weekly-cadence minimum is at least one trade per week"
         );
         Ok(())
@@ -200,6 +200,117 @@ pub fn weekly_feasibility_score(
     -(1.0 + cadence + net_penalty + risk_penalty)
 }
 
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeeklyRollingCadenceReportV1 {
+    pub trading_days: u64,
+    pub trades: usize,
+    pub trades_per_month: f64,
+    pub longest_silent_trading_days: u64,
+    pub violating_windows: u64,
+    pub violation: f64,
+    pub clustered: bool,
+}
+
+impl WeeklyRollingCadenceReportV1 {
+    pub fn feasible(&self) -> bool {
+        self.violation == 0.0 && self.trading_days > 0
+    }
+}
+
+pub fn evaluate_rolling_weekly_cadence(
+    contract: &WeeklyCadenceContractV1,
+    trade_entry_timestamps_ms: &[i64],
+) -> anyhow::Result<WeeklyRollingCadenceReportV1> {
+    contract.validate()?;
+    let start = Utc
+        .timestamp_millis_opt(contract.evaluation_start_ms)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("weekly contract start outside the UTC calendar"))?
+        .date_naive();
+    let end = Utc
+        .timestamp_millis_opt(contract.evaluation_end_ms)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("weekly contract end outside the UTC calendar"))?
+        .date_naive();
+    let mut days = Vec::new();
+    let mut day = start;
+    while day <= end {
+        if day.weekday().num_days_from_monday() < 5 {
+            days.push(day);
+        }
+        day = day.succ_opt().ok_or_else(|| anyhow::anyhow!("UTC calendar overflow"))?;
+    }
+    anyhow::ensure!(!days.is_empty(), "weekly-cadence interval contains no UTC weekday");
+    let mut presence = vec![false; days.len()];
+    for &ms in trade_entry_timestamps_ms {
+        anyhow::ensure!(
+            ms >= contract.evaluation_start_ms && ms <= contract.evaluation_end_ms,
+            "trade entry lies outside the weekly evaluation interval"
+        );
+        let date = Utc
+            .timestamp_millis_opt(ms)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("trade timestamp outside the UTC calendar"))?
+            .date_naive();
+        let index = days.binary_search(&date).map_err(|_| {
+            anyhow::anyhow!("trade entry is not on a UTC weekday inside the interval")
+        })?;
+        presence[index] = true;
+    }
+    let traded: Vec<usize> = presence
+        .iter()
+        .enumerate()
+        .filter_map(|(index, present)| present.then_some(index))
+        .collect();
+    let mut runs = Vec::new();
+    if traded.is_empty() {
+        runs.push(days.len() as u64);
+    } else {
+        runs.push(traded[0] as u64);
+        for pair in traded.windows(2) {
+            runs.push((pair[1] - pair[0] - 1) as u64);
+        }
+        runs.push((days.len() - 1 - traded[traded.len() - 1]) as u64);
+    }
+    let allowed = 4u64;
+    let longest = runs.iter().copied().max().unwrap_or(0);
+    let violation: f64 = runs.iter().map(|run| run.saturating_sub(allowed) as f64).sum();
+    let mut violating_windows = 0u64;
+    if days.len() >= 5 {
+        let mut prefix = vec![0u64; days.len() + 1];
+        for (index, present) in presence.iter().enumerate() {
+            prefix[index + 1] = prefix[index] + u64::from(*present);
+        }
+        for begin in 0..=days.len() - 5 {
+            if prefix[begin + 5] == prefix[begin] {
+                violating_windows += 1;
+            }
+        }
+    }
+    let weekdays = crate::quality::evaluation_weekdays(
+        contract.evaluation_start_ms,
+        contract.evaluation_end_ms,
+    )?;
+    let months = weekdays as f64 / contract.trading_days_per_month.max(1.0);
+    let trades_per_month = if months > 0.0 {
+        trade_entry_timestamps_ms.len() as f64 / months
+    } else {
+        0.0
+    };
+    let clustered = violation > 0.0
+        && !traded.is_empty()
+        && traded.len() as u64 >= days.len() as u64 / 5;
+    Ok(WeeklyRollingCadenceReportV1 {
+        trading_days: days.len() as u64,
+        trades: trade_entry_timestamps_ms.len(),
+        trades_per_month,
+        longest_silent_trading_days: longest,
+        violating_windows,
+        violation,
+        clustered,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,4 +372,36 @@ mod tests {
         }
         assert!(previous > 0.0);
     }
+    #[test]
+    fn rolling_oracle_endpoint_only_trades_are_infeasible() {
+        let c = WeeklyCadenceContractV1::new(ms(0), ms(11), 21.0).unwrap();
+        let report = evaluate_rolling_weekly_cadence(&c, &[ms(0), ms(11)]).unwrap();
+        assert!(!report.feasible(), "{report:?}");
+        assert!(report.longest_silent_trading_days >= 5);
+        assert!(report.violating_windows > 0);
+        let regular = evaluate_rolling_weekly_cadence(&c, &[ms(0), ms(7)]).unwrap();
+        assert!(regular.feasible(), "{regular:?}");
+    }
+
+    #[test]
+    fn rolling_oracle_clustered_and_refuge_rank_below_regular() {
+        let c = WeeklyCadenceContractV1::new(ms(0), ms(27), 21.0).unwrap();
+        let clustered = evaluate_rolling_weekly_cadence(&c, &(0..20).map(|i| ms(i % 4)).collect::<Vec<_>>()).unwrap();
+        assert!(!clustered.feasible());
+        let regular = evaluate_rolling_weekly_cadence(&c, &[ms(0), ms(7), ms(14), ms(21)]).unwrap();
+        assert!(regular.feasible());
+        assert!(weekly_feasibility_score(100.0, true, &WeeklyCadenceReportV1 {
+            expected_weeks: 0, weeks_with_trades: 0, trades: clustered.trades,
+            inclusive_weekdays: 0, trades_per_month: clustered.trades_per_month,
+            longest_silent_weeks: clustered.longest_silent_trading_days,
+            violation: clustered.violation, clustered: clustered.clustered }
+        ) < 1_000_000.0);
+    }
+
+    #[test]
+    fn rolling_oracle_weekend_only_interval_is_refused() {
+        let c = WeeklyCadenceContractV1::new(ms(5), ms(6), 21.0).unwrap();
+        assert!(evaluate_rolling_weekly_cadence(&c, &[]).is_err());
+    }
+
 }

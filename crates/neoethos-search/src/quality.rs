@@ -774,7 +774,7 @@ impl StrategyQualityAnalyzer {
 
 /// Inclusive UTC calendar dates; O(1) weeks plus at most six remainder days.
 /// Endpoint validation also bounds every later elapsed-time subtraction.
-fn evaluation_weekdays(start_ms: i64, end_ms: i64) -> anyhow::Result<u64> {
+pub(crate) fn evaluation_weekdays(start_ms: i64, end_ms: i64) -> anyhow::Result<u64> {
     anyhow::ensure!(
         start_ms >= 0 && end_ms > start_ms,
         "quality evaluation interval must have ordered nonnegative endpoints"
