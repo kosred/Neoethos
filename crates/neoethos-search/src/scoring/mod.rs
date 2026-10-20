@@ -152,3 +152,5 @@ mod tests {
         assert_eq!(SCORING_VERSION_CURRENT.0, 7);
     }
 }
+
+pub mod weekly_cadence;
