@@ -2436,6 +2436,38 @@ fn compute_discovery_forward_test_artifacts_produces_one_artifact_per_strategy()
 }
 
 #[test]
+fn diagnostic_replay_refuses_ambient_adaptive_stops_that_differ_from_the_sealed_policy() {
+    let sealed = crate::stop_target::ResolvedAdaptiveStopsPolicyV1::capture_current()
+        .expect("capture the process adaptive-stop recipe");
+    ensure_adaptive_stops_policy_matches_sealed(&sealed, &sealed)
+        .expect("the identical adaptive-stop policy must pass the replay guard");
+    let disabled = crate::stop_target::ResolvedAdaptiveStopsPolicyV1::checked_new(
+        sealed.settings().clone(),
+        !sealed.enabled(),
+        sealed.reward_risk_fallback(),
+    )
+    .expect("a valid policy with the enable flag toggled");
+    let error = ensure_adaptive_stops_policy_matches_sealed(&disabled, &sealed)
+        .expect_err("an ambient adaptive-stop policy with a different enable flag must be refused");
+    assert!(
+        error.to_string().contains("adaptive-stop policy differs"),
+        "unexpected guard error: {error}"
+    );
+    let different_rr = crate::stop_target::ResolvedAdaptiveStopsPolicyV1::checked_new(
+        sealed.settings().clone(),
+        sealed.enabled(),
+        sealed.reward_risk_fallback() * 2.0,
+    )
+    .expect("a valid policy with a different reward/risk fallback");
+    let error = ensure_adaptive_stops_policy_matches_sealed(&different_rr, &sealed)
+        .expect_err("an ambient adaptive-stop policy with a different fallback must be refused");
+    assert!(
+        error.to_string().contains("adaptive-stop policy differs"),
+        "unexpected guard error: {error}"
+    );
+}
+
+#[test]
 fn replay_config_parity_guard_rejects_a_reconstructed_risk_change() {
     let mut config = DiscoveryConfig::default();
     config.evaluation_spread_pips = 0.5;

@@ -6601,10 +6601,10 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
     let sealed_adaptive_stops = policy.sealed_adaptive_stops_policy()?;
     let current_adaptive_stops =
         crate::stop_target::ResolvedAdaptiveStopsPolicyV1::capture_current()?;
-    anyhow::ensure!(
-        &current_adaptive_stops == sealed_adaptive_stops,
-        "ambient adaptive-stop policy differs from the sealed Search policy — refusing to price saved adaptive candidates under a different stop recipe"
-    );
+    ensure_adaptive_stops_policy_matches_sealed(
+        &current_adaptive_stops,
+        sealed_adaptive_stops,
+    )?;
     anyhow::ensure!(
         policy.source_search_config_hash == result.search_config_hash,
         "saved research search_config_hash {} disagrees with its sealed policy {} — refusing to price candidates from an inconsistent archive",
@@ -6707,6 +6707,22 @@ pub(crate) fn install_research_replay_execution_scope(
     contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
 ) -> Result<crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionScopeV3> {
     crate::canonical_trendbar_research::install_canonical_trendbar_research_execution_v3(contract)
+}
+
+/// The diagnostic replay must not silently trust ambient adaptive stops: the
+/// resolved stop recipe is a separate archived object from EvaluationConfig and
+/// the per-gene resolver reads the process-owned adaptive producer. Compare the
+/// WHOLE policy (enabled flag, reward/risk fallback and every stop-target
+/// setting) so a mismatch is refused explicitly instead of changing stops.
+fn ensure_adaptive_stops_policy_matches_sealed(
+    current: &crate::stop_target::ResolvedAdaptiveStopsPolicyV1,
+    sealed: &crate::stop_target::ResolvedAdaptiveStopsPolicyV1,
+) -> Result<()> {
+    anyhow::ensure!(
+        current == sealed,
+        "ambient adaptive-stop policy differs from the sealed Search policy — refusing to price saved adaptive candidates under a different stop recipe"
+    );
+    Ok(())
 }
 
 /// Refuse to price saved candidates under a reconstructed configuration whose
