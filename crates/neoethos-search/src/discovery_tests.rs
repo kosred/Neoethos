@@ -3817,6 +3817,37 @@ fn each_mode_keeps_its_own_risk_band() {
 }
 
 #[test]
+fn prop_firm_mode_does_not_reimpose_a_fitness_sign_floor() {
+    // 2026-10-20: the PropFirm branch documents a "permissive filter floor —
+    // the GA's output is judged by the prop-firm window-pass score", yet it set
+    // min_profit = 0.0, i.e. it required fitness > 0. After the PropFirm
+    // objective stopped rewarding one-trade lottery genomes, all 1768 archived
+    // candidates had negative fitness (the best active genome: PF 1.86, DD 1.8%,
+    // 50 trades, fitness -0.26) and the mode produced zero selections before the
+    // window gate ran. The floor must stay permissive; acceptance is the window
+    // gate, cost bands and walk-forward.
+    let mut config = DiscoveryConfig::default();
+    config.mode = DiscoveryMode::PropFirm;
+    let prop = config.apply_mode_overrides();
+    assert_eq!(
+        prop.filtering.min_profit,
+        f64::NEG_INFINITY,
+        "the PropFirm floor must not require positive fitness"
+    );
+
+    let mut gene = profitable_gene("gene_negative_fitness_but_tradeable");
+    gene.fitness = -0.25;
+    assert!(
+        !gene.passes_filter(&FilteringConfig::default()),
+        "the default floor rejects a negative-fitness genome; the old PropFirm floor reimposed exactly this"
+    );
+    assert!(
+        gene.passes_filter(&prop.filtering),
+        "the PropFirm floor must admit a tradeable negative-fitness genome to the validation chain"
+    );
+}
+
+#[test]
 fn unset_mode_band_inherits_the_shared_one() {
     // Behaviour when NO per-mode band is set must be pure inheritance of the
     // shared band. The Risky 30% ceiling is now a default (operator decision

@@ -1529,7 +1529,14 @@ impl DiscoveryConfig {
             // Permissive filter floor — the GA's output is judged by the
             // prop-firm window-pass score, not by these legacy thresholds.
             self.filtering.max_dd = 0.50;
-            self.filtering.min_profit = 0.0;
+            // 2026-10-20: the permissive floor must not resurrect a fitness-SIGN
+            // requirement. It used to be 0.0, which silently re-imposed the legacy
+            // "fitness must be positive" threshold this branch exists to remove:
+            // after the PropFirm objective stopped rewarding one-trade lottery
+            // genomes, every archived candidate had negative fitness and the mode
+            // selected nothing before validation ever ran. Acceptance stays with the
+            // cost bands, walk-forward, calibration and the prop-firm window gate.
+            self.filtering.min_profit = f64::NEG_INFINITY;
             self.filtering.min_trades = 1.0;
             self.filtering.min_sharpe = -10.0;
             self.filtering.min_win_rate = 0.0;
