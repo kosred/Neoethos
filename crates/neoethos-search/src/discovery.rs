@@ -838,6 +838,19 @@ pub fn resolve_prop_firm_discovery_gate(
     if let Some(value) = config.min_trading_days {
         rules.min_trading_days = value;
     }
+    // 2026-10-20 EXTERNAL-EVIDENCE CALIBRATION. FTMO's consistency /
+    // "Best Day" rule is a PAYOUT-phase constraint, not part of the 2-Step
+    // challenge pass/fail objectives. The official 2-Step objectives are the
+    // 10% (phase 1) / 5% (phase 2) profit target, 5% max daily loss, 10% max
+    // loss, at least 4 trading days, and an UNLIMITED trading period
+    // (https://ftmo.com/en/2-step-challenge/ ;
+    //  https://ftmo.com/en/trading-objectives/). Applying the 50% consistency
+    // cap to DISCOVERY challenge windows therefore made every scored window
+    // stricter than the challenge it is meant to model, and the 2026-10-20
+    // rule breakdown showed consistency denying 77 of 306 windows. The rule
+    // stays in PropFirmRiskRules for funded/payout validation, where it
+    // belongs, but is disabled for the search window gate.
+    rules.max_profit_consistency_ratio = 0.0;
 
     PropFirmGateOverrides {
         rules,

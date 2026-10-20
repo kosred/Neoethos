@@ -3675,6 +3675,13 @@ fn prop_firm_preflight_uses_the_same_gate_resolver_as_discovery() {
     assert_eq!(resolved.rules.min_profit_target_pct, 0.09);
     assert!(resolved.rules.require_profit_target);
     assert_eq!(resolved.rules.min_trading_days, 6);
+    // 2026-10-20: consistency / Best-Day is a PAYOUT rule, not a 2-Step
+    // challenge objective (ftmo.com 2-step-challenge + trading-objectives).
+    // The discovery window gate models the challenge, so it must not apply it.
+    assert_eq!(
+        resolved.rules.max_profit_consistency_ratio, 0.0,
+        "the challenge window gate must not include the payout consistency rule"
+    );
     assert_eq!(resolved.window_days, 45);
     assert_eq!(resolved.n_windows, 17);
     assert_eq!(resolved.pass_rate, 0.55);
