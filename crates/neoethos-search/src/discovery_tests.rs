@@ -2436,7 +2436,8 @@ fn compute_discovery_forward_test_artifacts_produces_one_artifact_per_strategy()
 }
 
 #[test]
-fn candidate_cost_variant_diagnostic_prices_the_same_signals_at_different_costs() {
+fn candidate_cost_variant_diagnostic_matches_the_production_frequency_definition() {
+    use chrono::{Datelike, TimeZone, Utc};
     let mut config = DiscoveryConfig::default();
     // Default() deliberately carries NaN cost sentinels; this fixture measures
     // cost sensitivity, so resolve them to a finite baseline first.
@@ -2468,6 +2469,9 @@ fn candidate_cost_variant_diagnostic_prices_the_same_signals_at_different_costs(
     settings.max_hold_bars = 5;
     settings.sl_pips = 0.2;
     settings.tp_pips = 0.4;
+    let (month_idx, day_idx) = month_day_indices(timestamps);
+    let evaluation_span = (timestamps[0], timestamps[timestamps.len() - 1]);
+    let analyzer = quality_analyzer_for_config(&config);
     let old_cost = CandidateCostVariantV1 {
         label: "old_unverified".to_owned(),
         round_trip_cost_pips: 2.5,
@@ -2478,44 +2482,80 @@ fn candidate_cost_variant_diagnostic_prices_the_same_signals_at_different_costs(
         round_trip_cost_pips: 0.9,
         round_trip_commission_per_lot: 9.0,
     };
-    let old_trades = simulate_gene_under_cost_variant(
-        &gene,
+    let old_metrics = evaluate_gene_under_cost_variant(
+        &gene.strategy_id,
         &signals,
         &confidences,
         &ohlcv,
         timestamps,
+        &month_idx,
+        &day_idx,
         &settings,
+        config.initial_balance,
+        evaluation_span,
+        &analyzer,
         &old_cost,
     )
-    .expect("old-cost simulation");
-    let broker_trades = simulate_gene_under_cost_variant(
-        &gene,
+    .expect("old-cost evaluation");
+    let broker_metrics = evaluate_gene_under_cost_variant(
+        &gene.strategy_id,
         &signals,
         &confidences,
         &ohlcv,
         timestamps,
+        &month_idx,
+        &day_idx,
         &settings,
+        config.initial_balance,
+        evaluation_span,
+        &analyzer,
         &broker_cost,
     )
-    .expect("broker-cost simulation");
+    .expect("broker-cost evaluation");
     assert!(
-        !old_trades.is_empty(),
-        "the alternating-signal fixture must produce trades"
+        old_metrics.total_trades > 0,
+        "the alternating-signal fixture must produce closed trades"
     );
-    let old_net: f64 = old_trades.iter().map(|trade| trade.pnl).sum();
-    let broker_net: f64 = broker_trades.iter().map(|trade| trade.pnl).sum();
     assert!(
-        broker_net > old_net,
-        "lower verified costs must improve net PnL: old {old_net}, broker {broker_net}"
+        broker_metrics.profit_per_trade > old_metrics.profit_per_trade,
+        "lower verified costs must improve net expectancy per trade: old {}, broker {}",
+        old_metrics.profit_per_trade,
+        broker_metrics.profit_per_trade
     );
-    let row =
-        candidate_cost_rows(&gene, &broker_trades, 30.0, "broker_verified").expect("diagnostic row");
+    // Parity with the production frequency definition: the analyzer counts every
+    // WEEKDAY in [first bar, last bar] and scales by the configured trading-days
+    // convention. Recompute that independently from the fixture calendar.
+    let start = Utc.timestamp_millis_opt(evaluation_span.0).unwrap();
+    let end = Utc.timestamp_millis_opt(evaluation_span.1).unwrap();
+    let days = (end.date_naive() - start.date_naive()).num_days() as u64 + 1;
+    let first_weekday = u64::from(start.weekday().num_days_from_monday());
+    let weekdays = (days / 7) * 5
+        + (0..days % 7)
+            .filter(|offset| (first_weekday + offset) % 7 < 5)
+            .count() as u64;
+    let expected_trades_per_month = broker_metrics.total_trades as f64
+        * crate::quality::current_quality_runtime_overrides().trading_days_per_month
+        / weekdays as f64;
+    assert!(
+        (broker_metrics.trades_per_month - expected_trades_per_month).abs() < 1e-9,
+        "seam frequency {} must equal the production weekday definition {}",
+        broker_metrics.trades_per_month,
+        expected_trades_per_month
+    );
+    let row = candidate_cost_rows(
+        &gene.strategy_id,
+        crate::artifact_io::stable_json_hash(&gene).expect("gene hash"),
+        &broker_metrics,
+        &broker_cost,
+        evaluation_span,
+    );
     assert_eq!(row.variant, "broker_verified");
-    assert_eq!(row.strategy_id, gene.strategy_id);
+    assert_eq!(row.metrics.trades, broker_metrics.total_trades);
+    assert_eq!(row.metrics.trades_per_month, broker_metrics.trades_per_month);
+    assert_eq!(row.window.start_ms, evaluation_span.0);
+    assert_eq!(row.window.end_ms, evaluation_span.1);
     assert!(row.exact_gene_hash.starts_with("fnv64:"));
-    assert!(row.trades_per_month > 0.0);
 }
-
 #[test]
 fn research_only_oos_document_is_labelled_and_carries_one_entry_per_strategy() {
     let mut config = DiscoveryConfig::default();

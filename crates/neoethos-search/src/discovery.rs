@@ -6395,84 +6395,70 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
 pub struct CandidateCostVariantV1 {
     /// Stable label recorded on every row (e.g. old_unverified / broker_0_5).
     pub label: String,
-    /// Round-trip spread plus two fills of slippage, in pips. Applied once
-    /// per simulated trade through the simulator spread channel.
+    /// Round-trip spread plus two fills of slippage, in pips. Replaces the
+    /// simulator spread channel for this variant only.
     pub round_trip_cost_pips: f64,
-    /// Round-trip commission per lot. Applied once per simulated trade.
+    /// Round-trip commission per lot. Replaces the commission channel for this
+    /// variant only.
     pub round_trip_commission_per_lot: f64,
 }
 
 /// One row of the research-only saved-candidate cost diagnostic.
+///
+/// These are RAW evaluated metrics under an explicit cost envelope. They are
+/// not gate verdicts: no cost-band classifier runs here (the production band
+/// launches population scenarios; see CostBandVerdict for that evidence), and
+/// callers must not relabel these numbers as a cost-band pass.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CandidateCostDiagnosticRowV1 {
     pub variant: String,
     pub strategy_id: String,
     pub exact_gene_hash: String,
-    pub simulated_trades: usize,
+    /// Round-trip cost actually charged in this variant.
+    pub charged_round_trip_cost_pips: f64,
+    pub charged_round_trip_commission_per_lot: f64,
+    pub metrics: CandidateCostMetricSetV1,
+    pub window: CandidateCostWindowV1,
+}
+
+/// The evaluated metrics of one saved candidate under one cost envelope.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateCostMetricSetV1 {
+    /// Trades closed by the replay.
+    pub trades: usize,
+    /// Same definition the production quality analyzer and the gate use:
+    /// trades x resolved trading-days-per-month / weekdays in the evaluated
+    /// interval (NOT a calendar-month rescale).
     pub trades_per_month: f64,
-    pub win_rate: f64,
+    pub win_rate_pct: f64,
     pub profit_factor: f64,
-    pub net_profit_account: f64,
-    pub expectancy_account: f64,
-    pub span_days: f64,
+    pub net_account: f64,
+    pub per_trade_account: f64,
+    pub return_pct: f64,
+    pub drawdown_pct: f64,
 }
 
-fn candidate_cost_rows(
-    gene: &Gene,
-    trades: &[crate::quality::Trade],
-    span_days: f64,
-    variant_label: &str,
-) -> Result<CandidateCostDiagnosticRowV1> {
-    let net_profit: f64 = trades.iter().map(|trade| trade.pnl).sum();
-    let wins = trades.iter().filter(|trade| trade.pnl > 0.0).count();
-    let gross_profit: f64 = trades.iter().filter(|trade| trade.pnl > 0.0).map(|t| t.pnl).sum();
-    let gross_loss: f64 = trades.iter().filter(|trade| trade.pnl < 0.0).map(|t| -t.pnl).sum();
-    let profit_factor = if gross_loss > 0.0 {
-        gross_profit / gross_loss
-    } else if gross_profit > 0.0 {
-        10.0
-    } else {
-        0.0
-    };
-    let win_rate = if trades.is_empty() {
-        0.0
-    } else {
-        wins as f64 / trades.len() as f64
-    };
-    let expectancy = if trades.is_empty() {
-        0.0
-    } else {
-        net_profit / trades.len() as f64
-    };
-    let months = span_days / 30.4375;
-    let trades_per_month = if months > 0.0 {
-        trades.len() as f64 / months
-    } else {
-        0.0
-    };
-    Ok(CandidateCostDiagnosticRowV1 {
-        variant: variant_label.to_owned(),
-        strategy_id: gene.strategy_id.clone(),
-        exact_gene_hash: crate::artifact_io::stable_json_hash(gene)?,
-        simulated_trades: trades.len(),
-        trades_per_month,
-        win_rate,
-        profit_factor,
-        net_profit_account: net_profit,
-        expectancy_account: expectancy,
-        span_days,
-    })
+/// Half-open evaluation span the candidate was replayed over.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateCostWindowV1 {
+    pub start_ms: i64,
+    pub end_ms: i64,
 }
 
-fn simulate_gene_under_cost_variant(
-    gene: &Gene,
+fn evaluate_gene_under_cost_variant(
+    strategy_id: &str,
     signals: &[i8],
     confidences: &[f64],
     ohlcv: &Ohlcv,
     timestamps: &[i64],
-    base_settings: &crate::eval::BacktestSettings,
+    month_idx: &[i64],
+    day_idx: &[i64],
+    settings: &crate::eval::BacktestSettings,
+    initial_balance: f64,
+    evaluation_span: (i64, i64),
+    analyzer: &StrategyQualityAnalyzer,
     variant: &CandidateCostVariantV1,
-) -> Result<Vec<crate::quality::Trade>> {
+) -> Result<crate::quality::StrategyMetrics> {
     anyhow::ensure!(
         variant.round_trip_cost_pips.is_finite() && variant.round_trip_cost_pips >= 0.0,
         "candidate-cost variant '{}' has an invalid round-trip cost",
@@ -6484,20 +6470,63 @@ fn simulate_gene_under_cost_variant(
         "candidate-cost variant '{}' has an invalid round-trip commission",
         variant.label
     );
-    let mut settings = base_settings.clone();
-    settings.spread_pips = variant.round_trip_cost_pips;
-    settings.session_spread_profile = None;
-    settings.commission_per_trade = variant.round_trip_commission_per_lot;
-    let _ = gene;
-    simulate_trades_with_confidence_core(
+    anyhow::ensure!(
+        evaluation_span.1 > evaluation_span.0 && evaluation_span.0 >= 0,
+        "candidate-cost diagnostic needs an ordered nonnegative evaluation span"
+    );
+    let mut variant_settings = settings.clone();
+    variant_settings.spread_pips = variant.round_trip_cost_pips;
+    variant_settings.session_spread_profile = None;
+    variant_settings.commission_per_trade = variant.round_trip_commission_per_lot;
+    let (canonical_metrics, trades) = crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
         &ohlcv.close,
         &ohlcv.high,
         &ohlcv.low,
-        timestamps,
         signals,
         confidences,
-        &settings,
+        month_idx,
+        day_idx,
+        timestamps,
+        &variant_settings,
+    )?;
+    analyzer.analyze_strategy_with_evaluation(
+        strategy_id,
+        &trades,
+        initial_balance,
+        evaluation_span.0,
+        evaluation_span.1,
+        &canonical_metrics,
     )
+}
+
+fn candidate_cost_rows(
+    strategy_id: &str,
+    exact_gene_hash: String,
+    metrics: &crate::quality::StrategyMetrics,
+    variant: &CandidateCostVariantV1,
+    evaluation_span: (i64, i64),
+) -> CandidateCostDiagnosticRowV1 {
+    CandidateCostDiagnosticRowV1 {
+        variant: variant.label.clone(),
+        strategy_id: strategy_id.to_owned(),
+        exact_gene_hash,
+        charged_round_trip_cost_pips: variant.round_trip_cost_pips,
+        charged_round_trip_commission_per_lot: variant.round_trip_commission_per_lot,
+        metrics: CandidateCostMetricSetV1 {
+            trades: metrics.total_trades,
+            trades_per_month: metrics.trades_per_month,
+            win_rate_pct: metrics.win_rate * 100.0,
+            profit_factor: metrics.profit_factor,
+            net_account: metrics.profit_per_trade * metrics.total_trades as f64,
+            per_trade_account: metrics.profit_per_trade,
+            return_pct: metrics.total_return_pct,
+            drawdown_pct: metrics.max_drawdown_pct,
+        },
+        window: CandidateCostWindowV1 {
+            start_ms: evaluation_span.0,
+            end_ms: evaluation_span.1,
+        },
+    }
 }
 
 /// Research-only cost sensitivity for SAVED discovery candidates.
@@ -6507,6 +6536,13 @@ fn simulate_gene_under_cost_variant(
 /// under one or more cost envelopes. It does not run Search, does not touch
 /// the reserved final holdout, produces no artifacts/receipts and grants no
 /// authority: callers persist the returned rows as ResearchOnly.
+///
+/// The cost envelope is the ONLY variable: the saved research execution
+/// contract is applied to a clone of `config` first (symbol, account currency,
+/// contract spread/commission, swaps and conversion fee), then each variant
+/// overrides only spread_pips and commission_per_trade. The caller must pass
+/// the original run's non-cost configuration (risk bands, trailing/exit
+/// policy, kill zones, initial balance): this function does not invent them.
 ///
 /// Candidate gene indices are interpreted ONLY against
 /// research.discovery_result().effective_feature_names, projected by exact
@@ -6521,7 +6557,8 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
     variants: &[CandidateCostVariantV1],
 ) -> Result<Vec<CandidateCostDiagnosticRowV1>> {
     research.validate()?;
-    research.execution_contract().validate_against_input(input)?;
+    let contract = research.execution_contract();
+    contract.validate_against_input(input)?;
     anyhow::ensure!(
         !candidates.is_empty(),
         "candidate cost diagnostic requires at least one saved candidate"
@@ -6537,13 +6574,22 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
         &result.selection_scope == selection.scope(),
         "saved research selection window differs from the reopened canonical input"
     );
+    let mut research_config = config.clone();
+    apply_research_contract_to_discovery_config(&mut research_config, contract);
+    anyhow::ensure!(
+        research_config.evaluation_spread_pips.is_finite()
+            && research_config.evaluation_spread_pips >= 0.0
+            && research_config.evaluation_commission_per_trade.is_finite()
+            && research_config.evaluation_commission_per_trade >= 0.0,
+        "saved research contract did not pin finite baseline costs"
+    );
     let policy = result
         .funnel_profile
         .as_ref()
         .and_then(|funnel| funnel.live_trading_policy_v1())
         .ok_or_else(|| anyhow::anyhow!("saved research lost its sealed Search signal policy"))?;
     let (evaluation, bypass) = locked_holdout_evaluation(
-        config,
+        &research_config,
         selection.ohlcv().close.last().copied(),
         result.effective_smc_gate_threshold,
         Some(policy),
@@ -6569,45 +6615,56 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
         bypass,
     )?;
     let resolver = GeneEvalSettingsResolver::for_slice(
-        config,
+        &research_config,
         candidates.iter(),
         &selection.ohlcv().high,
         &selection.ohlcv().low,
         &selection.ohlcv().close,
     )?;
     let timestamps = projected.timestamps.as_slice();
-    let span_days = if timestamps.len() >= 2 {
-        let delta = timestamps[timestamps.len() - 1] - timestamps[0];
-        if delta > 0 {
-            delta as f64 / 86_400_000.0
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
+    let (month_idx, day_idx) = month_day_indices(timestamps);
+    let evaluation_start_ms = *timestamps
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("candidate cost diagnostic has no evaluated bars"))?;
+    let evaluation_end_ms = *timestamps
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("candidate cost diagnostic has no evaluated bars"))?;
+    let evaluation_span = (evaluation_start_ms, evaluation_end_ms);
+    let analyzer = quality_analyzer_for_config(&research_config);
+    let initial_balance = research_config.initial_balance;
     let mut rows = Vec::with_capacity(candidates.len() * variants.len());
     for (gene, (gene_signals, gene_confidences)) in candidates
         .iter()
         .zip(signals.iter().zip(confidences.iter()))
     {
         let base_settings = resolver.settings_for_gene(gene);
+        let exact_gene_hash = crate::artifact_io::stable_json_hash(gene)?;
         for variant in variants {
-            let trades = simulate_gene_under_cost_variant(
-                gene,
+            let metrics = evaluate_gene_under_cost_variant(
+                &gene.strategy_id,
                 gene_signals,
                 gene_confidences,
                 selection.ohlcv(),
                 timestamps,
+                &month_idx,
+                &day_idx,
                 &base_settings,
+                initial_balance,
+                evaluation_span,
+                &analyzer,
                 variant,
             )?;
-            rows.push(candidate_cost_rows(gene, &trades, span_days, &variant.label)?);
+            rows.push(candidate_cost_rows(
+                gene.strategy_id.as_str(),
+                exact_gene_hash.clone(),
+                &metrics,
+                variant,
+                evaluation_span,
+            ));
         }
     }
     Ok(rows)
 }
-
 /// Replay each portfolio gene on a held-out tail window and produce one
 /// ForwardTestValidationArtifactFile per strategy. The caller passes
 /// the *raw* tail (with the same `feature_names` ordering it had before
