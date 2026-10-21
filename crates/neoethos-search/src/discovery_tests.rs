@@ -6556,6 +6556,28 @@ fn weekly_base_filter_uses_measured_money_and_the_settings_path_binds_the_interv
 }
 
 #[test]
+fn recorded_expected_alphabet_guard_lifetime_survives_callback_scope() {
+    // Mirrors the production callback shape: the guard is an Option binding in
+    // the enclosing scope, not a temporary inside the new-search branch, and
+    // the alphabet check runs later in that same callback.
+    let result: Result<()> = (|| {
+        let _guard = if true {
+            Some(install_recorded_effective_feature_names(vec![
+                "a".to_string(),
+            ]))
+        } else {
+            None
+        };
+        // A non-new-mode branch may execute between guard installation and the
+        // fresh search in the real callback.
+        let _not_taken = false;
+        ensure_recorded_effective_feature_names(&["a".to_string()])?;
+        Ok(())
+    })();
+    result.expect("guard must remain installed across the callback scope");
+}
+
+#[test]
 fn recorded_effective_alphabet_mismatch_is_refused_before_search() {
     let _guard = install_recorded_effective_feature_names(vec!["a".to_string()]);
     assert!(ensure_recorded_effective_feature_names(&["a".to_string()]).is_ok());
