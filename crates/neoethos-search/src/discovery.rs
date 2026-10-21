@@ -6644,6 +6644,21 @@ struct PreparedSavedCandidateReplay<'a> {
 
 impl<'a> PreparedSavedCandidateReplay<'a> {
     fn signals(&self, candidates: &[Gene]) -> Result<(Vec<Vec<i8>>, Vec<Vec<f64>>)> {
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "candidate cost diagnostic requires at least one saved candidate"
+        );
+        for gene in candidates {
+            if let Some(index) = gene.indices.iter().copied().max() {
+                anyhow::ensure!(
+                    (index as usize) < self.projected.names.len(),
+                    "saved candidate '{}' references feature index {} beyond the {} saved effective features",
+                    gene.strategy_id,
+                    index,
+                    self.projected.names.len()
+                );
+            }
+        }
         locked_holdout_signals_and_confidences_with_policy(
             candidates,
             &self.projected,
@@ -6735,6 +6750,10 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
     let selection = replay.inputs.selection();
     let projected = &replay.projected;
     let research_config = &replay.research_config;
+    anyhow::ensure!(
+        !variants.is_empty(),
+        "candidate cost diagnostic requires at least one cost variant"
+    );
     let (signals, confidences) = replay.signals(candidates)?;
     let resolver = GeneEvalSettingsResolver::for_slice(
         &research_config,
@@ -6811,6 +6830,7 @@ struct CandidateSignalExactGroupV1 {
     candidates: Vec<CandidateSignalIdentityV1>,
 }
 
+#[derive(Clone)]
 struct CandidateSignalFingerprintV1 {
     identity: CandidateSignalIdentityV1,
     long: Vec<u64>,
@@ -6822,7 +6842,7 @@ struct CandidateSignalFingerprintV1 {
     all_zero: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct CandidateSignalPairStatV1 {
     left: usize,
     right: usize,
@@ -6831,6 +6851,20 @@ struct CandidateSignalPairStatV1 {
     opposite_direction_bars: usize,
     active_union_bars: usize,
     both_zero_bars: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateSignalAggregateV1 {
+    exact_signal_groups: Vec<CandidateSignalExactGroupV1>,
+    all_zero_candidates: usize,
+    defined_pairs: usize,
+    undefined_zero_union_pairs: usize,
+    exact_signal_candidate_total: usize,
+    same_direction_bars_sum: u64,
+    opposite_direction_bars_sum: u64,
+    active_union_bars_sum: u64,
+    threshold_counts: [usize; CANDIDATE_SIGNAL_NEAR_THRESHOLDS.len()],
+    top_pairs: Vec<CandidateSignalPairStatV1>,
 }
 
 fn candidate_signal_hash(signal: &[i8]) -> u64 {
@@ -6940,56 +6974,10 @@ fn candidate_signal_popcount_or(
         .sum()
 }
 
-pub fn summarize_research_candidate_signal_similarity_v1(
-    input: &CanonicalSearchRunInputV2<'_>,
-    config: &DiscoveryConfig,
-    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
-) -> anyhow::Result<serde_json::Value> {
-    let replay = prepare_saved_candidate_replay(input, config, research)?;
-    let result = research.discovery_result();
-    let candidates = &result.candidates;
-    anyhow::ensure!(
-        !candidates.is_empty(),
-        "saved candidate signal behavior census requires at least one saved candidate"
-    );
-    let n_bars = replay.inputs.selection().ohlcv().len();
-    anyhow::ensure!(
-        n_bars > 0,
-        "saved candidate signal behavior census has no bars"
-    );
-    let mut fingerprints = Vec::with_capacity(candidates.len());
-    for chunk in candidates.chunks(CANDIDATE_SIGNAL_CHUNK) {
-        let (signals, confidences) = replay.signals(chunk)?;
-        anyhow::ensure!(
-            signals.len() == chunk.len(),
-            "saved candidate signal replay returned {} signal rows for {} candidates",
-            signals.len(),
-            chunk.len()
-        );
-        anyhow::ensure!(
-            confidences.len() == chunk.len(),
-            "saved candidate signal replay returned {} confidence rows for {} candidates",
-            confidences.len(),
-            chunk.len()
-        );
-        for (gene, signal) in chunk.iter().zip(signals.iter()) {
-            let identity = CandidateSignalIdentityV1 {
-                index: fingerprints.len(),
-                strategy_id: gene.strategy_id.clone(),
-                exact_gene_hash: crate::artifact_io::stable_json_hash(gene)?,
-            };
-            fingerprints.push(candidate_signal_bitsets(signal, n_bars, identity)?);
-        }
-        // Signals/confidences are chunk-scoped; only compact bitsets and
-        // identities survive. No all-candidate f64 arrays are retained.
-        drop(signals);
-        drop(confidences);
-    }
-    anyhow::ensure!(
-        fingerprints.len() == candidates.len(),
-        "saved candidate signal behavior census lost candidates"
-    );
-
+fn aggregate_candidate_signal_behavior(
+    fingerprints: &[CandidateSignalFingerprintV1],
+    n_bars: usize,
+) -> CandidateSignalAggregateV1 {
     let mut exact_buckets: std::collections::HashMap<u64, Vec<usize>> =
         std::collections::HashMap::new();
     for (index, fingerprint) in fingerprints.iter().enumerate() {
@@ -7056,7 +7044,7 @@ pub fn summarize_research_candidate_signal_similarity_v1(
         Vec::with_capacity(CANDIDATE_SIGNAL_TOP_PAIRS);
     for left in 0..fingerprints.len() {
         for right in (left + 1)..fingerprints.len() {
-            let Some(mut stat) = candidate_signal_pair_stat(left, right, &fingerprints, n_bars)
+            let Some(mut stat) = candidate_signal_pair_stat(left, right, fingerprints, n_bars)
             else {
                 undefined_zero_union_pairs += 1;
                 continue;
@@ -7105,11 +7093,89 @@ pub fn summarize_research_candidate_signal_similarity_v1(
             .then_with(|| left.left.cmp(&right.left))
             .then_with(|| left.right.cmp(&right.right))
     });
+    CandidateSignalAggregateV1 {
+        exact_signal_groups,
+        all_zero_candidates,
+        defined_pairs,
+        undefined_zero_union_pairs,
+        exact_signal_candidate_total: exact_signal_candidate_count,
+        same_direction_bars_sum,
+        opposite_direction_bars_sum,
+        active_union_bars_sum,
+        threshold_counts,
+        top_pairs,
+    }
+}
 
+pub fn summarize_research_candidate_signal_similarity_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+) -> anyhow::Result<serde_json::Value> {
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let result = research.discovery_result();
+    let candidates = &result.candidates;
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "saved candidate signal behavior census requires at least one saved candidate"
+    );
+    let n_bars = replay.inputs.selection().ohlcv().len();
+    anyhow::ensure!(
+        n_bars > 0,
+        "saved candidate signal behavior census has no bars"
+    );
+    let mut fingerprints = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(CANDIDATE_SIGNAL_CHUNK) {
+        let (signals, confidences) = replay.signals(chunk)?;
+        anyhow::ensure!(
+            signals.len() == chunk.len(),
+            "saved candidate signal replay returned {} signal rows for {} candidates",
+            signals.len(),
+            chunk.len()
+        );
+        anyhow::ensure!(
+            confidences.len() == chunk.len(),
+            "saved candidate signal replay returned {} confidence rows for {} candidates",
+            confidences.len(),
+            chunk.len()
+        );
+        for (gene, signal) in chunk.iter().zip(signals.iter()) {
+            let identity = CandidateSignalIdentityV1 {
+                index: fingerprints.len(),
+                strategy_id: gene.strategy_id.clone(),
+                exact_gene_hash: crate::artifact_io::stable_json_hash(gene)?,
+            };
+            fingerprints.push(candidate_signal_bitsets(signal, n_bars, identity)?);
+        }
+        // Signals/confidences are chunk-scoped; only compact bitsets and
+        // identities survive. No all-candidate f64 arrays are retained.
+        drop(signals);
+        drop(confidences);
+    }
+    anyhow::ensure!(
+        fingerprints.len() == candidates.len(),
+        "saved candidate signal behavior census lost candidates"
+    );
+
+    let aggregate = aggregate_candidate_signal_behavior(&fingerprints, n_bars);
+    let exact_signal_groups = aggregate
+        .exact_signal_groups
+        .into_iter()
+        .map(|group| {
+            let candidate_identities = group.candidates;
+            serde_json::json!({
+                "all_zero": group.all_zero,
+                "support_bars": group.active_bars,
+                "long_active_bars": group.long_bars,
+                "short_active_bars": group.short_bars,
+                "candidate_identities": candidate_identities,
+            })
+        })
+        .collect::<Vec<_>>();
     let near_thresholds = CANDIDATE_SIGNAL_NEAR_THRESHOLDS
         .iter()
         .copied()
-        .zip(threshold_counts)
+        .zip(aggregate.threshold_counts)
         .map(|(threshold, count)| {
             serde_json::json!({
                 "similarity_threshold": threshold,
@@ -7117,19 +7183,8 @@ pub fn summarize_research_candidate_signal_similarity_v1(
             })
         })
         .collect::<Vec<_>>();
-    let exact_signal_groups = exact_signal_groups
-        .into_iter()
-        .map(|group| {
-            serde_json::json!({
-                "all_zero": group.all_zero,
-                "support_bars": group.active_bars,
-                "long_active_bars": group.long_bars,
-                "short_active_bars": group.short_bars,
-                "candidate_identities": group.candidates,
-            })
-        })
-        .collect::<Vec<_>>();
-    let top_pairs = top_pairs
+    let top_pairs = aggregate
+        .top_pairs
         .into_iter()
         .map(|stat| {
             serde_json::json!({
@@ -7160,14 +7215,14 @@ pub fn summarize_research_candidate_signal_similarity_v1(
                 .ok_or_else(|| anyhow::anyhow!("saved candidate signal behavior census has no timestamps"))?,
         },
         "summary": {
-            "all_zero_candidate_count": all_zero_candidates,
-            "defined_pair_count": defined_pairs,
-            "undefined_zero_union_pair_count": undefined_zero_union_pairs,
-            "same_direction_active_bars_sum": same_direction_bars_sum,
-            "opposite_direction_active_bars_sum": opposite_direction_bars_sum,
-            "active_union_bars_total": active_union_bars_sum,
+            "all_zero_candidate_count": aggregate.all_zero_candidates,
+            "defined_pair_count": aggregate.defined_pairs,
+            "undefined_zero_union_pair_count": aggregate.undefined_zero_union_pairs,
+            "same_direction_active_bars_sum": aggregate.same_direction_bars_sum,
+            "opposite_direction_active_bars_sum": aggregate.opposite_direction_bars_sum,
+            "active_union_bars_total": aggregate.active_union_bars_sum,
             "exact_signal_group_total": exact_signal_groups.len(),
-            "exact_signal_candidate_total": exact_signal_candidate_count,
+            "exact_signal_candidate_total": aggregate.exact_signal_candidate_total,
         },
         "exact_signal_groups": exact_signal_groups,
         "near_thresholds": near_thresholds,

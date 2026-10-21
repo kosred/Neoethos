@@ -6967,3 +6967,127 @@ fn candidate_signal_exact_fingerprint_equality_preserves_stable_identity() {
     assert_eq!(left.identity.strategy_id, "candidate-7");
     assert_eq!(right.identity.strategy_id, "candidate-11");
 }
+
+fn aggregate_pair(left: &[i8], right: &[i8]) -> CandidateSignalAggregateV1 {
+    aggregate_candidate_signal_behavior(
+        &[signal_fingerprint(left, 3), signal_fingerprint(right, 7)],
+        left.len(),
+    )
+}
+
+#[test]
+fn candidate_signal_aggregate_groups_silent_and_hash_collision_without_false_merge() {
+    let silent = aggregate_candidate_signal_behavior(
+        &[
+            signal_fingerprint(&[0, 0, 0], 0),
+            signal_fingerprint(&[0, 0, 0], 1),
+        ],
+        3,
+    );
+    assert_eq!(silent.exact_signal_groups.len(), 1);
+    assert!(silent.exact_signal_groups[0].all_zero);
+    assert_eq!(silent.exact_signal_groups[0].candidates.len(), 2);
+    assert_eq!(silent.all_zero_candidates, 2);
+    assert_eq!(silent.defined_pairs, 0);
+    assert_eq!(silent.undefined_zero_union_pairs, 1);
+
+    let identical = [1, 0, -1, 1, 0];
+    let grouped = aggregate_candidate_signal_behavior(
+        &[
+            signal_fingerprint(&identical, 7),
+            signal_fingerprint(&identical, 11),
+        ],
+        identical.len(),
+    );
+    assert_eq!(grouped.exact_signal_groups.len(), 1);
+    assert!(!grouped.exact_signal_groups[0].all_zero);
+    assert_eq!(
+        grouped.exact_signal_groups[0]
+            .candidates
+            .iter()
+            .map(|candidate| candidate.index)
+            .collect::<Vec<_>>(),
+        vec![7, 11]
+    );
+
+    // Force the acceleration hash to collide while retaining different signal
+    // bitsets. Exact grouping must verify bitsets, not trust the hash.
+    let mut left = signal_fingerprint(&[1, 0, 1, 0], 0);
+    let mut right = signal_fingerprint(&[1, 1, 0, 0], 1);
+    right.signal_hash = left.signal_hash;
+    let collision = aggregate_candidate_signal_behavior(&[left.clone(), right], 4);
+    assert!(collision.exact_signal_groups.is_empty());
+    left.identity.strategy_id = "stable-left".to_string();
+    assert_eq!(left.identity.index, 0);
+}
+
+#[test]
+fn candidate_signal_aggregate_counts_threshold_boundaries_and_pair_accounting() {
+    let left = vec![1_i8; 100];
+    let mut right = left.clone();
+    for slot in right.iter_mut().take(10) {
+        *slot = -1;
+    }
+    let boundary_90 = aggregate_pair(&left, &right);
+    assert_eq!(boundary_90.defined_pairs, 1);
+    assert_eq!(boundary_90.undefined_zero_union_pairs, 0);
+    assert_eq!(boundary_90.threshold_counts, [1, 0, 0]);
+    assert_eq!(boundary_90.top_pairs.len(), 1);
+    assert_eq!(boundary_90.top_pairs[0].similarity, 0.90);
+    assert_eq!(boundary_90.top_pairs[0].same_direction_bars, 90);
+    assert_eq!(boundary_90.top_pairs[0].opposite_direction_bars, 10);
+    assert_eq!(boundary_90.top_pairs[0].active_union_bars, 100);
+
+    let mut right = left.clone();
+    for slot in right.iter_mut().take(5) {
+        *slot = -1;
+    }
+    let boundary_95 = aggregate_pair(&left, &right);
+    assert_eq!(boundary_95.threshold_counts, [1, 1, 0]);
+    assert_eq!(boundary_95.top_pairs[0].similarity, 0.95);
+
+    let mut right = left.clone();
+    right[0] = -1;
+    let boundary_99 = aggregate_pair(&left, &right);
+    assert_eq!(boundary_99.threshold_counts, [1, 1, 1]);
+    assert_eq!(boundary_99.top_pairs[0].similarity, 0.99);
+
+    let mut right = left.clone();
+    for slot in right.iter_mut().take(11) {
+        *slot = -1;
+    }
+    let below_90 = aggregate_pair(&left, &right);
+    assert_eq!(below_90.threshold_counts, [0, 0, 0]);
+}
+
+#[test]
+fn candidate_signal_aggregate_top64_is_deterministic_and_keeps_candidate_ids() {
+    let mut fingerprints = Vec::new();
+    for index in 0..12usize {
+        let signal = (0..24)
+            .map(|row| {
+                if (row + index) % 3 == 0 {
+                    1
+                } else if (row + index) % 5 == 0 {
+                    -1
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        fingerprints.push(signal_fingerprint(&signal, index));
+    }
+    let first = aggregate_candidate_signal_behavior(&fingerprints, 24);
+    let second = aggregate_candidate_signal_behavior(&fingerprints, 24);
+    assert_eq!(first.defined_pairs, 66);
+    assert_eq!(first.top_pairs.len(), 64);
+    assert_eq!(first.top_pairs.len(), second.top_pairs.len());
+    for (left, right) in first.top_pairs.iter().zip(&second.top_pairs) {
+        assert_eq!(left.left, right.left);
+        assert_eq!(left.right, right.right);
+        assert_eq!(left.similarity.to_bits(), right.similarity.to_bits());
+        assert!(left.left < left.right);
+        assert!(left.similarity >= right.similarity || left.left < right.left);
+    }
+    assert!(first.top_pairs.iter().all(|pair| pair.left < 12));
+}

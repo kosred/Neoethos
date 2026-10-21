@@ -2235,6 +2235,12 @@ fn cmd_discover_on_budgeted_pool(
             Some(spec) => canonical_research::parse_diagnostic_cost_variants(&spec)?,
             None => Vec::new(),
         };
+        if diagnose_signals_out.is_some() {
+            anyhow::ensure!(
+                diagnose_cost_variants.is_empty(),
+                "candidate signal behavior census cannot be combined with cost variants"
+            );
+        }
         if diagnose_cost_out.is_some() {
             anyhow::ensure!(
                 saved_research.is_some(),
@@ -2246,6 +2252,7 @@ fn cmd_discover_on_budgeted_pool(
             );
         }
         let mut diagnose_cost_written: Option<String> = None;
+        let mut diagnose_signals_written: Option<String> = None;
         #[cfg(feature = "gpu-nvidia")]
         anyhow::ensure!(
             canonical_cpu_research.is_none(),
@@ -2726,6 +2733,7 @@ fn cmd_discover_on_budgeted_pool(
                             });
                             neoethos_core::storage::json::write_json_atomic(diag_path, &document)?;
                             emit_cpu_research_stage("candidate_signal_behavior_census_written");
+                            diagnose_signals_written = Some(signals_out.to_owned());
                             return Ok(research);
                         }
                         if let Some(diag_out) = diagnose_cost_out.as_deref() {
@@ -2851,6 +2859,11 @@ fn cmd_discover_on_budgeted_pool(
                 },
             )?;
 
+            if let Some(diag_out) = diagnose_signals_written {
+                println!("candidate_signal_behavior_census={diag_out}");
+                println!("candidate_signal_behavior_census_status=ResearchOnly");
+                return Ok((symbol.clone(), base.clone(), 0, 0));
+            }
             if let Some(diag_out) = diagnose_cost_written {
                 println!("candidate_cost_diagnostic={diag_out}");
                 println!("candidate_cost_diagnostic_status=ResearchOnly");

@@ -897,6 +897,13 @@ mod tests {
             ))
             .is_err()
         );
+        let mut with_variant_only = raw.clone();
+        push(
+            &mut with_variant_only,
+            "--diagnose-cost-variants",
+            "base=1.0:2.0",
+        );
+        assert!(Arguments::parse(&with_variant_only).is_err());
         let mut with_cost = raw.clone();
         push(
             &mut with_cost,
