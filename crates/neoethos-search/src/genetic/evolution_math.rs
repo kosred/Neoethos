@@ -1861,6 +1861,20 @@ mod tests {
         );
     }
 
+    fn diverse_raw_ladder_frame() -> neoethos_data::FeatureFrame {
+        let n = 100usize;
+        let scales = [
+            0.001_f64, 0.002, 0.004, 0.007, 0.010, 0.020, 0.040, 0.080, 0.100, 0.120, 0.140, 0.160,
+        ];
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, scales.len()));
+        for r in 0..n {
+            for (j, scale) in scales.iter().enumerate() {
+                data[(r, j)] = (r as f64 + 1.0) * scale;
+            }
+        }
+        frame_of(data)
+    }
+
     fn normalized_frame_of(a: ndarray::Array2<f64>) -> std::sync::Arc<neoethos_data::FeatureFrame> {
         let raw = std::sync::Arc::new(frame_of(a));
         let n = raw.n_samples();
@@ -1877,17 +1891,7 @@ mod tests {
     fn derive_ladder_produces_monotonic_ascending_values() {
         // A RAW fixture needs enough distinct per-column medians to supply six
         // distinct quantiles. This is not a normalized-collapse fixture.
-        let n = 100usize;
-        let scales = [
-            0.001_f64, 0.002, 0.004, 0.007, 0.010, 0.020, 0.040, 0.080, 0.100, 0.120, 0.140, 0.160,
-        ];
-        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, scales.len()));
-        for r in 0..n {
-            for (j, scale) in scales.iter().enumerate() {
-                data[(r, j)] = (r as f64 + 1.0) * scale;
-            }
-        }
-        let frame = frame_of(data);
+        let frame = diverse_raw_ladder_frame();
         let ladder = derive_adaptive_threshold_ladder_from_features(&frame)
             .expect("adaptive-threshold scan must not fail")
             .expect("diverse raw cube must produce ladder");
@@ -1930,6 +1934,51 @@ mod tests {
         assert_eq!(
             adaptive_column_median_abs(vec![4.0, 1.0, 3.0, 2.0]),
             Some(2.5)
+        );
+    }
+
+    #[test]
+    fn adaptive_column_median_handles_even_extremes_without_overflow() {
+        let median =
+            adaptive_column_median_abs(vec![f64::MAX, f64::MAX]).expect("finite extreme median");
+        assert!(
+            median.is_finite(),
+            "overflow-safe half-sum must stay finite"
+        );
+        let median = adaptive_column_median_abs(vec![f64::MAX, f64::MAX / 2.0, 1.0, 2.0])
+            .expect("finite mixed-extreme median");
+        assert!(
+            median.is_finite(),
+            "overflow-safe half-sum must stay finite"
+        );
+    }
+
+    #[test]
+    fn derive_ladder_rejects_asymmetric_even_shape_collapse() {
+        let n = 64usize;
+        let shapes: [fn(f64) -> f64; 8] = [
+            |x| x,
+            |x| x * x,
+            |x| x * x * x,
+            |x| x.sqrt(),
+            |x| x.ln(),
+            |x| (x / 20.0).exp(),
+            |x| 1.0 / x,
+            |x| (x / 5.0).sin(),
+        ];
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, shapes.len()));
+        for r in 0..n {
+            let x = (r + 1) as f64;
+            for (j, shape) in shapes.iter().enumerate() {
+                data[(r, j)] = shape(x);
+            }
+        }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "asymmetric even normalized shapes must collapse under the corrected median convention"
         );
     }
 
@@ -2040,7 +2089,7 @@ mod tests {
 
     #[test]
     fn derive_ladder_matches_hand_calculated_median_and_percentile_ranks() {
-        use FeatureCellValidity::{Gap, Stale, Valid, Warmup};
+        use FeatureCellValidity::{Gap, Valid, Warmup};
         use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
 
         let central = f64::from_bits(0.8_f64.to_bits() + 1);
@@ -2099,43 +2148,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn derive_ladder_is_bit_exact_across_ram_vortex_workers_and_projection_schedules() {
-        use FeatureCellValidity::{Gap, Valid, Warmup};
-        use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureData};
-
-        let rows = 2_053;
-        let scales = [
-            0.0002_f64, 0.0003, 0.0005, 0.0007, 0.0010, 0.0014, 0.0020, 0.0028, 0.0040, 0.0056,
-            0.0070, 0.0080,
-        ];
-        let columns = scales
-            .iter()
-            .enumerate()
-            .map(|(column, scale)| {
-                let values = (0..rows)
-                    .map(|row| {
-                        let sign = if row % 2 == 0 { -1.0 } else { 1.0 };
-                        sign * ((row + 1) as f64 * scale)
-                    })
-                    .collect();
-                let validity = (0..rows)
-                    .map(|row| if row % 17 == 0 { Warmup } else { Valid })
-                    .collect();
-                FeatureColumnF64::new(format!("mixed_δοκιμή_{column}"), values, validity)
-                    .expect("mixed precision/validity column")
-            })
-            .collect();
-        let ram = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
-            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
-            columns,
-        )
-        .expect("mixed ladder fixture");
-        let FeatureData::InMemory(raw_columns) = &ram.data else {
+    fn independent_threshold_ladder(frame: &neoethos_data::FeatureFrame) -> Option<[u64; 6]> {
+        use neoethos_data::FeatureData;
+        let FeatureData::InMemory(raw_columns) = &frame.data else {
             unreachable!()
         };
-        // Independent full-sort reference: no projection planner, parallel
-        // collection or select_nth implementation is reused by this oracle.
         let mut medians = raw_columns
             .iter()
             .filter_map(|column| {
@@ -2146,35 +2163,62 @@ mod tests {
                     .filter(|(value, validity)| value.is_finite() && validity.is_valid())
                     .map(|(value, _)| value.abs())
                     .collect::<Vec<_>>();
+                if magnitudes.is_empty() {
+                    return None;
+                }
                 magnitudes.sort_by(f64::total_cmp);
                 let middle = magnitudes.len() / 2;
                 if magnitudes.len() % 2 == 0 {
-                    Some((magnitudes[middle - 1] + magnitudes[middle]) * 0.5)
+                    // Overflow-safe mathematical average, matching the norm.
+                    Some(magnitudes[middle - 1] * 0.5 + magnitudes[middle] * 0.5)
                 } else {
                     magnitudes.get(middle).copied()
                 }
             })
             .collect::<Vec<_>>();
+        if medians.is_empty() {
+            return None;
+        }
         medians.sort_by(f64::total_cmp);
-        let expected = [0.10, 0.25, 0.50, 0.75, 0.90, 0.99].map(|percentile| {
+        let pct = |percentile: f64| -> f64 {
             let index = (percentile * (medians.len() - 1) as f64).round() as usize;
-            medians[index].clamp(1e-4, 10.0).to_bits()
+            medians[index].clamp(1e-4, 10.0)
+        };
+        let ladder = [
+            pct(0.10),
+            pct(0.25),
+            pct(0.50),
+            pct(0.75),
+            pct(0.90),
+            pct(0.99),
+        ];
+        // Independent copy of the documented fallback contract: the six
+        // randomized slots are useful only while adjacent values differ.
+        let tolerance = 1e-9_f64;
+        let distinct = ladder.windows(2).all(|pair| {
+            let scale = pair[0].abs().max(pair[1].abs()).max(1.0);
+            pair[1] > pair[0] && pair[1] - pair[0] > tolerance * scale
         });
+        distinct.then(|| ladder.map(f64::to_bits))
+    }
+
+    fn assert_adaptive_ladder_schedule_parity(
+        ram: &neoethos_data::FeatureFrame,
+        expected: Option<[u64; 6]>,
+    ) {
         let temporary = tempfile::tempdir().expect("isolated parity Vortex root");
-        let vortex = ladder_vortex_copy(&ram, temporary.path());
+        let vortex = ladder_vortex_copy(ram, temporary.path());
         for workers in [1, 2, 5] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(workers)
                 .build()
                 .expect("isolated parity worker pool");
-            for frame in [&ram, &vortex] {
-                assert_eq!(
-                    pool.install(|| derive_adaptive_threshold_ladder_from_features(frame))
-                        .expect("live-planned ladder")
-                        .expect("nonempty ladder")
-                        .map(f64::to_bits),
-                    expected,
-                );
+            for frame in [ram, &vortex] {
+                let actual = pool
+                    .install(|| derive_adaptive_threshold_ladder_from_features(frame))
+                    .expect("live-planned ladder")
+                    .map(|ladder| ladder.map(f64::to_bits));
+                assert_eq!(actual, expected, "workers={workers}");
                 for (batch_columns, concurrent_batches) in [
                     (1, 1),
                     (1, 3),
@@ -2192,8 +2236,7 @@ mod tests {
                             )
                         })
                         .expect("scheduled ladder")
-                        .expect("nonempty ladder")
-                        .map(f64::to_bits);
+                        .map(|ladder| ladder.map(f64::to_bits));
                     assert_eq!(
                         actual, expected,
                         "workers={workers}, batch_columns={batch_columns}, concurrent_batches={concurrent_batches}",
@@ -2201,6 +2244,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn derive_ladder_edge_fixture_is_bit_exact_across_ram_vortex_workers_and_schedules() {
+        use FeatureCellValidity::{Gap, Valid, Warmup};
+        use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
+
+        let rows = 2_053;
+        let columns = (0..19)
+            .map(|column| {
+                let values = (0..rows)
+                    .map(|row| {
+                        let sign = if row % 2 == 0 { -1.0 } else { 1.0 };
+                        sign * match column % 5 {
+                            0 => 0.0,
+                            1 => f64::MIN_POSITIVE * (row % 7 + 1) as f64,
+                            2 => f64::from_bits(1.0_f64.to_bits() + (row % 31) as u64),
+                            3 => f64::MAX / (row % 17 + 1) as f64,
+                            _ => ((row * 37 + column * 13) % 509) as f64 / 64.0,
+                        }
+                    })
+                    .collect();
+                let validity = (0..rows)
+                    .map(|row| {
+                        if column == 18 || row % 17 == 0 {
+                            Warmup
+                        } else if row % 23 == 0 {
+                            Gap
+                        } else {
+                            Valid
+                        }
+                    })
+                    .collect();
+                FeatureColumnF64::new(format!("mixed_δοκιμή_{column}"), values, validity)
+                    .expect("mixed precision/validity column")
+            })
+            .collect();
+        let ram = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+            neoethos_data::test_fixtures::canonical_test_timestamps(rows),
+            columns,
+        )
+        .expect("mixed ladder fixture");
+        let expected = independent_threshold_ladder(&ram);
+        assert_adaptive_ladder_schedule_parity(&ram, expected);
+    }
+
+    #[test]
+    fn derive_ladder_diverse_raw_is_bit_exact_across_ram_vortex_workers_and_schedules() {
+        let ram = diverse_raw_ladder_frame();
+        let expected = independent_threshold_ladder(&ram);
+        assert!(
+            expected.is_some(),
+            "diverse RAW fixture must retain a Some ladder"
+        );
+        assert_adaptive_ladder_schedule_parity(&ram, expected);
     }
 
     #[test]
