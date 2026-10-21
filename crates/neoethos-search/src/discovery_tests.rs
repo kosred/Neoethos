@@ -6488,3 +6488,156 @@ fn weekly_base_filter_uses_measured_money_and_the_settings_path_binds_the_interv
     );
     assert!(config.weekly_objective_for_window(&[1, 2]).is_err());
 }
+
+#[test]
+fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_roles() {
+    use neoethos_data::{
+        BarTimestampConvention, CanonicalDatasetIdentity, CanonicalTimeframe, FeatureBuildOptions,
+        FeatureCellValidity, FeatureColumnF64,
+    };
+    use neoethos_feature_contracts::{
+        DatasetFeatureArtifactProvenanceV1, FeatureNodeV1, FeatureOutputV1, FeaturePlanV1,
+        SourceArtifactBindingV1, SourceSegmentV1,
+    };
+    use rand::{SeedableRng, rngs::StdRng};
+
+    let ohlcv = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+    let timestamps = ohlcv.timestamp.clone().expect("fixture timestamps");
+    let n = timestamps.len();
+    let names = vec![
+        "adx".to_string(),
+        "noise_base".to_string(),
+        "h1_macd".to_string(),
+        "noise_higher".to_string(),
+    ];
+    let columns: Vec<FeatureColumnF64> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let values = (0..n)
+                .map(|row| (((row + 1) * (index + 2)) as f64 * 0.17).sin())
+                .collect();
+            FeatureColumnF64::new(name.clone(), values, vec![FeatureCellValidity::Valid; n])
+                .unwrap()
+        })
+        .collect();
+    let base_identity = CanonicalDatasetIdentity::external(
+        "fixture",
+        "EURUSD",
+        CanonicalTimeframe::M15,
+        BarTimestampConvention::BarOpen,
+    )
+    .unwrap();
+    let higher_identity = CanonicalDatasetIdentity::external(
+        "fixture",
+        "EURUSD",
+        CanonicalTimeframe::H1,
+        BarTimestampConvention::BarOpen,
+    )
+    .unwrap();
+    let outputs = |indices: &[usize]| {
+        indices
+            .iter()
+            .map(|index| FeatureOutputV1::f64(names[*index].clone(), 1).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let base_source = FeatureNodeV1::source(
+        "source:base",
+        base_identity.clone(),
+        "fixture.base",
+        1,
+        outputs(&[0, 1]),
+        [3u8; 32],
+    )
+    .unwrap();
+    let higher_source = FeatureNodeV1::source(
+        "source:higher",
+        higher_identity.clone(),
+        "fixture.higher",
+        1,
+        outputs(&[2, 3]),
+        [4u8; 32],
+    )
+    .unwrap();
+    let plan = FeaturePlanV1::new(vec![base_source, higher_source], names.clone()).unwrap();
+    let segment = |identity: &CanonicalDatasetIdentity, hash: [u8; 32]| {
+        SourceArtifactBindingV1::new(
+            if identity.timeframe() == CanonicalTimeframe::M15 {
+                "source:base"
+            } else {
+                "source:higher"
+            },
+            identity.clone(),
+            "fixture.schema",
+            hash,
+            "fixture.generation",
+            hash,
+            BarTimestampConvention::BarOpen,
+            vec![SourceSegmentV1::new(0, n as u64, timestamps[0], timestamps[n - 1]).unwrap()],
+        )
+        .unwrap()
+    };
+    let provenance = DatasetFeatureArtifactProvenanceV1::new(
+        &plan,
+        vec![
+            segment(&base_identity, [3u8; 32]),
+            segment(&higher_identity, [4u8; 32]),
+        ],
+    )
+    .unwrap();
+    let frame = neoethos_data::test_fixtures::with_test_feature_build_options(
+        neoethos_data::FeatureFrame::from_columns(timestamps, columns, plan, provenance).unwrap(),
+        FeatureBuildOptions {
+            profile: neoethos_data::FeatureProfile::Standard,
+            prefix_base_features: false,
+            higher_tfs: vec!["H1".to_string()],
+            normalization_training_rows: None,
+            drop_columns_without_normalization_training_support: false,
+            classic_ta_working_set: None,
+            quantitative_semantics: neoethos_data::QuantitativeFeatureSemantics::LegacyV2,
+        },
+    );
+    let spec = PrefilterSpec {
+        top_k: 2,
+        insample_frac: 1.0,
+        min_per_tf: 1,
+        max_hold_bars: 3,
+        atr_period: 3,
+        sl_atr_mult: 1.0,
+        rr: 2.0,
+        round_trip_cost_px: 0.0,
+    };
+    let (filtered, _census) = prefilter_features(&frame, &ohlcv, &spec).unwrap();
+    let base_column = filtered
+        .names
+        .iter()
+        .position(|name| name == "adx")
+        .expect("base force-kept");
+    let higher_column = filtered
+        .names
+        .iter()
+        .position(|name| name == "h1_macd")
+        .expect("higher force-kept");
+    assert_ne!(base_column, higher_column);
+    let (base, prefixed) =
+        crate::genetic::search_engine::base_timeframe_context_from_features(&frame)
+            .expect("exact M15/H1 recipe provenance");
+    let _guard = crate::genetic::seed_templates::enter_search_base_timeframe(&base, prefixed);
+    let seeds = crate::genetic::seed_templates::seed_professional_templates(
+        50,
+        &filtered.names,
+        filtered.names.len(),
+        &mut StdRng::seed_from_u64(21),
+    );
+    assert!(!seeds.is_empty());
+    assert!(
+        seeds.iter().any(|gene| gene.indices.contains(&base_column)),
+        "unprefixed base role reached emitted genes"
+    );
+    assert!(
+        seeds
+            .iter()
+            .any(|gene| gene.indices.contains(&higher_column)),
+        "higher timeframe identity stays distinct and reaches emitted genes"
+    );
+}
