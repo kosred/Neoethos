@@ -11500,20 +11500,20 @@ where
     let weekly_net = stage1_evaluation
         .weekly_objective
         .map(|_| candidate_metrics.iter().map(|m| m[0]).collect::<Vec<_>>());
-    let mut ranked_candidates = rank_candidates_on_matching_window(
-        candidates,
-        candidate_metrics,
-        stage1_evaluation.initial_equity,
-        stage1_timestamps,
-        growth_goal,
-    )?;
-    if stage1_evaluation.weekly_objective.is_some() {
-        ranked_candidates.sort_by(|a, b| {
-            b.1.fitness
-                .total_cmp(&a.1.fitness)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-    }
+    let mut ranked_candidates = if stage1_evaluation.weekly_objective.is_some() {
+        // The GA hands over weekly-vector order. Preserve it (and each original
+        // index) through the candidate cap, weekly net lookup and ID
+        // disambiguation; raw Gene.fitness is not the weekly selection owner.
+        indexed_candidates_preserving_ga_order(candidates, &candidate_metrics)?
+    } else {
+        rank_candidates_on_matching_window(
+            candidates,
+            candidate_metrics,
+            stage1_evaluation.initial_equity,
+            stage1_timestamps,
+            growth_goal,
+        )?
+    };
     let ga_returned_candidates = ranked_candidates.len();
     let max_candidates =
         candidate_truncation_limit(config.candidate_count, ranked_candidates.len());
@@ -14473,6 +14473,21 @@ fn rank_candidates_on_matching_window(
         .into_iter()
         .map(|(index, gene, _)| (index, gene))
         .collect())
+}
+
+/// Weekly mode already receives the GA weekly-vector order. The post-GA
+/// candidate cap must preserve that order and the original paired index: the
+/// weekly net lookup keys on that index, and re-sorting by raw financial
+/// Gene.fitness would undo feasible/vector precedence before the cap.
+fn indexed_candidates_preserving_ga_order(
+    candidates: Vec<Gene>,
+    metrics: &[[f64; 11]],
+) -> Result<Vec<(usize, Gene)>> {
+    anyhow::ensure!(
+        candidates.len() == metrics.len(),
+        "GA candidate/metric alignment mismatch"
+    );
+    Ok(candidates.into_iter().enumerate().collect())
 }
 
 fn candidate_truncation_limit(requested: usize, available: usize) -> usize {
@@ -17604,6 +17619,75 @@ mod candidate_validation_order_tests {
 #[cfg(test)]
 #[path = "discovery_holdout_signal_tests.rs"]
 mod holdout_signal_tests;
+
+#[cfg(test)]
+mod weekly_handoff_tests {
+    use super::*;
+
+    fn candidate(fitness: f64, strategy_id: &str) -> Gene {
+        Gene {
+            fitness,
+            strategy_id: strategy_id.to_string(),
+            ..Gene::default()
+        }
+    }
+
+    #[test]
+    fn weekly_order_and_original_index_survive_cap_and_net_lookup() {
+        let feasible = candidate(-1.70425, "feasible_first");
+        let infeasible = candidate(-0.2146797, "infeasible_higher_raw_fitness");
+        let feasible_net = 0.031;
+        let infeasible_net = -0.004;
+        let metrics = vec![
+            [
+                feasible_net,
+                0.0,
+                10_000.0,
+                0.09,
+                0.55,
+                1.2,
+                1.0,
+                0.0,
+                100.0,
+                0.1,
+                0.04,
+            ],
+            [
+                infeasible_net,
+                0.0,
+                10_000.0,
+                0.2,
+                0.4,
+                0.9,
+                -0.1,
+                0.0,
+                50.0,
+                0.1,
+                0.2,
+            ],
+        ];
+        let mut ranked =
+            indexed_candidates_preserving_ga_order(vec![feasible, infeasible], &metrics).unwrap();
+        let weekly_net: Vec<f64> = metrics.iter().map(|m| m[0]).collect();
+        ranked.truncate(candidate_truncation_limit(1, ranked.len()));
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].0, 0, "original GA index must survive the cap");
+        assert_eq!(ranked[0].1.strategy_id, "feasible_first");
+        assert_eq!(weekly_net[ranked[0].0], feasible_net);
+        assert!(
+            ranked[0].1.fitness < -0.5,
+            "the feasible candidate is deliberately negative on raw financial fitness"
+        );
+    }
+
+    #[test]
+    fn weekly_order_helper_rejects_unaligned_metrics() {
+        let error =
+            indexed_candidates_preserving_ga_order(vec![candidate(0.0, "only_candidate")], &[])
+                .expect_err("misaligned metrics must be refused");
+        assert!(error.to_string().contains("alignment mismatch"));
+    }
+}
 
 #[cfg(test)]
 #[path = "discovery_tests.rs"]

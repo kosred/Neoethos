@@ -584,7 +584,12 @@ fn run_finalization_milestone_fixture(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    candidate_count: usize,
+    weekly_objective: Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
+    fitnesses: Option<(f64, f64)>,
 ) -> (Result<DiscoveryResult>, Vec<DiscoveryProgress>) {
+    let mut config = config.clone();
+    config.candidate_count = candidate_count;
     // `profitable_gene` is also a compact artifact fixture and intentionally
     // uses broad +/-0.5 thresholds. The canonical EURUSD sample's first
     // feature is `close_minus_open`, whose real magnitude is much smaller, so
@@ -596,13 +601,21 @@ fn run_finalization_milestone_fixture(
     alpha_1.short_threshold = 0.0;
     alpha_1.tp_pips = 1.0;
     alpha_1.sl_pips = 20.0;
+    if let Some((fitness_1, _)) = fitnesses {
+        alpha_1.fitness = fitness_1;
+    }
     let mut alpha_2 = profitable_gene("alpha-2");
     alpha_2.long_threshold = 0.0;
     alpha_2.short_threshold = 0.0;
     alpha_2.tp_pips = 1.0;
     alpha_2.sl_pips = 20.0;
+    if let Some((_, fitness_2)) = fitnesses {
+        alpha_2.fitness = fitness_2;
+    }
     let candidates = vec![alpha_1, alpha_2];
-    let signal_config = config.evaluation_config_with_smc_gate(ohlcv.close.last().copied(), 0.75);
+    let mut signal_config =
+        config.evaluation_config_with_smc_gate(ohlcv.close.last().copied(), 0.75);
+    signal_config.weekly_objective = weekly_objective;
     let (candidate_signals, candidate_confidences): (Vec<_>, Vec<_>) = candidates
         .iter()
         .map(|gene| {
@@ -624,7 +637,7 @@ fn run_finalization_milestone_fixture(
     // metrics from these exact genes/values/settings, paired in the same order,
     // and the timestamps of that same window rather than invented GA scores.
     let resolver = GeneEvalSettingsResolver::for_slice(
-        config,
+        &config,
         candidates.iter(),
         &ohlcv.high,
         &ohlcv.low,
@@ -683,7 +696,7 @@ fn run_finalization_milestone_fixture(
         None,
         None,
         "fnv64:0123456789abcdef",
-        config,
+        &config,
         0.75,
         features.names.clone(),
         &population_execution_run,
@@ -691,6 +704,45 @@ fn run_finalization_milestone_fixture(
         |event| progress_events.push(event),
     );
     (result, progress_events)
+}
+
+#[test]
+fn weekly_finalizer_cap_preserves_incoming_ga_order_and_original_index() {
+    use crate::scoring::weekly_cadence::{
+        WeeklyCadenceContractV1, WeeklySearchLimitsV1, WeeklySearchObjectiveV1,
+    };
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let config = finalization_milestone_config();
+    let start = *features.timestamps.first().expect("fixture timestamps");
+    let end = *features.timestamps.last().expect("fixture timestamps");
+    let cadence = WeeklyCadenceContractV1::new(start, end, 21.0).unwrap();
+    let limits = WeeklySearchLimitsV1 {
+        initial_equity: 10_000.0,
+        per_trade_risk_band: (0.005, 0.01),
+        max_drawdown: 0.10,
+        max_daily_drawdown: 0.05,
+        min_trades_per_month: 0.0,
+        min_net_profit: 0.0,
+        min_net_expectancy: 0.0,
+        min_win_rate: 0.0,
+        min_profit_factor: 0.0,
+    };
+    let objective = WeeklySearchObjectiveV1::current(cadence, limits);
+    let (result, _events) = run_finalization_milestone_fixture(
+        &features,
+        &ohlcv,
+        &config,
+        1,
+        Some(objective),
+        Some((-1.70425, -0.2146797)),
+    );
+    let result = result.expect("weekly finalizer fixture");
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(
+        result.candidates[0].strategy_id, "alpha-1",
+        "weekly order must survive the cap instead of raw-fitness re-sort"
+    );
 }
 
 fn assert_pre_walkforward_milestones(progress_events: &[DiscoveryProgress]) {
@@ -739,7 +791,14 @@ fn finalize_candidates_with_no_wf_windows_returns_only_nonexportable_diagnostics
     assert_eq!(config.embargo_minutes, 120);
     assert!(ohlcv.close.len() / config.walkforward_splits < 80);
 
-    let (result, progress_events) = run_finalization_milestone_fixture(&features, &ohlcv, &config);
+    let (result, progress_events) = run_finalization_milestone_fixture(
+        &features,
+        &ohlcv,
+        &config,
+        config.candidate_count,
+        None,
+        None,
+    );
     let result = result.expect("no eligible WF window yields non-exportable diagnostics");
     assert_pre_walkforward_milestones(&progress_events);
     assert!(result.validation_gates.fallback_mode);
@@ -839,7 +898,14 @@ fn finalize_candidates_emits_selection_milestones_before_broker_truth_refusal() 
     assert_eq!(n - test_start, 60);
     assert!(window >= 80 && train_end >= 40 && n - test_start >= 40);
 
-    let (result, progress_events) = run_finalization_milestone_fixture(&features, &ohlcv, &config);
+    let (result, progress_events) = run_finalization_milestone_fixture(
+        &features,
+        &ohlcv,
+        &config,
+        config.candidate_count,
+        None,
+        None,
+    );
     let error =
         result.expect_err("eligible financial validation must require exact broker evidence");
     assert!(
