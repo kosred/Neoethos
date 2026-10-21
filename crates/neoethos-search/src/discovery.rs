@@ -8236,6 +8236,79 @@ where
     })
 }
 
+/// Validate a recorded research envelope as upstream INPUT for a fresh,
+/// hash-pinned NEW search. The old result supplies only its input/recipe
+/// provenance and ordered effective alphabet; old genomes, fitness and
+/// portfolio are never returned or reused.
+thread_local! {
+    static RECORDED_EFFECTIVE_FEATURE_NAMES: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub struct RecordedEffectiveFeatureNamesGuard {
+    previous: Option<Vec<String>>,
+}
+
+impl Drop for RecordedEffectiveFeatureNamesGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        RECORDED_EFFECTIVE_FEATURE_NAMES.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+pub fn install_recorded_effective_feature_names(
+    expected: Vec<String>,
+) -> RecordedEffectiveFeatureNamesGuard {
+    let previous = RECORDED_EFFECTIVE_FEATURE_NAMES.with(|slot| slot.borrow_mut().replace(expected));
+    RecordedEffectiveFeatureNamesGuard { previous }
+}
+
+fn ensure_recorded_effective_feature_names(observed: &[String]) -> Result<()> {
+    let expected = RECORDED_EFFECTIVE_FEATURE_NAMES.with(|slot| slot.borrow().clone());
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        expected.as_slice() == observed,
+        "recorded ordered effective feature alphabet differs from the current prefilter: expected {} names, observed {} names; refusing before GA",
+        expected.len(),
+        observed.len()
+    );
+    Ok(())
+}
+
+pub fn validate_recorded_new_search_input(
+    recorded: &crate::canonical_trendbar_research::CanonicalTrendbarResearchDiscoveryResultV3,
+    input: &CanonicalSearchRunInputV2<'_>,
+    current_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+) -> Result<Vec<String>> {
+    recorded.validate()?;
+    let recorded_contract = recorded.execution_contract();
+    recorded_contract.validate_against_input(input)?;
+    anyhow::ensure!(
+        recorded_contract.identity_sha256()? == current_contract.identity_sha256()?,
+        "recorded research input/settings/cost identity differs from the current reopened inputs; refusing a non-comparable new search"
+    );
+    let expected = recorded.discovery_result().effective_feature_names.clone();
+    anyhow::ensure!(
+        !expected.is_empty(),
+        "recorded new-search input has no ordered effective feature alphabet"
+    );
+    Ok(expected)
+}
+
+/// Production handoff for the recorded-input NEW-search mode. It validates
+/// input identity, installs the recorded ordered alphabet as a validation-only
+/// expectation, and starts a fresh search state without replaying old genomes,
+/// fitness, portfolio or discovery-ledger memory.
+pub fn prepare_recorded_new_search(
+    recorded: &crate::canonical_trendbar_research::CanonicalTrendbarResearchDiscoveryResultV3,
+    input: &CanonicalSearchRunInputV2<'_>,
+    current_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+) -> Result<Vec<String>> {
+    validate_recorded_new_search_input(recorded, input, current_contract)
+}
+
 /// Full receipt-bound CUDA/CPU discovery for canonical-trendbar research.
 /// The returned envelope is structurally research-only and cannot authorize
 /// live execution or promotion.
@@ -9419,6 +9492,7 @@ where
     );
     // Capture names after prefilter — gene indices refer to this list.
     let effective_feature_names = features.names.clone();
+    ensure_recorded_effective_feature_names(&effective_feature_names)?;
 
     // The resident execution parent is the exact post-trim, post-prefilter
     // dataset consumed by every population lane in this run. The public
@@ -14489,6 +14563,7 @@ fn indexed_candidates_preserving_ga_order(
     );
     Ok(candidates.into_iter().enumerate().collect())
 }
+
 
 fn candidate_truncation_limit(requested: usize, available: usize) -> usize {
     if available == 0 {

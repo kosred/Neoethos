@@ -2168,6 +2168,24 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         .context("execute Discovery on the lease-bound CPU pool")?
 }
 
+fn restore_recorded_feature_options(
+    requested: neoethos_data::FeatureBuildOptions,
+    recorded: &neoethos_data::FeatureBuildOptions,
+) -> Result<neoethos_data::FeatureBuildOptions> {
+    anyhow::ensure!(
+        recorded.classic_ta_working_set.is_some(),
+        "recorded research has no exact Classic working set; cannot restore the raw working set"
+    );
+    let mut expected = requested;
+    expected.classic_ta_working_set = recorded.classic_ta_working_set.clone();
+    expected.quantitative_semantics = recorded.quantitative_semantics;
+    anyhow::ensure!(
+        expected == *recorded,
+        "recorded feature-build recipe differs from the requested research inputs"
+    );
+    Ok(recorded.clone())
+}
+
 fn cmd_discover_on_budgeted_pool(
     args: &[String],
     cpu: &neoethos_core::execution::BudgetedCpuScope<'_>,
@@ -2177,11 +2195,24 @@ fn cmd_discover_on_budgeted_pool(
         let canonical_cpu_research = parse_canonical_cpu_research_inputs(args)?;
         let mut quote_replay = canonical_research::QuoteReplayInputs::load(args)?;
         let mut saved_research = canonical_research::SavedResearchInputs::load(args)?;
+        let new_search = canonical_research::NewSearchInputs::load(args)?;
         anyhow::ensure!(
-            (quote_replay.is_none() && saved_research.is_none())
+            (quote_replay.is_none() && saved_research.is_none() && new_search.is_none())
                 || canonical_cpu_research.is_some(),
-            "saved continuation requires receipt-bound canonical CPU research"
+            "saved/new-search continuation requires receipt-bound canonical CPU research"
         );
+        anyhow::ensure!(
+            new_search.is_none() || (quote_replay.is_none() && saved_research.is_none()),
+            "new-search recorded input cannot be combined with finalist/quote continuation"
+        );
+        if let Some(new_search) = &new_search {
+            tracing::info!(
+                target: "neoethos_cli::discover",
+                recorded_research_sha256 = %new_search.sha256,
+                recorded_research_source = %new_search.source.display(),
+                "starting a fresh NEW search from recorded input provenance"
+            );
+        }
         // Research-only saved-candidate cost diagnosis. It reads a saved
         // research envelope and re-costs its candidates; it never runs Search.
         let diagnose_cost_out = parse_flag(args, "--diagnose-candidate-costs-out");
@@ -2493,7 +2524,20 @@ fn cmd_discover_on_budgeted_pool(
 
             // Resume the recorded working set, including a later streaming
             // batch. Today's free RAM must not select a different vocabulary.
-            let (feature_options, streaming_plan) = if let Some(saved) = &saved_research {
+            let (feature_options, streaming_plan) = if let Some(new_search) = &new_search {
+                let recorded = new_search
+                    .research
+                    .as_ref()
+                    .context("new-search recorded research missing")?
+                    .discovery_result()
+                    .search_input_receipt
+                    .feature_build_options()
+                    .context("new-search recorded research has no exact feature-build recipe")?;
+                (
+                    restore_recorded_feature_options(feature_options, recorded)?,
+                    neoethos_search::orchestration::StreamingPlan::disabled(),
+                )
+            } else if let Some(saved) = &saved_research {
                 let recorded = saved
                     .research
                     .as_ref()
@@ -2502,19 +2546,8 @@ fn cmd_discover_on_budgeted_pool(
                     .search_input_receipt
                     .feature_build_options()
                     .context("saved research has no exact feature-build recipe")?;
-                let mut expected = feature_options;
-                expected.classic_ta_working_set = recorded.classic_ta_working_set.clone();
-                expected.quantitative_semantics = recorded.quantitative_semantics;
-                anyhow::ensure!(
-                    expected == *recorded,
-                    "saved feature-build recipe differs from the requested research inputs"
-                );
-                anyhow::ensure!(
-                    recorded.classic_ta_working_set.is_some(),
-                    "saved research has no exact Classic working set; cannot resume an adaptive prefix"
-                );
                 (
-                    recorded.clone(),
+                    restore_recorded_feature_options(feature_options, recorded)?,
                     neoethos_search::orchestration::StreamingPlan::disabled(),
                 )
             } else {
@@ -2607,7 +2640,7 @@ fn cmd_discover_on_budgeted_pool(
                         settings_ref,
                         &contract,
                     )?;
-                    let research_config = discovery_config_from_cli(
+                    let mut research_config = discovery_config_from_cli(
                         args,
                         &research_defaults,
                         &symbol,
@@ -2615,6 +2648,28 @@ fn cmd_discover_on_budgeted_pool(
                         &higher_list,
                         &account_currency,
                     )?;
+                    // The guard must live in this discovery-callback scope, not
+                    // inside the conditional block: the fresh Search/GA call below
+                    // is what reads the expected alphabet after prefiltering.
+                    let _recorded_expected_guard = if let Some(new_search) = &new_search {
+                        let recorded = new_search
+                            .research
+                            .as_ref()
+                            .context("new-search recorded research missing")?;
+                        let expected = neoethos_search::discovery::prepare_recorded_new_search(
+                            recorded, &run_input, &contract,
+                        )?;
+                        // Actual fresh-search state: do not load prior ledger
+                        // memory; the streaming index records this distinction.
+                        research_config.discovery_ledger_enabled = false;
+                        Some(
+                            neoethos_search::discovery::install_recorded_effective_feature_names(
+                                expected,
+                            ),
+                        )
+                    } else {
+                        None
+                    };
                     if let Some(saved) = saved_research.as_mut() {
                         let research = saved
                             .research
@@ -2860,8 +2915,21 @@ fn cmd_discover_on_budgeted_pool(
                 "quote_replay_status": quote_replay_status,
                 "quote_replay_evidence_path": quote_path,
                 "quote_replay_input_sha256": quote_replay.as_ref().map(|input| &input.sha256),
-                "selection_mode": if saved_research.is_some() { "FrozenResearchResumed" } else { "NewSearch" },
+                "selection_mode": if saved_research.is_some() {
+                    "FrozenResearchResumed"
+                } else if new_search.is_some() {
+                    "NewSearchFromRecordedInput"
+                } else {
+                    "NewSearch"
+                },
                 "saved_research_sha256": saved_research.as_ref().map(|input| &input.sha256),
+                "recorded_new_search_research_sha256": new_search.as_ref().map(|input| &input.sha256),
+                "fresh_search_memory_state": new_search.is_some(),
+                "search_memory_note": if new_search.is_some() {
+                    "fresh run; discovery ledger seeding disabled; old V5 search-memory state is not replayed or inferred"
+                } else {
+                    "ordinary mode"
+                },
                 "source_batch_cursor": source_batch_cursor,
                 "locked_finalists": locked_finalists,
                 "streaming_space_exhausted": streamed && next_cursor >= space_len,
@@ -5269,6 +5337,9 @@ fn print_help() {
     );
     println!(
         "    saved quote replay: --quote-replay-bundle <json> --quote-replay-sha256 <sha> --quote-replay-store <dir> --max-batches 1"
+    );
+    println!(
+        "    fresh search from recorded inputs: --new-search-research <research.json> --new-search-research-sha256 <sha> --max-batches 1"
     );
     println!(
         "    research-only saved-candidate cost diagnosis: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-costs-out <new-json> --diagnose-cost-variants label=<round-trip-pips>:<round-trip-commission>,..."

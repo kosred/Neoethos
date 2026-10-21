@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 15] = [
+const OPTIONAL: [&str; 17] = [
     "--higher",
     "--population",
     "--generations",
@@ -45,9 +45,12 @@ const OPTIONAL: [&str; 15] = [
     "--research-oos-eval",
     "--diagnose-candidate-costs-out",
     "--diagnose-cost-variants",
+    "--new-search-research",
+    "--new-search-research-sha256",
 ];
 
 const RESUME_FLAGS: [&str; 2] = ["--resume-research", "--resume-research-sha256"];
+const NEW_SEARCH_FLAGS: [&str; 2] = ["--new-search-research", "--new-search-research-sha256"];
 
 /// Read optional all-or-none inputs on both the strict operator command and
 /// the lower-level discover entrypoint. Neither accepts a duplicate binding.
@@ -95,6 +98,28 @@ fn read_pinned_input(
     Ok((bytes, sha256))
 }
 
+fn read_recorded_research(
+    args: &[String],
+    flags: &[&str; 2],
+    label: &str,
+) -> Result<
+    Option<(
+        neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3,
+        String,
+        PathBuf,
+    )>,
+> {
+    let values = optional_inputs(args, flags)?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let source = PathBuf::from(values[flags[0]]);
+    let (bytes, sha256) = read_pinned_input(&source, values[flags[1]], label, 512 * 1024 * 1024)?;
+    let research =
+        neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3::from_json_bytes(&bytes)?;
+    Ok(Some((research, sha256, source)))
+}
+
 pub(crate) struct SavedResearchInputs {
     pub research: Option<neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3>,
     pub sha256: String,
@@ -103,19 +128,11 @@ pub(crate) struct SavedResearchInputs {
 
 impl SavedResearchInputs {
     pub fn load(args: &[String]) -> Result<Option<Self>> {
-        let values = optional_inputs(args, &RESUME_FLAGS)?;
-        if values.is_empty() {
+        let Some((research, sha256, source)) =
+            read_recorded_research(args, &RESUME_FLAGS, "saved research")?
+        else {
             return Ok(None);
-        }
-        let source = PathBuf::from(values[RESUME_FLAGS[0]]);
-        let (bytes, sha256) = read_pinned_input(
-            &source,
-            values[RESUME_FLAGS[1]],
-            "saved research",
-            512 * 1024 * 1024,
-        )?;
-        let research =
-            neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3::from_json_bytes(&bytes)?;
+        };
         // The research-only saved-candidate cost diagnostic intentionally reads
         // zero-portfolio archives: it never resumes a frozen finalist and never
         // needs a portfolio to exist. Every other continuation still requires
@@ -129,6 +146,30 @@ impl SavedResearchInputs {
                 "resume frozen research",
             )?;
         }
+        Ok(Some(Self {
+            research: Some(research),
+            sha256,
+            source,
+        }))
+    }
+}
+
+/// A recorded research envelope used ONLY as upstream INPUT provenance for a
+/// fresh, hash-pinned NEW search. It may be zero-portfolio; its genomes,
+/// fitness and portfolio are never returned or replayed.
+pub(crate) struct NewSearchInputs {
+    pub research: Option<neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3>,
+    pub sha256: String,
+    pub source: PathBuf,
+}
+
+impl NewSearchInputs {
+    pub fn load(args: &[String]) -> Result<Option<Self>> {
+        let Some((research, sha256, source)) =
+            read_recorded_research(args, &NEW_SEARCH_FLAGS, "new-search recorded research")?
+        else {
+            return Ok(None);
+        };
         Ok(Some(Self {
             research: Some(research),
             sha256,
@@ -244,13 +285,33 @@ impl Arguments {
             resume_flags == 0 || resume_flags == RESUME_FLAGS.len(),
             "resume requires the saved research and its SHA256 together"
         );
-        let diagnose_flags = [
-            "--diagnose-candidate-costs-out",
-            "--diagnose-cost-variants",
-        ]
-        .iter()
-        .filter(|flag| parsed.0.contains_key(**flag))
-        .count();
+        let new_search_flags = NEW_SEARCH_FLAGS
+            .iter()
+            .filter(|flag| parsed.0.contains_key(**flag))
+            .count();
+        ensure!(
+            new_search_flags == 0 || new_search_flags == NEW_SEARCH_FLAGS.len(),
+            "new-search recorded input requires the research path and its SHA256 together"
+        );
+        ensure!(
+            new_search_flags == 0 || resume_flags == 0,
+            "--new-search-research and --resume-research are mutually exclusive modes"
+        );
+        if new_search_flags != 0 {
+            ensure!(
+                quote_flags == 0,
+                "new-search recorded inputs cannot be combined with quote replay"
+            );
+            ensure!(
+                parsed.0.get("--diagnose-candidate-costs-out").is_none()
+                    && parsed.0.get("--diagnose-cost-variants").is_none(),
+                "new-search recorded inputs cannot be combined with candidate cost diagnosis"
+            );
+        }
+        let diagnose_flags = ["--diagnose-candidate-costs-out", "--diagnose-cost-variants"]
+            .iter()
+            .filter(|flag| parsed.0.contains_key(**flag))
+            .count();
         ensure!(
             diagnose_flags == 0 || diagnose_flags == 2,
             "candidate cost diagnosis requires --diagnose-candidate-costs-out and --diagnose-cost-variants together"
@@ -275,10 +336,10 @@ impl Arguments {
                 );
             }
         }
-        if quote_flags != 0 || resume_flags != 0 {
+        if quote_flags != 0 || resume_flags != 0 || new_search_flags != 0 {
             ensure!(
                 parsed.positive("--max-batches", 2)? == 1,
-                "a saved continuation binds one exact batch; supply --max-batches 1"
+                "a saved/new-search continuation binds one exact batch; supply --max-batches 1"
             );
         }
         for flag in [
@@ -324,27 +385,30 @@ pub fn parse_diagnostic_cost_variants(spec: &str) -> Result<Vec<(String, f64, f6
     let mut variants = Vec::new();
     for item in spec.split(',') {
         let item = item.trim();
-        ensure!(!item.is_empty(), "--diagnose-cost-variants contains an empty item");
-        let (label, numbers) = item
-            .split_once('=')
-            .with_context(|| format!("diagnostic cost variant '{item}' must be label=pips:commission"))?;
+        ensure!(
+            !item.is_empty(),
+            "--diagnose-cost-variants contains an empty item"
+        );
+        let (label, numbers) = item.split_once('=').with_context(|| {
+            format!("diagnostic cost variant '{item}' must be label=pips:commission")
+        })?;
         let label = label.trim();
         ensure!(
             !label.is_empty()
-                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "diagnostic cost variant label '{label}' must be non-empty ascii alphanumeric, '-' or '_'"
         );
-        let (pips, commission) = numbers
-            .split_once(':')
-            .with_context(|| format!("diagnostic cost variant '{item}' must be label=pips:commission"))?;
-        let pips = pips
-            .trim()
-            .parse::<f64>()
-            .with_context(|| format!("diagnostic cost variant '{label}' round-trip pips is not a number"))?;
-        let commission = commission
-            .trim()
-            .parse::<f64>()
-            .with_context(|| format!("diagnostic cost variant '{label}' round-trip commission is not a number"))?;
+        let (pips, commission) = numbers.split_once(':').with_context(|| {
+            format!("diagnostic cost variant '{item}' must be label=pips:commission")
+        })?;
+        let pips = pips.trim().parse::<f64>().with_context(|| {
+            format!("diagnostic cost variant '{label}' round-trip pips is not a number")
+        })?;
+        let commission = commission.trim().parse::<f64>().with_context(|| {
+            format!("diagnostic cost variant '{label}' round-trip commission is not a number")
+        })?;
         ensure!(
             pips.is_finite() && pips >= 0.0,
             "diagnostic cost variant '{label}' round-trip pips must be finite and nonnegative"
@@ -551,10 +615,7 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
     }
     // Research-only saved-candidate cost diagnosis. It reuses the saved
     // research and its receipt-bound input; it never runs a new Search.
-    for flag in [
-        "--diagnose-candidate-costs-out",
-        "--diagnose-cost-variants",
-    ] {
+    for flag in ["--diagnose-candidate-costs-out", "--diagnose-cost-variants"] {
         if let Some(value) = args.0.get(flag) {
             push(&mut discovery_args, flag, value);
         }
@@ -676,6 +737,42 @@ mod tests {
     }
 
     #[test]
+    fn new_search_mode_requires_hash_pair_batch_one_and_exclusive_modes() {
+        let mut args = valid_arguments();
+        push(&mut args, "--new-search-research", "recorded.research.json");
+        assert!(Arguments::parse(&args).is_err(), "missing hash must fail");
+        push(&mut args, "--new-search-research-sha256", "explicit");
+        assert!(
+            Arguments::parse(&args).is_err(),
+            "missing max-batches must fail"
+        );
+        push(&mut args, "--max-batches", "1");
+        assert!(Arguments::parse(&args).is_ok());
+        let mut with_population = args.clone();
+        push(&mut with_population, "--population", "256");
+        assert!(
+            Arguments::parse(&with_population).is_ok(),
+            "new search may use its own budget"
+        );
+        for (flag, value) in [
+            ("--resume-research", "saved.json"),
+            ("--resume-research-sha256", "explicit"),
+            ("--quote-replay-bundle", "quote.json"),
+            ("--quote-replay-sha256", "explicit"),
+            ("--quote-replay-store", "store"),
+            ("--diagnose-candidate-costs-out", "diag.json"),
+            ("--diagnose-cost-variants", "old=2.5:9.0"),
+        ] {
+            let mut combined = args.clone();
+            push(&mut combined, flag, value);
+            assert!(
+                Arguments::parse(&combined).is_err(),
+                "{flag} must not combine with new-search mode"
+            );
+        }
+    }
+
+    #[test]
     fn diagnostic_cost_variants_are_explicit_and_require_a_saved_research() {
         let parsed = parse_diagnostic_cost_variants("old=2.5:9.0,broker=0.9:9.0").unwrap();
         assert_eq!(
@@ -685,7 +782,14 @@ mod tests {
                 ("broker".to_owned(), 0.9, 9.0)
             ]
         );
-        for bad in ["", "old", "old=2.5", "old=-1:9", "old=2.5:nan", "a=1:1,a=2:2"] {
+        for bad in [
+            "",
+            "old",
+            "old=2.5",
+            "old=-1:9",
+            "old=2.5:nan",
+            "a=1:1,a=2:2",
+        ] {
             assert!(
                 parse_diagnostic_cost_variants(bad).is_err(),
                 "{bad} must be refused"

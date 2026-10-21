@@ -6556,6 +6556,18 @@ fn weekly_base_filter_uses_measured_money_and_the_settings_path_binds_the_interv
 }
 
 #[test]
+fn recorded_effective_alphabet_mismatch_is_refused_before_search() {
+    let _guard = install_recorded_effective_feature_names(vec!["a".to_string()]);
+    assert!(ensure_recorded_effective_feature_names(&["a".to_string()]).is_ok());
+    let error = ensure_recorded_effective_feature_names(&["b".to_string()])
+        .expect_err("different ordered alphabet must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("recorded ordered effective feature alphabet")
+    );
+}
+#[test]
 fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_roles() {
     use neoethos_data::{
         BarTimestampConvention, CanonicalDatasetIdentity, CanonicalTimeframe, FeatureBuildOptions,

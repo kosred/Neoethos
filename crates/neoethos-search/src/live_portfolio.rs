@@ -1989,6 +1989,35 @@ mod tests {
     }
 
     #[test]
+    fn zero_portfolio_recorded_input_dispatches_to_new_search_not_finalist_replay() {
+        let original = frozen_research_fixture();
+        let mut wire = serde_json::to_value(original.discovery_result()).unwrap();
+        wire["portfolio"] = serde_json::json!([]);
+        wire["candidates"] = serde_json::json!([]);
+        let zero_result = serde_json::from_value(wire).unwrap();
+        let recorded = crate::CanonicalTrendbarResearchDiscoveryResultV3::new(
+            original.execution_contract().clone(),
+            zero_result,
+        )
+        .unwrap();
+        assert!(recorded.discovery_result().portfolio.is_empty());
+        let features = crate::quote_validated_outer_holdout_v1::explicit_broker_feature_fixture();
+        let ohlcv = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+        let input = crate::data_selection::CanonicalSearchRunInputV2::new_for_test_values(
+            recorded.discovery_result().search_input_receipt.clone(),
+            &features,
+            &ohlcv,
+        )
+        .unwrap();
+        let expected_names = recorded.discovery_result().effective_feature_names.clone();
+        let contract = recorded.execution_contract().clone();
+        let prepared = crate::discovery::prepare_recorded_new_search(&recorded, &input, &contract)
+            .expect("zero-portfolio recorded input must prepare a fresh search");
+        assert_eq!(prepared, expected_names);
+        assert!(recorded.discovery_result().portfolio.is_empty());
+    }
+
+    #[test]
     fn frozen_research_refuses_tampering_and_mismatched_reopened_features() {
         let original = frozen_research_fixture();
         let wire = serde_json::to_value(&original).unwrap();
