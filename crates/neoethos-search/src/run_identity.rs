@@ -26,38 +26,41 @@ const SEARCH_ALGORITHM_SEMANTICS_V1: &str = "neoethos.search.algorithm.is-calibr
 /// Include corrected execution/stop/admission arithmetic in every config key.
 /// Computed once, not once per candidate. This separates existing cached scores
 /// and checkpoints even when the user's knobs and dataset are unchanged.
-fn cpu_execution_source_sha256() -> &'static str {
-    use sha2::{Digest, Sha256};
-    static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    IDENTITY.get_or_init(|| {
-        let mut hash = Sha256::new();
-        hash.update(b"neoethos.cpu-execution-source.v1\0");
-        for source in [
-            include_bytes!("eval.rs").as_slice(),
-            include_bytes!("stop_target.rs").as_slice(),
-            include_bytes!("run_identity.rs").as_slice(),
-        ] {
-            hash.update((source.len() as u64).to_le_bytes());
-            hash.update(source);
-        }
-        format!("{:x}", hash.finalize())
-    })
-}
-
-/// Independent source identity for the weekly scoring semantics and the
-/// feasibility-first archive ordering that consumes it. The global
-/// `cpu_execution_source_sha256` is deliberately not widened: that would
-/// invalidate every historical non-weekly resolved-config stamp for a revision
-/// that only changes weekly runs.
-fn weekly_scoring_source_sha256_from(sources: &[&[u8]]) -> String {
+fn source_bundle_sha256(domain: &[u8], sources: &[&[u8]]) -> String {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
-    hash.update(b"neoethos.weekly-scoring-source.v1\0");
+    hash.update(domain);
     for source in sources {
         hash.update((source.len() as u64).to_le_bytes());
         hash.update(source);
     }
     format!("{:x}", hash.finalize())
+}
+
+fn cpu_execution_source_sha256_from(sources: &[&[u8]]) -> String {
+    source_bundle_sha256(b"neoethos.cpu-execution-source.v1\0", sources)
+}
+
+fn cpu_execution_source_sha256() -> &'static str {
+    static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        cpu_execution_source_sha256_from(&[
+            include_bytes!("eval.rs").as_slice(),
+            include_bytes!("stop_target.rs").as_slice(),
+            include_bytes!("run_identity.rs").as_slice(),
+        ])
+    })
+}
+
+/// Independent source identity for the weekly scoring semantics and the
+/// feasibility-first archive ordering that consumes it. The global
+/// `cpu_execution_source_sha256` also hashes this file, so this introduction
+/// changes every resolved-config stamp even for non-weekly runs: historical
+/// JSON remains readable, but old current-equivalence self-hash checks refuse.
+/// The separate weekly domain isolates FUTURE weekly scoring edits from
+/// non-weekly stamps without pretending the introduction was hash-neutral.
+fn weekly_scoring_source_sha256_from(sources: &[&[u8]]) -> String {
+    source_bundle_sha256(b"neoethos.weekly-scoring-source.v1\0", sources)
 }
 
 fn weekly_scoring_source_sha256() -> &'static str {
@@ -1894,6 +1897,23 @@ mod tests {
                 .contains("weekly_scoring_identity")
         );
         plain.validate().unwrap();
+    }
+
+    #[test]
+    fn global_execution_identity_includes_run_identity_itself() {
+        let mutated = cpu_execution_source_sha256_from(&[b"eval", b"stop", b"identity-v2"]);
+        assert_ne!(
+            cpu_execution_source_sha256_from(&[b"eval", b"stop", b"identity-v1"]),
+            mutated
+        );
+        assert_eq!(
+            cpu_execution_source_sha256(),
+            cpu_execution_source_sha256_from(&[
+                include_bytes!("eval.rs").as_slice(),
+                include_bytes!("stop_target.rs").as_slice(),
+                include_bytes!("run_identity.rs").as_slice(),
+            ])
+        );
     }
 
     #[test]

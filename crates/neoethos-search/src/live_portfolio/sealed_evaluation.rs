@@ -48,6 +48,11 @@ pub(super) struct SealedEvaluationPolicyV1 {
     growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     weekly_objective: Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
+    /// Current-equivalence binding for the weekly objective. Absent for
+    /// non-weekly snapshots and for historical weekly snapshots created before
+    /// the binding existed; those remain inspectable but are refused as replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekly_scoring_identity: Option<crate::run_identity::WeeklyScoringIdentityV1>,
 }
 
 #[cfg(test)]
@@ -248,6 +253,47 @@ mod tests {
         evaluation.growth_objective = false;
         assert!(SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).is_err());
     }
+    #[test]
+    fn sealed_weekly_replay_requires_the_same_compiled_scoring_identity() {
+        let (mut evaluation, stops) = evaluation_and_stops();
+        evaluation.growth_objective = false;
+        evaluation.weekly_objective = Some(crate::scoring::weekly_cadence::test_weekly_objective());
+        let snapshot =
+            SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        assert_eq!(
+            snapshot.weekly_scoring_identity,
+            Some(crate::run_identity::WeeklyScoringIdentityV1::current())
+        );
+        snapshot.to_evaluation().unwrap();
+
+        let mut stale = serde_json::to_value(&snapshot).unwrap();
+        stale["weekly_scoring_identity"]["source_sha256"] = "00".repeat(32).into();
+        let stale: SealedEvaluationPolicyV1 = serde_json::from_value(stale).unwrap();
+        let error = stale.to_evaluation().unwrap_err().to_string();
+        assert!(error.contains("stale"), "{error}");
+        assert!(stale.validate().is_err());
+
+        let mut absent = serde_json::to_value(&snapshot).unwrap();
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("weekly_scoring_identity");
+        let absent: SealedEvaluationPolicyV1 = serde_json::from_value(absent).unwrap();
+        let error = absent.to_evaluation().unwrap_err().to_string();
+        assert!(error.contains("unbound"), "{error}");
+
+        let (plain_evaluation, plain_stops) = evaluation_and_stops();
+        let plain =
+            SealedEvaluationPolicyV1::from_evaluation(&plain_evaluation, false, &plain_stops)
+                .unwrap();
+        assert!(plain.weekly_scoring_identity.is_none());
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("weekly_scoring_identity")
+        );
+        plain.to_evaluation().unwrap();
+    }
 }
 
 impl SealedEvaluationPolicyV1 {
@@ -264,6 +310,8 @@ impl SealedEvaluationPolicyV1 {
             )?),
             None => None,
         };
+        let weekly_scoring_identity =
+            weekly_objective.map(|_| crate::run_identity::WeeklyScoringIdentityV1::current());
         let mut body = serde_json::to_value(value)?;
         let object = body.as_object_mut().ok_or_else(|| {
             anyhow::anyhow!("weekly evaluation snapshot must serialize as an object")
@@ -280,6 +328,10 @@ impl SealedEvaluationPolicyV1 {
         object.insert(
             "weekly_objective".to_owned(),
             serde_json::to_value(weekly_objective)?,
+        );
+        object.insert(
+            "weekly_scoring_identity".to_owned(),
+            serde_json::to_value(weekly_scoring_identity)?,
         );
         let snapshot: Self = serde_json::from_value(body)?;
         snapshot.validate()?;
@@ -303,6 +355,7 @@ impl SealedEvaluationPolicyV1 {
         object.remove("schema_version");
         object.remove("smc_gate_disabled");
         object.remove("adaptive_stops_v1");
+        object.remove("weekly_scoring_identity");
         object.insert(
             "weekly_objective".to_owned(),
             serde_json::to_value(weekly_objective)?,
@@ -348,8 +401,29 @@ impl SealedEvaluationPolicyV1 {
         Ok(())
     }
 
+    /// Replay-boundary gate: the stored weekly objective may be inspected in
+    /// legacy form, but current replay needs the SAME compiled scoring identity.
+    fn validate_weekly_scoring_identity(&self) -> anyhow::Result<()> {
+        match (self.weekly_objective, self.weekly_scoring_identity.as_ref()) {
+            (Some(objective), Some(identity)) => {
+                objective.validate_current()?;
+                identity.validate_current()?;
+                Ok(())
+            }
+            (Some(objective), None) => anyhow::bail!(
+                "sealed weekly objective is unbound: no scoring identity in the stored snapshot (version {}); inspectable but not admissible as current replay",
+                objective.scoring_semantics_version
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "sealed weekly scoring identity is present without a weekly objective"
+            ),
+            (None, None) => Ok(()),
+        }
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         self.adaptive_stops_v1.validate()?;
+        self.validate_weekly_scoring_identity()?;
         if let Some(objective) = self.weekly_objective {
             objective.checked_for_evaluation(
                 self.initial_equity,

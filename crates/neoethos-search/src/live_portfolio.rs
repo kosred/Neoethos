@@ -1841,6 +1841,43 @@ mod tests {
         assert!(LivePortfolioArtifact::from_discovery(false, &result).is_err());
     }
 
+    #[test]
+    fn public_sealed_replay_refuses_a_stale_or_unbound_weekly_scoring_identity() {
+        let policy = sample_sealed_evaluation_policy();
+        let mut weekly = crate::scoring::weekly_cadence::test_weekly_objective();
+        weekly.limits.initial_equity = 12_345.67;
+        weekly.limits.per_trade_risk_band = (0.003, 0.023);
+        let identity = crate::run_identity::WeeklyScoringIdentityV1::current();
+
+        let mut wire = serde_json::to_value(&policy).unwrap();
+        wire["sealed_evaluation_v1"]["weekly_objective"] = serde_json::to_value(weekly).unwrap();
+        wire["sealed_evaluation_v1"]["weekly_scoring_identity"] =
+            serde_json::to_value(&identity).unwrap();
+        wire["sealed_evaluation_v1"]["growth_objective"] = false.into();
+        let mut weekly_policy: LiveTradingPolicyV1 = serde_json::from_value(wire).unwrap();
+        weekly_policy.identity_hash = weekly_policy.computed_identity_hash().unwrap();
+        weekly_policy.validate().unwrap();
+        assert!(weekly_policy.sealed_evaluation_config().is_ok());
+
+        let mut stale_wire = serde_json::to_value(&weekly_policy).unwrap();
+        stale_wire["sealed_evaluation_v1"]["weekly_scoring_identity"]["source_sha256"] =
+            "00".repeat(32).into();
+        let mut stale: LiveTradingPolicyV1 = serde_json::from_value(stale_wire).unwrap();
+        stale.identity_hash = stale.computed_identity_hash().unwrap();
+        let error = stale.sealed_evaluation_config().unwrap_err().to_string();
+        assert!(error.contains("stale"), "{error}");
+
+        let mut unbound_wire = serde_json::to_value(&weekly_policy).unwrap();
+        unbound_wire["sealed_evaluation_v1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("weekly_scoring_identity");
+        let mut unbound: LiveTradingPolicyV1 = serde_json::from_value(unbound_wire).unwrap();
+        unbound.identity_hash = unbound.computed_identity_hash().unwrap();
+        let error = unbound.sealed_evaluation_config().unwrap_err().to_string();
+        assert!(error.contains("unbound"), "{error}");
+    }
+
     fn frozen_research_fixture() -> crate::CanonicalTrendbarResearchDiscoveryResultV3 {
         let features = crate::quote_validated_outer_holdout_v1::explicit_broker_feature_fixture();
         let mut genes = sample_discovery_result().portfolio;
