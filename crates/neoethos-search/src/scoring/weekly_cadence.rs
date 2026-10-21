@@ -110,13 +110,47 @@ impl WeeklySearchLimitsV1 {
         Ok(())
     }
 }
+/// Version of the SCORING semantics (fitness arithmetic and ranking) bound into
+/// the wire objective. 0 is reserved for historical objectives serialized before
+/// this binding existed; they stay readable but are explicitly unbound and are
+/// refused as current equivalence/replay.
+pub const WEEKLY_SCORING_SEMANTICS_VERSION_V1: u16 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WeeklySearchObjectiveV1 {
     pub cadence: WeeklyCadenceContractV1,
     pub limits: WeeklySearchLimitsV1,
+    /// 0 = legacy/unbound; new runs always bind the current scoring semantics.
+    #[serde(default)]
+    pub scoring_semantics_version: u16,
 }
 impl WeeklySearchObjectiveV1 {
+    /// New objectives must bind the current scoring semantics explicitly.
+    pub fn current(cadence: WeeklyCadenceContractV1, limits: WeeklySearchLimitsV1) -> Self {
+        Self {
+            cadence,
+            limits,
+            scoring_semantics_version: WEEKLY_SCORING_SEMANTICS_VERSION_V1,
+        }
+    }
+
+    pub fn is_current_scoring_semantics(&self) -> bool {
+        self.scoring_semantics_version == WEEKLY_SCORING_SEMANTICS_VERSION_V1
+    }
+
+    /// Wire validation accepts the historical unbound form; current-equivalence
+    /// callers must use `validate_current`.
+    pub fn validate_current(&self) -> anyhow::Result<()> {
+        self.validate()?;
+        anyhow::ensure!(
+            self.is_current_scoring_semantics(),
+            "legacy weekly objective has no scoring-semantics binding (version {}); it remains inspectable but is not admissible as current equivalence or replay",
+            self.scoring_semantics_version
+        );
+        Ok(())
+    }
+
     /// One context check for generation evaluation and frozen-policy replay.
     pub fn checked_for_evaluation(
         self,
@@ -124,7 +158,7 @@ impl WeeklySearchObjectiveV1 {
         growth_objective: bool,
         risk_band: (f64, f64),
     ) -> anyhow::Result<Self> {
-        self.validate()?;
+        self.validate_current()?;
         anyhow::ensure!(
             !growth_objective
                 && self.limits.initial_equity == equity
@@ -137,6 +171,12 @@ impl WeeklySearchObjectiveV1 {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.cadence.validate()?;
         self.limits.validate()?;
+        anyhow::ensure!(
+            self.scoring_semantics_version == 0
+                || self.scoring_semantics_version == WEEKLY_SCORING_SEMANTICS_VERSION_V1,
+            "unsupported weekly scoring semantics version {}",
+            self.scoring_semantics_version
+        );
         anyhow::ensure!(
             crate::quality::evaluation_weekdays(
                 self.cadence.evaluation_start_ms,
@@ -305,9 +345,9 @@ pub fn evaluate_rolling_weekly_cadence(
 
 #[cfg(test)]
 pub(crate) fn test_weekly_objective() -> WeeklySearchObjectiveV1 {
-    WeeklySearchObjectiveV1 {
-        cadence: WeeklyCadenceContractV1::new(1_767_571_200_000, 1_769_731_200_000, 21.0).unwrap(),
-        limits: WeeklySearchLimitsV1 {
+    WeeklySearchObjectiveV1::current(
+        WeeklyCadenceContractV1::new(1_767_571_200_000, 1_769_731_200_000, 21.0).unwrap(),
+        WeeklySearchLimitsV1 {
             initial_equity: 10_000.0,
             per_trade_risk_band: (0.005, 0.03),
             max_drawdown: 0.1,
@@ -318,7 +358,7 @@ pub(crate) fn test_weekly_objective() -> WeeklySearchObjectiveV1 {
             min_win_rate: 0.0,
             min_profit_factor: 0.0,
         },
-    }
+    )
 }
 
 #[cfg(test)]
@@ -537,5 +577,43 @@ mod tests {
         assert!(o.fitness(&riskier, &r, 0.0) < o.fitness(&risky, &r, 0.0));
         risky[1] = f64::NEG_INFINITY;
         assert_eq!(o.fitness(&risky, &r, 0.0), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn weekly_scoring_semantics_legacy_wire_is_inspectable_but_unbound() {
+        let current = test_weekly_objective();
+        assert_eq!(
+            current.scoring_semantics_version,
+            WEEKLY_SCORING_SEMANTICS_VERSION_V1
+        );
+        current.validate_current().unwrap();
+        let good_report = report(&[0, 7, 14, 21], 25);
+        let metrics = [
+            50.0, 1.0, 10_050.0, 0.01, 0.6, 1.2, 12.5, 0.5, 4.0, 0.5, 0.005,
+        ];
+        assert!(current.fitness(&metrics, &good_report, 0.0) > 0.0);
+
+        let mut legacy = current;
+        legacy.scoring_semantics_version = 0;
+        legacy.validate().unwrap();
+        assert!(legacy.validate_current().is_err());
+        assert!(
+            legacy
+                .checked_for_evaluation(10_000.0, false, (0.005, 0.03))
+                .is_err()
+        );
+        let mut value = serde_json::to_value(legacy).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("scoring_semantics_version");
+        let decoded: WeeklySearchObjectiveV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.scoring_semantics_version, 0);
+        decoded.validate().unwrap();
+        assert!(decoded.validate_current().is_err());
+
+        let mut stale = current;
+        stale.scoring_semantics_version = WEEKLY_SCORING_SEMANTICS_VERSION_V1 + 1;
+        assert!(stale.validate().is_err());
     }
 }

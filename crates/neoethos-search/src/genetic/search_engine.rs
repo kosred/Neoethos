@@ -2785,12 +2785,15 @@ where
     F: FnMut(usize, usize, f64, usize, usize),
 {
     search_authority.validate()?;
+    let expected_weekly = eval_config
+        .as_ref()
+        .and_then(|c| c.weekly_objective)
+        .map(|o| (o.limits, o.scoring_semantics_version));
     anyhow::ensure!(
-        eval_config
-            .as_ref()
-            .and_then(|c| c.weekly_objective)
-            .map(|o| o.limits)
-            == search_authority.weekly_search_limits(),
+        expected_weekly
+            == search_authority
+                .weekly_search_binding()
+                .map(|(limits, identity)| (limits, identity.semantics_version)),
         "exact generation weekly objective is detached from its selection authority"
     );
     anyhow::ensure!(

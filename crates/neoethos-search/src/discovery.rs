@@ -1728,8 +1728,8 @@ impl DiscoveryConfig {
             timestamps.windows(2).all(|w| w[0] < w[1]),
             "weekly evaluation timestamps must be strictly increasing"
         );
-        let objective = crate::scoring::weekly_cadence::WeeklySearchObjectiveV1 {
-            cadence: crate::scoring::weekly_cadence::WeeklyCadenceContractV1::new(
+        let objective = crate::scoring::weekly_cadence::WeeklySearchObjectiveV1::current(
+            crate::scoring::weekly_cadence::WeeklyCadenceContractV1::new(
                 *timestamps
                     .first()
                     .ok_or_else(|| anyhow::anyhow!("empty weekly input"))?,
@@ -1737,8 +1737,8 @@ impl DiscoveryConfig {
                 crate::quality::current_quality_runtime_overrides().trading_days_per_month,
             )?,
             limits,
-        };
-        objective.validate()?;
+        );
+        objective.validate_current()?;
         Ok(Some(objective))
     }
 
@@ -6827,6 +6827,11 @@ fn ensure_research_config_matches_sealed_evaluation(
             "reconstructed discovery config field {field} = {rebuilt} differs from the sealed Search policy = {sealed}; refusing to price saved candidates under a configuration that is not the original run"
         )
     };
+    if let Some(objective) = sealed.weekly_objective {
+        objective
+            .validate_current()
+            .map_err(|error| anyhow::anyhow!("sealed weekly objective is not current: {error}"))?;
+    }
     anyhow::ensure!(
         config.weekly_search_limits()? == sealed.weekly_objective.map(|o| o.limits),
         "reconstructed weekly objective differs from the sealed Search policy"
