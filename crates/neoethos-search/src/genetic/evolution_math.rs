@@ -1103,17 +1103,36 @@ pub fn unique_candidate_or_retry(
     rng: &mut impl Rng,
 ) -> Gene {
     candidate.normalize(n_indicators, 1);
-    if seen.insert_gene(&candidate) {
+    let accepted = seen.insert_gene(&candidate);
+    #[cfg(test)]
+    if !accepted {
+        super::search_engine::record_retry_counter(
+            super::search_engine::RetryDiagnosticCounterV1::DuplicateAttempt,
+        );
+    }
+    if accepted {
         return candidate;
     }
     let attempts = max_attempts.max(1);
     for _ in 0..attempts {
         let mut probe = new_random_gene(n_indicators, max_indicators, generation, smc_cfg, rng);
+        #[cfg(test)]
+        super::search_engine::record_retry_counter(
+            super::search_engine::RetryDiagnosticCounterV1::NewbornDraw,
+        );
         probe.normalize(n_indicators, 1);
         if seen.insert_gene(&probe) {
+            #[cfg(test)]
+            super::search_engine::record_retry_counter(
+                super::search_engine::RetryDiagnosticCounterV1::SuccessfulReplacement,
+            );
             return probe;
         }
     }
+    #[cfg(test)]
+    super::search_engine::record_retry_counter(
+        super::search_engine::RetryDiagnosticCounterV1::Exhaustion,
+    );
     candidate
 }
 
@@ -2147,35 +2166,27 @@ mod generator_audit_tests {
     }
 
     #[test]
-    fn duplicate_retry_replaces_with_a_newborn_not_a_local_mutation() {
+    fn duplicate_retry_forced_duplicate_sample_has_no_unchanged_genomes() {
         let cfg = SmcSearchConfig::default();
         let parent = audit_gene(vec![0]);
         let mut seen = SeenSignatureMemory::current();
         assert!(seen.insert_gene(&parent));
         let mut rng = StdRng::seed_from_u64(77);
-        let mut inherited_like = 0usize;
+        let mut unchanged_genome = 0usize;
         let samples = 200usize;
         for _ in 0..samples {
-            let replacement = unique_candidate_or_retry(
-                parent.clone(),
-                &mut seen,
-                8,
-                4,
-                1,
-                20,
-                &cfg,
-                &mut rng,
-            );
+            let replacement =
+                unique_candidate_or_retry(parent.clone(), &mut seen, 8, 4, 1, 20, &cfg, &mut rng);
             if operator_traits_equal(&replacement, &parent) {
-                inherited_like += 1;
+                unchanged_genome += 1;
             }
         }
         eprintln!(
-            "duplicate retry: inherited_like={inherited_like} samples={samples}"
+            "duplicate retry forced-duplicate sample: unchanged_genome={unchanged_genome} samples={samples}"
         );
         assert_eq!(
-            inherited_like, 0,
-            "duplicate children are replaced by wholesale newborns, not local mutations"
+            unchanged_genome, 0,
+            "forced duplicate retry sample produced no unchanged genomes; source branch draws wholesale newborns, this counter alone cannot distinguish a local mutation"
         );
     }
 }

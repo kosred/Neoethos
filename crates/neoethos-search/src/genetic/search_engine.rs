@@ -3232,6 +3232,259 @@ impl EvaluatedGeneBehaviorKey {
 }
 
 /// Keep the admitted archive AND the complete last evaluated population.
+#[cfg(test)]
+#[derive(Default, Clone, Debug)]
+pub(crate) struct ReproductionPopulationCountsV1 {
+    pub elites: usize,
+    pub migrants: usize,
+    pub immigrants: usize,
+    pub rescue: usize,
+    pub births: usize,
+    pub produced: usize,
+}
+
+#[cfg(test)]
+#[derive(Default, Clone, Debug)]
+pub(crate) struct ReproductionRetryCountsV1 {
+    pub duplicate_attempts: usize,
+    pub newborn_draws: usize,
+    pub successful_newborn_replacements: usize,
+    pub retry_exhaustions: usize,
+}
+
+#[cfg(test)]
+#[derive(Default, Clone, Debug)]
+pub(crate) struct ReproductionRepairCountsV1 {
+    pub changed: usize,
+    pub created_collisions: usize,
+    pub existing_repeats: usize,
+}
+
+#[cfg(test)]
+#[derive(Default, Clone, Debug)]
+pub(crate) struct ReproductionBirthTraitCountsV1 {
+    pub structural_changes: usize,
+    pub other_trait_changes: usize,
+}
+
+#[cfg(test)]
+#[derive(Default, Clone, Debug)]
+pub(crate) struct ReproductionGenerationDiagnosticsV1 {
+    pub generation: usize,
+    pub population: ReproductionPopulationCountsV1,
+    pub retry: ReproductionRetryCountsV1,
+    pub breeding_retry: ReproductionRetryCountsV1,
+    pub repair: ReproductionRepairCountsV1,
+    pub birth_traits: ReproductionBirthTraitCountsV1,
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPRODUCTION_DIAGNOSTICS: std::cell::RefCell<
+        Vec<ReproductionGenerationDiagnosticsV1>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_reproduction_diagnostics() {
+    REPRODUCTION_DIAGNOSTICS.with(|diagnostics| diagnostics.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn start_reproduction_generation(generation: usize) {
+    REPRODUCTION_DIAGNOSTICS.with(|diagnostics| {
+        diagnostics
+            .borrow_mut()
+            .push(ReproductionGenerationDiagnosticsV1 {
+                generation,
+                ..ReproductionGenerationDiagnosticsV1::default()
+            });
+    });
+}
+
+#[cfg(test)]
+fn with_latest_diagnostic(mut update: impl FnMut(&mut ReproductionGenerationDiagnosticsV1)) {
+    REPRODUCTION_DIAGNOSTICS.with(|diagnostics| {
+        if let Some(latest) = diagnostics.borrow_mut().last_mut() {
+            update(latest);
+        }
+    });
+}
+
+#[cfg(test)]
+macro_rules! record_population {
+    ($field:ident, $value:expr) => {
+        with_latest_diagnostic(|diagnostic| diagnostic.population.$field = $value)
+    };
+}
+
+#[cfg(test)]
+macro_rules! increment_population {
+    ($field:ident) => {
+        with_latest_diagnostic(|diagnostic| diagnostic.population.$field += 1)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reproduction_diagnostics() -> Vec<ReproductionGenerationDiagnosticsV1> {
+    REPRODUCTION_DIAGNOSTICS.with(|diagnostics| diagnostics.borrow().clone())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum RetryDiagnosticCounterV1 {
+    DuplicateAttempt,
+    NewbornDraw,
+    SuccessfulReplacement,
+    Exhaustion,
+}
+
+#[cfg(test)]
+pub(crate) fn record_retry_counter(counter: RetryDiagnosticCounterV1) {
+    with_latest_diagnostic(|diagnostic| match counter {
+        RetryDiagnosticCounterV1::DuplicateAttempt => {
+            diagnostic.retry.duplicate_attempts += 1;
+        }
+        RetryDiagnosticCounterV1::NewbornDraw => {
+            diagnostic.retry.newborn_draws += 1;
+        }
+        RetryDiagnosticCounterV1::SuccessfulReplacement => {
+            diagnostic.retry.successful_newborn_replacements += 1;
+        }
+        RetryDiagnosticCounterV1::Exhaustion => {
+            diagnostic.retry.retry_exhaustions += 1;
+        }
+    });
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct RetryCounterSnapshot {
+    duplicate_attempts: usize,
+    newborn_draws: usize,
+    successful_newborn_replacements: usize,
+    retry_exhaustions: usize,
+}
+
+#[cfg(test)]
+fn retry_counter_snapshot() -> RetryCounterSnapshot {
+    REPRODUCTION_DIAGNOSTICS.with(|diagnostics| {
+        diagnostics
+            .borrow()
+            .last()
+            .map(|diagnostic| RetryCounterSnapshot {
+                duplicate_attempts: diagnostic.retry.duplicate_attempts,
+                newborn_draws: diagnostic.retry.newborn_draws,
+                successful_newborn_replacements: diagnostic.retry.successful_newborn_replacements,
+                retry_exhaustions: diagnostic.retry.retry_exhaustions,
+            })
+            .unwrap_or_default()
+    })
+}
+
+#[cfg(test)]
+fn record_breeding_retry_delta(before: RetryCounterSnapshot) {
+    with_latest_diagnostic(|diagnostic| {
+        diagnostic.breeding_retry.duplicate_attempts += diagnostic
+            .retry
+            .duplicate_attempts
+            .saturating_sub(before.duplicate_attempts);
+        diagnostic.breeding_retry.newborn_draws += diagnostic
+            .retry
+            .newborn_draws
+            .saturating_sub(before.newborn_draws);
+        diagnostic.breeding_retry.successful_newborn_replacements += diagnostic
+            .retry
+            .successful_newborn_replacements
+            .saturating_sub(before.successful_newborn_replacements);
+        diagnostic.breeding_retry.retry_exhaustions += diagnostic
+            .retry
+            .retry_exhaustions
+            .saturating_sub(before.retry_exhaustions);
+    });
+}
+
+#[cfg(test)]
+fn structural_flags(gene: &Gene) -> [bool; 11] {
+    [
+        gene.use_ob,
+        gene.use_fvg,
+        gene.use_liq_sweep,
+        gene.use_premium_discount,
+        gene.use_inducement,
+        gene.mtf_confirmation,
+        gene.use_bos,
+        gene.use_choch,
+        gene.use_eqh,
+        gene.use_eql,
+        gene.use_displacement,
+    ]
+}
+
+#[cfg(test)]
+fn other_traits_equal(left: &Gene, right: &Gene) -> bool {
+    left.indices == right.indices
+        && left.weights == right.weights
+        && left.long_threshold == right.long_threshold
+        && left.short_threshold == right.short_threshold
+        && left.sl_pips == right.sl_pips
+        && left.tp_pips == right.tp_pips
+        && left.stop_vol_mult == right.stop_vol_mult
+}
+
+#[cfg(test)]
+fn record_birth_trait_changes(pre_retry: &Gene, final_gene: &Gene) {
+    let structural_changed = structural_flags(pre_retry) != structural_flags(final_gene);
+    let other_changed = !other_traits_equal(pre_retry, final_gene);
+    with_latest_diagnostic(|diagnostic| {
+        if structural_changed {
+            diagnostic.birth_traits.structural_changes += 1;
+        }
+        if other_changed {
+            diagnostic.birth_traits.other_trait_changes += 1;
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_repair_effects(before: &[Gene], after: &[Gene]) {
+    let mut changed = 0usize;
+    let mut before_repeats = 0usize;
+    for (before, after) in before.iter().zip(after) {
+        if structural_flags(before) != structural_flags(after) || !other_traits_equal(before, after)
+        {
+            changed += 1;
+        }
+    }
+    let mut before_keys = std::collections::HashMap::<EvaluatedGeneBehaviorKey, usize>::new();
+    for gene in before {
+        *before_keys
+            .entry(EvaluatedGeneBehaviorKey::new(gene))
+            .or_default() += 1;
+    }
+    for count in before_keys.values() {
+        before_repeats += count.saturating_sub(1);
+    }
+    let mut pre_keys_by_post: std::collections::HashMap<
+        EvaluatedGeneBehaviorKey,
+        std::collections::HashSet<EvaluatedGeneBehaviorKey>,
+    > = std::collections::HashMap::new();
+    for (before, after) in before.iter().zip(after) {
+        pre_keys_by_post
+            .entry(EvaluatedGeneBehaviorKey::new(after))
+            .or_default()
+            .insert(EvaluatedGeneBehaviorKey::new(before));
+    }
+    let created = pre_keys_by_post
+        .values()
+        .map(|pre_keys| pre_keys.len().saturating_sub(1))
+        .sum();
+    with_latest_diagnostic(|diagnostic| {
+        diagnostic.repair.changed = changed;
+        diagnostic.repair.created_collisions = created;
+        diagnostic.repair.existing_repeats = before_repeats;
+    });
+}
 #[derive(Debug, Clone)]
 struct WeeklyGenerationSelectionV1 {
     ranks: Vec<crate::scoring::weekly_cadence::WeeklySelectionRankV1>,
@@ -3551,6 +3804,8 @@ where
     if population == 0 {
         bail!("population must be > 0");
     }
+    #[cfg(test)]
+    reset_reproduction_diagnostics();
     if feature_names.is_empty() {
         bail!("resident search feature schema must not be empty");
     }
@@ -4280,6 +4535,8 @@ where
         // Reuse the seeded RNG built at the top of `evolve_search_with_progress_impl`
         // (was `let mut rng = rand::rng();` here, which shadowed the seeded one and
         // broke the determinism work in the GPU path). `rng` is available in scope.
+        #[cfg(test)]
+        start_reproduction_generation(generation);
         let reproduction_started = Instant::now();
         let score_vector: Vec<f64> = weekly_selection
             .as_ref()
@@ -4314,6 +4571,8 @@ where
             .iter()
             .map(|idx| scored[*idx].2.clone())
             .collect();
+        #[cfg(test)]
+        record_population!(elites, survivors.len());
 
         let mut next = Vec::with_capacity(population);
         next.extend(survivors);
@@ -4323,6 +4582,8 @@ where
         // generation. They compete on THIS node's data in the upcoming
         // evaluation (re-scored from scratch), so a bad/hostile migrant simply
         // fails selection — no cross-node trust needed.
+        #[cfg(test)]
+        let before_migrants = next.len();
         if sizing_policy.migration_enabled_for_run() {
             let migrants = super::migration::take_incoming();
             sizing_policy.validate_gene_batch_v1(&migrants, "incoming migrants")?;
@@ -4334,6 +4595,8 @@ where
                 next.push(gene);
             }
         }
+        #[cfg(test)]
+        record_population!(migrants, next.len().saturating_sub(before_migrants));
 
         // **GA Fix C — diversity rescue (2026-05-26, taskdoc #275)**.
         // The Python prototype's reward-hack ("never trade → 0 DD →
@@ -4396,6 +4659,8 @@ where
             .saturating_sub(next.len())
             .saturating_sub(rescue_genes.len());
         let immigrant_count = immigrant_count.min(remaining_after_rescue);
+        #[cfg(test)]
+        record_population!(immigrants, immigrant_count);
         for _ in 0..immigrant_count {
             let immigrant = new_random_gene(
                 n_indicators,
@@ -4420,6 +4685,8 @@ where
         // as first-class population members in the next-generation eval
         // (the seen-signature dedupe still applies so duplicates with
         // earlier-archived genes are rejected).
+        #[cfg(test)]
+        let before_rescue = next.len();
         for rescue in rescue_genes.drain(..) {
             if next.len() >= population {
                 break;
@@ -4435,6 +4702,8 @@ where
                 &mut rng,
             ));
         }
+        #[cfg(test)]
+        record_population!(rescue, next.len().saturating_sub(before_rescue));
 
         let parent_indices: Vec<usize> = if let Some(selection) = &weekly_selection {
             selection.valid_positions.clone()
@@ -4488,7 +4757,11 @@ where
                 stagnant_gens,
                 &mut rng,
             );
-            next.push(unique_candidate_or_retry(
+            #[cfg(test)]
+            let pre_retry = mutated.clone();
+            #[cfg(test)]
+            let retry_before = retry_counter_snapshot();
+            let final_gene = unique_candidate_or_retry(
                 mutated,
                 &mut seen_memory,
                 n_indicators,
@@ -4497,12 +4770,25 @@ where
                 seen_retry_attempts,
                 &smc_cfg,
                 &mut rng,
-            ));
+            );
+            #[cfg(test)]
+            {
+                record_breeding_retry_delta(retry_before);
+                record_birth_trait_changes(&pre_retry, &final_gene);
+                increment_population!(births);
+            }
+            next.push(final_gene);
         }
+        #[cfg(test)]
+        let before_repair = next.clone();
         enforce_population_smc_ratio(&mut next, &smc_cfg, &mut rng);
+        #[cfg(test)]
+        record_repair_effects(&before_repair, &next);
         for gene in &next {
             let _ = seen_memory.insert_gene(gene);
         }
+        #[cfg(test)]
+        record_population!(produced, next.len());
         genes = next;
         seen_memory.flush();
         timing.reproduction += reproduction_started.elapsed();
@@ -6407,5 +6693,25 @@ mod weekly_integration_tests {
         assert!(weekly.retained > 0);
         assert_eq!(result.genes.len(), result.metrics.len());
         assert!(result.genes.len() >= population);
+
+        let diagnostics = reproduction_diagnostics();
+        assert!(
+            !diagnostics.is_empty(),
+            "the loop records reproduction diagnostics"
+        );
+        for (index, diagnostic) in diagnostics.iter().enumerate() {
+            eprintln!("{diagnostic:?}");
+            assert_eq!(diagnostic.generation, index);
+            assert_eq!(diagnostic.population.produced, population);
+            assert_eq!(
+                diagnostic.population.elites
+                    + diagnostic.population.migrants
+                    + diagnostic.population.immigrants
+                    + diagnostic.population.rescue
+                    + diagnostic.population.births,
+                diagnostic.population.produced,
+                "reproduction categories reconcile to the produced population"
+            );
+        }
     }
 }
