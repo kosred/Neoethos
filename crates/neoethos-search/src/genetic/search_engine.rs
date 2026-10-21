@@ -362,7 +362,7 @@ pub(crate) fn prepare_exact_cpu_population_auto_v1(
         &smc_cfg,
         &mut calibration_rng,
     );
-    enforce_population_smc_ratio(&mut calibration_genes, &smc_cfg);
+    enforce_population_smc_ratio(&mut calibration_genes, &smc_cfg, &mut calibration_rng);
     for gene in &mut calibration_genes {
         gene.normalize(features.n_features(), 1);
     }
@@ -2636,7 +2636,7 @@ pub fn random_search(
     let mut rng = build_search_rng();
     let mut genes =
         generate_random_genes(n_genes, n_indicators, max_indicators, 0, &smc_cfg, &mut rng);
-    enforce_population_smc_ratio(&mut genes, &smc_cfg);
+    enforce_population_smc_ratio(&mut genes, &smc_cfg, &mut rng);
     for gene in genes.iter_mut() {
         gene.normalize(n_indicators, 1);
     }
@@ -3686,7 +3686,7 @@ where
             &mut rng,
         )
     };
-    enforce_population_smc_ratio(&mut genes, &smc_cfg);
+    enforce_population_smc_ratio(&mut genes, &smc_cfg, &mut rng);
 
     genes = genes
         .into_iter()
@@ -4499,7 +4499,10 @@ where
                 &mut rng,
             ));
         }
-        enforce_population_smc_ratio(&mut next, &smc_cfg);
+        enforce_population_smc_ratio(&mut next, &smc_cfg, &mut rng);
+        for gene in &next {
+            let _ = seen_memory.insert_gene(gene);
+        }
         genes = next;
         seen_memory.flush();
         timing.reproduction += reproduction_started.elapsed();
@@ -6342,8 +6345,12 @@ mod weekly_integration_tests {
                     .iter()
                     .enumerate()
                     .map(|(slot, _)| {
-                        if call == 1 && slot == 1 {
-                            (invalid, report(0, 445))
+                        if call == 1 {
+                            if slot == 0 {
+                                (feasible, report(0, 445))
+                            } else {
+                                (invalid, report(0, 445))
+                            }
                         } else if call == 2 {
                             // One valid row among infeasible candidates.
                             if slot == 0 {

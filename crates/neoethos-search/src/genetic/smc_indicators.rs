@@ -218,7 +218,7 @@ pub fn enforce_min_structural_smc_flags(
     }
 }
 
-pub fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig) {
+pub fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig, rng: &mut impl Rng) {
     if genes.is_empty() {
         return;
     }
@@ -233,7 +233,6 @@ pub fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig) {
     if active >= target {
         return;
     }
-    let mut rng = rand::rng();
     for gene in genes.iter_mut() {
         if active >= target {
             break;
@@ -241,7 +240,7 @@ pub fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig) {
         if smc_structural_flag_count(gene) > 0 {
             continue;
         }
-        enforce_min_structural_smc_flags(gene, cfg, &mut rng);
+        enforce_min_structural_smc_flags(gene, cfg, rng);
         active += 1;
     }
 }
@@ -1157,4 +1156,86 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
         eql,
         displacement,
     ))
+}
+
+#[cfg(test)]
+mod operator_ratio_tests {
+    use super::*;
+    use crate::genetic::smc_indicators::smc_structural_flag_count;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn population_smc_ratio_is_seeded_and_reaches_the_target() {
+        let cfg = SmcSearchConfig {
+            force_ratio: 0.30,
+            min_flags: 1,
+            ..SmcSearchConfig::default()
+        };
+        let blank = vec![Gene::default(); 32];
+        let mut first = blank.clone();
+        let mut second = blank.clone();
+        let mut other = blank.clone();
+        enforce_population_smc_ratio(&mut first, &cfg, &mut StdRng::seed_from_u64(42));
+        enforce_population_smc_ratio(&mut second, &cfg, &mut StdRng::seed_from_u64(42));
+        enforce_population_smc_ratio(&mut other, &cfg, &mut StdRng::seed_from_u64(43));
+        let flags = |genes: &[Gene]| -> Vec<Vec<bool>> {
+            genes
+                .iter()
+                .map(|gene| {
+                    vec![
+                        gene.use_ob,
+                        gene.use_fvg,
+                        gene.use_liq_sweep,
+                        gene.use_premium_discount,
+                        gene.use_inducement,
+                        gene.mtf_confirmation,
+                        gene.use_bos,
+                        gene.use_choch,
+                        gene.use_eqh,
+                        gene.use_eql,
+                        gene.use_displacement,
+                    ]
+                })
+                .collect()
+        };
+        assert_eq!(
+            flags(&first),
+            flags(&second),
+            "same seed reproduces WHICH flags are forced"
+        );
+        assert_ne!(
+            flags(&first),
+            flags(&other),
+            "seeded placement is not one fixed pattern"
+        );
+        let active = first
+            .iter()
+            .filter(|gene| smc_structural_flag_count(gene) > 0)
+            .count();
+        assert!(active >= ((32.0 * cfg.force_ratio).ceil() as usize));
+    }
+
+    #[test]
+    fn smc_repair_actual_genes_can_collide_and_collision_is_counted() {
+        let cfg = SmcSearchConfig {
+            force_ratio: 1.0,
+            min_flags: 10,
+            p_mtf: 1.0,
+            ..SmcSearchConfig::default()
+        };
+        let mut first = Gene::default();
+        first.mtf_confirmation = false;
+        let mut second = Gene::default();
+        second.mtf_confirmation = true;
+        let mut genes = vec![first, second];
+        enforce_population_smc_ratio(&mut genes, &cfg, &mut StdRng::seed_from_u64(5));
+        let mut seen = crate::genetic::evolution_math::SeenSignatureMemory::current();
+        let registered_first = seen.insert_gene(&genes[0]);
+        let registered_second = seen.insert_gene(&genes[1]);
+        let collisions = usize::from(!registered_first) + usize::from(!registered_second);
+        assert_eq!(
+            collisions, 1,
+            "SMC repair can merge formerly distinct offspring; count the actual repeat"
+        );
+    }
 }

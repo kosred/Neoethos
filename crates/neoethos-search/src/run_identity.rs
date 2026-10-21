@@ -48,6 +48,9 @@ fn cpu_execution_source_sha256() -> &'static str {
             include_bytes!("eval.rs").as_slice(),
             include_bytes!("stop_target.rs").as_slice(),
             include_bytes!("run_identity.rs").as_slice(),
+            include_bytes!("genetic/evolution_math.rs").as_slice(),
+            include_bytes!("genetic/smc_indicators.rs").as_slice(),
+            include_bytes!("genetic/strategy_gene.rs").as_slice(),
         ])
     })
 }
@@ -1913,6 +1916,9 @@ mod tests {
                 include_bytes!("eval.rs").as_slice(),
                 include_bytes!("stop_target.rs").as_slice(),
                 include_bytes!("run_identity.rs").as_slice(),
+                include_bytes!("genetic/evolution_math.rs").as_slice(),
+                include_bytes!("genetic/smc_indicators.rs").as_slice(),
+                include_bytes!("genetic/strategy_gene.rs").as_slice(),
             ])
         );
     }

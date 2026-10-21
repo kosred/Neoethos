@@ -2015,3 +2015,105 @@ mod tests {
         assert_eq!(current_threshold_ladder(), STATIC_THRESHOLD_LADDER);
     }
 }
+
+#[cfg(test)]
+mod generator_audit_tests {
+    use super::*;
+    use crate::genetic::smc_indicators::smc_structural_flag_count;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    fn audit_gene(indices: Vec<usize>) -> Gene {
+        Gene {
+            weights: vec![0.4; indices.len()],
+            indices,
+            ..Gene::default()
+        }
+    }
+
+    #[test]
+    fn crossover_inherits_one_indicator_only_from_b() {
+        let a = audit_gene(vec![0]);
+        let b = audit_gene(vec![1]);
+        let child = crossover(&a, &b, 1, &mut StdRng::seed_from_u64(7));
+        assert_eq!(child.indices, vec![1]);
+        let child_reversed = crossover(&b, &a, 1, &mut StdRng::seed_from_u64(7));
+        assert_eq!(child_reversed.indices, vec![0]);
+    }
+
+    #[test]
+    fn crossover_fixed_midpoint_is_parent_order_sensitive() {
+        let a = audit_gene(vec![0, 1]);
+        let b = audit_gene(vec![2, 3]);
+        let child = crossover(&a, &b, 1, &mut StdRng::seed_from_u64(11));
+        assert_eq!(child.indices, vec![0, 3]);
+        let swapped = crossover(&b, &a, 1, &mut StdRng::seed_from_u64(11));
+        assert_eq!(swapped.indices, vec![2, 1]);
+    }
+
+    #[test]
+    fn mutation_in_improvement_mode_keeps_arity_and_measures_locus_changes() {
+        let cfg = SmcSearchConfig::default();
+        let parent = audit_gene(vec![0, 1, 2]);
+        let mut rng = StdRng::seed_from_u64(1234);
+        let mut changed = 0usize;
+        let mut neutral = 0usize;
+        let mut reduced = 0usize;
+        let mut unchanged_arity = 0usize;
+        let mut neutral_indices_other_traits_changed = 0usize;
+        let mut whole_genome_neutral = 0usize;
+        let samples = 2_000usize;
+        for _ in 0..samples {
+            let child = mutate(&parent, 8, 4, 1, &cfg, 0, &mut rng);
+            assert!(
+                child.indices.len() <= parent.indices.len(),
+                "improvement mode never grows arity"
+            );
+            if child.indices.len() < parent.indices.len() {
+                reduced += 1;
+            } else {
+                unchanged_arity += 1;
+            }
+            if child.indices != parent.indices {
+                changed += 1;
+            } else {
+                neutral += 1;
+            }
+            if child.indices == parent.indices {
+                let mut left = parent.clone();
+                let mut right = child.clone();
+                right.strategy_id = left.strategy_id.clone();
+                right.generation = left.generation;
+                reset_gene_metrics(&mut left);
+                reset_gene_metrics(&mut right);
+                let same_other = left == right;
+                if same_other {
+                    whole_genome_neutral += 1;
+                } else {
+                    neutral_indices_other_traits_changed += 1;
+                }
+            }
+        }
+        eprintln!(
+            "improvement-mode mutation: inherited={neutral} changed={changed} reduced_arity={reduced} same_arity={unchanged_arity} neutral_indices_other_traits_changed={neutral_indices_other_traits_changed} whole_genome_neutral={whole_genome_neutral} samples={samples}"
+        );
+        assert!(changed > 0);
+        assert!(neutral > 0);
+        assert_eq!(changed + neutral, samples);
+        assert_eq!(reduced + unchanged_arity, samples);
+        assert!(neutral_indices_other_traits_changed > 0);
+        assert!(whole_genome_neutral < neutral);
+    }
+
+    #[test]
+    fn random_newborn_always_satisfies_configured_min_structural_flags() {
+        let cfg = SmcSearchConfig::default();
+        let mut rng = StdRng::seed_from_u64(99);
+        for _ in 0..500 {
+            let gene = new_random_gene(6, 4, 0, &cfg, &mut rng);
+            assert!(
+                smc_structural_flag_count(&gene) >= cfg.min_flags,
+                "new_random_gene enforces min_flags on every newborn"
+            );
+        }
+    }
+}
