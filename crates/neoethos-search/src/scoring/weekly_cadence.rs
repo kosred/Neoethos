@@ -114,7 +114,7 @@ impl WeeklySearchLimitsV1 {
 /// the wire objective. 0 is reserved for historical objectives serialized before
 /// this binding existed; they stay readable but are explicitly unbound and are
 /// refused as current equivalence/replay.
-pub const WEEKLY_SCORING_SEMANTICS_VERSION_V1: u16 = 1;
+pub const WEEKLY_SCORING_SEMANTICS_VERSION_V1: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,8 +172,7 @@ impl WeeklySearchObjectiveV1 {
         self.cadence.validate()?;
         self.limits.validate()?;
         anyhow::ensure!(
-            self.scoring_semantics_version == 0
-                || self.scoring_semantics_version == WEEKLY_SCORING_SEMANTICS_VERSION_V1,
+            self.scoring_semantics_version <= WEEKLY_SCORING_SEMANTICS_VERSION_V1,
             "unsupported weekly scoring semantics version {}",
             self.scoring_semantics_version
         );
@@ -341,6 +340,328 @@ pub fn evaluate_rolling_weekly_cadence(
             && entries.len().saturating_sub(weekend_entries) + sunday_entries_credited
                 >= days.len().div_ceil(5),
     })
+}
+
+/// Research adaptation of nondominated sorting and crowding to the weekly
+/// feasibility problem. This is not stock constrained-NSGA-II and it does not
+/// claim to reproduce it or to guarantee a profitable genome. It follows the
+/// published nondominated-ranking/crowding idea (Deb et al., IEEE TEC 2002,
+/// doi:10.1109/4235.996017) only as an explicit small-population selection aid.
+pub const WEEKLY_SELECTION_AXES_V1: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WeeklySelectionRankV1 {
+    pub feasible: bool,
+    pub front_rank: u32,
+    pub crowding: f64,
+    pub bounded_distance: f64,
+    pub fitness: f64,
+    /// Full violation vector used for input permutation checks and unique-vector
+    /// diversity; never a missing daily-DD zero because callers supply all 11
+    /// metrics plus the same-execution report.
+    pub axes: [f64; WEEKLY_SELECTION_AXES_V1],
+}
+
+impl WeeklySelectionRankV1 {
+    /// Feasible first, then better fronts, then wider crowding, then the
+    /// bounded smooth distance, then the original objective. Used by the
+    /// bounded weekly archive only; no caller may relabel an infeasible rank.
+    /// The SINGLE ordering owner. Greater always means better: feasible first,
+    /// then better front, wider crowding, lower smooth distance, higher
+    /// original financial fitness. Order/archive/survivor code must delegate
+    /// here instead of mirroring comparator directions.
+    pub fn preference_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.feasible, other.feasible) {
+            (true, false) => return std::cmp::Ordering::Greater,
+            (false, true) => return std::cmp::Ordering::Less,
+            _ => {}
+        }
+        other
+            .front_rank
+            .cmp(&self.front_rank)
+            .then_with(|| self.crowding.total_cmp(&other.crowding))
+            .then_with(|| other.bounded_distance.total_cmp(&self.bounded_distance))
+            .then_with(|| self.fitness.total_cmp(&other.fitness))
+    }
+
+    pub fn retention_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.preference_cmp(other)
+    }
+
+    /// Cross-generation archive ordering: absolute, bounded and independent of
+    /// a candidate's cohort-relative front/crowding number. Feasible first, then
+    /// fewer violated axes, lower smooth distance and higher financial fitness.
+    pub fn archive_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.feasible, other.feasible) {
+            (true, false) => return std::cmp::Ordering::Greater,
+            (false, true) => return std::cmp::Ordering::Less,
+            _ => {}
+        }
+        let left_violated = self.axes.iter().filter(|axis| **axis > 0.0).count();
+        let right_violated = other.axes.iter().filter(|axis| **axis > 0.0).count();
+        right_violated
+            .cmp(&left_violated)
+            .then_with(|| other.bounded_distance.total_cmp(&self.bounded_distance))
+            .then_with(|| self.fitness.total_cmp(&other.fitness))
+    }
+}
+
+impl Eq for WeeklySelectionRankV1 {}
+
+fn weekly_dominates(
+    a: &[f64; WEEKLY_SELECTION_AXES_V1],
+    b: &[f64; WEEKLY_SELECTION_AXES_V1],
+) -> bool {
+    let mut strictly_better = false;
+    for axis in 0..WEEKLY_SELECTION_AXES_V1 {
+        if a[axis] > b[axis] {
+            return false;
+        }
+        if a[axis] < b[axis] {
+            strictly_better = true;
+        }
+    }
+    strictly_better
+}
+
+/// Full observed metrics plus the same-execution cadence report. Non-finite
+/// inputs fail closed; no missing daily drawdown is replaced by zero.
+pub fn weekly_violation_axes(
+    objective: &WeeklySearchObjectiveV1,
+    metrics: &[f64; 11],
+    report: &WeeklyRollingCadenceReportV1,
+) -> anyhow::Result<[f64; WEEKLY_SELECTION_AXES_V1]> {
+    objective.validate_current()?;
+    anyhow::ensure!(
+        metrics.iter().all(|value| value.is_finite())
+            && report.violation.is_finite()
+            && report.trades_per_month.is_finite()
+            && report.trading_days > 4,
+        "weekly selection requires finite observed metrics and a finite cadence report"
+    );
+    let limits = &objective.limits;
+    let expectancy_scale = if limits.min_net_expectancy > 0.0 {
+        limits.min_net_expectancy
+    } else {
+        limits.initial_equity * limits.per_trade_risk_band.1
+    };
+    Ok([
+        report.violating_windows as f64,
+        (limits.min_net_profit - metrics[0]).max(0.0) / limits.initial_equity,
+        (limits.min_net_expectancy - metrics[6]).max(0.0) / expectancy_scale,
+        (metrics[3] - limits.max_drawdown).max(0.0) / limits.max_drawdown,
+        (metrics[10] - limits.max_daily_drawdown).max(0.0) / limits.max_daily_drawdown,
+        (limits.min_trades_per_month - report.trades_per_month).max(0.0)
+            / limits.min_trades_per_month.max(1.0),
+        (limits.min_win_rate - metrics[4]).max(0.0),
+        (limits.min_profit_factor - metrics[5]).max(0.0) / limits.min_profit_factor.max(1.0),
+    ])
+}
+
+pub fn weekly_axes_are_feasible(
+    objective: &WeeklySearchObjectiveV1,
+    metrics: &[f64; 11],
+    report: &WeeklyRollingCadenceReportV1,
+    axes: &[f64; WEEKLY_SELECTION_AXES_V1],
+) -> bool {
+    axes.iter().all(|axis| *axis == 0.0)
+        && report.feasible()
+        && metrics[0] > 0.0
+        && metrics[6] > 0.0
+        && metrics[3] < objective.limits.max_drawdown
+        && metrics[10] < objective.limits.max_daily_drawdown
+}
+
+/// Deterministic O(N^2)-time / O(N)-memory nondominated ranking with
+/// per-front crowding. The explicit bound is the population, never the history.
+pub fn weekly_selection_ranks(
+    objective: &WeeklySearchObjectiveV1,
+    metrics: &[[f64; 11]],
+    reports: &[WeeklyRollingCadenceReportV1],
+    fitness: &[f64],
+) -> anyhow::Result<Vec<WeeklySelectionRankV1>> {
+    anyhow::ensure!(
+        metrics.len() == reports.len() && reports.len() == fitness.len(),
+        "weekly selection requires aligned genes, metrics and same-execution cadence reports"
+    );
+    let n = metrics.len();
+    let mut ranks = vec![
+        WeeklySelectionRankV1 {
+            feasible: false,
+            front_rank: 0,
+            crowding: 0.0,
+            bounded_distance: 0.0,
+            fitness: 0.0,
+            axes: [0.0; WEEKLY_SELECTION_AXES_V1],
+        };
+        n
+    ];
+    let mut feasible = vec![false; n];
+    for i in 0..n {
+        anyhow::ensure!(
+            fitness[i].is_finite(),
+            "weekly selection fitness must be finite"
+        );
+        let axes = weekly_violation_axes(objective, &metrics[i], &reports[i])?;
+        feasible[i] = weekly_axes_are_feasible(objective, &metrics[i], &reports[i], &axes);
+        ranks[i].axes = axes;
+        ranks[i].feasible = feasible[i];
+        ranks[i].bounded_distance = axes.iter().map(|x| x / (1.0 + x)).sum();
+        ranks[i].fitness = fitness[i];
+    }
+    let infeasible: Vec<usize> = (0..n).filter(|i| !feasible[*i]).collect();
+    if infeasible.is_empty() {
+        return Ok(ranks);
+    }
+    let m = infeasible.len();
+    let mut dominated_by = vec![0usize; n];
+    for &candidate in &infeasible {
+        for &other in &infeasible {
+            if other != candidate && weekly_dominates(&ranks[other].axes, &ranks[candidate].axes) {
+                dominated_by[candidate] += 1;
+            }
+        }
+    }
+    let mut removed = vec![false; n];
+    let mut front_rank = 1u32;
+    loop {
+        let front: Vec<usize> = infeasible
+            .iter()
+            .copied()
+            .filter(|i| !removed[*i] && dominated_by[*i] == 0)
+            .collect();
+        if front.is_empty() {
+            anyhow::ensure!(
+                front_rank > 1 && removed.iter().filter(|v| **v).count() >= m,
+                "weekly nondominated front unexpectedly empty"
+            );
+            break;
+        }
+        let positions: std::collections::HashMap<usize, usize> = front
+            .iter()
+            .enumerate()
+            .map(|(position, index)| (*index, position))
+            .collect();
+        let mut crowding = vec![0.0; front.len()];
+        if front.len() > 1 {
+            for axis in 0..WEEKLY_SELECTION_AXES_V1 {
+                let mut order = front.clone();
+                order.sort_by(|&a, &b| {
+                    ranks[a].axes[axis]
+                        .total_cmp(&ranks[b].axes[axis])
+                        .then_with(|| a.cmp(&b))
+                });
+                let span = ranks[order[order.len() - 1]].axes[axis] - ranks[order[0]].axes[axis];
+                if !(span > 0.0) {
+                    continue;
+                }
+                crowding[positions[&order[0]]] += f64::INFINITY;
+                crowding[positions[&order[order.len() - 1]]] += f64::INFINITY;
+                for pos in 1..order.len() - 1 {
+                    let gap = ranks[order[pos + 1]].axes[axis] - ranks[order[pos - 1]].axes[axis];
+                    crowding[positions[&order[pos]]] += gap / span;
+                }
+            }
+        }
+        for &index in &front {
+            ranks[index].front_rank = front_rank;
+            ranks[index].crowding = crowding[positions[&index]];
+        }
+        for &index in &front {
+            removed[index] = true;
+        }
+        for &index in &front {
+            for &other in &infeasible {
+                if !removed[other] && weekly_dominates(&ranks[index].axes, &ranks[other].axes) {
+                    dominated_by[other] = dominated_by[other].saturating_sub(1);
+                }
+            }
+        }
+        front_rank = front_rank
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("weekly front rank overflow"))?;
+    }
+    Ok(ranks)
+}
+
+pub fn weekly_selection_order(ranks: &[WeeklySelectionRankV1]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..ranks.len()).collect();
+    order.sort_by(|&a, &b| ranks[b].preference_cmp(&ranks[a]).then_with(|| a.cmp(&b)));
+    order
+}
+
+/// Bounded scalar for existing tournament/parent selectors. It preserves the
+/// order above; it is not a feasibility label and cannot erase a front because
+/// survivors use the front-aware allocator below.
+pub fn weekly_selection_scores(ranks: &[WeeklySelectionRankV1]) -> Vec<f64> {
+    let order = weekly_selection_order(ranks);
+    let mut scores = vec![0.0; ranks.len()];
+    let total = order.len().max(1) as f64;
+    for (position, index) in order.into_iter().enumerate() {
+        scores[index] = 1.0 - position as f64 / total;
+    }
+    scores
+}
+
+/// NSGA-II-style environmental selection: feasible first, then front by front,
+/// crowding-truncated. It retains complementary infeasible paths while capacity
+/// remains; repeated identical vectors have zero crowding and cannot flood it.
+pub fn weekly_select_survivors(ranks: &[WeeklySelectionRankV1], requested: usize) -> Vec<usize> {
+    let requested = requested.min(ranks.len());
+    if requested == 0 {
+        return Vec::new();
+    }
+    let mut selected: Vec<usize> = Vec::with_capacity(requested);
+    let mut seen_vectors: std::collections::HashSet<[u64; WEEKLY_SELECTION_AXES_V1]> =
+        std::collections::HashSet::new();
+    let vector_key = |rank: &WeeklySelectionRankV1| {
+        let mut key = [0u64; WEEKLY_SELECTION_AXES_V1];
+        for (slot, value) in rank.axes.iter().enumerate() {
+            key[slot] = if *value == 0.0 { 0 } else { value.to_bits() };
+        }
+        key
+    };
+    // Pass 1: one representative per unique violation vector, feasible first
+    // and then front by front. This is what stops a quiet-vector flood from
+    // consuming every survivor slot.
+    let mut feasible: Vec<usize> = (0..ranks.len()).filter(|i| ranks[*i].feasible).collect();
+    feasible.sort_by(|&a, &b| ranks[b].preference_cmp(&ranks[a]).then_with(|| a.cmp(&b)));
+    for index in feasible {
+        if selected.len() == requested {
+            return selected;
+        }
+        // Every feasible candidate is retained in financial-objective order;
+        // unique-vector diversity applies only to the infeasible exploration
+        // section below.
+        selected.push(index);
+    }
+    let max_front = ranks.iter().map(|rank| rank.front_rank).max().unwrap_or(0);
+    let mut skipped: Vec<usize> = Vec::new();
+    for front in 1..=max_front {
+        let mut members: Vec<usize> = (0..ranks.len())
+            .filter(|i| !ranks[*i].feasible && ranks[*i].front_rank == front)
+            .collect();
+        members.sort_by(|&a, &b| ranks[b].preference_cmp(&ranks[a]).then_with(|| a.cmp(&b)));
+        for index in members {
+            if selected.len() == requested {
+                return selected;
+            }
+            if seen_vectors.insert(vector_key(&ranks[index])) {
+                selected.push(index);
+            } else {
+                skipped.push(index);
+            }
+        }
+    }
+    // Pass 2: only after every complementary vector has a representative may
+    // remaining capacity hold exact-duplicate genomes for reproducibility.
+    for index in skipped {
+        if selected.len() == requested {
+            break;
+        }
+        selected.push(index);
+    }
+    selected
 }
 
 #[cfg(test)]
@@ -593,6 +914,10 @@ mod tests {
         ];
         assert!(current.fitness(&metrics, &good_report, 0.0) > 0.0);
 
+        let mut version_one = current;
+        version_one.scoring_semantics_version = 1;
+        version_one.validate().unwrap();
+        assert!(version_one.validate_current().is_err());
         let mut legacy = current;
         legacy.scoring_semantics_version = 0;
         legacy.validate().unwrap();
@@ -615,5 +940,357 @@ mod tests {
         let mut stale = current;
         stale.scoring_semantics_version = WEEKLY_SCORING_SEMANTICS_VERSION_V1 + 1;
         assert!(stale.validate().is_err());
+    }
+    // Synthetic selection-only fixtures, not reports reconstructed from entry
+    // timestamps. The test objective's 3% risk ceiling is not the v4 run's 1%.
+    fn selection_report(windows: u64, trades: usize) -> WeeklyRollingCadenceReportV1 {
+        WeeklyRollingCadenceReportV1 {
+            trading_days: 2219,
+            trades,
+            sunday_entries_credited: 0,
+            weekend_entries: 0,
+            trades_per_month: 21.0 * trades as f64 / 2219.0,
+            longest_silent_trading_days: if windows == 0 { 4 } else { 5 },
+            violating_windows: windows,
+            violation: windows as f64,
+            clustered: windows > 0,
+        }
+    }
+
+    fn selection_metrics(
+        net: f64,
+        drawdown: f64,
+        daily_drawdown: f64,
+        _expectancy: f64,
+        trades: usize,
+    ) -> [f64; 11] {
+        [
+            net,
+            if net >= 0.0 { 1.0 } else { -1.0 },
+            10_000.0 + net,
+            drawdown,
+            0.6,
+            1.2,
+            net / trades.max(1) as f64,
+            0.0,
+            trades as f64,
+            0.0,
+            daily_drawdown,
+        ]
+    }
+
+    fn selection_fixture() -> (
+        WeeklySearchObjectiveV1,
+        Vec<[f64; 11]>,
+        Vec<WeeklyRollingCadenceReportV1>,
+        Vec<f64>,
+        [usize; 5],
+    ) {
+        let objective = test_weekly_objective();
+        let metrics = vec![
+            selection_metrics(100.0, 0.09, 0.02, 1.0, 445), // B one-gap, joint dimensions
+            selection_metrics(50.0, 0.001, 0.001, 50.0, 1), // R one-trade refuge
+            selection_metrics(100.0, 0.30, 0.02, 1.0, 445), // D one gap but bad DD
+            selection_metrics(-9_900.0, 0.99, 0.049, -2.5, 5_000), // C zero-window near ruin
+            selection_metrics(-9_999.0, 0.999, 0.049, -4.0, 5_000), // C2 worse
+        ];
+        let reports = vec![
+            selection_report(1, 445),
+            selection_report(2_214, 1),
+            selection_report(1, 445),
+            selection_report(0, 5_000),
+            selection_report(0, 5_000),
+        ];
+        let fitness = vec![-1.0, -2.0, -3.0, -4.0, -5.0];
+        let indices = [0, 1, 2, 3, 4];
+        (objective, metrics, reports, fitness, indices)
+    }
+
+    #[test]
+    fn weekly_vector_fronts_retain_complementary_infeasible_paths() {
+        let (objective, metrics, reports, fitness, i) = selection_fixture();
+        let ranks = weekly_selection_ranks(&objective, &metrics, &reports, &fitness).unwrap();
+        assert_eq!(ranks[i[0]].front_rank, 1, "B is nondominated");
+        assert_eq!(ranks[i[3]].front_rank, 1, "C is nondominated with B");
+        assert_eq!(ranks[i[1]].front_rank, 2, "R is a complementary path");
+        assert_eq!(ranks[i[2]].front_rank, 2, "D is a complementary path");
+        assert_eq!(ranks[i[4]].front_rank, 2, "C2 is in the later front");
+        assert!(ranks[i[3]].retention_cmp(&ranks[i[4]]) == std::cmp::Ordering::Greater);
+
+        let order = weekly_selection_order(&ranks);
+        assert_eq!(order[0], i[0], "bounded distance prefers jointly closer B");
+        let survivors = weekly_select_survivors(&ranks, 2);
+        let retained: std::collections::BTreeSet<usize> = survivors.into_iter().collect();
+        assert_eq!(retained, std::collections::BTreeSet::from([i[0], i[3]]));
+    }
+
+    #[test]
+    fn weekly_vector_selection_rejects_near_ruin_and_losing_churn_as_feasible() {
+        let (objective, mut metrics, mut reports, mut fitness, i) = selection_fixture();
+        // Add a genuinely feasible active candidate and a zero-window losing churn.
+        metrics.push(selection_metrics(100.0, 0.09, 0.02, 1.0, 445));
+        reports.push(selection_report(0, 445));
+        fitness.push(0.5);
+        let feasible_index = metrics.len() - 1;
+        metrics.push(selection_metrics(-100.0, 0.05, 0.02, -1.0, 5_000));
+        reports.push(selection_report(0, 5_000));
+        fitness.push(-0.5);
+        let churn_index = metrics.len() - 1;
+        let ranks = weekly_selection_ranks(&objective, &metrics, &reports, &fitness).unwrap();
+        assert!(ranks[feasible_index].feasible);
+        assert!(
+            !ranks[churn_index].feasible,
+            "zero windows cannot rescue losses"
+        );
+        assert!(!ranks[i[3]].feasible, "near-ruin C is never feasible");
+        let survivors = weekly_select_survivors(&ranks, 2);
+        assert_eq!(survivors[0], feasible_index);
+        assert!(!survivors.contains(&i[3]));
+
+        let mut order = weekly_selection_order(&ranks);
+        assert_eq!(order.remove(0), feasible_index);
+    }
+
+    #[test]
+    fn weekly_vector_diversity_survives_repeated_identical_vectors() {
+        let (objective, base_metrics, base_reports, _, i) = selection_fixture();
+        let mut metrics = vec![base_metrics[i[1]], base_metrics[i[2]], base_metrics[i[3]]];
+        let mut reports = vec![
+            base_reports[i[1]].clone(),
+            base_reports[i[2]].clone(),
+            base_reports[i[3]].clone(),
+        ];
+        for _ in 0..20 {
+            metrics.push(base_metrics[i[1]]);
+            reports.push(base_reports[i[1]].clone());
+        }
+        let fitness = vec![-1.0; metrics.len()];
+        let ranks = weekly_selection_ranks(&objective, &metrics, &reports, &fitness).unwrap();
+        let survivors = weekly_select_survivors(&ranks, 3);
+        assert_eq!(survivors.len(), 3);
+        assert!(survivors.contains(&0), "one R representative remains");
+        assert!(survivors.contains(&1), "D remains a complementary path");
+        assert!(survivors.contains(&2), "C remains a complementary path");
+        assert_eq!(
+            survivors.iter().filter(|index| **index > 2).count(),
+            0,
+            "a flood of identical R vectors cannot take the complementary slots"
+        );
+    }
+
+    #[test]
+    fn weekly_vector_same_front_ties_use_fitness_and_crowding_consistently() {
+        let (mut objective, mut metrics, mut reports, _, i) = selection_fixture();
+        objective.limits.min_net_profit = 0.0;
+        metrics.truncate(2);
+        reports.truncate(2);
+        metrics[0] = selection_metrics(100.0, 0.09, 0.02, 1.0, 445);
+        reports[0] = selection_report(0, 445);
+        metrics[1] = selection_metrics(200.0, 0.09, 0.02, 1.0, 445);
+        reports[1] = selection_report(0, 445);
+        let fitness = vec![1.0, 5.0];
+        let ranks = weekly_selection_ranks(&objective, &metrics, &reports, &fitness).unwrap();
+        assert!(ranks[0].feasible && ranks[1].feasible);
+        assert_eq!(ranks[1].front_rank, 0);
+        assert_eq!(
+            ranks[1].preference_cmp(&ranks[0]),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(weekly_selection_order(&ranks)[0], 1);
+        assert_eq!(
+            ranks[1].retention_cmp(&ranks[0]),
+            std::cmp::Ordering::Greater
+        );
+        let _ = i;
+    }
+
+    #[test]
+    fn weekly_vector_ranking_is_input_permutation_invariant() {
+        let (objective, metrics, reports, fitness, _) = selection_fixture();
+        let original = weekly_selection_ranks(&objective, &metrics, &reports, &fitness).unwrap();
+        let permutation = [4usize, 0, 3, 1, 2];
+        let permuted_metrics: Vec<_> = permutation.iter().map(|i| metrics[*i]).collect();
+        let permuted_reports: Vec<_> = permutation.iter().map(|i| reports[*i].clone()).collect();
+        let permuted_fitness: Vec<_> = permutation.iter().map(|i| fitness[*i]).collect();
+        let shuffled = weekly_selection_ranks(
+            &objective,
+            &permuted_metrics,
+            &permuted_reports,
+            &permuted_fitness,
+        )
+        .unwrap();
+        for (new_index, old_index) in permutation.iter().enumerate() {
+            assert_eq!(
+                shuffled[new_index].front_rank,
+                original[*old_index].front_rank
+            );
+            assert_eq!(
+                shuffled[new_index].crowding.to_bits(),
+                original[*old_index].crowding.to_bits()
+            );
+            assert_eq!(shuffled[new_index].feasible, original[*old_index].feasible);
+        }
+    }
+
+    #[test]
+    fn weekly_vector_reverse_chain_peels_one_front_at_a_time() {
+        let objective = test_weekly_objective();
+        let n = 60usize;
+        let metrics: Vec<[f64; 11]> = (0..n)
+            .map(|_| selection_metrics(-100.0, 0.05, 0.02, -1.0, 5_000))
+            .collect();
+        let reports: Vec<_> = (0..n)
+            .map(|windows| selection_report(windows as u64, 5_000))
+            .collect();
+        let fitness = vec![-1.0; n];
+        let ranks = weekly_selection_ranks(&objective, &metrics, &reports, &fitness).unwrap();
+        let mut fronts: Vec<u32> = ranks.iter().map(|rank| rank.front_rank).collect();
+        fronts.sort_unstable();
+        assert_eq!(fronts, (1..=n as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn weekly_vector_empty_observations_keep_empty_selection() {
+        let objective = test_weekly_objective();
+        let ranks = weekly_selection_ranks(&objective, &[], &[], &[]).unwrap();
+        assert!(ranks.is_empty());
+        assert!(weekly_selection_order(&ranks).is_empty());
+        for requested in [0, 1, usize::MAX] {
+            assert!(weekly_select_survivors(&ranks, requested).is_empty());
+        }
+    }
+
+    #[test]
+    fn weekly_vector_all_feasible_preserves_cardinality_and_financial_order() {
+        let objective = test_weekly_objective();
+        let fitness = [1.0, 5.0, 3.0];
+        let expected = [vec![0], vec![1, 0], vec![1, 2, 0]];
+        for count in 1..=3 {
+            let metrics: Vec<_> = (0..count)
+                .map(|_| selection_metrics(100.0, 0.09, 0.02, 1.0, 445))
+                .collect();
+            let reports = vec![selection_report(0, 445); count];
+            let ranks =
+                weekly_selection_ranks(&objective, &metrics, &reports, &fitness[..count]).unwrap();
+            assert_eq!(ranks.len(), count);
+            assert!(ranks.iter().all(|rank| rank.feasible));
+            assert!(ranks.iter().all(|rank| rank.axes == [0.0; 8]));
+            assert_eq!(weekly_selection_order(&ranks), expected[count - 1]);
+            for requested in 0..=count + 1 {
+                let survivors = weekly_select_survivors(&ranks, requested);
+                assert_eq!(survivors.len(), requested.min(count));
+                assert_eq!(survivors, expected[count - 1][..requested.min(count)]);
+            }
+        }
+    }
+
+    #[test]
+    fn weekly_vector_feasible_candidates_fill_capacity_before_infeasible() {
+        let objective = test_weekly_objective();
+        let metrics = vec![selection_metrics(100.0, 0.09, 0.02, 1.0, 445); 3];
+        let reports = vec![
+            selection_report(1, 445),
+            selection_report(0, 445),
+            selection_report(0, 445),
+        ];
+        let ranks =
+            weekly_selection_ranks(&objective, &metrics, &reports, &[100.0, 1.0, 5.0]).unwrap();
+        assert!(!ranks[0].feasible);
+        assert!(ranks[1].feasible && ranks[2].feasible);
+        assert_eq!(weekly_select_survivors(&ranks, 2), vec![2, 1]);
+        assert_eq!(weekly_select_survivors(&ranks, 3), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn weekly_vector_exact_drawdown_boundaries_remain_infeasible() {
+        let objective = test_weekly_objective();
+        let limits = objective.limits;
+        let metrics = vec![
+            selection_metrics(100.0, limits.max_drawdown, 0.02, 1.0, 445),
+            selection_metrics(100.0, 0.09, limits.max_daily_drawdown, 1.0, 445),
+            selection_metrics(
+                100.0,
+                limits.max_drawdown - f64::EPSILON,
+                limits.max_daily_drawdown - f64::EPSILON,
+                1.0,
+                445,
+            ),
+        ];
+        let reports = vec![selection_report(0, 445); 3];
+        let ranks =
+            weekly_selection_ranks(&objective, &metrics, &reports, &[100.0, 200.0, -5.0]).unwrap();
+        assert!(ranks.iter().all(|rank| rank.axes == [0.0; 8]));
+        assert!(
+            !ranks[0].feasible,
+            "overall drawdown must be strictly below its limit"
+        );
+        assert!(
+            !ranks[1].feasible,
+            "daily drawdown must be strictly below its limit"
+        );
+        assert!(ranks[2].feasible);
+        assert_eq!(weekly_select_survivors(&ranks, 1), vec![2]);
+        let survivors = weekly_select_survivors(&ranks, 3);
+        assert_eq!(survivors.len(), 3);
+        assert_eq!(survivors[0], 2);
+        assert_eq!(
+            survivors
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0, 1, 2])
+        );
+    }
+
+    #[test]
+    fn weekly_vector_requested_capacity_does_not_drop_duplicate_slots() {
+        let (objective, mut metrics, mut reports, mut fitness, i) = selection_fixture();
+        for _ in 0..3 {
+            metrics.push(metrics[i[1]]);
+            reports.push(reports[i[1]].clone());
+            fitness.push(-2.0);
+        }
+        let ranks = weekly_selection_ranks(&objective, &metrics, &reports, &fitness).unwrap();
+        for requested in [0, 1, 3, ranks.len(), ranks.len() + 1] {
+            let survivors = weekly_select_survivors(&ranks, requested);
+            let distinct: std::collections::BTreeSet<_> = survivors.iter().copied().collect();
+            assert_eq!(survivors.len(), requested.min(ranks.len()));
+            assert_eq!(
+                distinct.len(),
+                survivors.len(),
+                "no input slot may be selected twice"
+            );
+            assert!(distinct.iter().all(|index| *index < ranks.len()));
+            if requested >= ranks.len() {
+                assert_eq!(distinct, (0..ranks.len()).collect());
+            }
+        }
+    }
+
+    #[test]
+    fn weekly_vector_nonpositive_financial_results_remain_infeasible() {
+        let objective = test_weekly_objective();
+        let metrics = vec![
+            selection_metrics(0.0, 0.09, 0.02, 0.0, 445),
+            selection_metrics(-100.0, 0.09, 0.02, -1.0, 445),
+            selection_metrics(100.0, 0.09, 0.02, 1.0, 445),
+        ];
+        let reports = vec![selection_report(0, 445); 3];
+        let ranks =
+            weekly_selection_ranks(&objective, &metrics, &reports, &[100.0, 200.0, -5.0]).unwrap();
+        assert!(
+            !ranks[0].feasible,
+            "zero net and expectancy are not acceptable"
+        );
+        assert!(!ranks[1].feasible, "active losses are not acceptable");
+        assert!(ranks[2].feasible);
+        assert_eq!(weekly_select_survivors(&ranks, 1), vec![2]);
+    }
+
+    #[test]
+    fn weekly_vector_selection_fails_closed_on_nonfinite_metrics() {
+        let (objective, metrics, reports, fitness, _) = selection_fixture();
+        let mut bad = metrics;
+        bad[0][0] = f64::NAN;
+        assert!(weekly_selection_ranks(&objective, &bad, &reports, &fitness).is_err());
     }
 }

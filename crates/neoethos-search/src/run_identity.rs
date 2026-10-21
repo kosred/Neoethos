@@ -69,6 +69,7 @@ fn weekly_scoring_source_sha256() -> &'static str {
         weekly_scoring_source_sha256_from(&[
             include_bytes!("scoring/weekly_cadence.rs").as_slice(),
             include_bytes!("genetic/profitable_archive.rs").as_slice(),
+            include_bytes!("genetic/search_engine.rs").as_slice(),
         ])
     })
 }
