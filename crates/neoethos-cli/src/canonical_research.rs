@@ -435,6 +435,18 @@ pub fn settings_path(args: &[String]) -> Result<PathBuf> {
     Ok(Arguments::parse(args)?.value("--settings-source").into())
 }
 
+fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String>) {
+    for flag in QUOTE_FLAGS
+        .into_iter()
+        .chain(RESUME_FLAGS)
+        .chain(NEW_SEARCH_FLAGS)
+    {
+        if let Some(value) = args.0.get(flag) {
+            push(discovery_args, flag, value);
+        }
+    }
+}
+
 pub fn run(args: &[String], settings: &Settings) -> Result<()> {
     ensure!(
         !cfg!(feature = "gpu-nvidia"),
@@ -602,11 +614,7 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
             &args.positive(source_flag, default)?.to_string(),
         );
     }
-    for flag in QUOTE_FLAGS.into_iter().chain(RESUME_FLAGS) {
-        if let Some(value) = args.0.get(flag) {
-            push(&mut discovery_args, flag, value);
-        }
-    }
+    forward_optional_mode_flags(&args, &mut discovery_args);
     // Research-only outer-holdout evaluation: the CLI keeps the operator-facing
     // spelling, the discovery layer receives an explicit output path. This is
     // NOT a promotion artifact and never feeds back into Search.
@@ -807,6 +815,34 @@ mod tests {
         push(&mut args, "--max-batches", "1");
         assert!(Arguments::parse(&args).is_ok());
     }
+    #[test]
+    fn recorded_new_search_flags_survive_the_actual_forwarding_boundary_exactly_once() {
+        let mut raw = valid_arguments();
+        let path = "C:/recorded/v5.research.json";
+        let sha = "abc123".repeat(10) + "abcd";
+        push(&mut raw, "--new-search-research", path);
+        push(&mut raw, "--new-search-research-sha256", &sha);
+        push(&mut raw, "--max-batches", "1");
+        let args = Arguments::parse(&raw).expect("new-search arguments");
+        let mut forwarded = Vec::new();
+        forward_optional_mode_flags(&args, &mut forwarded);
+        for (flag, value) in [
+            ("--new-search-research", path),
+            ("--new-search-research-sha256", sha.as_str()),
+        ] {
+            assert_eq!(
+                forwarded.iter().filter(|arg| arg.as_str() == flag).count(),
+                1,
+                "{flag} must be forwarded exactly once"
+            );
+            let index = forwarded
+                .iter()
+                .position(|arg| arg.as_str() == flag)
+                .expect("forwarded flag");
+            assert_eq!(forwarded[index + 1], value, "{flag} value changed");
+        }
+    }
+
     #[test]
     fn saved_input_hash_is_checked_above_the_scalar_cost_file_limit() {
         use sha2::{Digest, Sha256};
