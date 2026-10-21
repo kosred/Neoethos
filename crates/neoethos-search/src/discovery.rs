@@ -10262,6 +10262,12 @@ fn prefilter_features(
         };
         return Ok((features.clone(), census));
     }
+    let _base_timeframe_guard =
+        crate::genetic::search_engine::base_timeframe_context_from_features(features).map(
+            |(base, prefixed)| {
+                crate::genetic::seed_templates::enter_search_base_timeframe(&base, prefixed)
+            },
+        );
     let sealed_schema =
         crate::prefilter_schema_v1::seal_prefilter_column_classification_v1(&features.names)
             .ok_or_else(|| {

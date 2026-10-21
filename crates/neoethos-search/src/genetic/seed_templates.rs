@@ -831,5 +831,12 @@ mod tests {
         );
         let _guard = crate::genetic::seed_templates::enter_search_base_timeframe(&base, prefixed);
         assert_eq!(resolve_role(&names, &base_role), Some(0));
+        drop(_guard);
+        let _m15_guard = enter_search_base_timeframe("M15", false);
+        let template_names = vec!["rsi".to_string(), "h1_rsi".to_string()];
+        assert!(
+            template_feature_indices(&template_names).contains(&0),
+            "base role features are force-kept under explicit provenance"
+        );
     }
 }
