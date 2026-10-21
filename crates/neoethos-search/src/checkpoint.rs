@@ -236,6 +236,7 @@ impl SearchCheckpointArtifactFile {
 
     pub fn search_result(&self) -> SearchResult {
         SearchResult {
+            generation_census_v1: None,
             genes: self.genes.clone(),
             metrics: self.metrics.clone(),
 
@@ -368,6 +369,7 @@ mod tests {
             seed_chain,
             ledger,
             SearchResult {
+                generation_census_v1: None,
                 genes: vec![gene],
                 metrics: vec![[1.0; 11]],
 

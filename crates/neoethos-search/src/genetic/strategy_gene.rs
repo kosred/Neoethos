@@ -812,8 +812,27 @@ impl Gene {
     }
 }
 
+/// Observed counts for one search invocation, independent of financial merit.
+/// Slots include repeated survivors; distinct genomes exclude those repeats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationCensusV1 {
+    pub schema_version: u16,
+    pub generation_evaluation_slots: u64,
+    pub final_policy_replay_evaluation_slots: u64,
+    pub total_evaluation_slots: u64,
+    /// None means the complete evaluation history was not observed.
+    pub whole_run_distinct_genomes: Option<usize>,
+    /// Actual retained archive entries before merging the last population.
+    pub archive_entries: usize,
+    pub final_population: usize,
+    pub returned_candidates: usize,
+    pub duplicate_handoff_entries: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    /// Absent for legacy checkpoints or routes without measured accounting.
+    pub generation_census_v1: Option<GenerationCensusV1>,
     pub genes: Vec<Gene>,
     pub metrics: Vec<[f64; 11]>,
     /// Effective SMC gate used for the metrics in this result. This is the

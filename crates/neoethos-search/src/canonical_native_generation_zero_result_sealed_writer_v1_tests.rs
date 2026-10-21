@@ -428,6 +428,7 @@ pub(super) fn with_fully_populated_sealed_result_v1(
         metrics.push(row);
     }
     let search_result = SearchResult {
+        generation_census_v1: None,
         genes,
         metrics,
         effective_smc_gate_threshold: 0.5,

@@ -20,11 +20,10 @@ use crate::validation::{
     CanonicalBacktestArtifactFile, CombinatorialPurgedCV, ForwardTestInput,
     ForwardTestValidationArtifactFile, PropFirmRiskInput, PropFirmRiskRules,
     PropFirmRiskValidationArtifactFile, PropFirmRiskValidationSummary,
-    ValidationStrategyIdentityV2, WalkforwardSummary,
-    WalkforwardValidationArtifactFile, compute_forward_test_summary,
-    compute_prop_firm_risk_summary, write_canonical_backtest_artifact_atomic,
-    write_forward_test_validation_artifact_atomic, write_prop_firm_risk_validation_artifact_atomic,
-    write_walkforward_validation_artifact_atomic,
+    ValidationStrategyIdentityV2, WalkforwardSummary, WalkforwardValidationArtifactFile,
+    compute_forward_test_summary, compute_prop_firm_risk_summary,
+    write_canonical_backtest_artifact_atomic, write_forward_test_validation_artifact_atomic,
+    write_prop_firm_risk_validation_artifact_atomic, write_walkforward_validation_artifact_atomic,
 };
 use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
@@ -2730,7 +2729,9 @@ fn remedy_for_stage(stage: &str) -> &'static str {
         "features_built" | "features_after_prefilter" => {
             "inspect feature validity, training-window support and the recorded prefilter reasons."
         }
-        "stage1_candidates_generated" | "profitable_archive_size" => {
+        "stage1_candidates_generated"
+        | "profitable_archive_size"
+        | "ga_returned_candidates_observation" => {
             "inspect the candidate census and measured net results after costs."
         }
         "full_is_evaluated" | "passed_base_filter" => {
@@ -6478,17 +6479,18 @@ fn evaluate_gene_under_cost_variant(
     variant_settings.spread_pips = variant.round_trip_cost_pips;
     variant_settings.session_spread_profile = None;
     variant_settings.commission_per_trade = variant.round_trip_commission_per_lot;
-    let (canonical_metrics, trades) = crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
-        &ohlcv.close,
-        &ohlcv.high,
-        &ohlcv.low,
-        signals,
-        confidences,
-        month_idx,
-        day_idx,
-        timestamps,
-        &variant_settings,
-    )?;
+    let (canonical_metrics, trades) =
+        crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
+            &ohlcv.close,
+            &ohlcv.high,
+            &ohlcv.low,
+            signals,
+            confidences,
+            month_idx,
+            day_idx,
+            timestamps,
+            &variant_settings,
+        )?;
     analyzer.analyze_strategy_with_evaluation(
         strategy_id,
         &trades,
@@ -6601,10 +6603,7 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
     let sealed_adaptive_stops = policy.sealed_adaptive_stops_policy()?;
     let current_adaptive_stops =
         crate::stop_target::ResolvedAdaptiveStopsPolicyV1::capture_current()?;
-    ensure_adaptive_stops_policy_matches_sealed(
-        &current_adaptive_stops,
-        sealed_adaptive_stops,
-    )?;
+    ensure_adaptive_stops_policy_matches_sealed(&current_adaptive_stops, sealed_adaptive_stops)?;
     anyhow::ensure!(
         policy.source_search_config_hash == result.search_config_hash,
         "saved research search_config_hash {} disagrees with its sealed policy {} — refusing to price candidates from an inconsistent archive",
@@ -6757,37 +6756,123 @@ fn ensure_research_config_matches_sealed_evaluation(
         );
     }
     let floats = [
-        ("initial_equity", rebuilt.initial_equity, sealed.initial_equity),
-        ("trailing_atr_multiplier", rebuilt.trailing_atr_multiplier, sealed.trailing_atr_multiplier),
-        ("trailing_be_trigger_r", rebuilt.trailing_be_trigger_r, sealed.trailing_be_trigger_r),
-        ("trailing_min_lock_pips", rebuilt.trailing_min_lock_pips, sealed.trailing_min_lock_pips),
+        (
+            "initial_equity",
+            rebuilt.initial_equity,
+            sealed.initial_equity,
+        ),
+        (
+            "trailing_atr_multiplier",
+            rebuilt.trailing_atr_multiplier,
+            sealed.trailing_atr_multiplier,
+        ),
+        (
+            "trailing_be_trigger_r",
+            rebuilt.trailing_be_trigger_r,
+            sealed.trailing_be_trigger_r,
+        ),
+        (
+            "trailing_min_lock_pips",
+            rebuilt.trailing_min_lock_pips,
+            sealed.trailing_min_lock_pips,
+        ),
         ("pip_value", rebuilt.pip_value, sealed.pip_value),
         ("spread_pips", rebuilt.spread_pips, sealed.spread_pips),
-        ("commission_per_trade", rebuilt.commission_per_trade, sealed.commission_per_trade),
-        ("pip_value_per_lot", rebuilt.pip_value_per_lot, sealed.pip_value_per_lot),
-        ("swap_long_pips_per_day", rebuilt.swap_long_pips_per_day, sealed.swap_long_pips_per_day),
-        ("swap_short_pips_per_day", rebuilt.swap_short_pips_per_day, sealed.swap_short_pips_per_day),
-        ("pnl_conversion_fee_rate", rebuilt.pnl_conversion_fee_rate, sealed.pnl_conversion_fee_rate),
-        ("risk_per_trade_min", rebuilt.risk_per_trade_min, sealed.risk_per_trade_min),
-        ("risk_per_trade_max", rebuilt.risk_per_trade_max, sealed.risk_per_trade_max),
-        ("high_quality_confidence", rebuilt.high_quality_confidence, sealed.high_quality_confidence),
+        (
+            "commission_per_trade",
+            rebuilt.commission_per_trade,
+            sealed.commission_per_trade,
+        ),
+        (
+            "pip_value_per_lot",
+            rebuilt.pip_value_per_lot,
+            sealed.pip_value_per_lot,
+        ),
+        (
+            "swap_long_pips_per_day",
+            rebuilt.swap_long_pips_per_day,
+            sealed.swap_long_pips_per_day,
+        ),
+        (
+            "swap_short_pips_per_day",
+            rebuilt.swap_short_pips_per_day,
+            sealed.swap_short_pips_per_day,
+        ),
+        (
+            "pnl_conversion_fee_rate",
+            rebuilt.pnl_conversion_fee_rate,
+            sealed.pnl_conversion_fee_rate,
+        ),
+        (
+            "risk_per_trade_min",
+            rebuilt.risk_per_trade_min,
+            sealed.risk_per_trade_min,
+        ),
+        (
+            "risk_per_trade_max",
+            rebuilt.risk_per_trade_max,
+            sealed.risk_per_trade_max,
+        ),
+        (
+            "high_quality_confidence",
+            rebuilt.high_quality_confidence,
+            sealed.high_quality_confidence,
+        ),
         ("smc_weight_ob", rebuilt.smc_weight_ob, sealed.smc_weight_ob),
-        ("smc_weight_fvg", rebuilt.smc_weight_fvg, sealed.smc_weight_fvg),
-        ("smc_weight_liq", rebuilt.smc_weight_liq, sealed.smc_weight_liq),
-        ("smc_weight_mtf", rebuilt.smc_weight_mtf, sealed.smc_weight_mtf),
-        ("smc_weight_premium", rebuilt.smc_weight_premium, sealed.smc_weight_premium),
-        ("smc_weight_inducement", rebuilt.smc_weight_inducement, sealed.smc_weight_inducement),
-        ("smc_weight_bos", rebuilt.smc_weight_bos, sealed.smc_weight_bos),
-        ("smc_weight_choch", rebuilt.smc_weight_choch, sealed.smc_weight_choch),
-        ("smc_weight_eqh", rebuilt.smc_weight_eqh, sealed.smc_weight_eqh),
-        ("smc_weight_eql", rebuilt.smc_weight_eql, sealed.smc_weight_eql),
-        ("smc_weight_displacement", rebuilt.smc_weight_displacement, sealed.smc_weight_displacement),
+        (
+            "smc_weight_fvg",
+            rebuilt.smc_weight_fvg,
+            sealed.smc_weight_fvg,
+        ),
+        (
+            "smc_weight_liq",
+            rebuilt.smc_weight_liq,
+            sealed.smc_weight_liq,
+        ),
+        (
+            "smc_weight_mtf",
+            rebuilt.smc_weight_mtf,
+            sealed.smc_weight_mtf,
+        ),
+        (
+            "smc_weight_premium",
+            rebuilt.smc_weight_premium,
+            sealed.smc_weight_premium,
+        ),
+        (
+            "smc_weight_inducement",
+            rebuilt.smc_weight_inducement,
+            sealed.smc_weight_inducement,
+        ),
+        (
+            "smc_weight_bos",
+            rebuilt.smc_weight_bos,
+            sealed.smc_weight_bos,
+        ),
+        (
+            "smc_weight_choch",
+            rebuilt.smc_weight_choch,
+            sealed.smc_weight_choch,
+        ),
+        (
+            "smc_weight_eqh",
+            rebuilt.smc_weight_eqh,
+            sealed.smc_weight_eqh,
+        ),
+        (
+            "smc_weight_eql",
+            rebuilt.smc_weight_eql,
+            sealed.smc_weight_eql,
+        ),
+        (
+            "smc_weight_displacement",
+            rebuilt.smc_weight_displacement,
+            sealed.smc_weight_displacement,
+        ),
     ];
     for (field, rebuilt, sealed) in floats {
         let scale = rebuilt.abs().max(sealed.abs()).max(1.0);
-        if !(rebuilt.is_finite() && sealed.is_finite())
-            || (rebuilt - sealed).abs() > 1e-9 * scale
-        {
+        if !(rebuilt.is_finite() && sealed.is_finite()) || (rebuilt - sealed).abs() > 1e-9 * scale {
             return mismatch(field, format!("{rebuilt}"), format!("{sealed}"));
         }
     }
@@ -6800,11 +6885,17 @@ fn ensure_research_config_matches_sealed_evaluation(
             "replay flags",
             format!(
                 "max_hold_bars={} trailing_enabled={} kill_zones_enabled={} growth_objective={}",
-                rebuilt.max_hold_bars, rebuilt.trailing_enabled, rebuilt.kill_zones_enabled, rebuilt.growth_objective
+                rebuilt.max_hold_bars,
+                rebuilt.trailing_enabled,
+                rebuilt.kill_zones_enabled,
+                rebuilt.growth_objective
             ),
             format!(
                 "max_hold_bars={} trailing_enabled={} kill_zones_enabled={} growth_objective={}",
-                sealed.max_hold_bars, sealed.trailing_enabled, sealed.kill_zones_enabled, sealed.growth_objective
+                sealed.max_hold_bars,
+                sealed.trailing_enabled,
+                sealed.kill_zones_enabled,
+                sealed.growth_objective
             ),
         );
     }
@@ -9542,14 +9633,9 @@ where
     let effective_smc_gate_threshold = search.effective_smc_gate_threshold;
     let stage1_count = search.genes.len();
     funnel.record_stage("stage1_candidates_generated", 0, stage1_count);
-    // The archive that survived the GA is what we hand the IS evaluator. The
-    // genes themselves carry a `fitness` field reflecting the stage-1
-    // evaluation, so "profitable" here means fitness > 0.0. The GA already
-    // applies its own profitable-archive filter (`apply_metrics` archives
-    // only nonnegative-fitness genes), so this stage is informational —
-    // count_in == count_out unless the GA archive logic changes.
-    let profitable_count = search.genes.iter().filter(|g| g.fitness > 0.0).count();
-    funnel.record_stage("profitable_archive_size", stage1_count, profitable_count);
+    // Fitness signs and observed positive net are diagnostics, never admission
+    // gates or substitutes for archive-owner counts and independent validation.
+    funnel.record_ga_handoff(&search);
 
     let mut result = finalize_candidates_with_progress(
         search.genes,

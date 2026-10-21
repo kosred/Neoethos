@@ -2619,7 +2619,10 @@ fn candidate_cost_variant_diagnostic_matches_the_production_frequency_definition
     );
     assert_eq!(row.variant, "broker_verified");
     assert_eq!(row.metrics.trades, broker_metrics.total_trades);
-    assert_eq!(row.metrics.trades_per_month, broker_metrics.trades_per_month);
+    assert_eq!(
+        row.metrics.trades_per_month,
+        broker_metrics.trades_per_month
+    );
     assert_eq!(row.window.start_ms, evaluation_span.0);
     assert_eq!(row.window.end_ms, evaluation_span.1);
     assert!(row.exact_gene_hash.starts_with("fnv64:"));
@@ -2645,7 +2648,10 @@ fn research_only_oos_document_is_labelled_and_carries_one_entry_per_strategy() {
     let document = prepared
         .research_only_oos_document(PropFirmRiskRules::default())
         .expect("research-only OOS document");
-    assert_eq!(document["schema"], "neoethos.research-only.oos-evaluation.v1");
+    assert_eq!(
+        document["schema"],
+        "neoethos.research-only.oos-evaluation.v1"
+    );
     assert_eq!(document["artifact_class"], "ResearchOnly");
     assert_eq!(document["promotion_eligibility"], "NotPromotionEligible");
     assert_eq!(document["authorization_issued"], false);
@@ -2654,10 +2660,12 @@ fn research_only_oos_document_is_labelled_and_carries_one_entry_per_strategy() {
             .as_str()
             .is_some_and(|warning| warning.contains("NOT broker-quote validated"))
     );
-    assert!(document["holdout_scope"]["receipt_sha256"].as_str().is_some());
-    let strategies = document["strategies"]
-        .as_array()
-        .expect("strategies array");
+    assert!(
+        document["holdout_scope"]["receipt_sha256"]
+            .as_str()
+            .is_some()
+    );
+    let strategies = document["strategies"].as_array().expect("strategies array");
     assert_eq!(strategies.len(), portfolio.len());
     for strategy in strategies {
         assert!(

@@ -13,7 +13,7 @@
 //!   3.  features_built
 //!   4.  features_after_prefilter
 //!   5.  stage1_candidates_generated
-//!   6.  profitable_archive_size
+//!   6.  ga_returned_candidates_observation (informational; no rejections)
 //!   7.  validation_candidates_admitted
 //!   8.  passed_base_filter
 //!   9.  nonzero_signals
@@ -30,6 +30,17 @@
 //!   20. export_ready
 
 use serde::{Deserialize, Serialize};
+
+/// Versioned handoff observations, not a profitability or validation verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GaHandoffObservationsV1 {
+    pub schema_version: u16,
+    pub returned_candidates: usize,
+    pub finite_positive_fitness_candidates: usize,
+    pub finite_positive_net_candidates: usize,
+    /// Absent on historical/checkpoint inputs rather than inferred from fitness.
+    pub generation_census: Option<crate::genetic::GenerationCensusV1>,
+}
 
 /// Measured row range used to evolve genes, relative to the selection window.
 /// This is diagnostic metadata, not an additional source or trading authority.
@@ -258,6 +269,9 @@ pub struct FunnelProfile {
     /// Each canonical pipeline stage. Stages
     /// the run didn't reach get count_in/out=0.
     pub stages: Vec<FunnelStage>,
+    /// Measurements behind the informational GA stage, separate from gates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ga_handoff_v1: Option<GaHandoffObservationsV1>,
     /// Bottleneck = the stage with the highest `rejected` count.
     pub bottleneck_stage: String,
     pub bottleneck_rejected: usize,
@@ -284,6 +298,7 @@ pub struct FunnelProfile {
 impl FunnelProfile {
     pub fn new(symbol: impl Into<String>, timeframe: impl Into<String>) -> Self {
         Self {
+            ga_handoff_v1: None,
             candidate_census: None,
             selection_calibration_cohort: None,
             walkforward_selection_cohort: None,
@@ -301,6 +316,31 @@ impl FunnelProfile {
             live_trading_policy_v1: None,
             last_mark: Some(std::time::Instant::now()),
         }
+    }
+
+    /// Observe the returned population without treating metric signs as gates.
+    pub(crate) fn record_ga_handoff(&mut self, search: &crate::genetic::SearchResult) {
+        let returned_candidates = search.genes.len();
+        self.ga_handoff_v1 = Some(GaHandoffObservationsV1 {
+            schema_version: 1,
+            returned_candidates,
+            finite_positive_fitness_candidates: search
+                .genes
+                .iter()
+                .filter(|gene| gene.fitness.is_finite() && gene.fitness > 0.0)
+                .count(),
+            finite_positive_net_candidates: search
+                .metrics
+                .iter()
+                .filter(|metrics| metrics[0].is_finite() && metrics[0] > 0.0)
+                .count(),
+            generation_census: search.generation_census_v1.clone(),
+        });
+        self.record_stage(
+            "ga_returned_candidates_observation",
+            returned_candidates,
+            returned_candidates,
+        );
     }
 
     pub(crate) fn attach_live_trading_policy_v1(
@@ -444,7 +484,7 @@ fn canonical_empty_stages() -> Vec<FunnelStage> {
         FunnelStage::new("features_built"),
         FunnelStage::new("features_after_prefilter"),
         FunnelStage::new("stage1_candidates_generated"),
-        FunnelStage::new("profitable_archive_size"),
+        FunnelStage::new("ga_returned_candidates_observation"),
         FunnelStage::new("validation_candidates_admitted"),
         FunnelStage::new("passed_base_filter"),
         FunnelStage::new("nonzero_signals"),
@@ -483,6 +523,25 @@ mod tests {
         let mut profile = FunnelProfile::new("EURUSD", "M5");
         let legacy = serde_json::to_string(&profile).unwrap();
         assert!(!legacy.contains("candidate_census"));
+        assert!(!legacy.contains("ga_handoff_v1"));
+        let mut historical: serde_json::Value = serde_json::from_str(&legacy).unwrap();
+        let old_stage = historical["stages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|stage| stage["name"] == "ga_returned_candidates_observation")
+            .unwrap();
+        old_stage["name"] = "profitable_archive_size".into();
+        old_stage["count_in"] = 942.into();
+        old_stage["count_out"] = 0.into();
+        old_stage["rejected"] = 942.into();
+        let restored_legacy: FunnelProfile = serde_json::from_value(historical.clone()).unwrap();
+        assert!(restored_legacy.ga_handoff_v1.is_none());
+        assert_eq!(
+            serde_json::to_value(restored_legacy).unwrap(),
+            historical,
+            "historical observations must remain inspectable without rewriting their old counts"
+        );
         assert!(
             serde_json::from_str::<FunnelProfile>(&legacy)
                 .unwrap()

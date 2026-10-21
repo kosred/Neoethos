@@ -353,6 +353,7 @@ fn milestone_v1(
         None,
         counters,
         SearchResult {
+            generation_census_v1: None,
             genes,
             metrics,
             effective_smc_gate_threshold: 0.5,

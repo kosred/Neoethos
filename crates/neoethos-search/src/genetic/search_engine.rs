@@ -9,7 +9,7 @@ use super::evolution_math::{
 };
 use super::runtime_overrides::current_genetic_search_runtime_overrides;
 use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
-use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
+use super::strategy_gene::{EvaluationConfig, Gene, GenerationCensusV1, SearchResult};
 use crate::eval::BacktestSettings;
 use crate::stop_target::{StopTargetSettings, infer_stop_target_pips};
 #[cfg(any(test, feature = "gpu-cuda"))]
@@ -2604,6 +2604,7 @@ pub fn random_search(
     let eval_cfg = EvaluationConfig::default();
     let metrics = evaluate_genes(features, ohlcv, &genes, &eval_cfg)?;
     Ok(SearchResult {
+        generation_census_v1: None,
         genes,
         metrics,
         effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
@@ -3245,11 +3246,22 @@ pub(crate) fn finish_evaluated_generation(
         final_population,
         returned_exact_unique = candidates.len(),
         duplicate_handoff_entries = archive_entries + final_population - candidates.len(),
-        whole_run_unique_evaluated_recorded = false,
-        "GA handoff: evaluation slots include repeated survivors; exact uniqueness is measured only for the returned archive/final-population union"
+        "GA handoff: slots include repeated survivors; archive/population union is deduplicated exactly"
     );
+    let returned_candidates = candidates.len();
     let (genes, metrics) = candidates.into_iter().unzip();
     SearchResult {
+        generation_census_v1: Some(GenerationCensusV1 {
+            schema_version: 1,
+            generation_evaluation_slots: evaluation_slots,
+            final_policy_replay_evaluation_slots: 0,
+            total_evaluation_slots: evaluation_slots,
+            whole_run_distinct_genomes: None,
+            archive_entries,
+            final_population,
+            returned_candidates,
+            duplicate_handoff_entries: archive_entries + final_population - returned_candidates,
+        }),
         genes,
         metrics,
         effective_smc_gate_threshold,
@@ -3271,6 +3283,7 @@ fn finish_with_final_gate_metrics<E>(
     evaluation_slots: u64,
     evaluate: &mut E,
     cancel_requested: &mut impl FnMut() -> bool,
+    whole_run_distinct_genomes: Option<usize>,
 ) -> Result<SearchResult>
 where
     E: FnMut(&[Gene], &EvaluationConfig) -> Result<Vec<[f64; 11]>>,
@@ -3285,6 +3298,9 @@ where
     let needs_replay = !archive.is_empty();
     let mut result =
         finish_evaluated_generation(archive, scored, config.smc_gate_threshold, evaluation_slots);
+    if let Some(census) = &mut result.generation_census_v1 {
+        census.whole_run_distinct_genomes = whole_run_distinct_genomes;
+    }
     // With no archive the complete last population already has this policy.
     if !needs_replay {
         return Ok(result);
@@ -3318,6 +3334,10 @@ where
     let total_evaluation_slots = evaluation_slots
         .checked_add(u64::try_from(replayed)?)
         .ok_or_else(|| anyhow!("final-gate total evaluation count overflow"))?;
+    if let Some(census) = &mut result.generation_census_v1 {
+        census.final_policy_replay_evaluation_slots = u64::try_from(replayed)?;
+        census.total_evaluation_slots = total_evaluation_slots;
+    }
     let mut aligned = result
         .genes
         .into_iter()
@@ -3512,6 +3532,7 @@ where
         .collect();
 
     let mut evaluation_slots = 0_u64;
+    let mut evaluated_genomes = HashSet::new();
     // Archive scoring thresholds and selection policy come from the typed
     // overrides resolved above; no further env reads are necessary here.
     let archive_mode = genetic_runtime_overrides.archive_scoring.mode.clone();
@@ -3615,9 +3636,22 @@ where
             metrics.len() == genes.len(),
             "generation evaluator metric count differs from population"
         );
+        evaluated_genomes.extend(genes.iter().map(EvaluatedGeneBehaviorKey::new));
+        let generation_census_v1 = Some(GenerationCensusV1 {
+            schema_version: 1,
+            generation_evaluation_slots: u64::try_from(genes.len())?,
+            final_policy_replay_evaluation_slots: 0,
+            total_evaluation_slots: u64::try_from(genes.len())?,
+            whole_run_distinct_genomes: Some(evaluated_genomes.len()),
+            archive_entries: 0,
+            final_population: genes.len(),
+            returned_candidates: genes.len(),
+            duplicate_handoff_entries: 0,
+        });
         apply_metrics(&mut genes, &metrics, &eval_cfg, evaluation_span_days);
         seen_memory.flush();
         return Ok(SearchResult {
+            generation_census_v1,
             genes,
             metrics,
             effective_smc_gate_threshold: eval_cfg.smc_gate_threshold,
@@ -3685,6 +3719,7 @@ where
         evaluation_slots = evaluation_slots
             .checked_add(u64::try_from(genes.len())?)
             .ok_or_else(|| anyhow!("GA evaluation-slot count overflow"))?;
+        evaluated_genomes.extend(genes.iter().map(EvaluatedGeneBehaviorKey::new));
         apply_metrics(&mut genes, &metrics, &eval_cfg, evaluation_span_days);
 
         let mut scored: Vec<(f64, usize, Gene, [f64; 11])> = genes
@@ -3932,6 +3967,7 @@ where
                 evaluation_slots,
                 &mut evaluate_generation,
                 &mut cancel_requested,
+                Some(evaluated_genomes.len()),
             );
         }
 
@@ -3948,6 +3984,7 @@ where
                 evaluation_slots,
                 &mut evaluate_generation,
                 &mut cancel_requested,
+                Some(evaluated_genomes.len()),
             );
         }
 
@@ -3962,6 +3999,7 @@ where
                 evaluation_slots,
                 &mut evaluate_generation,
                 &mut cancel_requested,
+                Some(evaluated_genomes.len()),
             );
         }
 
@@ -4976,6 +5014,13 @@ mod exact_search_sizing_policy_tests {
             || false,
         )
         .expect("resident generation-zero evaluator");
+        let census = result.generation_census_v1.as_ref().unwrap();
+        assert_eq!(
+            census.generation_evaluation_slots,
+            result.genes.len() as u64
+        );
+        assert_eq!(census.final_policy_replay_evaluation_slots, 0);
+        assert!(census.whole_run_distinct_genomes.is_some());
 
         assert_eq!(evaluation_calls, 1);
         assert_eq!(result.genes.len(), 4);
@@ -5154,6 +5199,7 @@ mod evaluated_generation_handoff_tests {
                         .collect())
                 },
                 &mut || false,
+                None,
             )?;
             observed.sort_unstable();
             assert_eq!(observed, [0, 1, 2]);
@@ -5246,6 +5292,7 @@ mod evaluated_generation_handoff_tests {
             1,
             &mut |_, _| Ok(Vec::new()),
             &mut || false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5266,6 +5313,7 @@ mod evaluated_generation_handoff_tests {
                 Ok(vec![archive.3; genes.len()])
             },
             &mut || cancelled.get(),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5282,6 +5330,7 @@ mod evaluated_generation_handoff_tests {
             1,
             &mut |_, _| bail!("exact evaluator admission refused"),
             &mut || false,
+            None,
         )
         .unwrap_err();
         assert_eq!(refused.to_string(), "exact evaluator admission refused");
@@ -5313,6 +5362,16 @@ mod evaluated_generation_handoff_tests {
             "current metrics replace the older duplicate"
         );
         assert_eq!(one.effective_smc_gate_threshold, 0.35);
+        let empty_census = empty.generation_census_v1.unwrap();
+        assert_eq!(empty_census.archive_entries, 0);
+        assert_eq!(empty_census.final_population, 200);
+        assert_eq!(empty_census.returned_candidates, 200);
+        assert_eq!(empty_census.generation_evaluation_slots, 200_000);
+        assert_eq!(empty_census.whole_run_distinct_genomes, None);
+        let one_census = one.generation_census_v1.unwrap();
+        assert_eq!(one_census.archive_entries, 1);
+        assert_eq!(one_census.duplicate_handoff_entries, 1);
+        assert_eq!(one_census.returned_candidates, 200);
     }
 
     #[test]
@@ -5337,6 +5396,53 @@ mod evaluated_generation_handoff_tests {
             vec![3.0, 2.0, 1.0]
         );
         assert_eq!(result.genes[1].strategy_id, "current_0");
+        let census = result.generation_census_v1.unwrap();
+        assert_eq!(census.archive_entries, 1);
+        assert_eq!(census.final_population, 3);
+        assert_eq!(census.returned_candidates, 3);
+        assert_eq!(census.duplicate_handoff_entries, 1);
+    }
+
+    #[test]
+    fn handoff_observation_preserves_all_candidates_without_financial_admission() {
+        let scored = [20.0, -5.0, 2.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, net)| {
+                let mut row = candidate(index, net);
+                row.2.fitness = -1.0;
+                row.0 = -1.0;
+                row
+            })
+            .collect();
+        let result = finish_evaluated_generation(Vec::new(), scored, 0.35, 12);
+        let mut profile = crate::funnel_profile::FunnelProfile::new("EURUSD", "M15");
+        profile.record_ga_handoff(&result);
+        let stage = profile
+            .stages
+            .iter()
+            .find(|stage| stage.name == "ga_returned_candidates_observation")
+            .unwrap();
+        assert_eq!((stage.count_in, stage.count_out, stage.rejected), (3, 3, 0));
+        assert_eq!(
+            result.genes.len(),
+            3,
+            "observation must not prune candidates"
+        );
+        let observed = profile.ga_handoff_v1.as_ref().unwrap();
+        assert_eq!(observed.finite_positive_fitness_candidates, 0);
+        assert_eq!(observed.finite_positive_net_candidates, 2);
+        assert_eq!(
+            observed.generation_census.as_ref().unwrap().archive_entries,
+            0
+        );
+        let restored: crate::funnel_profile::FunnelProfile =
+            serde_json::from_str(&serde_json::to_string(&profile).unwrap()).unwrap();
+        assert_eq!(restored.ga_handoff_v1, profile.ga_handoff_v1);
+        profile.record_stage("passed_quality", 3, 1);
+        profile.finalize("empty");
+        assert_eq!(profile.bottleneck_stage, "passed_quality");
+        assert_eq!(profile.bottleneck_rejected, 2);
     }
 
     #[test]
@@ -5421,6 +5527,7 @@ mod evaluated_generation_handoff_tests {
         let policy = ExactSearchSizingPolicyV1::new(false, 8).expect("bounded policy");
         let mut calls = Vec::new();
         let mut last_keys = HashSet::new();
+        let mut evaluated_keys = HashSet::new();
         let mut progress = Vec::new();
         let result = evolve_search_with_generation_evaluator_v1(
             &names,
@@ -5434,6 +5541,7 @@ mod evaluated_generation_handoff_tests {
             |genes, _| {
                 calls.push(genes.len());
                 last_keys = genes.iter().map(EvaluatedGeneBehaviorKey::new).collect();
+                evaluated_keys.extend(genes.iter().map(EvaluatedGeneBehaviorKey::new));
                 Ok(vec![candidate(0, -1.0).3; genes.len()])
             },
             |generation, _, _, _, archive| {
@@ -5458,6 +5566,17 @@ mod evaluated_generation_handoff_tests {
             last_keys
         );
         assert!(result.metrics.iter().all(|metrics| metrics[0] == -1.0));
+        let census = result.generation_census_v1.unwrap();
+        assert_eq!(census.generation_evaluation_slots, 600);
+        assert_eq!(census.total_evaluation_slots, 600);
+        assert_eq!(census.final_policy_replay_evaluation_slots, 0);
+        assert_eq!(
+            census.whole_run_distinct_genomes,
+            Some(evaluated_keys.len())
+        );
+        assert_eq!(census.archive_entries, 0);
+        assert_eq!(census.final_population, 200);
+        assert!(evaluated_keys.len() <= 600);
     }
 
     #[test]
