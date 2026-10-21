@@ -6923,13 +6923,6 @@ fn candidate_signal_bitsets(
     })
 }
 
-fn candidate_signal_popcount_and(a: &[u64], b: &[u64]) -> usize {
-    a.iter()
-        .zip(b)
-        .map(|(left, right)| (left & right).count_ones() as usize)
-        .sum()
-}
-
 fn candidate_signal_pair_stat(
     left: usize,
     right: usize,
@@ -6938,15 +6931,27 @@ fn candidate_signal_pair_stat(
 ) -> Option<CandidateSignalPairStatV1> {
     let left = &fingerprints[left];
     let right = &fingerprints[right];
-    let active_union_bars =
-        candidate_signal_popcount_or(&left.long, &left.short, &right.long, &right.short);
+    // One fused pass over the four sign words: active union and both
+    // directional overlaps are accumulated together, avoiding five separate
+    // bit-word scans per candidate pair.
+    let mut active_union_bars = 0usize;
+    let mut same_direction_bars = 0usize;
+    let mut opposite_direction_bars = 0usize;
+    for index in 0..left.long.len() {
+        let left_long = left.long[index];
+        let left_short = left.short[index];
+        let right_long = right.long[index];
+        let right_short = right.short[index];
+        active_union_bars +=
+            ((left_long | left_short) | (right_long | right_short)).count_ones() as usize;
+        same_direction_bars += (left_long & right_long).count_ones() as usize
+            + (left_short & right_short).count_ones() as usize;
+        opposite_direction_bars += (left_long & right_short).count_ones() as usize
+            + (left_short & right_long).count_ones() as usize;
+    }
     if active_union_bars == 0 {
         return None;
     }
-    let same_direction_bars = candidate_signal_popcount_and(&left.long, &right.long)
-        + candidate_signal_popcount_and(&left.short, &right.short);
-    let opposite_direction_bars = candidate_signal_popcount_and(&left.long, &right.short)
-        + candidate_signal_popcount_and(&left.short, &right.long);
     Some(CandidateSignalPairStatV1 {
         left: 0,
         right: 0,
@@ -6956,22 +6961,6 @@ fn candidate_signal_pair_stat(
         active_union_bars,
         both_zero_bars: n_bars - active_union_bars,
     })
-}
-
-fn candidate_signal_popcount_or(
-    left_long: &[u64],
-    left_short: &[u64],
-    right_long: &[u64],
-    right_short: &[u64],
-) -> usize {
-    left_long
-        .iter()
-        .zip(left_short)
-        .zip(right_long.iter().zip(right_short))
-        .map(|((a_long, a_short), (b_long, b_short))| {
-            ((a_long | a_short) | (b_long | b_short)).count_ones() as usize
-        })
-        .sum()
 }
 
 fn aggregate_candidate_signal_behavior(
