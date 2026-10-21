@@ -161,8 +161,13 @@ impl WeeklySearchObjectiveV1 {
         } else {
             l.initial_equity * l.per_trade_risk_band.1
         };
-        let violation = report.violation / report.trading_days.saturating_sub(4).max(1) as f64
-            + deficit(m[0], l.min_net_profit, l.initial_equity)
+        // The operator's minimum is one trade per rolling five trading days:
+        // cadence is the PRIMARY feasibility tier. A weekly-valid but losing
+        // candidate is still infeasible (negative fitness), but it must outrank
+        // a sparse historically-profitable genome so evolution repairs cadence
+        // before optimising net/risk inside the cadence-valid tier.
+        let cadence_ratio = report.violation / report.trading_days.saturating_sub(4).max(1) as f64;
+        let deficits = deficit(m[0], l.min_net_profit, l.initial_equity)
             + deficit(m[6], l.min_net_expectancy, expectancy_scale)
             + deficit(l.max_drawdown, m[3], l.max_drawdown)
             + deficit(l.max_daily_drawdown, m[10], l.max_daily_drawdown)
@@ -172,9 +177,15 @@ impl WeeklySearchObjectiveV1 {
                 l.min_trades_per_month.max(1.0),
             )
             + deficit(m[4], l.min_win_rate, 1.0)
-            + deficit(m[5], l.min_profit_factor, l.min_profit_factor.max(1.0));
-        let feasible = violation == 0.0
+            + deficit(m[5], l.min_profit_factor, l.min_profit_factor.max(1.0))
+            // Losses are graded even when the configured floor is zero: a
+            // cadence-valid losing genome must rank below a smaller loss and a
+            // high-frequency losing churn must never look like progress.
+            + (-m[0]).max(0.0) / l.initial_equity
+            + (-m[6]).max(0.0) / expectancy_scale;
+        let feasible = cadence_ratio == 0.0
             && report.feasible()
+            && deficits == 0.0
             && m[0] > 0.0
             && m[6] > 0.0
             && m[3] < l.max_drawdown
@@ -182,7 +193,7 @@ impl WeeklySearchObjectiveV1 {
         if feasible {
             1.0 + old.atan() / std::f64::consts::PI
         } else {
-            -violation
+            -(1_000.0 * (1.0 + cadence_ratio) + deficits)
         }
     }
 }
@@ -452,7 +463,7 @@ mod tests {
         let mut m = [
             50.0, 1.0, 10_050.0, 0.01, 0.6, 1.2, 0.49, 0.5, 4.0, 0.5, 0.005,
         ];
-        assert!((o.fitness(&m, &r, 0.0) + 0.02).abs() < 1e-12);
+        assert!((o.fitness(&m, &r, 0.0) + 1_000.02).abs() < 1e-12);
         m[6] = -1e-9;
         let below = o.fitness(&m, &r, 0.0);
         m[6] = 1e-9;
@@ -470,6 +481,33 @@ mod tests {
             o.fitness(&m, &r, 0.0) <= 0.0,
             "zero net never receives feasible tier"
         );
+    }
+
+    #[test]
+    fn rolling_weekly_cadence_is_the_primary_infeasibility_tier() {
+        let objective = test_weekly_objective();
+        let regular = report(&[0, 7, 14, 21], 25);
+        let sparse = report(&[0], 25);
+        let good = [
+            50.0, 1.0, 10_050.0, 0.01, 0.6, 1.2, 12.5, 0.5, 4.0, 0.5, 0.005,
+        ];
+        let mut weekly_losing = good;
+        weekly_losing[0] = -50.0;
+        weekly_losing[6] = -5.0;
+        let feasible = objective.fitness(&good, &regular, 0.0);
+        let losing = objective.fitness(&weekly_losing, &regular, 0.0);
+        let sparse_profit = objective.fitness(&good, &sparse, 0.0);
+        assert!(feasible > 0.0, "weekly-valid positive net is feasible");
+        assert!(losing < 0.0, "weekly-valid losing churn is never feasible");
+        assert!(sparse_profit < 0.0);
+        assert!(
+            losing > sparse_profit,
+            "cadence is primary: weekly-valid losing outranks sparse profit"
+        );
+        let mut heavier_loss = weekly_losing;
+        heavier_loss[0] = -500.0;
+        heavier_loss[6] = -50.0;
+        assert!(objective.fitness(&heavier_loss, &regular, 0.0) < losing);
     }
 
     #[test]
