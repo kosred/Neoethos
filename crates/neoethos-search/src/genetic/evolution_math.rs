@@ -665,6 +665,11 @@ fn random_coarse_weight(rng: &mut impl Rng) -> f64 {
 /// the adaptive ladder hasn't been installed for this process.
 const STATIC_THRESHOLD_LADDER: [f64; 6] = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
 
+/// Relative tolerance for treating adjacent adaptive-ladder slots as the same
+/// randomized choice. Duplicate/near-duplicate slots silently overweight one
+/// threshold; such a ladder must use the static fallback instead.
+const ADAPTIVE_THRESHOLD_LADDER_DISTINCT_REL_TOLERANCE: f64 = 1e-9;
+
 /// F-277 (2026-05-28): process-wide adaptive threshold ladder derived
 /// from the actual feature-magnitude profile of the current discovery
 /// dataset. Installed once at the start of `run_discovery_cycle_with_progress`
@@ -900,6 +905,28 @@ pub fn derive_adaptive_threshold_ladder_from_features(
 // Keep the mathematical reduction independent of the live RAM probe so tests
 // can prove that different admitted schedules do not change the search space.
 // Production always enters through the adaptive planner above.
+/// Median abs value using the SAME convention as robust normalization:
+/// average the two central values for an even valid count, odd middle otherwise.
+fn adaptive_column_median_abs(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let middle = values.len() / 2;
+    let median = if values.len() % 2 == 1 {
+        let (_, &mut median, _) = values.select_nth_unstable_by(middle, f64::total_cmp);
+        median
+    } else {
+        let (lower, &mut upper, _) = values.select_nth_unstable_by(middle, f64::total_cmp);
+        let lower_middle = lower
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .expect("even-length sample has a lower middle");
+        lower_middle * 0.5 + upper * 0.5
+    };
+    (median.is_finite() && median >= 0.0).then_some(median)
+}
+
 fn derive_adaptive_threshold_ladder_with_projection_schedule(
     features: &neoethos_data::FeatureFrame,
     columns_per_batch: usize,
@@ -929,19 +956,14 @@ fn derive_adaptive_threshold_ladder_with_projection_schedule(
                 );
                 let mut medians = Vec::with_capacity(indices.len());
                 for column in &projection.columns {
-                    let mut abs_values = column
+                    let abs_values = column
                         .values
                         .iter()
                         .zip(&column.validity)
                         .filter_map(|(value, validity)| validity.is_valid().then_some(value.abs()))
                         .collect::<Vec<_>>();
-                    if abs_values.is_empty() {
-                        continue;
-                    }
-                    let middle = abs_values.len() / 2;
-                    let (_, median, _) = abs_values.select_nth_unstable_by(middle, f64::total_cmp);
-                    if median.is_finite() && *median >= 0.0 {
-                        medians.push(*median);
+                    if let Some(median) = adaptive_column_median_abs(abs_values) {
+                        medians.push(median);
                     }
                 }
                 Ok(medians)
@@ -972,11 +994,17 @@ fn derive_adaptive_threshold_ladder_with_projection_schedule(
         pct(0.90),
         pct(0.99),
     ];
-    // Final safety: ensure strictly non-decreasing (clamp+pct may
-    // collapse two adjacent points in degenerate inputs).
+    // A randomized six-slot grid is useful only when every adjacent slot is a
+    // distinct choice. Normalization can standardize the per-column median
+    // statistic to the same value across genuinely different columns, and
+    // even/odd median conventions can also create tiny artificial spreads.
+    // Reject both equal and near-equal slots; the discovery owner then uses the
+    // existing static fallback rather than silently weighting one threshold.
     for i in 1..ladder.len() {
-        if ladder[i] < ladder[i - 1] {
-            // Degenerate distribution — bail to static fallback.
+        let scale = ladder[i].abs().max(ladder[i - 1].abs()).max(1.0);
+        if ladder[i] < ladder[i - 1]
+            || ladder[i] - ladder[i - 1] <= ADAPTIVE_THRESHOLD_LADDER_DISTINCT_REL_TOLERANCE * scale
+        {
             return Ok(None);
         }
     }
@@ -1833,35 +1861,150 @@ mod tests {
         );
     }
 
+    fn normalized_frame_of(a: ndarray::Array2<f64>) -> std::sync::Arc<neoethos_data::FeatureFrame> {
+        let raw = std::sync::Arc::new(frame_of(a));
+        let n = raw.n_samples();
+        let fit = raw
+            .fit_normalization(0..n, false, &neoethos_data::FeatureBuildControl::default())
+            .expect("robust normalization fit");
+        std::sync::Arc::new(
+            raw.with_fitted_normalization(&fit)
+                .expect("materialize robust normalization"),
+        )
+    }
+
     #[test]
     fn derive_ladder_produces_monotonic_ascending_values() {
-        // Sample with varied magnitudes per column.
-        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((100, 4));
-        for r in 0..100 {
-            data[(r, 0)] = (r as f64) * 0.01; // 0..1.0 — small magnitudes
-            data[(r, 1)] = (r as f64) * 0.05; // 0..5.0 — medium
-            data[(r, 2)] = (r as f64) * 0.10; // 0..10.0 — large (will clamp)
-            data[(r, 3)] = -(r as f64) * 0.02; // negative side
+        // A RAW fixture needs enough distinct per-column medians to supply six
+        // distinct quantiles. This is not a normalized-collapse fixture.
+        let n = 100usize;
+        let scales = [
+            0.001_f64, 0.002, 0.004, 0.007, 0.010, 0.020, 0.040, 0.080, 0.100, 0.120, 0.140, 0.160,
+        ];
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, scales.len()));
+        for r in 0..n {
+            for (j, scale) in scales.iter().enumerate() {
+                data[(r, j)] = (r as f64 + 1.0) * scale;
+            }
         }
-        let ladder = derive_adaptive_threshold_ladder_from_features(&frame_of(data))
+        let frame = frame_of(data);
+        let ladder = derive_adaptive_threshold_ladder_from_features(&frame)
             .expect("adaptive-threshold scan must not fail")
-            .expect("non-degenerate cube must produce ladder");
-        // Monotone ascending
+            .expect("diverse raw cube must produce ladder");
         for i in 1..ladder.len() {
             assert!(
-                ladder[i] >= ladder[i - 1],
-                "ladder[{i}]={} < ladder[{}]={}",
+                ladder[i] > ladder[i - 1],
+                "ladder[{i}]={} must be distinctly above ladder[{}]={}",
                 ladder[i],
                 i - 1,
                 ladder[i - 1]
             );
         }
-        // All clamped to safe range
-        for v in ladder.iter() {
-            assert!(v.is_finite());
-            assert!(*v >= 1e-4);
-            assert!(*v <= 10.0);
+    }
+
+    #[test]
+    fn derive_ladder_rejects_mad_normalized_odd_collapse() {
+        let n = 63usize;
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, 8));
+        let scales = [0.002_f64, 0.05, 0.7, 4.0, 0.001, 0.02];
+        for r in 0..n {
+            let centered = r as f64 - 31.0;
+            for (j, scale) in scales.iter().enumerate() {
+                data[(r, j)] = centered * scale;
+            }
+            data[(r, 6)] = if r % 17 == 0 { 1.0 } else { 0.0 };
+            data[(r, 7)] = if r % 29 == 0 { 1.0 } else { 0.0 };
         }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "normalized diverse columns collapse to one median statistic; fallback is required"
+        );
+    }
+
+    #[test]
+    fn adaptive_column_median_matches_robust_mean_of_central_pair() {
+        assert_eq!(adaptive_column_median_abs(vec![3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(
+            adaptive_column_median_abs(vec![4.0, 1.0, 3.0, 2.0]),
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn derive_ladder_rejects_asymmetric_even_normalized_collapse() {
+        let n = 64usize;
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, 8));
+        let scales = [0.003_f64, 0.02, 0.3, 2.0, 0.001, 0.05, 0.9, 4.0];
+        for (j, scale) in scales.iter().enumerate() {
+            let mut values = Vec::with_capacity(n);
+            for r in 0..n / 2 {
+                values.push(-((r + 1) as f64) * scale);
+            }
+            for r in 0..n / 2 {
+                let positive = if r == n / 2 - 1 {
+                    100.0
+                } else {
+                    (r + 1) as f64
+                };
+                values.push(positive * scale);
+            }
+            for (r, value) in values.into_iter().enumerate() {
+                data[(r, j)] = value;
+            }
+        }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "asymmetric even normalized columns must fall back, not retain artificial spread"
+        );
+    }
+
+    #[test]
+    fn derive_ladder_rejects_continuous_sparse_mixture() {
+        let n = 64usize;
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, 8));
+        let scales = [0.002_f64, 0.05, 0.7, 4.0];
+        for r in 0..n {
+            let centered = r as f64 - 31.5;
+            for (j, scale) in scales.iter().enumerate() {
+                data[(r, j)] = centered * scale;
+            }
+            for (j, modulus) in [(4usize, 7usize), (5, 11), (6, 13), (7, 17)] {
+                data[(r, j)] = if r % modulus == 0 { 1.0 } else { 0.0 };
+            }
+        }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "four continuous + four sparse normalized columns must fall back"
+        );
+    }
+
+    #[test]
+    fn derive_ladder_rejects_sparse_only_normalized_columns() {
+        let n = 64usize;
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, 6));
+        for r in 0..n {
+            for j in 0..6 {
+                data[(r, j)] = if r % (7 + j * 2) == 0 { 1.0 } else { 0.0 };
+            }
+        }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "sparse-only normalized cube must fall back explicitly"
+        );
+        clear_adaptive_threshold_ladder();
+        assert_eq!(current_threshold_ladder(), STATIC_THRESHOLD_LADDER);
     }
 
     fn ladder_vortex_copy(
@@ -1896,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_ladder_matches_hand_calculated_upper_medians_and_percentile_ranks() {
+    fn derive_ladder_matches_hand_calculated_median_and_percentile_ranks() {
         use FeatureCellValidity::{Gap, Stale, Valid, Warmup};
         use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
 
@@ -1916,20 +2059,20 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, median)| {
-                // Four valid magnitudes: [0.5m, 0.75m, m, 2m]. The upper
-                // median is exactly m, not the average of the middle pair.
+                // Five valid magnitudes: [0.25m, 0.5m, m, 2m, 3m]. The odd
+                // middle is exactly m under either median convention.
                 FeatureColumnF64::new(
                     format!("known_median_{index}"),
                     vec![
-                        -median * 0.5,
-                        median * 2.0,
+                        median * 0.25,
+                        median * 0.5,
                         median,
-                        -median * 0.75,
+                        median * 2.0,
+                        median * 3.0,
                         f64::MAX,
                         -99.0,
-                        42.0,
                     ],
-                    vec![Valid, Valid, Valid, Valid, Warmup, Gap, Stale],
+                    vec![Valid, Valid, Valid, Valid, Valid, Warmup, Gap],
                 )
                 .expect("known median column")
             })
@@ -1962,30 +2105,22 @@ mod tests {
         use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureData};
 
         let rows = 2_053;
-        let columns = (0..19)
-            .map(|column| {
+        let scales = [
+            0.0002_f64, 0.0003, 0.0005, 0.0007, 0.0010, 0.0014, 0.0020, 0.0028, 0.0040, 0.0056,
+            0.0070, 0.0080,
+        ];
+        let columns = scales
+            .iter()
+            .enumerate()
+            .map(|(column, scale)| {
                 let values = (0..rows)
                     .map(|row| {
                         let sign = if row % 2 == 0 { -1.0 } else { 1.0 };
-                        sign * match column % 5 {
-                            0 => 0.0,
-                            1 => f64::MIN_POSITIVE * (row % 7 + 1) as f64,
-                            2 => f64::from_bits(1.0_f64.to_bits() + (row % 31) as u64),
-                            3 => f64::MAX / (row % 17 + 1) as f64,
-                            _ => ((row * 37 + column * 13) % 509) as f64 / 64.0,
-                        }
+                        sign * ((row + 1) as f64 * scale)
                     })
                     .collect();
                 let validity = (0..rows)
-                    .map(|row| {
-                        if column == 18 || row % 17 == 0 {
-                            Warmup
-                        } else if row % 23 == 0 {
-                            Gap
-                        } else {
-                            Valid
-                        }
-                    })
+                    .map(|row| if row % 17 == 0 { Warmup } else { Valid })
                     .collect();
                 FeatureColumnF64::new(format!("mixed_δοκιμή_{column}"), values, validity)
                     .expect("mixed precision/validity column")
@@ -2012,7 +2147,12 @@ mod tests {
                     .map(|(value, _)| value.abs())
                     .collect::<Vec<_>>();
                 magnitudes.sort_by(f64::total_cmp);
-                magnitudes.get(magnitudes.len() / 2).copied()
+                let middle = magnitudes.len() / 2;
+                if magnitudes.len() % 2 == 0 {
+                    Some((magnitudes[middle - 1] + magnitudes[middle]) * 0.5)
+                } else {
+                    magnitudes.get(middle).copied()
+                }
             })
             .collect::<Vec<_>>();
         medians.sort_by(f64::total_cmp);
