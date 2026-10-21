@@ -385,6 +385,51 @@ fn account_risk_ledger_prices_signal_confidence_compounding_and_all_costs() {
     assert_eq!(metrics[8], 2.0);
     assert!((trades[0].mfe - 2_000.0 * first_lots).abs() < 1e-9);
     assert!((trades[1].mae - 1_000.0 * second_lots).abs() < 1e-9);
+
+    // This same fixture, with identical bars/signals/confidences/costs and the
+    // only change being fixed-1-lot sizing, documents the deliberate distinction
+    // between per-lot price-edge screening and sealed account-risk sizing. It is
+    // NOT evidence of a sizing defect, promotion evidence, or a V7 root cause.
+    let mut fixed_policy = policy.clone();
+    fixed_policy.risk_based_sizing = false;
+    let (fixed_metrics, fixed_trades) = evaluate_strategy_with_confidence_and_ledger_core(
+        &close,
+        &high,
+        &low,
+        &signals,
+        &confidence,
+        &[0; 5],
+        &days,
+        &times,
+        &fixed_policy,
+    )
+    .expect("fixed-1-lot replay on the same fixture");
+    assert_eq!(
+        fixed_trades.len(),
+        trades.len(),
+        "both sizing modes must trade twice"
+    );
+    assert_eq!(
+        fixed_metrics[8], metrics[8],
+        "both sizing modes must report two trades"
+    );
+    assert!(
+        (fixed_trades[0].pnl - 1_827.0).abs() < 1e-9,
+        "fixed per-lot first pnl"
+    );
+    assert!(
+        (fixed_trades[1].pnl - (-1_090.0)).abs() < 1e-9,
+        "fixed per-lot second pnl"
+    );
+    assert!((fixed_metrics[0] - 737.0).abs() < 1e-9, "fixed net");
+    assert!(
+        (metrics[0] - (-39.282_86)).abs() < 1e-6,
+        "account-sized net"
+    );
+    assert!(
+        fixed_metrics[0] > 0.0 && metrics[0] < 0.0,
+        "the documented sizing policies must give opposite raw net decisions"
+    );
 }
 
 #[test]
