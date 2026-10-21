@@ -2822,19 +2822,51 @@ where
 pub(crate) fn base_timeframe_context_from_features(
     features: &neoethos_data::FeatureFrame,
 ) -> Option<(String, bool)> {
-    let base_timeframe = features
-        .provenance()
-        .bindings()
-        .iter()
-        .map(|binding| binding.dataset_identity().timeframe())
-        .min_by_key(|timeframe| *timeframe as u8)?
-        .as_str()
-        .to_owned();
-    let base_features_prefixed = features
-        .feature_build_options()
+    let options = features.feature_build_options();
+    let prefix_base_features = options
         .map(|options| options.prefix_base_features)
         .unwrap_or(false);
-    Some((base_timeframe, base_features_prefixed))
+    if let Some(options) = options {
+        let higher: std::collections::BTreeSet<neoethos_dataset_contracts::CanonicalTimeframe> =
+            options
+                .higher_tfs
+                .iter()
+                .filter_map(|timeframe| timeframe.parse().ok())
+                .collect();
+        let bases: std::collections::BTreeMap<
+            String,
+            neoethos_dataset_contracts::CanonicalTimeframe,
+        > = features
+            .provenance()
+            .bindings()
+            .iter()
+            .map(|binding| binding.dataset_identity())
+            .filter(|identity| !higher.contains(&identity.timeframe()))
+            .map(|identity| (identity.to_path_component(), identity.timeframe()))
+            .collect();
+        if bases.len() != 1 {
+            return None;
+        }
+        let timeframe = bases.values().next()?;
+        return Some((timeframe.as_str().to_owned(), prefix_base_features));
+    }
+    // No recorded recipe: only a single unambiguous source identity is allowed;
+    // multiple bindings remain unresolved rather than guessed.
+    let mut identities: std::collections::BTreeMap<
+        String,
+        neoethos_dataset_contracts::CanonicalTimeframe,
+    > = std::collections::BTreeMap::new();
+    for binding in features.provenance().bindings() {
+        let identity = binding.dataset_identity();
+        identities.insert(identity.to_path_component(), identity.timeframe());
+    }
+    if identities.len() != 1 {
+        return None;
+    }
+    Some((
+        identities.values().next()?.as_str().to_owned(),
+        prefix_base_features,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
