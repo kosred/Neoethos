@@ -51,6 +51,7 @@ fn cpu_execution_source_sha256() -> &'static str {
             include_bytes!("genetic/evolution_math.rs").as_slice(),
             include_bytes!("genetic/smc_indicators.rs").as_slice(),
             include_bytes!("genetic/strategy_gene.rs").as_slice(),
+            include_bytes!("genetic/seed_templates.rs").as_slice(),
         ])
     })
 }
@@ -1919,6 +1920,7 @@ mod tests {
                 include_bytes!("genetic/evolution_math.rs").as_slice(),
                 include_bytes!("genetic/smc_indicators.rs").as_slice(),
                 include_bytes!("genetic/strategy_gene.rs").as_slice(),
+                include_bytes!("genetic/seed_templates.rs").as_slice(),
             ])
         );
     }

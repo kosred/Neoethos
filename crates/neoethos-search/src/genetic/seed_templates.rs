@@ -294,14 +294,50 @@ const VARIANTS_PER_TEMPLATE: usize = 10;
 
 /// Find the feature index whose lowercased name contains both `tf` and
 /// `primary`. Returns `None` if no match exists.
-fn find_feature(feature_names: &[String], tf: &str, primary: &str) -> Option<usize> {
+fn token_sequence_present(name: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    let mut start = 0usize;
+    while let Some(found) = name[start..].find(needle) {
+        let index = start + found;
+        let end = index + needle.len();
+        let before_ok = index == 0 || bytes[index - 1] == b'_';
+        let after_ok = end == bytes.len() || bytes[end] == b'_';
+        if before_ok && after_ok {
+            return true;
+        }
+        start = index + 1;
+        if start >= name.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn timeframe_token_present(lower: &str, tf: &str) -> bool {
+    tf.is_empty() || lower.split('_').any(|segment| segment == tf)
+}
+
+fn find_feature(
+    feature_names: &[String],
+    tf: &str,
+    needle: &str,
+    token_boundary: bool,
+) -> Option<usize> {
     feature_names
         .iter()
         .enumerate()
         .find(|(_, name)| {
             let lower = name.to_lowercase();
-            let tf_ok = tf.is_empty() || lower.contains(tf);
-            tf_ok && lower.contains(primary)
+            let tf_ok = timeframe_token_present(&lower, tf);
+            let needle_ok = if token_boundary {
+                token_sequence_present(&lower, needle)
+            } else {
+                lower.contains(needle)
+            };
+            tf_ok && needle_ok
         })
         .map(|(idx, _)| idx)
 }
@@ -310,8 +346,8 @@ fn find_feature(feature_names: &[String], tf: &str, primary: &str) -> Option<usi
 /// `find_feature(tf, family)`; if that also misses, return `None` (the
 /// caller will skip this role rather than producing nonsense).
 fn resolve_role(feature_names: &[String], role: &RoleSpec) -> Option<usize> {
-    find_feature(feature_names, role.tf, role.primary)
-        .or_else(|| find_feature(feature_names, role.tf, role.family))
+    find_feature(feature_names, role.tf, role.primary, true)
+        .or_else(|| find_feature(feature_names, role.tf, role.family, false))
 }
 
 /// Build one Gene from a template + variant index. Variant rotations
@@ -364,12 +400,20 @@ fn build_variant(
     let long_threshold = template.long_threshold * scale;
     let short_threshold = template.short_threshold * scale;
 
-    // SL/TP rotation: alternate between conservative (1:2 RR) and
-    // moderate (1:2.5 RR) across variants.
+    // Use the SAME dataset-resolved geometry policy as new_random_gene.
+    // Hardcoded pip literals only described M5 and could place H4/H12 seeds
+    // wholly outside the current ATR-scaled stop band.
+    let bounds = super::evolution_math::current_gene_stop_bounds();
     let (sl_pips, tp_pips) = if variant % 2 == 0 {
-        (15.0, 30.0)
+        let sl = bounds.mid_pair().0;
+        let rr = 0.5 * (bounds.rr_min + bounds.rr_max);
+        (sl, (sl * rr).clamp(bounds.tp_min_pips, bounds.tp_max_pips))
     } else {
-        (20.0, 50.0)
+        let sl = bounds.sl_max_pips;
+        (
+            sl,
+            (sl * bounds.rr_max).clamp(bounds.tp_min_pips, bounds.tp_max_pips),
+        )
     };
 
     // SMC flag rotation: every 3rd variant flips a random flag so we
@@ -490,6 +534,51 @@ pub fn seed_professional_templates(
 }
 
 #[cfg(test)]
+pub(crate) fn multi_tf_test_feature_names() -> Vec<String> {
+    vec![
+        "ema_50",
+        "ema_21",
+        "ema_20",
+        "ema_200",
+        "ema_8",
+        "rsi",
+        "atr",
+        "macd",
+        "adx",
+        "cci",
+        "stoch",
+        "vwap",
+        "donchian",
+        "obv",
+        "bollinger_bands",
+        "d1_ema_50",
+        "d1_ema_20",
+        "d1_ema_200",
+        "d1_atr",
+        "h4_ema_21",
+        "h4_ema_50",
+        "h4_bbands",
+        "h4_macd",
+        "h4_donchian",
+        "h1_ema_50",
+        "h1_rsi",
+        "h1_macd",
+        "h1_obv",
+        "m15_rsi",
+        "m15_adx",
+        "m15_donchian",
+        "m5_vwap",
+        "m5_cci",
+        "m5_ema_8",
+        "m5_stoch",
+        "m5_atr",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rand::SeedableRng;
@@ -514,47 +603,7 @@ mod tests {
     fn full_multi_tf_feature_set_yields_templates() {
         // Construct a feature-name set that matches several template
         // roles across all 5 TFs.
-        let names: Vec<String> = vec![
-            "ema_50",
-            "ema_21",
-            "ema_20",
-            "ema_200",
-            "ema_8",
-            "rsi",
-            "atr",
-            "macd",
-            "adx",
-            "cci",
-            "stoch",
-            "vwap",
-            "donchian",
-            "obv",
-            "bollinger_bands",
-            "d1_ema_50",
-            "d1_ema_20",
-            "d1_ema_200",
-            "d1_atr",
-            "h4_ema_21",
-            "h4_ema_50",
-            "h4_bbands",
-            "h4_macd",
-            "h4_donchian",
-            "h1_ema_50",
-            "h1_rsi",
-            "h1_macd",
-            "h1_obv",
-            "m15_rsi",
-            "m15_adx",
-            "m15_donchian",
-            "m5_vwap",
-            "m5_cci",
-            "m5_ema_8",
-            "m5_stoch",
-            "m5_atr",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let names = multi_tf_test_feature_names();
         let n = names.len();
         let mut rng = StdRng::seed_from_u64(42);
         let seeds = seed_professional_templates(50, &names, n, &mut rng);
@@ -644,5 +693,21 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(template_feature_indices(&names).is_empty());
+    }
+
+    #[test]
+    fn feature_matching_uses_full_tf_and_keyword_tokens() {
+        let names = vec![
+            "h12_ema_50".to_string(),
+            "h1_rsi".to_string(),
+            "h1_ema_500".to_string(),
+            "h1_ema_50".to_string(),
+        ];
+        assert_eq!(find_feature(&names, "h1", "ema_50", true), Some(3));
+        assert_eq!(find_feature(&names, "h12", "ema_50", true), Some(0));
+        assert_eq!(find_feature(&names, "h1", "rsi", true), Some(1));
+        assert_eq!(find_feature(&names, "h1", "ema_500", true), Some(2));
+        assert_eq!(find_feature(&names, "h1", "ema_5", true), None);
+        assert_eq!(find_feature(&names, "h1", "ema_5", false), Some(2));
     }
 }

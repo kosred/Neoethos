@@ -1532,6 +1532,43 @@ mod tests {
         );
         assert!(adaptive_ratio_mutated, "adaptive ratio never mutated");
 
+        use rand::{SeedableRng, rngs::StdRng};
+        let names = crate::genetic::seed_templates::multi_tf_test_feature_names();
+        let seed_count = names.len();
+        let seeds = crate::genetic::seed_templates::seed_professional_templates(
+            50,
+            &names,
+            seed_count,
+            &mut StdRng::seed_from_u64(13),
+        );
+        assert!(
+            !seeds.is_empty(),
+            "full multi-TF schema must resolve templates"
+        );
+        for gene in &seeds {
+            assert!(
+                gene.sl_pips >= band.sl_min_pips - 1e-9 && gene.sl_pips <= band.sl_max_pips + 1e-9,
+                "template sl {} outside H4 band [{}, {}]",
+                gene.sl_pips,
+                band.sl_min_pips,
+                band.sl_max_pips
+            );
+            assert!(
+                gene.tp_pips >= band.tp_min_pips - 1e-9 && gene.tp_pips <= band.tp_max_pips + 1e-9,
+                "template tp {} outside H4 band [{}, {}]",
+                gene.tp_pips,
+                band.tp_min_pips,
+                band.tp_max_pips
+            );
+            let ratio = gene.tp_pips / gene.sl_pips;
+            assert!(
+                ratio >= band.rr_min - 1e-9 && ratio <= band.rr_max + 1e-9,
+                "template rr {ratio} outside [{}, {}]",
+                band.rr_min,
+                band.rr_max
+            );
+        }
+
         // Leave the process as we found it so no later test inherits an H4 scale.
         clear_gene_stop_atr_scale();
     }
