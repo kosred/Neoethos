@@ -822,6 +822,15 @@ impl Gene {
 /// Observed counts for one search invocation, independent of financial merit.
 /// Slots include repeated survivors; distinct genomes exclude those repeats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeeklyVectorArchiveCensusV1 {
+    pub capacity: usize,
+    pub evaluated: usize,
+    pub retained: usize,
+    pub capacity_rejected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationCensusV1 {
     pub schema_version: u16,
     pub generation_evaluation_slots: u64,
@@ -834,6 +843,8 @@ pub struct GenerationCensusV1 {
     pub final_population: usize,
     pub returned_candidates: usize,
     pub duplicate_handoff_entries: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_vector_archive: Option<WeeklyVectorArchiveCensusV1>,
 }
 
 #[derive(Debug, Clone)]

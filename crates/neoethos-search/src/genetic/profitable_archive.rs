@@ -77,6 +77,14 @@ pub(super) struct WeeklyVectorObservationV1 {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct WeeklyArchiveSummaryV1 {
+    pub capacity: usize,
+    pub evaluated: usize,
+    pub retained: usize,
+    pub capacity_rejected: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct WeeklyArchiveBatchCensusV1 {
     pub evaluated: usize,
     pub distinct: usize,
@@ -134,18 +142,22 @@ impl BoundedProfitableArchive {
         self.weekly_vector_capacity
     }
 
+    #[cfg(test)]
     pub(super) fn weekly_vector_len(&self) -> usize {
         self.weekly_observations.len()
     }
 
+    #[cfg(test)]
     pub(super) fn weekly_vector_evaluated(&self) -> usize {
         self.weekly_evaluated
     }
 
+    #[cfg(test)]
     pub(super) fn weekly_vector_capacity_rejected(&self) -> usize {
         self.weekly_capacity_rejected
     }
 
+    #[cfg(test)]
     pub(super) fn weekly_observations(&self) -> &[WeeklyVectorObservationV1] {
         &self.weekly_observations
     }
@@ -345,6 +357,28 @@ impl BoundedProfitableArchive {
         Ok(census)
     }
 
+    pub(super) fn weekly_archive_summary(&self) -> Option<WeeklyArchiveSummaryV1> {
+        (self.weekly_vector_capacity > 0).then_some(WeeklyArchiveSummaryV1 {
+            capacity: self.weekly_vector_capacity,
+            evaluated: self.weekly_evaluated,
+            retained: self.weekly_observations.len(),
+            capacity_rejected: self.weekly_capacity_rejected,
+        })
+    }
+
+    pub(super) fn into_finish_observations(self) -> Vec<ArchiveObservation> {
+        if self.weekly_vector_capacity > 0 {
+            self.weekly_observations
+                .into_iter()
+                .enumerate()
+                .map(|(sequence, observation)| (observation.gene, observation.metrics, sequence))
+                .collect()
+        } else {
+            self.observations
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn into_observations(self) -> Vec<ArchiveObservation> {
         self.observations
     }
@@ -426,33 +460,16 @@ mod tests {
         daily_drawdown: f64,
         trades: usize,
     ) -> [f64; 11] {
-        [
+        crate::scoring::weekly_cadence::synthetic_weekly_metrics(
             net,
-            1.0,
-            10_000.0,
             drawdown,
-            0.6,
-            1.2,
-            net / trades.max(1) as f64,
-            0.5,
-            trades as f64,
-            0.5,
             daily_drawdown,
-        ]
+            trades,
+        )
     }
 
     fn weekly_vector_report(windows: u64, trades: usize) -> WeeklyRollingCadenceReportV1 {
-        WeeklyRollingCadenceReportV1 {
-            trading_days: 2_219,
-            trades,
-            sunday_entries_credited: 0,
-            weekend_entries: 0,
-            trades_per_month: 21.0 * trades as f64 / 2_219.0,
-            longest_silent_trading_days: if windows == 0 { 4 } else { 5 },
-            violating_windows: windows,
-            violation: windows as f64,
-            clustered: windows > 0,
-        }
+        crate::scoring::weekly_cadence::synthetic_weekly_report(windows, trades)
     }
 
     fn weekly_vector_observation(

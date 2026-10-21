@@ -352,6 +352,8 @@ pub const WEEKLY_SELECTION_AXES_V1: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WeeklySelectionRankV1 {
     pub feasible: bool,
+    /// Intentional per-candidate invalid observation; never accepted.
+    pub invalid: bool,
     pub front_rank: u32,
     pub crowding: f64,
     pub bounded_distance: f64,
@@ -371,6 +373,12 @@ impl WeeklySelectionRankV1 {
     /// original financial fitness. Order/archive/survivor code must delegate
     /// here instead of mirroring comparator directions.
     pub fn preference_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.invalid, other.invalid) {
+            (false, true) => return std::cmp::Ordering::Greater,
+            (true, false) => return std::cmp::Ordering::Less,
+            (true, true) => return std::cmp::Ordering::Equal,
+            (false, false) => {}
+        }
         match (self.feasible, other.feasible) {
             (true, false) => return std::cmp::Ordering::Greater,
             (false, true) => return std::cmp::Ordering::Less,
@@ -386,23 +394,6 @@ impl WeeklySelectionRankV1 {
 
     pub fn retention_cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.preference_cmp(other)
-    }
-
-    /// Cross-generation archive ordering: absolute, bounded and independent of
-    /// a candidate's cohort-relative front/crowding number. Feasible first, then
-    /// fewer violated axes, lower smooth distance and higher financial fitness.
-    pub fn archive_cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self.feasible, other.feasible) {
-            (true, false) => return std::cmp::Ordering::Greater,
-            (false, true) => return std::cmp::Ordering::Less,
-            _ => {}
-        }
-        let left_violated = self.axes.iter().filter(|axis| **axis > 0.0).count();
-        let right_violated = other.axes.iter().filter(|axis| **axis > 0.0).count();
-        right_violated
-            .cmp(&left_violated)
-            .then_with(|| other.bounded_distance.total_cmp(&self.bounded_distance))
-            .then_with(|| self.fitness.total_cmp(&other.fitness))
     }
 }
 
@@ -426,6 +417,18 @@ fn weekly_dominates(
 
 /// Full observed metrics plus the same-execution cadence report. Non-finite
 /// inputs fail closed; no missing daily drawdown is replaced by zero.
+fn validate_weekly_report(report: &WeeklyRollingCadenceReportV1) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        report.trading_days >= 5
+            && report.violating_windows <= report.trading_days
+            && report.violation.is_finite()
+            && report.trades_per_month.is_finite()
+            && report.trades_per_month >= 0.0,
+        "malformed weekly cadence report"
+    );
+    Ok(())
+}
+
 pub fn weekly_violation_axes(
     objective: &WeeklySearchObjectiveV1,
     metrics: &[f64; 11],
@@ -488,6 +491,7 @@ pub fn weekly_selection_ranks(
     let mut ranks = vec![
         WeeklySelectionRankV1 {
             feasible: false,
+            invalid: false,
             front_rank: 0,
             crowding: 0.0,
             bounded_distance: 0.0,
@@ -498,10 +502,15 @@ pub fn weekly_selection_ranks(
     ];
     let mut feasible = vec![false; n];
     for i in 0..n {
-        anyhow::ensure!(
-            fitness[i].is_finite(),
-            "weekly selection fitness must be finite"
-        );
+        validate_weekly_report(&reports[i])?;
+        if !metrics[i].iter().all(|value| value.is_finite()) || !fitness[i].is_finite() {
+            ranks[i].invalid = true;
+            ranks[i].front_rank = u32::MAX;
+            ranks[i].bounded_distance = f64::INFINITY;
+            ranks[i].fitness = f64::NEG_INFINITY;
+            ranks[i].axes = [f64::INFINITY; WEEKLY_SELECTION_AXES_V1];
+            continue;
+        }
         let axes = weekly_violation_axes(objective, &metrics[i], &reports[i])?;
         feasible[i] = weekly_axes_are_feasible(objective, &metrics[i], &reports[i], &axes);
         ranks[i].axes = axes;
@@ -624,7 +633,9 @@ pub fn weekly_select_survivors(ranks: &[WeeklySelectionRankV1], requested: usize
     // Pass 1: one representative per unique violation vector, feasible first
     // and then front by front. This is what stops a quiet-vector flood from
     // consuming every survivor slot.
-    let mut feasible: Vec<usize> = (0..ranks.len()).filter(|i| ranks[*i].feasible).collect();
+    let mut feasible: Vec<usize> = (0..ranks.len())
+        .filter(|i| !ranks[*i].invalid && ranks[*i].feasible)
+        .collect();
     feasible.sort_by(|&a, &b| ranks[b].preference_cmp(&ranks[a]).then_with(|| a.cmp(&b)));
     for index in feasible {
         if selected.len() == requested {
@@ -639,7 +650,7 @@ pub fn weekly_select_survivors(ranks: &[WeeklySelectionRankV1], requested: usize
     let mut skipped: Vec<usize> = Vec::new();
     for front in 1..=max_front {
         let mut members: Vec<usize> = (0..ranks.len())
-            .filter(|i| !ranks[*i].feasible && ranks[*i].front_rank == front)
+            .filter(|i| !ranks[*i].invalid && !ranks[*i].feasible && ranks[*i].front_rank == front)
             .collect();
         members.sort_by(|&a, &b| ranks[b].preference_cmp(&ranks[a]).then_with(|| a.cmp(&b)));
         for index in members {
@@ -662,6 +673,47 @@ pub fn weekly_select_survivors(ranks: &[WeeklySelectionRankV1], requested: usize
         selected.push(index);
     }
     selected
+}
+
+/// Shared synthetic cadence report for selection/archive/GA tests. These
+/// window counts are hand-built, not replay-generated.
+#[cfg(test)]
+pub(crate) fn synthetic_weekly_report(windows: u64, trades: usize) -> WeeklyRollingCadenceReportV1 {
+    WeeklyRollingCadenceReportV1 {
+        trading_days: 2_219,
+        trades,
+        sunday_entries_credited: 0,
+        weekend_entries: 0,
+        trades_per_month: 21.0 * trades as f64 / 2_219.0,
+        longest_silent_trading_days: if windows == 0 { 4 } else { 5 },
+        violating_windows: windows,
+        violation: windows as f64,
+        clustered: windows > 0,
+    }
+}
+
+/// Shared synthetic metric row for selection/archive/GA tests. Not a replay
+/// observation and not a profitability claim; report windows are synthetic too.
+#[cfg(test)]
+pub(crate) fn synthetic_weekly_metrics(
+    net: f64,
+    drawdown: f64,
+    daily_drawdown: f64,
+    trades: usize,
+) -> [f64; 11] {
+    [
+        net,
+        1.0,
+        10_000.0,
+        drawdown,
+        0.6,
+        1.2,
+        net / trades.max(1) as f64,
+        0.0,
+        trades as f64,
+        0.0,
+        daily_drawdown,
+    ]
 }
 
 #[cfg(test)]
@@ -1287,10 +1339,14 @@ mod tests {
     }
 
     #[test]
-    fn weekly_vector_selection_fails_closed_on_nonfinite_metrics() {
+    fn weekly_vector_selection_marks_nonfinite_metrics_invalid_not_accepted() {
         let (objective, metrics, reports, fitness, _) = selection_fixture();
         let mut bad = metrics;
         bad[0][0] = f64::NAN;
-        assert!(weekly_selection_ranks(&objective, &bad, &reports, &fitness).is_err());
+        let ranks = weekly_selection_ranks(&objective, &bad, &reports, &fitness).unwrap();
+        assert!(ranks[0].invalid);
+        assert!(!ranks[0].feasible);
+        let survivors = weekly_select_survivors(&ranks, ranks.len());
+        assert!(!survivors.contains(&0));
     }
 }

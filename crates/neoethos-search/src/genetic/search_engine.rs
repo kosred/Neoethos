@@ -3232,6 +3232,99 @@ impl EvaluatedGeneBehaviorKey {
 }
 
 /// Keep the admitted archive AND the complete last evaluated population.
+#[derive(Debug, Clone)]
+struct WeeklyGenerationSelectionV1 {
+    ranks: Vec<crate::scoring::weekly_cadence::WeeklySelectionRankV1>,
+    order: Vec<usize>,
+    selection_scores: Vec<f64>,
+    valid_positions: Vec<usize>,
+    progress: f64,
+}
+
+fn weekly_generation_selection(
+    objective: &crate::scoring::weekly_cadence::WeeklySearchObjectiveV1,
+    metrics: &[[f64; 11]],
+    reports: &[crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1],
+    fitness: &[f64],
+) -> Result<WeeklyGenerationSelectionV1> {
+    let ranks = crate::scoring::weekly_cadence::weekly_selection_ranks(
+        objective, metrics, reports, fitness,
+    )?;
+    let order = crate::scoring::weekly_cadence::weekly_selection_order(&ranks);
+    let sorted_ranks: Vec<_> = order.iter().map(|index| ranks[*index]).collect();
+    let selection_scores = crate::scoring::weekly_cadence::weekly_selection_scores(&sorted_ranks);
+    let valid_positions: Vec<usize> = (0..sorted_ranks.len())
+        .filter(|position| !sorted_ranks[*position].invalid)
+        .collect();
+    let progress = if let Some(feasible) = sorted_ranks
+        .iter()
+        .find(|rank| !rank.invalid && rank.feasible)
+    {
+        1.0 + feasible.fitness
+    } else if let Some(best) = sorted_ranks
+        .iter()
+        .filter(|rank| !rank.invalid)
+        .min_by(|left, right| left.bounded_distance.total_cmp(&right.bounded_distance))
+    {
+        -best.bounded_distance
+    } else {
+        f64::NEG_INFINITY
+    };
+    Ok(WeeklyGenerationSelectionV1 {
+        ranks: sorted_ranks,
+        order,
+        selection_scores,
+        valid_positions,
+        progress,
+    })
+}
+
+fn attach_weekly_archive_summary(
+    result: &mut SearchResult,
+    summary: Option<profitable_archive::WeeklyArchiveSummaryV1>,
+) {
+    let Some(summary) = summary else {
+        return;
+    };
+    if let Some(census) = &mut result.generation_census_v1 {
+        census.weekly_vector_archive = Some(super::strategy_gene::WeeklyVectorArchiveCensusV1 {
+            capacity: summary.capacity,
+            evaluated: summary.evaluated,
+            retained: summary.retained,
+            capacity_rejected: summary.capacity_rejected,
+        });
+    }
+}
+
+fn weekly_reorder_final_rows(
+    config: &EvaluationConfig,
+    rows: &mut Vec<(
+        Gene,
+        [f64; 11],
+        Option<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>,
+    )>,
+) -> Result<()> {
+    let Some(objective) = config.weekly_objective else {
+        return Ok(());
+    };
+    let reports: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            row.2.clone().ok_or_else(|| {
+                anyhow::anyhow!("weekly final replay is missing same-execution cadence reports")
+            })
+        })
+        .collect::<Result<_>>()?;
+    let metrics: Vec<[f64; 11]> = rows.iter().map(|row| row.1).collect();
+    let fitness: Vec<f64> = rows.iter().map(|row| row.0.fitness).collect();
+    let ranks = crate::scoring::weekly_cadence::weekly_selection_ranks(
+        &objective, &metrics, &reports, &fitness,
+    )?;
+    let order = crate::scoring::weekly_cadence::weekly_selection_order(&ranks);
+    *rows = order.iter().map(|index| rows[*index].clone()).collect();
+    Ok(())
+}
+
 /// A single profitable archive entry must not suppress all remaining evaluated
 /// candidates. Only compact genes/metrics cross this boundary; downstream
 /// validation still owns its separate RAM-bounded signal and ledger batches.
@@ -3313,6 +3406,7 @@ pub(crate) fn finish_evaluated_generation(
             final_population,
             returned_candidates,
             duplicate_handoff_entries: archive_entries + final_population - returned_candidates,
+            weekly_vector_archive: None,
         }),
         genes,
         metrics,
@@ -3402,21 +3496,19 @@ where
         .enumerate()
         .map(|(i, (g, m))| (g, m, cadence.as_ref().map(|reports| reports[i].clone())))
         .collect::<Vec<_>>();
-    aligned.sort_by(|a, b| {
-        let finite = |net: f64| {
-            if net.is_finite() {
-                if net == 0.0 { 0.0 } else { net }
-            } else {
-                f64::NEG_INFINITY
-            }
-        };
-        let weekly = if config.weekly_objective.is_some() {
-            b.0.fitness.total_cmp(&a.0.fitness)
-        } else {
-            std::cmp::Ordering::Equal
-        };
-        weekly.then_with(|| finite(b.1[0]).total_cmp(&finite(a.1[0])))
-    });
+    weekly_reorder_final_rows(config, &mut aligned)?;
+    if config.weekly_objective.is_none() {
+        aligned.sort_by(|a, b| {
+            let finite = |net: f64| {
+                if net.is_finite() {
+                    if net == 0.0 { 0.0 } else { net }
+                } else {
+                    f64::NEG_INFINITY
+                }
+            };
+            finite(b.1[0]).total_cmp(&finite(a.1[0]))
+        });
+    }
     result.weekly_cadence_v1 = cadence.map(|_| Vec::with_capacity(aligned.len()));
     result.genes = Vec::with_capacity(aligned.len());
     result.metrics = Vec::with_capacity(aligned.len());
@@ -3621,8 +3713,11 @@ where
     let archive_min_pf = genetic_runtime_overrides.archive_scoring.min_pf;
     let archive_min_sharpe = genetic_runtime_overrides.archive_scoring.min_sharpe;
     let archive_cap = genetic_runtime_overrides.effective_archive_cap(population, generations);
-    let mut profitable_archive =
-        BoundedProfitableArchive::for_objective(archive_cap, eval_cfg.weekly_objective.is_some());
+    let mut profitable_archive = if eval_cfg.weekly_objective.is_some() {
+        BoundedProfitableArchive::for_weekly_vector_objective(archive_cap)
+    } else {
+        BoundedProfitableArchive::for_objective(archive_cap, false)
+    };
     let base_immigrant_ratio = resolved_selection.immigrant_ratio;
     let base_survivor_fraction = resolved_selection.survivor_fraction;
     let parent_selection = resolved_selection.parent;
@@ -3734,6 +3829,7 @@ where
             final_population: genes.len(),
             returned_candidates: genes.len(),
             duplicate_handoff_entries: 0,
+            weekly_vector_archive: None,
         });
         seen_memory.flush();
         return Ok(SearchResult {
@@ -3798,6 +3894,7 @@ where
         timing.evaluation += evaluation_started.elapsed();
         let observation: crate::eval::PopulationEvaluationV1 = metrics?.into();
         observation.apply(&mut genes, &eval_cfg, evaluation_span_days)?;
+        let cadence = observation.cadence;
         let metrics = observation.metrics;
         anyhow::ensure!(
             metrics.len() == genes.len(),
@@ -3817,6 +3914,35 @@ where
             .enumerate()
             .map(|(idx, (g, m))| (g.fitness, idx, g, m))
             .collect();
+
+        let weekly_selection = if let Some(objective) = eval_cfg.weekly_objective {
+            let reports = cadence.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "weekly generation requires same-execution cadence reports for every candidate"
+                )
+            })?;
+            anyhow::ensure!(
+                reports.len() == scored.len(),
+                "weekly cadence report row count is detached from the scored population"
+            );
+            let fitness: Vec<f64> = scored.iter().map(|(fitness, _, _, _)| *fitness).collect();
+            let observed: Vec<[f64; 11]> =
+                scored.iter().map(|(_, _, _, metrics)| *metrics).collect();
+            Some(weekly_generation_selection(
+                &objective, &observed, reports, &fitness,
+            )?)
+        } else {
+            None
+        };
+        if weekly_selection
+            .as_ref()
+            .is_some_and(|selection| selection.valid_positions.is_empty())
+        {
+            anyhow::bail!(
+                "weekly generation produced no valid finite candidate; refusing to breed or mark success"
+            );
+        }
+        let weekly_reports = cadence;
 
         // --- Novelty Search: Behavioral Diversity ---
         // Build each sparse signature once. The inverted-index evaluator visits
@@ -3863,19 +3989,27 @@ where
         }
         // ------------------------------------------
 
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    if eval_cfg.weekly_objective.is_some() {
-                        crate::scoring::ga_fitness(&b.3)
-                            .total_cmp(&crate::scoring::ga_fitness(&a.3))
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-                .then_with(|| a.1.cmp(&b.1))
-        });
+        if let Some(selection) = &weekly_selection {
+            scored = selection
+                .order
+                .iter()
+                .map(|index| scored[*index].clone())
+                .collect();
+        } else {
+            scored.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        if eval_cfg.weekly_objective.is_some() {
+                            crate::scoring::ga_fitness(&b.3)
+                                .total_cmp(&crate::scoring::ga_fitness(&a.3))
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    })
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+        }
 
         // Distributed island migration (OFF by default — no-op unless the mesh
         // sidecar enabled it). Every INTERVAL generations, publish this
@@ -3892,8 +4026,12 @@ where
         }
 
         let top_score = scored.first().map(|x| x.0).unwrap_or(f64::NEG_INFINITY);
-        if top_score > best_score_seen + min_improvement {
-            best_score_seen = top_score;
+        let progress_score = weekly_selection
+            .as_ref()
+            .map(|selection| selection.progress)
+            .unwrap_or(top_score);
+        if progress_score > best_score_seen + min_improvement {
+            best_score_seen = progress_score;
             stagnant_gens = 0;
             last_improvement_at = Instant::now();
         } else {
@@ -3916,38 +4054,69 @@ where
         let mut rejected_capacity = 0usize;
         let mut archive_replaced = 0usize;
         let mut archive_improved_duplicates = 0usize;
-        for (_score, _, gene, m) in scored.iter() {
-            let (net, sharpe, pf, trades) = (m[0], m[1], m[5], m[8]);
-            if !net.is_finite() || !sharpe.is_finite() || !pf.is_finite() || !trades.is_finite() {
-                rejected_non_finite += 1;
-                continue;
+        let mut weekly_archive_census = None;
+        if let (Some(objective), Some(reports)) =
+            (eval_cfg.weekly_objective.as_ref(), weekly_reports.as_ref())
+        {
+            let batch: Vec<profitable_archive::WeeklyVectorObservationV1> = scored
+                .iter()
+                .map(
+                    |(_, index, gene, metrics)| profitable_archive::WeeklyVectorObservationV1 {
+                        gene: gene.clone(),
+                        metrics: *metrics,
+                        report: reports[*index].clone(),
+                    },
+                )
+                .collect();
+            weekly_archive_census = Some(profitable_archive.retain_weekly_batch(objective, batch)?);
+        } else {
+            for (_score, _, gene, m) in scored.iter() {
+                let (net, sharpe, pf, trades) = (m[0], m[1], m[5], m[8]);
+                if !net.is_finite() || !sharpe.is_finite() || !pf.is_finite() || !trades.is_finite()
+                {
+                    rejected_non_finite += 1;
+                    continue;
+                }
+                if !(trades > 0.0) {
+                    rejected_no_trades += 1;
+                    continue;
+                }
+                let keep = match archive_mode.as_str() {
+                    "active" => true,
+                    "pf" | "profit_factor" => pf > archive_min_pf,
+                    "sharpe" => sharpe > archive_min_sharpe,
+                    _ => net > archive_min_net,
+                };
+                if !keep {
+                    rejected_threshold += 1;
+                    continue;
+                }
+                // Capacity bounds retention, not consideration. Exact behavior
+                // identity and finite-net ranking retain later better observations
+                // without changing admission thresholds or the final union policy.
+                match profitable_archive.offer(gene, m)? {
+                    ArchiveOffer::Inserted => {}
+                    ArchiveOffer::ReplacedWorst => archive_replaced += 1,
+                    ArchiveOffer::ImprovedDuplicate => archive_improved_duplicates += 1,
+                    ArchiveOffer::RejectedDuplicate => rejected_duplicate += 1,
+                    ArchiveOffer::RejectedCapacity => rejected_capacity += 1,
+                    ArchiveOffer::RejectedNonFinite => rejected_non_finite += 1,
+                    ArchiveOffer::RejectedNoTrades => rejected_no_trades += 1,
+                }
             }
-            if !(trades > 0.0) {
-                rejected_no_trades += 1;
-                continue;
-            }
-            let keep = match archive_mode.as_str() {
-                "active" => true,
-                "pf" | "profit_factor" => pf > archive_min_pf,
-                "sharpe" => sharpe > archive_min_sharpe,
-                _ => net > archive_min_net,
-            };
-            if !keep {
-                rejected_threshold += 1;
-                continue;
-            }
-            // Capacity bounds retention, not consideration. Exact behavior
-            // identity and finite-net ranking retain later better observations
-            // without changing admission thresholds or the final union policy.
-            match profitable_archive.offer(gene, m)? {
-                ArchiveOffer::Inserted => {}
-                ArchiveOffer::ReplacedWorst => archive_replaced += 1,
-                ArchiveOffer::ImprovedDuplicate => archive_improved_duplicates += 1,
-                ArchiveOffer::RejectedDuplicate => rejected_duplicate += 1,
-                ArchiveOffer::RejectedCapacity => rejected_capacity += 1,
-                ArchiveOffer::RejectedNonFinite => rejected_non_finite += 1,
-                ArchiveOffer::RejectedNoTrades => rejected_no_trades += 1,
-            }
+        }
+        if let Some(census) = &weekly_archive_census {
+            tracing::info!(
+                target: "neoethos_search::funnel",
+                generation = generation + 1,
+                bound = profitable_archive.resolved_weekly_vector_capacity(),
+                evaluated = census.evaluated,
+                distinct = census.distinct,
+                retained = census.retained,
+                capacity_rejected = census.capacity_rejected,
+                invalid = census.invalid,
+                "weekly vector archive union census — retained exploration is not acceptance"
+            );
         }
         // Say which rule emptied the generation, and only when it matters —
         // a healthy archive does not need narrating every generation.
@@ -4054,8 +4223,9 @@ where
                  floor); advancing to the next."
             );
             seen_memory.flush();
-            return finish_with_final_gate_metrics(
-                profitable_archive.into_observations(),
+            let weekly_archive_summary = profitable_archive.weekly_archive_summary();
+            let mut result = finish_with_final_gate_metrics(
+                profitable_archive.into_finish_observations(),
                 scored,
                 &eval_cfg,
                 evaluation_span_days,
@@ -4064,15 +4234,18 @@ where
                 &mut evaluate_generation,
                 &mut cancel_requested,
                 Some(evaluated_genomes.len()),
-            );
+            )?;
+            attach_weekly_archive_summary(&mut result, weekly_archive_summary);
+            return Ok(result);
         }
 
         if let Some(max_runtime) = max_runtime
             && started_at.elapsed() >= max_runtime
         {
             seen_memory.flush();
-            return finish_with_final_gate_metrics(
-                profitable_archive.into_observations(),
+            let weekly_archive_summary = profitable_archive.weekly_archive_summary();
+            let mut result = finish_with_final_gate_metrics(
+                profitable_archive.into_finish_observations(),
                 scored,
                 &eval_cfg,
                 evaluation_span_days,
@@ -4081,13 +4254,16 @@ where
                 &mut evaluate_generation,
                 &mut cancel_requested,
                 Some(evaluated_genomes.len()),
-            );
+            )?;
+            attach_weekly_archive_summary(&mut result, weekly_archive_summary);
+            return Ok(result);
         }
 
         if generation + 1 == generations {
             seen_memory.flush();
-            return finish_with_final_gate_metrics(
-                profitable_archive.into_observations(),
+            let weekly_archive_summary = profitable_archive.weekly_archive_summary();
+            let mut result = finish_with_final_gate_metrics(
+                profitable_archive.into_finish_observations(),
                 scored,
                 &eval_cfg,
                 evaluation_span_days,
@@ -4096,14 +4272,19 @@ where
                 &mut evaluate_generation,
                 &mut cancel_requested,
                 Some(evaluated_genomes.len()),
-            );
+            )?;
+            attach_weekly_archive_summary(&mut result, weekly_archive_summary);
+            return Ok(result);
         }
 
         // Reuse the seeded RNG built at the top of `evolve_search_with_progress_impl`
         // (was `let mut rng = rand::rng();` here, which shadowed the seeded one and
         // broke the determinism work in the GPU path). `rng` is available in scope.
         let reproduction_started = Instant::now();
-        let score_vector: Vec<f64> = scored.iter().map(|(score, _, _, _)| *score).collect();
+        let score_vector: Vec<f64> = weekly_selection
+            .as_ref()
+            .map(|selection| selection.selection_scores.clone())
+            .unwrap_or_else(|| scored.iter().map(|(score, _, _, _)| *score).collect());
         let survivor_fraction = if stagnant_gens >= stagnation_patience {
             (search_policy.survivor_fraction * 0.75).clamp(0.0, 0.5)
         } else {
@@ -4112,16 +4293,23 @@ where
         let survivor_count = ((population as f64) * survivor_fraction).round() as usize;
         let survivor_count = match search_policy.survivor_selection {
             SurvivorSelectionPolicy::Generational => 0,
-            _ => survivor_count.clamp(2, scored.len()),
+            _ => survivor_count.clamp(2.min(scored.len()), scored.len()),
         };
-        let survivor_indices = select_survivor_indices(
-            &score_vector,
-            survivor_count,
-            search_policy.survivor_selection,
-            search_policy.selection_temperature,
-            search_policy.tournament_size,
-            &mut rng,
-        );
+        let survivor_indices = if let Some(selection) = &weekly_selection {
+            crate::scoring::weekly_cadence::weekly_select_survivors(
+                &selection.ranks,
+                survivor_count,
+            )
+        } else {
+            select_survivor_indices(
+                &score_vector,
+                survivor_count,
+                search_policy.survivor_selection,
+                search_policy.selection_temperature,
+                search_policy.tournament_size,
+                &mut rng,
+            )
+        };
         let survivors: Vec<Gene> = survivor_indices
             .iter()
             .map(|idx| scored[*idx].2.clone())
@@ -4248,7 +4436,15 @@ where
             ));
         }
 
-        let parent_indices: Vec<usize> = (0..scored.len()).collect();
+        let parent_indices: Vec<usize> = if let Some(selection) = &weekly_selection {
+            selection.valid_positions.clone()
+        } else {
+            (0..scored.len()).collect()
+        };
+        anyhow::ensure!(
+            !parent_indices.is_empty(),
+            "weekly generation has no valid breeding parent"
+        );
         while next.len() < population {
             let a_idx = select_parent_index(
                 &score_vector,
@@ -5889,5 +6085,219 @@ mod evaluated_generation_handoff_tests {
             .to_string();
         assert!(error.starts_with("__DISCOVERY_CANCELLED__"));
         assert!(error.contains("cancelled by operator before generation 2"));
+    }
+}
+
+#[cfg(test)]
+mod weekly_integration_tests {
+    use super::*;
+    use crate::scoring::weekly_cadence::{
+        WeeklyRollingCadenceReportV1, test_weekly_objective, weekly_select_survivors,
+    };
+
+    fn report(windows: u64, trades: usize) -> WeeklyRollingCadenceReportV1 {
+        crate::scoring::weekly_cadence::synthetic_weekly_report(windows, trades)
+    }
+
+    fn observed(net: f64, drawdown: f64, daily: f64, trades: usize) -> [f64; 11] {
+        crate::scoring::weekly_cadence::synthetic_weekly_metrics(net, drawdown, daily, trades)
+    }
+
+    fn gene(index: usize, fitness: f64) -> Gene {
+        Gene {
+            indices: vec![index],
+            weights: vec![0.4],
+            strategy_id: format!("weekly_integration_gene_{index}"),
+            fitness,
+            ..Gene::default()
+        }
+    }
+
+    fn select(
+        metrics: &[[f64; 11]],
+        reports: &[WeeklyRollingCadenceReportV1],
+        fitness: &[f64],
+    ) -> WeeklyGenerationSelectionV1 {
+        weekly_generation_selection(&test_weekly_objective(), metrics, reports, fitness).unwrap()
+    }
+
+    #[test]
+    fn weekly_integration_refuge_and_losing_churn_are_never_accepted() {
+        let metrics = [
+            observed(50.0, 0.001, 0.001, 1),
+            observed(-9_900.0, 0.99, 0.049, 5_000),
+        ];
+        let reports = [report(2_200, 1), report(0, 5_000)];
+        let selection = select(&metrics, &reports, &[10.0, -10.0]);
+        assert!(!selection.ranks.iter().any(|rank| rank.feasible));
+        assert_eq!(selection.valid_positions.len(), 2);
+        let survivors = weekly_select_survivors(&selection.ranks, 2);
+        assert_eq!(survivors.len(), 2);
+        assert!(!selection.ranks.iter().any(|rank| rank.invalid));
+    }
+
+    #[test]
+    fn weekly_integration_complementary_paths_reach_survivors_and_parents() {
+        let metrics = [
+            observed(50.0, 0.001, 0.001, 1),
+            observed(100.0, 0.30, 0.02, 445),
+            observed(-9_900.0, 0.99, 0.049, 5_000),
+        ];
+        let reports = [report(2_200, 1), report(1, 445), report(0, 5_000)];
+        let selection = select(&metrics, &reports, &[10.0, 20.0, -10.0]);
+        let survivors = weekly_select_survivors(&selection.ranks, 3);
+        assert_eq!(
+            survivors.len(),
+            3,
+            "one representative per complementary vector"
+        );
+        assert_eq!(selection.valid_positions, vec![0, 1, 2]);
+        let parent_positions: Vec<usize> = selection
+            .valid_positions
+            .iter()
+            .copied()
+            .filter(|position| !selection.ranks[*position].invalid)
+            .collect();
+        assert_eq!(parent_positions.len(), 3);
+    }
+
+    #[test]
+    fn weekly_integration_all_feasible_keeps_cardinality_and_financial_order() {
+        let metrics = [
+            observed(100.0, 0.09, 0.02, 445),
+            observed(100.0, 0.09, 0.02, 445),
+            observed(100.0, 0.09, 0.02, 445),
+        ];
+        let reports = [report(0, 445), report(0, 445), report(0, 445)];
+        let selection = select(&metrics, &reports, &[1.0, 3.0, 2.0]);
+        assert!(selection.ranks.iter().all(|rank| rank.feasible));
+        assert_eq!(
+            selection
+                .ranks
+                .iter()
+                .map(|rank| rank.fitness)
+                .collect::<Vec<_>>(),
+            vec![3.0, 2.0, 1.0]
+        );
+        assert_eq!(weekly_select_survivors(&selection.ranks, 3).len(), 3);
+        assert_eq!(selection.selection_scores[0], 1.0);
+    }
+
+    #[test]
+    fn weekly_integration_progress_improves_while_ordinal_top_stays_one() {
+        let first_metrics = [observed(-100.0, 0.20, 0.02, 445)];
+        let second_metrics = [observed(-100.0, 0.10, 0.02, 445)];
+        let first_reports = [report(10, 445)];
+        let second_reports = [report(5, 445)];
+        let first = select(&first_metrics, &first_reports, &[-100.0]);
+        let second = select(&second_metrics, &second_reports, &[-100.0]);
+        assert_eq!(first.selection_scores[0], 1.0);
+        assert_eq!(second.selection_scores[0], 1.0);
+        assert!(second.progress > first.progress);
+    }
+
+    #[test]
+    fn weekly_integration_invalid_sharpe_row_is_rejected_without_killing_valid_rows() {
+        let mut invalid = observed(100.0, 0.09, 0.02, 445);
+        invalid[1] = f64::NEG_INFINITY;
+        let metrics = [
+            observed(100.0, 0.09, 0.02, 445),
+            observed(100.0, 0.30, 0.02, 445),
+            invalid,
+        ];
+        let reports = [report(0, 445), report(1, 445), report(0, 445)];
+        let selection = select(&metrics, &reports, &[1.0, 2.0, 3.0]);
+        let invalid_positions: Vec<usize> = (0..selection.ranks.len())
+            .filter(|position| selection.ranks[*position].invalid)
+            .collect();
+        assert_eq!(invalid_positions.len(), 1);
+        assert_eq!(selection.valid_positions.len(), 2);
+        let survivors = weekly_select_survivors(&selection.ranks, 2);
+        assert_eq!(survivors.len(), 2);
+        assert!(!survivors.contains(&invalid_positions[0]));
+        let parents = selection.valid_positions.clone();
+        assert_eq!(parents.len(), 2);
+
+        let invalid_rows = [invalid, invalid];
+        let all_invalid = select(
+            &invalid_rows,
+            &[report(0, 445), report(0, 445)],
+            &[1.0, 2.0],
+        );
+        assert!(all_invalid.valid_positions.is_empty());
+        assert!(all_invalid.progress == f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn weekly_integration_malformed_report_or_count_mismatch_errors() {
+        let objective = test_weekly_objective();
+        let metrics = [observed(100.0, 0.09, 0.02, 445)];
+        let mut malformed = report(0, 445);
+        malformed.violating_windows = 9_999;
+        assert!(
+            crate::scoring::weekly_cadence::weekly_selection_ranks(
+                &objective,
+                &metrics,
+                &[malformed],
+                &[1.0]
+            )
+            .is_err()
+        );
+        assert!(
+            crate::scoring::weekly_cadence::weekly_selection_ranks(
+                &objective,
+                &metrics,
+                &[],
+                &[1.0]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn weekly_integration_final_replay_alignment_uses_same_vector_order() {
+        let config = EvaluationConfig {
+            weekly_objective: Some(test_weekly_objective()),
+            ..EvaluationConfig::default()
+        };
+        let rows = vec![
+            (
+                gene(0, 50.0),
+                observed(50.0, 0.001, 0.001, 1),
+                Some(report(2_200, 1)),
+            ),
+            (
+                gene(1, -10.0),
+                observed(-9_900.0, 0.99, 0.049, 5_000),
+                Some(report(0, 5_000)),
+            ),
+            (
+                gene(2, 100.0),
+                observed(100.0, 0.30, 0.02, 445),
+                Some(report(1, 445)),
+            ),
+        ];
+        let metrics: Vec<[f64; 11]> = rows.iter().map(|row| row.1).collect();
+        let reports: Vec<_> = rows.iter().map(|row| row.2.clone().unwrap()).collect();
+        let fitness: Vec<f64> = rows.iter().map(|row| row.0.fitness).collect();
+        let ranks = crate::scoring::weekly_cadence::weekly_selection_ranks(
+            &test_weekly_objective(),
+            &metrics,
+            &reports,
+            &fitness,
+        )
+        .unwrap();
+        let expected_order = crate::scoring::weekly_cadence::weekly_selection_order(&ranks);
+        let mut aligned = rows.clone();
+        weekly_reorder_final_rows(&config, &mut aligned).unwrap();
+        assert_eq!(aligned.len(), rows.len());
+        for (position, index) in expected_order.iter().enumerate() {
+            assert_eq!(aligned[position].0.strategy_id, rows[*index].0.strategy_id);
+            assert_eq!(aligned[position].1, rows[*index].1);
+            assert_eq!(
+                aligned[position].2.as_ref().unwrap().violating_windows,
+                rows[*index].2.as_ref().unwrap().violating_windows
+            );
+        }
     }
 }
