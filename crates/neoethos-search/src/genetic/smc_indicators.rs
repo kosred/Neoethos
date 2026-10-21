@@ -562,9 +562,39 @@ fn resolve_smc_columns(names: &[String]) -> [Option<usize>; SMC_FLAG_COUNT] {
     out
 }
 
-fn detect_smc_columns(names: &[String]) -> SmcColumns {
-    let bound = resolve_smc_columns(names);
-    record_binding(names, &bound);
+fn find_exact_column_in_frame(frame: &FeatureFrame, candidates: &[&str]) -> Option<usize> {
+    for candidate in candidates {
+        let Ok(resolved) = frame.model_base_feature_name(candidate) else {
+            continue;
+        };
+        let want = normalize_feature_name(&resolved);
+        if let Some(index) = frame
+            .names
+            .iter()
+            .position(|raw| normalize_feature_name(raw) == want)
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Frame-aware resolution. The canonical base identity comes from the frame's
+/// recorded prefix recipe, so a prefixed base column (for example M15_smc_ob)
+/// binds by its exact producer name. Higher-timeframe columns and ambiguous
+/// provenance cannot impersonate the base; they resolve to None and retain the
+/// existing crude-bar fallback.
+pub(crate) fn resolve_smc_columns_in_frame(
+    frame: &FeatureFrame,
+) -> [Option<usize>; SMC_FLAG_COUNT] {
+    let mut out = [None; SMC_FLAG_COUNT];
+    for (index, spec) in SMC_ALIAS_SPECS.iter().enumerate() {
+        out[index] = find_exact_column_in_frame(frame, spec.candidates);
+    }
+    out
+}
+
+fn smc_columns_from_bound(bound: [Option<usize>; SMC_FLAG_COUNT]) -> SmcColumns {
     SmcColumns {
         ob: bound[SMC_IDX_OB],
         fvg: bound[SMC_IDX_FVG],
@@ -578,6 +608,18 @@ fn detect_smc_columns(names: &[String]) -> SmcColumns {
         eql: bound[SMC_IDX_EQL],
         displacement: bound[SMC_IDX_DISPLACEMENT],
     }
+}
+
+fn detect_smc_columns_in_frame(frame: &FeatureFrame) -> SmcColumns {
+    let bound = resolve_smc_columns_in_frame(frame);
+    record_binding(&frame.names, &bound);
+    smc_columns_from_bound(bound)
+}
+
+fn detect_smc_columns(names: &[String]) -> SmcColumns {
+    let bound = resolve_smc_columns(names);
+    record_binding(names, &bound);
+    smc_columns_from_bound(bound)
 }
 
 pub fn derive_smc_arrays(ohlcv: &Ohlcv) -> SmcSignalTuple {
@@ -1041,7 +1083,7 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
         ohlcv.open.len() == n && ohlcv.high.len() == n && ohlcv.low.len() == n,
         "SMC OHLC column length mismatch"
     );
-    let cols = detect_smc_columns(&frame.names);
+    let cols = detect_smc_columns_in_frame(frame);
     let all_bound = [
         cols.ob,
         cols.fvg,
@@ -1126,10 +1168,15 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
     apply_dir_col(&mut liq, cols.liq)?;
     apply_dir_col(&mut trend, cols.trend)?;
     apply_dir_col(&mut premium, cols.premium)?;
-    if cols
-        .premium
-        .is_some_and(|col| normalize_feature_name(&frame.names[col]) == "smc_pd_array")
-    {
+    let premium_is_pd_array = cols.premium.is_some_and(|col| {
+        frame
+            .model_base_feature_name("smc_pd_array")
+            .map(|resolved| {
+                normalize_feature_name(&frame.names[col]) == normalize_feature_name(&resolved)
+            })
+            .unwrap_or(false)
+    });
+    if premium_is_pd_array {
         premium.iter_mut().for_each(|value| *value = -*value);
     }
     // Inducement is a presence gate for either direction. EQH is the short
@@ -1156,6 +1203,153 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
         eql,
         displacement,
     ))
+}
+
+#[cfg(test)]
+mod prefixed_binding_tests {
+    use super::*;
+    use neoethos_data::test_fixtures::ctrader_sample_ohlcv;
+
+    const CANONICAL_ALIASES: [&str; 11] = [
+        "smc_ob",
+        "smc_fvg",
+        "smc_liq_sweep",
+        "smc_trend_bias",
+        "smc_pd_array",
+        "smc_inducement",
+        "smc_bos",
+        "smc_mss",
+        "smc_eqh",
+        "smc_eql",
+        "smc_displacement",
+    ];
+
+    fn smc_frame(prefixed: bool, higher_only: bool) -> FeatureFrame {
+        use neoethos_data::{FeatureBuildOptions, FeatureCellValidity, FeatureColumnF64};
+        let ohlcv = ctrader_sample_ohlcv();
+        let timestamps = ohlcv.timestamp.clone().expect("fixture timestamps");
+        let n = timestamps.len();
+        let names: Vec<String> = CANONICAL_ALIASES
+            .iter()
+            .map(|alias| {
+                if higher_only {
+                    format!("H1_{alias}")
+                } else if prefixed {
+                    format!("M1_{alias}")
+                } else {
+                    (*alias).to_string()
+                }
+            })
+            .collect();
+        let columns: Vec<FeatureColumnF64> = names
+            .iter()
+            .enumerate()
+            .map(|(column, name)| {
+                let values: Vec<f64> = (0..n)
+                    .map(|row| {
+                        if CANONICAL_ALIASES[column] == "smc_pd_array" {
+                            1.0
+                        } else {
+                            match row % 3 {
+                                0 => -1.0,
+                                1 => 1.0,
+                                _ => 0.0,
+                            }
+                        }
+                    })
+                    .collect();
+                let validity: Vec<FeatureCellValidity> = (0..n)
+                    .map(|row| {
+                        if row % 11 == 0 {
+                            FeatureCellValidity::MissingInput
+                        } else {
+                            FeatureCellValidity::Valid
+                        }
+                    })
+                    .collect();
+                FeatureColumnF64::new(name.clone(), values, validity).unwrap()
+            })
+            .collect();
+        let options = FeatureBuildOptions {
+            prefix_base_features: prefixed,
+            higher_tfs: if higher_only {
+                vec!["H1".to_string()]
+            } else {
+                Vec::new()
+            },
+            ..FeatureBuildOptions::default()
+        };
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns_with_options(
+            timestamps, columns, options,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prefixed_base_smc_columns_bind_by_canonical_identity_and_match_arrays() {
+        let ohlcv = ctrader_sample_ohlcv();
+        let plain = smc_frame(false, false);
+        let prefixed = smc_frame(true, false);
+        let plain_binding = resolve_smc_columns(&plain.names);
+        let prefixed_name_only = resolve_smc_columns(&prefixed.names);
+        let prefixed_binding = resolve_smc_columns_in_frame(&prefixed);
+        for flag in 0..SMC_FLAG_COUNT {
+            assert!(
+                plain_binding[flag].is_some(),
+                "unprefixed flag {flag} unbound"
+            );
+            assert!(
+                prefixed_name_only[flag].is_none(),
+                "name-only resolver must not guess prefixed flag {flag}"
+            );
+            assert!(
+                prefixed_binding[flag].is_some(),
+                "prefixed flag {flag} did not bind by canonical identity"
+            );
+        }
+        let plain_arrays = build_smc_arrays(&plain, &ohlcv).unwrap();
+        let prefixed_arrays = build_smc_arrays(&prefixed, &ohlcv).unwrap();
+        let plain_tuple = [
+            plain_arrays.0,
+            plain_arrays.1,
+            plain_arrays.2,
+            plain_arrays.3,
+            plain_arrays.4,
+            plain_arrays.5,
+            plain_arrays.6,
+            plain_arrays.7,
+            plain_arrays.8,
+            plain_arrays.9,
+            plain_arrays.10,
+        ];
+        let prefixed_tuple = [
+            prefixed_arrays.0,
+            prefixed_arrays.1,
+            prefixed_arrays.2,
+            prefixed_arrays.3,
+            prefixed_arrays.4,
+            prefixed_arrays.5,
+            prefixed_arrays.6,
+            prefixed_arrays.7,
+            prefixed_arrays.8,
+            prefixed_arrays.9,
+            prefixed_arrays.10,
+        ];
+        for (flag, (plain, prefixed)) in plain_tuple.iter().zip(prefixed_tuple.iter()).enumerate() {
+            assert_eq!(plain, prefixed, "flag {flag} arrays diverged");
+        }
+        // smc_pd_array raw +1 must invert in BOTH spellings.
+        assert!(plain_tuple[4].iter().any(|value| *value == -1));
+        assert_eq!(plain_tuple[4], prefixed_tuple[4]);
+
+        let higher_only = smc_frame(true, true);
+        assert!(
+            resolve_smc_columns_in_frame(&higher_only)
+                .iter()
+                .all(Option::is_none),
+            "higher-timeframe names cannot impersonate the prefixed base"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -6585,8 +6585,11 @@ fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_r
         ],
     )
     .unwrap();
+    let raw_frame =
+        neoethos_data::FeatureFrame::from_columns(timestamps, columns, plan, provenance).unwrap();
+    let counterfactual_frame = raw_frame.clone();
     let frame = neoethos_data::test_fixtures::with_test_feature_build_options(
-        neoethos_data::FeatureFrame::from_columns(timestamps, columns, plan, provenance).unwrap(),
+        raw_frame,
         FeatureBuildOptions {
             profile: neoethos_data::FeatureProfile::Standard,
             prefix_base_features: false,
@@ -6598,9 +6601,9 @@ fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_r
         },
     );
     let spec = PrefilterSpec {
-        top_k: 2,
+        top_k: 1,
         insample_frac: 1.0,
-        min_per_tf: 1,
+        min_per_tf: 0,
         max_hold_bars: 3,
         atr_period: 3,
         sl_atr_mult: 1.0,
@@ -6608,6 +6611,11 @@ fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_r
         round_trip_cost_px: 0.0,
     };
     let (filtered, _census) = prefilter_features(&frame, &ohlcv, &spec).unwrap();
+    let (without_recipe, _) = prefilter_features(&counterfactual_frame, &ohlcv, &spec).unwrap();
+    assert!(
+        !without_recipe.names.iter().any(|name| name == "adx"),
+        "base role must be droppable without explicit provenance/force-keep"
+    );
     let base_column = filtered
         .names
         .iter()
@@ -6620,8 +6628,8 @@ fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_r
         .expect("higher force-kept");
     assert_ne!(base_column, higher_column);
     let (base, prefixed) =
-        crate::genetic::search_engine::base_timeframe_context_from_features(&frame)
-            .expect("exact M15/H1 recipe provenance");
+        crate::genetic::search_engine::base_timeframe_context_from_features(&filtered)
+            .expect("exact M15/H1 recipe provenance survives filtering");
     let _guard = crate::genetic::seed_templates::enter_search_base_timeframe(&base, prefixed);
     let seeds = crate::genetic::seed_templates::seed_professional_templates(
         50,
