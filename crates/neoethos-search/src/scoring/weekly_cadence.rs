@@ -162,11 +162,12 @@ impl WeeklySearchObjectiveV1 {
             l.initial_equity * l.per_trade_risk_band.1
         };
         // The operator's minimum is one trade per rolling five trading days:
-        // cadence is the PRIMARY feasibility tier. A weekly-valid but losing
-        // candidate is still infeasible (negative fitness), but it must outrank
-        // a sparse historically-profitable genome so evolution repairs cadence
-        // before optimising net/risk inside the cadence-valid tier.
-        let cadence_ratio = report.violation / report.trading_days.saturating_sub(4).max(1) as f64;
+        // cadence is the PRIMARY feasibility tier and EACH violated window is a
+        // full tier. A weekly-valid but losing candidate is still infeasible
+        // (negative fitness), but it must outrank any candidate with even one
+        // violated window so evolution closes the last gaps instead of trading
+        // tiny deficit improvements against remaining inactivity.
+        let cadence_tier = report.violating_windows as f64;
         let deficits = deficit(m[0], l.min_net_profit, l.initial_equity)
             + deficit(m[6], l.min_net_expectancy, expectancy_scale)
             + deficit(l.max_drawdown, m[3], l.max_drawdown)
@@ -183,7 +184,7 @@ impl WeeklySearchObjectiveV1 {
             // high-frequency losing churn must never look like progress.
             + (-m[0]).max(0.0) / l.initial_equity
             + (-m[6]).max(0.0) / expectancy_scale;
-        let feasible = cadence_ratio == 0.0
+        let feasible = cadence_tier == 0.0
             && report.feasible()
             && deficits == 0.0
             && m[0] > 0.0
@@ -193,7 +194,7 @@ impl WeeklySearchObjectiveV1 {
         if feasible {
             1.0 + old.atan() / std::f64::consts::PI
         } else {
-            -(1_000.0 * (1.0 + cadence_ratio) + deficits)
+            -(1_000.0 * (1.0 + cadence_tier) + deficits)
         }
     }
 }
@@ -508,6 +509,14 @@ mod tests {
         heavier_loss[0] = -500.0;
         heavier_loss[6] = -50.0;
         assert!(objective.fitness(&heavier_loss, &regular, 0.0) < losing);
+        // One remaining violated window is a full tier above a cadence-valid
+        // candidate with any deficits: closing the last gap is primary.
+        let one_window = report(&[0, 7, 14], 25);
+        assert!(one_window.violating_windows > 0);
+        assert!(
+            objective.fitness(&good, &one_window, 0.0)
+                < objective.fitness(&heavier_loss, &regular, 0.0)
+        );
     }
 
     #[test]
