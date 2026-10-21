@@ -564,7 +564,7 @@ fn resolve_smc_columns(names: &[String]) -> [Option<usize>; SMC_FLAG_COUNT] {
 
 fn find_exact_column_in_frame(frame: &FeatureFrame, candidates: &[&str]) -> Option<usize> {
     for candidate in candidates {
-        let Ok(resolved) = frame.model_base_feature_name(candidate) else {
+        let Ok(resolved) = frame.model_base_feature_name_candidate(candidate) else {
             continue;
         };
         let want = normalize_feature_name(&resolved);
@@ -1170,7 +1170,7 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
     apply_dir_col(&mut premium, cols.premium)?;
     let premium_is_pd_array = cols.premium.is_some_and(|col| {
         frame
-            .model_base_feature_name("smc_pd_array")
+            .model_base_feature_name_candidate("smc_pd_array")
             .map(|resolved| {
                 normalize_feature_name(&frame.names[col]) == normalize_feature_name(&resolved)
             })
@@ -1224,7 +1224,7 @@ mod prefixed_binding_tests {
         "smc_displacement",
     ];
 
-    fn smc_frame(prefixed: bool, higher_only: bool) -> FeatureFrame {
+    fn smc_frame(prefixed: bool, higher_only: bool, legacy_spelling: bool) -> FeatureFrame {
         use neoethos_data::{FeatureBuildOptions, FeatureCellValidity, FeatureColumnF64};
         let ohlcv = ctrader_sample_ohlcv();
         let timestamps = ohlcv.timestamp.clone().expect("fixture timestamps");
@@ -1232,12 +1232,17 @@ mod prefixed_binding_tests {
         let names: Vec<String> = CANONICAL_ALIASES
             .iter()
             .map(|alias| {
-                if higher_only {
-                    format!("H1_{alias}")
-                } else if prefixed {
-                    format!("M1_{alias}")
+                let spelling = if legacy_spelling {
+                    alias.to_ascii_uppercase().replace('_', "-")
                 } else {
                     (*alias).to_string()
+                };
+                if higher_only {
+                    format!("H1_{spelling}")
+                } else if prefixed {
+                    format!("M1_{spelling}")
+                } else {
+                    spelling
                 }
             })
             .collect();
@@ -1288,8 +1293,8 @@ mod prefixed_binding_tests {
     #[test]
     fn prefixed_base_smc_columns_bind_by_canonical_identity_and_match_arrays() {
         let ohlcv = ctrader_sample_ohlcv();
-        let plain = smc_frame(false, false);
-        let prefixed = smc_frame(true, false);
+        let plain = smc_frame(false, false, false);
+        let prefixed = smc_frame(true, false, false);
         let plain_binding = resolve_smc_columns(&plain.names);
         let prefixed_name_only = resolve_smc_columns(&prefixed.names);
         let prefixed_binding = resolve_smc_columns_in_frame(&prefixed);
@@ -1342,7 +1347,27 @@ mod prefixed_binding_tests {
         assert!(plain_tuple[4].iter().any(|value| *value == -1));
         assert_eq!(plain_tuple[4], prefixed_tuple[4]);
 
-        let higher_only = smc_frame(true, true);
+        // Legacy normalised spellings must still bind on the ACTUAL frame path.
+        let legacy_plain = smc_frame(false, false, true);
+        let legacy_prefixed = smc_frame(true, false, true);
+        assert!(
+            resolve_smc_columns_in_frame(&legacy_plain)
+                .iter()
+                .all(Option::is_some)
+        );
+        assert!(
+            resolve_smc_columns_in_frame(&legacy_prefixed)
+                .iter()
+                .all(Option::is_some)
+        );
+        let legacy_plain_arrays = build_smc_arrays(&legacy_plain, &ohlcv).unwrap();
+        let legacy_prefixed_arrays = build_smc_arrays(&legacy_prefixed, &ohlcv).unwrap();
+        assert_eq!(legacy_plain_arrays.0, plain_tuple[0]);
+        assert_eq!(legacy_plain_arrays.4, plain_tuple[4]);
+        assert_eq!(legacy_prefixed_arrays.0, prefixed_tuple[0]);
+        assert_eq!(legacy_prefixed_arrays.4, prefixed_tuple[4]);
+
+        let higher_only = smc_frame(true, true, false);
         assert!(
             resolve_smc_columns_in_frame(&higher_only)
                 .iter()

@@ -1449,7 +1449,12 @@ impl FeatureFrame {
 
     /// Resolve a base feature only from the recorded prefix recipe and exact
     /// source identity. No lowest-timeframe or name-substring guessing.
-    pub fn model_base_feature_name(&self, unprefixed: &str) -> Result<String> {
+    /// Resolve the recipe-canonical base spelling without requiring that the
+    /// literal spelling already exists in names. Callers that legitimately
+    /// accept normalized legacy spellings (for example SMC-OB) match this
+    /// candidate against their own normalized schema; ordinary model callers
+    /// keep using the existence-checked API below.
+    pub fn model_base_feature_name_candidate(&self, unprefixed: &str) -> Result<String> {
         let name = if let Some(options) = self
             .feature_build_options()
             .filter(|options| options.prefix_base_features)
@@ -1479,9 +1484,14 @@ impl FeatureFrame {
         } else {
             unprefixed.to_owned()
         };
+        Ok(name)
+    }
+
+    pub fn model_base_feature_name(&self, unprefixed: &str) -> Result<String> {
+        let name = self.model_base_feature_name_candidate(unprefixed)?;
         anyhow::ensure!(
             self.names.contains(&name),
-            "model base feature `{name}` is absent"
+            "model base feature name is absent"
         );
         Ok(name)
     }
