@@ -6300,4 +6300,95 @@ mod weekly_integration_tests {
             );
         }
     }
+
+    #[test]
+    fn weekly_integration_fake_evaluator_multigeneration_keeps_valid_rows_and_aligned_replay() {
+        use std::cell::Cell;
+        let objective = test_weekly_objective();
+        let config = EvaluationConfig {
+            initial_equity: 10_000.0,
+            risk_per_trade_min: objective.limits.per_trade_risk_band.0,
+            risk_per_trade_max: objective.limits.per_trade_risk_band.1,
+            weekly_objective: Some(objective),
+            ..EvaluationConfig::default()
+        };
+        let names = (0..4)
+            .map(|index| format!("feature_{index}"))
+            .collect::<Vec<_>>();
+        let population = 8usize;
+        let policy = ExactSearchSizingPolicyV1::new(false, population).unwrap();
+        let calls = Cell::new(0usize);
+        let generation_sizes = std::cell::RefCell::new(Vec::new());
+        let feasible = observed(100.0, 0.09, 0.02, 445);
+        let invalid = {
+            let mut row = feasible;
+            row[1] = f64::NEG_INFINITY;
+            row
+        };
+        let result = evolve_search_with_generation_evaluator_v1(
+            &names,
+            25.0,
+            population,
+            3,
+            1,
+            None,
+            Some(config),
+            &policy,
+            |genes, _| {
+                let call = calls.get();
+                calls.set(call + 1);
+                generation_sizes.borrow_mut().push(genes.len());
+                let rows: Vec<([f64; 11], WeeklyRollingCadenceReportV1)> = genes
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, _)| {
+                        if call == 1 && slot == 1 {
+                            (invalid, report(0, 445))
+                        } else if call == 2 {
+                            // One valid row among infeasible candidates.
+                            if slot == 0 {
+                                (feasible, report(0, 445))
+                            } else {
+                                (observed(-100.0, 0.20, 0.02, 445), report(4, 445))
+                            }
+                        } else if call == 3 {
+                            if slot % 3 == 0 {
+                                (invalid, report(0, 445))
+                            } else if slot % 3 == 1 {
+                                (feasible, report(0, 445))
+                            } else {
+                                (observed(-100.0, 0.10, 0.02, 445), report(2, 445))
+                            }
+                        } else {
+                            (observed(-100.0, 0.30, 0.02, 445), report(8, 445))
+                        }
+                    })
+                    .collect();
+                Ok(crate::eval::PopulationEvaluationV1 {
+                    metrics: rows.iter().map(|row| row.0).collect(),
+                    cadence: Some(rows.into_iter().map(|row| row.1).collect()),
+                })
+            },
+            |_, _, _, _, _| {},
+            || false,
+        )
+        .expect("fake-evaluator weekly GA completes");
+        let sizes = generation_sizes.borrow();
+        assert!(sizes.len() >= 3);
+        assert_eq!(&sizes[..3], &[population, population, population]);
+        assert_eq!(
+            result.weekly_cadence_v1.as_ref().unwrap().len(),
+            result.genes.len()
+        );
+        let census = result.generation_census_v1.as_ref().unwrap();
+        let weekly = census
+            .weekly_vector_archive
+            .as_ref()
+            .expect("weekly archive census");
+        assert!(weekly.capacity <= 1024);
+        assert!(weekly.evaluated >= population * 3);
+        assert!(weekly.retained > 0);
+        assert_eq!(result.genes.len(), result.metrics.len());
+        assert!(result.genes.len() >= population);
+    }
 }

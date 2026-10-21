@@ -148,11 +148,6 @@ impl BoundedProfitableArchive {
     }
 
     #[cfg(test)]
-    pub(super) fn weekly_vector_evaluated(&self) -> usize {
-        self.weekly_evaluated
-    }
-
-    #[cfg(test)]
     pub(super) fn weekly_vector_capacity_rejected(&self) -> usize {
         self.weekly_capacity_rejected
     }
