@@ -1423,6 +1423,10 @@ impl Default for SearchRuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiscoveryRuntimeConfig {
+    /// Opt-in rolling five-UTC-weekday objective for new PropFirm CPU runs.
+    /// Existing stricter frequency and financial floors remain active.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub weekly_cadence: bool,
     /// Max features kept after the in-sample correlation prefilter; `0`
     /// disables the prefilter. (was `NEOETHOS_BOT_PREFILTER_TOP_K`)
     ///
@@ -1527,6 +1531,7 @@ impl Default for DiscoveryRuntimeConfig {
         Self {
             // 240, matching config.yaml. See the field docs — the previous 50
             // silently contradicted the shipped config.
+            weekly_cadence: false,
             prefilter_top_k: 240,
             // Discovery already receives only the training side of the outer
             // temporal split. Rank features on all of that admissible prefix;

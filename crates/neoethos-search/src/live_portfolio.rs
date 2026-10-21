@@ -107,6 +107,10 @@ impl LiveTradingPolicyV1 {
             evaluation.growth_goal == authority.growth_goal(),
             "actual stage-1 growth goal disagrees with its resolved Search authority"
         );
+        anyhow::ensure!(
+            evaluation.weekly_objective.map(|o| o.limits) == authority.weekly_search_limits(),
+            "actual weekly objective disagrees with its sealed selection authority"
+        );
         let stamp = authority.resolved_config_stamp();
         let mut policy = Self::seal(
             authority.search_config_hash(),
@@ -260,6 +264,7 @@ impl LiveTradingPolicyV1 {
         self.sealed_evaluation_v1
             .as_ref()
             .map(SealedEvaluationPolicyV1::to_evaluation)
+            .transpose()?
             .ok_or_else(|| {
                 anyhow::anyhow!("legacy live policy lacks sealed signal/account evaluation")
             })
@@ -1776,6 +1781,7 @@ mod tests {
             smc_weight_displacement: 1.21,
             growth_objective: true,
             growth_goal: None,
+            weekly_objective: None,
         };
         policy.sealed_evaluation_v1 = Some(
             SealedEvaluationPolicyV1::from_evaluation(

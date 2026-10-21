@@ -132,6 +132,38 @@ than the admitted population; cancellation or a refused/incomplete evaluation
 fails the handoff. Old profits measured at earlier thresholds cannot select the
 validation cohort. This does not relax quality or walk-forward requirements.
 
+For a new PropFirm CPU experiment, opt in through the supplied settings file:
+`models.discovery_runtime.weekly_cadence: true`. This adds the versioned rolling
+weekly objective; omitted/false retains legacy scoring. Every five consecutive
+UTC weekdays in the complete evaluation interval must contain a trade entry.
+Inactive prefixes, gaps and tails count. Multiple entries on one day cannot
+cover another day. Observed Sunday FX entries cover the following Monday
+when it lies inside the interval; Sunday and Monday cover the same day.
+Saturday entries and a terminal Sunday without an evaluated Monday cover no day.
+All fills retain their costs and trade counts. This sealed research calendar
+is not broker-session or holiday evidence. A window with fewer than five weekdays is refused.
+
+The existing CPU position lifecycle records completed trades' entry timestamps
+alongside its unchanged eleven financial metrics, without retaining a full
+population trade ledger. Feasible candidates precede infeasible candidates in
+parent/survivor selection, bounded archive retention and finalist admission.
+When all candidates are infeasible, normalized inactivity, net-loss and risk
+deficits still distinguish them. Exact deficit ties use the original objective.
+The full selection-window quality replay independently enforces cadence and
+records `rolling_five_weekday_cadence` rejections. None of this is OOS evidence.
+
+The weekly minimum is additional to the explicit run's existing acceptance
+floors. A profile still configured for 20 trades/month continues to require
+20; enabling this objective does not silently turn it into a weekly-only
+profile. Record any operator-authorized activity-profile change in a new
+settings snapshot, preserving the frozen old experiment and financial/risk
+floors. Weekly limits participate in the search identity; the exact interval
+and month convention are retained in `live_trading_policy_v1`'s sealed evaluator.
+GA handoff metadata retains aligned cadence observations and checkpoints retain
+them when present. Native routes refuse this objective before population
+execution because they do not produce these observations. Novelty blending is
+also refused rather than allowing novelty to override financial feasibility.
+
 `funnel_profile.walkforward_selection_cohort` retains all completed internal WF
 trials, including rejected candidates. Each links to the exact genome and its
 index in `discovery_result.candidates`, selection scope and search config hash.

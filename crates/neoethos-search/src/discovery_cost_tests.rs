@@ -77,7 +77,7 @@ fn assert_same_evaluation_config(actual: &EvaluationConfig, expected: &Evaluatio
     // No `..`: adding an evaluation field requires extending this proof.
     compare_fields! {
         values: [symbol, account_currency, max_hold_bars, trailing_enabled,
-            kill_zones_enabled, session_spread_pips, growth_objective, growth_goal],
+            kill_zones_enabled, session_spread_pips, growth_objective, growth_goal, weekly_objective],
         floats: [initial_equity, trailing_atr_multiplier, trailing_be_trigger_r,
             trailing_min_lock_pips, pip_value, spread_pips, commission_per_trade,
             pip_value_per_lot, swap_long_pips_per_day, swap_short_pips_per_day,

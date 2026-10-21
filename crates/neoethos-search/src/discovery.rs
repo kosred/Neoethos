@@ -116,6 +116,9 @@ impl Stage1Window {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct DiscoveryRuntimeOverrides {
+    /// Explicit new-run weekly objective. False retains legacy scoring.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub weekly_cadence: bool,
     /// FLOOR on the number of features kept after the in-sample correlation
     /// prefilter. `0` disables the prefilter entirely.
     ///
@@ -165,6 +168,7 @@ impl Default for DiscoveryRuntimeOverrides {
             // `crates/neoethos-core/tests/shipped_config_matches_defaults.rs`;
             // this is the third, applied from
             // `docs/pending-edits-forbidden-territory.md` §2.
+            weekly_cadence: false,
             prefilter_top_k: 240,
             // The outer discovery wrapper has already removed the untouched
             // holdout. Ranking on only 80% of that admissible selection prefix
@@ -209,6 +213,7 @@ impl DiscoveryRuntimeOverrides {
     pub(crate) fn from_settings(settings: &neoethos_core::Settings) -> Self {
         let cfg = &settings.models.discovery_runtime;
         let mut overrides = Self::default();
+        overrides.weekly_cadence = cfg.weekly_cadence;
         overrides.prefilter_top_k = cfg.prefilter_top_k;
         if cfg.prefilter_insample_frac.is_finite()
             && cfg.prefilter_insample_frac > 0.0
@@ -1662,6 +1667,81 @@ impl DiscoveryConfig {
         Ok(self.evaluation_config(price_hint))
     }
 
+    pub(crate) fn weekly_search_limits(
+        &self,
+    ) -> Result<Option<crate::scoring::weekly_cadence::WeeklySearchLimitsV1>> {
+        if !self.runtime_overrides.weekly_cadence {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            matches!(self.mode, DiscoveryMode::PropFirm),
+            "weekly objective currently requires PropFirm mode"
+        );
+        let rules = self
+            .prop_firm_gate
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("weekly objective requires resolved PropFirm risk limits")
+            })?
+            .rules;
+        anyhow::ensure!(
+            self.filtering.min_profit == f64::NEG_INFINITY || self.filtering.min_profit.is_finite(),
+            "invalid weekly profit floor"
+        );
+        anyhow::ensure!(
+            [
+                self.filtering.max_dd,
+                rules.max_overall_drawdown_pct,
+                self.filtering.min_win_rate,
+                self.target_profile.min_win_rate
+            ]
+            .iter()
+            .all(|v| v.is_finite()),
+            "invalid weekly risk or win-rate floor"
+        );
+        let limits = crate::scoring::weekly_cadence::WeeklySearchLimitsV1 {
+            initial_equity: self.initial_balance,
+            per_trade_risk_band: (self.risk_per_trade_min, self.risk_per_trade_max),
+            max_drawdown: self.filtering.max_dd.min(rules.max_overall_drawdown_pct),
+            max_daily_drawdown: rules.max_daily_loss_pct,
+            min_trades_per_month: self.filtering.min_trades_per_month,
+            min_net_profit: self.filtering.min_profit.max(0.0),
+            min_net_expectancy: self.target_profile.min_net_expectancy_per_trade,
+            min_win_rate: self
+                .filtering
+                .min_win_rate
+                .max(self.target_profile.min_win_rate),
+            min_profit_factor: self.filtering.min_profit_factor,
+        };
+        limits.validate()?;
+        Ok(Some(limits))
+    }
+
+    pub(crate) fn weekly_objective_for_window(
+        &self,
+        timestamps: &[i64],
+    ) -> Result<Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>> {
+        let Some(limits) = self.weekly_search_limits()? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            timestamps.windows(2).all(|w| w[0] < w[1]),
+            "weekly evaluation timestamps must be strictly increasing"
+        );
+        let objective = crate::scoring::weekly_cadence::WeeklySearchObjectiveV1 {
+            cadence: crate::scoring::weekly_cadence::WeeklyCadenceContractV1::new(
+                *timestamps
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("empty weekly input"))?,
+                *timestamps.last().unwrap(),
+                crate::quality::current_quality_runtime_overrides().trading_days_per_month,
+            )?,
+            limits,
+        };
+        objective.validate()?;
+        Ok(Some(objective))
+    }
+
     pub(crate) fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
         let research_contract =
             crate::historical_evaluation_authority::active_research_contract_v1();
@@ -2484,6 +2564,8 @@ pub struct DiscoveryRunProfile {
     pub prefilter_insample_frac: f64,
     pub prefilter_min_per_timeframe: usize,
     pub funnel_stage1_pct: f64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub weekly_cadence: bool,
     /// Per-kind validation-evidence hashes ready for the typed
     /// [`neoethos_core::contracts::ValidationEvidenceManifest`]. `None`
     /// per field indicates that artifact kind was not produced for
@@ -6745,6 +6827,10 @@ fn ensure_research_config_matches_sealed_evaluation(
             "reconstructed discovery config field {field} = {rebuilt} differs from the sealed Search policy = {sealed}; refusing to price saved candidates under a configuration that is not the original run"
         )
     };
+    anyhow::ensure!(
+        config.weekly_search_limits()? == sealed.weekly_objective.map(|o| o.limits),
+        "reconstructed weekly objective differs from the sealed Search policy"
+    );
     if rebuilt.symbol != sealed.symbol {
         return mismatch("symbol", rebuilt.symbol.clone(), sealed.symbol.clone());
     }
@@ -7314,6 +7400,7 @@ struct QualityScreenRejects {
     /// Failed both the strict and the opportunistic metric bars. Equal to the
     /// sum of the ten fields below it, by construction.
     base_quality: usize,
+    weekly_cadence: Option<usize>,
     bq_account_wiped: usize,
     bq_profile_net_expectancy: usize,
     bq_profile_expectancy_significance: usize,
@@ -7441,6 +7528,7 @@ impl CostBandVerdict {
 impl QualityScreenRejects {
     fn total(&self) -> usize {
         self.base_quality
+            + self.weekly_cadence.unwrap_or(0)
             + self.regime
             + self.mc_error
             + self.sensitivity_error
@@ -9441,7 +9529,9 @@ where
         .map_err(anyhow::Error::new)?;
     let migration_enabled_for_run = crate::genetic::migration_enabled();
     let month_capacity = crate::eval::current_backtest_runtime_overrides().month_capacity;
-    let stage1_evaluation_config = config.evaluation_config(ohlcv_stage1.close.last().copied());
+    let mut stage1_evaluation_config = config.evaluation_config(ohlcv_stage1.close.last().copied());
+    stage1_evaluation_config.weekly_objective =
+        config.weekly_objective_for_window(&features_stage1.timestamps)?;
     let exact_stage1_view =
         crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::ContiguousRange {
             start: stage1_start,
@@ -11396,6 +11486,9 @@ where
     } else {
         None
     };
+    let weekly_net = stage1_evaluation
+        .weekly_objective
+        .map(|_| candidate_metrics.iter().map(|m| m[0]).collect::<Vec<_>>());
     let mut ranked_candidates = rank_candidates_on_matching_window(
         candidates,
         candidate_metrics,
@@ -11403,6 +11496,13 @@ where
         stage1_timestamps,
         growth_goal,
     )?;
+    if stage1_evaluation.weekly_objective.is_some() {
+        ranked_candidates.sort_by(|a, b| {
+            b.1.fitness
+                .total_cmp(&a.1.fitness)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
     let ga_returned_candidates = ranked_candidates.len();
     let max_candidates =
         candidate_truncation_limit(config.candidate_count, ranked_candidates.len());
@@ -11514,6 +11614,7 @@ where
     let mut reject_win_rate = 0usize;
     let mut reject_profit_factor = 0usize;
     let mut reject_fitness = 0usize;
+    let mut reject_net = 0usize;
     let mut reject_other = 0usize;
     // AN ABANDONED BATCH STOPS HERE. Emptying the ladder's input is how the
     // rejection is enforced: signal generation, the quality screen, the
@@ -11527,14 +11628,22 @@ where
     } else {
         ranked_candidates
             .iter()
-            .filter(|(_, g)| {
-                let ok = g.passes_filter(&config.filtering);
+            .filter(|(index, g)| {
+                let measured_net = weekly_net.as_ref().map(|net| net[*index]);
+                let ok = measured_net.map_or_else(
+                    || g.passes_filter(&config.filtering),
+                    |net| net.is_finite() && g.passes_filter_with_profit(&config.filtering, net),
+                );
                 if !ok {
                     // Cheap heuristic: pick the FIRST violated threshold so the
                     // counts roughly partition the rejections. Not every Gene
                     // populates every metric, so the buckets are a guide rather
                     // than an audit trail.
-                    if !g.max_drawdown.is_nan() && g.max_drawdown > config.filtering.max_dd {
+                    if measured_net
+                        .is_some_and(|net| !net.is_finite() || net <= config.filtering.min_profit)
+                    {
+                        reject_net += 1;
+                    } else if !g.max_drawdown.is_nan() && g.max_drawdown > config.filtering.max_dd {
                         reject_dd += 1;
                     } else if !g.win_rate.is_nan() && g.win_rate < config.filtering.min_win_rate {
                         reject_win_rate += 1;
@@ -11583,6 +11692,9 @@ where
             reject_profit_factor,
         );
     }
+    if reject_net > 0 {
+        funnel.add_reject_reason("passed_base_filter", "net_profit_too_low", reject_net);
+    }
     if reject_fitness > 0 {
         funnel.add_reject_reason("passed_base_filter", "fitness_too_low", reject_fitness);
     }
@@ -11610,6 +11722,7 @@ where
             win_rate_too_low = reject_win_rate,
             profit_factor_too_low = reject_profit_factor,
             fitness_too_low = reject_fitness,
+            net_profit_too_low = reject_net,
             other_threshold = reject_other,
             max_dd_floor = config.filtering.max_dd,
             min_win_rate_floor = config.filtering.min_win_rate,
@@ -11719,6 +11832,9 @@ where
     // ran, so turning logging off could also turn off the positive-expectancy
     // decision. Run the base quality screen whenever candidates exist; logging
     // controls only whether trade details are retained.
+    let weekly_gate = config
+        .weekly_objective_for_window(&features.timestamps)?
+        .map(|objective| (objective, std::sync::atomic::AtomicUsize::new(0)));
     if !filtered.is_empty() {
         let candidate_deep_robustness = !matches!(config.mode, DiscoveryMode::Risky);
         progress_fn(DiscoveryProgress::StageAdvanced {
@@ -12631,6 +12747,18 @@ where
                         trades_outside_grid,
                     };
 
+                    if let Some((objective, rejected)) = &weekly_gate {
+                        let entries = trades.iter().map(|t| t.entry_time).collect::<Vec<_>>();
+                        let cadence =
+                            crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
+                                &objective.cadence,
+                                &entries,
+                            )?;
+                        if !cadence.feasible() {
+                            rejected.fetch_add(1, AtomicOrdering::Relaxed);
+                            return Ok((None, trial_row));
+                        }
+                    }
                     let verdict =
                         classify_base_quality(&metrics, &config.target_profile, &config.filtering);
                     let opportunistic_quality = match verdict {
@@ -12886,6 +13014,9 @@ where
             mc_floor: rejected_mc_floor.load(AtomicOrdering::Relaxed),
             mc_near_miss: mc_near_miss.load(AtomicOrdering::Relaxed),
             sensitivity: rejected_sensitivity.load(AtomicOrdering::Relaxed),
+            weekly_cadence: weekly_gate
+                .as_ref()
+                .map(|(_, counter)| counter.load(AtomicOrdering::Relaxed)),
         };
         // Arithmetic self-check: the ten criteria must partition the
         // base-quality rejects exactly. If they ever disagree the breakdown is
@@ -13122,6 +13253,10 @@ where
     // The prefixes carry that distinction so a reader does not have to know it.
     if quality_rejects.total() > 0 {
         for (reason, count) in [
+            (
+                "rolling_five_weekday_cadence",
+                quality_rejects.weekly_cadence.unwrap_or(0),
+            ),
             ("total.base_quality", quality_rejects.base_quality),
             ("regime_robustness", quality_rejects.regime),
             ("monte_carlo_perturbation", quality_rejects.mc_floor),
@@ -15656,8 +15791,10 @@ pub fn build_discovery_profile(
         funnel_stage1_pct: _, // recorded resolved below
         stage1_window,
         min_history_years,
+        weekly_cadence,
     } = runtime_overrides;
     DiscoveryRunProfile {
+        weekly_cadence: *weekly_cadence,
         population_eval_engines,
         population_execution_run_receipt_v2: population_execution_run_receipt_v2.cloned(),
         timeframe_label: timeframe_label.clone(),

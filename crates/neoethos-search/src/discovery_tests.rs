@@ -1901,6 +1901,7 @@ fn discovery_runtime_overrides_defaults_match_legacy_env_defaults() {
 #[test]
 fn discovery_runtime_overrides_clamp_invalid_values() {
     let overrides = DiscoveryRuntimeOverrides {
+        weekly_cadence: false,
         prefilter_top_k: 0,
         prefilter_insample_frac: f64::NAN,
         prefilter_min_per_timeframe: 6,
@@ -1917,6 +1918,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
     assert!((overrides.resolved_funnel_stage1_pct() - 1.0).abs() < 1e-9);
 
     let too_small = DiscoveryRuntimeOverrides {
+        weekly_cadence: false,
         prefilter_top_k: 0,
         prefilter_insample_frac: 0.0,
         prefilter_min_per_timeframe: 6,
@@ -1944,6 +1946,7 @@ fn default_discovery_config_does_not_read_environment() {
 fn discovery_profile_exports_runtime_override_resolution() {
     let mut config = DiscoveryConfig::default();
     config.runtime_overrides = DiscoveryRuntimeOverrides {
+        weekly_cadence: false,
         prefilter_top_k: 17,
         prefilter_insample_frac: 0.6,
         prefilter_min_per_timeframe: 6,
@@ -6433,4 +6436,55 @@ fn prop_firm_window_diagnostics_attribute_each_rule() {
     assert_eq!(diag.passed, 2);
     assert!((diag.best_net_return_pct - 0.20).abs() < 1e-12);
     assert!((diag.worst_net_return_pct + 0.09).abs() < 1e-12);
+}
+
+#[test]
+fn weekly_base_filter_uses_measured_money_and_the_settings_path_binds_the_interval() {
+    let gene = Gene {
+        fitness: 1.0,
+        sharpe_ratio: 1.0,
+        win_rate: 0.6,
+        profit_factor: 1.5,
+        trades_count: 100,
+        max_drawdown: 0.01,
+        ..Default::default()
+    };
+    let filter = crate::genetic::FilteringConfig {
+        min_profit: 10.0,
+        min_trades: 1.0,
+        anomaly_guard: false,
+        ..Default::default()
+    };
+    assert!(
+        !gene.passes_filter(&filter),
+        "legacy fitness proxy stays unchanged"
+    );
+    assert!(gene.passes_filter_with_profit(&filter, 100.0));
+    assert!(!gene.passes_filter_with_profit(&filter, -100.0));
+    let mut settings = neoethos_core::Settings::default();
+    settings.models.discovery_runtime.weekly_cadence = true;
+    assert!(DiscoveryRuntimeOverrides::from_settings(&settings).weekly_cadence);
+    let mut config = DiscoveryConfig {
+        mode: DiscoveryMode::PropFirm,
+        ..Default::default()
+    }
+    .apply_mode_overrides();
+    config.runtime_overrides.weekly_cadence = true;
+    let objective = crate::scoring::weekly_cadence::test_weekly_objective();
+    let bound = config
+        .weekly_objective_for_window(&[
+            objective.cadence.evaluation_start_ms,
+            objective.cadence.evaluation_end_ms,
+        ])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        bound.limits,
+        config.weekly_search_limits().unwrap().unwrap()
+    );
+    assert_eq!(
+        bound.cadence.evaluation_start_ms,
+        objective.cadence.evaluation_start_ms
+    );
+    assert!(config.weekly_objective_for_window(&[1, 2]).is_err());
 }

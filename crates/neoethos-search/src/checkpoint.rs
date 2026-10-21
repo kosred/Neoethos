@@ -211,6 +211,9 @@ pub struct SearchCheckpointArtifactFile {
     pub genes: Vec<Gene>,
     pub metrics: Vec<[f64; 11]>,
     pub effective_smc_gate_threshold: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_cadence_v1:
+        Option<Vec<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>>,
 }
 
 impl SearchCheckpointArtifactFile {
@@ -228,6 +231,7 @@ impl SearchCheckpointArtifactFile {
             completed_generations,
             seed_chain,
             ledger,
+            weekly_cadence_v1: result.weekly_cadence_v1,
             genes: result.genes,
             metrics: result.metrics,
             effective_smc_gate_threshold: result.effective_smc_gate_threshold,
@@ -236,6 +240,7 @@ impl SearchCheckpointArtifactFile {
 
     pub fn search_result(&self) -> SearchResult {
         SearchResult {
+            weekly_cadence_v1: self.weekly_cadence_v1.clone(),
             generation_census_v1: None,
             genes: self.genes.clone(),
             metrics: self.metrics.clone(),
@@ -257,6 +262,12 @@ impl SearchCheckpointArtifactFile {
                 self.artifact_schema_version
             );
         }
+        anyhow::ensure!(
+            self.weekly_cadence_v1
+                .as_ref()
+                .is_none_or(|r| r.len() == self.genes.len()),
+            "checkpoint cadence observation count mismatch"
+        );
         self.scope.validate_resume(expected_scope)
     }
 }
@@ -369,6 +380,7 @@ mod tests {
             seed_chain,
             ledger,
             SearchResult {
+                weekly_cadence_v1: None,
                 generation_census_v1: None,
                 genes: vec![gene],
                 metrics: vec![[1.0; 11]],

@@ -488,6 +488,7 @@ fn public_preparation_evaluates_exact_published_canonical_holdout_and_rejects_re
         smc_weight_displacement: 1.0,
         growth_objective: false,
         growth_goal: None,
+        weekly_objective: None,
     };
     contract.validate_evaluation_costs(&evaluation).unwrap();
     let prepared =

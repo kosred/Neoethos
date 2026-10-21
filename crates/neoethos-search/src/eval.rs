@@ -25,6 +25,69 @@ pub use netted_bar_research::{
     PreparedNettedCanonicalBarResearchV1, TerminalBarPositionV1,
 };
 
+/// Metrics retain their canonical eleven-slot layout; cadence is an explicit
+/// optional observation from the same CPU simulation, never inferred from count.
+#[derive(Debug)]
+pub(crate) struct PopulationEvaluationV1 {
+    pub metrics: Vec<[f64; 11]>,
+    pub cadence: Option<Vec<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>>,
+}
+impl From<Vec<[f64; 11]>> for PopulationEvaluationV1 {
+    fn from(metrics: Vec<[f64; 11]>) -> Self {
+        Self {
+            metrics,
+            cadence: None,
+        }
+    }
+}
+impl PopulationEvaluationV1 {
+    pub(crate) fn apply(
+        &self,
+        genes: &mut [crate::Gene],
+        config: &crate::genetic::EvaluationConfig,
+        span: f64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.metrics.len() == genes.len(),
+            "evaluation observation count mismatch"
+        );
+        if let Some(objective) = config.weekly_objective {
+            objective.checked_for_evaluation(
+                config.initial_equity,
+                config.growth_objective,
+                (config.risk_per_trade_min, config.risk_per_trade_max),
+            )?;
+            let reports = self.cadence.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("weekly objective requires same-execution cadence observations")
+            })?;
+            anyhow::ensure!(
+                reports.len() == genes.len(),
+                "cadence observation count mismatch"
+            );
+            anyhow::ensure!(
+                reports
+                    .iter()
+                    .zip(&self.metrics)
+                    .all(|(r, m)| r.trades as f64 == m[8]),
+                "cadence ledger and metric trade counts disagree"
+            );
+        } else {
+            anyhow::ensure!(self.cadence.is_none(), "unbound weekly observations");
+        }
+        crate::genetic::apply_metrics(genes, &self.metrics, config, span);
+        if let Some(objective) = config.weekly_objective {
+            for ((gene, metrics), report) in genes
+                .iter_mut()
+                .zip(&self.metrics)
+                .zip(self.cadence.as_ref().unwrap())
+            {
+                gene.fitness = objective.fitness(metrics, report, gene.fitness);
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct PopulationEvalInputs<'a> {
     pub close: &'a [f64],
     pub high: &'a [f64],
@@ -927,6 +990,7 @@ pub(crate) fn fast_evaluate_strategy_core(
         settings,
         &mut Vec::new(),
         None,
+        None,
     )
 }
 
@@ -946,6 +1010,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     settings: &BacktestSettings,
     trades: &mut Vec<Trade>,
     mut netted: Option<&mut netted_bar_research::NettedBarCoreState<'_>>,
+    mut entry_timestamps: Option<&mut Vec<i64>>,
 ) -> [f64; 11] {
     // Reports itself on first call — see `eval_telemetry`.
     neoethos_core::research_conversion_fee::validate_conversion_fee_rate_v1(
@@ -1223,6 +1288,9 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 equity += pnl;
                 current_month_pnl += pnl;
                 trade_count += 1;
+                if let Some(entries) = entry_timestamps.as_deref_mut() {
+                    entries.push(timestamps[entry_idx as usize]);
+                }
                 if pnl > 0.0 {
                     wins += 1;
                     gross_profit += pnl;
@@ -1540,6 +1608,7 @@ pub(crate) fn simulate_trades_core(
         settings,
         &mut trades,
         None,
+        None,
     );
     trades
 }
@@ -1630,6 +1699,7 @@ pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
         timestamps,
         settings,
         &mut trades,
+        None,
         None,
     );
     Ok((metrics, trades))
@@ -2130,70 +2200,7 @@ fn evaluate_population_core_unchecked(
                 .to_string(),
         );
     }
-    let PopulationEvalInputs {
-        close,
-        high,
-        low,
-        indicators,
-        gene_offsets,
-        gene_indices,
-        gene_weights,
-        long_thr,
-        short_thr,
-        month_idx,
-        day_idx,
-        timestamps,
-        sl_pips,
-        tp_pips,
-        stop_vol_mult,
-        smc_data,
-        gene_smc_flags,
-        gate_threshold,
-        weights,
-        settings,
-    } = inputs;
-    let n_genes = long_thr.len();
-    let n_samples = close.len();
-    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
-    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
-
-    // Per-gene CPU evaluation (signal synthesis + SL/TP backtest), reachable
-    // only under the sealed exact-zero-device CPU receipt.
-    let eval_gene_cpu = |g: usize| -> [f64; 11] {
-        let (signals, confidences) = synthesize_signals_and_confidence_cpu(
-            indicators,
-            gene_offsets,
-            gene_indices,
-            gene_weights,
-            long_thr,
-            short_thr,
-            smc_data,
-            gene_smc_flags,
-            gate_threshold,
-            weights,
-            g,
-            n_samples,
-        );
-        let mut gene_settings = settings.clone();
-        gene_settings.sl_pips = sl_pips[g];
-        gene_settings.tp_pips = tp_pips[g];
-        // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
-        // Pairs with the shared `adaptive_base_pips` on the cloned settings.
-        gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
-        // Risk-based sizing uses the per-bar confidence; with
-        // `risk_based_sizing == false` the slice is ignored (legacy).
-        fast_evaluate_strategy_core(
-            close,
-            high,
-            low,
-            &signals,
-            &confidences,
-            month_idx,
-            day_idx,
-            timestamps,
-            &gene_settings,
-        )
-    };
+    let n_genes = inputs.long_thr.len();
 
     // The only legal CPU branch is the exact-zero-device route sealed before
     // this evaluation. Backend configuration cannot grant or block it.
@@ -2201,7 +2208,7 @@ fn evaluate_population_core_unchecked(
         .require_cpu_route_receipt_v1()
         .map_err(|error| error.to_string())?;
     let cpu_started = std::time::Instant::now();
-    let results: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+    let results = validation_backtest_population_cpu(inputs);
     evidence
         .record_successful_population(
             crate::engine_identity::PopulationEvalEngine::Cpu,
@@ -2264,71 +2271,7 @@ fn validation_backtest_population_inner(
     if !cpu_route {
         panic!("sealed native validation route requires the compiled native CUDA adapter");
     }
-    let PopulationEvalInputs {
-        close,
-        high,
-        low,
-        indicators,
-        gene_offsets,
-        gene_indices,
-        gene_weights,
-        long_thr,
-        short_thr,
-        month_idx,
-        day_idx,
-        timestamps,
-        sl_pips,
-        tp_pips,
-        stop_vol_mult,
-        smc_data,
-        gene_smc_flags,
-        gate_threshold,
-        weights,
-        settings,
-    } = inputs;
-    let n_genes = long_thr.len();
-    let n_samples = close.len();
-    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
-    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
-    if n_genes == 0 {
-        return Vec::new();
-    }
-
-    // Canonical per-gene CPU route, shared mathematically with the GA. It is a
-    // local closure because it borrows the input slices.
-    let eval_gene_cpu = |g: usize| -> [f64; 11] {
-        let (signals, confidences) = synthesize_signals_and_confidence_cpu(
-            indicators,
-            gene_offsets,
-            gene_indices,
-            gene_weights,
-            long_thr,
-            short_thr,
-            smc_data,
-            gene_smc_flags,
-            gate_threshold,
-            weights,
-            g,
-            n_samples,
-        );
-        let mut gene_settings = settings.clone();
-        gene_settings.sl_pips = sl_pips[g];
-        gene_settings.tp_pips = tp_pips[g];
-        // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
-        // Pairs with the shared `adaptive_base_pips` on the cloned settings.
-        gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
-        fast_evaluate_strategy_core(
-            close,
-            high,
-            low,
-            &signals,
-            &confidences,
-            month_idx,
-            day_idx,
-            timestamps,
-            &gene_settings,
-        )
-    };
+    let n_genes = inputs.long_thr.len();
 
     // Canonical CPU execution exists only under the sealed exact-zero-device
     // receipt checked above; it is not a recovery action after native failure.
@@ -2336,7 +2279,7 @@ fn validation_backtest_population_inner(
         .require_cpu_route_receipt_v1()
         .unwrap_or_else(|error| panic!("CPU validation route is not authorized: {error}"));
     let cpu_started = std::time::Instant::now();
-    let out: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+    let out = validation_backtest_population_cpu(inputs);
     evidence
         .record_successful_population(
             crate::engine_identity::PopulationEvalEngine::Cpu,
@@ -2403,6 +2346,24 @@ pub(crate) fn validation_backtest_population_with_ledger_cpu(
 fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
     inputs: PopulationEvalInputs<'_>,
 ) -> anyhow::Result<Vec<([f64; 11], Vec<Trade>)>> {
+    Ok(
+        validation_backtest_population_observed_cpu::<RECORD_TRADES>(inputs, None)?
+            .into_iter()
+            .map(|(m, t, _)| (m, t))
+            .collect(),
+    )
+}
+
+pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: bool>(
+    inputs: PopulationEvalInputs<'_>,
+    weekly: Option<&crate::scoring::weekly_cadence::WeeklyCadenceContractV1>,
+) -> anyhow::Result<
+    Vec<(
+        [f64; 11],
+        Vec<Trade>,
+        Option<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>,
+    )>,
+> {
     // Reports itself on first call, so "never used" is visible rather
     // than inferred. See `eval_telemetry`.
     let _telemetry_started = std::time::Instant::now();
@@ -2447,7 +2408,7 @@ fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
     if n_genes == 0 {
         return Ok(Vec::new());
     }
-    let eval_gene_cpu = |g: usize| -> anyhow::Result<([f64; 11], Vec<Trade>)> {
+    let eval_gene_cpu = |g: usize| -> anyhow::Result<_> {
         let (signals, confidences) = synthesize_signals_and_confidence_cpu(
             indicators,
             gene_offsets,
@@ -2468,8 +2429,11 @@ fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
         // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
         // Pairs with the shared `adaptive_base_pips` on the cloned settings.
         gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
-        if RECORD_TRADES {
-            evaluate_strategy_with_confidence_and_ledger_core(
+        let (metrics, trades, entries) = if weekly.is_some() {
+            // Retain entry times only, not a population-sized trade ledger.
+            let mut entries = Vec::new();
+            let mut trades = Vec::new();
+            let metrics = evaluate_strategy_with_ledger_core::<RECORD_TRADES>(
                 close,
                 high,
                 low,
@@ -2479,9 +2443,26 @@ fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
                 day_idx,
                 timestamps,
                 &gene_settings,
-            )
+                &mut trades,
+                None,
+                Some(&mut entries),
+            );
+            (metrics, trades, entries)
+        } else if RECORD_TRADES {
+            let (metrics, trades) = evaluate_strategy_with_confidence_and_ledger_core(
+                close,
+                high,
+                low,
+                &signals,
+                &confidences,
+                month_idx,
+                day_idx,
+                timestamps,
+                &gene_settings,
+            )?;
+            (metrics, trades, Vec::new())
         } else {
-            Ok((
+            (
                 fast_evaluate_strategy_core(
                     close,
                     high,
@@ -2494,8 +2475,13 @@ fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
                     &gene_settings,
                 ),
                 Vec::new(),
-            ))
-        }
+                Vec::new(),
+            )
+        };
+        let report = weekly
+            .map(|c| crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(c, &entries))
+            .transpose()?;
+        Ok((metrics, trades, report))
     };
     (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
 }

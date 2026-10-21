@@ -1,5 +1,6 @@
 use super::runtime_overrides::current_strategy_evaluation_runtime_overrides;
 use rand::Rng;
+use serde::{Deserialize as SealedDeserialize, Serialize as SealedSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -691,7 +692,13 @@ impl Gene {
     }
 
     pub fn passes_filter(&self, cfg: &FilteringConfig) -> bool {
-        if self.fitness <= cfg.min_profit {
+        self.passes_filter_with_profit(cfg, self.fitness)
+    }
+
+    /// New objectives must compare the monetary floor with actual measured net,
+    /// never a bounded dimensionless feasibility score.
+    pub(crate) fn passes_filter_with_profit(&self, cfg: &FilteringConfig, profit: f64) -> bool {
+        if profit <= cfg.min_profit {
             return false;
         }
         if self.max_drawdown > cfg.max_dd {
@@ -831,6 +838,8 @@ pub struct GenerationCensusV1 {
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    pub weekly_cadence_v1:
+        Option<Vec<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>>,
     /// Absent for legacy checkpoints or routes without measured accounting.
     pub generation_census_v1: Option<GenerationCensusV1>,
     pub genes: Vec<Gene>,
@@ -840,11 +849,12 @@ pub struct SearchResult {
     pub effective_smc_gate_threshold: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, SealedSerialize, SealedDeserialize)]
 pub struct EvaluationConfig {
     pub symbol: String,
     pub account_currency: String,
     /// Run-scoped starting equity shared by Search and account-risk validation.
+    #[serde(rename = "initial_equity")]
     pub initial_equity: f64,
     pub max_hold_bars: usize,
     /// Exit geometry — resolved from `models.exit_policy`, never hardcoded.
@@ -852,6 +862,7 @@ pub struct EvaluationConfig {
     /// From 2026-06-06 to 2026-08-09 the three fields below were literals in
     /// `for_symbol` with no config recipient, so no run could measure the search
     /// without them. See `ExitPolicyOverrides` for what they cost.
+    #[serde(rename = "trailing_enabled")]
     pub trailing_enabled: bool,
     /// A multiple of the position's OWN STOP DISTANCE, not of ATR
     /// (`eval.rs:1030-1035`: `hi - trailing_atr_multiplier * pos_sl_pips * pip`).
@@ -864,6 +875,7 @@ pub struct EvaluationConfig {
     /// other three were set explicitly — a fourth number of the same policy,
     /// travelling by a different route. It now comes from the same config.
     pub trailing_min_lock_pips: f64,
+    #[serde(rename = "pip_value")]
     pub pip_value: f64,
     pub spread_pips: f64,
     pub commission_per_trade: f64,
@@ -874,12 +886,15 @@ pub struct EvaluationConfig {
     /// Search-time execution policy. These values must travel with the same
     /// run-scoped configuration as the financial inputs; otherwise Generation
     /// 0 and the post-GA validation funnel price different strategies.
+    #[serde(rename = "kill_zones_enabled")]
     pub kill_zones_enabled: bool,
     pub session_spread_pips: Option<[f64; 3]>,
+    #[serde(rename = "risk_per_trade_min")]
     pub risk_per_trade_min: f64,
     pub risk_per_trade_max: f64,
     pub high_quality_confidence: f64,
     pub smc_gate_threshold: f64,
+    #[serde(rename = "smc_weight_ob")]
     pub smc_weight_ob: f64,
     pub smc_weight_fvg: f64,
     pub smc_weight_liq: f64,
@@ -890,6 +905,7 @@ pub struct EvaluationConfig {
     pub smc_weight_choch: f64,
     pub smc_weight_eqh: f64,
     pub smc_weight_eql: f64,
+    #[serde(rename = "smc_weight_displacement")]
     pub smc_weight_displacement: f64,
     /// Selects Risky growth scoring instead of the unchanged PropFirm v4
     /// consistency formula. A bound `growth_goal` selects measured goal pace
@@ -898,6 +914,7 @@ pub struct EvaluationConfig {
     pub growth_objective: bool,
     /// Run-bound v6 goal-pace objective; None retains explicitly legacy v5.
     pub growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
+    pub weekly_objective: Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
 }
 
 impl Default for EvaluationConfig {
@@ -968,6 +985,7 @@ impl Default for EvaluationConfig {
             smc_weight_displacement: smc.w_displacement,
             growth_objective: false,
             growth_goal: None,
+            weekly_objective: None,
         }
     }
 }

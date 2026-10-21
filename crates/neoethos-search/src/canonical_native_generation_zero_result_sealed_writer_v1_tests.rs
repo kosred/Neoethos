@@ -428,6 +428,7 @@ pub(super) fn with_fully_populated_sealed_result_v1(
         metrics.push(row);
     }
     let search_result = SearchResult {
+        weekly_cadence_v1: None,
         generation_census_v1: None,
         genes,
         metrics,

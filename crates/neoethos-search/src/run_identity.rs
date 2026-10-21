@@ -902,6 +902,8 @@ pub struct PopulationAutoSelectionSemanticsV1 {
     stage1_identity_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekly_search_limits: Option<crate::scoring::weekly_cadence::WeeklySearchLimitsV1>,
 }
 
 /// Strict persisted authority for the selection-changing population decision.
@@ -923,9 +925,17 @@ pub struct PopulationAutoSearchAuthorityV1 {
     /// from the unchanged resolved-config stamp schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekly_search_limits: Option<crate::scoring::weekly_cadence::WeeklySearchLimitsV1>,
 }
 
 impl PopulationAutoSearchAuthorityV1 {
+    pub fn weekly_search_limits(
+        &self,
+    ) -> Option<crate::scoring::weekly_cadence::WeeklySearchLimitsV1> {
+        self.weekly_search_limits
+    }
+
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
     }
@@ -966,6 +976,7 @@ impl PopulationAutoSearchAuthorityV1 {
             stage1_row_end: stage1.row_end(),
             stage1_identity_sha256: stage1.identity_sha256().to_owned(),
             growth_goal: self.growth_goal,
+            weekly_search_limits: self.weekly_search_limits,
         })
     }
 
@@ -992,6 +1003,17 @@ impl PopulationAutoSearchAuthorityV1 {
         self.population_auto_sizing_receipt
             .validate()
             .map_err(anyhow::Error::new)?;
+        if let Some(limits) = self.weekly_search_limits {
+            limits.validate()?;
+            anyhow::ensure!(
+                self.resolved_config_stamp.mode == "prop_firm",
+                "weekly search authority requires PropFirm mode"
+            );
+            anyhow::ensure!(
+                limits.initial_equity == self.resolved_config_stamp.initial_balance,
+                "weekly limits disagree with simulation equity"
+            );
+        }
         let stamp = &self.resolved_config_stamp;
         let receipt = &self.population_auto_sizing_receipt;
         if let Some(goal) = self.growth_goal {
@@ -1092,6 +1114,7 @@ pub fn build_population_auto_search_authority_v1(
         population_auto_sizing_receipt: receipt.clone(),
         search_config_hash: String::new(),
         growth_goal,
+        weekly_search_limits: config.weekly_search_limits()?,
     };
     authority.search_config_hash = authority.computed_search_config_hash_v1()?;
     authority.validate()?;
@@ -1672,6 +1695,35 @@ mod tests {
                     .contains("self-hash mismatch")
             );
         }
+    }
+
+    #[test]
+    fn weekly_selection_authority_binds_limits_and_legacy_omits_them() {
+        let (config, receipt) = cpu_selection_authority_fixture();
+        let legacy =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("weekly_search_limits")
+        );
+        let mut config = DiscoveryConfig {
+            mode: crate::discovery::DiscoveryMode::PropFirm,
+            ..config
+        }
+        .apply_mode_overrides();
+        let baseline =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        config.runtime_overrides.weekly_cadence = true;
+        let weekly =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        assert_ne!(baseline.search_config_hash(), weekly.search_config_hash());
+        assert!(weekly.weekly_search_limits().is_some());
+        let bytes = serde_json::to_vec(&weekly).unwrap();
+        let mut decoded: PopulationAutoSearchAuthorityV1 = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+        decoded.weekly_search_limits.as_mut().unwrap().max_drawdown *= 0.5;
+        assert!(decoded.validate().is_err());
     }
 
     fn cpu_selection_authority_fixture() -> (

@@ -1,8 +1,9 @@
 //! Bounded retention of qualifying, evaluated GA observations.
 //!
 //! Admission thresholds remain at the generation caller. Retention uses the
-//! existing archive handoff ranking: greater finite net profit wins, and an
-//! equal net profit keeps the earlier admitted observation. This is not a
+//! legacy archive handoff ranking: greater finite net profit wins. Explicit
+//! weekly runs retain the measured feasibility fitness first instead. Equal
+//! rank keeps the earlier admitted observation. This is not a
 //! MAP-Elites or behavioral-novelty policy, and retained in-sample observations
 //! are not independent OOS validation evidence.
 
@@ -17,16 +18,16 @@ type ArchiveObservation = (Gene, [f64; 11], usize);
 /// latest admission is worst; signed zero is one tie, as in the old comparator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ArchiveRank {
-    net_bits: u64,
+    score_bits: u64,
     sequence: usize,
     slot: usize,
 }
 
 impl ArchiveRank {
-    fn new(net: f64, sequence: usize, slot: usize) -> Self {
-        debug_assert!(net.is_finite());
+    fn new(value: f64, sequence: usize, slot: usize) -> Self {
+        debug_assert!(value.is_finite());
         Self {
-            net_bits: if net == 0.0 { 0.0 } else { net }.to_bits(),
+            score_bits: if value == 0.0 { 0.0 } else { value }.to_bits(),
             sequence,
             slot,
         }
@@ -35,8 +36,8 @@ impl ArchiveRank {
 
 impl Ord for ArchiveRank {
     fn cmp(&self, other: &Self) -> Ordering {
-        f64::from_bits(self.net_bits)
-            .total_cmp(&f64::from_bits(other.net_bits))
+        f64::from_bits(self.score_bits)
+            .total_cmp(&f64::from_bits(other.score_bits))
             .then_with(|| other.sequence.cmp(&self.sequence))
             .then_with(|| self.slot.cmp(&other.slot))
     }
@@ -64,6 +65,7 @@ pub(super) enum ArchiveOffer {
 /// place. No all-history key set or stale heap nodes can grow with generations.
 pub(super) struct BoundedProfitableArchive {
     capacity: usize,
+    weekly_fitness: bool,
     observations: Vec<ArchiveObservation>,
     positions: HashMap<EvaluatedGeneBehaviorKey, usize>,
     ranks: BTreeSet<ArchiveRank>,
@@ -71,13 +73,27 @@ pub(super) struct BoundedProfitableArchive {
 }
 
 impl BoundedProfitableArchive {
+    #[cfg(test)]
     pub(super) fn new(capacity: usize) -> Self {
+        Self::for_objective(capacity, false)
+    }
+
+    pub(super) fn for_objective(capacity: usize, weekly_fitness: bool) -> Self {
         Self {
+            weekly_fitness,
             capacity,
             observations: Vec::new(),
             positions: HashMap::new(),
             ranks: BTreeSet::new(),
             next_sequence: 0,
+        }
+    }
+
+    fn retention_value(&self, gene: &Gene, metrics: &[f64; 11]) -> f64 {
+        if self.weekly_fitness {
+            gene.fitness
+        } else {
+            metrics[0]
         }
     }
 
@@ -101,20 +117,24 @@ impl BoundedProfitableArchive {
             return Ok(ArchiveOffer::RejectedCapacity);
         }
 
+        let value = self.retention_value(gene, metrics);
+        if !value.is_finite() {
+            return Ok(ArchiveOffer::RejectedNonFinite);
+        }
         let key = EvaluatedGeneBehaviorKey::new(gene);
         if let Some(&slot) = self.positions.get(&key) {
             let incumbent = &self.observations[slot];
-            if metrics[0] <= incumbent.1[0] {
+            let incumbent_value = self.retention_value(&incumbent.0, &incumbent.1);
+            if value <= incumbent_value {
                 return Ok(ArchiveOffer::RejectedDuplicate);
             }
             let sequence = incumbent.2;
-            let old_rank = ArchiveRank::new(incumbent.1[0], sequence, slot);
+            let old_rank = ArchiveRank::new(incumbent_value, sequence, slot);
             self.ranks.remove(&old_rank);
             // Replace the whole observation: no new metrics attached to an old
             // gene ID, measured fitness, or other per-observation metadata.
             self.observations[slot] = (gene.clone(), *metrics, sequence);
-            self.ranks
-                .insert(ArchiveRank::new(metrics[0], sequence, slot));
+            self.ranks.insert(ArchiveRank::new(value, sequence, slot));
             return Ok(ArchiveOffer::ImprovedDuplicate);
         }
 
@@ -123,7 +143,7 @@ impl BoundedProfitableArchive {
                 .ranks
                 .first()
                 .expect("a nonempty full archive has a retained rank");
-            if metrics[0] <= f64::from_bits(worst.net_bits) {
+            if value <= f64::from_bits(worst.score_bits) {
                 return Ok(ArchiveOffer::RejectedCapacity);
             }
             Some(worst)
@@ -147,8 +167,7 @@ impl BoundedProfitableArchive {
             (slot, ArchiveOffer::Inserted)
         };
         self.positions.insert(key, slot);
-        self.ranks
-            .insert(ArchiveRank::new(metrics[0], sequence, slot));
+        self.ranks.insert(ArchiveRank::new(value, sequence, slot));
         self.next_sequence = next_sequence;
         Ok(outcome)
     }
@@ -160,6 +179,25 @@ impl BoundedProfitableArchive {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn weekly_archive_capacity_retains_feasibility_before_larger_quiet_profit() {
+        let mut archive = BoundedProfitableArchive::for_objective(1, true);
+        let (mut quiet, q) = observation(0, 1_000.0);
+        quiet.fitness = -0.9;
+        let (mut active, a) = observation(1, 50.0);
+        active.fitness = 1.0;
+        assert_eq!(archive.offer(&quiet, &q).unwrap(), ArchiveOffer::Inserted);
+        assert_eq!(
+            archive.offer(&active, &a).unwrap(),
+            ArchiveOffer::ReplacedWorst
+        );
+        assert_eq!(
+            archive.offer(&quiet, &q).unwrap(),
+            ArchiveOffer::RejectedCapacity
+        );
+        assert_eq!(retained_indices(&archive), vec![1]);
+    }
     use super::*;
 
     fn observation(index: usize, net: f64) -> (Gene, [f64; 11]) {
@@ -214,11 +252,11 @@ mod tests {
                 archive.positions.get(&EvaluatedGeneBehaviorKey::new(gene)),
                 Some(&slot)
             );
-            assert!(
-                archive
-                    .ranks
-                    .contains(&ArchiveRank::new(metrics[0], *sequence, slot))
-            );
+            assert!(archive.ranks.contains(&ArchiveRank::new(
+                archive.retention_value(gene, metrics),
+                *sequence,
+                slot
+            )));
         }
     }
 

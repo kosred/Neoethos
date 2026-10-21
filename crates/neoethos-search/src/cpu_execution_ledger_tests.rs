@@ -219,6 +219,7 @@ fn recording_does_not_change_risk_sized_metrics_or_compounding() {
         &settings,
         &mut trades,
         None,
+        None,
     );
     assert_eq!(fast.map(f64::to_bits), recorded.map(f64::to_bits));
     assert_eq!(trades.len(), 2);
@@ -473,4 +474,117 @@ fn parallel_population_ledger_retains_each_runs_balance_and_synthesized_confiden
         assert!((trades[1].pnl - second).abs() < 1e-9);
         assert!((metrics[0] - first - second).abs() < 1e-9);
     }
+}
+
+#[test]
+fn weekly_observations_preserve_all_metrics_and_the_complete_cpu_ledger() {
+    let times = [
+        timestamp(7, 10, 0),
+        timestamp(7, 11, 0),
+        timestamp(8, 10, 0),
+        timestamp(9, 10, 0),
+        timestamp(10, 10, 0),
+    ];
+    let contract = crate::scoring::weekly_cadence::WeeklyCadenceContractV1::new(
+        timestamp(7, 0, 0),
+        timestamp(11, 23, 0),
+        21.0,
+    )
+    .expect("rolling weekly contract over five UTC weekdays");
+    let mut policy = settings();
+    policy.initial_equity_override = Some(10_000.0);
+    policy.kill_zones_enabled = false;
+    policy.risk_based_sizing = true;
+    policy.risk_per_trade_min = 0.01;
+    policy.risk_per_trade_max = 0.02;
+    policy.high_quality_confidence = 1.0;
+    policy.pip_value_per_lot = 100.0;
+    // Commission keeps costs nonzero without moving the entry price beyond the
+    // fixture's known take-profit bar; a spread shift would leave the position open.
+    policy.spread_pips = 0.0;
+    policy.commission_per_trade = 4.0;
+    let close = [100.0, 100.0, 120.0, 100.0, 110.0];
+    let high = [100.0, 100.0, 120.0, 100.0, 110.0];
+    let low = [100.0; 5];
+    let month_idx = [0; 5];
+    let day_idx = [0; 5];
+    let smc_data = [[0; 11]; 5];
+    let gene_smc_flags = [[0; 11]];
+    let weights = [0.0; 11];
+    let sl_pips = [10.0];
+    let tp_pips = [20.0];
+    let gene_offsets = [0, 1];
+    let gene_indices = [0];
+    let gene_weights = [1.0];
+    let long_thr = [1.0];
+    let short_thr = [-1.0];
+    let indicators = ndarray::arr2(&[[1.0, 0.0, -2.0, 0.0, 0.0]]);
+
+    macro_rules! population_inputs {
+        () => {
+            PopulationEvalInputs {
+                close: &close,
+                high: &high,
+                low: &low,
+                indicators: indicators.view(),
+                gene_offsets: &gene_offsets,
+                gene_indices: &gene_indices,
+                gene_weights: &gene_weights,
+                long_thr: &long_thr,
+                short_thr: &short_thr,
+                month_idx: &month_idx,
+                day_idx: &day_idx,
+                timestamps: &times,
+                sl_pips: &sl_pips,
+                tp_pips: &tp_pips,
+                stop_vol_mult: &[],
+                smc_data: &smc_data,
+                gene_smc_flags: &gene_smc_flags,
+                gate_threshold: 0.0,
+                weights: &weights,
+                settings: &policy,
+            }
+        };
+    }
+
+    let baseline = validation_backtest_population_cpu_core::<true>(population_inputs!())
+        .expect("baseline CPU population ledger");
+    let observed =
+        validation_backtest_population_observed_cpu::<true>(population_inputs!(), Some(&contract))
+            .expect("weekly CPU population observation");
+
+    assert_eq!(observed.len(), 1);
+    assert_eq!(baseline.len(), observed.len());
+    let (observed_metrics, observed_trades, report) = &observed[0];
+    let (baseline_metrics, baseline_trades) = &baseline[0];
+    assert_eq!(
+        (*observed_metrics).map(f64::to_bits),
+        (*baseline_metrics).map(f64::to_bits),
+        "weekly observation must not move any of the eleven financial metric bits"
+    );
+    assert_eq!(
+        format!("{observed_trades:?}"),
+        format!("{baseline_trades:?}"),
+        "the complete CPU ledger must be identical between the two observations"
+    );
+    assert_eq!(
+        observed_trades.len(),
+        2,
+        "the fixture must execute both known trades"
+    );
+    let observed_entries: Vec<i64> = observed_trades.iter().map(|t| t.entry_time).collect();
+    assert_eq!(
+        observed_entries,
+        vec![times[1], times[3]],
+        "weekly entries must be the same completed-trade entry timestamps"
+    );
+    let report = report
+        .as_ref()
+        .expect("the weekly observation must attach its cadence report");
+    assert_eq!(report.trades, observed_trades.len());
+    assert_eq!(
+        report.trading_days, 5,
+        "Monday through Friday are enumerated"
+    );
+    assert_eq!(report.weekend_entries, 0);
 }

@@ -1,407 +1,494 @@
-//! Versioned weekly-cadence feasibility (2026-10-21 operator requirement).
-//!
-//! The new requirement is at least ONE trade in every five trading days.
-//! An average trades/month count cannot certify that: a strategy may cluster
-//! trades in one week and stay silent for years while its monthly average looks
-//! acceptable. This module evaluates the full evaluation interval, counts
-//! inclusive UTC weekdays with the same convention as the production quality
-//! analyzer, and turns every empty ISO week into a violation that grows with the
-//! length of the silent run. It is research-only ranking evidence: it does not
-//! replace the quality gate, the frozen historical daily-profile thresholds, or
-//! any risk/cost gate.
+//! Rolling five-UTC-weekday research objective, opt-in for new runs.
+//! Entries come from the same cost-charged CPU execution as the eleven metrics.
 use chrono::{Datelike, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 
-/// Frozen version stamp for the weekly-cadence contract.
 pub const WEEKLY_CADENCE_CONTRACT_SCHEMA_V1: u16 = 1;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeeklyCadenceCalendarV1 {
+    /// Observed Sunday FX entries cover the following Monday if it is inside
+    /// the evaluated interval. Sunday and Monday never cover two separate days.
+    UtcWeekdaysSundayToMonday,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WeeklyCadenceContractV1 {
     pub schema_version: u16,
+    pub calendar: WeeklyCadenceCalendarV1,
     pub evaluation_start_ms: i64,
     pub evaluation_end_ms: i64,
-    /// Trading days in a weekly window (five: Mon-Fri).
     pub trading_days_per_week: u64,
-    /// Month convention shared with the quality analyzer (21.0 default).
     pub trading_days_per_month: f64,
     pub min_trades_per_week: f64,
 }
-
 impl WeeklyCadenceContractV1 {
-    pub fn new(
-        evaluation_start_ms: i64,
-        evaluation_end_ms: i64,
-        trading_days_per_month: f64,
-    ) -> anyhow::Result<Self> {
-        let contract = Self {
+    pub fn new(start: i64, end: i64, trading_days_per_month: f64) -> anyhow::Result<Self> {
+        let value = Self {
             schema_version: WEEKLY_CADENCE_CONTRACT_SCHEMA_V1,
-            evaluation_start_ms,
-            evaluation_end_ms,
+            calendar: WeeklyCadenceCalendarV1::UtcWeekdaysSundayToMonday,
+            evaluation_start_ms: start,
+            evaluation_end_ms: end,
             trading_days_per_week: 5,
             trading_days_per_month,
             min_trades_per_week: 1.0,
         };
-        contract.validate()?;
-        Ok(contract)
+        value.validate()?;
+        Ok(value)
     }
-
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.schema_version == WEEKLY_CADENCE_CONTRACT_SCHEMA_V1,
-            "unsupported weekly-cadence contract schema {}",
-            self.schema_version
+            self.schema_version == 1
+                && self.trading_days_per_week == 5
+                && self.min_trades_per_week == 1.0,
+            "unsupported rolling weekly contract"
         );
         anyhow::ensure!(
             self.evaluation_start_ms >= 0 && self.evaluation_end_ms > self.evaluation_start_ms,
-            "weekly-cadence interval must be ordered and nonnegative"
-        );
-        anyhow::ensure!(
-            self.trading_days_per_week == 5,
-            "weekly-cadence windows are five trading days"
+            "weekly interval must be ordered and nonnegative"
         );
         anyhow::ensure!(
             self.trading_days_per_month.is_finite() && self.trading_days_per_month >= 1.0,
-            "weekly-cadence trading-days-per-month must be finite and at least one"
-        );
-        anyhow::ensure!(
-            self.min_trades_per_week == 1.0,
-            "weekly-cadence minimum is at least one trade per week"
+            "invalid trading month convention"
         );
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct WeeklyCadenceReportV1 {
-    pub expected_weeks: u64,
-    pub weeks_with_trades: u64,
-    pub trades: usize,
-    pub inclusive_weekdays: u64,
-    pub trades_per_month: f64,
-    pub longest_silent_weeks: u64,
-    /// Nonnegative; zero only when every expected week has at least the minimum.
-    pub violation: f64,
-    pub clustered: bool,
+/// Additional active floors remain binding, including stricter monthly activity.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeeklySearchLimitsV1 {
+    pub initial_equity: f64,
+    /// Resolved account-risk band; cash risk supplies the zero-floor expectancy scale.
+    pub per_trade_risk_band: (f64, f64),
+    pub max_drawdown: f64,
+    pub max_daily_drawdown: f64,
+    pub min_trades_per_month: f64,
+    pub min_net_profit: f64,
+    pub min_net_expectancy: f64,
+    pub min_win_rate: f64,
+    pub min_profit_factor: f64,
 }
-
-impl WeeklyCadenceReportV1 {
-    pub fn feasible(&self) -> bool {
-        self.violation == 0.0
-    }
-}
-
-fn iso_week_key(ms: i64) -> anyhow::Result<(i32, u32)> {
-    let ts = Utc
-        .timestamp_millis_opt(ms)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("timestamp outside the UTC calendar: {ms}"))?;
-    let iso = ts.iso_week();
-    Ok((iso.year(), iso.week()))
-}
-
-fn inclusive_weekdays(contract: &WeeklyCadenceContractV1) -> anyhow::Result<u64> {
-    let start = Utc
-        .timestamp_millis_opt(contract.evaluation_start_ms)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("weekly-cadence start outside the UTC calendar"))?
-        .date_naive();
-    let end = Utc
-        .timestamp_millis_opt(contract.evaluation_end_ms)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("weekly-cadence end outside the UTC calendar"))?
-        .date_naive();
-    let days = (end - start).num_days() as u64 + 1;
-    let first = u64::from(start.weekday().num_days_from_monday());
-    Ok((days / 7) * 5
-        + (0..days % 7)
-            .filter(|offset| (first + offset) % 7 < 5)
-            .count() as u64)
-}
-
-/// Evaluate explicit trade ENTRY timestamps against the weekly contract.
-pub fn evaluate_weekly_cadence(
-    contract: &WeeklyCadenceContractV1,
-    trade_entry_timestamps_ms: &[i64],
-) -> anyhow::Result<WeeklyCadenceReportV1> {
-    contract.validate()?;
-    let mut per_week: std::collections::BTreeMap<(i32, u32), usize> =
-        std::collections::BTreeMap::new();
-    for &ms in trade_entry_timestamps_ms {
+impl WeeklySearchLimitsV1 {
+    pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            ms >= contract.evaluation_start_ms && ms <= contract.evaluation_end_ms,
-            "trade entry {ms} lies outside the weekly evaluation interval"
+            self.initial_equity.is_finite() && self.initial_equity > 0.0,
+            "weekly objective requires positive initial equity"
         );
-        *per_week.entry(iso_week_key(ms)?).or_insert(0) += 1;
+        let (risk_min, risk_max) = self.per_trade_risk_band;
+        anyhow::ensure!(
+            risk_min.is_finite()
+                && risk_max.is_finite()
+                && risk_min >= 0.0
+                && risk_max > 0.0
+                && risk_max >= risk_min
+                && risk_max <= 1.0,
+            "weekly objective requires a valid account-risk band"
+        );
+        anyhow::ensure!(
+            [self.max_drawdown, self.max_daily_drawdown]
+                .iter()
+                .all(|v| v.is_finite() && *v > 0.0 && *v <= 1.0),
+            "weekly objective requires explicit positive drawdown limits"
+        );
+        anyhow::ensure!(
+            [
+                self.min_trades_per_month,
+                self.min_net_profit,
+                self.min_net_expectancy,
+                self.min_win_rate,
+                self.min_profit_factor
+            ]
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.0)
+                && self.min_win_rate <= 1.0,
+            "weekly objective contains invalid acceptance floors"
+        );
+        Ok(())
     }
-    // Expected ISO weeks are exactly the weeks that contain at least one weekDAY
-    // of the interval; a partial week still needs its minimum.
-    let mut expected: Vec<(i32, u32)> = Vec::new();
-    let mut cursor = contract.evaluation_start_ms;
-    while cursor <= contract.evaluation_end_ms {
-        let key = iso_week_key(cursor)?;
-        if expected.last().copied() != Some(key) {
-            expected.push(key);
+}
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeeklySearchObjectiveV1 {
+    pub cadence: WeeklyCadenceContractV1,
+    pub limits: WeeklySearchLimitsV1,
+}
+impl WeeklySearchObjectiveV1 {
+    /// One context check for generation evaluation and frozen-policy replay.
+    pub fn checked_for_evaluation(
+        self,
+        equity: f64,
+        growth_objective: bool,
+        risk_band: (f64, f64),
+    ) -> anyhow::Result<Self> {
+        self.validate()?;
+        anyhow::ensure!(
+            !growth_objective
+                && self.limits.initial_equity == equity
+                && self.limits.per_trade_risk_band == risk_band,
+            "weekly objective must match its PropFirm simulation equity"
+        );
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.cadence.validate()?;
+        self.limits.validate()?;
+        anyhow::ensure!(
+            crate::quality::evaluation_weekdays(
+                self.cadence.evaluation_start_ms,
+                self.cadence.evaluation_end_ms
+            )? >= 5,
+            "weekly search needs at least five UTC weekdays of evidence"
+        );
+        Ok(())
+    }
+    /// Feasible fitness is positive. Infeasible fitness is minus the sum of
+    /// dimensionless deficits; exact ties retain the original objective in the
+    /// GA caller. This feasibility layer adds no trade-count bonus after the
+    /// floors; the existing objective still supplies its sample-confidence terms.
+    pub fn fitness(&self, m: &[f64; 11], report: &WeeklyRollingCadenceReportV1, old: f64) -> f64 {
+        if m.iter().any(|v| !v.is_finite()) || !old.is_finite() {
+            return f64::NEG_INFINITY;
         }
-        cursor += 86_400_000;
-    }
-    let mut violation = 0.0_f64;
-    let mut silent_run = 0u64;
-    let mut longest_silent_weeks = 0u64;
-    let mut weeks_with_trades = 0u64;
-    for key in &expected {
-        let count = per_week.get(key).copied().unwrap_or(0);
-        if count > 0 {
-            weeks_with_trades += 1;
-            silent_run = 0;
+        let l = self.limits;
+        let deficit = |observed: f64, floor: f64, scale: f64| (floor - observed).max(0.0) / scale;
+        let expectancy_scale = if l.min_net_expectancy > 0.0 {
+            l.min_net_expectancy
         } else {
-            silent_run += 1;
-            longest_silent_weeks = longest_silent_weeks.max(silent_run);
-            // Strictly increasing in the length of the silent run.
-            violation += (silent_run as f64) * ((silent_run as f64) + 1.0) / 2.0;
+            l.initial_equity * l.per_trade_risk_band.1
+        };
+        let violation = report.violation / report.trading_days.saturating_sub(4).max(1) as f64
+            + deficit(m[0], l.min_net_profit, l.initial_equity)
+            + deficit(m[6], l.min_net_expectancy, expectancy_scale)
+            + deficit(l.max_drawdown, m[3], l.max_drawdown)
+            + deficit(l.max_daily_drawdown, m[10], l.max_daily_drawdown)
+            + deficit(
+                report.trades_per_month,
+                l.min_trades_per_month,
+                l.min_trades_per_month.max(1.0),
+            )
+            + deficit(m[4], l.min_win_rate, 1.0)
+            + deficit(m[5], l.min_profit_factor, l.min_profit_factor.max(1.0));
+        let feasible = violation == 0.0
+            && report.feasible()
+            && m[0] > 0.0
+            && m[6] > 0.0
+            && m[3] < l.max_drawdown
+            && m[10] < l.max_daily_drawdown;
+        if feasible {
+            1.0 + old.atan() / std::f64::consts::PI
+        } else {
+            -violation
         }
     }
-    let inclusive_weekdays = inclusive_weekdays(contract)?;
-    let months = inclusive_weekdays as f64 / contract.trading_days_per_month.max(1.0);
-    let trades_per_month = if months > 0.0 {
-        trade_entry_timestamps_ms.len() as f64 / months
-    } else {
-        0.0
-    };
-    let clustered = !expected.is_empty()
-        && weeks_with_trades < expected.len() as u64
-        && trade_entry_timestamps_ms.len() as u64 >= expected.len() as u64;
-    Ok(WeeklyCadenceReportV1 {
-        expected_weeks: expected.len() as u64,
-        weeks_with_trades,
-        trades: trade_entry_timestamps_ms.len(),
-        inclusive_weekdays,
-        trades_per_month,
-        longest_silent_weeks,
-        violation,
-        clustered,
-    })
 }
-
-/// Feasible candidates rank above every infeasible one; an infeasible candidate
-/// is graded by its normalized constraint violations so evolution still has an
-/// ordering instead of an all-infeasible dead population. Losing churn never
-/// earns the feasible tier.
-pub fn weekly_feasibility_score(
-    net_after_costs: f64,
-    risk_ok: bool,
-    report: &WeeklyCadenceReportV1,
-) -> f64 {
-    let net_ok = net_after_costs.is_finite() && net_after_costs > 0.0;
-    if report.feasible() && net_ok && risk_ok {
-        return 1_000_000.0 + net_after_costs.min(1_000.0);
-    }
-    let cadence = report.violation;
-    let net_penalty = if net_ok { 0.0 } else { 1.0 };
-    let risk_penalty = if risk_ok { 0.0 } else { 1.0 };
-    -(1.0 + cadence + net_penalty + risk_penalty)
-}
-
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WeeklyRollingCadenceReportV1 {
     pub trading_days: u64,
     pub trades: usize,
+    /// All weekend fills retain costs/counts; only in-interval Sunday->Monday
+    /// mappings can cover a weekday. This is a sealed research calendar.
+    pub sunday_entries_credited: usize,
+    /// Total actual Saturday/Sunday fills, including credited Sunday entries.
+    pub weekend_entries: usize,
     pub trades_per_month: f64,
     pub longest_silent_trading_days: u64,
     pub violating_windows: u64,
     pub violation: f64,
     pub clustered: bool,
 }
-
 impl WeeklyRollingCadenceReportV1 {
     pub fn feasible(&self) -> bool {
-        self.violation == 0.0 && self.trading_days > 0
+        self.violating_windows == 0 && self.trading_days >= 5
     }
 }
-
 pub fn evaluate_rolling_weekly_cadence(
     contract: &WeeklyCadenceContractV1,
-    trade_entry_timestamps_ms: &[i64],
+    entries: &[i64],
 ) -> anyhow::Result<WeeklyRollingCadenceReportV1> {
     contract.validate()?;
-    let start = Utc
-        .timestamp_millis_opt(contract.evaluation_start_ms)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("weekly contract start outside the UTC calendar"))?
-        .date_naive();
-    let end = Utc
-        .timestamp_millis_opt(contract.evaluation_end_ms)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("weekly contract end outside the UTC calendar"))?
-        .date_naive();
+    let date = |ms| {
+        Utc.timestamp_millis_opt(ms)
+            .single()
+            .map(|ts| ts.date_naive())
+            .ok_or_else(|| anyhow::anyhow!("timestamp outside UTC calendar"))
+    };
+    let start = date(contract.evaluation_start_ms)?;
+    let end = date(contract.evaluation_end_ms)?;
     let mut days = Vec::new();
     let mut day = start;
     while day <= end {
         if day.weekday().num_days_from_monday() < 5 {
             days.push(day);
         }
-        day = day.succ_opt().ok_or_else(|| anyhow::anyhow!("UTC calendar overflow"))?;
+        if day == end {
+            break;
+        }
+        day = day
+            .succ_opt()
+            .ok_or_else(|| anyhow::anyhow!("UTC calendar overflow"))?;
     }
-    anyhow::ensure!(!days.is_empty(), "weekly-cadence interval contains no UTC weekday");
+    anyhow::ensure!(!days.is_empty(), "weekly interval contains no UTC weekday");
     let mut presence = vec![false; days.len()];
-    for &ms in trade_entry_timestamps_ms {
+    let mut weekend_entries = 0;
+    let mut sunday_entries_credited = 0;
+    for &ms in entries {
         anyhow::ensure!(
             ms >= contract.evaluation_start_ms && ms <= contract.evaluation_end_ms,
-            "trade entry lies outside the weekly evaluation interval"
+            "trade entry outside weekly evaluation interval"
         );
-        let date = Utc
-            .timestamp_millis_opt(ms)
-            .single()
-            .ok_or_else(|| anyhow::anyhow!("trade timestamp outside the UTC calendar"))?
-            .date_naive();
-        let index = days.binary_search(&date).map_err(|_| {
-            anyhow::anyhow!("trade entry is not on a UTC weekday inside the interval")
-        })?;
-        presence[index] = true;
-    }
-    let traded: Vec<usize> = presence
-        .iter()
-        .enumerate()
-        .filter_map(|(index, present)| present.then_some(index))
-        .collect();
-    let mut runs = Vec::new();
-    if traded.is_empty() {
-        runs.push(days.len() as u64);
-    } else {
-        runs.push(traded[0] as u64);
-        for pair in traded.windows(2) {
-            runs.push((pair[1] - pair[0] - 1) as u64);
-        }
-        runs.push((days.len() - 1 - traded[traded.len() - 1]) as u64);
-    }
-    let allowed = 4u64;
-    let longest = runs.iter().copied().max().unwrap_or(0);
-    let violation: f64 = runs.iter().map(|run| run.saturating_sub(allowed) as f64).sum();
-    let mut violating_windows = 0u64;
-    if days.len() >= 5 {
-        let mut prefix = vec![0u64; days.len() + 1];
-        for (index, present) in presence.iter().enumerate() {
-            prefix[index + 1] = prefix[index] + u64::from(*present);
-        }
-        for begin in 0..=days.len() - 5 {
-            if prefix[begin + 5] == prefix[begin] {
-                violating_windows += 1;
+        let mut day = date(ms)?;
+        let weekday = day.weekday().num_days_from_monday();
+        if weekday >= 5 {
+            weekend_entries += 1;
+            if weekday == 5 {
+                continue;
             }
+            day = day
+                .succ_opt()
+                .ok_or_else(|| anyhow::anyhow!("UTC calendar overflow"))?;
+            if day > end {
+                continue;
+            }
+            sunday_entries_credited += 1;
+        }
+        presence[days
+            .binary_search(&day)
+            .expect("in-range weekday was enumerated")] = true;
+    }
+    let mut silent = 0u64;
+    let mut longest = 0u64;
+    let mut violating_windows = 0u64;
+    for present in &presence {
+        silent = if *present { 0 } else { silent + 1 };
+        longest = longest.max(silent);
+        if silent >= 5 {
+            violating_windows += 1;
         }
     }
     let weekdays = crate::quality::evaluation_weekdays(
         contract.evaluation_start_ms,
         contract.evaluation_end_ms,
     )?;
-    let months = weekdays as f64 / contract.trading_days_per_month.max(1.0);
-    let trades_per_month = if months > 0.0 {
-        trade_entry_timestamps_ms.len() as f64 / months
-    } else {
-        0.0
-    };
-    let clustered = violation > 0.0
-        && !traded.is_empty()
-        && traded.len() as u64 >= days.len() as u64 / 5;
+    let trades_per_month = entries.len() as f64 * contract.trading_days_per_month / weekdays as f64;
     Ok(WeeklyRollingCadenceReportV1 {
         trading_days: days.len() as u64,
-        trades: trade_entry_timestamps_ms.len(),
+        trades: entries.len(),
+        weekend_entries,
+        sunday_entries_credited,
         trades_per_month,
         longest_silent_trading_days: longest,
         violating_windows,
-        violation,
-        clustered,
+        violation: violating_windows as f64,
+        clustered: violating_windows > 0
+            && entries.len().saturating_sub(weekend_entries) + sunday_entries_credited
+                >= days.len().div_ceil(5),
     })
 }
+
+#[cfg(test)]
+pub(crate) fn test_weekly_objective() -> WeeklySearchObjectiveV1 {
+    WeeklySearchObjectiveV1 {
+        cadence: WeeklyCadenceContractV1::new(1_767_571_200_000, 1_769_731_200_000, 21.0).unwrap(),
+        limits: WeeklySearchLimitsV1 {
+            initial_equity: 10_000.0,
+            per_trade_risk_band: (0.005, 0.03),
+            max_drawdown: 0.1,
+            max_daily_drawdown: 0.05,
+            min_trades_per_month: 0.0,
+            min_net_profit: 0.0,
+            min_net_expectancy: 0.0,
+            min_win_rate: 0.0,
+            min_profit_factor: 0.0,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn ms(day: i64) -> i64 {
-        1_600_041_600_000 + day * 86_400_000
+        Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis()
+            + day * 86_400_000
     }
-
-    fn contract(weeks: i64) -> WeeklyCadenceContractV1 {
-        WeeklyCadenceContractV1::new(ms(0), ms(weeks * 7 - 1), 21.0).expect("weekly cadence contract")
-    }
-
-    #[test]
-    fn one_trade_every_week_is_feasible_and_an_average_does_not_certify_it() {
-        let c = contract(40);
-        let regular: Vec<i64> = (0..40).map(|w| ms(w * 7 + 1)).collect();
-        let report = evaluate_weekly_cadence(&c, &regular).expect("regular cadence");
-        assert!(report.feasible(), "regular weekly trades must be feasible: {report:?}");
-        // The same trade COUNT clustered in one week: the monthly average is
-        // identical, but the weekly requirement is violated.
-        let clustered: Vec<i64> = (0..40).map(|i| ms(i % 5)).collect();
-        let clustered_report = evaluate_weekly_cadence(&c, &clustered).expect("clustered cadence");
-        assert!(!clustered_report.feasible());
-        assert!(clustered_report.violation > report.violation);
-        assert!(clustered_report.clustered);
-        assert!(weekly_feasibility_score(100.0, true, &clustered_report)
-            < weekly_feasibility_score(100.0, true, &report));
-    }
-
-    #[test]
-    fn one_trade_refuge_and_losing_churn_never_reach_the_feasible_tier() {
-        let c = contract(40);
-        let regular: Vec<i64> = (0..40).map(|w| ms(w * 7 + 1)).collect();
-        let regular_report = evaluate_weekly_cadence(&c, &regular).unwrap();
-        let refuge = evaluate_weekly_cadence(&c, &[ms(3)]).unwrap();
-        assert!(!refuge.feasible());
-        assert_eq!(refuge.longest_silent_weeks, 39);
-        assert!(weekly_feasibility_score(1_000.0, true, &refuge)
-            < weekly_feasibility_score(1.0, true, &regular_report));
-        // Weekly-regular but net-negative churn is infeasible regardless of cadence.
-        assert!(weekly_feasibility_score(-50.0, true, &regular_report)
-            < weekly_feasibility_score(1.0, true, &regular_report));
-    }
-
-    #[test]
-    fn longer_silent_runs_are_monotonically_worse() {
-        let c = contract(40);
-        let mut previous = -1.0;
-        for silent_weeks in 1..=4 {
-            // Trade on week 0, stay silent for `silent_weeks` weeks, then regular.
-            let mut trades: Vec<i64> = vec![ms(0)];
-            trades.extend(((silent_weeks + 1)..40).map(|w| ms(w * 7)));
-            let report = evaluate_weekly_cadence(&c, &trades).unwrap();
-            assert!(
-                report.violation > previous,
-                "violation must increase with the silent run: {report:?}"
-            );
-            previous = report.violation;
-        }
-        assert!(previous > 0.0);
+    fn report(entries: &[i64], end: i64) -> WeeklyRollingCadenceReportV1 {
+        evaluate_rolling_weekly_cadence(
+            &WeeklyCadenceContractV1::new(ms(0), ms(end), 21.0).unwrap(),
+            &entries.iter().map(|d| ms(*d)).collect::<Vec<_>>(),
+        )
+        .unwrap()
     }
     #[test]
-    fn rolling_oracle_endpoint_only_trades_are_infeasible() {
-        let c = WeeklyCadenceContractV1::new(ms(0), ms(11), 21.0).unwrap();
-        let report = evaluate_rolling_weekly_cadence(&c, &[ms(0), ms(11)]).unwrap();
-        assert!(!report.feasible(), "{report:?}");
-        assert!(report.longest_silent_trading_days >= 5);
-        assert!(report.violating_windows > 0);
-        let regular = evaluate_rolling_weekly_cadence(&c, &[ms(0), ms(7)]).unwrap();
-        assert!(regular.feasible(), "{regular:?}");
-    }
-
-    #[test]
-    fn rolling_oracle_clustered_and_refuge_rank_below_regular() {
-        let c = WeeklyCadenceContractV1::new(ms(0), ms(27), 21.0).unwrap();
-        let clustered = evaluate_rolling_weekly_cadence(&c, &(0..20).map(|i| ms(i % 4)).collect::<Vec<_>>()).unwrap();
-        assert!(!clustered.feasible());
-        let regular = evaluate_rolling_weekly_cadence(&c, &[ms(0), ms(7), ms(14), ms(21)]).unwrap();
+    fn rolling_weekly_endpoint_oracle_includes_all_inactive_days() {
+        let endpoints = report(&[0, 11], 11);
+        assert_eq!(
+            (
+                endpoints.trading_days,
+                endpoints.longest_silent_trading_days,
+                endpoints.violating_windows
+            ),
+            (10, 8, 4)
+        );
+        assert!(!endpoints.feasible());
+        let regular = report(&[0, 7], 11);
+        assert_eq!(regular.longest_silent_trading_days, 4);
         assert!(regular.feasible());
-        assert!(weekly_feasibility_score(100.0, true, &WeeklyCadenceReportV1 {
-            expected_weeks: 0, weeks_with_trades: 0, trades: clustered.trades,
-            inclusive_weekdays: 0, trades_per_month: clustered.trades_per_month,
-            longest_silent_weeks: clustered.longest_silent_trading_days,
-            violation: clustered.violation, clustered: clustered.clustered }
-        ) < 1_000_000.0);
+        assert_eq!(
+            regular.trades_per_month.to_bits(),
+            endpoints.trades_per_month.to_bits()
+        );
+        assert_eq!(report(&[], 11).violating_windows, 6);
+        assert_eq!(report(&[0], 11).violating_windows, 5);
     }
-
     #[test]
-    fn rolling_oracle_weekend_only_interval_is_refused() {
+    fn rolling_weekly_clusters_and_longer_gaps_are_worse_without_churn_bonus() {
+        let regular = report(&[0, 7, 14, 21], 25);
+        let clustered = report(&[0, 0, 0, 0], 25);
+        assert!(regular.feasible());
+        assert!(!clustered.feasible() && clustered.clustered);
+        let mut objective = test_weekly_objective();
+        objective.cadence = WeeklyCadenceContractV1::new(ms(0), ms(25), 21.0).unwrap();
+        let good = [
+            50.0, 1.0, 10_050.0, 0.01, 0.6, 1.2, 12.5, 0.5, 4.0, 0.5, 0.005,
+        ];
+        let fitness = objective.fitness(&good, &regular, 0.1);
+        assert!(fitness > 0.0);
+        assert!(objective.fitness(&good, &clustered, 0.1) < 0.0);
+        let mut losing = good;
+        losing[0] = -50.0;
+        losing[6] = -12.5;
+        let mut worse = losing;
+        worse[0] = -500.0;
+        worse[6] = -125.0;
+        assert!(
+            objective.fitness(&worse, &regular, 0.1) < objective.fitness(&losing, &regular, 0.1)
+        );
+        let mut churn = regular.clone();
+        churn.trades *= 100;
+        churn.trades_per_month *= 100.0;
+        assert_eq!(
+            objective.fitness(&good, &regular, 0.1),
+            objective.fitness(&good, &churn, 0.1)
+        );
+        let short_gap = report(&[0, 7, 14], 25);
+        let long_gap = report(&[0, 7], 25);
+        assert!(
+            objective.fitness(&good, &long_gap, 0.1) < objective.fitness(&good, &short_gap, 0.1)
+        );
+    }
+    #[test]
+    fn rolling_weekly_sunday_maps_to_monday_and_saturday_cannot_cover_a_weekday() {
+        let r = report(&[5, 5], 11);
+        assert_eq!(r.weekend_entries, 2);
+        assert_eq!(r.trades, 2);
+        assert_eq!(r.violating_windows, 6);
+        let sunday = report(&[6], 11);
+        let sunday_and_monday = report(&[6, 7], 11);
+        assert_eq!(sunday.sunday_entries_credited, 1);
+        assert_eq!(sunday.violating_windows, 1);
+        assert_eq!(
+            sunday.violating_windows,
+            sunday_and_monday.violating_windows
+        );
         let c = WeeklyCadenceContractV1::new(ms(5), ms(6), 21.0).unwrap();
         assert!(evaluate_rolling_weekly_cadence(&c, &[]).is_err());
+        assert!(
+            evaluate_rolling_weekly_cadence(
+                &WeeklyCadenceContractV1::new(ms(0), ms(11), 21.0).unwrap(),
+                &[ms(12)]
+            )
+            .is_err()
+        );
+        let mut o = test_weekly_objective();
+        o.cadence = WeeklyCadenceContractV1::new(ms(0), ms(2), 21.0).unwrap();
+        assert!(o.validate().is_err());
+        o.cadence.min_trades_per_week = 2.0;
+        assert!(o.validate().is_err());
+    }
+    #[test]
+    fn rolling_weekly_reverses_the_actual_one_trade_scoring_refuge() {
+        // Algebraic counterexample in the actual legacy scorer, not a market replay.
+        let one = [
+            50.0, 0.343, 10_050.0, 0.001, 1.0, 10.0, 50.0, 0.0, 1.0, 0.1, 0.001,
+        ];
+        let active = [
+            1_000.0,
+            1.0,
+            11_000.0,
+            0.02,
+            0.6,
+            1.5,
+            1_000.0 / 2_400.0,
+            0.0,
+            2_400.0,
+            0.5,
+            0.01,
+        ];
+        let old_one = crate::scoring::ga_fitness(&one);
+        let old_active = crate::scoring::ga_fitness(&active);
+        assert!(old_one > old_active);
+        let objective = test_weekly_objective();
+        let refuge = report(&[0], 25);
+        let entries = (0..2_400)
+            .map(|i| [0, 7, 14, 21][i % 4])
+            .collect::<Vec<_>>();
+        let regular = report(&entries, 25);
+        assert!(objective.fitness(&active, &regular, old_active) > 0.0);
+        assert!(objective.fitness(&one, &refuge, old_one) < 0.0);
     }
 
+    #[test]
+    fn rolling_weekly_expectancy_deficit_has_its_own_scale_and_no_zero_step() {
+        let r = report(&[0, 7, 14, 21], 25);
+        let mut o = test_weekly_objective();
+        o.limits.min_net_expectancy = 0.5;
+        let mut m = [
+            50.0, 1.0, 10_050.0, 0.01, 0.6, 1.2, 0.49, 0.5, 4.0, 0.5, 0.005,
+        ];
+        assert!((o.fitness(&m, &r, 0.0) + 0.02).abs() < 1e-12);
+        m[6] = -1e-9;
+        let below = o.fitness(&m, &r, 0.0);
+        m[6] = 1e-9;
+        let above = o.fitness(&m, &r, 0.0);
+        assert!((above - below).abs() < 1e-7);
+        m[6] = 1.0;
+        m[3] = o.limits.max_drawdown;
+        assert!(
+            o.fitness(&m, &r, 0.0) <= 0.0,
+            "current risk owner rejects equality"
+        );
+        m[3] = 0.01;
+        m[0] = 0.0;
+        assert!(
+            o.fitness(&m, &r, 0.0) <= 0.0,
+            "zero net never receives feasible tier"
+        );
+    }
+
+    #[test]
+    fn rolling_weekly_honors_stricter_monthly_and_risk_limits() {
+        let r = report(&[0, 7, 14, 21], 25);
+        let mut o = test_weekly_objective();
+        let good = [
+            50.0, 1.0, 10_050.0, 0.01, 0.6, 1.2, 12.5, 0.5, 4.0, 0.5, 0.005,
+        ];
+        assert!(o.fitness(&good, &r, 0.0) > 0.0);
+        o.limits.min_trades_per_month = 20.0;
+        assert!(o.fitness(&good, &r, 0.0) < 0.0);
+        o.limits.min_trades_per_month = 0.0;
+        let mut risky = good;
+        risky[3] = 0.2;
+        let mut riskier = risky;
+        riskier[3] = 0.4;
+        assert!(o.fitness(&riskier, &r, 0.0) < o.fitness(&risky, &r, 0.0));
+        risky[1] = f64::NEG_INFINITY;
+        assert_eq!(o.fitness(&risky, &r, 0.0), f64::NEG_INFINITY);
+    }
 }

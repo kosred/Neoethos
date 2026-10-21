@@ -32,8 +32,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Versioned handoff observations, not a profitability or validation verdict.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GaHandoffObservationsV1 {
+    /// Original GA returned order, before finalist sorting; the ordinal is the
+    /// candidate archive index used by downstream selection diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_cadence: Option<Vec<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>>,
     pub schema_version: u16,
     pub returned_candidates: usize,
     pub finite_positive_fitness_candidates: usize,
@@ -322,6 +326,7 @@ impl FunnelProfile {
     pub(crate) fn record_ga_handoff(&mut self, search: &crate::genetic::SearchResult) {
         let returned_candidates = search.genes.len();
         self.ga_handoff_v1 = Some(GaHandoffObservationsV1 {
+            weekly_cadence: search.weekly_cadence_v1.clone(),
             schema_version: 1,
             returned_candidates,
             finite_positive_fitness_candidates: search

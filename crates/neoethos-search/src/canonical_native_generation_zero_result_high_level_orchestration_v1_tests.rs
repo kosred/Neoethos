@@ -353,6 +353,7 @@ fn milestone_v1(
         None,
         counters,
         SearchResult {
+            weekly_cadence_v1: None,
             generation_census_v1: None,
             genes,
             metrics,

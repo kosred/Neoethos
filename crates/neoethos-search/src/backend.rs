@@ -225,7 +225,8 @@ pub fn evaluate_population_core_with_backend(
     backend: EvaluationBackend,
 ) -> Result<Vec<[f64; 11]>, String> {
     let audit = crate::gpu_native::cpu_strategy::CpuStrategyAuditContext::production(0);
-    evaluate_population_core_with_backend_and_audit_inner(inputs, backend, &audit, None)
+    evaluate_population_core_with_backend_and_audit_inner(inputs, backend, &audit, None, None)
+        .map(|batch| batch.metrics)
 }
 
 pub(crate) fn evaluate_population_core_with_backend_and_evidence(
@@ -234,7 +235,14 @@ pub(crate) fn evaluate_population_core_with_backend_and_evidence(
     evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
 ) -> Result<Vec<[f64; 11]>, String> {
     let audit = crate::gpu_native::cpu_strategy::CpuStrategyAuditContext::production(0);
-    evaluate_population_core_with_backend_and_audit_inner(inputs, backend, &audit, Some(evidence))
+    evaluate_population_core_with_backend_and_audit_inner(
+        inputs,
+        backend,
+        &audit,
+        Some(evidence),
+        None,
+    )
+    .map(|batch| batch.metrics)
 }
 
 pub fn evaluate_population_core_with_backend_and_audit(
@@ -244,7 +252,34 @@ pub fn evaluate_population_core_with_backend_and_audit(
 ) -> Result<Vec<[f64; 11]>, String> {
     crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()
         .map_err(|error| error.to_string())?;
-    evaluate_population_core_with_backend_and_audit_inner(inputs, backend, audit, None)
+    evaluate_population_core_with_backend_and_audit_inner(inputs, backend, audit, None, None)
+        .map(|batch| batch.metrics)
+}
+
+pub(crate) fn evaluate_population_with_cadence_and_evidence(
+    inputs: crate::eval::PopulationEvalInputs<'_>,
+    backend: EvaluationBackend,
+    evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
+    objective: &crate::scoring::weekly_cadence::WeeklySearchObjectiveV1,
+) -> Result<crate::eval::PopulationEvaluationV1, String> {
+    objective
+        .checked_for_evaluation(
+            inputs.settings.initial_equity(),
+            false,
+            (
+                inputs.settings.risk_per_trade_min,
+                inputs.settings.risk_per_trade_max,
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+    let audit = crate::gpu_native::cpu_strategy::CpuStrategyAuditContext::production(0);
+    evaluate_population_core_with_backend_and_audit_inner(
+        inputs,
+        backend,
+        &audit,
+        Some(evidence),
+        Some(objective),
+    )
 }
 
 fn evaluate_population_core_with_backend_and_audit_inner(
@@ -252,7 +287,8 @@ fn evaluate_population_core_with_backend_and_audit_inner(
     backend: EvaluationBackend,
     audit: &crate::gpu_native::cpu_strategy::CpuStrategyAuditContext,
     evidence: Option<&crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>>,
-) -> Result<Vec<[f64; 11]>, String> {
+    weekly: Option<&crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
+) -> Result<crate::eval::PopulationEvaluationV1, String> {
     use crate::gpu_native::cpu_strategy::{self, CpuStrategyCategory};
 
     backend.validate().map_err(|error| error.to_string())?;
@@ -289,8 +325,40 @@ fn evaluate_population_core_with_backend_and_audit_inner(
             cpu_route_receipt,
             audit,
             CpuStrategyCategory::PopulationEvaluation,
-            || crate::eval::validation_backtest_population_cpu(inputs),
-        );
+            || -> Result<crate::eval::PopulationEvaluationV1, String> {
+                if let Some(objective) = weekly {
+                    if objective.limits.initial_equity != inputs.settings.initial_equity()
+                        || inputs.timestamps.len() != inputs.close.len()
+                        || !inputs.timestamps.windows(2).all(|w| w[0] < w[1])
+                        || inputs.timestamps.first().copied()
+                            != Some(objective.cadence.evaluation_start_ms)
+                        || inputs.timestamps.last().copied()
+                            != Some(objective.cadence.evaluation_end_ms)
+                    {
+                        return Err(
+                            "weekly contract interval differs from actual population input".into(),
+                        );
+                    }
+                    let rows = crate::eval::validation_backtest_population_observed_cpu::<false>(
+                        inputs,
+                        Some(&objective.cadence),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let mut metrics = Vec::with_capacity(rows.len());
+                    let mut reports = Vec::with_capacity(rows.len());
+                    for (m, _, report) in rows {
+                        reports.push(report.expect("weekly execution records cadence"));
+                        metrics.push(m);
+                    }
+                    Ok(crate::eval::PopulationEvaluationV1 {
+                        metrics,
+                        cadence: Some(reports),
+                    })
+                } else {
+                    Ok(crate::eval::validation_backtest_population_cpu(inputs).into())
+                }
+            },
+        )?;
         crate::eval_telemetry::record_device(
             "population_eval",
             crate::eval_telemetry::Device::Cpu,
@@ -300,10 +368,13 @@ fn evaluate_population_core_with_backend_and_audit_inner(
             .record_successful_population(
                 crate::engine_identity::PopulationEvalEngine::Cpu,
                 expected_output_rows,
-                rows.len(),
+                rows.metrics.len(),
             )
             .map_err(|error| error.to_string())?;
         return Ok(rows);
+    }
+    if weekly.is_some() {
+        return Err("rolling weekly objective requires sealed CPU execution; native cadence observations are not implemented".into());
     }
     evidence
         .require_exact_cuda_device_ordinal_v1()
@@ -316,7 +387,7 @@ fn evaluate_population_core_with_backend_and_audit_inner(
             dispatch_started.elapsed(),
         );
     }
-    out
+    out.map(Into::into)
 }
 
 /// Unit-only backend oracle. It preserves device/fallback dispatch tests while
