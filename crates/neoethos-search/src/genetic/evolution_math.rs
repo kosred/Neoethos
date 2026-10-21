@@ -2116,4 +2116,66 @@ mod generator_audit_tests {
             );
         }
     }
+
+    fn operator_traits_equal(left: &Gene, right: &Gene) -> bool {
+        if left.indices != right.indices
+            || left.weights != right.weights
+            || left.long_threshold != right.long_threshold
+            || left.short_threshold != right.short_threshold
+            || left.sl_pips != right.sl_pips
+            || left.tp_pips != right.tp_pips
+            || left.stop_vol_mult != right.stop_vol_mult
+        {
+            return false;
+        }
+        let flags = |gene: &Gene| {
+            [
+                gene.use_ob,
+                gene.use_fvg,
+                gene.use_liq_sweep,
+                gene.use_premium_discount,
+                gene.use_inducement,
+                gene.mtf_confirmation,
+                gene.use_bos,
+                gene.use_choch,
+                gene.use_eqh,
+                gene.use_eql,
+                gene.use_displacement,
+            ]
+        };
+        flags(left) == flags(right)
+    }
+
+    #[test]
+    fn duplicate_retry_replaces_with_a_newborn_not_a_local_mutation() {
+        let cfg = SmcSearchConfig::default();
+        let parent = audit_gene(vec![0]);
+        let mut seen = SeenSignatureMemory::current();
+        assert!(seen.insert_gene(&parent));
+        let mut rng = StdRng::seed_from_u64(77);
+        let mut inherited_like = 0usize;
+        let samples = 200usize;
+        for _ in 0..samples {
+            let replacement = unique_candidate_or_retry(
+                parent.clone(),
+                &mut seen,
+                8,
+                4,
+                1,
+                20,
+                &cfg,
+                &mut rng,
+            );
+            if operator_traits_equal(&replacement, &parent) {
+                inherited_like += 1;
+            }
+        }
+        eprintln!(
+            "duplicate retry: inherited_like={inherited_like} samples={samples}"
+        );
+        assert_eq!(
+            inherited_like, 0,
+            "duplicate children are replaced by wholesale newborns, not local mutations"
+        );
+    }
 }
