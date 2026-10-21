@@ -2088,11 +2088,19 @@ mod generator_audit_tests {
     use rand::{SeedableRng, rngs::StdRng};
 
     fn audit_gene(indices: Vec<usize>) -> Gene {
-        Gene {
+        let (sl_pips, tp_pips) = current_gene_stop_bounds().mid_pair();
+        let mut gene = Gene {
             weights: vec![0.4; indices.len()],
             indices,
+            long_threshold: 0.2,
+            short_threshold: -0.2,
+            sl_pips,
+            tp_pips,
+            stop_vol_mult: 0.0,
             ..Gene::default()
-        }
+        };
+        gene.normalize(8, 1);
+        gene
     }
 
     #[test]

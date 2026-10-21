@@ -196,7 +196,10 @@ pub fn enforce_min_structural_smc_flags(
     rng: &mut impl Rng,
 ) {
     let need = cfg.min_flags.min(10);
-    if need == 0 {
+    if need == 0 || smc_structural_flag_count(gene) >= need {
+        // Min structural flags are already satisfied: do not redraw or force
+        // MTF confirmation. That field was sampled from cfg.p_mtf by
+        // randomize_smc_flags and is not a structural flag.
         return;
     }
     while smc_structural_flag_count(gene) < need {
@@ -212,9 +215,6 @@ pub fn enforce_min_structural_smc_flags(
             8 => gene.use_eql = true,
             _ => gene.use_displacement = true,
         }
-    }
-    if !gene.mtf_confirmation && rng.random_bool(cfg.p_mtf.max(0.5)) {
-        gene.mtf_confirmation = true;
     }
 }
 
@@ -1224,9 +1224,19 @@ mod operator_ratio_tests {
             ..SmcSearchConfig::default()
         };
         let mut first = Gene::default();
-        first.mtf_confirmation = false;
+        first.mtf_confirmation = true;
         let mut second = Gene::default();
         second.mtf_confirmation = true;
+        second.use_ob = true;
+        second.use_fvg = true;
+        second.use_liq_sweep = true;
+        second.use_premium_discount = true;
+        second.use_inducement = true;
+        second.use_bos = true;
+        second.use_choch = true;
+        second.use_eqh = true;
+        second.use_eql = true;
+        second.use_displacement = true;
         let mut genes = vec![first, second];
         enforce_population_smc_ratio(&mut genes, &cfg, &mut StdRng::seed_from_u64(5));
         let mut seen = crate::genetic::evolution_math::SeenSignatureMemory::current();
@@ -1236,6 +1246,38 @@ mod operator_ratio_tests {
         assert_eq!(
             collisions, 1,
             "SMC repair can merge formerly distinct offspring; count the actual repeat"
+        );
+    }
+
+    #[test]
+    fn structural_minimum_does_not_redraw_or_force_mtf_probability() {
+        let cfg = SmcSearchConfig {
+            min_flags: 1,
+            p_mtf: 0.0,
+            ..SmcSearchConfig::default()
+        };
+        let mut gene = Gene {
+            use_ob: true,
+            mtf_confirmation: false,
+            ..Gene::default()
+        };
+        enforce_min_structural_smc_flags(&mut gene, &cfg, &mut StdRng::seed_from_u64(7));
+        assert!(!gene.mtf_confirmation, "p_mtf=0 must not be forced to 0.5");
+
+        let mut zero_flags = Gene::default();
+        enforce_min_structural_smc_flags(
+            &mut zero_flags,
+            &SmcSearchConfig {
+                min_flags: 10,
+                p_mtf: 0.0,
+                ..SmcSearchConfig::default()
+            },
+            &mut StdRng::seed_from_u64(8),
+        );
+        assert!(smc_structural_flag_count(&zero_flags) >= 10);
+        assert!(
+            !zero_flags.mtf_confirmation,
+            "structural repair must not enable MTF"
         );
     }
 }

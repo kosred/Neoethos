@@ -39,6 +39,7 @@
 //! 5 templates × 10 variants = up to 50 starter genes.
 
 use super::strategy_gene::Gene;
+use neoethos_dataset_contracts::CANONICAL_TIMEFRAMES;
 use rand::Rng;
 
 /// Hand-crafted feature-role spec for one slot in a template.
@@ -292,8 +293,44 @@ const TEMPLATES: &[Template] = &[
 /// caller).
 const VARIANTS_PER_TEMPLATE: usize = 10;
 
-/// Find the feature index whose lowercased name contains both `tf` and
-/// `primary`. Returns `None` if no match exists.
+thread_local! {
+    static SEARCH_BASE_TIMEFRAME: std::cell::RefCell<Option<(String, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct SearchBaseTimeframeGuard {
+    previous: Option<(String, bool)>,
+}
+
+impl Drop for SearchBaseTimeframeGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        SEARCH_BASE_TIMEFRAME.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Explicit provenance handoff from the feature owner: base timeframe and
+/// whether its columns were prefixed. No base timeframe is inferred from names.
+pub(crate) fn enter_search_base_timeframe(
+    base_timeframe: &str,
+    base_features_prefixed: bool,
+) -> SearchBaseTimeframeGuard {
+    let value = (base_timeframe.to_ascii_lowercase(), base_features_prefixed);
+    let previous = SEARCH_BASE_TIMEFRAME.with(|slot| slot.borrow_mut().replace(value));
+    SearchBaseTimeframeGuard { previous }
+}
+
+fn current_base_timeframe() -> Option<(String, bool)> {
+    SEARCH_BASE_TIMEFRAME.with(|slot| slot.borrow().clone())
+}
+
+fn has_known_timeframe_prefix(lower: &str) -> bool {
+    let first = lower.split('_').next().unwrap_or("");
+    CANONICAL_TIMEFRAMES
+        .iter()
+        .any(|timeframe| timeframe.eq_ignore_ascii_case(first))
+}
+
 fn token_sequence_present(name: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -345,7 +382,37 @@ fn find_feature(
 /// Try `find_feature(tf, primary)` first; if that misses, fall back to
 /// `find_feature(tf, family)`; if that also misses, return `None` (the
 /// caller will skip this role rather than producing nonsense).
+fn find_base_feature(
+    feature_names: &[String],
+    needle: &str,
+    token_boundary: bool,
+) -> Option<usize> {
+    feature_names
+        .iter()
+        .enumerate()
+        .find(|(_, name)| {
+            let lower = name.to_lowercase();
+            if has_known_timeframe_prefix(&lower) {
+                return false;
+            }
+            if token_boundary {
+                token_sequence_present(&lower, needle)
+            } else {
+                lower.contains(needle)
+            }
+        })
+        .map(|(idx, _)| idx)
+}
+
 fn resolve_role(feature_names: &[String], role: &RoleSpec) -> Option<usize> {
+    let base = current_base_timeframe();
+    let base_unprefixed = base
+        .as_ref()
+        .is_some_and(|(base_tf, prefixed)| role.tf == base_tf && !prefixed);
+    if base_unprefixed {
+        return find_base_feature(feature_names, role.primary, true)
+            .or_else(|| find_base_feature(feature_names, role.family, false));
+    }
     find_feature(feature_names, role.tf, role.primary, true)
         .or_else(|| find_feature(feature_names, role.tf, role.family, false))
 }
@@ -709,5 +776,60 @@ mod tests {
         assert_eq!(find_feature(&names, "h1", "ema_500", true), Some(2));
         assert_eq!(find_feature(&names, "h1", "ema_5", true), None);
         assert_eq!(find_feature(&names, "h1", "ema_5", false), Some(2));
+    }
+
+    #[test]
+    fn explicit_unprefixed_base_provenance_resolves_base_roles_only() {
+        let _guard = enter_search_base_timeframe("M15", false);
+        let names = vec![
+            "adx".to_string(),
+            "h1_adx".to_string(),
+            "d1_atr".to_string(),
+            "m15_rsi".to_string(),
+        ];
+        let base_role = RoleSpec {
+            tf: "m15",
+            primary: "adx",
+            family: "adx",
+            weight: 0.2,
+        };
+        let higher_role = RoleSpec {
+            tf: "h1",
+            primary: "adx",
+            family: "adx",
+            weight: 0.2,
+        };
+        let absent_base_role = RoleSpec {
+            tf: "m15",
+            primary: "rsi",
+            family: "rsi",
+            weight: 0.2,
+        };
+        assert_eq!(resolve_role(&names, &base_role), Some(0));
+        assert_eq!(resolve_role(&names, &higher_role), Some(1));
+        assert_eq!(resolve_role(&names, &absent_base_role), None);
+    }
+
+    #[test]
+    fn actual_feature_frame_provenance_reaches_base_role_resolution() {
+        let frame = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let (base, prefixed) =
+            crate::genetic::search_engine::base_timeframe_context_from_features(&frame)
+                .expect("fixture frame has source provenance");
+        assert!(!base.is_empty());
+        let names = vec!["adx".to_string(), "h1_adx".to_string()];
+        let base_role = RoleSpec {
+            tf: Box::leak(base.to_ascii_lowercase().into_boxed_str()),
+            primary: "adx",
+            family: "adx",
+            weight: 0.2,
+        };
+        assert_eq!(
+            resolve_role(&names, &base_role),
+            None,
+            "without the explicit provenance guard unprefixed base is not assumed"
+        );
+        let _guard = crate::genetic::seed_templates::enter_search_base_timeframe(&base, prefixed);
+        assert_eq!(resolve_role(&names, &base_role), Some(0));
     }
 }

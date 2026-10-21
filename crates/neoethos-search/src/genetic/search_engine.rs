@@ -2819,6 +2819,24 @@ where
     )
 }
 
+pub(crate) fn base_timeframe_context_from_features(
+    features: &neoethos_data::FeatureFrame,
+) -> Option<(String, bool)> {
+    let base_timeframe = features
+        .provenance()
+        .bindings()
+        .iter()
+        .map(|binding| binding.dataset_identity().timeframe())
+        .min_by_key(|timeframe| *timeframe as u8)?
+        .as_str()
+        .to_owned();
+    let base_features_prefixed = features
+        .feature_build_options()
+        .map(|options| options.prefix_base_features)
+        .unwrap_or(false);
+    Some((base_timeframe, base_features_prefixed))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evolve_search_with_progress_impl<F>(
     features: &FeatureFrame,
@@ -2843,6 +2861,7 @@ where
     // host route builds its immutable bar cache once and supplies only the
     // generation evaluator closure below; the resident V3 route supplies a
     // purpose-bound session evaluator and never constructs this cache.
+
     let eval_cache = match prepared_eval_cache {
         Some(cache) => {
             anyhow::ensure!(
@@ -2868,6 +2887,10 @@ where
             exact_execution,
         )
     };
+    let _base_timeframe_guard =
+        base_timeframe_context_from_features(features).map(|(base, prefixed)| {
+            super::seed_templates::enter_search_base_timeframe(&base, prefixed)
+        });
     evolve_search_with_generation_evaluator_v1(
         &features.names,
         features
