@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 17] = [
+const OPTIONAL: [&str; 18] = [
     "--higher",
     "--population",
     "--generations",
@@ -45,6 +45,7 @@ const OPTIONAL: [&str; 17] = [
     "--research-oos-eval",
     "--diagnose-candidate-costs-out",
     "--diagnose-cost-variants",
+    "--diagnose-candidate-signals-out",
     "--new-search-research",
     "--new-search-research-sha256",
 ];
@@ -137,10 +138,10 @@ impl SavedResearchInputs {
         // zero-portfolio archives: it never resumes a frozen finalist and never
         // needs a portfolio to exist. Every other continuation still requires
         // one, because it would otherwise restart a finalist replay over nothing.
-        let cost_diagnostic = args
-            .iter()
-            .any(|arg| arg == "--diagnose-candidate-costs-out");
-        if !cost_diagnostic {
+        let research_only_diagnostic = args.iter().any(|arg| {
+            arg == "--diagnose-candidate-costs-out" || arg == "--diagnose-candidate-signals-out"
+        });
+        if !research_only_diagnostic {
             neoethos_search::ensure_non_empty_portfolio(
                 research.discovery_result(),
                 "resume frozen research",
@@ -323,6 +324,21 @@ impl Arguments {
             );
             parse_diagnostic_cost_variants(parsed.value("--diagnose-cost-variants"))?;
         }
+        let signal_behavior_out = parsed.0.get("--diagnose-candidate-signals-out");
+        if signal_behavior_out.is_some() {
+            ensure!(
+                resume_flags != 0,
+                "candidate signal behavior census requires an exact saved research (--resume-research + --resume-research-sha256)"
+            );
+            ensure!(
+                diagnose_flags == 0,
+                "candidate signal behavior census cannot be combined with candidate cost diagnosis"
+            );
+            ensure!(
+                new_search_flags == 0 && quote_flags == 0,
+                "candidate signal behavior census cannot be combined with fresh-search or quote replay"
+            );
+        }
         if resume_flags != 0 {
             for flag in [
                 "--population",
@@ -441,6 +457,18 @@ fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String
         .chain(RESUME_FLAGS)
         .chain(NEW_SEARCH_FLAGS)
     {
+        if let Some(value) = args.0.get(flag) {
+            push(discovery_args, flag, value);
+        }
+    }
+}
+
+fn forward_optional_diagnostic_flags(args: &Arguments, discovery_args: &mut Vec<String>) {
+    for flag in [
+        "--diagnose-candidate-costs-out",
+        "--diagnose-cost-variants",
+        "--diagnose-candidate-signals-out",
+    ] {
         if let Some(value) = args.0.get(flag) {
             push(discovery_args, flag, value);
         }
@@ -623,11 +651,7 @@ pub fn run(args: &[String], settings: &Settings) -> Result<()> {
     }
     // Research-only saved-candidate cost diagnosis. It reuses the saved
     // research and its receipt-bound input; it never runs a new Search.
-    for flag in ["--diagnose-candidate-costs-out", "--diagnose-cost-variants"] {
-        if let Some(value) = args.0.get(flag) {
-            push(&mut discovery_args, flag, value);
-        }
-    }
+    forward_optional_diagnostic_flags(&args, &mut discovery_args);
     neoethos_core::storage::json::write_json_atomic(
         output.join("discovery-arguments.json"),
         &discovery_args,
@@ -841,6 +865,60 @@ mod tests {
                 .expect("forwarded flag");
             assert_eq!(forwarded[index + 1], value, "{flag} value changed");
         }
+    }
+
+    #[test]
+    fn saved_candidate_signal_behavior_flag_survives_actual_forwarding_and_mode_checks() {
+        let path = "C:/recorded/v7.research.json";
+        let sha = "b".repeat(64);
+        let mut raw = valid_arguments();
+        push(&mut raw, "--resume-research", path);
+        push(&mut raw, "--resume-research-sha256", &sha);
+        push(&mut raw, "--max-batches", "1");
+        push(
+            &mut raw,
+            "--diagnose-candidate-signals-out",
+            "C:/out/signals.json",
+        );
+        let args = Arguments::parse(&raw).expect("signal census arguments");
+        let mut forwarded = Vec::new();
+        forward_optional_diagnostic_flags(&args, &mut forwarded);
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|arg| arg.as_str() == "--diagnose-candidate-signals-out")
+                .count(),
+            1
+        );
+        assert!(
+            Arguments::parse(&valid_arguments_with_flag(
+                "--diagnose-candidate-signals-out",
+                "C:/out/signals.json"
+            ))
+            .is_err()
+        );
+        let mut with_cost = raw.clone();
+        push(
+            &mut with_cost,
+            "--diagnose-candidate-costs-out",
+            "C:/out/cost.json",
+        );
+        push(&mut with_cost, "--diagnose-cost-variants", "base=1.0:2.0");
+        assert!(Arguments::parse(&with_cost).is_err());
+        let mut with_new_search = raw.clone();
+        push(&mut with_new_search, "--new-search-research", "C:/v7.json");
+        push(
+            &mut with_new_search,
+            "--new-search-research-sha256",
+            &"c".repeat(64),
+        );
+        assert!(Arguments::parse(&with_new_search).is_err());
+    }
+
+    fn valid_arguments_with_flag(flag: &str, value: &str) -> Vec<String> {
+        let mut args = valid_arguments();
+        push(&mut args, flag, value);
+        args
     }
 
     #[test]

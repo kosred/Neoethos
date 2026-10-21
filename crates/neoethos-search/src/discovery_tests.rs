@@ -6755,3 +6755,215 @@ fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_r
         "higher timeframe identity stays distinct and reaches emitted genes"
     );
 }
+
+fn signal_fingerprint(signal: &[i8], index: usize) -> CandidateSignalFingerprintV1 {
+    candidate_signal_bitsets(
+        signal,
+        signal.len(),
+        CandidateSignalIdentityV1 {
+            index,
+            strategy_id: format!("candidate-{index}"),
+            exact_gene_hash: format!("hash-{index}"),
+        },
+    )
+    .expect("valid bounded signal fingerprint")
+}
+
+fn naive_pair_counts(left: &[i8], right: &[i8]) -> (usize, usize, usize, usize) {
+    assert_eq!(left.len(), right.len());
+    let mut same = 0usize;
+    let mut opposite = 0usize;
+    let mut union = 0usize;
+    let mut both_zero = 0usize;
+    for (a, b) in left.iter().zip(right) {
+        if *a == 0 && *b == 0 {
+            both_zero += 1;
+        } else {
+            union += 1;
+        }
+        if *a != 0 && *a == *b {
+            same += 1;
+        }
+        if *a != 0 && *b != 0 && *a != *b {
+            opposite += 1;
+        }
+    }
+    (same, opposite, union, both_zero)
+}
+
+#[test]
+fn candidate_signal_pair_bitsets_match_naive_per_bar_oracle_at_64_65_boundary() {
+    for n in [64usize, 65] {
+        let mut left = vec![0_i8; n];
+        let mut right = vec![0_i8; n];
+        for row in 0..n {
+            left[row] = match row % 5 {
+                0 => 1,
+                1 => -1,
+                _ => 0,
+            };
+            right[row] = match row % 7 {
+                0 => 1,
+                1 => -1,
+                _ => 0,
+            };
+        }
+        left[n - 1] = 1;
+        right[0] = 1;
+        let left_fp = signal_fingerprint(&left, 0);
+        let right_fp = signal_fingerprint(&right, 1);
+        let pair = candidate_signal_pair_stat(0, 1, &[left_fp, right_fp], n).expect("active pair");
+        let (same, opposite, union, both_zero) = naive_pair_counts(&left, &right);
+        assert_eq!(pair.same_direction_bars, same, "n={n}");
+        assert_eq!(pair.opposite_direction_bars, opposite, "n={n}");
+        assert_eq!(pair.active_union_bars, union, "n={n}");
+        assert_eq!(pair.both_zero_bars, both_zero, "n={n}");
+        assert_eq!(
+            pair.similarity,
+            same as f64 / union as f64,
+            "n={n} similarity"
+        );
+    }
+}
+
+#[test]
+fn candidate_signal_pair_similarity_handles_identical_opposite_disjoint_and_all_zero() {
+    let identical = [1, 0, -1, 0, 1];
+    let opposite = [-1, 0, 1, 0, -1];
+    let disjoint = [0, 1, 0, 1, 0];
+    let all_zero = [0, 0, 0, 0, 0];
+
+    let identical_pair = candidate_signal_pair_stat(
+        0,
+        1,
+        &[
+            signal_fingerprint(&identical, 0),
+            signal_fingerprint(&identical, 1),
+        ],
+        identical.len(),
+    )
+    .expect("identical active pair");
+    assert_eq!(identical_pair.similarity, 1.0);
+
+    let opposite_pair = candidate_signal_pair_stat(
+        0,
+        1,
+        &[
+            signal_fingerprint(&identical, 0),
+            signal_fingerprint(&opposite, 1),
+        ],
+        identical.len(),
+    )
+    .expect("opposite active pair");
+    assert_eq!(opposite_pair.similarity, 0.0);
+    assert_eq!(opposite_pair.opposite_direction_bars, 3);
+
+    let disjoint_pair = candidate_signal_pair_stat(
+        0,
+        1,
+        &[
+            signal_fingerprint(&identical, 0),
+            signal_fingerprint(&disjoint, 1),
+        ],
+        identical.len(),
+    )
+    .expect("disjoint active pair");
+    assert_eq!(disjoint_pair.similarity, 0.0);
+    assert_eq!(disjoint_pair.same_direction_bars, 0);
+
+    let zero_active_pair = candidate_signal_pair_stat(
+        0,
+        1,
+        &[
+            signal_fingerprint(&all_zero, 0),
+            signal_fingerprint(&identical, 1),
+        ],
+        identical.len(),
+    )
+    .expect("nonzero support pair");
+    assert_eq!(zero_active_pair.similarity, 0.0);
+    assert_eq!(zero_active_pair.both_zero_bars, 2);
+    assert!(
+        candidate_signal_pair_stat(
+            0,
+            1,
+            &[
+                signal_fingerprint(&all_zero, 0),
+                signal_fingerprint(&all_zero, 1)
+            ],
+            all_zero.len()
+        )
+        .is_none(),
+        "zero-union pairs are undefined, not similarity one"
+    );
+}
+
+#[test]
+fn candidate_signal_bitsets_are_invariant_to_both_zero_padding_and_validate_inputs() {
+    let left = [1, 0, -1, 1, 0];
+    let right = [1, 0, 1, 0, 0];
+    let mut padded_left = left.to_vec();
+    let mut padded_right = right.to_vec();
+    padded_left.extend([0; 3]);
+    padded_right.extend([0; 3]);
+    let pair = candidate_signal_pair_stat(
+        0,
+        1,
+        &[signal_fingerprint(&left, 0), signal_fingerprint(&right, 1)],
+        left.len(),
+    )
+    .unwrap();
+    let padded = candidate_signal_pair_stat(
+        0,
+        1,
+        &[
+            signal_fingerprint(&padded_left, 0),
+            signal_fingerprint(&padded_right, 1),
+        ],
+        padded_left.len(),
+    )
+    .unwrap();
+    assert_eq!(pair.similarity, padded.similarity);
+    assert_eq!(pair.same_direction_bars, padded.same_direction_bars);
+    assert_eq!(pair.opposite_direction_bars, padded.opposite_direction_bars);
+    assert_eq!(padded.both_zero_bars, pair.both_zero_bars + 3);
+
+    assert!(
+        candidate_signal_bitsets(
+            &[1, 0],
+            3,
+            CandidateSignalIdentityV1 {
+                index: 0,
+                strategy_id: "bad-length".to_string(),
+                exact_gene_hash: "bad".to_string()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        candidate_signal_bitsets(
+            &[1, 2],
+            2,
+            CandidateSignalIdentityV1 {
+                index: 0,
+                strategy_id: "bad-value".to_string(),
+                exact_gene_hash: "bad".to_string()
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn candidate_signal_exact_fingerprint_equality_preserves_stable_identity() {
+    let signal = [1, 0, -1, 0, 1, 1];
+    let left = signal_fingerprint(&signal, 7);
+    let right = signal_fingerprint(&signal, 11);
+    assert_eq!(left.long, right.long);
+    assert_eq!(left.short, right.short);
+    assert_eq!(left.signal_hash, right.signal_hash);
+    assert_eq!(left.identity.index, 7);
+    assert_eq!(right.identity.index, 11);
+    assert_eq!(left.identity.strategy_id, "candidate-7");
+    assert_eq!(right.identity.strategy_id, "candidate-11");
+}

@@ -6633,28 +6633,39 @@ fn candidate_cost_rows(
 /// name (never against a differently ordered fresh prefilter). The frame must
 /// contain every saved feature name; a missing name fails loud instead of
 /// silently reinterpreting an index.
-pub fn diagnose_research_candidates_under_cost_variants_v3(
-    input: &CanonicalSearchRunInputV2<'_>,
+struct PreparedSavedCandidateReplay<'a> {
+    _execution: crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionScopeV3,
+    inputs: CanonicalDiscoveryRunInputs<'a>,
+    projected: neoethos_data::FeatureFrame,
+    research_config: DiscoveryConfig,
+    evaluation: crate::genetic::EvaluationConfig,
+    bypass: bool,
+}
+
+impl<'a> PreparedSavedCandidateReplay<'a> {
+    fn signals(&self, candidates: &[Gene]) -> Result<(Vec<Vec<i8>>, Vec<Vec<f64>>)> {
+        locked_holdout_signals_and_confidences_with_policy(
+            candidates,
+            &self.projected,
+            self.inputs.selection().ohlcv(),
+            &self.evaluation,
+            self.bypass,
+        )
+    }
+}
+
+fn prepare_saved_candidate_replay<'a>(
+    input: &'a CanonicalSearchRunInputV2<'_>,
     config: &DiscoveryConfig,
     research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
-    candidates: &[Gene],
-    variants: &[CandidateCostVariantV1],
-) -> Result<Vec<CandidateCostDiagnosticRowV1>> {
+) -> Result<PreparedSavedCandidateReplay<'a>> {
     research.validate()?;
     let contract = research.execution_contract();
     contract.validate_against_input(input)?;
-    // Keep the exact saved execution scope alive for the entire diagnostic: it
-    // pins the contract monetary basis (pip value/conversion, spread, swaps,
-    // fees) while this function builds evaluation config and per-gene settings.
-    let _research_execution = install_research_replay_execution_scope(contract)?;
-    anyhow::ensure!(
-        !candidates.is_empty(),
-        "candidate cost diagnostic requires at least one saved candidate"
-    );
-    anyhow::ensure!(
-        !variants.is_empty(),
-        "candidate cost diagnostic requires at least one cost variant"
-    );
+    // Keep the exact saved execution scope alive through the consumer. The
+    // context owns this guard; callers must not split the guard from the
+    // materialized signals/similarity work.
+    let execution = install_research_replay_execution_scope(contract)?;
     let result = research.discovery_result();
     let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
     let selection = inputs.selection();
@@ -6677,11 +6688,6 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
         .and_then(|funnel| funnel.live_trading_policy_v1())
         .ok_or_else(|| anyhow::anyhow!("saved research lost its sealed Search signal policy"))?;
     policy.validate()?;
-    // Adaptive stops are a separate archived recipe from EvaluationConfig. The
-    // simulation reads the process-owned adaptive-base producer, so an ambient
-    // recipe that differs from the sealed Search policy would silently price
-    // every adaptive gene with different stops. Compare the whole policy, not
-    // just one scalar; fail loud instead of falling back to ambient economics.
     let sealed_adaptive_stops = policy.sealed_adaptive_stops_policy()?;
     let current_adaptive_stops =
         crate::stop_target::ResolvedAdaptiveStopsPolicyV1::capture_current()?;
@@ -6706,25 +6712,30 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
         Some(policy),
     )?;
     let projected =
-        project_locked_holdout_features(selection.features(), &result.effective_feature_names)?;
-    for gene in candidates {
-        if let Some(index) = gene.indices.iter().copied().max() {
-            anyhow::ensure!(
-                (index as usize) < projected.names.len(),
-                "saved candidate '{}' references feature index {} beyond the {} saved effective features",
-                gene.strategy_id,
-                index,
-                projected.names.len()
-            );
-        }
-    }
-    let (signals, confidences) = locked_holdout_signals_and_confidences_with_policy(
-        candidates,
-        &projected,
-        selection.ohlcv(),
-        &evaluation,
+        project_locked_holdout_features(selection.features(), &result.effective_feature_names)?
+            .into_owned();
+    Ok(PreparedSavedCandidateReplay {
+        _execution: execution,
+        inputs,
+        projected,
+        research_config,
+        evaluation,
         bypass,
-    )?;
+    })
+}
+
+pub fn diagnose_research_candidates_under_cost_variants_v3(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    candidates: &[Gene],
+    variants: &[CandidateCostVariantV1],
+) -> Result<Vec<CandidateCostDiagnosticRowV1>> {
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let selection = replay.inputs.selection();
+    let projected = &replay.projected;
+    let research_config = &replay.research_config;
+    let (signals, confidences) = replay.signals(candidates)?;
     let resolver = GeneEvalSettingsResolver::for_slice(
         &research_config,
         candidates.iter(),
@@ -6776,6 +6787,394 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
     }
     Ok(rows)
 }
+/// Fixed descriptive near-similarity thresholds for the saved-candidate
+/// signal census. These are report buckets, not selection knobs.
+pub const CANDIDATE_SIGNAL_NEAR_THRESHOLDS: [f64; 3] = [0.90, 0.95, 0.99];
+const CANDIDATE_SIGNAL_CHUNK: usize = 64;
+const CANDIDATE_SIGNAL_TOP_PAIRS: usize = 64;
+const CANDIDATE_SIGNAL_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+const CANDIDATE_SIGNAL_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateSignalIdentityV1 {
+    pub index: usize,
+    pub strategy_id: String,
+    pub exact_gene_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateSignalExactGroupV1 {
+    all_zero: bool,
+    active_bars: usize,
+    long_bars: usize,
+    short_bars: usize,
+    candidates: Vec<CandidateSignalIdentityV1>,
+}
+
+struct CandidateSignalFingerprintV1 {
+    identity: CandidateSignalIdentityV1,
+    long: Vec<u64>,
+    short: Vec<u64>,
+    active_bars: usize,
+    long_bars: usize,
+    short_bars: usize,
+    signal_hash: u64,
+    all_zero: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CandidateSignalPairStatV1 {
+    left: usize,
+    right: usize,
+    similarity: f64,
+    same_direction_bars: usize,
+    opposite_direction_bars: usize,
+    active_union_bars: usize,
+    both_zero_bars: usize,
+}
+
+fn candidate_signal_hash(signal: &[i8]) -> u64 {
+    let mut hash = CANDIDATE_SIGNAL_HASH_SEED;
+    for value in signal {
+        hash ^= u64::from(*value as u8);
+        hash = hash.wrapping_mul(CANDIDATE_SIGNAL_HASH_PRIME);
+    }
+    hash
+}
+
+fn candidate_signal_bitsets(
+    signal: &[i8],
+    n_bars: usize,
+    identity: CandidateSignalIdentityV1,
+) -> anyhow::Result<CandidateSignalFingerprintV1> {
+    anyhow::ensure!(
+        signal.len() == n_bars,
+        "saved candidate '{}' signal length {} differs from {n_bars} bars",
+        identity.strategy_id,
+        signal.len()
+    );
+    let words = n_bars.div_ceil(64);
+    let mut long = vec![0_u64; words];
+    let mut short = vec![0_u64; words];
+    let mut long_bars = 0usize;
+    let mut short_bars = 0usize;
+    for (row, value) in signal.iter().copied().enumerate() {
+        let bit = 1_u64 << (row % 64);
+        let word = row / 64;
+        match value {
+            1 => {
+                long[word] |= bit;
+                long_bars += 1;
+            }
+            -1 => {
+                short[word] |= bit;
+                short_bars += 1;
+            }
+            0 => {}
+            other => anyhow::bail!(
+                "saved candidate '{}' signal at row {row} is {other}, not -1/0/1",
+                identity.strategy_id
+            ),
+        }
+    }
+    Ok(CandidateSignalFingerprintV1 {
+        identity,
+        long,
+        short,
+        active_bars: long_bars + short_bars,
+        long_bars,
+        short_bars,
+        signal_hash: candidate_signal_hash(signal),
+        all_zero: long_bars + short_bars == 0,
+    })
+}
+
+fn candidate_signal_popcount_and(a: &[u64], b: &[u64]) -> usize {
+    a.iter()
+        .zip(b)
+        .map(|(left, right)| (left & right).count_ones() as usize)
+        .sum()
+}
+
+fn candidate_signal_pair_stat(
+    left: usize,
+    right: usize,
+    fingerprints: &[CandidateSignalFingerprintV1],
+    n_bars: usize,
+) -> Option<CandidateSignalPairStatV1> {
+    let left = &fingerprints[left];
+    let right = &fingerprints[right];
+    let active_union_bars =
+        candidate_signal_popcount_or(&left.long, &left.short, &right.long, &right.short);
+    if active_union_bars == 0 {
+        return None;
+    }
+    let same_direction_bars = candidate_signal_popcount_and(&left.long, &right.long)
+        + candidate_signal_popcount_and(&left.short, &right.short);
+    let opposite_direction_bars = candidate_signal_popcount_and(&left.long, &right.short)
+        + candidate_signal_popcount_and(&left.short, &right.long);
+    Some(CandidateSignalPairStatV1 {
+        left: 0,
+        right: 0,
+        similarity: same_direction_bars as f64 / active_union_bars as f64,
+        same_direction_bars,
+        opposite_direction_bars,
+        active_union_bars,
+        both_zero_bars: n_bars - active_union_bars,
+    })
+}
+
+fn candidate_signal_popcount_or(
+    left_long: &[u64],
+    left_short: &[u64],
+    right_long: &[u64],
+    right_short: &[u64],
+) -> usize {
+    left_long
+        .iter()
+        .zip(left_short)
+        .zip(right_long.iter().zip(right_short))
+        .map(|((a_long, a_short), (b_long, b_short))| {
+            ((a_long | a_short) | (b_long | b_short)).count_ones() as usize
+        })
+        .sum()
+}
+
+pub fn summarize_research_candidate_signal_similarity_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+) -> anyhow::Result<serde_json::Value> {
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let result = research.discovery_result();
+    let candidates = &result.candidates;
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "saved candidate signal behavior census requires at least one saved candidate"
+    );
+    let n_bars = replay.inputs.selection().ohlcv().len();
+    anyhow::ensure!(
+        n_bars > 0,
+        "saved candidate signal behavior census has no bars"
+    );
+    let mut fingerprints = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(CANDIDATE_SIGNAL_CHUNK) {
+        let (signals, confidences) = replay.signals(chunk)?;
+        anyhow::ensure!(
+            signals.len() == chunk.len(),
+            "saved candidate signal replay returned {} signal rows for {} candidates",
+            signals.len(),
+            chunk.len()
+        );
+        anyhow::ensure!(
+            confidences.len() == chunk.len(),
+            "saved candidate signal replay returned {} confidence rows for {} candidates",
+            confidences.len(),
+            chunk.len()
+        );
+        for (gene, signal) in chunk.iter().zip(signals.iter()) {
+            let identity = CandidateSignalIdentityV1 {
+                index: fingerprints.len(),
+                strategy_id: gene.strategy_id.clone(),
+                exact_gene_hash: crate::artifact_io::stable_json_hash(gene)?,
+            };
+            fingerprints.push(candidate_signal_bitsets(signal, n_bars, identity)?);
+        }
+        // Signals/confidences are chunk-scoped; only compact bitsets and
+        // identities survive. No all-candidate f64 arrays are retained.
+        drop(signals);
+        drop(confidences);
+    }
+    anyhow::ensure!(
+        fingerprints.len() == candidates.len(),
+        "saved candidate signal behavior census lost candidates"
+    );
+
+    let mut exact_buckets: std::collections::HashMap<u64, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, fingerprint) in fingerprints.iter().enumerate() {
+        exact_buckets
+            .entry(fingerprint.signal_hash)
+            .or_default()
+            .push(index);
+    }
+    let mut exact_signal_groups = Vec::new();
+    let mut exact_signal_candidate_count = 0usize;
+    let mut all_zero_candidates = 0usize;
+    for indices in exact_buckets.into_values() {
+        if indices.len() < 2 {
+            if fingerprints[indices[0]].all_zero {
+                all_zero_candidates += 1;
+            }
+            continue;
+        }
+        let mut remaining = indices;
+        while let Some(first) = remaining.pop() {
+            let first_fp = &fingerprints[first];
+            let mut group = vec![first];
+            remaining.retain(|&index| {
+                let fp = &fingerprints[index];
+                if fp.long == first_fp.long && fp.short == first_fp.short {
+                    group.push(index);
+                    false
+                } else {
+                    true
+                }
+            });
+            if group.len() > 1 {
+                group.sort_unstable();
+                let group_fp = &fingerprints[group[0]];
+                if group_fp.all_zero {
+                    all_zero_candidates += group.len();
+                }
+                exact_signal_candidate_count += group.len();
+                exact_signal_groups.push(CandidateSignalExactGroupV1 {
+                    all_zero: group_fp.all_zero,
+                    active_bars: group_fp.active_bars,
+                    long_bars: group_fp.long_bars,
+                    short_bars: group_fp.short_bars,
+                    candidates: group
+                        .into_iter()
+                        .map(|index| fingerprints[index].identity.clone())
+                        .collect(),
+                });
+            } else if first_fp.all_zero {
+                all_zero_candidates += 1;
+            }
+        }
+    }
+    exact_signal_groups
+        .sort_by(|left, right| left.candidates[0].index.cmp(&right.candidates[0].index));
+
+    let mut defined_pairs = 0usize;
+    let mut undefined_zero_union_pairs = 0usize;
+    let mut same_direction_bars_sum = 0u64;
+    let mut opposite_direction_bars_sum = 0u64;
+    let mut active_union_bars_sum = 0u64;
+    let mut threshold_counts = [0usize; CANDIDATE_SIGNAL_NEAR_THRESHOLDS.len()];
+    let mut top_pairs: Vec<CandidateSignalPairStatV1> =
+        Vec::with_capacity(CANDIDATE_SIGNAL_TOP_PAIRS);
+    for left in 0..fingerprints.len() {
+        for right in (left + 1)..fingerprints.len() {
+            let Some(mut stat) = candidate_signal_pair_stat(left, right, &fingerprints, n_bars)
+            else {
+                undefined_zero_union_pairs += 1;
+                continue;
+            };
+            stat.left = left;
+            stat.right = right;
+            defined_pairs += 1;
+            same_direction_bars_sum += stat.same_direction_bars as u64;
+            opposite_direction_bars_sum += stat.opposite_direction_bars as u64;
+            active_union_bars_sum += stat.active_union_bars as u64;
+            for (slot, threshold) in CANDIDATE_SIGNAL_NEAR_THRESHOLDS.iter().enumerate() {
+                if stat.similarity >= *threshold {
+                    threshold_counts[slot] += 1;
+                }
+            }
+            if top_pairs.len() < CANDIDATE_SIGNAL_TOP_PAIRS {
+                top_pairs.push(stat);
+            } else {
+                let (worst_index, worst) = top_pairs
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, left), (_, right)| {
+                        left.similarity
+                            .total_cmp(&right.similarity)
+                            .then_with(|| right.left.cmp(&left.left))
+                            .then_with(|| right.right.cmp(&left.right))
+                    })
+                    .map(|(index, stat)| (index, *stat))
+                    .expect("nonempty top pairs");
+                let better = stat
+                    .similarity
+                    .total_cmp(&worst.similarity)
+                    .then_with(|| worst.left.cmp(&stat.left))
+                    .then_with(|| worst.right.cmp(&stat.right))
+                    .is_gt();
+                if better {
+                    top_pairs[worst_index] = stat;
+                }
+            }
+        }
+    }
+    top_pairs.sort_by(|left, right| {
+        right
+            .similarity
+            .total_cmp(&left.similarity)
+            .then_with(|| left.left.cmp(&right.left))
+            .then_with(|| left.right.cmp(&right.right))
+    });
+
+    let near_thresholds = CANDIDATE_SIGNAL_NEAR_THRESHOLDS
+        .iter()
+        .copied()
+        .zip(threshold_counts)
+        .map(|(threshold, count)| {
+            serde_json::json!({
+                "similarity_threshold": threshold,
+                "defined_pairs_at_or_above_threshold": count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let exact_signal_groups = exact_signal_groups
+        .into_iter()
+        .map(|group| {
+            serde_json::json!({
+                "all_zero": group.all_zero,
+                "support_bars": group.active_bars,
+                "long_active_bars": group.long_bars,
+                "short_active_bars": group.short_bars,
+                "candidate_identities": group.candidates,
+            })
+        })
+        .collect::<Vec<_>>();
+    let top_pairs = top_pairs
+        .into_iter()
+        .map(|stat| {
+            serde_json::json!({
+                "left_candidate": fingerprints[stat.left].identity,
+                "right_candidate": fingerprints[stat.right].identity,
+                "signal_similarity": stat.similarity,
+                "same_direction_active_bars": stat.same_direction_bars,
+                "opposite_direction_active_bars": stat.opposite_direction_bars,
+                "active_union_bars": stat.active_union_bars,
+                "both_zero_bars": stat.both_zero_bars,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "schema": "neoethos.research-only.candidate-signal-behavior-census.v1",
+        "candidate_count": fingerprints.len(),
+        "signal_bars": n_bars,
+        "provenance": {
+            "ordered_effective_feature_count": result.effective_feature_names.len(),
+            "ordered_effective_feature_names": result.effective_feature_names,
+            "saved_feature_plan_identity": result.search_input_receipt.feature_plan_identity(),
+            "saved_feature_provenance_identity": result.search_input_receipt.feature_provenance_identity(),
+            "saved_feature_content_sha256": result.search_input_receipt.feature_content_sha256(),
+            "sealed_smc_gate_threshold": result.effective_smc_gate_threshold,
+            "saved_selection_start_ms": replay.inputs.selection().features().timestamps.first()
+                .ok_or_else(|| anyhow::anyhow!("saved candidate signal behavior census has no timestamps"))?,
+            "saved_selection_end_ms": replay.inputs.selection().features().timestamps.last()
+                .ok_or_else(|| anyhow::anyhow!("saved candidate signal behavior census has no timestamps"))?,
+        },
+        "summary": {
+            "all_zero_candidate_count": all_zero_candidates,
+            "defined_pair_count": defined_pairs,
+            "undefined_zero_union_pair_count": undefined_zero_union_pairs,
+            "same_direction_active_bars_sum": same_direction_bars_sum,
+            "opposite_direction_active_bars_sum": opposite_direction_bars_sum,
+            "active_union_bars_total": active_union_bars_sum,
+            "exact_signal_group_total": exact_signal_groups.len(),
+            "exact_signal_candidate_total": exact_signal_candidate_count,
+        },
+        "exact_signal_groups": exact_signal_groups,
+        "near_thresholds": near_thresholds,
+        "top_pairs": top_pairs,
+    }))
+}
+
 /// Install the saved research execution scope for the diagnostic replay.
 ///
 /// Without this RAII scope the discovery evaluation path falls back to ambient

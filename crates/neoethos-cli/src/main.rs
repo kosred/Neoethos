@@ -2216,6 +2216,21 @@ fn cmd_discover_on_budgeted_pool(
         // Research-only saved-candidate cost diagnosis. It reads a saved
         // research envelope and re-costs its candidates; it never runs Search.
         let diagnose_cost_out = parse_flag(args, "--diagnose-candidate-costs-out");
+        let diagnose_signals_out = parse_flag(args, "--diagnose-candidate-signals-out");
+        if let Some(out) = diagnose_signals_out.as_deref() {
+            anyhow::ensure!(
+                saved_research.is_some(),
+                "candidate signal behavior census requires --resume-research and --resume-research-sha256"
+            );
+            anyhow::ensure!(
+                diagnose_cost_out.is_none(),
+                "candidate signal behavior census cannot be combined with candidate cost diagnosis"
+            );
+            anyhow::ensure!(
+                !std::path::Path::new(out).exists(),
+                "candidate signal behavior census output must be a new path: {out}"
+            );
+        }
         let diagnose_cost_variants = match parse_flag(args, "--diagnose-cost-variants") {
             Some(spec) => canonical_research::parse_diagnostic_cost_variants(&spec)?,
             None => Vec::new(),
@@ -2680,8 +2695,40 @@ fn cmd_discover_on_budgeted_pool(
                                 == contract.identity_sha256()?,
                             "saved research contract differs from the reopened sources and settings"
                         );
+                        let result_ref = research.discovery_result();
+                        if let Some(signals_out) = diagnose_signals_out.as_deref() {
+                            let diag_path = std::path::Path::new(signals_out);
+                            anyhow::ensure!(
+                                !diag_path.exists(),
+                                "candidate signal behavior census output must be a new path: {signals_out}"
+                            );
+                            if let Some(parent) = diag_path.parent()
+                                && !parent.as_os_str().is_empty()
+                            {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let census = neoethos_search::discovery::summarize_research_candidate_signal_similarity_v1(
+                                &run_input,
+                                &research_config,
+                                &research,
+                            )?;
+                            let document = serde_json::json!({
+                                "schema": "neoethos.research-only.candidate-signal-behavior-census-report.v1",
+                                "artifact_class": "ResearchOnly",
+                                "promotion_eligibility": "NotPromotionEligible",
+                                "authorization_issued": false,
+                                "authority": "research-only-actual-saved-candidate-signals-not-trades-equity-or-promotion-authority",
+                                "warning": "Raw saved-candidate signal behavior on the sealed selection frame. Signal similarity is not confidence, sized-trade, equity, cost-band, or promotion evidence.",
+                                "saved_research_sha256": &saved.sha256,
+                                "contract_identity_sha256": contract.identity_sha256()?,
+                                "saved_effective_feature_names": &result_ref.effective_feature_names,
+                                "signal_behavior": census,
+                            });
+                            neoethos_core::storage::json::write_json_atomic(diag_path, &document)?;
+                            emit_cpu_research_stage("candidate_signal_behavior_census_written");
+                            return Ok(research);
+                        }
                         if let Some(diag_out) = diagnose_cost_out.as_deref() {
-                            let result_ref = research.discovery_result();
                             let diag_path = std::path::Path::new(diag_out);
                             anyhow::ensure!(
                                 !diag_path.exists(),
@@ -5343,6 +5390,9 @@ fn print_help() {
     );
     println!(
         "    research-only saved-candidate cost diagnosis: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-costs-out <new-json> --diagnose-cost-variants label=<round-trip-pips>:<round-trip-commission>,..."
+    );
+    println!(
+        "    research-only saved-candidate signal behavior: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-signals-out <new-json>"
     );
     println!(
         "                               One bounded CPU research run from exact acquisition receipts through D1 costs, discovery and chronological holdout evidence. Never authorizes promotion."
