@@ -3509,11 +3509,15 @@ fn weekly_generation_selection(
     let valid_positions: Vec<usize> = (0..sorted_ranks.len())
         .filter(|position| !sorted_ranks[*position].invalid)
         .collect();
+    // Feasibility classes compare lexicographically for progress. The original
+    // financial scorer can be below -1 even for an accepted strategy, so
+    // 1 + fitness could rank a feasible generation below an infeasible one.
+    let smooth = |value: f64| value / (1.0 + value.abs());
     let progress = if let Some(feasible) = sorted_ranks
         .iter()
         .find(|rank| !rank.invalid && rank.feasible)
     {
-        1.0 + feasible.fitness
+        2.0 + smooth(feasible.fitness)
     } else if let Some(best) = sorted_ranks
         .iter()
         .filter(|rank| !rank.invalid)
@@ -6713,5 +6717,49 @@ mod weekly_integration_tests {
                 "reproduction categories reconcile to the produced population"
             );
         }
+    }
+
+    #[test]
+    fn weekly_integration_feasible_progress_outranks_infeasible_even_with_negative_financial_fitness()
+     {
+        let metrics = [
+            100.0, 0.0, 11_000.0, 0.09, 0.55, 1.2, 1.0, 0.0, 100.0, 0.1, 0.04,
+        ];
+        let financial = crate::scoring::ga_fitness(&metrics);
+        assert!(
+            financial < -1.0,
+            "fixture exposes the negative feasible scorer: {financial}"
+        );
+        let objective = test_weekly_objective();
+        let feasible_report = report(0, 100);
+        let infeasible_report = report(1, 100);
+        let reports = [feasible_report.clone(), infeasible_report.clone()];
+        let feasible = weekly_generation_selection(
+            &objective,
+            &[metrics, metrics],
+            &reports,
+            &[financial, financial],
+        )
+        .unwrap();
+        let infeasible = weekly_generation_selection(
+            &objective,
+            &[metrics, metrics],
+            &[infeasible_report.clone(), infeasible_report],
+            &[financial, financial],
+        )
+        .unwrap();
+        assert!(feasible.ranks[0].feasible);
+        assert!(!infeasible.ranks[0].feasible);
+        assert!(
+            feasible.progress > infeasible.progress,
+            "feasible progress {} must outrank infeasible {}",
+            feasible.progress,
+            infeasible.progress
+        );
+        let previous_best = infeasible.progress;
+        assert!(
+            feasible.progress > previous_best + 1e-4,
+            "the actual stagnation reset condition fires on the first accepted strategy"
+        );
     }
 }

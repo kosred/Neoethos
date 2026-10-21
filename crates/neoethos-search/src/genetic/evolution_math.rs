@@ -127,23 +127,32 @@ fn softmax_weights(
     selection_temperature: f64,
 ) -> Vec<f64> {
     let temperature = selection_temperature.max(1e-6);
-    let max_score = candidate_indices
+    let eligible: Vec<f64> = candidate_indices
         .iter()
         .filter_map(|idx| scores.get(*idx))
         .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    if !max_score.is_finite() {
+        .filter(|score| score.is_finite())
+        .collect();
+    if eligible.is_empty() {
+        // Explicit all-invalid fallback: no finite eligible genome exists.
+        // This is degenerate uniform fallback, never healthy selection and
+        // never promotion of an invalid genome above a finite one.
         return vec![1.0; candidate_indices.len()];
     }
+    let max_score = eligible.into_iter().fold(f64::NEG_INFINITY, f64::max);
 
     candidate_indices
         .iter()
         .map(|idx| {
-            let centered = (scores[*idx] - max_score) / temperature;
+            let score = scores[*idx];
+            if !score.is_finite() {
+                return 0.0;
+            }
+            let centered = (score - max_score) / temperature;
             if centered.is_finite() {
                 centered.exp().max(1e-12)
             } else {
-                1.0
+                0.0
             }
         })
         .collect()
@@ -2187,6 +2196,22 @@ mod generator_audit_tests {
         assert_eq!(
             unchanged_genome, 0,
             "forced duplicate retry sample produced no unchanged genomes; source branch draws wholesale newborns, this counter alone cannot distinguish a local mutation"
+        );
+    }
+
+    #[test]
+    fn softmax_never_promotes_invalid_genome_above_finite_candidates() {
+        let weights = softmax_weights(&[2.0, f64::NEG_INFINITY, 1.0], &[0, 1, 2], 1.0);
+        let total: f64 = weights.iter().sum();
+        assert!((weights[0] - 1.0).abs() < 1e-12);
+        assert_eq!(weights[1], 0.0, "invalid candidate weight is zero");
+        assert!((weights[2] - (-1.0f64).exp()).abs() < 1e-12);
+        assert!(weights[1] / total < 1e-12);
+        assert!((weights[0] / total - 1.0 / (1.0 + (-1.0f64).exp())).abs() < 1e-12);
+        assert_eq!(
+            softmax_weights(&[f64::NEG_INFINITY, f64::NEG_INFINITY], &[0, 1], 1.0),
+            vec![1.0, 1.0],
+            "all-invalid remains an explicit uniform fallback"
         );
     }
 }
