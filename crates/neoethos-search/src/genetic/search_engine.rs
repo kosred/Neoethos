@@ -5578,7 +5578,7 @@ mod evaluated_generation_handoff_tests {
                 })
             },
             |_, _, score, _, _| {
-                assert!(score > 0.0);
+                assert!(score.is_finite(), "financial progress score stays finite");
                 positive_progress += 1;
             },
             || false,
@@ -5597,19 +5597,29 @@ mod evaluated_generation_handoff_tests {
                 .final_policy_replay_evaluation_slots
                 > 0
         );
-        assert!(
-            result
-                .genes
-                .windows(2)
-                .all(|p| p[0].fitness >= p[1].fitness)
-        );
+        let replay_metrics: Vec<[f64; 11]> = result.metrics.clone();
+        let replay_fitness: Vec<f64> = result.genes.iter().map(|gene| gene.fitness).collect();
+        let ranks = crate::scoring::weekly_cadence::weekly_selection_ranks(
+            &objective,
+            &replay_metrics,
+            reports,
+            &replay_fitness,
+        )
+        .unwrap();
+        let expected = crate::scoring::weekly_cadence::weekly_selection_order(&ranks);
+        for (position, index) in expected.iter().enumerate() {
+            assert_eq!(
+                result.genes[position].strategy_id,
+                result.genes[*index].strategy_id
+            );
+        }
         for ((gene, m), r) in result.genes.iter().zip(&result.metrics).zip(reports) {
             assert_eq!(m[8], r.trades as f64);
+            let expected_fitness = crate::scoring::ga_fitness(m);
             assert_eq!(
-                gene.fitness,
-                objective.fitness(m, r, crate::scoring::ga_fitness(m))
+                gene.fitness, expected_fitness,
+                "weekly keeps the financial scorer in Gene.fitness"
             );
-            assert_eq!(gene.fitness > 0.0, r.feasible());
         }
         Ok(())
     }

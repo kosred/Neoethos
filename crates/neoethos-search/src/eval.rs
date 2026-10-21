@@ -75,15 +75,9 @@ impl PopulationEvaluationV1 {
             anyhow::ensure!(self.cadence.is_none(), "unbound weekly observations");
         }
         crate::genetic::apply_metrics(genes, &self.metrics, config, span);
-        if let Some(objective) = config.weekly_objective {
-            for ((gene, metrics), report) in genes
-                .iter_mut()
-                .zip(&self.metrics)
-                .zip(self.cadence.as_ref().unwrap())
-            {
-                gene.fitness = objective.fitness(metrics, report, gene.fitness);
-            }
-        }
+        // Weekly runs keep the ORIGINAL financial scorer in Gene.fitness. The
+        // versioned vector/front selection owns weekly ordering; the legacy
+        // per-window 1000-tier objective is historical/diagnostic only.
         Ok(())
     }
 }
