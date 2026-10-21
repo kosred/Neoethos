@@ -1370,6 +1370,13 @@ pub fn mutate(
     mutated.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
     mutated.generation = generation;
     reset_gene_metrics(&mut mutated);
+    if mutated.has_total_weight_cancellation(n_indicators) {
+        // A finite crossover child can algebraically cancel every term. Treat
+        // that as a degenerate offspring requiring explicit replacement, using
+        // the existing seeded newborn mechanism; normalize fixed +1 fallback
+        // would silently turn a canceled inherited term into a strong active one.
+        return new_random_gene(n_indicators, max_indicators, generation, smc_cfg, rng);
+    }
     mutated.normalize(n_indicators, 1);
     mutated
 }
@@ -2242,6 +2249,97 @@ mod generator_audit_tests {
             unchanged_genome, 0,
             "forced duplicate retry sample produced no unchanged genomes; source branch draws wholesale newborns, this counter alone cannot distinguish a local mutation"
         );
+    }
+
+    fn cancellation_parent_genes() -> (Gene, Gene) {
+        let mut a = Gene {
+            indices: vec![140, 202],
+            weights: vec![0.2, -0.4],
+            long_threshold: 0.2,
+            short_threshold: -0.2,
+            sl_pips: 20.0,
+            tp_pips: 40.0,
+            ..Gene::default()
+        };
+        a.normalize(323, 1);
+        let mut b = Gene {
+            indices: vec![97, 140],
+            weights: vec![0.4, -0.2],
+            long_threshold: 0.2,
+            short_threshold: -0.2,
+            sl_pips: 20.0,
+            tp_pips: 40.0,
+            ..Gene::default()
+        };
+        b.normalize(323, 1);
+        (a, b)
+    }
+
+    #[test]
+    fn finite_total_cancellation_is_replaced_not_injected_as_plus_one() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let (a, b) = cancellation_parent_genes();
+        let child = crossover(&a, &b, 1, &mut StdRng::seed_from_u64(1));
+        assert_eq!(child.indices, vec![140, 140]);
+        assert_eq!(child.weights, vec![0.2, -0.2]);
+        assert!(child.has_total_weight_cancellation(323));
+
+        // Reproduce mutate's exact first RNG draw type/shape. This seed selects
+        // a branch that rewrites no index or weight, so the pre-repair final
+        // normalize would have converted the canceled term to [140] weight +1.0.
+        let mut branch_rng = StdRng::seed_from_u64(0);
+        let branch: i32 = branch_rng.random_range(0..4);
+        assert!(
+            branch == 1 || branch == 3,
+            "expected a threshold/SMC branch with no index/weight rewrite, got {branch}"
+        );
+        let mut old_style = child.clone();
+        old_style.normalize(323, 1);
+        assert_eq!(old_style.indices, vec![140]);
+        assert_eq!(old_style.weights, vec![1.0]);
+        let cfg = SmcSearchConfig::default();
+        let mut rng = StdRng::seed_from_u64(0);
+        let replacement = mutate(&child, 323, 5, 1, &cfg, 1, &mut rng);
+        assert!(!replacement.has_total_weight_cancellation(323));
+        assert!(replacement.weights.iter().all(|weight| *weight != 0.0));
+        assert_ne!(replacement.indices, vec![140]);
+        assert_ne!(replacement.weights, vec![1.0]);
+
+        let mut second_rng = StdRng::seed_from_u64(0);
+        let repeated = mutate(&child, 323, 5, 1, &cfg, 1, &mut second_rng);
+        assert_eq!(replacement.indices, repeated.indices);
+        assert_eq!(replacement.weights, repeated.weights);
+        assert_eq!(replacement.long_threshold, repeated.long_threshold);
+        assert_eq!(replacement.short_threshold, repeated.short_threshold);
+        assert_eq!(replacement.sl_pips, repeated.sl_pips);
+        assert_eq!(replacement.tp_pips, repeated.tp_pips);
+
+        // Preserve signed noncanceling and partial-cancellation offspring.
+        let mut partial = Gene {
+            indices: vec![140, 140, 231],
+            weights: vec![0.2, -0.2, -0.8],
+            ..Gene::default()
+        };
+        partial.normalize(323, 1);
+        assert_eq!(partial.indices, vec![231]);
+        assert_eq!(partial.weights, vec![-0.8]);
+        let mut signed = Gene {
+            indices: vec![140],
+            weights: vec![-1.0],
+            ..Gene::default()
+        };
+        signed.normalize(323, 1);
+        assert_eq!(signed.indices, vec![140]);
+        assert_eq!(signed.weights, vec![-1.0]);
+
+        // Malformed-input repair is intentionally unchanged.
+        let mut malformed = Gene {
+            indices: vec![140],
+            weights: vec![f64::NAN],
+            ..Gene::default()
+        };
+        malformed.normalize(323, 1);
+        assert_eq!(malformed.weights, vec![1.0]);
     }
 
     #[test]

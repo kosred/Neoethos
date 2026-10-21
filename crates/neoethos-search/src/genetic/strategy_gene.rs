@@ -730,6 +730,25 @@ impl Gene {
             || (cfg.opportunistic_enabled && cfg.use_opportunistic_candidates)
     }
 
+    /// True only when every finite term survives the same index merge that
+    /// normalize performs but the algebraic sum is zero. This is a degenerate
+    /// newly bred child, not a malformed input: callers must replace it rather
+    /// than let normalize inject the fixed +1 fallback.
+    pub(crate) fn has_total_weight_cancellation(&self, n_indicators: usize) -> bool {
+        let n_indicators = n_indicators.max(1);
+        if self.indices.is_empty() || self.weights.len() != self.indices.len() {
+            return false;
+        }
+        let mut merged = std::collections::BTreeMap::<usize, f64>::new();
+        for (index, weight) in self.indices.iter().zip(&self.weights) {
+            if !weight.is_finite() {
+                return false;
+            }
+            *merged.entry(index % n_indicators).or_insert(0.0) += *weight;
+        }
+        !merged.is_empty() && merged.values().all(|weight| weight.abs() <= 1e-6)
+    }
+
     pub fn normalize(&mut self, n_indicators: usize, min_indicators: usize) {
         let n_indicators = n_indicators.max(1);
         let min_indicators = min_indicators.clamp(1, n_indicators);
