@@ -104,7 +104,7 @@ tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 # In-process, cancellation-aware DNS for the persistent cTrader socket. This
 # avoids std::net::ToSocketAddrs/getaddrinfo, whose blocking call cannot observe
 # an exact-run stop token or the cumulative connect deadline.
-hickory-resolver = "0.26.1"
+hickory-resolver = "0.26.3"
 futures = "0.3.31"
 # **2026-05-25 — SSE push channel**: `BroadcastStream` adapter so
 # the `/live/spots/stream` SSE endpoint can wrap a
@@ -129,7 +129,7 @@ zip = "7.2"
 # CryptoProvider before tungstenite builds a ClientConfig; without this,
 # the mixed reqwest/object_store feature graph can enable both ring and
 # aws-lc-rs and rustls 0.23 panics at runtime.
-rustls = { version = "0.23", default-features = true, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = true, features = ["ring", "std", "tls12"] }
 
 # ── Flutter migration (Phase 1) ─────────────────────────────────────────────
 # axum is the HTTP layer the Flutter front-end talks to. Latest stable 0.8.x
