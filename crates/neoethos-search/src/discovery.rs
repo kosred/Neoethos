@@ -8259,7 +8259,8 @@ impl Drop for RecordedEffectiveFeatureNamesGuard {
 pub fn install_recorded_effective_feature_names(
     expected: Vec<String>,
 ) -> RecordedEffectiveFeatureNamesGuard {
-    let previous = RECORDED_EFFECTIVE_FEATURE_NAMES.with(|slot| slot.borrow_mut().replace(expected));
+    let previous =
+        RECORDED_EFFECTIVE_FEATURE_NAMES.with(|slot| slot.borrow_mut().replace(expected));
     RecordedEffectiveFeatureNamesGuard { previous }
 }
 
@@ -9073,8 +9074,9 @@ where
             crate::genetic::clear_adaptive_threshold_ladder();
             tracing::warn!(
                 target: "neoethos_search::discovery",
-                "F-277: adaptive ladder derivation returned None (degenerate \
-                 feature cube: empty or zero-variance). Falling back to static ladder."
+                "F-277: adaptive ladder derivation returned None (empty or \
+                 zero-variance feature cube, or normalized medians collapsed to \
+                 insufficiently distinct levels). Falling back to static ladder."
             );
         }
     } else {
@@ -14563,7 +14565,6 @@ fn indexed_candidates_preserving_ga_order(
     );
     Ok(candidates.into_iter().enumerate().collect())
 }
-
 
 fn candidate_truncation_limit(requested: usize, available: usize) -> usize {
     if available == 0 {
