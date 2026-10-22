@@ -7091,3 +7091,137 @@ fn candidate_signal_aggregate_top64_is_deterministic_and_keeps_candidate_ids() {
     }
     assert!(first.top_pairs.iter().all(|pair| pair.left < 12));
 }
+
+#[test]
+fn saved_candidate_weekday_selection_requires_exact_identity_and_small_explicit_set() {
+    let spec = "0:gene_953632_18:fnv64:c7f02e00c7b758c5,83:gene_782139_19:fnv64:88f81216a43578eb";
+    let selections = parse_saved_candidate_selections_v1(spec).expect("explicit selectors");
+    assert_eq!(selections.len(), 2);
+    assert_eq!(selections[0].index, 0);
+    assert_eq!(selections[1].exact_gene_hash, "fnv64:88f81216a43578eb");
+    assert!(parse_saved_candidate_selections_v1("").is_err());
+    assert!(
+        parse_saved_candidate_selections_v1(
+            "0:gene_953632_18:fnv64:c7f02e00c7b758c5,0:gene_782139_19:fnv64:88f81216a43578eb"
+        )
+        .is_err()
+    );
+    assert!(parse_saved_candidate_selections_v1("0:gene_953632_18:fnv64:nothex").is_err());
+
+    let mut gene = Gene::default();
+    gene.strategy_id = "gene_953632_18".to_string();
+    let hash = stable_json_hash(&gene).unwrap();
+    let good = SavedCandidateSelectionV1 {
+        index: 0,
+        strategy_id: gene.strategy_id.clone(),
+        exact_gene_hash: hash,
+    };
+    assert!(saved_candidate_gene_for_selection_v1(&[gene.clone()], &good).is_ok());
+    let mut wrong_index = good.clone();
+    wrong_index.index = 1;
+    assert!(saved_candidate_gene_for_selection_v1(&[gene.clone()], &wrong_index).is_err());
+    let mut wrong_id = good.clone();
+    wrong_id.strategy_id = "gene_other".to_string();
+    assert!(saved_candidate_gene_for_selection_v1(&[gene.clone()], &wrong_id).is_err());
+    let mut wrong_hash = good;
+    wrong_hash.exact_gene_hash = "fnv64:0000000000000000".to_string();
+    assert!(saved_candidate_gene_for_selection_v1(&[gene], &wrong_hash).is_err());
+}
+
+#[test]
+fn saved_candidate_weekday_signal_counts_map_prior_bar_to_next_execution_date() {
+    let friday = chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap();
+    let saturday = chrono::NaiveDate::from_ymd_opt(2026, 10, 17).unwrap();
+    let sunday = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+    let monday = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+    let dates = vec![friday, saturday, sunday, monday];
+    let signal = [1_i8, 0, 0, 1];
+    let (counts, omitted) = saved_candidate_signal_day_counts_v1(&signal, &dates).unwrap();
+    assert_eq!(omitted, 1, "final signal has no next execution bar");
+    assert_eq!(counts[&friday].raw_post_gate_nonzero_signal_bars, 1);
+    assert_eq!(
+        counts[&friday].nonzero_prior_signal_at_next_execution_bar,
+        0
+    );
+    assert_eq!(counts[&saturday].raw_post_gate_nonzero_signal_bars, 0);
+    assert_eq!(
+        counts[&saturday].nonzero_prior_signal_at_next_execution_bar,
+        1
+    );
+    assert_eq!(counts[&monday].raw_post_gate_nonzero_signal_bars, 1);
+    assert_eq!(
+        counts[&monday].nonzero_prior_signal_at_next_execution_bar,
+        0
+    );
+    assert_eq!(counts[&friday].observed_bars, 1);
+
+    let calendar = saved_candidate_calendar_dates_v1(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 10, 16, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis(),
+        chrono::Utc
+            .with_ymd_and_hms(2026, 10, 19, 23, 59, 59)
+            .unwrap()
+            .timestamp_millis(),
+    )
+    .unwrap();
+    assert_eq!(calendar, dates);
+    assert_eq!(
+        calendar
+            .iter()
+            .filter(|date| date.weekday().num_days_from_monday() >= 5)
+            .count(),
+        2
+    );
+    let extended = saved_candidate_calendar_dates_v1(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 10, 16, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis(),
+        chrono::Utc
+            .with_ymd_and_hms(2026, 10, 21, 23, 59, 59)
+            .unwrap()
+            .timestamp_millis(),
+    )
+    .unwrap();
+    assert_eq!(extended.len(), 6);
+    let tuesday = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+    assert!(extended.contains(&tuesday));
+    assert!(
+        counts.get(&tuesday).is_none(),
+        "a barless expected weekday remains a zero bucket, not an implicit observation"
+    );
+    assert_eq!(
+        extended
+            .iter()
+            .filter(|date| date.weekday().num_days_from_monday() >= 5)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn saved_candidate_weekday_metric_deltas_keep_unavailable_slots_and_fail_material_counts() {
+    let mut gene = Gene::default();
+    gene.trades_count = 2;
+    gene.sharpe_ratio = 1.0;
+    gene.max_drawdown = 0.1;
+    gene.win_rate = 0.5;
+    gene.profit_factor = 1.2;
+    gene.expectancy = 3.0;
+    gene.consistency = 0.4;
+    let actual = [100.0, 1.5, 500.0, 0.1, 0.5, 1.2, 3.0, 0.25, 3.0, 0.4, 0.02];
+    let (deltas, reasons) = saved_candidate_metric_deltas_v1(&gene, &actual);
+    assert_eq!(deltas.len(), 11);
+    assert!(deltas[0].is_none());
+    assert!(deltas[2].is_none());
+    assert!(deltas[7].is_none());
+    assert!(deltas[10].is_none());
+    assert!((deltas[1].unwrap() - 0.5).abs() < 1e-12);
+    assert!((deltas[8].unwrap() - 1.0).abs() < 1e-12);
+    assert!(
+        reasons.iter().any(|reason| reason.contains("trade_count")),
+        "trade-count mismatch must be explicit: {reasons:?}"
+    );
+}

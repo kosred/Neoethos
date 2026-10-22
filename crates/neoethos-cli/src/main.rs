@@ -2217,6 +2217,46 @@ fn cmd_discover_on_budgeted_pool(
         // research envelope and re-costs its candidates; it never runs Search.
         let diagnose_cost_out = parse_flag(args, "--diagnose-candidate-costs-out");
         let diagnose_signals_out = parse_flag(args, "--diagnose-candidate-signals-out");
+        let diagnose_weekdays_out = parse_flag(args, "--diagnose-candidate-weekdays-out");
+        let diagnose_weekday_selectors = parse_flag(args, "--diagnose-candidate-selectors");
+        let diagnose_weekday_selections = match (
+            diagnose_weekdays_out.as_deref(),
+            diagnose_weekday_selectors.as_deref(),
+        ) {
+            (None, None) => Vec::new(),
+            (Some(out), Some(spec)) => {
+                anyhow::ensure!(
+                    saved_research.is_some(),
+                    "candidate weekday attribution requires --resume-research and --resume-research-sha256"
+                );
+                anyhow::ensure!(
+                    diagnose_cost_out.is_none() && diagnose_signals_out.is_none(),
+                    "candidate weekday attribution cannot be combined with cost or signal diagnosis"
+                );
+                anyhow::ensure!(
+                    new_search.is_none() && quote_replay.is_none(),
+                    "candidate weekday attribution cannot be combined with fresh-search or quote replay"
+                );
+                anyhow::ensure!(
+                    !std::path::Path::new(out).exists(),
+                    "candidate weekday attribution output must be a new path: {out}"
+                );
+                let selections =
+                    neoethos_search::discovery::parse_saved_candidate_selections_v1(spec)?;
+                let saved = saved_research
+                    .as_ref()
+                    .and_then(|saved| saved.research.as_ref())
+                    .context("saved research was already consumed before identity validation")?;
+                neoethos_search::discovery::validate_saved_candidate_selections_v1(
+                    saved,
+                    &selections,
+                )?;
+                selections
+            }
+            _ => anyhow::bail!(
+                "candidate weekday attribution requires --diagnose-candidate-weekdays-out and --diagnose-candidate-selectors together"
+            ),
+        };
         if let Some(out) = diagnose_signals_out.as_deref() {
             anyhow::ensure!(
                 saved_research.is_some(),
@@ -2225,6 +2265,10 @@ fn cmd_discover_on_budgeted_pool(
             anyhow::ensure!(
                 diagnose_cost_out.is_none(),
                 "candidate signal behavior census cannot be combined with candidate cost diagnosis"
+            );
+            anyhow::ensure!(
+                diagnose_weekdays_out.is_none() && diagnose_weekday_selectors.is_none(),
+                "candidate signal behavior census cannot be combined with candidate weekday attribution"
             );
             anyhow::ensure!(
                 !std::path::Path::new(out).exists(),
@@ -2250,9 +2294,20 @@ fn cmd_discover_on_budgeted_pool(
                 !diagnose_cost_variants.is_empty(),
                 "candidate cost diagnosis requires --diagnose-cost-variants"
             );
+            anyhow::ensure!(
+                diagnose_weekdays_out.is_none(),
+                "candidate cost diagnosis cannot be combined with candidate weekday attribution"
+            );
+        }
+        if diagnose_weekdays_out.is_some() {
+            anyhow::ensure!(
+                diagnose_cost_variants.is_empty(),
+                "candidate weekday attribution cannot be combined with cost variants"
+            );
         }
         let mut diagnose_cost_written: Option<String> = None;
         let mut diagnose_signals_written: Option<String> = None;
+        let mut diagnose_weekdays_written: Option<String> = None;
         #[cfg(feature = "gpu-nvidia")]
         anyhow::ensure!(
             canonical_cpu_research.is_none(),
@@ -2703,6 +2758,40 @@ fn cmd_discover_on_budgeted_pool(
                             "saved research contract differs from the reopened sources and settings"
                         );
                         let result_ref = research.discovery_result();
+                        if let Some(weekdays_out) = diagnose_weekdays_out.as_deref() {
+                            let diag_path = std::path::Path::new(weekdays_out);
+                            anyhow::ensure!(
+                                !diag_path.exists(),
+                                "candidate weekday attribution output must be a new path: {weekdays_out}"
+                            );
+                            if let Some(parent) = diag_path.parent()
+                                && !parent.as_os_str().is_empty()
+                            {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let census = neoethos_search::discovery::summarize_saved_candidate_weekday_attribution_v1(
+                                &run_input,
+                                &research_config,
+                                &research,
+                                &diagnose_weekday_selections,
+                            )?;
+                            let document = serde_json::json!({
+                                "schema": "neoethos.research-only.saved-candidate-weekday-attribution-report.v1",
+                                "artifact_class": "ResearchOnly",
+                                "promotion_eligibility": "NotPromotionEligible",
+                                "authorization_issued": false,
+                                "authority": "research-only-saved-candidate-causal-signal-and-closed-ledger-attribution",
+                                "warning": "Signal-bar dates and next-execution-bar observations are descriptive, not eligibility. Closed-trade entries are the actual ledger. This report does not establish viability, promotion, or a defect.",
+                                "saved_research_sha256": &saved.sha256,
+                                "contract_identity_sha256": contract.identity_sha256()?,
+                                "saved_effective_feature_names": &result_ref.effective_feature_names,
+                                "weekday_attribution": census,
+                            });
+                            neoethos_core::storage::json::write_json_atomic(diag_path, &document)?;
+                            emit_cpu_research_stage("saved_candidate_weekday_attribution_written");
+                            diagnose_weekdays_written = Some(weekdays_out.to_owned());
+                            return Ok(research);
+                        }
                         if let Some(signals_out) = diagnose_signals_out.as_deref() {
                             let diag_path = std::path::Path::new(signals_out);
                             anyhow::ensure!(
@@ -2859,6 +2948,11 @@ fn cmd_discover_on_budgeted_pool(
                 },
             )?;
 
+            if let Some(diag_out) = diagnose_weekdays_written {
+                println!("candidate_weekday_attribution={diag_out}");
+                println!("candidate_weekday_attribution_status=ResearchOnly");
+                return Ok((symbol.clone(), base.clone(), 0, 0));
+            }
             if let Some(diag_out) = diagnose_signals_written {
                 println!("candidate_signal_behavior_census={diag_out}");
                 println!("candidate_signal_behavior_census_status=ResearchOnly");
@@ -5406,6 +5500,9 @@ fn print_help() {
     );
     println!(
         "    research-only saved-candidate signal behavior: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-signals-out <new-json>"
+    );
+    println!(
+        "    research-only saved-candidate weekday attribution: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-selectors <index:strategy_id:fnv64:hash,...> --diagnose-candidate-weekdays-out <new-json>"
     );
     println!(
         "                               One bounded CPU research run from exact acquisition receipts through D1 costs, discovery and chronological holdout evidence. Never authorizes promotion."

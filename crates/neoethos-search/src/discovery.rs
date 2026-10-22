@@ -26,7 +26,7 @@ use crate::validation::{
     write_prop_firm_risk_validation_artifact_atomic, write_walkforward_validation_artifact_atomic,
 };
 use anyhow::{Context, Result};
-use chrono::{Datelike, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use neoethos_core::contracts::{
     DeterminismPolicy, LiveValidationEvidence, TemporalFeatureContract, ValidationEvidenceManifest,
 };
@@ -34,7 +34,7 @@ use neoethos_data::{FeatureFrame, Ohlcv};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 const PERMUTATION_MONTE_CARLO_P_VALUE_SEMANTICS_V1: &str =
@@ -6528,6 +6528,28 @@ pub struct CandidateCostWindowV1 {
     pub end_ms: i64,
 }
 
+fn evaluate_gene_with_ledger_v1(
+    ohlcv: &Ohlcv,
+    timestamps: &[i64],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    signals: &[i8],
+    confidences: &[f64],
+    settings: &crate::eval::BacktestSettings,
+) -> Result<([f64; 11], Vec<Trade>)> {
+    crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
+        &ohlcv.close,
+        &ohlcv.high,
+        &ohlcv.low,
+        signals,
+        confidences,
+        month_idx,
+        day_idx,
+        timestamps,
+        settings,
+    )
+}
+
 fn evaluate_gene_under_cost_variant(
     strategy_id: &str,
     signals: &[i8],
@@ -6561,18 +6583,15 @@ fn evaluate_gene_under_cost_variant(
     variant_settings.spread_pips = variant.round_trip_cost_pips;
     variant_settings.session_spread_profile = None;
     variant_settings.commission_per_trade = variant.round_trip_commission_per_lot;
-    let (canonical_metrics, trades) =
-        crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
-            &ohlcv.close,
-            &ohlcv.high,
-            &ohlcv.low,
-            signals,
-            confidences,
-            month_idx,
-            day_idx,
-            timestamps,
-            &variant_settings,
-        )?;
+    let (canonical_metrics, trades) = evaluate_gene_with_ledger_v1(
+        ohlcv,
+        timestamps,
+        month_idx,
+        day_idx,
+        signals,
+        confidences,
+        &variant_settings,
+    )?;
     analyzer.analyze_strategy_with_evaluation(
         strategy_id,
         &trades,
@@ -6806,6 +6825,556 @@ pub fn diagnose_research_candidates_under_cost_variants_v3(
     }
     Ok(rows)
 }
+/// One explicitly named saved candidate for the bounded weekday attribution
+/// diagnostic. The index alone is not identity: the strategy id and the exact
+/// stable JSON hash are both verified against the saved archive before any
+/// feature reconstruction or replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedCandidateSelectionV1 {
+    pub index: usize,
+    pub strategy_id: String,
+    pub exact_gene_hash: String,
+}
+
+/// Parse the explicit index:strategy_id:fnv64:<hex> selector list. There is
+/// no default all-candidate mode: an empty or malformed selection is refused.
+pub fn parse_saved_candidate_selections_v1(spec: &str) -> Result<Vec<SavedCandidateSelectionV1>> {
+    let mut selections = Vec::new();
+    for token in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let parts = token.split(':').collect::<Vec<_>>();
+        anyhow::ensure!(
+            parts.len() == 4 && parts[2] == "fnv64",
+            "saved candidate selector '{}' must be index:strategy_id:fnv64:<hex>",
+            token
+        );
+        let index = parts[0].parse::<usize>().with_context(|| {
+            format!("saved candidate selector '{}' has an invalid index", token)
+        })?;
+        anyhow::ensure!(
+            !parts[1].trim().is_empty(),
+            "saved candidate selector '{}' has an empty strategy id",
+            token
+        );
+        anyhow::ensure!(
+            parts[3].len() == 16 && parts[3].chars().all(|c| c.is_ascii_hexdigit()),
+            "saved candidate selector '{}' has an invalid fnv64 hash",
+            token
+        );
+        selections.push(SavedCandidateSelectionV1 {
+            index,
+            strategy_id: parts[1].to_owned(),
+            exact_gene_hash: format!("fnv64:{}", parts[3].to_ascii_lowercase()),
+        });
+    }
+    anyhow::ensure!(
+        !selections.is_empty(),
+        "saved candidate weekday attribution requires explicit candidate selectors"
+    );
+    anyhow::ensure!(
+        selections.len() <= 8,
+        "saved candidate weekday attribution accepts at most eight explicit candidates"
+    );
+    let mut seen_indices = HashSet::new();
+    let mut seen_strategy_ids = HashSet::new();
+    for selection in &selections {
+        anyhow::ensure!(
+            seen_indices.insert(selection.index),
+            "saved candidate weekday attribution selects index {} more than once",
+            selection.index
+        );
+        anyhow::ensure!(
+            seen_strategy_ids.insert(selection.strategy_id.as_str()),
+            "saved candidate weekday attribution selects strategy id '{}' more than once",
+            selection.strategy_id
+        );
+    }
+    Ok(selections)
+}
+
+/// Validate explicit selections against the archived candidate identities
+/// without touching a feature frame. This is the CLI pre-feature identity gate.
+pub fn validate_saved_candidate_selections_v1(
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<()> {
+    selected_saved_candidate_genes_v1(research.discovery_result(), selections).map(|_| ())
+}
+
+fn saved_candidate_gene_for_selection_v1<'a>(
+    candidates: &'a [Gene],
+    selection: &SavedCandidateSelectionV1,
+) -> Result<&'a Gene> {
+    let gene = candidates.get(selection.index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "saved candidate weekday attribution index {} is outside the archived candidate list of {}",
+            selection.index,
+            candidates.len()
+        )
+    })?;
+    anyhow::ensure!(
+        gene.strategy_id == selection.strategy_id,
+        "saved candidate weekday attribution index {} is '{}', not requested '{}'",
+        selection.index,
+        gene.strategy_id,
+        selection.strategy_id
+    );
+    let actual_hash = stable_json_hash(gene)?;
+    anyhow::ensure!(
+        actual_hash == selection.exact_gene_hash,
+        "saved candidate weekday attribution index {} hash {} differs from requested {}",
+        selection.index,
+        actual_hash,
+        selection.exact_gene_hash
+    );
+    Ok(gene)
+}
+
+fn selected_saved_candidate_genes_v1(
+    result: &crate::DiscoveryResult,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<Vec<(usize, Gene)>> {
+    anyhow::ensure!(
+        !selections.is_empty(),
+        "saved candidate weekday attribution requires explicit candidate selectors"
+    );
+    anyhow::ensure!(
+        selections.len() <= 8,
+        "saved candidate weekday attribution accepts at most eight explicit candidates"
+    );
+    let mut selected = Vec::with_capacity(selections.len());
+    let mut seen = HashSet::new();
+    for selection in selections {
+        anyhow::ensure!(
+            seen.insert(selection.index),
+            "saved candidate weekday attribution selects index {} more than once",
+            selection.index
+        );
+        let gene = saved_candidate_gene_for_selection_v1(&result.candidates, selection)?;
+        selected.push((selection.index, gene.clone()));
+    }
+    Ok(selected)
+}
+
+const SAVED_CANDIDATE_METRIC_NAMES: [&str; 11] = [
+    "net_profit",
+    "sharpe",
+    "peak_equity",
+    "max_drawdown",
+    "win_rate",
+    "profit_factor",
+    "expectancy",
+    "monthly_target_hit_rate",
+    "trade_count",
+    "consistency",
+    "max_daily_drawdown",
+];
+
+const SAVED_CANDIDATE_METRIC_MISMATCH_TOLERANCE_V1: f64 = 1e-6;
+
+fn saved_candidate_metric_value_v1(gene: &Gene, slot: usize) -> Option<f64> {
+    match slot {
+        1 => Some(gene.sharpe_ratio),
+        3 => Some(gene.max_drawdown),
+        4 => Some(gene.win_rate),
+        5 => Some(gene.profit_factor),
+        6 => Some(gene.expectancy),
+        8 => Some(gene.trades_count as f64),
+        9 => Some(gene.consistency),
+        _ => None,
+    }
+}
+
+fn saved_candidate_metric_deltas_v1(
+    gene: &Gene,
+    actual: &[f64; 11],
+) -> (Vec<Option<f64>>, Vec<String>) {
+    let mut deltas = Vec::with_capacity(actual.len());
+    let mut reasons = Vec::new();
+    for (slot, name) in SAVED_CANDIDATE_METRIC_NAMES.iter().enumerate() {
+        match saved_candidate_metric_value_v1(gene, slot) {
+            Some(saved) => {
+                let delta = actual[slot] - saved;
+                deltas.push(Some(delta));
+                let material = if slot == 8 {
+                    actual[slot] != saved
+                } else {
+                    !delta.is_finite() || delta.abs() > SAVED_CANDIDATE_METRIC_MISMATCH_TOLERANCE_V1
+                };
+                if material {
+                    reasons.push(format!(
+                        "{}: actual {:.12} vs saved {:.12} (delta {:.12})",
+                        name, actual[slot], saved, delta
+                    ));
+                }
+            }
+            None => deltas.push(None),
+        }
+    }
+    (deltas, reasons)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SavedCandidateSignalDayCountsV1 {
+    observed_bars: u64,
+    raw_post_gate_nonzero_signal_bars: u64,
+    nonzero_prior_signal_at_next_execution_bar: u64,
+    closed_entries: u64,
+}
+
+fn saved_candidate_utc_date_v1(timestamp_ms: i64) -> Result<NaiveDate> {
+    Utc.timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|timestamp| timestamp.date_naive())
+        .ok_or_else(|| anyhow::anyhow!("timestamp {} is outside the UTC calendar", timestamp_ms))
+}
+
+fn saved_candidate_calendar_dates_v1(start_ms: i64, end_ms: i64) -> Result<Vec<NaiveDate>> {
+    let start = saved_candidate_utc_date_v1(start_ms)?;
+    let end = saved_candidate_utc_date_v1(end_ms)?;
+    anyhow::ensure!(
+        end >= start,
+        "saved candidate weekday attribution needs an ordered UTC selection calendar"
+    );
+    let mut dates = Vec::new();
+    let mut date = start;
+    loop {
+        dates.push(date);
+        if date == end {
+            break;
+        }
+        date = date
+            .succ_opt()
+            .ok_or_else(|| anyhow::anyhow!("saved candidate UTC calendar overflow"))?;
+    }
+    Ok(dates)
+}
+
+/// Attribute each bar to its own UTC date and map the prior-bar signal to the
+/// next bar execution timestamp. The final bar signal has no execution bar
+/// and is returned as an explicit omitted count, never silently mapped.
+fn saved_candidate_signal_day_counts_v1(
+    signal: &[i8],
+    dates: &[NaiveDate],
+) -> Result<(BTreeMap<NaiveDate, SavedCandidateSignalDayCountsV1>, u64)> {
+    anyhow::ensure!(
+        signal.len() == dates.len(),
+        "saved candidate signal/date length mismatch"
+    );
+    anyhow::ensure!(
+        !signal.is_empty(),
+        "saved candidate weekday attribution has no signal bars"
+    );
+    let mut counts = BTreeMap::<NaiveDate, SavedCandidateSignalDayCountsV1>::new();
+    let mut final_signal_without_next_bar = 0_u64;
+    for (index, value) in signal.iter().copied().enumerate() {
+        anyhow::ensure!(
+            matches!(value, -1 | 0 | 1),
+            "saved candidate signal at row {} is {}, not -1/0/1",
+            index,
+            value
+        );
+        counts.entry(dates[index]).or_default().observed_bars += 1;
+        if value != 0 {
+            counts
+                .entry(dates[index])
+                .or_default()
+                .raw_post_gate_nonzero_signal_bars += 1;
+            if index + 1 < dates.len() {
+                counts
+                    .entry(dates[index + 1])
+                    .or_default()
+                    .nonzero_prior_signal_at_next_execution_bar += 1;
+            } else {
+                final_signal_without_next_bar += 1;
+            }
+        }
+    }
+    Ok((counts, final_signal_without_next_bar))
+}
+
+fn saved_candidate_settings_provenance_v1(
+    settings: &crate::eval::BacktestSettings,
+) -> serde_json::Value {
+    let session_profile = settings.session_spread_profile.as_ref().map(|profile| {
+        serde_json::json!({
+            "asian_pips": profile.asian_pips,
+            "overlap_pips": profile.overlap_pips,
+            "late_ny_pips": profile.late_ny_pips,
+        })
+    });
+    serde_json::json!({
+        "initial_equity": settings.initial_equity(),
+        "risk_based_sizing": settings.risk_based_sizing,
+        "risk_per_trade_min": settings.risk_per_trade_min,
+        "risk_per_trade_max": settings.risk_per_trade_max,
+        "high_quality_confidence": settings.high_quality_confidence,
+        "sl_pips": settings.sl_pips,
+        "tp_pips": settings.tp_pips,
+        "adaptive_vol_mult": settings.adaptive_vol_mult,
+        "adaptive_base_pips_present": settings.adaptive_base_pips.is_some(),
+        "max_hold_bars": settings.max_hold_bars,
+        "max_trades_per_day": settings.max_trades_per_day,
+        "trailing_enabled": settings.trailing_enabled,
+        "trailing_atr_multiplier": settings.trailing_atr_multiplier,
+        "trailing_be_trigger_r": settings.trailing_be_trigger_r,
+        "trailing_min_lock_pips": settings.trailing_min_lock_pips,
+        "spread_pips": settings.spread_pips,
+        "session_spread_profile": session_profile,
+        "commission_per_trade": settings.commission_per_trade,
+        "pip_value": settings.pip_value,
+        "pip_value_per_lot": settings.pip_value_per_lot,
+        "kill_zones_enabled": settings.kill_zones_enabled,
+        "swap_long_pips_per_day": settings.swap_long_pips_per_day,
+        "swap_short_pips_per_day": settings.swap_short_pips_per_day,
+        "pnl_conversion_fee_rate": settings.pnl_conversion_fee_rate,
+    })
+}
+
+/// Research-only, explicit small-set attribution of saved-candidate signals
+/// and actual closed-trade entries by UTC selection date. It reuses the sealed
+/// saved replay, the existing per-gene settings resolver and the existing CPU
+/// ledger; it does not invent a second evaluator or a second cadence rule.
+pub fn summarize_saved_candidate_weekday_attribution_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<serde_json::Value> {
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let result = research.discovery_result();
+    let selected = selected_saved_candidate_genes_v1(result, selections)?;
+    let selection = replay.inputs.selection();
+    let timestamps = replay.projected.timestamps.as_slice();
+    anyhow::ensure!(
+        !timestamps.is_empty(),
+        "saved candidate weekday attribution has no selection bars"
+    );
+    let (month_idx, day_idx) = month_day_indices(timestamps);
+    let calendar =
+        saved_candidate_calendar_dates_v1(timestamps[0], timestamps[timestamps.len() - 1])?;
+    let dates_by_bar = timestamps
+        .iter()
+        .copied()
+        .map(saved_candidate_utc_date_v1)
+        .collect::<Result<Vec<_>>>()?;
+    let objective = replay
+        .research_config
+        .weekly_objective_for_window(timestamps)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "saved candidate weekday attribution requires the sealed rolling weekly cadence objective"
+            )
+        })?;
+    let resolver = GeneEvalSettingsResolver::for_slice(
+        &replay.research_config,
+        selected.iter().map(|(_, gene)| gene),
+        &selection.ohlcv().high,
+        &selection.ohlcv().low,
+        &selection.ohlcv().close,
+    )?;
+    let genes = selected
+        .iter()
+        .map(|(_, gene)| gene.clone())
+        .collect::<Vec<_>>();
+    let (signals, confidences) = replay.signals(&genes)?;
+    let mut candidates = Vec::with_capacity(selected.len());
+    for (position, ((index, gene), (signal, confidence))) in selected
+        .iter()
+        .zip(signals.iter().zip(confidences.iter()))
+        .enumerate()
+    {
+        let settings = resolver.settings_for_gene(gene);
+        let (actual_metrics, trades) = evaluate_gene_with_ledger_v1(
+            selection.ohlcv(),
+            timestamps,
+            &month_idx,
+            &day_idx,
+            signal,
+            confidence,
+            &settings,
+        )?;
+        let (mut day_counts, final_signal_without_next_bar) =
+            saved_candidate_signal_day_counts_v1(signal, &dates_by_bar)?;
+        let mut closed_entry_days = BTreeMap::<NaiveDate, u64>::new();
+        for trade in &trades {
+            let entry_date = saved_candidate_utc_date_v1(trade.entry_time)?;
+            anyhow::ensure!(
+                calendar.iter().any(|date| *date == entry_date),
+                "closed entry at {} is outside the saved UTC selection calendar",
+                trade.entry_time
+            );
+            *closed_entry_days.entry(entry_date).or_default() += 1;
+            day_counts.entry(entry_date).or_default().closed_entries += 1;
+        }
+        let (metric_deltas, mut mismatch_reasons) =
+            saved_candidate_metric_deltas_v1(gene, &actual_metrics);
+        if trades.len() != gene.trades_count {
+            mismatch_reasons.push(format!(
+                "trade_count: actual ledger {} vs saved {}",
+                trades.len(),
+                gene.trades_count
+            ));
+        }
+        let material_mismatch = !mismatch_reasons.is_empty();
+        let actual_metric_values = actual_metrics.to_vec();
+        let mut delta_map = serde_json::Map::new();
+        for (name, delta) in SAVED_CANDIDATE_METRIC_NAMES
+            .iter()
+            .zip(metric_deltas.iter())
+        {
+            delta_map.insert((*name).to_owned(), serde_json::json!(delta));
+        }
+        let dates = calendar
+            .iter()
+            .map(|date| {
+                let counts = day_counts.get(date).copied().unwrap_or_default();
+                let weekend = date.weekday().num_days_from_monday() >= 5;
+                serde_json::json!({
+                    "utc_date": date.format("%Y-%m-%d").to_string(),
+                    "weekend": weekend,
+                    "expected_trading_day": !weekend,
+                    "observed_bars": counts.observed_bars,
+                    "raw_post_gate_nonzero_signal_bars": counts.raw_post_gate_nonzero_signal_bars,
+                    "nonzero_prior_signal_at_next_execution_bar": counts.nonzero_prior_signal_at_next_execution_bar,
+                    "closed_entries": counts.closed_entries,
+                })
+            })
+            .collect::<Vec<_>>();
+        let raw_signal_total = calendar
+            .iter()
+            .map(|date| {
+                day_counts
+                    .get(date)
+                    .copied()
+                    .unwrap_or_default()
+                    .raw_post_gate_nonzero_signal_bars
+            })
+            .sum::<u64>();
+        let next_execution_total = calendar
+            .iter()
+            .map(|date| {
+                day_counts
+                    .get(date)
+                    .copied()
+                    .unwrap_or_default()
+                    .nonzero_prior_signal_at_next_execution_bar
+            })
+            .sum::<u64>();
+        let zero_raw_signal_date_count = calendar
+            .iter()
+            .filter(|date| {
+                day_counts
+                    .get(date)
+                    .copied()
+                    .unwrap_or_default()
+                    .raw_post_gate_nonzero_signal_bars
+                    == 0
+            })
+            .count();
+        let zero_next_execution_observation_date_count = calendar
+            .iter()
+            .filter(|date| {
+                day_counts
+                    .get(date)
+                    .copied()
+                    .unwrap_or_default()
+                    .nonzero_prior_signal_at_next_execution_bar
+                    == 0
+            })
+            .count();
+        let entry_times = trades
+            .iter()
+            .map(|trade| trade.entry_time)
+            .collect::<Vec<_>>();
+        let weekly_cadence = crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
+            &objective.cadence,
+            &entry_times,
+        )?;
+        let ledger = trades
+            .iter()
+            .map(|trade| {
+                serde_json::json!({
+                    "entry_time_ms": trade.entry_time,
+                    "entry_utc_date": saved_candidate_utc_date_v1(trade.entry_time).ok().map(|date| date.format("%Y-%m-%d").to_string()),
+                    "exit_time_ms": trade.exit_time,
+                    "exit_utc_date": trade.exit_time.and_then(|ms| saved_candidate_utc_date_v1(ms).ok()).map(|date| date.format("%Y-%m-%d").to_string()),
+                    "pnl": trade.pnl,
+                    "exit_reason": trade.exit_reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.push(serde_json::json!({
+            "candidate": {
+                "index": index,
+                "strategy_id": gene.strategy_id,
+                "exact_gene_hash": selections[position].exact_gene_hash,
+            },
+            "saved_metrics": {
+                "fitness": gene.fitness,
+                "sharpe": gene.sharpe_ratio,
+                "max_drawdown": gene.max_drawdown,
+                "win_rate": gene.win_rate,
+                "profit_factor": gene.profit_factor,
+                "expectancy": gene.expectancy,
+                "trade_count": gene.trades_count,
+                "consistency": gene.consistency,
+                "unavailable_metric_slots": ["net_profit", "peak_equity", "monthly_target_hit_rate", "max_daily_drawdown"],
+            },
+            "actual_metrics": {
+                "names": SAVED_CANDIDATE_METRIC_NAMES,
+                "values": actual_metric_values,
+            },
+            "metric_deltas": delta_map,
+            "material_mismatch": material_mismatch,
+            "material_mismatch_reasons": mismatch_reasons,
+            "ledger_trade_count": trades.len(),
+            "saved_trade_count": gene.trades_count,
+            "entry_exit_ledger": ledger,
+            "weekly_cadence": weekly_cadence,
+            "settings_provenance": saved_candidate_settings_provenance_v1(&settings),
+            "summary": {
+                "calendar_date_count": calendar.len(),
+                "expected_trading_day_count": calendar.iter().filter(|date| date.weekday().num_days_from_monday() < 5).count(),
+                "weekend_date_count": calendar.iter().filter(|date| date.weekday().num_days_from_monday() >= 5).count(),
+                "observed_bar_count": signal.len(),
+                "raw_post_gate_nonzero_signal_bar_total": raw_signal_total,
+                "nonzero_prior_signal_at_next_execution_bar_total": next_execution_total,
+                "final_signal_without_next_execution_bar_omitted_count": final_signal_without_next_bar,
+                "closed_entry_total_at_actual_entry_time": trades.len(),
+                "closed_entry_date_count": closed_entry_days.len(),
+                "zero_raw_signal_date_count": zero_raw_signal_date_count,
+                "zero_next_execution_observation_date_count": zero_next_execution_observation_date_count,
+            },
+            "dates": dates,
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema": "neoethos.research-only.saved-candidate-weekday-attribution.v1",
+        "candidate_count": candidates.len(),
+        "selection_bars": timestamps.len(),
+        "provenance": {
+            "ordered_effective_feature_count": result.effective_feature_names.len(),
+            "ordered_effective_feature_names": result.effective_feature_names,
+            "saved_feature_plan_identity": result.search_input_receipt.feature_plan_identity(),
+            "saved_feature_provenance_identity": result.search_input_receipt.feature_provenance_identity(),
+            "saved_feature_content_sha256": result.search_input_receipt.feature_content_sha256(),
+            "sealed_smc_gate_threshold": result.effective_smc_gate_threshold,
+            "saved_selection_start_ms": timestamps[0],
+            "saved_selection_end_ms": timestamps[timestamps.len() - 1],
+        },
+        "weekly_objective": {
+            "cadence": objective.cadence,
+            "limits": objective.limits,
+            "scoring_semantics_version": objective.scoring_semantics_version,
+        },
+        "candidates": candidates,
+    }))
+}
+
 /// Fixed descriptive near-similarity thresholds for the saved-candidate
 /// signal census. These are report buckets, not selection knobs.
 pub const CANDIDATE_SIGNAL_NEAR_THRESHOLDS: [f64; 3] = [0.90, 0.95, 0.99];
