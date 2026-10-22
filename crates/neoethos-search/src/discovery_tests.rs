@@ -1573,6 +1573,76 @@ fn strict_split_validation_result(portfolio: Vec<Gene>) -> DiscoveryResult {
 }
 
 #[test]
+fn publication_roundtrip_rejects_nonfinite_ranked_archive_without_reindexing() {
+    fn archive_gene(id: &str) -> Gene {
+        let mut gene = Gene::default();
+        gene.strategy_id = id.to_owned();
+        gene.fitness = 1.0;
+        gene.long_threshold = 0.5;
+        gene.short_threshold = -0.5;
+        gene.indices = vec![0];
+        gene.weights = vec![1.0];
+        gene.tp_pips = 20.0;
+        gene.sl_pips = 10.0;
+        gene
+    }
+    let mut result = strict_split_validation_result(Vec::new());
+    result.effective_smc_gate_threshold = 0.0;
+    result.candidates = vec![archive_gene("archive-finite"), archive_gene("archive-nan")];
+    result.candidates[1].fitness = f64::NAN;
+    let expected_ids: Vec<String> = result
+        .candidates
+        .iter()
+        .map(|gene| gene.strategy_id.clone())
+        .collect();
+    let error = validate_discovery_result_publication_v1(&result)
+        .expect_err("nonfinite archived candidate must fail closed before publication");
+    let message = error.to_string();
+    assert!(
+        message.contains("DiscoveryResult.candidates") && message.contains("nonfinite"),
+        "unexpected publication refusal: {message}"
+    );
+    assert!(
+        message.contains("#1 archive-nan"),
+        "reject attribution must name the exact archive index: {message}"
+    );
+    assert_eq!(
+        result
+            .candidates
+            .iter()
+            .map(|gene| gene.strategy_id.clone())
+            .collect::<Vec<_>>(),
+        expected_ids,
+        "publication validation must not drop or reindex archived candidates"
+    );
+    let null_serialization = serde_json::to_vec(&result).expect("serialize synthetic archive");
+    assert!(
+        String::from_utf8_lossy(&null_serialization).contains("\"fitness\":null"),
+        "the regression must reproduce the null f64 serialization failure"
+    );
+    assert!(
+        serde_json::from_slice::<DiscoveryResult>(&null_serialization).is_err(),
+        "strict decoder must reject the synthetic null artifact"
+    );
+
+    result.candidates[1].fitness = 2.0;
+    validate_discovery_result_publication_v1(&result)
+        .expect("finite synthetic ranked archive must roundtrip strictly");
+    let encoded = serde_json::to_vec(&result).expect("serialize finite archive");
+    let decoded: DiscoveryResult =
+        serde_json::from_slice(&encoded).expect("strict decode finite archive");
+    assert_eq!(decoded.candidates.len(), 2);
+    assert_eq!(
+        decoded
+            .candidates
+            .iter()
+            .map(|gene| gene.strategy_id.clone())
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+}
+
+#[test]
 fn legacy_validation_snapshot_refuses_without_quote_validated_outer_holdout() {
     let root = temp_dir("legacy-validation-snapshot-refusal");
     let result = strict_split_validation_result(vec![profitable_gene("strict-alpha")]);

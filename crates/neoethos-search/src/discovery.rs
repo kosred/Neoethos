@@ -8996,6 +8996,78 @@ fn gene_artifact_metrics_finite_v1(gene: &Gene) -> bool {
         && gene.weights.iter().all(|value| value.is_finite())
 }
 
+fn ensure_gene_artifact_metrics_finite_v1(genes: &[Gene], boundary: &str) -> Result<()> {
+    let violations: Vec<String> = genes
+        .iter()
+        .enumerate()
+        .filter(|(_, gene)| !gene_artifact_metrics_finite_v1(gene))
+        .map(|(index, gene)| {
+            if gene.strategy_id.is_empty() {
+                format!("#{index}<unnamed>")
+            } else {
+                format!("#{index} {}", gene.strategy_id)
+            }
+        })
+        .collect();
+    if !violations.is_empty() {
+        anyhow::bail!(
+            "{boundary} contains {} nonfinite gene artifact metric/weight value(s) at {}; \
+             refusing to publish an artifact whose JSON would contain null f64 fields",
+            violations.len(),
+            violations.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Validate the exact final result at the publication boundary before any caller
+/// can emit a success artifact. This intentionally fails closed instead of
+/// dropping, reindexing or rewriting archived genes: candidate indices,
+/// metrics and validation-cohort identities must stay aligned with the archive.
+pub fn validate_discovery_result_publication_v1(result: &DiscoveryResult) -> Result<()> {
+    ensure_gene_artifact_metrics_finite_v1(
+        &result.candidates,
+        "DiscoveryResult.candidates (ranked candidate archive)",
+    )?;
+    ensure_gene_artifact_metrics_finite_v1(&result.portfolio, "DiscoveryResult.portfolio")?;
+    let encoded = serde_json::to_vec(result)
+        .context("serialize DiscoveryResult for strict publication roundtrip")?;
+    let decoded: DiscoveryResult = serde_json::from_slice(&encoded).context(
+        "strictly deserialize DiscoveryResult before publication; the artifact cannot roundtrip",
+    )?;
+    anyhow::ensure!(
+        decoded.candidates.len() == result.candidates.len(),
+        "publication roundtrip changed the candidate archive length"
+    );
+    anyhow::ensure!(
+        decoded.portfolio.len() == result.portfolio.len(),
+        "publication roundtrip changed the portfolio length"
+    );
+    for (index, (expected, actual)) in result
+        .candidates
+        .iter()
+        .zip(decoded.candidates.iter())
+        .enumerate()
+    {
+        anyhow::ensure!(
+            expected.strategy_id == actual.strategy_id,
+            "publication roundtrip changed candidate #{index} strategy identity"
+        );
+    }
+    for (index, (expected, actual)) in result
+        .portfolio
+        .iter()
+        .zip(decoded.portfolio.iter())
+        .enumerate()
+    {
+        anyhow::ensure!(
+            expected.strategy_id == actual.strategy_id,
+            "publication roundtrip changed portfolio #{index} strategy identity"
+        );
+    }
+    Ok(())
+}
+
 pub fn run_discovery_cycle(
     input: &CanonicalSearchRunInputV2<'_>,
     config: &DiscoveryConfig,
@@ -13012,6 +13084,10 @@ where
         .iter()
         .map(|(_, gene)| gene.clone())
         .collect();
+    ensure_gene_artifact_metrics_finite_v1(
+        &ranked_candidate_genes,
+        "ranked candidate archive before publication",
+    )?;
     progress_fn(DiscoveryProgress::CandidatesRanked {
         candidate_count: ga_returned_candidates,
         truncated_to: max_candidates,
@@ -13124,19 +13200,11 @@ where
             .iter()
             .filter(|(index, g)| {
                 let measured_net = weekly_net.as_ref().map(|net| net[*index]);
-                let finite_metrics = gene_artifact_metrics_finite_v1(g);
-                let ok = finite_metrics
-                    && measured_net.map_or_else(
-                        || g.passes_filter(&config.filtering),
-                        |net| {
-                            net.is_finite() && g.passes_filter_with_profit(&config.filtering, net)
-                        },
-                    );
+                let ok = measured_net.map_or_else(
+                    || g.passes_filter(&config.filtering),
+                    |net| net.is_finite() && g.passes_filter_with_profit(&config.filtering, net),
+                );
                 if !ok {
-                    if !finite_metrics {
-                        reject_fitness += 1;
-                        return false;
-                    }
                     // Cheap heuristic: pick the FIRST violated threshold so the
                     // counts roughly partition the rejections. Not every Gene
                     // populates every metric, so the buckets are a guide rather
@@ -15881,6 +15949,7 @@ where
         effective_smc_gate_threshold,
     };
     result.validate_evaluated_scopes()?;
+    validate_discovery_result_publication_v1(&result)?;
     progress_fn(DiscoveryProgress::Completed {
         candidate_count: result.candidates.len(),
         filtered_count,
