@@ -7241,7 +7241,7 @@ fn saved_candidate_exit_variants_only_change_exit_controls() {
         .iter()
         .find(|variant| variant.label == "baseline_sealed_policy")
         .unwrap();
-    let unchanged = saved_candidate_variant_settings_v1(&base, *baseline);
+    let unchanged = saved_candidate_variant_settings_v1(&base, baseline);
     assert_eq!(unchanged.max_hold_bars, 0);
     assert!(!unchanged.trailing_enabled);
     assert_eq!(unchanged.risk_based_sizing, true);
@@ -7249,14 +7249,14 @@ fn saved_candidate_exit_variants_only_change_exit_controls() {
         .iter()
         .find(|variant| variant.label == "max_hold_96_bars_approx_24h_m15")
         .unwrap();
-    let capped = saved_candidate_variant_settings_v1(&base, *max_hold);
+    let capped = saved_candidate_variant_settings_v1(&base, max_hold);
     assert_eq!(capped.max_hold_bars, 96);
     assert!(!capped.trailing_enabled);
     let early = variants
         .iter()
         .find(|variant| variant.label == "trailing_early_lock")
         .unwrap();
-    let trailing = saved_candidate_variant_settings_v1(&base, *early);
+    let trailing = saved_candidate_variant_settings_v1(&base, early);
     assert!(trailing.trailing_enabled);
     assert_eq!(trailing.trailing_atr_multiplier, 0.5);
     assert_eq!(trailing.trailing_be_trigger_r, 0.5);
@@ -7264,6 +7264,17 @@ fn saved_candidate_exit_variants_only_change_exit_controls() {
         base.trailing_enabled, false,
         "base settings must not mutate"
     );
+    let fixed = variants
+        .iter()
+        .find(|variant| variant.label == "fixed_sl20_rr2_hold96_trailfalse")
+        .expect("fixed grid variant");
+    let fixed_settings = saved_candidate_variant_settings_v1(&base, fixed);
+    assert_eq!(fixed_settings.sl_pips, 20.0);
+    assert_eq!(fixed_settings.tp_pips, 40.0);
+    assert_eq!(fixed_settings.max_hold_bars, 96);
+    assert_eq!(fixed_settings.adaptive_vol_mult, 0.0);
+    assert!(fixed_settings.adaptive_base_pips.is_none());
+    assert_eq!(fixed_settings.risk_based_sizing, true);
 }
 
 #[test]

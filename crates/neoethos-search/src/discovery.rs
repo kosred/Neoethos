@@ -7404,72 +7404,141 @@ pub fn summarize_saved_candidate_weekday_attribution_v1(
     }))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SavedCandidateExitPolicyVariantV1 {
-    label: &'static str,
+    label: String,
     max_hold_bars: usize,
     trailing_enabled: bool,
     trailing_atr_multiplier: Option<f64>,
     trailing_be_trigger_r: Option<f64>,
     trailing_min_lock_pips: Option<f64>,
+    sl_pips_override: Option<f64>,
+    tp_pips_override: Option<f64>,
+    disable_adaptive: bool,
+}
+
+fn saved_candidate_exit_policy_variant_v1(
+    label: impl Into<String>,
+    max_hold_bars: usize,
+    trailing_enabled: bool,
+    trailing_atr_multiplier: Option<f64>,
+    trailing_be_trigger_r: Option<f64>,
+    trailing_min_lock_pips: Option<f64>,
+    sl_pips_override: Option<f64>,
+    tp_pips_override: Option<f64>,
+    disable_adaptive: bool,
+) -> SavedCandidateExitPolicyVariantV1 {
+    SavedCandidateExitPolicyVariantV1 {
+        label: label.into(),
+        max_hold_bars,
+        trailing_enabled,
+        trailing_atr_multiplier,
+        trailing_be_trigger_r,
+        trailing_min_lock_pips,
+        sl_pips_override,
+        tp_pips_override,
+        disable_adaptive,
+    }
 }
 
 fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVariantV1> {
-    vec![
-        SavedCandidateExitPolicyVariantV1 {
-            label: "baseline_sealed_policy",
-            max_hold_bars: 0,
-            trailing_enabled: false,
-            trailing_atr_multiplier: None,
-            trailing_be_trigger_r: None,
-            trailing_min_lock_pips: None,
-        },
-        SavedCandidateExitPolicyVariantV1 {
-            label: "max_hold_32_bars",
-            max_hold_bars: 32,
-            trailing_enabled: false,
-            trailing_atr_multiplier: None,
-            trailing_be_trigger_r: None,
-            trailing_min_lock_pips: None,
-        },
-        SavedCandidateExitPolicyVariantV1 {
-            label: "max_hold_96_bars_approx_24h_m15",
-            max_hold_bars: 96,
-            trailing_enabled: false,
-            trailing_atr_multiplier: None,
-            trailing_be_trigger_r: None,
-            trailing_min_lock_pips: None,
-        },
-        SavedCandidateExitPolicyVariantV1 {
-            label: "trailing_existing_parameters",
-            max_hold_bars: 0,
-            trailing_enabled: true,
-            trailing_atr_multiplier: None,
-            trailing_be_trigger_r: None,
-            trailing_min_lock_pips: None,
-        },
-        SavedCandidateExitPolicyVariantV1 {
-            label: "trailing_early_lock",
-            max_hold_bars: 0,
-            trailing_enabled: true,
-            trailing_atr_multiplier: Some(0.5),
-            trailing_be_trigger_r: Some(0.5),
-            trailing_min_lock_pips: Some(2.0),
-        },
-        SavedCandidateExitPolicyVariantV1 {
-            label: "trailing_existing_plus_96_bars",
-            max_hold_bars: 96,
-            trailing_enabled: true,
-            trailing_atr_multiplier: None,
-            trailing_be_trigger_r: None,
-            trailing_min_lock_pips: None,
-        },
-    ]
+    let mut variants = vec![
+        saved_candidate_exit_policy_variant_v1(
+            "baseline_sealed_policy",
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "max_hold_32_bars",
+            32,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "max_hold_96_bars_approx_24h_m15",
+            96,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "trailing_existing_parameters",
+            0,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "trailing_early_lock",
+            0,
+            true,
+            Some(0.5),
+            Some(0.5),
+            Some(2.0),
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "trailing_existing_plus_96_bars",
+            96,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+    ];
+    // Counterfactual fixed-geometry sweep. Adaptive scaling is disabled so
+    // the same entry signals are evaluated with explicit stop/target pips.
+    for stop_pips in [5.0_f64, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0] {
+        for reward_risk in [0.5_f64, 1.0, 1.5, 2.0, 3.0] {
+            for max_hold_bars in [0_usize, 32, 64, 96] {
+                for trailing_enabled in [false, true] {
+                    variants.push(saved_candidate_exit_policy_variant_v1(
+                        format!(
+                            "fixed_sl{stop_pips}_rr{reward_risk}_hold{max_hold_bars}_trail{trailing_enabled}"
+                        ),
+                        max_hold_bars,
+                        trailing_enabled,
+                        None,
+                        None,
+                        None,
+                        Some(stop_pips),
+                        Some(stop_pips * reward_risk),
+                        true,
+                    ));
+                }
+            }
+        }
+    }
+    variants
 }
 
 fn saved_candidate_variant_settings_v1(
     base: &crate::eval::BacktestSettings,
-    variant: SavedCandidateExitPolicyVariantV1,
+    variant: &SavedCandidateExitPolicyVariantV1,
 ) -> crate::eval::BacktestSettings {
     let mut settings = base.clone();
     settings.max_hold_bars = variant.max_hold_bars;
@@ -7482,6 +7551,16 @@ fn saved_candidate_variant_settings_v1(
     }
     if let Some(value) = variant.trailing_min_lock_pips {
         settings.trailing_min_lock_pips = value;
+    }
+    if variant.disable_adaptive {
+        settings.adaptive_vol_mult = 0.0;
+        settings.adaptive_base_pips = None;
+    }
+    if let Some(value) = variant.sl_pips_override {
+        settings.sl_pips = value;
+    }
+    if let Some(value) = variant.tp_pips_override {
+        settings.tp_pips = value;
     }
     settings
 }
@@ -7578,7 +7657,7 @@ pub fn summarize_saved_candidate_exit_policy_variants_v1(
         let mut baseline_metrics = None;
         let mut baseline_ledger = 0usize;
         for variant in &variants {
-            let settings = saved_candidate_variant_settings_v1(&base_settings, *variant);
+            let settings = saved_candidate_variant_settings_v1(&base_settings, variant);
             let (metrics, trades) = evaluate_gene_with_ledger_v1(
                 selection.ohlcv(),
                 timestamps,
@@ -7604,6 +7683,9 @@ pub fn summarize_saved_candidate_exit_policy_variants_v1(
                 "label": variant.label,
                 "max_hold_bars": variant.max_hold_bars,
                 "trailing_enabled": variant.trailing_enabled,
+                "sl_pips": settings.sl_pips,
+                "tp_pips": settings.tp_pips,
+                "adaptive_scaling_disabled": variant.disable_adaptive,
                 "trailing_atr_multiplier": settings.trailing_atr_multiplier,
                 "trailing_be_trigger_r": settings.trailing_be_trigger_r,
                 "trailing_min_lock_pips": settings.trailing_min_lock_pips,
