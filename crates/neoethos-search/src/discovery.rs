@@ -8976,6 +8976,26 @@ impl QualityScreenRejects {
     }
 }
 
+fn gene_artifact_metrics_finite_v1(gene: &Gene) -> bool {
+    let scalars = [
+        gene.long_threshold,
+        gene.short_threshold,
+        gene.fitness,
+        gene.sharpe_ratio,
+        gene.win_rate,
+        gene.max_drawdown,
+        gene.profit_factor,
+        gene.expectancy,
+        gene.tp_pips,
+        gene.sl_pips,
+        gene.slice_pass_rate,
+        gene.consistency,
+        gene.stop_vol_mult,
+    ];
+    scalars.iter().all(|value| value.is_finite())
+        && gene.weights.iter().all(|value| value.is_finite())
+}
+
 pub fn run_discovery_cycle(
     input: &CanonicalSearchRunInputV2<'_>,
     config: &DiscoveryConfig,
@@ -13104,11 +13124,19 @@ where
             .iter()
             .filter(|(index, g)| {
                 let measured_net = weekly_net.as_ref().map(|net| net[*index]);
-                let ok = measured_net.map_or_else(
-                    || g.passes_filter(&config.filtering),
-                    |net| net.is_finite() && g.passes_filter_with_profit(&config.filtering, net),
-                );
+                let finite_metrics = gene_artifact_metrics_finite_v1(g);
+                let ok = finite_metrics
+                    && measured_net.map_or_else(
+                        || g.passes_filter(&config.filtering),
+                        |net| {
+                            net.is_finite() && g.passes_filter_with_profit(&config.filtering, net)
+                        },
+                    );
                 if !ok {
+                    if !finite_metrics {
+                        reject_fitness += 1;
+                        return false;
+                    }
                     // Cheap heuristic: pick the FIRST violated threshold so the
                     // counts roughly partition the rejections. Not every Gene
                     // populates every metric, so the buckets are a guide rather

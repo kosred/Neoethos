@@ -7304,3 +7304,18 @@ fn saved_candidate_exit_summary_counts_reasons_and_duration() {
     assert_eq!(summary["duration_hours_max"], 2.0);
     assert_eq!(summary["pnl_sum"], 6.0);
 }
+
+#[test]
+fn gene_artifact_metrics_reject_nonfinite_scalars_and_weights() {
+    let finite = Gene::default();
+    assert!(gene_artifact_metrics_finite_v1(&finite));
+    let mut bad_fitness = Gene::default();
+    bad_fitness.fitness = f64::NAN;
+    assert!(!gene_artifact_metrics_finite_v1(&bad_fitness));
+    let mut bad_weight = Gene::default();
+    bad_weight.weights.push(f64::INFINITY);
+    assert!(!gene_artifact_metrics_finite_v1(&bad_weight));
+    let mut bad_stop = Gene::default();
+    bad_stop.stop_vol_mult = f64::NEG_INFINITY;
+    assert!(!gene_artifact_metrics_finite_v1(&bad_stop));
+}
