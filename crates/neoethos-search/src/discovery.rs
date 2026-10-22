@@ -8996,6 +8996,38 @@ fn gene_artifact_metrics_finite_v1(gene: &Gene) -> bool {
         && gene.weights.iter().all(|value| value.is_finite())
 }
 
+fn gene_artifact_record_exact_v1(expected: &Gene, actual: &Gene) -> bool {
+    let scalars = |gene: &Gene| {
+        [
+            gene.long_threshold,
+            gene.short_threshold,
+            gene.fitness,
+            gene.sharpe_ratio,
+            gene.win_rate,
+            gene.max_drawdown,
+            gene.profit_factor,
+            gene.expectancy,
+            gene.tp_pips,
+            gene.sl_pips,
+            gene.slice_pass_rate,
+            gene.consistency,
+            gene.stop_vol_mult,
+        ]
+    };
+    expected.strategy_id == actual.strategy_id
+        && expected.indices == actual.indices
+        && expected.weights.len() == actual.weights.len()
+        && expected
+            .weights
+            .iter()
+            .zip(actual.weights.iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        && scalars(expected)
+            .iter()
+            .zip(scalars(actual).iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
 fn ensure_gene_artifact_metrics_finite_v1(genes: &[Gene], boundary: &str) -> Result<()> {
     let violations: Vec<String> = genes
         .iter()
@@ -9050,8 +9082,8 @@ pub fn validate_discovery_result_publication_v1(result: &DiscoveryResult) -> Res
         .enumerate()
     {
         anyhow::ensure!(
-            expected.strategy_id == actual.strategy_id,
-            "publication roundtrip changed candidate #{index} strategy identity"
+            gene_artifact_record_exact_v1(expected, actual),
+            "publication roundtrip changed candidate #{index} identity or artifact metrics"
         );
     }
     for (index, (expected, actual)) in result
@@ -9061,8 +9093,8 @@ pub fn validate_discovery_result_publication_v1(result: &DiscoveryResult) -> Res
         .enumerate()
     {
         anyhow::ensure!(
-            expected.strategy_id == actual.strategy_id,
-            "publication roundtrip changed portfolio #{index} strategy identity"
+            gene_artifact_record_exact_v1(expected, actual),
+            "publication roundtrip changed portfolio #{index} identity or artifact metrics"
         );
     }
     Ok(())
