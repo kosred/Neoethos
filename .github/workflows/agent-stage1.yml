@@ -1,21 +1,21 @@
 name: GPU-native Stage 1 verification
 
+# Manual-only; do not run verification automatically on pull requests.
 on:
-  pull_request:
-    branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
   pull-requests: read
 
 concurrency:
-  group: gpu-native-stage1-${{ github.event.pull_request.number }}
+  group: gpu-native-stage1-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   frontend:
     name: Desktop frontend checks
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -48,7 +48,7 @@ jobs:
         run: npm run build
 
   verify:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 55
     steps:
