@@ -7440,6 +7440,57 @@ fn saved_candidate_exit_variants_only_change_exit_controls() {
     assert_eq!(fixed_settings.adaptive_vol_mult, 0.0);
     assert!(fixed_settings.adaptive_base_pips.is_none());
     assert_eq!(fixed_settings.risk_based_sizing, true);
+    let ladder = variants
+        .iter()
+        .find(|variant| variant.label == "profit_lock_sl20rr2_be0.5_give0.2_lock5")
+        .expect("profit-lock ladder variant");
+    let ladder_settings = saved_candidate_variant_settings_v1(&base, ladder);
+    assert!(ladder_settings.trailing_enabled);
+    assert_eq!(ladder_settings.trailing_be_trigger_r, 0.5);
+    assert_eq!(ladder_settings.trailing_atr_multiplier, 0.3);
+    assert_eq!(ladder_settings.trailing_min_lock_pips, 5.0);
+    assert_eq!(ladder_settings.sl_pips, 20.0);
+    assert_eq!(ladder_settings.tp_pips, 40.0);
+    assert_eq!(ladder_settings.adaptive_vol_mult, 0.0);
+}
+
+#[test]
+fn saved_candidate_exit_summary_reports_monthly_profit_distribution() {
+    let january = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_700_000_000_000)
+        .unwrap()
+        .timestamp_millis();
+    let february = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_704_000_000_000)
+        .unwrap()
+        .timestamp_millis();
+    let trades = vec![
+        Trade {
+            entry_time: january,
+            pnl: 10.0,
+            pnl_pct: Some(0.01),
+            ..Trade::default()
+        },
+        Trade {
+            entry_time: january,
+            pnl: -30.0,
+            pnl_pct: Some(-0.02),
+            ..Trade::default()
+        },
+        Trade {
+            entry_time: february,
+            pnl: 5.0,
+            pnl_pct: Some(0.005),
+            ..Trade::default()
+        },
+    ];
+    let summary = saved_candidate_exit_summary_v1(&trades);
+    let monthly = summary
+        .get("monthly")
+        .expect("monthly distribution present");
+    assert_eq!(monthly["months_observed"], 2);
+    assert_eq!(monthly["positive_months"], 1);
+    assert_eq!(monthly["negative_months"], 1);
+    assert_eq!(monthly["monthly_win_rate"], 0.5);
+    assert_eq!(monthly["worst_month_pnl_pct"], -0.01);
 }
 
 #[test]
@@ -7468,6 +7519,33 @@ fn saved_candidate_exit_summary_counts_reasons_and_duration() {
     assert_eq!(summary["duration_hours_min"], 1.0);
     assert_eq!(summary["duration_hours_max"], 2.0);
     assert_eq!(summary["pnl_sum"], 6.0);
+}
+
+#[test]
+fn retain_finite_artifact_ranked_candidates_preserves_indexes_and_attributes_removal() {
+    let mut finite0 = Gene::default();
+    finite0.strategy_id = "finite-0".to_owned();
+    finite0.fitness = 1.0;
+    let mut sentinel = Gene::default();
+    sentinel.strategy_id = "bankrupt-sentinel".to_owned();
+    sentinel.fitness = f64::NEG_INFINITY;
+    sentinel.max_drawdown = 1.0;
+    let mut finite2 = Gene::default();
+    finite2.strategy_id = "finite-2".to_owned();
+    finite2.fitness = 2.0;
+    let mut ranked = vec![(0, finite0), (1, sentinel), (2, finite2)];
+    let removed = retain_finite_artifact_ranked_candidates_v1(&mut ranked);
+    assert_eq!(removed, 1);
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(
+        (ranked[0].0, ranked[0].1.strategy_id.as_str()),
+        (0, "finite-0")
+    );
+    assert_eq!(
+        (ranked[1].0, ranked[1].1.strategy_id.as_str()),
+        (2, "finite-2")
+    );
+    assert!(ranked.iter().all(|(_, gene)| gene.fitness.is_finite()));
 }
 
 #[test]

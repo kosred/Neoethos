@@ -7411,6 +7411,7 @@ struct SavedCandidateExitPolicyVariantV1 {
     trailing_enabled: bool,
     trailing_atr_multiplier: Option<f64>,
     trailing_be_trigger_r: Option<f64>,
+    trailing_give_back_r: Option<f64>,
     trailing_min_lock_pips: Option<f64>,
     sl_pips_override: Option<f64>,
     tp_pips_override: Option<f64>,
@@ -7423,6 +7424,7 @@ fn saved_candidate_exit_policy_variant_v1(
     trailing_enabled: bool,
     trailing_atr_multiplier: Option<f64>,
     trailing_be_trigger_r: Option<f64>,
+    trailing_give_back_r: Option<f64>,
     trailing_min_lock_pips: Option<f64>,
     sl_pips_override: Option<f64>,
     tp_pips_override: Option<f64>,
@@ -7434,6 +7436,7 @@ fn saved_candidate_exit_policy_variant_v1(
         trailing_enabled,
         trailing_atr_multiplier,
         trailing_be_trigger_r,
+        trailing_give_back_r,
         trailing_min_lock_pips,
         sl_pips_override,
         tp_pips_override,
@@ -7452,12 +7455,14 @@ fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVari
             None,
             None,
             None,
+            None,
             false,
         ),
         saved_candidate_exit_policy_variant_v1(
             "max_hold_32_bars",
             32,
             false,
+            None,
             None,
             None,
             None,
@@ -7474,12 +7479,14 @@ fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVari
             None,
             None,
             None,
+            None,
             false,
         ),
         saved_candidate_exit_policy_variant_v1(
             "trailing_existing_parameters",
             0,
             true,
+            None,
             None,
             None,
             None,
@@ -7493,6 +7500,7 @@ fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVari
             true,
             Some(0.5),
             Some(0.5),
+            None,
             Some(2.0),
             None,
             None,
@@ -7507,9 +7515,41 @@ fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVari
             None,
             None,
             None,
+            None,
             false,
         ),
     ];
+    // Profit-lock ladder: trigger the trailing stop early and lock a bounded
+    // give-back floor. Evaluated on the sealed adaptive geometry and on three
+    // representative fixed geometries. This is the direct, measurable answer to
+    // "the entries show MFE but the exits give it back".
+    for (geometry_label, sl_override, tp_override, disable_adaptive) in [
+        ("adaptive", None, None, false),
+        ("sl20rr2", Some(20.0_f64), Some(40.0_f64), true),
+        ("sl30rr2", Some(30.0_f64), Some(60.0_f64), true),
+        ("sl40rr2", Some(40.0_f64), Some(80.0_f64), true),
+    ] {
+        for be_trigger_r in [0.25_f64, 0.5, 1.0] {
+            for give_back_r in [0.2_f64, 0.5] {
+                for min_lock_pips in [2.0_f64, 5.0] {
+                    variants.push(saved_candidate_exit_policy_variant_v1(
+                        format!(
+                            "profit_lock_{geometry_label}_be{be_trigger_r}_give{give_back_r}_lock{min_lock_pips}"
+                        ),
+                        0,
+                        true,
+                        None,
+                        Some(be_trigger_r),
+                        Some(give_back_r),
+                        Some(min_lock_pips),
+                        sl_override,
+                        tp_override,
+                        disable_adaptive,
+                    ));
+                }
+            }
+        }
+    }
     // Counterfactual fixed-geometry sweep. Adaptive scaling is disabled so
     // the same entry signals are evaluated with explicit stop/target pips.
     for stop_pips in [5.0_f64, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0] {
@@ -7522,6 +7562,7 @@ fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVari
                         ),
                         max_hold_bars,
                         trailing_enabled,
+                        None,
                         None,
                         None,
                         None,
@@ -7548,6 +7589,9 @@ fn saved_candidate_variant_settings_v1(
     }
     if let Some(value) = variant.trailing_be_trigger_r {
         settings.trailing_be_trigger_r = value;
+    }
+    if let Some(value) = variant.trailing_give_back_r {
+        settings.trailing_atr_multiplier = (settings.trailing_be_trigger_r - value).max(0.0);
     }
     if let Some(value) = variant.trailing_min_lock_pips {
         settings.trailing_min_lock_pips = value;
@@ -7598,6 +7642,36 @@ fn saved_candidate_exit_summary_v1(trades: &[Trade]) -> serde_json::Value {
     } else {
         durations.iter().sum::<f64>() / durations.len() as f64
     };
+    // Monthly profitability is the operator's actual acceptance question. Group
+    // cost-charged per-trade returns by entry month (UTC) and report the whole
+    // distribution summary, not only the annual total.
+    let mut monthly: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for trade in trades {
+        if let Some(pnl_pct) = trade.pnl_pct {
+            let month = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(trade.entry_time)
+                .map(|entry| entry.format("%Y-%m").to_string());
+            if let Some(month) = month {
+                *monthly.entry(month).or_default() += pnl_pct;
+            }
+        }
+    }
+    let monthly_values: Vec<f64> = monthly.values().copied().collect();
+    let positive_months = monthly_values.iter().filter(|value| **value > 0.0).count();
+    let negative_months = monthly_values.iter().filter(|value| **value < 0.0).count();
+    let months_observed = monthly_values.len();
+    let worst_month_pnl_pct = monthly_values.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut sorted_monthly = monthly_values.clone();
+    sorted_monthly.sort_by(|left, right| left.total_cmp(right));
+    let median_month_pnl_pct = if sorted_monthly.is_empty() {
+        0.0
+    } else {
+        sorted_monthly[sorted_monthly.len() / 2]
+    };
+    let monthly_win_rate = if positive_months + negative_months == 0 {
+        0.0
+    } else {
+        positive_months as f64 / (positive_months + negative_months) as f64
+    };
     serde_json::json!({
         "trade_count": trades.len(),
         "win_count": wins,
@@ -7609,6 +7683,14 @@ fn saved_candidate_exit_summary_v1(trades: &[Trade]) -> serde_json::Value {
         "duration_hours_mean": mean,
         "duration_hours_max": durations.last().copied().unwrap_or(0.0),
         "exit_reason_counts": reasons,
+        "monthly": {
+            "months_observed": months_observed,
+            "positive_months": positive_months,
+            "negative_months": negative_months,
+            "monthly_win_rate": monthly_win_rate,
+            "worst_month_pnl_pct": if months_observed == 0 { 0.0 } else { worst_month_pnl_pct },
+            "median_month_pnl_pct": median_month_pnl_pct,
+        },
     })
 }
 
@@ -8994,6 +9076,12 @@ fn gene_artifact_metrics_finite_v1(gene: &Gene) -> bool {
     ];
     scalars.iter().all(|value| value.is_finite())
         && gene.weights.iter().all(|value| value.is_finite())
+}
+
+fn retain_finite_artifact_ranked_candidates_v1(ranked: &mut Vec<(usize, Gene)>) -> usize {
+    let before = ranked.len();
+    ranked.retain(|(_, gene)| gene_artifact_metrics_finite_v1(gene));
+    before.saturating_sub(ranked.len())
 }
 
 fn ensure_gene_artifact_metrics_finite_v1(genes: &[Gene], boundary: &str) -> Result<()> {
@@ -13043,6 +13131,21 @@ where
     let max_candidates =
         candidate_truncation_limit(config.candidate_count, ranked_candidates.len());
     ranked_candidates.truncate(max_candidates);
+    // A gene whose serialized artifact metrics are nonfinite (NaN/±Inf — e.g.
+    // the Risky bankruptcy NEG_INFINITY fitness sentinel) cannot be published
+    // without a null f64 field. Remove it here, at the ranked-admission
+    // boundary, keeping every survivor's ORIGINAL index so weekly_net,
+    // candidate_metrics and later cohorts stay aligned. The removal is
+    // attributed below, never silent.
+    let nonfinite_admission_removed =
+        retain_finite_artifact_ranked_candidates_v1(&mut ranked_candidates);
+    if nonfinite_admission_removed > 0 {
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            nonfinite_admission_removed,
+            "ranked candidate admission removed genes with nonfinite artifact metrics; original indexes of survivors are preserved"
+        );
+    }
     let renamed_candidate_ids = crate::post_ga::disambiguate_candidate_ids(&mut ranked_candidates);
     if renamed_candidate_ids > 0 {
         tracing::info!(
@@ -13065,16 +13168,23 @@ where
     let mut candidate_census = crate::funnel_profile::DiscoveryCandidateCensus {
         ga_returned_candidates,
         validation_candidate_limit: config.candidate_count,
-        validation_candidates_admitted: max_candidates,
+        validation_candidates_admitted: ranked_candidates.len(),
         validation_candidates_capped: ga_returned_candidates.saturating_sub(max_candidates),
-        walkforward_not_tested: max_candidates,
+        walkforward_not_tested: ranked_candidates.len(),
         ..Default::default()
     };
     funnel.record_stage(
         "validation_candidates_admitted",
         ga_returned_candidates,
-        max_candidates,
+        ranked_candidates.len(),
     );
+    if nonfinite_admission_removed > 0 {
+        funnel.add_reject_reason(
+            "validation_candidates_admitted",
+            "nonfinite_artifact_metrics",
+            nonfinite_admission_removed,
+        );
+    }
     if candidate_census.validation_candidates_capped > 0 {
         funnel.add_reject_reason(
             "validation_candidates_admitted",
