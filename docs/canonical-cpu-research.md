@@ -175,6 +175,14 @@ fold remains part of the existing positive-fold denominator. Multiple reasons
 can apply to one candidate. Older profiles omit these diagnostics rather than
 inventing measurements. These selection diagnostics are not deployment artifacts.
 
+Internal WF/CPCV evaluate the already-normalized selection frame. The global
+normalizer is fitted on the first 80% selection prefix, which includes their
+internal test rows; there is no per-fold normalization refit. The outer
+calibration and final holdout rows are excluded from that fit. Internal WF/CPCV
+results and candidate-selection export therefore do not establish untouched
+chronological OOS evidence or promotion authority; promotion requires the
+separate quote-validated outer holdout.
+
 CPU research uses the existing normalization projection to exclude columns with
 no valid cell in the in-sample normalization interval. Both base and aligned
 higher-timeframe columns use that same interval. Holdout values cannot rescue a

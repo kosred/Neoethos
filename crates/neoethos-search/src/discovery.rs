@@ -2505,18 +2505,21 @@ impl DiscoveryValidationGates {
     }
 
     pub fn is_portfolio_export_ready(&self) -> bool {
-        // MANDATORY out-of-sample validation (operator directive 2026-06-30):
-        // a strategy is export-ready ONLY if it passed BOTH out-of-sample gates
-        // — walkforward AND CPCV. The prop-firm window is an ADDITIONAL
-        // requirement for prop-firm runs (folded into `walkforward_passed` via
-        // the mode-aware criterion), never a bypass. This closes the hole where
-        // a strategy that FAILED walkforward (e.g. AUDUSD: 20 live trades, all
-        // losing) was still exported because it cleared the prop-firm window.
+        // Configured selection gates: walk-forward, CPCV and PBO. These run
+        // during selection on the globally selection-fitted feature frame.
+        // Internal folds reuse the same normalizer, whose fit rows include
+        // those folds' later test rows; there is no per-fold refit. They are
+        // selection diagnostics, not independent chronological OOS evidence,
+        // and confer no trading or promotion authority.
         //
-        // 2026-07-02: plus the PBO gate — when the Probability of Backtest
-        // Overfitting was measured and exceeded the configured ceiling, the
-        // selection process is statistically indistinguishable from luck and
-        // nothing gets exported, no matter how good the survivors look.
+        // The prop-firm window is an ADDITIONAL requirement for prop-firm runs
+        // (folded into walkforward_passed via the mode-aware criterion), never
+        // a bypass. This closes the hole where a strategy that FAILED
+        // walkforward was still exported because it cleared the prop-firm window.
+        //
+        // PBO is a configured-ceiling check: a measured pbo above the
+        // configured ceiling rejects selection; it does not by itself prove the
+        // selection process is indistinguishable from luck.
         self.walkforward_passed && self.cpcv_passed && self.pbo_passed
     }
 }
@@ -4467,9 +4470,10 @@ fn evaluate_cpcv_gate(
     if !config.enable_cpcv {
         tracing::warn!(
             target: "neoethos_search::discovery",
-            "CPCV gate is DISABLED via config.enable_cpcv=false — \
-             portfolio promoted without out-of-sample validation. \
-             For prop-firm production runs, set enable_cpcv=true."
+            "CPCV research selection check is DISABLED via config.enable_cpcv=false; \
+             0 folds were evaluated, so the configured internal selection check was \
+             skipped. This grants no OOS or trading authority. For prop-firm research \
+             runs, set enable_cpcv=true."
         );
         return Ok((true, 0, 1.0, None, true));
     }
@@ -4483,11 +4487,10 @@ fn evaluate_cpcv_gate(
     let offset = n.saturating_sub(capped_n);
     // ── COVERAGE, REPORTED (2026-08-10) 💰 ──────────────────────────────────
     //
-    // This gate validates the TAIL ONLY — `offset = n - capped_n` — and until
-    // now it returned pass/fail with no coverage figure anywhere. 200 000 rows
-    // against 1.05 M bars is 19% of history: the out-of-sample gate that
-    // promotes a strategy toward real money reported a clean pass on a fifth of
-    // the record, and nothing in the run said which fifth.
+    // This selection diagnostic validates the TAIL ONLY —
+    // offset = n - capped_n — and reports its coverage. It is not a
+    // real-money promotion gate and does not establish untouched chronological
+    // OOS authority; a pass covers only the most recent capped_n rows.
     //
     // Nothing is refused here. `cpcv_max_rows` is a memory bound, and refusing
     // a run because the operator's box is small is the wrong trade. What
@@ -15816,10 +15819,12 @@ pub fn ensure_portfolio_export_ready(result: &DiscoveryResult) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "Portfolio export requires passing validation gates (walkforward_passed={} cpcv_passed={}). \
-         Lower the walk-forward splits or disable CPCV in config.yaml and re-run.",
+        "Portfolio selection export requires all configured selection gates \
+         (walkforward_passed={} cpcv_passed={} pbo_passed={}). The criteria are unchanged; \
+         inspect the recorded walk-forward, CPCV and PBO evidence.",
         result.validation_gates.walkforward_passed,
-        result.validation_gates.cpcv_passed
+        result.validation_gates.cpcv_passed,
+        result.validation_gates.pbo_passed
     );
 }
 
