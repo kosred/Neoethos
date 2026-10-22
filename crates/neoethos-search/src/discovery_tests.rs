@@ -1574,6 +1574,37 @@ fn strict_split_validation_result(portfolio: Vec<Gene>) -> DiscoveryResult {
 
 #[test]
 fn publication_roundtrip_rejects_nonfinite_ranked_archive_without_reindexing() {
+    fn gene_artifact_record_exact_test(expected: &Gene, actual: &Gene) -> bool {
+        let scalars = |gene: &Gene| {
+            [
+                gene.long_threshold,
+                gene.short_threshold,
+                gene.fitness,
+                gene.sharpe_ratio,
+                gene.win_rate,
+                gene.max_drawdown,
+                gene.profit_factor,
+                gene.expectancy,
+                gene.tp_pips,
+                gene.sl_pips,
+                gene.slice_pass_rate,
+                gene.consistency,
+                gene.stop_vol_mult,
+            ]
+        };
+        expected.strategy_id == actual.strategy_id
+            && expected.indices == actual.indices
+            && expected.weights.len() == actual.weights.len()
+            && expected
+                .weights
+                .iter()
+                .zip(actual.weights.iter())
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+            && scalars(expected)
+                .iter()
+                .zip(scalars(actual).iter())
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+    }
     fn archive_gene(id: &str) -> Gene {
         let mut gene = Gene::default();
         gene.strategy_id = id.to_owned();
@@ -1627,19 +1658,24 @@ fn publication_roundtrip_rejects_nonfinite_ranked_archive_without_reindexing() {
 
     result.candidates[1].fitness = 2.0;
     validate_discovery_result_publication_v1(&result)
-        .expect("finite synthetic ranked archive must roundtrip strictly");
+        .expect("finite synthetic ranked archive must pass the production boundary guard");
     let encoded = serde_json::to_vec(&result).expect("serialize finite archive");
     let decoded: DiscoveryResult =
         serde_json::from_slice(&encoded).expect("strict decode finite archive");
     assert_eq!(decoded.candidates.len(), 2);
-    assert_eq!(
-        decoded
-            .candidates
-            .iter()
-            .map(|gene| gene.strategy_id.clone())
-            .collect::<Vec<_>>(),
-        expected_ids
-    );
+    assert_eq!(decoded.portfolio.len(), result.portfolio.len());
+    for (expected, actual) in result.candidates.iter().zip(decoded.candidates.iter()) {
+        assert!(
+            gene_artifact_record_exact_test(expected, actual),
+            "roundtrip changed candidate identity, indices or artifact metrics"
+        );
+    }
+    for (expected, actual) in result.portfolio.iter().zip(decoded.portfolio.iter()) {
+        assert!(
+            gene_artifact_record_exact_test(expected, actual),
+            "roundtrip changed portfolio identity, indices or artifact metrics"
+        );
+    }
 
     // JSON null cannot distinguish NaN from +/-Inf. The real bankruptcy path
     // returns NEG_INFINITY fitness; exercise that sentinel plus the other

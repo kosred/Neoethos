@@ -8996,38 +8996,6 @@ fn gene_artifact_metrics_finite_v1(gene: &Gene) -> bool {
         && gene.weights.iter().all(|value| value.is_finite())
 }
 
-fn gene_artifact_record_exact_v1(expected: &Gene, actual: &Gene) -> bool {
-    let scalars = |gene: &Gene| {
-        [
-            gene.long_threshold,
-            gene.short_threshold,
-            gene.fitness,
-            gene.sharpe_ratio,
-            gene.win_rate,
-            gene.max_drawdown,
-            gene.profit_factor,
-            gene.expectancy,
-            gene.tp_pips,
-            gene.sl_pips,
-            gene.slice_pass_rate,
-            gene.consistency,
-            gene.stop_vol_mult,
-        ]
-    };
-    expected.strategy_id == actual.strategy_id
-        && expected.indices == actual.indices
-        && expected.weights.len() == actual.weights.len()
-        && expected
-            .weights
-            .iter()
-            .zip(actual.weights.iter())
-            .all(|(left, right)| left.to_bits() == right.to_bits())
-        && scalars(expected)
-            .iter()
-            .zip(scalars(actual).iter())
-            .all(|(left, right)| left.to_bits() == right.to_bits())
-}
-
 fn ensure_gene_artifact_metrics_finite_v1(genes: &[Gene], boundary: &str) -> Result<()> {
     let violations: Vec<String> = genes
         .iter()
@@ -9062,41 +9030,11 @@ pub fn validate_discovery_result_publication_v1(result: &DiscoveryResult) -> Res
         "DiscoveryResult.candidates (ranked candidate archive)",
     )?;
     ensure_gene_artifact_metrics_finite_v1(&result.portfolio, "DiscoveryResult.portfolio")?;
-    let encoded = serde_json::to_vec(result)
-        .context("serialize DiscoveryResult for strict publication roundtrip")?;
-    let decoded: DiscoveryResult = serde_json::from_slice(&encoded).context(
-        "strictly deserialize DiscoveryResult before publication; the artifact cannot roundtrip",
-    )?;
-    anyhow::ensure!(
-        decoded.candidates.len() == result.candidates.len(),
-        "publication roundtrip changed the candidate archive length"
-    );
-    anyhow::ensure!(
-        decoded.portfolio.len() == result.portfolio.len(),
-        "publication roundtrip changed the portfolio length"
-    );
-    for (index, (expected, actual)) in result
-        .candidates
-        .iter()
-        .zip(decoded.candidates.iter())
-        .enumerate()
-    {
-        anyhow::ensure!(
-            gene_artifact_record_exact_v1(expected, actual),
-            "publication roundtrip changed candidate #{index} identity or artifact metrics"
-        );
-    }
-    for (index, (expected, actual)) in result
-        .portfolio
-        .iter()
-        .zip(decoded.portfolio.iter())
-        .enumerate()
-    {
-        anyhow::ensure!(
-            gene_artifact_record_exact_v1(expected, actual),
-            "publication roundtrip changed portfolio #{index} identity or artifact metrics"
-        );
-    }
+    // The full strict serialize/deserialize roundtrip and exact-record
+    // comparison live in the bounded regression test only: encoding a second
+    // full DiscoveryResult copy here would allocate artifacts up to 745MB at
+    // runtime while the direct finite guards above already prevent the
+    // demonstrated null-f64 publication defect.
     Ok(())
 }
 
