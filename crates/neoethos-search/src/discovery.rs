@@ -7743,14 +7743,12 @@ pub fn summarize_saved_candidate_exit_policy_variants_v1(
         "saved candidate exit-policy diagnostic has no selection bars"
     );
     let (month_idx, day_idx) = month_day_indices(timestamps);
+    // PropFirm runs seal a rolling weekly cadence objective; Risky runs do not
+    // (their gate is the 180-day growth horizon). The diagnostic stays valid for
+    // both: cadence rows are reported only when the sealed objective exists.
     let objective = replay
         .research_config
-        .weekly_objective_for_window(timestamps)?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "saved candidate exit-policy diagnostic requires the sealed rolling weekly cadence objective"
-            )
-        })?;
+        .weekly_objective_for_window(timestamps)?;
     let resolver = GeneEvalSettingsResolver::for_slice(
         &replay.research_config,
         selected.iter().map(|(_, gene)| gene),
@@ -7789,10 +7787,15 @@ pub fn summarize_saved_candidate_exit_policy_variants_v1(
                 .iter()
                 .map(|trade| trade.entry_time)
                 .collect::<Vec<_>>();
-            let cadence = crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
-                &objective.cadence,
-                &entry_times,
-            )?;
+            let cadence = match &objective {
+                Some(objective) => Some(
+                    crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
+                        &objective.cadence,
+                        &entry_times,
+                    )?,
+                ),
+                None => None,
+            };
             variant_rows.push(serde_json::json!({
                 "label": variant.label,
                 "max_hold_bars": variant.max_hold_bars,
@@ -7844,11 +7847,13 @@ pub fn summarize_saved_candidate_exit_policy_variants_v1(
         "candidate_count": candidates.len(),
         "selection_bars": timestamps.len(),
         "provenance": saved_candidate_diagnostic_provenance_v1(result, timestamps),
-        "weekly_objective": {
-            "cadence": objective.cadence,
-            "limits": objective.limits,
-            "scoring_semantics_version": objective.scoring_semantics_version,
-        },
+        "weekly_objective": objective.as_ref().map_or(serde_json::Value::Null, |objective| {
+            serde_json::json!({
+                "cadence": objective.cadence,
+                "limits": objective.limits,
+                "scoring_semantics_version": objective.scoring_semantics_version,
+            })
+        }),
         "variants": variants
             .iter()
             .map(|variant| serde_json::json!({
