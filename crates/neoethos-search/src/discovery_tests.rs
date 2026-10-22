@@ -7505,6 +7505,15 @@ fn saved_candidate_exit_summary_reports_monthly_profit_distribution() {
     assert_eq!(monthly["negative_months"], 1);
     assert_eq!(monthly["monthly_win_rate"], 0.5);
     assert_eq!(monthly["worst_month_pnl_pct"], -0.01);
+    let series = monthly["series"]
+        .as_array()
+        .expect("per-month series present");
+    assert_eq!(series.len(), 2);
+    assert_eq!(series[0]["month"], "2023-11");
+    assert_eq!(series[0]["trades"], 2);
+    assert_eq!(series[0]["wins"], 1);
+    assert_eq!(series[0]["trade_win_rate"], 0.5);
+    assert_eq!(series[1]["month"], "2023-12");
 }
 
 #[test]

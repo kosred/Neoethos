@@ -7540,6 +7540,12 @@ fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVari
             (0.5, 0.35),
             (1.0, 0.2),
             (1.0, 0.5),
+            // Winner-run rungs: engage the trail later so winners have room
+            // to reach the 1.5-2R region instead of being locked at ~0.75R.
+            (1.5, 0.5),
+            (1.5, 1.0),
+            (2.0, 0.5),
+            (2.0, 1.0),
         ] {
             for min_lock_pips in [2.0_f64, 5.0] {
                 variants.push(saved_candidate_exit_policy_variant_v1(
@@ -7654,17 +7660,33 @@ fn saved_candidate_exit_summary_v1(trades: &[Trade]) -> serde_json::Value {
     // Monthly profitability is the operator's actual acceptance question. Group
     // cost-charged per-trade returns by entry month (UTC) and report the whole
     // distribution summary, not only the annual total.
-    let mut monthly: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    let mut monthly: std::collections::BTreeMap<String, (usize, usize, f64)> =
+        std::collections::BTreeMap::new();
     for trade in trades {
         if let Some(pnl_pct) = trade.pnl_pct {
             let month = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(trade.entry_time)
                 .map(|entry| entry.format("%Y-%m").to_string());
             if let Some(month) = month {
-                *monthly.entry(month).or_default() += pnl_pct;
+                let row = monthly.entry(month).or_default();
+                row.0 += 1;
+                row.1 += usize::from(pnl_pct > 0.0);
+                row.2 += pnl_pct;
             }
         }
     }
-    let monthly_values: Vec<f64> = monthly.values().copied().collect();
+    let monthly_series: Vec<serde_json::Value> = monthly
+        .iter()
+        .map(|(month, (trades, wins, pnl_pct))| {
+            serde_json::json!({
+                "month": month,
+                "trades": trades,
+                "wins": wins,
+                "trade_win_rate": if *trades == 0 { 0.0 } else { *wins as f64 / *trades as f64 },
+                "pnl_pct": pnl_pct,
+            })
+        })
+        .collect();
+    let monthly_values: Vec<f64> = monthly.values().map(|(_, _, pnl)| *pnl).collect();
     let positive_months = monthly_values.iter().filter(|value| **value > 0.0).count();
     let negative_months = monthly_values.iter().filter(|value| **value < 0.0).count();
     let months_observed = monthly_values.len();
@@ -7699,6 +7721,7 @@ fn saved_candidate_exit_summary_v1(trades: &[Trade]) -> serde_json::Value {
             "monthly_win_rate": monthly_win_rate,
             "worst_month_pnl_pct": if months_observed == 0 { 0.0 } else { worst_month_pnl_pct },
             "median_month_pnl_pct": median_month_pnl_pct,
+            "series": monthly_series,
         },
     })
 }
