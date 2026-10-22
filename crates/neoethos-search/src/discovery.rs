@@ -7529,24 +7529,33 @@ fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVari
         ("sl30rr2", Some(30.0_f64), Some(60.0_f64), true),
         ("sl40rr2", Some(40.0_f64), Some(80.0_f64), true),
     ] {
-        for be_trigger_r in [0.25_f64, 0.5, 1.0] {
-            for give_back_r in [0.2_f64, 0.5] {
-                for min_lock_pips in [2.0_f64, 5.0] {
-                    variants.push(saved_candidate_exit_policy_variant_v1(
-                        format!(
-                            "profit_lock_{geometry_label}_be{be_trigger_r}_give{give_back_r}_lock{min_lock_pips}"
-                        ),
-                        0,
-                        true,
-                        None,
-                        Some(be_trigger_r),
-                        Some(give_back_r),
-                        Some(min_lock_pips),
-                        sl_override,
-                        tp_override,
-                        disable_adaptive,
-                    ));
-                }
+        // Give-back must stay BELOW the trigger: a trail distance of zero (or
+        // negative, clamped to zero) degenerates into an instant exit the moment
+        // the trigger is touched and manufactures absurd trade counts and net
+        // figures. Only strictly positive trail distances are valid ladder rungs.
+        for (be_trigger_r, give_back_r) in [
+            (0.25_f64, 0.1_f64),
+            (0.25, 0.2),
+            (0.5, 0.2),
+            (0.5, 0.35),
+            (1.0, 0.2),
+            (1.0, 0.5),
+        ] {
+            for min_lock_pips in [2.0_f64, 5.0] {
+                variants.push(saved_candidate_exit_policy_variant_v1(
+                    format!(
+                        "profit_lock_{geometry_label}_be{be_trigger_r}_give{give_back_r}_lock{min_lock_pips}"
+                    ),
+                    0,
+                    true,
+                    None,
+                    Some(be_trigger_r),
+                    Some(give_back_r),
+                    Some(min_lock_pips),
+                    sl_override,
+                    tp_override,
+                    disable_adaptive,
+                ));
             }
         }
     }

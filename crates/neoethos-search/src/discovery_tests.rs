@@ -7452,6 +7452,20 @@ fn saved_candidate_exit_variants_only_change_exit_controls() {
     assert_eq!(ladder_settings.sl_pips, 20.0);
     assert_eq!(ladder_settings.tp_pips, 40.0);
     assert_eq!(ladder_settings.adaptive_vol_mult, 0.0);
+    for variant in &variants {
+        if variant.label.starts_with("profit_lock_") {
+            assert!(
+                variant.trailing_give_back_r.unwrap() < variant.trailing_be_trigger_r.unwrap(),
+                "ladder rung {} must keep a strictly positive trail distance",
+                variant.label
+            );
+        }
+    }
+    assert!(
+        !variants
+            .iter()
+            .any(|variant| variant.label == "profit_lock_adaptive_be0.25_give0.5_lock2")
+    );
 }
 
 #[test]
