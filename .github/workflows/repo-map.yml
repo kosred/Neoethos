@@ -1,12 +1,7 @@
 name: Repository map
 
-# This diagnostic is independent of the manual-only build/test CI.
+# Manual-only repository mapping; automatic push/PR triggers disabled.
 on:
-  pull_request:
-    branches: [master]
-  push:
-    branches: [master, 'codex/repo-map-*']
-    paths-ignore: ['docs/**', '**/*.md']
   workflow_dispatch:
     inputs:
       semantic_rust:
