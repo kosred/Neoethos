@@ -1640,6 +1640,65 @@ fn publication_roundtrip_rejects_nonfinite_ranked_archive_without_reindexing() {
             .collect::<Vec<_>>(),
         expected_ids
     );
+
+    // JSON null cannot distinguish NaN from +/-Inf. The real bankruptcy path
+    // returns NEG_INFINITY fitness; exercise that sentinel plus the other
+    // nonfinite scalar/weight encodings at the same publication boundary.
+    let nonfinite_cases: Vec<(&str, fn(&mut Gene))> = vec![
+        ("archive-neg-inf-fitness", |gene| {
+            gene.fitness = f64::NEG_INFINITY
+        }),
+        ("archive-pos-inf-fitness", |gene| {
+            gene.fitness = f64::INFINITY
+        }),
+        ("archive-nan-fitness", |gene| gene.fitness = f64::NAN),
+        ("archive-inf-scalar", |gene| {
+            gene.sharpe_ratio = f64::INFINITY
+        }),
+        ("archive-nan-scalar", |gene| gene.expectancy = f64::NAN),
+        ("archive-inf-weight", |gene| gene.weights[0] = f64::INFINITY),
+        ("archive-nan-weight", |gene| gene.weights[0] = f64::NAN),
+    ];
+    for (label, mutate) in nonfinite_cases {
+        let mut result = strict_split_validation_result(Vec::new());
+        result.effective_smc_gate_threshold = 0.0;
+        let mut bad = archive_gene(label);
+        // The observed archived sentinel genes carried max_drawdown=1.0.
+        bad.max_drawdown = 1.0;
+        mutate(&mut bad);
+        let preserved_fitness_bits = bad.fitness.to_bits();
+        result.candidates = vec![archive_gene("archive-finite"), bad];
+        let error = validate_discovery_result_publication_v1(&result)
+            .expect_err("nonfinite archived candidate must fail closed before publication");
+        let message = error.to_string();
+        assert!(
+            message.contains("DiscoveryResult.candidates")
+                && message.contains("nonfinite")
+                && message.contains(label),
+            "unexpected publication refusal for {label}: {message}"
+        );
+        assert_eq!(
+            result.candidates[0].strategy_id, "archive-finite",
+            "finite candidate identity/order must be preserved"
+        );
+        assert_eq!(
+            result.candidates[1].fitness.to_bits(),
+            preserved_fitness_bits,
+            "publication validation must not rewrite the sentinel"
+        );
+        if label == "archive-neg-inf-fitness" {
+            assert!(
+                result.candidates[1].fitness.is_infinite()
+                    && result.candidates[1].fitness.is_sign_negative(),
+                "the expected -Inf bankruptcy sentinel must stay -Inf, never become 0"
+            );
+        }
+        let encoded = serde_json::to_vec(&result).expect("serialize synthetic nonfinite archive");
+        assert!(
+            serde_json::from_slice::<DiscoveryResult>(&encoded).is_err(),
+            "strict decoder must reject null from {label}"
+        );
+    }
 }
 
 #[test]
