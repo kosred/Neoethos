@@ -2218,28 +2218,38 @@ fn cmd_discover_on_budgeted_pool(
         let diagnose_cost_out = parse_flag(args, "--diagnose-candidate-costs-out");
         let diagnose_signals_out = parse_flag(args, "--diagnose-candidate-signals-out");
         let diagnose_weekdays_out = parse_flag(args, "--diagnose-candidate-weekdays-out");
+        let diagnose_exit_out = parse_flag(args, "--diagnose-exit-policy-out");
         let diagnose_weekday_selectors = parse_flag(args, "--diagnose-candidate-selectors");
-        let diagnose_weekday_selections = match (
-            diagnose_weekdays_out.as_deref(),
-            diagnose_weekday_selectors.as_deref(),
-        ) {
-            (None, None) => Vec::new(),
-            (Some(out), Some(spec)) => {
+        let diagnose_candidate_selections = {
+            let weekday_mode = diagnose_weekdays_out.is_some();
+            let exit_mode = diagnose_exit_out.is_some();
+            anyhow::ensure!(
+                !(weekday_mode && exit_mode),
+                "candidate weekday and exit-policy diagnostics cannot be combined"
+            );
+            if weekday_mode || exit_mode {
                 anyhow::ensure!(
                     saved_research.is_some(),
-                    "candidate weekday attribution requires --resume-research and --resume-research-sha256"
+                    "saved-candidate selector diagnostics require --resume-research and --resume-research-sha256"
                 );
                 anyhow::ensure!(
                     diagnose_cost_out.is_none() && diagnose_signals_out.is_none(),
-                    "candidate weekday attribution cannot be combined with cost or signal diagnosis"
+                    "saved-candidate selector diagnostics cannot be combined with cost or signal diagnosis"
                 );
                 anyhow::ensure!(
                     new_search.is_none() && quote_replay.is_none(),
-                    "candidate weekday attribution cannot be combined with fresh-search or quote replay"
+                    "saved-candidate selector diagnostics cannot be combined with fresh-search or quote replay"
                 );
+                let spec = diagnose_weekday_selectors.as_deref().context(
+                    "saved-candidate selector diagnostics require --diagnose-candidate-selectors",
+                )?;
+                let out = diagnose_weekdays_out
+                    .as_deref()
+                    .or(diagnose_exit_out.as_deref())
+                    .expect("one selector diagnostic output is selected");
                 anyhow::ensure!(
                     !std::path::Path::new(out).exists(),
-                    "candidate weekday attribution output must be a new path: {out}"
+                    "saved-candidate selector diagnostic output must be a new path: {out}"
                 );
                 let selections =
                     neoethos_search::discovery::parse_saved_candidate_selections_v1(spec)?;
@@ -2252,10 +2262,13 @@ fn cmd_discover_on_budgeted_pool(
                     &selections,
                 )?;
                 selections
+            } else {
+                anyhow::ensure!(
+                    diagnose_weekday_selectors.is_none(),
+                    "--diagnose-candidate-selectors requires --diagnose-candidate-weekdays-out or --diagnose-exit-policy-out"
+                );
+                Vec::new()
             }
-            _ => anyhow::bail!(
-                "candidate weekday attribution requires --diagnose-candidate-weekdays-out and --diagnose-candidate-selectors together"
-            ),
         };
         if let Some(out) = diagnose_signals_out.as_deref() {
             anyhow::ensure!(
@@ -2267,8 +2280,10 @@ fn cmd_discover_on_budgeted_pool(
                 "candidate signal behavior census cannot be combined with candidate cost diagnosis"
             );
             anyhow::ensure!(
-                diagnose_weekdays_out.is_none() && diagnose_weekday_selectors.is_none(),
-                "candidate signal behavior census cannot be combined with candidate weekday attribution"
+                diagnose_weekdays_out.is_none()
+                    && diagnose_exit_out.is_none()
+                    && diagnose_weekday_selectors.is_none(),
+                "candidate signal behavior census cannot be combined with candidate selector diagnostics"
             );
             anyhow::ensure!(
                 !std::path::Path::new(out).exists(),
@@ -2295,19 +2310,20 @@ fn cmd_discover_on_budgeted_pool(
                 "candidate cost diagnosis requires --diagnose-cost-variants"
             );
             anyhow::ensure!(
-                diagnose_weekdays_out.is_none(),
-                "candidate cost diagnosis cannot be combined with candidate weekday attribution"
+                diagnose_weekdays_out.is_none() && diagnose_exit_out.is_none(),
+                "candidate cost diagnosis cannot be combined with candidate selector diagnostics"
             );
         }
-        if diagnose_weekdays_out.is_some() {
+        if diagnose_weekdays_out.is_some() || diagnose_exit_out.is_some() {
             anyhow::ensure!(
                 diagnose_cost_variants.is_empty(),
-                "candidate weekday attribution cannot be combined with cost variants"
+                "candidate selector diagnostics cannot be combined with cost variants"
             );
         }
         let mut diagnose_cost_written: Option<String> = None;
         let mut diagnose_signals_written: Option<String> = None;
         let mut diagnose_weekdays_written: Option<String> = None;
+        let mut diagnose_exit_written: Option<String> = None;
         #[cfg(feature = "gpu-nvidia")]
         anyhow::ensure!(
             canonical_cpu_research.is_none(),
@@ -2758,6 +2774,40 @@ fn cmd_discover_on_budgeted_pool(
                             "saved research contract differs from the reopened sources and settings"
                         );
                         let result_ref = research.discovery_result();
+                        if let Some(exit_out) = diagnose_exit_out.as_deref() {
+                            let diag_path = std::path::Path::new(exit_out);
+                            anyhow::ensure!(
+                                !diag_path.exists(),
+                                "candidate exit-policy diagnostic output must be a new path: {exit_out}"
+                            );
+                            if let Some(parent) = diag_path.parent()
+                                && !parent.as_os_str().is_empty()
+                            {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let census = neoethos_search::discovery::summarize_saved_candidate_exit_policy_variants_v1(
+                                &diagnose_candidate_selections,
+                                &run_input,
+                                &research_config,
+                                &research,
+                            )?;
+                            let document = serde_json::json!({
+                                "schema": "neoethos.research-only.saved-candidate-exit-policy-variants-report.v1",
+                                "artifact_class": "ResearchOnly",
+                                "promotion_eligibility": "NotPromotionEligible",
+                                "authorization_issued": false,
+                                "authority": "research-only-saved-candidate-exit-policy-counterfactual",
+                                "warning": "Counterfactual replay on explicit saved candidates. Variant settings are diagnostic only and do not change production policy, gates, costs or sizing; no result is OOS or promotion evidence.",
+                                "saved_research_sha256": &saved.sha256,
+                                "contract_identity_sha256": contract.identity_sha256()?,
+                                "saved_effective_feature_names": &result_ref.effective_feature_names,
+                                "exit_policy_variants": census,
+                            });
+                            neoethos_core::storage::json::write_json_atomic(diag_path, &document)?;
+                            emit_cpu_research_stage("saved_candidate_exit_policy_variants_written");
+                            diagnose_exit_written = Some(exit_out.to_owned());
+                            return Ok(research);
+                        }
                         if let Some(weekdays_out) = diagnose_weekdays_out.as_deref() {
                             let diag_path = std::path::Path::new(weekdays_out);
                             anyhow::ensure!(
@@ -2773,7 +2823,7 @@ fn cmd_discover_on_budgeted_pool(
                                 &run_input,
                                 &research_config,
                                 &research,
-                                &diagnose_weekday_selections,
+                                &diagnose_candidate_selections,
                             )?;
                             let document = serde_json::json!({
                                 "schema": "neoethos.research-only.saved-candidate-weekday-attribution-report.v1",
@@ -2948,6 +2998,11 @@ fn cmd_discover_on_budgeted_pool(
                 },
             )?;
 
+            if let Some(diag_out) = diagnose_exit_written {
+                println!("candidate_exit_policy_variants={diag_out}");
+                println!("candidate_exit_policy_variants_status=ResearchOnly");
+                return Ok((symbol.clone(), base.clone(), 0, 0));
+            }
             if let Some(diag_out) = diagnose_weekdays_written {
                 println!("candidate_weekday_attribution={diag_out}");
                 println!("candidate_weekday_attribution_status=ResearchOnly");
@@ -5503,6 +5558,9 @@ fn print_help() {
     );
     println!(
         "    research-only saved-candidate weekday attribution: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-selectors <index:strategy_id:fnv64:hash,...> --diagnose-candidate-weekdays-out <new-json>"
+    );
+    println!(
+        "    research-only saved-candidate exit-policy variants: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-selectors <index:strategy_id:fnv64:hash,...> --diagnose-exit-policy-out <new-json>"
     );
     println!(
         "                               One bounded CPU research run from exact acquisition receipts through D1 costs, discovery and chronological holdout evidence. Never authorizes promotion."

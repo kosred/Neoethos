@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 20] = [
+const OPTIONAL: [&str; 21] = [
     "--higher",
     "--population",
     "--generations",
@@ -48,6 +48,7 @@ const OPTIONAL: [&str; 20] = [
     "--diagnose-candidate-signals-out",
     "--diagnose-candidate-weekdays-out",
     "--diagnose-candidate-selectors",
+    "--diagnose-exit-policy-out",
     "--new-search-research",
     "--new-search-research-sha256",
 ];
@@ -144,6 +145,7 @@ impl SavedResearchInputs {
             arg == "--diagnose-candidate-costs-out"
                 || arg == "--diagnose-candidate-signals-out"
                 || arg == "--diagnose-candidate-weekdays-out"
+                || arg == "--diagnose-exit-policy-out"
         });
         if !research_only_diagnostic {
             neoethos_search::ensure_non_empty_portfolio(
@@ -312,6 +314,7 @@ impl Arguments {
                     && parsed.0.get("--diagnose-cost-variants").is_none()
                     && parsed.0.get("--diagnose-candidate-signals-out").is_none()
                     && parsed.0.get("--diagnose-candidate-weekdays-out").is_none()
+                    && parsed.0.get("--diagnose-exit-policy-out").is_none()
                     && parsed.0.get("--diagnose-candidate-selectors").is_none(),
                 "new-search recorded inputs cannot be combined with candidate diagnostics"
             );
@@ -347,32 +350,39 @@ impl Arguments {
             );
             ensure!(
                 parsed.0.get("--diagnose-candidate-weekdays-out").is_none()
+                    && parsed.0.get("--diagnose-exit-policy-out").is_none()
                     && parsed.0.get("--diagnose-candidate-selectors").is_none(),
-                "candidate signal behavior census cannot be combined with candidate weekday attribution"
+                "candidate signal behavior census cannot be combined with candidate selector diagnostics"
             );
         }
         let weekday_out = parsed.0.get("--diagnose-candidate-weekdays-out");
+        let exit_out = parsed.0.get("--diagnose-exit-policy-out");
+        let selector_out = weekday_out.or(exit_out);
         let weekday_selectors = parsed.0.get("--diagnose-candidate-selectors");
         ensure!(
-            weekday_out.is_some() == weekday_selectors.is_some(),
-            "candidate weekday attribution requires --diagnose-candidate-weekdays-out and --diagnose-candidate-selectors together"
+            selector_out.is_some() == weekday_selectors.is_some(),
+            "candidate selector diagnostics require an output flag and --diagnose-candidate-selectors together"
         );
-        if weekday_out.is_some() {
+        ensure!(
+            !(weekday_out.is_some() && exit_out.is_some()),
+            "candidate weekday and exit-policy diagnostics cannot be combined"
+        );
+        if selector_out.is_some() {
             ensure!(
                 resume_flags != 0,
-                "candidate weekday attribution requires an exact saved research (--resume-research + --resume-research-sha256)"
+                "candidate selector diagnostics require an exact saved research (--resume-research + --resume-research-sha256)"
             );
             ensure!(
                 diagnose_flags == 0,
-                "candidate weekday attribution cannot be combined with candidate cost diagnosis"
+                "candidate selector diagnostics cannot be combined with candidate cost diagnosis"
             );
             ensure!(
                 parsed.0.get("--diagnose-candidate-signals-out").is_none(),
-                "candidate weekday attribution cannot be combined with signal behavior census"
+                "candidate selector diagnostics cannot be combined with signal behavior census"
             );
             ensure!(
                 new_search_flags == 0 && quote_flags == 0,
-                "candidate weekday attribution cannot be combined with fresh-search or quote replay"
+                "candidate selector diagnostics cannot be combined with fresh-search or quote replay"
             );
             parse_saved_candidate_selections(parsed.value("--diagnose-candidate-selectors"))?;
         }
@@ -513,6 +523,7 @@ fn forward_optional_diagnostic_flags(args: &Arguments, discovery_args: &mut Vec<
         "--diagnose-candidate-signals-out",
         "--diagnose-candidate-weekdays-out",
         "--diagnose-candidate-selectors",
+        "--diagnose-exit-policy-out",
     ] {
         if let Some(value) = args.0.get(flag) {
             push(discovery_args, flag, value);
@@ -973,8 +984,7 @@ mod tests {
         args
     }
 
-    #[test]
-    fn saved_candidate_weekday_attribution_flags_parse_forward_and_exclude_other_diagnostics() {
+    fn selector_diagnostic_arguments(out_flag: &str, out_value: &str) -> Vec<String> {
         let path = "C:/recorded/v7.research.json";
         let sha = "b".repeat(64);
         let selectors =
@@ -984,31 +994,41 @@ mod tests {
         push(&mut raw, "--resume-research-sha256", &sha);
         push(&mut raw, "--max-batches", "1");
         push(&mut raw, "--diagnose-candidate-selectors", selectors);
-        push(
-            &mut raw,
-            "--diagnose-candidate-weekdays-out",
-            "C:/out/weekdays.json",
-        );
-        let args = Arguments::parse(&raw).expect("weekday attribution arguments");
+        push(&mut raw, out_flag, out_value);
+        raw
+    }
+
+    fn assert_selector_forwarded(raw: &[String], out_flag: &str) {
+        let args = Arguments::parse(raw).expect("selector diagnostic arguments");
         let mut forwarded = Vec::new();
         forward_optional_diagnostic_flags(&args, &mut forwarded);
-        for flag in [
-            "--diagnose-candidate-selectors",
-            "--diagnose-candidate-weekdays-out",
-        ] {
+        for flag in ["--diagnose-candidate-selectors", out_flag] {
             assert_eq!(
                 forwarded.iter().filter(|arg| arg.as_str() == flag).count(),
                 1,
                 "{flag} must be forwarded exactly once"
             );
         }
-        let mut missing_selectors = raw.clone();
-        let position = missing_selectors
+    }
+
+    fn without_selector_pair(raw: &[String]) -> Vec<String> {
+        let mut missing = raw.to_vec();
+        let position = missing
             .iter()
             .position(|arg| arg == "--diagnose-candidate-selectors")
             .unwrap();
-        missing_selectors.drain(position..position + 2);
-        assert!(Arguments::parse(&missing_selectors).is_err());
+        missing.drain(position..position + 2);
+        missing
+    }
+
+    #[test]
+    fn saved_candidate_selector_mode_flags_parse_forward_and_exclude_other_diagnostics() {
+        let weekday = selector_diagnostic_arguments(
+            "--diagnose-candidate-weekdays-out",
+            "C:/out/weekdays.json",
+        );
+        assert_selector_forwarded(&weekday, "--diagnose-candidate-weekdays-out");
+        assert!(Arguments::parse(&without_selector_pair(&weekday)).is_err());
         assert!(
             Arguments::parse(&valid_arguments_with_flag(
                 "--diagnose-candidate-weekdays-out",
@@ -1016,28 +1036,50 @@ mod tests {
             ))
             .is_err()
         );
-        let mut bad_selector = raw.clone();
+        let mut bad_selector = weekday.clone();
         let position = bad_selector
             .iter()
             .position(|arg| arg == "--diagnose-candidate-selectors")
             .unwrap();
         bad_selector[position + 1] = "0:gene_953632_18:fnv64:nothex".to_string();
         assert!(Arguments::parse(&bad_selector).is_err());
-        let mut with_signal = raw.clone();
-        push(
-            &mut with_signal,
-            "--diagnose-candidate-signals-out",
-            "C:/out/signals.json",
+
+        let exit =
+            selector_diagnostic_arguments("--diagnose-exit-policy-out", "C:/out/exit-policy.json");
+        assert_selector_forwarded(&exit, "--diagnose-exit-policy-out");
+        assert!(Arguments::parse(&without_selector_pair(&exit)).is_err());
+        assert!(
+            Arguments::parse(&valid_arguments_with_flag(
+                "--diagnose-exit-policy-out",
+                "C:/out/exit-policy.json"
+            ))
+            .is_err()
         );
-        assert!(Arguments::parse(&with_signal).is_err());
-        let mut with_cost = raw.clone();
+
+        let mut both = exit.clone();
         push(
-            &mut with_cost,
-            "--diagnose-candidate-costs-out",
-            "C:/out/cost.json",
+            &mut both,
+            "--diagnose-candidate-weekdays-out",
+            "C:/out/weekdays.json",
         );
-        push(&mut with_cost, "--diagnose-cost-variants", "base=1.0:2.0");
-        assert!(Arguments::parse(&with_cost).is_err());
+        assert!(Arguments::parse(&both).is_err());
+        for raw in [weekday, exit] {
+            let mut with_signal = raw.clone();
+            push(
+                &mut with_signal,
+                "--diagnose-candidate-signals-out",
+                "C:/out/signals.json",
+            );
+            assert!(Arguments::parse(&with_signal).is_err());
+            let mut with_cost = raw;
+            push(
+                &mut with_cost,
+                "--diagnose-candidate-costs-out",
+                "C:/out/cost.json",
+            );
+            push(&mut with_cost, "--diagnose-cost-variants", "base=1.0:2.0");
+            assert!(Arguments::parse(&with_cost).is_err());
+        }
     }
 
     #[test]

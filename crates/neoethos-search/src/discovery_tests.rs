@@ -7225,3 +7225,71 @@ fn saved_candidate_weekday_metric_deltas_keep_unavailable_slots_and_fail_materia
         "trade-count mismatch must be explicit: {reasons:?}"
     );
 }
+
+#[test]
+fn saved_candidate_exit_variants_only_change_exit_controls() {
+    let mut base = crate::eval::BacktestSettings::default();
+    base.max_hold_bars = 0;
+    base.trailing_enabled = false;
+    base.trailing_atr_multiplier = 1.0;
+    base.trailing_be_trigger_r = 1.0;
+    base.trailing_min_lock_pips = 2.0;
+    base.risk_based_sizing = true;
+    let variants = saved_candidate_exit_policy_variants_v1();
+    assert!(variants.len() >= 4);
+    let baseline = variants
+        .iter()
+        .find(|variant| variant.label == "baseline_sealed_policy")
+        .unwrap();
+    let unchanged = saved_candidate_variant_settings_v1(&base, *baseline);
+    assert_eq!(unchanged.max_hold_bars, 0);
+    assert!(!unchanged.trailing_enabled);
+    assert_eq!(unchanged.risk_based_sizing, true);
+    let max_hold = variants
+        .iter()
+        .find(|variant| variant.label == "max_hold_96_bars_approx_24h_m15")
+        .unwrap();
+    let capped = saved_candidate_variant_settings_v1(&base, *max_hold);
+    assert_eq!(capped.max_hold_bars, 96);
+    assert!(!capped.trailing_enabled);
+    let early = variants
+        .iter()
+        .find(|variant| variant.label == "trailing_early_lock")
+        .unwrap();
+    let trailing = saved_candidate_variant_settings_v1(&base, *early);
+    assert!(trailing.trailing_enabled);
+    assert_eq!(trailing.trailing_atr_multiplier, 0.5);
+    assert_eq!(trailing.trailing_be_trigger_r, 0.5);
+    assert_eq!(
+        base.trailing_enabled, false,
+        "base settings must not mutate"
+    );
+}
+
+#[test]
+fn saved_candidate_exit_summary_counts_reasons_and_duration() {
+    let trades = vec![
+        Trade {
+            entry_time: 0,
+            exit_time: Some(3_600_000),
+            pnl: 10.0,
+            mfe: 20.0,
+            mae: 5.0,
+            ..Trade::default()
+        },
+        Trade {
+            entry_time: 0,
+            exit_time: Some(7_200_000),
+            pnl: -4.0,
+            mfe: 1.0,
+            mae: 6.0,
+            ..Trade::default()
+        },
+    ];
+    let summary = saved_candidate_exit_summary_v1(&trades);
+    assert_eq!(summary["trade_count"], 2);
+    assert_eq!(summary["win_count"], 1);
+    assert_eq!(summary["duration_hours_min"], 1.0);
+    assert_eq!(summary["duration_hours_max"], 2.0);
+    assert_eq!(summary["pnl_sum"], 6.0);
+}

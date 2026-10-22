@@ -7137,6 +7137,45 @@ fn saved_candidate_settings_provenance_v1(
     })
 }
 
+fn prepare_saved_candidate_diagnostic_v1<'a>(
+    input: &'a CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<(PreparedSavedCandidateReplay<'a>, Vec<(usize, Gene)>)> {
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let selected = selected_saved_candidate_genes_v1(research.discovery_result(), selections)?;
+    Ok((replay, selected))
+}
+
+fn saved_candidate_signal_rows_v1(
+    replay: &PreparedSavedCandidateReplay<'_>,
+    selected: &[(usize, Gene)],
+) -> Result<(Vec<Gene>, Vec<Vec<i8>>, Vec<Vec<f64>>)> {
+    let genes = selected
+        .iter()
+        .map(|(_, gene)| gene.clone())
+        .collect::<Vec<_>>();
+    let (signals, confidences) = replay.signals(&genes)?;
+    Ok((genes, signals, confidences))
+}
+
+fn saved_candidate_diagnostic_provenance_v1(
+    result: &crate::DiscoveryResult,
+    timestamps: &[i64],
+) -> serde_json::Value {
+    serde_json::json!({
+        "ordered_effective_feature_count": result.effective_feature_names.len(),
+        "ordered_effective_feature_names": result.effective_feature_names,
+        "saved_feature_plan_identity": result.search_input_receipt.feature_plan_identity(),
+        "saved_feature_provenance_identity": result.search_input_receipt.feature_provenance_identity(),
+        "saved_feature_content_sha256": result.search_input_receipt.feature_content_sha256(),
+        "sealed_smc_gate_threshold": result.effective_smc_gate_threshold,
+        "saved_selection_start_ms": timestamps[0],
+        "saved_selection_end_ms": timestamps[timestamps.len() - 1],
+    })
+}
+
 /// Research-only, explicit small-set attribution of saved-candidate signals
 /// and actual closed-trade entries by UTC selection date. It reuses the sealed
 /// saved replay, the existing per-gene settings resolver and the existing CPU
@@ -7147,9 +7186,9 @@ pub fn summarize_saved_candidate_weekday_attribution_v1(
     research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
     selections: &[SavedCandidateSelectionV1],
 ) -> Result<serde_json::Value> {
-    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let (replay, selected) =
+        prepare_saved_candidate_diagnostic_v1(input, config, research, selections)?;
     let result = research.discovery_result();
-    let selected = selected_saved_candidate_genes_v1(result, selections)?;
     let selection = replay.inputs.selection();
     let timestamps = replay.projected.timestamps.as_slice();
     anyhow::ensure!(
@@ -7179,11 +7218,7 @@ pub fn summarize_saved_candidate_weekday_attribution_v1(
         &selection.ohlcv().low,
         &selection.ohlcv().close,
     )?;
-    let genes = selected
-        .iter()
-        .map(|(_, gene)| gene.clone())
-        .collect::<Vec<_>>();
-    let (signals, confidences) = replay.signals(&genes)?;
+    let (_genes, signals, confidences) = saved_candidate_signal_rows_v1(&replay, &selected)?;
     let mut candidates = Vec::with_capacity(selected.len());
     for (position, ((index, gene), (signal, confidence))) in selected
         .iter()
@@ -7359,21 +7394,276 @@ pub fn summarize_saved_candidate_weekday_attribution_v1(
         "schema": "neoethos.research-only.saved-candidate-weekday-attribution.v1",
         "candidate_count": candidates.len(),
         "selection_bars": timestamps.len(),
-        "provenance": {
-            "ordered_effective_feature_count": result.effective_feature_names.len(),
-            "ordered_effective_feature_names": result.effective_feature_names,
-            "saved_feature_plan_identity": result.search_input_receipt.feature_plan_identity(),
-            "saved_feature_provenance_identity": result.search_input_receipt.feature_provenance_identity(),
-            "saved_feature_content_sha256": result.search_input_receipt.feature_content_sha256(),
-            "sealed_smc_gate_threshold": result.effective_smc_gate_threshold,
-            "saved_selection_start_ms": timestamps[0],
-            "saved_selection_end_ms": timestamps[timestamps.len() - 1],
-        },
+        "provenance": saved_candidate_diagnostic_provenance_v1(result, timestamps),
         "weekly_objective": {
             "cadence": objective.cadence,
             "limits": objective.limits,
             "scoring_semantics_version": objective.scoring_semantics_version,
         },
+        "candidates": candidates,
+    }))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SavedCandidateExitPolicyVariantV1 {
+    label: &'static str,
+    max_hold_bars: usize,
+    trailing_enabled: bool,
+    trailing_atr_multiplier: Option<f64>,
+    trailing_be_trigger_r: Option<f64>,
+    trailing_min_lock_pips: Option<f64>,
+}
+
+fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVariantV1> {
+    vec![
+        SavedCandidateExitPolicyVariantV1 {
+            label: "baseline_sealed_policy",
+            max_hold_bars: 0,
+            trailing_enabled: false,
+            trailing_atr_multiplier: None,
+            trailing_be_trigger_r: None,
+            trailing_min_lock_pips: None,
+        },
+        SavedCandidateExitPolicyVariantV1 {
+            label: "max_hold_32_bars",
+            max_hold_bars: 32,
+            trailing_enabled: false,
+            trailing_atr_multiplier: None,
+            trailing_be_trigger_r: None,
+            trailing_min_lock_pips: None,
+        },
+        SavedCandidateExitPolicyVariantV1 {
+            label: "max_hold_96_bars_approx_24h_m15",
+            max_hold_bars: 96,
+            trailing_enabled: false,
+            trailing_atr_multiplier: None,
+            trailing_be_trigger_r: None,
+            trailing_min_lock_pips: None,
+        },
+        SavedCandidateExitPolicyVariantV1 {
+            label: "trailing_existing_parameters",
+            max_hold_bars: 0,
+            trailing_enabled: true,
+            trailing_atr_multiplier: None,
+            trailing_be_trigger_r: None,
+            trailing_min_lock_pips: None,
+        },
+        SavedCandidateExitPolicyVariantV1 {
+            label: "trailing_early_lock",
+            max_hold_bars: 0,
+            trailing_enabled: true,
+            trailing_atr_multiplier: Some(0.5),
+            trailing_be_trigger_r: Some(0.5),
+            trailing_min_lock_pips: Some(2.0),
+        },
+        SavedCandidateExitPolicyVariantV1 {
+            label: "trailing_existing_plus_96_bars",
+            max_hold_bars: 96,
+            trailing_enabled: true,
+            trailing_atr_multiplier: None,
+            trailing_be_trigger_r: None,
+            trailing_min_lock_pips: None,
+        },
+    ]
+}
+
+fn saved_candidate_variant_settings_v1(
+    base: &crate::eval::BacktestSettings,
+    variant: SavedCandidateExitPolicyVariantV1,
+) -> crate::eval::BacktestSettings {
+    let mut settings = base.clone();
+    settings.max_hold_bars = variant.max_hold_bars;
+    settings.trailing_enabled = variant.trailing_enabled;
+    if let Some(value) = variant.trailing_atr_multiplier {
+        settings.trailing_atr_multiplier = value;
+    }
+    if let Some(value) = variant.trailing_be_trigger_r {
+        settings.trailing_be_trigger_r = value;
+    }
+    if let Some(value) = variant.trailing_min_lock_pips {
+        settings.trailing_min_lock_pips = value;
+    }
+    settings
+}
+
+fn saved_candidate_exit_summary_v1(trades: &[Trade]) -> serde_json::Value {
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    let mut durations = Vec::with_capacity(trades.len());
+    let mut pnl_sum = 0.0_f64;
+    let mut mfe_sum = 0.0_f64;
+    let mut mae_sum = 0.0_f64;
+    let mut wins = 0usize;
+    for trade in trades {
+        let reason = format!("{:?}", trade.exit_reason);
+        *reasons.entry(reason).or_default() += 1;
+        let duration_hours = trade
+            .exit_time
+            .map(|exit| (exit - trade.entry_time) as f64 / 3_600_000.0)
+            .unwrap_or(0.0);
+        durations.push(duration_hours);
+        pnl_sum += trade.pnl;
+        mfe_sum += trade.mfe;
+        mae_sum += trade.mae;
+        if trade.pnl > 0.0 {
+            wins += 1;
+        }
+    }
+    durations.sort_by(|left, right| left.total_cmp(right));
+    let median = if durations.is_empty() {
+        0.0
+    } else {
+        durations[durations.len() / 2]
+    };
+    let mean = if durations.is_empty() {
+        0.0
+    } else {
+        durations.iter().sum::<f64>() / durations.len() as f64
+    };
+    serde_json::json!({
+        "trade_count": trades.len(),
+        "win_count": wins,
+        "pnl_sum": pnl_sum,
+        "mfe_sum": mfe_sum,
+        "mae_sum": mae_sum,
+        "duration_hours_min": durations.first().copied().unwrap_or(0.0),
+        "duration_hours_median": median,
+        "duration_hours_mean": mean,
+        "duration_hours_max": durations.last().copied().unwrap_or(0.0),
+        "exit_reason_counts": reasons,
+    })
+}
+
+/// Research-only counterfactual replay under existing exit controls.
+pub fn summarize_saved_candidate_exit_policy_variants_v1(
+    selections: &[SavedCandidateSelectionV1],
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+) -> Result<serde_json::Value> {
+    let (replay, selected) =
+        prepare_saved_candidate_diagnostic_v1(input, config, research, selections)?;
+    let result = research.discovery_result();
+    let selection = replay.inputs.selection();
+    let timestamps = replay.projected.timestamps.as_slice();
+    anyhow::ensure!(
+        !timestamps.is_empty(),
+        "saved candidate exit-policy diagnostic has no selection bars"
+    );
+    let (month_idx, day_idx) = month_day_indices(timestamps);
+    let objective = replay
+        .research_config
+        .weekly_objective_for_window(timestamps)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "saved candidate exit-policy diagnostic requires the sealed rolling weekly cadence objective"
+            )
+        })?;
+    let resolver = GeneEvalSettingsResolver::for_slice(
+        &replay.research_config,
+        selected.iter().map(|(_, gene)| gene),
+        &selection.ohlcv().high,
+        &selection.ohlcv().low,
+        &selection.ohlcv().close,
+    )?;
+    let variants = saved_candidate_exit_policy_variants_v1();
+    let (_genes, signals, confidences) = saved_candidate_signal_rows_v1(&replay, &selected)?;
+    let mut candidates = Vec::with_capacity(selected.len());
+    for (position, ((index, gene), (signal, confidence))) in selected
+        .iter()
+        .zip(signals.iter().zip(confidences.iter()))
+        .enumerate()
+    {
+        let base_settings = resolver.settings_for_gene(gene);
+        let mut variant_rows = Vec::with_capacity(variants.len());
+        let mut baseline_metrics = None;
+        let mut baseline_ledger = 0usize;
+        for variant in &variants {
+            let settings = saved_candidate_variant_settings_v1(&base_settings, *variant);
+            let (metrics, trades) = evaluate_gene_with_ledger_v1(
+                selection.ohlcv(),
+                timestamps,
+                &month_idx,
+                &day_idx,
+                signal,
+                confidence,
+                &settings,
+            )?;
+            if variant.label == "baseline_sealed_policy" {
+                baseline_metrics = Some(metrics);
+                baseline_ledger = trades.len();
+            }
+            let entry_times = trades
+                .iter()
+                .map(|trade| trade.entry_time)
+                .collect::<Vec<_>>();
+            let cadence = crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
+                &objective.cadence,
+                &entry_times,
+            )?;
+            variant_rows.push(serde_json::json!({
+                "label": variant.label,
+                "max_hold_bars": variant.max_hold_bars,
+                "trailing_enabled": variant.trailing_enabled,
+                "trailing_atr_multiplier": settings.trailing_atr_multiplier,
+                "trailing_be_trigger_r": settings.trailing_be_trigger_r,
+                "trailing_min_lock_pips": settings.trailing_min_lock_pips,
+                "metrics": {
+                    "names": SAVED_CANDIDATE_METRIC_NAMES,
+                    "values": metrics.to_vec(),
+                },
+                "ledger": saved_candidate_exit_summary_v1(&trades),
+                "weekly_cadence": cadence,
+            }));
+        }
+        let baseline_metrics = baseline_metrics
+            .ok_or_else(|| anyhow::anyhow!("exit-policy diagnostic has no baseline variant"))?;
+        let (metric_deltas, mut mismatch_reasons) =
+            saved_candidate_metric_deltas_v1(gene, &baseline_metrics);
+        if baseline_ledger != gene.trades_count {
+            mismatch_reasons.push(format!(
+                "baseline trade_count: actual ledger {} vs saved {}",
+                baseline_ledger, gene.trades_count
+            ));
+        }
+        candidates.push(serde_json::json!({
+            "candidate": {
+                "index": index,
+                "strategy_id": gene.strategy_id,
+                "exact_gene_hash": selections[position].exact_gene_hash,
+            },
+            "saved_trade_count": gene.trades_count,
+            "baseline_ledger_trade_count": baseline_ledger,
+            "baseline_metric_deltas": {
+                "names": SAVED_CANDIDATE_METRIC_NAMES,
+                "values": metric_deltas,
+            },
+            "material_mismatch": !mismatch_reasons.is_empty(),
+            "material_mismatch_reasons": mismatch_reasons,
+            "base_settings_provenance": saved_candidate_settings_provenance_v1(&base_settings),
+            "variants": variant_rows,
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema": "neoethos.research-only.saved-candidate-exit-policy-variants.v1",
+        "candidate_count": candidates.len(),
+        "selection_bars": timestamps.len(),
+        "provenance": saved_candidate_diagnostic_provenance_v1(result, timestamps),
+        "weekly_objective": {
+            "cadence": objective.cadence,
+            "limits": objective.limits,
+            "scoring_semantics_version": objective.scoring_semantics_version,
+        },
+        "variants": variants
+            .iter()
+            .map(|variant| serde_json::json!({
+                "label": variant.label,
+                "max_hold_bars": variant.max_hold_bars,
+                "trailing_enabled": variant.trailing_enabled,
+                "trailing_atr_multiplier": variant.trailing_atr_multiplier,
+                "trailing_be_trigger_r": variant.trailing_be_trigger_r,
+                "trailing_min_lock_pips": variant.trailing_min_lock_pips,
+            }))
+            .collect::<Vec<_>>(),
         "candidates": candidates,
     }))
 }
