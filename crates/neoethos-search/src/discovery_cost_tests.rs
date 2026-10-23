@@ -189,7 +189,7 @@ fn assert_same_resolved_discovery_config(actual: &DiscoveryConfig, expected: &Di
     compare_fields! {
         values: [
             timeframe_label, evaluation_symbol, evaluation_account_currency,
-            session_spread_pips, cost_band_pips, kill_zones_enabled,
+            session_spread_pips, cost_band_pips, kill_zones_enabled, max_hold_bars,
             population, population_auto, generations, max_indicators,
             candidate_count, portfolio_size, max_rows, max_rows_by_timeframe,
             target_profile, walkforward_splits, embargo_minutes, enable_cpcv,

@@ -120,6 +120,9 @@ impl LiveTradingPolicyV1 {
                 trailing_be_trigger_r: stamp.trailing_be_trigger_r,
                 trailing_stop_multiplier: stamp.trailing_give_back_r,
                 trailing_min_lock_pips: stamp.trailing_min_lock_pips,
+                // The hold horizon travels in the sealed evaluation, not in
+                // this trail-geometry policy reconstruction.
+                max_hold_bars: 0,
             },
             stamp.kill_zones_enabled,
             stamp.spread_pips,
@@ -308,6 +311,9 @@ impl LiveTradingPolicyV1 {
             trailing_be_trigger_r: self.trailing_be_trigger_r,
             trailing_stop_multiplier: self.trailing_stop_multiplier,
             trailing_min_lock_pips: self.trailing_min_lock_pips,
+            // The hold horizon travels in the sealed evaluation, not in this
+            // trail-geometry policy reconstruction.
+            max_hold_bars: 0,
         }
     }
 
@@ -1736,6 +1742,7 @@ mod tests {
                 trailing_be_trigger_r: 1.25,
                 trailing_stop_multiplier: 0.75,
                 trailing_min_lock_pips: 3.0,
+                max_hold_bars: 0,
             },
             false,
             1.5,
@@ -2538,6 +2545,7 @@ mod tests {
                 trailing_be_trigger_r: 1.25,
                 trailing_stop_multiplier: 0.75,
                 trailing_min_lock_pips: 3.0,
+                max_hold_bars: 0,
             },
             "the exact exit policy priced by discovery must survive the artifact round-trip"
         );

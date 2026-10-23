@@ -726,6 +726,9 @@ pub struct DiscoveryConfig {
     /// How many top archive (non-portfolio) genes to also record in the ledger.
     /// Wired from `models.discovery_ledger.archive_top_n`.
     pub discovery_ledger_archive_top_n: usize,
+    /// Max-hold-horizon bars for the evaluation time stop (0 = disabled).
+    /// Resolved by `from_settings` from `models.exit_policy.max_hold_bars`.
+    pub max_hold_bars: usize,
     /// Which named scoring table the GA maximises (docs/autoresearch-loop.md
     /// section 14.7; the autoresearch search-* capability features write this,
     /// read-only to the loop). GaFitness keeps the canonical
@@ -910,6 +913,10 @@ impl Default for DiscoveryConfig {
             // live loop applies. See the field's doc for why this is one knob
             // and not two.
             kill_zones_enabled: true,
+            // Same value `ExitPolicyConfig::default()` ships (0 = no
+            // max-hold exit), so the config-less fallback searches under the
+            // same horizon policy as before the knob existed.
+            max_hold_bars: 0,
             population: 1000,
             population_auto: true,
             generations: 10,
@@ -1359,6 +1366,10 @@ impl DiscoveryConfig {
             // #75/#217: the SAME field the live loop reads
             // (`live_trading.rs:732-735`). One knob, both sides.
             kill_zones_enabled: settings.risk.kill_zones_enabled,
+            // The maximum-holding-horizon knob, resolved from
+            // `models.exit_policy.max_hold_bars`. 0 = unchanged/disabled —
+            // exactly the behaviour every run had before the knob existed.
+            max_hold_bars: model_settings.exit_policy.max_hold_bars,
             population: model_settings.prop_search_population.max(10),
             population_auto: model_settings.prop_search_population_auto,
             generations: model_settings.prop_search_generations.max(1),
@@ -1843,6 +1854,9 @@ impl DiscoveryConfig {
                 cfg.pnl_conversion_fee_rate = f64::NAN;
             }
         }
+        // Max-hold horizon of the resolved exit policy; set AFTER the
+        // research-contract seal so both branches carry the configured value.
+        cfg.max_hold_bars = self.max_hold_bars;
         cfg
     }
 
@@ -17485,6 +17499,10 @@ pub fn build_discovery_profile(
         // field can never be added to DiscoveryConfig without this destructure
         // noticing it.
         fitness_table: _profile_fitness_table @ _,
+        // Bound like `fitness_table` (not yet recorded in the run profile —
+        // section 14.8 stamp gap); a new field can never be added to
+        // DiscoveryConfig without this destructure noticing it.
+        max_hold_bars: _max_hold_bars @ _,
         timeframe_label,
         evaluation_symbol,
         evaluation_account_currency,

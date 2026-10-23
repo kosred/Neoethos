@@ -6574,6 +6574,72 @@ fn the_kill_zone_switch_reaches_the_discovery_backtest() {
     );
 }
 
+/// The Settings-side maximum-holding-horizon knob
+/// (`models.exit_policy.max_hold_bars`) must resolve into
+/// `DiscoveryConfig.max_hold_bars` inside `DiscoveryConfig::from_settings`, so
+/// the next research experiment can use short holds without editing code.
+#[test]
+fn settings_exit_policy_max_hold_bars_resolves_into_discovery_config() {
+    let settings = neoethos_core::Settings::default();
+    let base = crate::discovery::DiscoveryConfig::from_settings(&settings);
+    assert_eq!(
+        base.max_hold_bars, 0,
+        "the shipped default (0 = unchanged/disabled) must keep current behaviour: \
+         no max-hold exit is armed"
+    );
+
+    let mut configured = neoethos_core::Settings::default();
+    configured.models.exit_policy.max_hold_bars = 24;
+    let resolved = crate::discovery::DiscoveryConfig::from_settings(&configured);
+    assert_eq!(
+        resolved.max_hold_bars, 24,
+        "models.exit_policy.max_hold_bars must land in DiscoveryConfig.max_hold_bars"
+    );
+}
+
+/// The max-holding-horizon knob must reach `BacktestSettings.max_hold_bars` —
+/// the time stop every discovery evaluation lane reads — through the existing
+/// evaluation-config path, or the next experiment's short holds would be dead
+/// code. Asserts both ends: `from_settings` carries the field and the settings
+/// template the lanes flow through carries it (mirror of
+/// `the_kill_zone_switch_reaches_the_discovery_backtest`).
+#[test]
+fn the_max_hold_horizon_reaches_the_discovery_backtest() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.models.exit_policy.max_hold_bars = 24;
+
+    let gene = profitable_gene("max-hold-wiring");
+
+    // Through the RESOLVER, never the raw builder: the SLICE-2 guard
+    // (`discovery_backtest_settings_has_no_callers_outside_the_resolvers`)
+    // permits exactly three occurrences of the private builder and none in
+    // this file. `PopulationTemplateResolver::template` is the
+    // gene-independent template every population lane takes.
+    let template = |config: &crate::discovery::DiscoveryConfig| {
+        crate::discovery::PopulationTemplateResolver::new(config, None).template(&gene)
+    };
+
+    let on = crate::discovery::DiscoveryConfig::from_settings(&settings);
+    assert_eq!(on.max_hold_bars, 24, "from_settings must carry the field");
+    assert_eq!(
+        template(&on).max_hold_bars, 24,
+        "the configured horizon must reach the settings template"
+    );
+    assert_eq!(
+        on.evaluation_config(None).max_hold_bars, 24,
+        "the configured horizon must reach Generation 0"
+    );
+
+    // Default 0 stays disabled end to end — byte-identical to every run
+    // produced before the knob existed.
+    let off = crate::discovery::DiscoveryConfig::from_settings(
+        &neoethos_core::Settings::default(),
+    );
+    assert_eq!(off.max_hold_bars, 0);
+    assert_eq!(template(&off).max_hold_bars, 0);
+    assert_eq!(off.evaluation_config(None).max_hold_bars, 0);
+}
+
 /// The prop-firm gate's zero pass-rate is only actionable if each failing
 /// window is attributed to the rule that denied it. This test pins that
 /// accounting: which rule is counted, that windows with no trades are counted
