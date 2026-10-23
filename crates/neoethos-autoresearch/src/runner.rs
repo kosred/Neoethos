@@ -972,6 +972,45 @@ pub fn run_until_boundary_v1(
 }
 
 /// The state machine proper, against any [`SweepExecutor`].
+
+fn load_reviewed_broker_financial_truth_authority_v2(
+    store_path: Option<&std::path::Path>,
+    link_path: Option<&std::path::Path>,
+    reviewed_path: Option<&std::path::Path>,
+) -> Result<Option<neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2>> {
+    match (store_path, link_path, reviewed_path) {
+        (Some(store_path), Some(link_path), Some(reviewed_path)) => {
+            let store = neoethos_core::broker_financial_truth::BrokerTruthAcquisitionStoreV1::new(
+                store_path.to_path_buf(),
+            );
+            let link_bytes = std::fs::read(link_path)
+                .with_context(|| format!("read quote replay link {}", link_path.display()))?;
+            let link_receipt =
+                neoethos_core::broker_financial_truth::BrokerTruthAcquisitionLinkReceiptV1::from_json_bytes(
+                    &link_bytes,
+                )
+                .map_err(anyhow::Error::new)
+                .context("parse quote replay link receipt")?;
+            let reviewed_bytes = std::fs::read(reviewed_path)
+                .with_context(|| format!("read reviewed evidence {}", reviewed_path.display()))?;
+            let reviewed: neoethos_core::broker_financial_truth::ReviewedBrokerFinancialTruthEvidenceV2 =
+                serde_json::from_slice(&reviewed_bytes)
+                    .context("parse reviewed broker-financial-truth evidence")?;
+            let authority =
+                neoethos_core::broker_financial_truth::validate_reviewed_broker_financial_truth_authority_v2(
+                    &store, &link_receipt, reviewed,
+                )
+                .map_err(anyhow::Error::new)
+                .context("validate the reviewed broker bundle and mint run-scoped authority")?;
+            Ok(Some(authority))
+        }
+        (None, None, None) => Ok(None),
+        _ => anyhow::bail!(
+            "quote-replay store, link and reviewed evidence must be supplied together"
+        ),
+    }
+}
+
 pub fn run_with_executor(
     args: RunArgs,
     settings: &Settings,
@@ -1002,9 +1041,20 @@ pub fn run_until_boundary_with_executor_v1(
     // test harnesses and alternate callers can supply a config directly.
     // Gate again at the actual execution boundary: no synthetic executor may
     // turn guessed costs or returns into an autoresearch verdict.
-    neoethos_core::current_broker_financial_truth_capability_v1()
-        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
-        .map_err(anyhow::Error::new)?;
+    //
+    // With an exact reviewed broker bundle, mint the run-scoped authority
+    // from the validated bundle instead; otherwise keep the global
+    // fail-closed gate.
+    let _reviewed_authority = load_reviewed_broker_financial_truth_authority_v2(
+        args.quote_replay_store.as_deref(),
+        args.quote_replay_link.as_deref(),
+        args.reviewed_evidence.as_deref(),
+    )?;
+    if _reviewed_authority.is_none() {
+        neoethos_core::current_broker_financial_truth_capability_v1()
+            .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
+            .map_err(anyhow::Error::new)?;
+    }
     assert_executor_receipt(&args.dataset_identity, executor)?;
 
     let started = Instant::now();

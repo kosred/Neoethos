@@ -634,3 +634,35 @@ fn run_args_default_to_no_reviewed_broker_bundle() {
     assert!(args.quote_replay_link.is_none());
     assert!(args.reviewed_evidence.is_none());
 }
+
+#[test]
+fn reviewed_bundle_inputs_must_be_supplied_together() {
+    let error = load_reviewed_broker_financial_truth_authority_v2(
+        Some(std::path::Path::new("store")),
+        Some(std::path::Path::new("link")),
+        None,
+    )
+    .expect_err("partial reviewed bundle inputs must fail closed");
+    assert!(
+        error.to_string().contains("together"),
+        "unexpected partial-input refusal: {error:#}"
+    );
+}
+
+#[test]
+fn no_reviewed_bundle_inputs_keep_the_global_gate() {
+    let authority = load_reviewed_broker_financial_truth_authority_v2(None, None, None)
+        .expect("no inputs means the global gate, not an error");
+    assert!(authority.is_none());
+}
+
+#[test]
+fn unreadable_reviewed_bundle_inputs_fail_closed() {
+    let error = load_reviewed_broker_financial_truth_authority_v2(
+        Some(std::path::Path::new("missing-store")),
+        Some(std::path::Path::new("missing-link.json")),
+        Some(std::path::Path::new("missing-reviewed.json")),
+    )
+    .expect_err("unreadable reviewed bundle inputs must fail closed");
+    assert!(!error.to_string().is_empty());
+}
