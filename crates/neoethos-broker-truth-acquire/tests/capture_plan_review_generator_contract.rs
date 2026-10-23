@@ -2,10 +2,11 @@
 //!
 //! The acquisition CLI must offer a reviewed-input generator that emits REAL,
 //! schema-exact files (capture plan, review record, protocol evidence, trust
-//! root) content-addressed with lowercase SHA-256 sidecars, deriving every
-//! canonical digest from the real operator-supplied input bytes. The agent
-//! acts as reviewer and that identity is recorded in the trust root; the
-//! generator never produces a permit or capability.
+//! root, and the per-synchronization reviewed quote-session evidence that the
+//! history ingress loads), content-addressed with lowercase SHA-256 sidecars,
+//! deriving every canonical digest from the real operator-supplied input
+//! bytes. The agent acts as reviewer and that identity is recorded in the
+//! trust root; the generator never produces a permit or capability.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,12 +19,22 @@ use tempfile::TempDir;
 use neoethos_broker_history::bootstrap_writer::{
     BrokerTrendbarStreamRequest, publish_broker_trendbar_chunks,
 };
-use neoethos_broker_truth::ReviewedQuoteReplayRuleIdentityV2;
+use neoethos_broker_history::broker_truth_capture::ExactQuoteInstrumentV2;
+use neoethos_broker_history::{
+    LoadedReviewedCTraderQuoteSynchronizationV2, ReviewedCTraderQuoteSynchronizationSourceV2,
+    load_reviewed_ctrader_quote_synchronizations_v2,
+};
+use neoethos_broker_truth::{
+    BrokerTruthReviewedSynchronizationBindingV1, EvidenceWindowV1,
+    ReviewedQuoteReplayRuleIdentityV2,
+};
 use neoethos_broker_truth_acquire::{
     AGENT_REVIEWER_IDENTITY_V1, AGENT_REVIEWER_NONCE_FILE_V1,
     BrokerTruthAcquisitionPreflightErrorCodeV1, BrokerTruthAcquisitionPreflightErrorV1,
-    GeneratedReviewedInputsV1, ReviewedInputGenerationArgsV1, generate_reviewed_inputs_v1,
+    GeneratedReviewedInputArtifactV1, GeneratedReviewedInputsV1,
+    ReviewedInputGenerationArgsV1, generate_reviewed_inputs_v1,
 };
+use neoethos_data::core::vortex_io::write_vortex_array;
 use neoethos_data::{
     BarTimestampConvention, CTraderEnvironment, CanonicalDatasetIdentity, CanonicalOhlcvChunk,
     CanonicalTimeframe, CanonicalVolumeChunk, SelectedDatasetGenerationV1,
@@ -31,6 +42,8 @@ use neoethos_data::{
 use neoethos_search::{
     CanonicalSearchArtifactScopeV2, CanonicalSearchInputReceiptV2, CanonicalSearchWindowRoleV1,
 };
+use vortex_array::IntoArray;
+use vortex_array::arrays::VarBinArray;
 
 const SERVER: &str = "demo.ctraderapi.com";
 const WINDOW_POLICY_ID: &str = "reviewed-half-open-m1-v1";
@@ -43,6 +56,10 @@ const CONVERSION_SYMBOL_ID: i64 = 15;
 const USD_ASSET_ID: i64 = 2;
 const EUR_ASSET_ID: i64 = 1;
 const JPY_ASSET_ID: i64 = 3;
+const TICK_ARCHIVE_SCHEMA_V1: &str = "neoethos.unreviewed-ctrader-tick-archive.v1";
+const TICK_RESPONSE_PAYLOAD_TYPE: u32 = 2_146;
+const BID_SIDE: i32 = 1;
+const ASK_SIDE: i32 = 2;
 
 // ---------------------------------------------------------------------------
 // Strict mirrors of the private acquisition wire schemas. Every field name
@@ -208,6 +225,10 @@ fn is_lowercase_hex64(value: &str) -> bool {
     only_hex
 }
 
+fn fixture_window() -> EvidenceWindowV1 {
+    EvidenceWindowV1::new(FROM_MS, TO_MS_EXCLUSIVE).expect("valid half-open fixture window")
+}
+
 fn primary_identity() -> CanonicalDatasetIdentity {
     CanonicalDatasetIdentity::ctrader(
         CTraderEnvironment::Demo,
@@ -219,6 +240,94 @@ fn primary_identity() -> CanonicalDatasetIdentity {
         BarTimestampConvention::BarOpen,
     )
     .expect("valid exact cTrader dataset identity")
+}
+
+/// One archived cTrader tick page in the real tick-archive page format. The
+/// fixture is synthetic but structurally identical to the archive pages the
+/// generator reads and validates.
+struct ProbePageContent {
+    sequence: u64,
+    side: i32,
+    client_msg_id: String,
+    envelope: Value,
+    raw_response_sha256: Option<String>,
+    schema: &'static str,
+}
+
+impl ProbePageContent {
+    fn bid() -> Self {
+        Self::new(0, BID_SIDE)
+    }
+
+    fn ask() -> Self {
+        Self::new(1, ASK_SIDE)
+    }
+
+    fn new(sequence: u64, side: i32) -> Self {
+        let client_msg_id = format!("reviewed-fixture-{sequence}-side-{side}");
+        Self {
+            sequence,
+            side,
+            client_msg_id: client_msg_id.clone(),
+            envelope: json!({
+                "clientMsgId": client_msg_id,
+                "payloadType": TICK_RESPONSE_PAYLOAD_TYPE,
+                "payload": {
+                    "ctidTraderAccountId": ACCOUNT_ID,
+                    "hasMore": false,
+                    "tickData": [
+                        {"tick": 100 + sequence, "timestamp": FROM_MS + 1_000 + i64::try_from(sequence).expect("sequence fits i64")},
+                    ],
+                },
+            }),
+            raw_response_sha256: None,
+            schema: TICK_ARCHIVE_SCHEMA_V1,
+        }
+    }
+}
+
+/// Mirrors tick_archive.rs raw_fragments: bounded UTF-8 fragments of the
+/// serialized page record, one VarBin vortex column.
+fn fragment_array(raw: &str) -> vortex_array::ArrayRef {
+    let mut fragments = Vec::new();
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(1024);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        fragments.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    VarBinArray::from(fragments).into_array()
+}
+
+fn write_probe_page(root: &Path, name: &str, content: &ProbePageContent) -> (PathBuf, String) {
+    let raw_response_json = serde_json::to_string(&content.envelope).expect("envelope JSON");
+    let raw_response_sha256 = content
+        .raw_response_sha256
+        .clone()
+        .unwrap_or_else(|| sha256(raw_response_json.as_bytes()));
+    let record = json!({
+        "schema": content.schema,
+        "plan_sha256": "cd".repeat(32),
+        "sequence": content.sequence,
+        "cursor": {
+            "chunk_from_ms": FROM_MS,
+            "chunk_to_ms_exclusive": TO_MS_EXCLUSIVE,
+            "page_to_ms_exclusive": TO_MS_EXCLUSIVE,
+            "side": content.side,
+        },
+        "client_msg_id": content.client_msg_id,
+        "captured_at_ms": 1_800_000_000_000_i64,
+        "raw_response_sha256": raw_response_sha256,
+        "raw_response_json": raw_response_json,
+    });
+    let serialized = serde_json::to_string(&record).expect("page record JSON");
+    let path = root.join(name);
+    write_vortex_array(&path, fragment_array(&serialized)).expect("write probe page fixture");
+    let bytes = fs::read(&path).expect("read probe page fixture");
+    (path, sha256(&bytes))
 }
 
 struct FixturePublication {
@@ -274,7 +383,6 @@ fn publish_fixture_generation(
 struct Fixture {
     _temp: TempDir,
     args: Vec<String>,
-    rules: Vec<(PathBuf, String)>,
     observations: Vec<(PathBuf, String)>,
     manifest_vortex_sha256: String,
     manifest_schema_id: String,
@@ -287,11 +395,16 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(
+    fn new(account_asset_id: i64, account_asset_name: &str, legs: &[&str]) -> Self {
+        let pages = [ProbePageContent::bid(), ProbePageContent::ask()];
+        Self::with_pages(account_asset_id, account_asset_name, legs, &pages)
+    }
+
+    fn with_pages(
         account_asset_id: i64,
         account_asset_name: &str,
         legs: &[&str],
-        sync_count: usize,
+        pages: &[ProbePageContent; 2],
     ) -> Self {
         let temp = tempfile::tempdir().expect("temporary generator fixture");
         let data_root = temp.path().join("canonical-data");
@@ -365,23 +478,11 @@ impl Fixture {
         let scope_path = input_root.join("canonical-search-artifact-scope.json");
         fs::write(&scope_path, &scope_bytes).expect("write canonical scope file");
 
-        let observations = (0..sync_count)
-            .map(|index| {
-                let bytes = format!("immutable-observation-fixture-v1-{index}").into_bytes();
-                let path = input_root.join(format!("quote-session-observations-{index:03}.vortex"));
-                fs::write(&path, &bytes).expect("write observation file");
-                (path, sha256(&bytes))
-            })
-            .collect::<Vec<_>>();
-        let rules = (0..sync_count)
-            .map(|index| {
-                let bytes = format!("immutable-reviewed-rules-fixture-v1-{index}").into_bytes();
-                let path =
-                    input_root.join(format!("reviewed-quote-replay-rules-{index:03}.vortex"));
-                fs::write(&path, &bytes).expect("write reviewed rules file");
-                (path, sha256(&bytes))
-            })
-            .collect::<Vec<_>>();
+        let mut observations = Vec::with_capacity(pages.len());
+        for (index, page) in pages.iter().enumerate() {
+            let name = format!("probe-page-{index:03}.vortex");
+            observations.push(write_probe_page(&input_root, &name, page));
+        }
 
         let mut args = vec![
             "broker-truth-acquire".to_owned(),
@@ -430,12 +531,6 @@ impl Fixture {
             args.push("--quote-observations-sha256".to_owned());
             args.push(digest.clone());
         }
-        for (path, digest) in &rules {
-            args.push("--reviewed-replay-rules".to_owned());
-            args.push(path.to_string_lossy().into_owned());
-            args.push("--reviewed-replay-rules-sha256".to_owned());
-            args.push(digest.clone());
-        }
 
         Self {
             _temp: temp,
@@ -448,7 +543,6 @@ impl Fixture {
             manifest_schema_id,
             manifest_vortex_sha256,
             observations,
-            rules,
             args,
         }
     }
@@ -550,9 +644,70 @@ fn expect_review_identity(
     assert_eq!(plan_sync.review_identity_sha256, binding.identity_sha256());
 }
 
+fn assert_evidence_artifact(artifact: &GeneratedReviewedInputArtifactV1) {
+    let bytes = fs::read(artifact.path()).expect("read generated evidence artifact");
+    assert_eq!(sha256(&bytes), artifact.sha256().to_owned());
+    assert_sidecar(artifact.path(), artifact.sha256());
+}
+
+/// Loads one emitted synchronization through the REAL history ingress
+/// (load_reviewed_ctrader_quote_synchronizations_v2) with the exact binding
+/// the acquisition orchestrator constructs. This is the acceptance proof that
+/// the emitted evidence is schema-exact and ingress-valid.
+fn load_emitted_synchronization(
+    ordinal: u32,
+    symbol_id: i64,
+    symbol_name: &str,
+    base_id: i64,
+    base_name: &str,
+    quote_id: i64,
+    quote_name: &str,
+    generated: &GeneratedReviewedInputsV1,
+) -> LoadedReviewedCTraderQuoteSynchronizationV2 {
+    let ordinal_index = usize::try_from(ordinal).expect("ordinal fits fixture index");
+    let review_record_sha256 = generated.review_record().sha256().to_owned();
+    let protocol_sha256 = generated.protocol_evidence().sha256().to_owned();
+    let observations_sha256 = generated.quote_observations()[ordinal_index]
+        .sha256()
+        .to_owned();
+    let rules_sha256 = generated.reviewed_replay_rules()[ordinal_index]
+        .sha256()
+        .to_owned();
+    let review_identity = ReviewedQuoteReplayRuleIdentityV2::new(
+        review_record_sha256,
+        protocol_sha256,
+        observations_sha256,
+    )
+    .expect("reviewed replay-rule identity");
+    let binding = BrokerTruthReviewedSynchronizationBindingV1::new(
+        ordinal,
+        ACCOUNT_ID,
+        symbol_id,
+        fixture_window(),
+        review_identity,
+        rules_sha256,
+    )
+    .expect("exact reviewed synchronization binding");
+    let instrument = ExactQuoteInstrumentV2::new(
+        symbol_id, symbol_name, base_id, base_name, quote_id, quote_name,
+    )
+    .expect("exact fixture instrument");
+    let source = ReviewedCTraderQuoteSynchronizationSourceV2::new(
+        binding,
+        instrument,
+        generated.quote_observations()[ordinal_index].path().to_path_buf(),
+        generated.reviewed_replay_rules()[ordinal_index].path().to_path_buf(),
+    )
+    .expect("explicit evidence source");
+    let loaded = load_reviewed_ctrader_quote_synchronizations_v2(vec![source])
+        .expect("history ingress must accept the emitted reviewed evidence");
+    assert_eq!(loaded.len(), 1);
+    loaded.into_iter().next().expect("one loaded synchronization")
+}
+
 #[test]
 fn generator_emits_schema_exact_content_addressed_reviewed_bundle() {
-    let fixture = Fixture::new(USD_ASSET_ID, "USD", &[], 1);
+    let fixture = Fixture::new(USD_ASSET_ID, "USD", &[]);
     let generated = fixture.generate().expect("agent-reviewed input generation");
 
     let capture_plan = generated.capture_plan();
@@ -565,6 +720,15 @@ fn generator_emits_schema_exact_content_addressed_reviewed_bundle() {
     let window_binding = generated
         .canonical_scope_window_binding()
         .expect("derived canonical scope-window binding");
+    assert_eq!(generated.quote_observations().len(), 1);
+    assert_eq!(generated.reviewed_replay_rules().len(), 1);
+    for artifact in generated
+        .quote_observations()
+        .iter()
+        .chain(generated.reviewed_replay_rules())
+    {
+        assert_evidence_artifact(artifact);
+    }
 
     for (label, digest) in [
         ("capture plan", capture_plan.sha256()),
@@ -635,9 +799,12 @@ fn generator_emits_schema_exact_content_addressed_reviewed_bundle() {
     );
     assert_eq!(
         review_sync.quote_observations_sha256,
-        fixture.observations[0].1
+        generated.quote_observations()[0].sha256().to_owned()
     );
-    assert_eq!(review_sync.reviewed_replay_rules_sha256, fixture.rules[0].1);
+    assert_eq!(
+        review_sync.reviewed_replay_rules_sha256,
+        generated.reviewed_replay_rules()[0].sha256().to_owned()
+    );
 
     let plan: MirrorPlan = read_json_mirror(capture_plan.path());
     assert_eq!(
@@ -716,14 +883,17 @@ fn generator_emits_schema_exact_content_addressed_reviewed_bundle() {
     assert_exact_window(&plan_sync.window);
     assert_eq!(
         plan_sync.quote_observations_sha256,
-        fixture.observations[0].1
+        generated.quote_observations()[0].sha256().to_owned()
     );
-    assert_eq!(plan_sync.reviewed_replay_rules_sha256, fixture.rules[0].1);
+    assert_eq!(
+        plan_sync.reviewed_replay_rules_sha256,
+        generated.reviewed_replay_rules()[0].sha256().to_owned()
+    );
     expect_review_identity(
         plan_sync,
         review_record.sha256(),
         protocol_evidence.sha256(),
-        &fixture.observations[0].1,
+        generated.quote_observations()[0].sha256(),
     );
 
     let root: MirrorRootVerification = read_json_mirror(root_verification.path());
@@ -786,7 +956,7 @@ fn generator_emits_schema_exact_content_addressed_reviewed_bundle() {
     assert_eq!(protocol["protocol"], "ctrader-open-api");
     assert_eq!(
         protocol["quote_observations_sha256"],
-        json!([fixture.observations[0].1])
+        json!([generated.quote_observations()[0].sha256().to_owned()])
     );
     assert_eq!(protocol["reviewer"], AGENT_REVIEWER_IDENTITY_V1);
 
@@ -802,44 +972,85 @@ fn generator_emits_schema_exact_content_addressed_reviewed_bundle() {
             &fs::read(path).unwrap_or_else(|error| panic!("read {label}: {error}")),
         );
     }
+
+    // The real acceptance proof: the emitted observations + replay rules load
+    // through the unchanged history ingress with the exact acquisition binding.
+    let loaded = load_emitted_synchronization(
+        0,
+        PRIMARY_SYMBOL_ID,
+        "EURUSD",
+        EUR_ASSET_ID,
+        "EUR",
+        USD_ASSET_ID,
+        "USD",
+        &generated,
+    );
+    assert_eq!(loaded.ordinal(), 0);
+    assert_eq!(loaded.account_id(), ACCOUNT_ID);
+    assert_eq!(loaded.symbol_id(), PRIMARY_SYMBOL_ID);
+    assert_eq!(loaded.window(), fixture_window());
+    assert_eq!(loaded.raw_observation_count(), 2);
+    assert_eq!(loaded.decoded_replay_rule_count(), 1);
+    assert_eq!(
+        loaded.review_identity_sha256(),
+        ReviewedQuoteReplayRuleIdentityV2::new(
+            review_record.sha256().to_owned(),
+            protocol_evidence.sha256().to_owned(),
+            generated.quote_observations()[0].sha256().to_owned(),
+        )
+        .expect("identity")
+        .identity_sha256()
+    );
 }
 
 #[test]
 fn generator_emits_exact_settlement_conversion_route_and_second_synchronization() {
     let leg_spec = format!(
-        "{USD_ASSET_ID}|USD|{JPY_ASSET_ID}|JPY|{CONVERSION_SYMBOL_ID}|USDJPY|{USD_ASSET_ID}|USD|{JPY_ASSET_ID}|JPY"
+        "{USD_ASSET_ID}|USD|{EUR_ASSET_ID}|EUR|{PRIMARY_SYMBOL_ID}|EURUSD|{EUR_ASSET_ID}|EUR|{USD_ASSET_ID}|USD"
     );
     let legs = [leg_spec.as_str()];
-    let fixture = Fixture::new(JPY_ASSET_ID, "JPY", &legs, 2);
+    // Order independence: the ask page is supplied before the bid page and the
+    // generator must still bind sides from the archived cursor, not CLI order.
+    let pages = [ProbePageContent::ask(), ProbePageContent::bid()];
+    let fixture = Fixture::with_pages(EUR_ASSET_ID, "EUR", &legs, &pages);
     let generated = fixture.generate().expect("agent-reviewed input generation");
     let capture_plan = generated.capture_plan();
     let review_record = generated.review_record();
     let protocol_evidence = generated.protocol_evidence();
+    assert_eq!(generated.quote_observations().len(), 2);
+    assert_eq!(generated.reviewed_replay_rules().len(), 2);
+    for artifact in generated
+        .quote_observations()
+        .iter()
+        .chain(generated.reviewed_replay_rules())
+    {
+        assert_evidence_artifact(artifact);
+    }
 
     let plan: MirrorPlan = read_json_mirror(capture_plan.path());
-    assert_eq!(plan.account_asset.asset_id, JPY_ASSET_ID);
-    assert_eq!(plan.account_asset.asset_name, "JPY");
+    assert_eq!(plan.account_asset.asset_id, EUR_ASSET_ID);
+    assert_eq!(plan.account_asset.asset_name, "EUR");
     assert_eq!(plan.conversion_routes.len(), 1);
     let route = &plan.conversion_routes[0];
     assert_eq!(route.purpose, "primary_pnl_settlement");
     assert_eq!(route.from_asset_id, USD_ASSET_ID);
     assert_eq!(route.from_asset_name, "USD");
-    assert_eq!(route.to_asset_id, JPY_ASSET_ID);
-    assert_eq!(route.to_asset_name, "JPY");
+    assert_eq!(route.to_asset_id, EUR_ASSET_ID);
+    assert_eq!(route.to_asset_name, "EUR");
     assert_eq!(route.legs.len(), 1);
     let leg = &route.legs[0];
     assert_eq!(leg.from_asset_id, USD_ASSET_ID);
     assert_eq!(leg.from_asset_name, "USD");
-    assert_eq!(leg.to_asset_id, JPY_ASSET_ID);
-    assert_eq!(leg.to_asset_name, "JPY");
+    assert_eq!(leg.to_asset_id, EUR_ASSET_ID);
+    assert_eq!(leg.to_asset_name, "EUR");
     assert_exact_instrument(
         &leg.instrument,
-        CONVERSION_SYMBOL_ID,
-        "USDJPY",
+        PRIMARY_SYMBOL_ID,
+        "EURUSD",
+        EUR_ASSET_ID,
+        "EUR",
         USD_ASSET_ID,
         "USD",
-        JPY_ASSET_ID,
-        "JPY",
     );
     assert_eq!(plan.synchronizations.len(), 2);
     assert_eq!(
@@ -851,24 +1062,27 @@ fn generator_emits_exact_settlement_conversion_route_and_second_synchronization(
     assert_eq!(second_sync.account_id, ACCOUNT_ID);
     assert_exact_instrument(
         &second_sync.instrument,
-        CONVERSION_SYMBOL_ID,
-        "USDJPY",
+        PRIMARY_SYMBOL_ID,
+        "EURUSD",
+        EUR_ASSET_ID,
+        "EUR",
         USD_ASSET_ID,
         "USD",
-        JPY_ASSET_ID,
-        "JPY",
     );
     assert_exact_window(&second_sync.window);
     assert_eq!(
         second_sync.quote_observations_sha256,
-        fixture.observations[1].1
+        generated.quote_observations()[1].sha256().to_owned()
     );
-    assert_eq!(second_sync.reviewed_replay_rules_sha256, fixture.rules[1].1);
+    assert_eq!(
+        second_sync.reviewed_replay_rules_sha256,
+        generated.reviewed_replay_rules()[1].sha256().to_owned()
+    );
     expect_review_identity(
         second_sync,
         review_record.sha256(),
         protocol_evidence.sha256(),
-        &fixture.observations[1].1,
+        generated.quote_observations()[1].sha256(),
     );
 
     let review: MirrorReviewRecord = read_json_mirror(review_record.path());
@@ -877,21 +1091,166 @@ fn generator_emits_exact_settlement_conversion_route_and_second_synchronization(
     assert_eq!(second_review_sync.ordinal, 1);
     assert_eq!(
         second_review_sync.instrument.symbol_id,
-        CONVERSION_SYMBOL_ID
+        PRIMARY_SYMBOL_ID
     );
     assert_eq!(
         second_review_sync.quote_observations_sha256,
-        fixture.observations[1].1
+        generated.quote_observations()[1].sha256().to_owned()
     );
     assert_eq!(
         second_review_sync.reviewed_replay_rules_sha256,
-        fixture.rules[1].1
+        generated.reviewed_replay_rules()[1].sha256().to_owned()
+    );
+
+    // Both synchronizations must load through the real ingress in caller order.
+    let mut sources = Vec::new();
+    for ordinal in 0..2_u32 {
+        let ordinal_index = usize::try_from(ordinal).expect("ordinal index");
+        let review_identity = ReviewedQuoteReplayRuleIdentityV2::new(
+            review_record.sha256().to_owned(),
+            protocol_evidence.sha256().to_owned(),
+            generated.quote_observations()[ordinal_index].sha256().to_owned(),
+        )
+        .expect("reviewed replay-rule identity");
+        let binding = BrokerTruthReviewedSynchronizationBindingV1::new(
+            ordinal,
+            ACCOUNT_ID,
+            PRIMARY_SYMBOL_ID,
+            fixture_window(),
+            review_identity,
+            generated.reviewed_replay_rules()[ordinal_index].sha256().to_owned(),
+        )
+        .expect("exact reviewed synchronization binding");
+        let instrument = ExactQuoteInstrumentV2::new(
+            PRIMARY_SYMBOL_ID,
+            "EURUSD",
+            EUR_ASSET_ID,
+            "EUR",
+            USD_ASSET_ID,
+            "USD",
+        )
+        .expect("exact fixture instrument");
+        sources.push(
+            ReviewedCTraderQuoteSynchronizationSourceV2::new(
+                binding,
+                instrument,
+                generated.quote_observations()[ordinal_index].path().to_path_buf(),
+                generated.reviewed_replay_rules()[ordinal_index]
+                    .path()
+                    .to_path_buf(),
+            )
+            .expect("explicit evidence source"),
+        );
+    }
+    let loaded = load_reviewed_ctrader_quote_synchronizations_v2(sources)
+        .expect("history ingress must accept both emitted synchronizations");
+    assert_eq!(loaded.len(), 2);
+    for (ordinal, synchronization) in loaded.iter().enumerate() {
+        assert_eq!(synchronization.ordinal(), ordinal as u32);
+        assert_eq!(synchronization.account_id(), ACCOUNT_ID);
+        assert_eq!(synchronization.symbol_id(), PRIMARY_SYMBOL_ID);
+        assert_eq!(synchronization.window(), fixture_window());
+        assert_eq!(synchronization.raw_observation_count(), 2);
+        assert_eq!(synchronization.decoded_replay_rule_count(), 1);
+    }
+}
+
+#[test]
+fn generator_refuses_multi_instrument_synchronizations_without_per_instrument_pages() {
+    let leg_spec = format!(
+        "{USD_ASSET_ID}|USD|{JPY_ASSET_ID}|JPY|{CONVERSION_SYMBOL_ID}|USDJPY|{USD_ASSET_ID}|USD|{JPY_ASSET_ID}|JPY"
+    );
+    let legs = [leg_spec.as_str()];
+    let fixture = Fixture::new(JPY_ASSET_ID, "JPY", &legs);
+    expect_generation_error(
+        fixture.args,
+        BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
     );
 }
 
 #[test]
+fn generator_refuses_tampered_or_invalid_quote_observation_pages() {
+    let cases: [(&str, fn(&mut [ProbePageContent; 2]), BrokerTruthAcquisitionPreflightErrorCodeV1); 7] = [
+        (
+            "raw digest mismatch",
+            |pages| {
+                pages[0].raw_response_sha256 = Some("0".repeat(64));
+            },
+            BrokerTruthAcquisitionPreflightErrorCodeV1::ArtifactDigestMismatch,
+        ),
+        (
+            "duplicate bid sides",
+            |pages| {
+                pages[1].sequence = 1;
+                pages[1].side = BID_SIDE;
+                pages[1].client_msg_id = "reviewed-fixture-1-side-1".to_owned();
+                pages[1].envelope = json!({
+                    "clientMsgId": "reviewed-fixture-1-side-1",
+                    "payloadType": TICK_RESPONSE_PAYLOAD_TYPE,
+                    "payload": {"ctidTraderAccountId": ACCOUNT_ID, "hasMore": false, "tickData": []},
+                });
+            },
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+        ),
+        (
+            "wrong payload type",
+            |pages| {
+                pages[0].envelope = json!({
+                    "clientMsgId": pages[0].client_msg_id,
+                    "payloadType": 9_999,
+                    "payload": {"ctidTraderAccountId": ACCOUNT_ID, "hasMore": false, "tickData": []},
+                });
+            },
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+        ),
+        (
+            "detached envelope client message id",
+            |pages| {
+                pages[0].envelope = json!({
+                    "clientMsgId": "another-client-message-id",
+                    "payloadType": TICK_RESPONSE_PAYLOAD_TYPE,
+                    "payload": {"ctidTraderAccountId": ACCOUNT_ID, "hasMore": false, "tickData": []},
+                });
+            },
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+        ),
+        (
+            "detached envelope account",
+            |pages| {
+                pages[0].envelope = json!({
+                    "clientMsgId": pages[0].client_msg_id,
+                    "payloadType": TICK_RESPONSE_PAYLOAD_TYPE,
+                    "payload": {"ctidTraderAccountId": ACCOUNT_ID + 1, "hasMore": false, "tickData": []},
+                });
+            },
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+        ),
+        (
+            "invalid archived side",
+            |pages| {
+                pages[0].side = 3;
+            },
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+        ),
+        (
+            "unknown archive schema",
+            |pages| {
+                pages[0].schema = "not-the-tick-archive-schema";
+            },
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+        ),
+    ];
+    for (_label, tamper, expected) in cases {
+        let mut pages = [ProbePageContent::bid(), ProbePageContent::ask()];
+        tamper(&mut pages);
+        let fixture = Fixture::with_pages(USD_ASSET_ID, "USD", &[], &pages);
+        expect_generation_error(fixture.args, expected);
+    }
+}
+
+#[test]
 fn generator_fails_closed_on_digest_mismatch_missing_path_and_bad_window() {
-    let fixture = Fixture::new(USD_ASSET_ID, "USD", &[], 1);
+    let fixture = Fixture::new(USD_ASSET_ID, "USD", &[]);
     let wrong_digest = "0".repeat(64);
     expect_generation_error(
         with_flag_value(
@@ -928,7 +1287,7 @@ fn generator_fails_closed_on_digest_mismatch_missing_path_and_bad_window() {
     );
 
     // Pre-existing output file is refused instead of overwritten.
-    let fixture = Fixture::new(USD_ASSET_ID, "USD", &[], 1);
+    let fixture = Fixture::new(USD_ASSET_ID, "USD", &[]);
     let preexisting = fixture.out_dir.join("broker-truth-capture-plan.json");
     fs::write(&preexisting, b"pre-existing bytes").expect("write pre-existing output file");
     let error = fixture
@@ -938,11 +1297,25 @@ fn generator_fails_closed_on_digest_mismatch_missing_path_and_bad_window() {
         error.code(),
         BrokerTruthAcquisitionPreflightErrorCodeV1::UnsafePath
     );
+
+    // Pre-existing evidence output is also refused instead of overwritten.
+    let fixture = Fixture::new(USD_ASSET_ID, "USD", &[]);
+    let preexisting = fixture
+        .out_dir
+        .join("reviewed-quote-replay-rules-000.vortex");
+    fs::write(&preexisting, b"pre-existing bytes").expect("write pre-existing evidence output");
+    let error = fixture
+        .generate()
+        .expect_err("existing evidence output must be refused");
+    assert_eq!(
+        error.code(),
+        BrokerTruthAcquisitionPreflightErrorCodeV1::UnsafePath
+    );
 }
 
 #[test]
 fn generator_rejects_malformed_arguments_secret_flags_and_relative_paths() {
-    let fixture = Fixture::new(USD_ASSET_ID, "USD", &[], 1);
+    let fixture = Fixture::new(USD_ASSET_ID, "USD", &[]);
 
     let secret_flags = vec![
         "--client-secret",
@@ -1002,13 +1375,11 @@ fn generator_rejects_malformed_arguments_secret_flags_and_relative_paths() {
     count.extend([
         "--quote-observations".to_owned(),
         fixture.observations[0].0.to_string_lossy().into_owned(),
-        "--quote-observations-sha256".to_owned(),
-        fixture.observations[0].1.clone(),
     ]);
     assert_eq!(
         generation_parse_error(count),
         BrokerTruthAcquisitionPreflightErrorCodeV1::InvalidArguments,
-        "unbalanced observation/rules evidence pairs must be refused"
+        "unbalanced observation evidence pairs must be refused"
     );
 }
 
@@ -1029,6 +1400,10 @@ fn generator_source_has_no_permit_capability_or_ambient_authority_path() {
         "read_current_manifest",
         "open_current",
         "load_exact_production_broker_truth_credentials_v2",
+        "read_dir(",
+        "glob(",
+        "Default::default",
+        "fallback",
     ] {
         assert!(
             !source.contains(forbidden),

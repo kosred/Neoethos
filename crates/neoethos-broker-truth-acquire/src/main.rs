@@ -56,6 +56,20 @@ fn run_reviewed_input_generation_v1() -> ExitCode {
                     artifact.sha256()
                 );
             }
+            for (index, artifact) in generated.quote_observations().iter().enumerate() {
+                println!(
+                    "quote_observations[{index}]={} quote_observations_sha256[{index}]={}",
+                    artifact.path().display(),
+                    artifact.sha256()
+                );
+            }
+            for (index, artifact) in generated.reviewed_replay_rules().iter().enumerate() {
+                println!(
+                    "reviewed_replay_rules[{index}]={} reviewed_replay_rules_sha256[{index}]={}",
+                    artifact.path().display(),
+                    artifact.sha256()
+                );
+            }
             println!("permit_issued=false");
             ExitCode::SUCCESS
         }

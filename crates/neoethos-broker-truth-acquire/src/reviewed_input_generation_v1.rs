@@ -30,13 +30,19 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{ArgAction, Parser};
-use neoethos_broker_truth::{EvidenceWindowV1, ReviewedQuoteReplayRuleIdentityV2};
+use neoethos_broker_history::broker_truth_capture::{
+    BrokerEvidenceRowKindV2, CapturedBrokerEvidenceRowV2,
+};
+use neoethos_broker_truth::{
+    EvidenceWindowV1, QuoteSideV1, ReviewedQuoteReplayRuleIdentityV2,
+};
 use neoethos_data::{CanonicalDatasetIdentity, CanonicalDatasetScope, SelectedDatasetGenerationV1};
 use neoethos_search::{
     CanonicalSearchArtifactScopeV2, CanonicalSearchInputReceiptV2,
     CanonicalSearchSourceBindingReceiptV1,
 };
 use serde_json::{Value, json};
+use vortex_array::ToCanonical;
 
 use super::{
     ACQUISITION_SCHEMA_VERSION_V1, AcquisitionEnvironmentArgumentV1,
@@ -59,6 +65,17 @@ pub const AGENT_REVIEWER_IDENTITY_V1: &str =
 
 /// File name of the random reviewer nonce stored in the explicit work parent.
 pub const AGENT_REVIEWER_NONCE_FILE_V1: &str = "agent-reviewer-nonce.v1.txt";
+
+/// Schema id of the unreviewed cTrader tick-archive pages the generator reads.
+const TICK_ARCHIVE_SCHEMA_V1: &str = "neoethos.unreviewed-ctrader-tick-archive.v1";
+/// cTrader Open API tick-response envelope payload type.
+const CTRADER_TICK_RESPONSE_PAYLOAD_TYPE_V1: u32 = 2_146;
+/// Archived cursor side codes: 1 = bid, 2 = ask.
+const ARCHIVED_BID_SIDE_V1: i64 = 1;
+const ARCHIVED_ASK_SIDE_V1: i64 = 2;
+/// Same bound the tick archive enforces on one serialized page record; the
+/// decoded fragment concatenation may exceed the compressed file size.
+const MAX_ARCHIVED_PAGE_RECORD_BYTES_V1: usize = 32 * 1024 * 1024;
 
 const PROTOCOL_IDENTITY_V1: &str = "ctrader-open-api";
 const REVIEWED_DATE_V1: &str = "2026-10-23";
@@ -149,17 +166,16 @@ struct ReviewedWindowArgumentsV1 {
     window_policy_id: String,
 }
 
-/// Exact observation/rules evidence pairs for every reviewed synchronization.
+/// Exact observation evidence for the reviewed synchronization set: exactly
+/// one archived bid page and one archived ask page captured from the live
+/// Demo account. The reviewed replay rules are derived from the decoded
+/// pages and never supplied or invented by the operator.
 #[derive(Parser)]
 struct ReviewedEvidenceArgumentsV1 {
     #[arg(long, required = true, action = ArgAction::Append)]
     quote_observations: Vec<PathBuf>,
     #[arg(long, required = true, action = ArgAction::Append)]
     quote_observations_sha256: Vec<String>,
-    #[arg(long, required = true, action = ArgAction::Append)]
-    reviewed_replay_rules: Vec<PathBuf>,
-    #[arg(long, required = true, action = ArgAction::Append)]
-    reviewed_replay_rules_sha256: Vec<String>,
 }
 
 /// Exact instrument and account asset identities for the settlement route.
@@ -185,8 +201,6 @@ fn validate_generation_argument_shape(
     let observation_count = args.evidence.quote_observations.len();
     let exact_pairs = observation_count > 0
         && args.evidence.quote_observations_sha256.len() == observation_count
-        && args.evidence.reviewed_replay_rules.len() == observation_count
-        && args.evidence.reviewed_replay_rules_sha256.len() == observation_count
         && args.window.account_id > 0
         && args.canonical.canonical_root_verification.is_some()
             == args.canonical.canonical_root_verification_sha256.is_some()
@@ -331,6 +345,8 @@ pub struct GeneratedReviewedInputsV1 {
     trust_root: GeneratedReviewedInputArtifactV1,
     canonical_root_verification: Option<GeneratedReviewedInputArtifactV1>,
     canonical_scope_window_binding: Option<GeneratedReviewedInputArtifactV1>,
+    quote_observations: Vec<GeneratedReviewedInputArtifactV1>,
+    reviewed_replay_rules: Vec<GeneratedReviewedInputArtifactV1>,
 }
 
 impl GeneratedReviewedInputsV1 {
@@ -349,6 +365,20 @@ impl GeneratedReviewedInputsV1 {
     pub fn trust_root(&self) -> &GeneratedReviewedInputArtifactV1 {
         let artifact = &self.trust_root;
         artifact
+    }
+
+    /// Emitted schema-exact quote-session observation evidence, one file per
+    /// synchronization in ordinal order. Each file carries exactly the two
+    /// reviewed rows (bid, ask) built from the real archived raw envelopes.
+    pub fn quote_observations(&self) -> &[GeneratedReviewedInputArtifactV1] {
+        &self.quote_observations
+    }
+
+    /// Emitted schema-exact reviewed quote replay rules, one file per
+    /// synchronization in ordinal order. Each file carries exactly one rule
+    /// row linking the two retained raw observation envelopes.
+    pub fn reviewed_replay_rules(&self) -> &[GeneratedReviewedInputArtifactV1] {
+        &self.reviewed_replay_rules
     }
 
     /// Emitted only when the operator did not supply a real root-verification receipt.
@@ -429,12 +459,6 @@ fn validate_generation_roots(
     input_paths.extend(
         args.evidence
             .quote_observations
-            .iter()
-            .map(PathBuf::as_path),
-    );
-    input_paths.extend(
-        args.evidence
-            .reviewed_replay_rules
             .iter()
             .map(PathBuf::as_path),
     );
@@ -645,6 +669,382 @@ fn read_evidence_files(
     Ok(files)
 }
 
+
+// ---------------------------------------------------------------------------
+// Reviewed quote-session evidence emission.
+//
+// The history ingress (reviewed_sync_ingress_v2) loads exactly two files per
+// synchronization: a two-row quote-session observation Vortex (bid row, ask
+// row) and a one-row reviewed replay-rule Vortex, both in the exact fixed
+// 13-field evidence dtype. The generator decodes the real archived tick pages
+// (one bid page, one ask page) and emits schema-exact evidence whose payload
+// bytes are the verbatim raw cTrader envelopes; it also emits the reviewed
+// replay rule that links the two retained envelopes. Rows are encoded with
+// the broker-history-owned evidence encoder so producer and ingress share one
+// schema owner. Every digest in the generated plan/review record binds these
+// emitted files.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservedQuoteSideV1 {
+    Bid,
+    Ask,
+}
+
+struct DecodedQuoteObservationPageV1 {
+    client_msg_id: String,
+    side: ObservedQuoteSideV1,
+    raw_response_json: String,
+}
+
+fn quote_session_observations_evidence_name(ordinal: u32) -> String {
+    format!("quote-session-observations-{ordinal:03}.vortex")
+}
+
+fn reviewed_quote_replay_rules_evidence_name(ordinal: u32) -> String {
+    format!("reviewed-quote-replay-rules-{ordinal:03}.vortex")
+}
+
+fn page_field_error(
+    code: BrokerTruthAcquisitionPreflightErrorCodeV1,
+    detail: &'static str,
+) -> BrokerTruthAcquisitionPreflightErrorV1 {
+    preflight_error(code, detail)
+}
+
+fn decode_quote_observation_page(
+    frozen: &FrozenArtifactV1,
+    account_id: i64,
+) -> Result<DecodedQuoteObservationPageV1, BrokerTruthAcquisitionPreflightErrorV1> {
+    let array =
+        neoethos_data::core::vortex_io::read_vortex_array(&frozen.source_path).map_err(|_| {
+            page_field_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "quote observation page is not readable Vortex",
+            )
+        })?;
+    if array.is_empty() {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "quote observation page has no retained raw fragments",
+        ));
+    }
+    let view = array.to_varbinview();
+    let mut raw = Vec::new();
+    for index in 0..view.len() {
+        let bytes = view.bytes_at(index);
+        if raw.len().saturating_add(bytes.len()) > MAX_ARCHIVED_PAGE_RECORD_BYTES_V1 {
+            return Err(page_field_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "quote observation page fragments exceed the archived page bound",
+            ));
+        }
+        raw.extend_from_slice(bytes.as_ref());
+    }
+    let record: Value = serde_json::from_slice(&raw).map_err(|_| {
+        page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "quote observation page record is invalid",
+        )
+    })?;
+    let object = record.as_object().ok_or_else(|| {
+        page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "quote observation page record is not a JSON object",
+        )
+    })?;
+    let schema = object
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            page_field_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "quote observation page record omitted its schema",
+            )
+        })?;
+    if schema != TICK_ARCHIVE_SCHEMA_V1 {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "quote observation page schema is not the exact tick archive schema",
+        ));
+    }
+    let plan_sha256 = object
+        .get("plan_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            page_field_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "quote observation page record omitted its plan digest",
+            )
+        })?;
+    let raw_response_sha256 = object
+        .get("raw_response_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            page_field_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "quote observation page record omitted its raw response digest",
+            )
+        })?;
+    if !validate_sha256(plan_sha256) || !validate_sha256(raw_response_sha256) {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "quote observation page digests are not canonical lowercase 64-hex",
+        ));
+    }
+    let raw_response_json = object
+        .get("raw_response_json")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            page_field_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "quote observation page record omitted its raw response",
+            )
+        })?;
+    if sha256_bytes(raw_response_json.as_bytes()) != raw_response_sha256 {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::ArtifactDigestMismatch,
+            "quote observation page raw response digest differs from its archive binding",
+        ));
+    }
+    let client_msg_id = object
+        .get("client_msg_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            page_field_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "quote observation page record omitted its client message id",
+            )
+        })?;
+    let archived_side = record
+        .pointer("/cursor/side")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            page_field_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "quote observation page record omitted its archived quote side",
+            )
+        })?;
+    let envelope: Value = serde_json::from_str(raw_response_json).map_err(|_| {
+        page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "quote observation raw response is not JSON",
+        )
+    })?;
+    if !envelope.is_object()
+        || envelope.get("clientMsgId").and_then(Value::as_str) != Some(client_msg_id)
+        || envelope.get("payloadType").and_then(Value::as_u64)
+            != Some(u64::from(CTRADER_TICK_RESPONSE_PAYLOAD_TYPE_V1))
+        || envelope
+            .pointer("/payload/ctidTraderAccountId")
+            .and_then(Value::as_i64)
+            != Some(account_id)
+    {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "quote observation raw envelope is detached from its exact account/protocol binding",
+        ));
+    }
+    let side = match archived_side {
+        ARCHIVED_BID_SIDE_V1 => ObservedQuoteSideV1::Bid,
+        ARCHIVED_ASK_SIDE_V1 => ObservedQuoteSideV1::Ask,
+        _ => {
+            return Err(page_field_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "quote observation page has an invalid archived quote side",
+            ));
+        }
+    };
+    if client_msg_id.trim().is_empty()
+        || client_msg_id != client_msg_id.trim()
+        || client_msg_id.chars().any(char::is_control)
+    {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "quote observation page has an invalid client message id",
+        ));
+    }
+    Ok(DecodedQuoteObservationPageV1 {
+        client_msg_id: client_msg_id.to_owned(),
+        side,
+        raw_response_json: raw_response_json.to_owned(),
+    })
+}
+
+fn decode_exact_quote_observation_pages(
+    observations: &[FrozenArtifactV1],
+    account_id: i64,
+) -> Result<
+    (
+        DecodedQuoteObservationPageV1,
+        DecodedQuoteObservationPageV1,
+    ),
+    BrokerTruthAcquisitionPreflightErrorV1,
+> {
+    let pages = observations
+        .iter()
+        .map(|frozen| decode_quote_observation_page(frozen, account_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    if pages.len() != 2 {
+        return Err(preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "reviewed synchronization requires exactly one bid and one ask quote observation page",
+        ));
+    }
+    let mut bid = None;
+    let mut ask = None;
+    for page in pages {
+        match page.side {
+            ObservedQuoteSideV1::Bid => {
+                if bid.replace(page).is_some() {
+                    return Err(preflight_error(
+                        BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                        "reviewed synchronization received duplicate bid quote observation pages",
+                    ));
+                }
+            }
+            ObservedQuoteSideV1::Ask => {
+                if ask.replace(page).is_some() {
+                    return Err(preflight_error(
+                        BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                        "reviewed synchronization received duplicate ask quote observation pages",
+                    ));
+                }
+            }
+        }
+    }
+    let bid = bid.ok_or_else(|| {
+        preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "reviewed synchronization is missing its bid quote observation page",
+        )
+    })?;
+    let ask = ask.ok_or_else(|| {
+        preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "reviewed synchronization is missing its ask quote observation page",
+        )
+    })?;
+    Ok((bid, ask))
+}
+
+fn reviewed_quote_observation_rows(
+    bid_page: &DecodedQuoteObservationPageV1,
+    ask_page: &DecodedQuoteObservationPageV1,
+    account_id: i64,
+    symbol_id: i64,
+    requested_window: EvidenceWindowV1,
+) -> Result<vortex_array::ArrayRef, BrokerTruthAcquisitionPreflightErrorV1> {
+    if symbol_id <= 0 {
+        return Err(preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "reviewed synchronization instrument has an invalid symbol id",
+        ));
+    }
+    let rows = [
+        CapturedBrokerEvidenceRowV2::new(
+            0,
+            account_id,
+            Some(symbol_id),
+            Some(QuoteSideV1::Bid),
+            BrokerEvidenceRowKindV2::QuoteSessionObservation,
+            Some(requested_window),
+            bid_page.client_msg_id.clone(),
+            CTRADER_TICK_RESPONSE_PAYLOAD_TYPE_V1,
+            bid_page.raw_response_json.clone(),
+        ),
+        CapturedBrokerEvidenceRowV2::new(
+            1,
+            account_id,
+            Some(symbol_id),
+            Some(QuoteSideV1::Ask),
+            BrokerEvidenceRowKindV2::QuoteSessionObservation,
+            Some(requested_window),
+            ask_page.client_msg_id.clone(),
+            CTRADER_TICK_RESPONSE_PAYLOAD_TYPE_V1,
+            ask_page.raw_response_json.clone(),
+        ),
+    ];
+    neoethos_broker_history::encode_broker_evidence_rows_v2(&rows).map_err(|_| {
+        preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "reviewed quote observation rows cannot be encoded",
+        )
+    })
+}
+
+fn reviewed_replay_rule_rows(
+    bid_page: &DecodedQuoteObservationPageV1,
+    ask_page: &DecodedQuoteObservationPageV1,
+    account_id: i64,
+    symbol_id: i64,
+    requested_window: EvidenceWindowV1,
+) -> Result<vortex_array::ArrayRef, BrokerTruthAcquisitionPreflightErrorV1> {
+    let payload = json!({
+        "accountId": account_id,
+        "askClientMsgId": ask_page.client_msg_id,
+        "bidClientMsgId": bid_page.client_msg_id,
+        "symbolId": symbol_id,
+        "window": {
+            "fromUnixMsInclusive": requested_window.from_unix_ms_inclusive(),
+            "toUnixMsExclusive": requested_window.to_unix_ms_exclusive(),
+        },
+    });
+    let payload_json =
+        serde_json::to_string(&payload).expect("reviewed replay rule encodes as canonical JSON");
+    let rows = [CapturedBrokerEvidenceRowV2::new(
+        0,
+        account_id,
+        Some(symbol_id),
+        None,
+        BrokerEvidenceRowKindV2::QuoteReplayRule,
+        Some(requested_window),
+        bid_page.client_msg_id.clone(),
+        CTRADER_TICK_RESPONSE_PAYLOAD_TYPE_V1,
+        payload_json,
+    )];
+    neoethos_broker_history::encode_broker_evidence_rows_v2(&rows).map_err(|_| {
+        preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "reviewed replay rule rows cannot be encoded",
+        )
+    })
+}
+
+fn write_generated_vortex_artifact(
+    out_dir: &Path,
+    name: &str,
+    array: vortex_array::ArrayRef,
+) -> Result<GeneratedReviewedInputArtifactV1, BrokerTruthAcquisitionPreflightErrorV1> {
+    let path = out_dir.join(name);
+    if fs::symlink_metadata(&path).is_ok() {
+        return Err(preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::UnsafePath,
+            "reviewed-input evidence output file already exists",
+        ));
+    }
+    neoethos_data::core::vortex_io::write_vortex_array(&path, array).map_err(|_| {
+        preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::UnsafePath,
+            "reviewed-input evidence output file cannot be written",
+        )
+    })?;
+    let bytes = fs::read(&path).map_err(|_| {
+        preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::UnsafePath,
+            "reviewed-input evidence output file cannot be re-read",
+        )
+    })?;
+    let sha256 = sha256_bytes(&bytes);
+    fs::write(out_dir.join(format!("{name}.sha256")), format!("{sha256}
+")).map_err(|_| {
+        preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::UnsafePath,
+            "reviewed-input evidence SHA-256 sidecar cannot be written",
+        )
+    })?;
+    Ok(GeneratedReviewedInputArtifactV1 { path, sha256 })
+}
+
 fn validate_settlement_shape(
     primary_instrument: &ExactInstrumentWireV1,
     account_asset_id: i64,
@@ -845,23 +1245,71 @@ pub fn generate_reviewed_inputs_v1(
         &legs,
     )?;
     let synchronization_count = 1 + legs.len();
-    if args.evidence.quote_observations.len() != synchronization_count
-        || args.evidence.reviewed_replay_rules.len() != synchronization_count
-    {
-        return Err(preflight_error(
-            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
-            "explicit observation/rules evidence does not match the exact synchronization set",
-        ));
-    }
+    let synchronization_instruments = std::iter::once(primary_instrument.clone())
+        .chain(legs.iter().map(|leg| ExactInstrumentWireV1 {
+            symbol_id: leg.symbol_id,
+            symbol_name: leg.symbol_name.clone(),
+            base_asset_id: leg.base_asset_id,
+            base_asset_name: leg.base_asset_name.clone(),
+            quote_asset_id: leg.quote_asset_id,
+            quote_asset_name: leg.quote_asset_name.clone(),
+        }))
+        .collect::<Vec<_>>();
 
     let observations = read_evidence_files(
         &args.evidence.quote_observations,
         &args.evidence.quote_observations_sha256,
     )?;
-    let rules = read_evidence_files(
-        &args.evidence.reviewed_replay_rules,
-        &args.evidence.reviewed_replay_rules_sha256,
-    )?;
+    let (bid_page, ask_page) =
+        decode_exact_quote_observation_pages(&observations, args.window.account_id)?;
+    let instrument_symbol_ids = synchronization_instruments
+        .iter()
+        .map(|instrument| instrument.symbol_id)
+        .collect::<HashSet<_>>();
+    if instrument_symbol_ids.len() != 1 {
+        return Err(preflight_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "reviewed quote pages cover one instrument; multi-instrument synchronizations require per-instrument pages",
+        ));
+    }
+    let synchronization_symbol_id = *instrument_symbol_ids
+        .iter()
+        .next()
+        .expect("synchronization set is never empty");
+    let mut emitted_observations = Vec::with_capacity(synchronization_count);
+    let mut emitted_rules = Vec::with_capacity(synchronization_count);
+    for index in 0..synchronization_count {
+        let ordinal = u32::try_from(index).map_err(|_| {
+            preflight_error(
+                BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+                "reviewed synchronization ordinal exceeds u32",
+            )
+        })?;
+        let observations_artifact = write_generated_vortex_artifact(
+            &args.generate_reviewed_inputs,
+            &quote_session_observations_evidence_name(ordinal),
+            reviewed_quote_observation_rows(
+                &bid_page,
+                &ask_page,
+                args.window.account_id,
+                synchronization_symbol_id,
+                requested_window,
+            )?,
+        )?;
+        let rules_artifact = write_generated_vortex_artifact(
+            &args.generate_reviewed_inputs,
+            &reviewed_quote_replay_rules_evidence_name(ordinal),
+            reviewed_replay_rule_rows(
+                &bid_page,
+                &ask_page,
+                args.window.account_id,
+                synchronization_symbol_id,
+                requested_window,
+            )?,
+        )?;
+        emitted_observations.push(observations_artifact);
+        emitted_rules.push(rules_artifact);
+    }
 
     let (root_verification_bytes, root_verification_sha256, root_verification_emitted) = match (
         &args.canonical.canonical_root_verification,
@@ -941,7 +1389,10 @@ pub fn generate_reviewed_inputs_v1(
         "protocol": PROTOCOL_IDENTITY_V1,
         "reviewer": AGENT_REVIEWER_IDENTITY_V1,
         "reviewed": REVIEWED_DATE_V1,
-        "quote_observations_sha256": observations.iter().map(|frozen| frozen.sha256.clone()).collect::<Vec<_>>(),
+        "quote_observations_sha256": emitted_observations
+            .iter()
+            .map(|artifact| artifact.sha256().to_owned())
+            .collect::<Vec<_>>(),
     });
     let protocol_bytes =
         serde_json::to_vec(&protocol_value).expect("protocol evidence encodes as JSON");
@@ -951,16 +1402,6 @@ pub fn generate_reviewed_inputs_v1(
         AcquisitionEnvironmentArgumentV1::Demo => "demo",
         AcquisitionEnvironmentArgumentV1::Live => "live",
     };
-    let synchronization_instruments = std::iter::once(primary_instrument.clone())
-        .chain(legs.iter().map(|leg| ExactInstrumentWireV1 {
-            symbol_id: leg.symbol_id,
-            symbol_name: leg.symbol_name.clone(),
-            base_asset_id: leg.base_asset_id,
-            base_asset_name: leg.base_asset_name.clone(),
-            quote_asset_id: leg.quote_asset_id,
-            quote_asset_name: leg.quote_asset_name.clone(),
-        }))
-        .collect::<Vec<_>>();
     let review_record_value = json!({
         "schema_version": ACQUISITION_SCHEMA_VERSION_V1,
         "canonical_search_input_receipt_identity_sha256": receipt_identity,
@@ -978,8 +1419,8 @@ pub fn generate_reviewed_inputs_v1(
                 json!({
                     "ordinal": u32::try_from(index).expect("synchronization ordinal fits u32"),
                     "instrument": instrument_value(&synchronization_instruments[index]),
-                    "quote_observations_sha256": observations[index].sha256,
-                    "reviewed_replay_rules_sha256": rules[index].sha256,
+                    "quote_observations_sha256": emitted_observations[index].sha256().to_owned(),
+                    "reviewed_replay_rules_sha256": emitted_rules[index].sha256().to_owned(),
                 })
             })
             .collect::<Vec<_>>(),
@@ -1016,7 +1457,7 @@ pub fn generate_reviewed_inputs_v1(
                 let review_identity_binding = ReviewedQuoteReplayRuleIdentityV2::new(
                     review_record_sha256.clone(),
                     protocol_sha256.clone(),
-                    observations[index].sha256.clone(),
+                    emitted_observations[index].sha256().to_owned(),
                 )
                 .map_err(|_| {
                     preflight_error(
@@ -1030,8 +1471,8 @@ pub fn generate_reviewed_inputs_v1(
                     "account_id": args.window.account_id,
                     "instrument": instrument_value(&synchronization_instruments[index]),
                     "window": window_value(requested_window),
-                    "quote_observations_sha256": observations[index].sha256,
-                    "reviewed_replay_rules_sha256": rules[index].sha256,
+                    "quote_observations_sha256": emitted_observations[index].sha256().to_owned(),
+                    "reviewed_replay_rules_sha256": emitted_rules[index].sha256().to_owned(),
                     "review_identity_sha256": review_identity,
                 }))
             })
@@ -1086,5 +1527,7 @@ pub fn generate_reviewed_inputs_v1(
         trust_root,
         canonical_root_verification,
         canonical_scope_window_binding,
+        quote_observations: emitted_observations,
+        reviewed_replay_rules: emitted_rules,
     })
 }
