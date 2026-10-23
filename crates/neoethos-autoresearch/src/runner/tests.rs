@@ -619,3 +619,18 @@ fn outcome_with(slot: usize, e: Option<f64>, id: &str) -> SearchOutcome {
         error: None,
     }
 }
+
+#[test]
+fn run_args_default_to_no_reviewed_broker_bundle() {
+    let identity = neoethos_data::CanonicalDatasetIdentity::external(
+        "run-args-defaults",
+        "EURUSD",
+        neoethos_data::CanonicalTimeframe::M5,
+        neoethos_data::BarTimestampConvention::BarOpen,
+    )
+    .expect("valid test dataset identity");
+    let args = RunArgs::new(identity);
+    assert!(args.quote_replay_store.is_none());
+    assert!(args.quote_replay_link.is_none());
+    assert!(args.reviewed_evidence.is_none());
+}

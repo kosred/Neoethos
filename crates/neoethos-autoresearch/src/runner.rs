@@ -88,6 +88,13 @@ pub struct RunArgs {
     pub scenario: Option<String>,
     /// Draw and stamp proposals; run nothing.
     pub dry_run: bool,
+    /// Exact content-addressed acquisition store for the reviewed
+    /// broker-financial-truth bundle. `None` keeps the fail-closed global gate.
+    pub quote_replay_store: Option<std::path::PathBuf>,
+    /// Exact acquisition link receipt JSON for the reviewed bundle.
+    pub quote_replay_link: Option<std::path::PathBuf>,
+    /// Independently reviewed broker-financial-truth evidence JSON.
+    pub reviewed_evidence: Option<std::path::PathBuf>,
 }
 
 impl RunArgs {
@@ -99,6 +106,9 @@ impl RunArgs {
             session: None,
             scenario: None,
             dry_run: false,
+            quote_replay_store: None,
+            quote_replay_link: None,
+            reviewed_evidence: None,
         }
     }
 }
