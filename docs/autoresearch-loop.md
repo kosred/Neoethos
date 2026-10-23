@@ -1421,6 +1421,24 @@ not be deduplicated against a default run by hash alone), and metrics-only
 producers (GPU routes, transport adapters) pass no vector, so the scorer's
 "no monthly observations" guard applies there.
 
+Operator plumbing (same series, neo-671): `neoethos-cli` declares the
+`search-monthly-upside-objective` passthrough feature (forwarding to
+`neoethos-autoresearch`). With it compiled in, `canonical-research` accepts
+`--fitness-table <ga_fitness|monthly_upside_v1>` for a FRESH search, forwards
+it to discovery and sets `DiscoveryConfig.fitness_table`; unknown names, saved
+continuations and quote replay are refused with the selector present. Without
+the feature the argument is rejected as unknown and the canonical three-way
+fitness dispatch stays byte-identical; `SCORING_VERSION_CURRENT` stays 7.
+
+The sealed evaluation-policy wire (`SealedEvaluationPolicyV1`, the policy
+round-trip the CPU funnel performs before generation 0) carries the selector
+the same way: `serde(default, skip_serializing_if = FitnessTable::is_default)`,
+so default snapshots and legacy bytes are unchanged and a non-default table
+survives the round-trip instead of being refused as an unknown field. The
+canonical config digest still does not encode the selector (the §14.8
+stamp-gap above); a B9 run is identified by its argument/run-arguments stamp,
+not by digest deduplication.
+
 ### 14.8 `crates/neoethos-search/src/run_identity.rs` — six factors are invisible to the stamp
 
 Beyond §14.3's `ga_seed`: `ResolvedConfigStamp` does not carry

@@ -53,6 +53,12 @@ pub(super) struct SealedEvaluationPolicyV1 {
     /// the binding existed; those remain inspectable but are refused as replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     weekly_scoring_identity: Option<crate::run_identity::WeeklyScoringIdentityV1>,
+    /// Opt-in GA scoring-table selector (docs/autoresearch-loop.md section
+    /// 14.7). Absent for the canonical default and for historical snapshots;
+    /// serialized only when a non-default table was selected, so legacy wire
+    /// bytes and unknown-field refusal stay byte-identical.
+    #[serde(default, skip_serializing_if = "crate::scoring::FitnessTable::is_default")]
+    fitness_table: crate::scoring::FitnessTable,
 }
 
 #[cfg(test)]
@@ -217,6 +223,28 @@ mod tests {
         let changed =
             SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
         assert_ne!(serde_json::to_vec(&changed).unwrap(), bytes);
+    }
+
+    #[test]
+    fn monthly_upside_selector_roundtrips_the_sealed_wire_without_changing_legacy_bytes() {
+        let (mut evaluation, stops) = evaluation_and_stops();
+        evaluation.growth_objective = false;
+        let legacy = SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(!String::from_utf8_lossy(&legacy_bytes).contains("fitness_table"));
+        evaluation.fitness_table = crate::scoring::FitnessTable::MonthlyUpsideV1;
+        let snapshot =
+            SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("monthly_upside_v1"));
+        let reopened: SealedEvaluationPolicyV1 = serde_json::from_slice(&bytes).unwrap();
+        reopened.validate().unwrap();
+        assert_eq!(
+            reopened.to_evaluation().unwrap().fitness_table,
+            crate::scoring::FitnessTable::MonthlyUpsideV1
+        );
+        assert_eq!(serde_json::to_vec(&reopened).unwrap(), bytes);
+        assert_ne!(bytes, legacy_bytes);
     }
 
     #[test]

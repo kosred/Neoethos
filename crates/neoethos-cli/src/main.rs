@@ -2122,6 +2122,19 @@ fn discovery_config_from_cli(
     // Share the typed overrides with batch discovery. Receipt-bound research
     // must not silently inherit population_auto after an explicit false.
     apply_batch_discover_cli_overrides(args, &mut config)?;
+    #[cfg(feature = "search-monthly-upside-objective")]
+    if let Some(name) = parse_flag(args, "--fitness-table") {
+        // B9 opt-in selector (docs section 14.7). Only the two tables the
+        // canonical CPU evaluator can actually drive are accepted, and an
+        // unknown name fails loudly instead of silently falling back to the
+        // canonical three-way dispatch.
+        let normalized = name.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            normalized == "ga_fitness" || normalized == "monthly_upside_v1",
+            "--fitness-table must be ga_fitness or monthly_upside_v1"
+        );
+        config.fitness_table = neoethos_search::scoring::FitnessTable::from_name(&normalized);
+    }
     Ok(config.apply_mode_overrides())
 }
 
@@ -6128,5 +6141,38 @@ mod tests {
         assert_eq!(record.operation, "discover");
         assert_eq!(record.status, "FAILED");
         assert_eq!(record.message, "discovery failed");
+    }
+
+    #[cfg(feature = "search-monthly-upside-objective")]
+    mod monthly_upside_selector_tests {
+        #[test]
+        fn canonical_config_picks_up_the_opt_in_fitness_selector() {
+            let defaults = neoethos_search::DiscoveryConfig::default();
+            let resolve = |args: &[String]| {
+                super::super::discovery_config_from_cli(
+                    args, &defaults, "EURUSD", "M15", &[], "USD",
+                )
+            };
+            let inherited = resolve(&[]).unwrap();
+            assert_eq!(
+                inherited.fitness_table,
+                neoethos_search::scoring::FitnessTable::GaFitness
+            );
+            let selected = resolve(&[
+                "--fitness-table".to_owned(),
+                "monthly_upside_v1".to_owned(),
+            ])
+            .unwrap();
+            assert_eq!(
+                selected.fitness_table,
+                neoethos_search::scoring::FitnessTable::MonthlyUpsideV1
+            );
+            for bad in ["bogus", "archive_score"] {
+                assert!(
+                    resolve(&["--fitness-table".to_owned(), bad.to_owned()]).is_err(),
+                    "{bad} must be refused"
+                );
+            }
+        }
     }
 }

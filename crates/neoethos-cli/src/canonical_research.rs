@@ -56,6 +56,20 @@ const OPTIONAL: [&str; 21] = [
 const RESUME_FLAGS: [&str; 2] = ["--resume-research", "--resume-research-sha256"];
 const NEW_SEARCH_FLAGS: [&str; 2] = ["--new-search-research", "--new-search-research-sha256"];
 
+/// The B9 opt-in fitness selector (docs/autoresearch-loop.md section 14.7)
+/// exists only when the same named cargo feature is compiled in. Without it,
+/// --fitness-table stays an unknown argument, so the shipped CLI's fitness
+/// dispatch is byte-identical to the pre-selector build.
+#[cfg(not(feature = "search-monthly-upside-objective"))]
+fn is_optional_flag(flag: &str) -> bool {
+    OPTIONAL.contains(&flag)
+}
+
+#[cfg(feature = "search-monthly-upside-objective")]
+fn is_optional_flag(flag: &str) -> bool {
+    OPTIONAL.contains(&flag) || flag == "--fitness-table"
+}
+
 /// Read optional all-or-none inputs on both the strict operator command and
 /// the lower-level discover entrypoint. Neither accepts a duplicate binding.
 fn optional_inputs<'a>(
@@ -257,7 +271,7 @@ impl Arguments {
         for pair in args.chunks_exact(2) {
             let flag = pair[0].as_str();
             ensure!(
-                REQUIRED.contains(&flag) || OPTIONAL.contains(&flag),
+                REQUIRED.contains(&flag) || is_optional_flag(flag),
                 "unknown canonical-research argument {flag}"
             );
             ensure!(
@@ -317,6 +331,18 @@ impl Arguments {
                     && parsed.0.get("--diagnose-exit-policy-out").is_none()
                     && parsed.0.get("--diagnose-candidate-selectors").is_none(),
                 "new-search recorded inputs cannot be combined with candidate diagnostics"
+            );
+        }
+        #[cfg(feature = "search-monthly-upside-objective")]
+        if let Some(name) = parsed.0.get("--fitness-table") {
+            let normalized = name.trim().to_ascii_lowercase();
+            ensure!(
+                normalized == "ga_fitness" || normalized == "monthly_upside_v1",
+                "--fitness-table must be ga_fitness or monthly_upside_v1"
+            );
+            ensure!(
+                resume_flags == 0 && quote_flags == 0,
+                "--fitness-table is a fresh-search selector and cannot be combined with a saved continuation or quote replay"
             );
         }
         let diagnose_flags = ["--diagnose-candidate-costs-out", "--diagnose-cost-variants"]
@@ -513,6 +539,10 @@ fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String
         if let Some(value) = args.0.get(flag) {
             push(discovery_args, flag, value);
         }
+    }
+    #[cfg(feature = "search-monthly-upside-objective")]
+    if let Some(value) = args.0.get("--fitness-table") {
+        push(discovery_args, "--fitness-table", value);
     }
 }
 
@@ -1121,5 +1151,61 @@ mod tests {
         assert!(SavedResearchInputs::load(&args).is_err());
         drop(file);
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "search-monthly-upside-objective")]
+    mod monthly_upside_selector_tests {
+        use super::*;
+
+        #[test]
+        fn fitness_table_selector_is_accepted_for_fresh_search_and_forwarded_once() {
+            let mut raw = valid_arguments();
+            push(&mut raw, "--fitness-table", "monthly_upside_v1");
+            let args = Arguments::parse(&raw).expect("B9 selector is a fresh-search knob");
+            let mut forwarded = Vec::new();
+            forward_optional_mode_flags(&args, &mut forwarded);
+            assert_eq!(
+                forwarded,
+                vec!["--fitness-table".to_owned(), "monthly_upside_v1".to_owned()]
+            );
+            let mut explicit_default = valid_arguments();
+            push(&mut explicit_default, "--fitness-table", "ga_fitness");
+            assert!(Arguments::parse(&explicit_default).is_ok());
+        }
+
+        #[test]
+        fn unknown_fitness_table_names_and_continuations_are_refused() {
+            for bad in ["bogus", "archive_score", "expectancy_t_stat", ""] {
+                let mut raw = valid_arguments();
+                push(&mut raw, "--fitness-table", bad);
+                assert!(
+                    Arguments::parse(&raw).is_err(),
+                    "fitness-table value {bad:?} must be refused"
+                );
+            }
+            let mut resumed = valid_arguments();
+            push(&mut resumed, "--resume-research", "saved.json");
+            push(&mut resumed, "--resume-research-sha256", "explicit");
+            push(&mut resumed, "--max-batches", "1");
+            push(&mut resumed, "--fitness-table", "monthly_upside_v1");
+            assert!(
+                Arguments::parse(&resumed).is_err(),
+                "saved continuation must refuse the fresh-search selector"
+            );
+            let mut replay = valid_arguments();
+            for (flag, value) in [
+                ("--quote-replay-bundle", "bundle.json"),
+                ("--quote-replay-sha256", "explicit"),
+                ("--quote-replay-store", "store"),
+            ] {
+                push(&mut replay, flag, value);
+            }
+            push(&mut replay, "--max-batches", "1");
+            push(&mut replay, "--fitness-table", "monthly_upside_v1");
+            assert!(
+                Arguments::parse(&replay).is_err(),
+                "quote replay must refuse the fresh-search selector"
+            );
+        }
     }
 }
