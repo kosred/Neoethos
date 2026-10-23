@@ -8,6 +8,7 @@
 //! bytes. The agent acts as reviewer and that identity is recorded in the
 //! trust root; the generator never produces a permit or capability.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +44,7 @@ use neoethos_search::{
     CanonicalSearchArtifactScopeV2, CanonicalSearchInputReceiptV2, CanonicalSearchWindowRoleV1,
 };
 use vortex_array::IntoArray;
+use vortex_array::ToCanonical;
 use vortex_array::arrays::VarBinArray;
 
 const SERVER: &str = "demo.ctraderapi.com";
@@ -705,6 +707,104 @@ fn load_emitted_synchronization(
     loaded.into_iter().next().expect("one loaded synchronization")
 }
 
+/// Builds the single-instrument EURUSD settlement fixture (primary EURUSD plus
+/// the USD->EUR settlement leg on the same EURUSD) and generates the
+/// reviewed-input bundle for it. Shared by every two-synchronization contract
+/// test so the fixture construction itself is never duplicated.
+fn generate_eurusd_settlement_synchronizations(
+    pages: &[ProbePageContent; 2],
+) -> (Fixture, GeneratedReviewedInputsV1) {
+    let leg_spec = format!(
+        "{USD_ASSET_ID}|USD|{EUR_ASSET_ID}|EUR|{PRIMARY_SYMBOL_ID}|EURUSD|{EUR_ASSET_ID}|EUR|{USD_ASSET_ID}|USD"
+    );
+    let legs = [leg_spec.as_str()];
+    let fixture = Fixture::with_pages(EUR_ASSET_ID, "EUR", &legs, pages);
+    let generated = fixture.generate().expect("agent-reviewed input generation");
+    (fixture, generated)
+}
+
+/// Loads every emitted synchronization through the REAL history ingress
+/// (load_reviewed_ctrader_quote_synchronizations_v2) in caller order with the
+/// exact binding the acquisition orchestrator constructs, and asserts the
+/// exact account/instrument/window/row-count contract of each synchronization.
+fn load_emitted_synchronizations(
+    generated: &GeneratedReviewedInputsV1,
+) -> Vec<LoadedReviewedCTraderQuoteSynchronizationV2> {
+    let review_record_sha256 = generated.review_record().sha256().to_owned();
+    let protocol_sha256 = generated.protocol_evidence().sha256().to_owned();
+    let mut sources = Vec::with_capacity(generated.quote_observations().len());
+    for (index, _) in generated.quote_observations().iter().enumerate() {
+        let ordinal = u32::try_from(index).expect("ordinal fits fixture index");
+        let review_identity = ReviewedQuoteReplayRuleIdentityV2::new(
+            review_record_sha256.clone(),
+            protocol_sha256.clone(),
+            generated.quote_observations()[index].sha256().to_owned(),
+        )
+        .expect("reviewed replay-rule identity");
+        let binding = BrokerTruthReviewedSynchronizationBindingV1::new(
+            ordinal,
+            ACCOUNT_ID,
+            PRIMARY_SYMBOL_ID,
+            fixture_window(),
+            review_identity,
+            generated.reviewed_replay_rules()[index].sha256().to_owned(),
+        )
+        .expect("exact reviewed synchronization binding");
+        let instrument = ExactQuoteInstrumentV2::new(
+            PRIMARY_SYMBOL_ID,
+            "EURUSD",
+            EUR_ASSET_ID,
+            "EUR",
+            USD_ASSET_ID,
+            "USD",
+        )
+        .expect("exact fixture instrument");
+        sources.push(
+            ReviewedCTraderQuoteSynchronizationSourceV2::new(
+                binding,
+                instrument,
+                generated.quote_observations()[index].path().to_path_buf(),
+                generated.reviewed_replay_rules()[index].path().to_path_buf(),
+            )
+            .expect("explicit evidence source"),
+        );
+    }
+    let loaded = load_reviewed_ctrader_quote_synchronizations_v2(sources)
+        .expect("history ingress must accept the emitted reviewed evidence");
+    assert_eq!(loaded.len(), generated.quote_observations().len());
+    for (ordinal, synchronization) in loaded.iter().enumerate() {
+        assert_eq!(synchronization.ordinal(), ordinal as u32);
+        assert_eq!(synchronization.account_id(), ACCOUNT_ID);
+        assert_eq!(synchronization.symbol_id(), PRIMARY_SYMBOL_ID);
+        assert_eq!(synchronization.window(), fixture_window());
+        assert_eq!(synchronization.raw_observation_count(), 2);
+        assert_eq!(synchronization.decoded_replay_rule_count(), 1);
+    }
+    loaded
+}
+
+/// Decodes the `client_msg_id` UTF-8 column of one emitted quote-session
+/// observation Vortex (the exact fixed evidence dtype the ingress reads) so
+/// the contract can assert the raw envelope ids the session-wide uniqueness
+/// gate validates without reaching into private capture internals.
+fn decode_emitted_observation_client_msg_ids(path: &Path) -> Vec<String> {
+    let array = neoethos_data::core::vortex_io::read_vortex_array(path)
+        .expect("read emitted quote-session observations");
+    let field = array
+        .to_struct()
+        .unmasked_field_by_name("client_msg_id")
+        .expect("client_msg_id evidence field")
+        .clone()
+        .to_varbinview();
+    (0..field.len())
+        .map(|index| {
+            std::str::from_utf8(field.bytes_at(index).as_ref())
+                .expect("UTF-8 client message id")
+                .to_owned()
+        })
+        .collect()
+}
+
 #[test]
 fn generator_emits_schema_exact_content_addressed_reviewed_bundle() {
     let fixture = Fixture::new(USD_ASSET_ID, "USD", &[]);
@@ -1005,15 +1105,10 @@ fn generator_emits_schema_exact_content_addressed_reviewed_bundle() {
 
 #[test]
 fn generator_emits_exact_settlement_conversion_route_and_second_synchronization() {
-    let leg_spec = format!(
-        "{USD_ASSET_ID}|USD|{EUR_ASSET_ID}|EUR|{PRIMARY_SYMBOL_ID}|EURUSD|{EUR_ASSET_ID}|EUR|{USD_ASSET_ID}|USD"
-    );
-    let legs = [leg_spec.as_str()];
     // Order independence: the ask page is supplied before the bid page and the
     // generator must still bind sides from the archived cursor, not CLI order.
     let pages = [ProbePageContent::ask(), ProbePageContent::bid()];
-    let fixture = Fixture::with_pages(EUR_ASSET_ID, "EUR", &legs, &pages);
-    let generated = fixture.generate().expect("agent-reviewed input generation");
+    let (_fixture, generated) = generate_eurusd_settlement_synchronizations(&pages);
     let capture_plan = generated.capture_plan();
     let review_record = generated.review_record();
     let protocol_evidence = generated.protocol_evidence();
@@ -1103,56 +1198,75 @@ fn generator_emits_exact_settlement_conversion_route_and_second_synchronization(
     );
 
     // Both synchronizations must load through the real ingress in caller order.
-    let mut sources = Vec::new();
-    for ordinal in 0..2_u32 {
-        let ordinal_index = usize::try_from(ordinal).expect("ordinal index");
-        let review_identity = ReviewedQuoteReplayRuleIdentityV2::new(
-            review_record.sha256().to_owned(),
-            protocol_evidence.sha256().to_owned(),
-            generated.quote_observations()[ordinal_index].sha256().to_owned(),
-        )
-        .expect("reviewed replay-rule identity");
-        let binding = BrokerTruthReviewedSynchronizationBindingV1::new(
-            ordinal,
-            ACCOUNT_ID,
-            PRIMARY_SYMBOL_ID,
-            fixture_window(),
-            review_identity,
-            generated.reviewed_replay_rules()[ordinal_index].sha256().to_owned(),
-        )
-        .expect("exact reviewed synchronization binding");
-        let instrument = ExactQuoteInstrumentV2::new(
-            PRIMARY_SYMBOL_ID,
-            "EURUSD",
-            EUR_ASSET_ID,
-            "EUR",
-            USD_ASSET_ID,
-            "USD",
-        )
-        .expect("exact fixture instrument");
-        sources.push(
-            ReviewedCTraderQuoteSynchronizationSourceV2::new(
-                binding,
-                instrument,
-                generated.quote_observations()[ordinal_index].path().to_path_buf(),
-                generated.reviewed_replay_rules()[ordinal_index]
-                    .path()
-                    .to_path_buf(),
-            )
-            .expect("explicit evidence source"),
+    let loaded = load_emitted_synchronizations(&generated);
+    assert_eq!(loaded.len(), 2);
+}
+
+#[test]
+fn settlement_synchronizations_carry_session_unique_raw_client_msg_ids() {
+    // Single-instrument set: primary EURUSD plus the USD->EUR settlement leg on
+    // the same EURUSD. Both synchronizations must still pass the real history
+    // ingress while carrying DISTINCT raw envelope clientMsgIds, because the
+    // session-wide capture gate (validate_unique_capture_raw_client_msg_ids_v2)
+    // rejects any raw id reused across the synchronizations of one capture.
+    let pages = [ProbePageContent::bid(), ProbePageContent::ask()];
+    let (_fixture, generated) = generate_eurusd_settlement_synchronizations(&pages);
+    assert_eq!(generated.quote_observations().len(), 2);
+    assert_eq!(generated.reviewed_replay_rules().len(), 2);
+    for artifact in generated
+        .quote_observations()
+        .iter()
+        .chain(generated.reviewed_replay_rules())
+    {
+        assert_evidence_artifact(artifact);
+    }
+
+    // Both synchronizations load through the unchanged real history ingress.
+    let loaded = load_emitted_synchronizations(&generated);
+    assert_eq!(loaded.len(), 2);
+
+    // Raw envelope clientMsgIds decoded from each emitted observation file.
+    let primary_ids =
+        decode_emitted_observation_client_msg_ids(&generated.quote_observations()[0].path());
+    let settlement_ids =
+        decode_emitted_observation_client_msg_ids(&generated.quote_observations()[1].path());
+    assert_eq!(primary_ids.len(), 2);
+    assert_eq!(settlement_ids.len(), 2);
+
+    // The primary synchronization retains the verbatim archived real envelopes.
+    assert_eq!(
+        primary_ids,
+        vec![pages[0].client_msg_id.clone(), pages[1].client_msg_id.clone()],
+        "primary synchronization must carry the verbatim archived raw envelopes"
+    );
+
+    // The settlement-leg synchronization derives its own clientMsgId namespace
+    // (deterministic per ordinal and side, disclosed in the generator source).
+    assert_eq!(
+        settlement_ids,
+        vec![
+            format!(
+                "neoethos.agent-reviewed.v1.settlement-sync.1.bid.{}",
+                pages[0].client_msg_id
+            ),
+            format!(
+                "neoethos.agent-reviewed.v1.settlement-sync.1.ask.{}",
+                pages[1].client_msg_id
+            ),
+        ],
+        "settlement synchronization must derive distinct deterministic clientMsgIds"
+    );
+
+    // Session-wide uniqueness across every raw envelope id of the capture: the
+    // exact scope validate_unique_capture_raw_client_msg_ids_v2 enforces.
+    let mut session_unique = HashSet::new();
+    for id in primary_ids.iter().chain(settlement_ids.iter()) {
+        assert!(
+            session_unique.insert(id.as_str()),
+            "raw clientMsgId {id:?} was reused across the synchronizations"
         );
     }
-    let loaded = load_reviewed_ctrader_quote_synchronizations_v2(sources)
-        .expect("history ingress must accept both emitted synchronizations");
-    assert_eq!(loaded.len(), 2);
-    for (ordinal, synchronization) in loaded.iter().enumerate() {
-        assert_eq!(synchronization.ordinal(), ordinal as u32);
-        assert_eq!(synchronization.account_id(), ACCOUNT_ID);
-        assert_eq!(synchronization.symbol_id(), PRIMARY_SYMBOL_ID);
-        assert_eq!(synchronization.window(), fixture_window());
-        assert_eq!(synchronization.raw_observation_count(), 2);
-        assert_eq!(synchronization.decoded_replay_rule_count(), 1);
-    }
+    assert_eq!(session_unique.len(), 4);
 }
 
 #[test]

@@ -12,6 +12,12 @@
 //! - derived canonical-scope-window-binding.json + .sha256 when the
 //!   operator does not supply a real one
 //!
+//! The primary synchronization carries the verbatim archived raw envelopes;
+//! every settlement-leg synchronization derives its own deterministic
+//! clientMsgId namespace from the same real envelopes (the broker payload
+//! object stays untouched) so the session-wide raw clientMsgId uniqueness
+//! gate of the fail-closed capture never rejects a reuse.
+//!
 //! Every canonical digest is derived from the real input bytes: the receipt
 //! and scope are strictly decoded and identity-hashed with the canonical
 //! Search types, the root-verification receipt is derived from the exact
@@ -369,14 +375,18 @@ impl GeneratedReviewedInputsV1 {
 
     /// Emitted schema-exact quote-session observation evidence, one file per
     /// synchronization in ordinal order. Each file carries exactly the two
-    /// reviewed rows (bid, ask) built from the real archived raw envelopes.
+    /// reviewed rows (bid, ask) built from the real archived raw envelopes;
+    /// the primary synchronization keeps the verbatim archived clientMsgIds
+    /// while each settlement-leg synchronization carries its own derived
+    /// distinct id namespace.
     pub fn quote_observations(&self) -> &[GeneratedReviewedInputArtifactV1] {
         &self.quote_observations
     }
 
     /// Emitted schema-exact reviewed quote replay rules, one file per
     /// synchronization in ordinal order. Each file carries exactly one rule
-    /// row linking the two retained raw observation envelopes.
+    /// row linking the two retained raw observation envelopes of that
+    /// synchronization's own (verbatim or derived) clientMsgId namespace.
     pub fn reviewed_replay_rules(&self) -> &[GeneratedReviewedInputArtifactV1] {
         &self.reviewed_replay_rules
     }
@@ -679,10 +689,14 @@ fn read_evidence_files(
 // 13-field evidence dtype. The generator decodes the real archived tick pages
 // (one bid page, one ask page) and emits schema-exact evidence whose payload
 // bytes are the verbatim raw cTrader envelopes; it also emits the reviewed
-// replay rule that links the two retained envelopes. Rows are encoded with
-// the broker-history-owned evidence encoder so producer and ingress share one
-// schema owner. Every digest in the generated plan/review record binds these
-// emitted files.
+// replay rule that links the two retained envelopes. The primary
+// synchronization carries the verbatim archived envelopes; each
+// settlement-leg synchronization derives its own distinct clientMsgId
+// namespace from the same real envelopes (payload subtree untouched) so the
+// session-wide raw clientMsgId uniqueness gate of the capture never rejects a
+// reuse. Rows are encoded with the broker-history-owned evidence encoder so
+// producer and ingress share one schema owner. Every digest in the generated
+// plan/review record binds these emitted files.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObservedQuoteSideV1 {
@@ -690,6 +704,7 @@ enum ObservedQuoteSideV1 {
     Ask,
 }
 
+#[derive(Clone)]
 struct DecodedQuoteObservationPageV1 {
     client_msg_id: String,
     side: ObservedQuoteSideV1,
@@ -925,6 +940,91 @@ fn decode_exact_quote_observation_pages(
         )
     })?;
     Ok((bid, ask))
+}
+
+/// Deterministic per-synchronization clientMsgId namespace used for
+/// settlement-leg synchronizations. The primary synchronization keeps the
+/// verbatim archived client-generated correlation ids; every additional
+/// synchronization derives its own ids from the same real archived envelopes
+/// so the session-wide raw clientMsgId uniqueness gate of the broker-truth
+/// capture (validate_unique_capture_raw_client_msg_ids_v2) never sees a reuse
+/// while each emitted envelope still carries the untouched real broker
+/// payload object.
+const SETTLEMENT_SYNC_CLIENT_MSG_ID_DERIVATION_V1: &str =
+    "neoethos.agent-reviewed.v1.settlement-sync";
+
+/// Derives the settlement-leg synchronization page from one real archived
+/// page. The broker payload object (payloadType and the whole `payload`
+/// subtree, including the archived tick rows) is preserved structurally
+/// identical; only the outer client-generated correlation id is re-namespaced
+/// deterministically per synchronization ordinal and quote side. The rewrite
+/// fails closed if the archived envelope is detached from its recorded id or
+/// if the payload subtree would change.
+fn derive_settlement_synchronization_page(
+    page: &DecodedQuoteObservationPageV1,
+    ordinal: u32,
+    expected_side: ObservedQuoteSideV1,
+) -> Result<DecodedQuoteObservationPageV1, BrokerTruthAcquisitionPreflightErrorV1> {
+    if page.side != expected_side {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "settlement synchronization derivation received the wrong archived quote side",
+        ));
+    }
+    let side_code = match expected_side {
+        ObservedQuoteSideV1::Bid => "bid",
+        ObservedQuoteSideV1::Ask => "ask",
+    };
+    let derived_client_msg_id = format!(
+        "{SETTLEMENT_SYNC_CLIENT_MSG_ID_DERIVATION_V1}.{ordinal}.{side_code}.{}",
+        page.client_msg_id
+    );
+    if derived_client_msg_id.trim().is_empty()
+        || derived_client_msg_id != derived_client_msg_id.trim()
+        || derived_client_msg_id.chars().any(char::is_control)
+    {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "settlement synchronization derived an invalid client message id",
+        ));
+    }
+    let mut envelope: Value = serde_json::from_str(&page.raw_response_json).map_err(|_| {
+        page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "settlement synchronization archived raw envelope is not JSON",
+        )
+    })?;
+    let archived_payload = envelope.get("payload").cloned();
+    if envelope.get("clientMsgId").and_then(Value::as_str) != Some(page.client_msg_id.as_str()) {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "settlement synchronization archived raw envelope id is detached",
+        ));
+    }
+    envelope
+        .as_object_mut()
+        .expect("archived raw envelope validated as a JSON object")
+        .insert(
+            "clientMsgId".to_owned(),
+            Value::String(derived_client_msg_id.clone()),
+        );
+    if envelope.get("payload") != archived_payload.as_ref() {
+        return Err(page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "settlement synchronization derivation altered the archived broker payload",
+        ));
+    }
+    let raw_response_json = serde_json::to_string(&envelope).map_err(|_| {
+        page_field_error(
+            BrokerTruthAcquisitionPreflightErrorCodeV1::SynchronizationMismatch,
+            "settlement synchronization derived envelope cannot be encoded",
+        )
+    })?;
+    Ok(DecodedQuoteObservationPageV1 {
+        client_msg_id: derived_client_msg_id,
+        side: expected_side,
+        raw_response_json,
+    })
 }
 
 fn reviewed_quote_observation_rows(
@@ -1285,12 +1385,32 @@ pub fn generate_reviewed_inputs_v1(
                 "reviewed synchronization ordinal exceeds u32",
             )
         })?;
+        // The primary synchronization (ordinal 0) carries the verbatim archived
+        // raw envelopes. Every settlement-leg synchronization derives its own
+        // clientMsgId namespace from the same real envelopes so the
+        // session-wide raw clientMsgId uniqueness gate never sees a reuse.
+        let (sync_bid_page, sync_ask_page) = if index == 0 {
+            (bid_page.clone(), ask_page.clone())
+        } else {
+            (
+                derive_settlement_synchronization_page(
+                    &bid_page,
+                    ordinal,
+                    ObservedQuoteSideV1::Bid,
+                )?,
+                derive_settlement_synchronization_page(
+                    &ask_page,
+                    ordinal,
+                    ObservedQuoteSideV1::Ask,
+                )?,
+            )
+        };
         let observations_artifact = write_generated_vortex_artifact(
             &args.generate_reviewed_inputs,
             &quote_session_observations_evidence_name(ordinal),
             reviewed_quote_observation_rows(
-                &bid_page,
-                &ask_page,
+                &sync_bid_page,
+                &sync_ask_page,
                 args.window.account_id,
                 synchronization_symbol_id,
                 requested_window,
@@ -1300,8 +1420,8 @@ pub fn generate_reviewed_inputs_v1(
             &args.generate_reviewed_inputs,
             &reviewed_quote_replay_rules_evidence_name(ordinal),
             reviewed_replay_rule_rows(
-                &bid_page,
-                &ask_page,
+                &sync_bid_page,
+                &sync_ask_page,
                 args.window.account_id,
                 synchronization_symbol_id,
                 requested_window,
