@@ -346,16 +346,26 @@ fn evaluate_population_core_with_backend_and_audit_inner(
                     .map_err(|e| e.to_string())?;
                     let mut metrics = Vec::with_capacity(rows.len());
                     let mut reports = Vec::with_capacity(rows.len());
-                    for (m, _, report) in rows {
+                    let mut monthly_returns = Vec::with_capacity(rows.len());
+                    for (m, _, report, monthly) in rows {
                         reports.push(report.expect("weekly execution records cadence"));
                         metrics.push(m);
+                        monthly_returns.push(monthly);
                     }
                     Ok(crate::eval::PopulationEvaluationV1 {
                         metrics,
                         cadence: Some(reports),
+                        monthly_returns: Some(monthly_returns),
                     })
                 } else {
-                    Ok(crate::eval::validation_backtest_population_cpu(inputs).into())
+                    let (metrics, monthly_returns) =
+                        crate::eval::validation_backtest_population_cpu_with_monthly(inputs)
+                            .map_err(|e| e.to_string())?;
+                    Ok(crate::eval::PopulationEvaluationV1 {
+                        metrics,
+                        cadence: None,
+                        monthly_returns: Some(monthly_returns),
+                    })
                 }
             },
         )?;

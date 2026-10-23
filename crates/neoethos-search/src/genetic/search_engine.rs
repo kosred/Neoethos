@@ -5920,6 +5920,7 @@ mod evaluated_generation_handoff_tests {
                 Ok(crate::eval::PopulationEvaluationV1 {
                     metrics,
                     cadence: Some(reports),
+                    monthly_returns: None,
                 })
             },
             |_, _, score, _, _| {
@@ -6729,6 +6730,7 @@ mod weekly_integration_tests {
                 Ok(crate::eval::PopulationEvaluationV1 {
                     metrics: rows.iter().map(|row| row.0).collect(),
                     cadence: Some(rows.into_iter().map(|row| row.1).collect()),
+                    monthly_returns: None,
                 })
             },
             |_, _, _, _, _| {},

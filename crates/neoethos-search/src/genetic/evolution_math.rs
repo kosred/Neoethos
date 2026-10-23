@@ -1421,15 +1421,28 @@ pub fn apply_metrics(
     metrics: &[[f64; 11]],
     config: &super::strategy_gene::EvaluationConfig,
     evaluation_span_days: f64,
+    monthly_returns: Option<&[Vec<f64>]>,
 ) {
-    for (gene, m) in genes.iter_mut().zip(metrics.iter()) {
-        gene.fitness = if let Some(goal) = config.growth_goal {
-            crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
-        } else if config.growth_objective {
-            crate::scoring::ga_fitness_growth(m)
-        } else {
-            crate::scoring::ga_fitness(m)
-        };
+    for (index, (gene, m)) in genes.iter_mut().zip(metrics.iter()).enumerate() {
+        gene.fitness =
+            if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideV1 {
+                // Opt-in B9 (docs section 14.7): the explicit selector wins over
+                // the legacy boolean chain and reads the evaluator's
+                // completed-month return vector. A missing vector (metrics-only
+                // producer) graduates to the scorer's "no monthly observations"
+                // -100.0 guard rather than silently using another table.
+                let months = monthly_returns
+                    .and_then(|series| series.get(index))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                crate::scoring::ga_fitness_monthly_upside_v1(months, m)
+            } else if let Some(goal) = config.growth_goal {
+                crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
+            } else if config.growth_objective {
+                crate::scoring::ga_fitness_growth(m)
+            } else {
+                crate::scoring::ga_fitness(m)
+            };
         gene.sharpe_ratio = m[1];
         gene.max_drawdown = m[3];
         gene.win_rate = m[4];
@@ -2593,6 +2606,45 @@ mod generator_audit_tests {
             softmax_weights(&[f64::NEG_INFINITY, f64::NEG_INFINITY], &[0, 1], 1.0),
             vec![1.0, 1.0],
             "all-invalid remains an explicit uniform fallback"
+        );
+    }
+
+    /// The opt-in MonthlyUpsideV1 selector must route fitness through the
+    /// evaluator's completed-month return vector (neo-671 B9, docs §14.7), and
+    /// the default selector must keep the canonical dispatch untouched.
+    #[test]
+    fn monthly_upside_selector_routes_fitness_and_default_dispatch_is_unchanged() {
+        use crate::scoring::FitnessTable;
+
+        let metrics = vec![
+            [10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01],
+            [20.0, 1.2, 20_100.0, 0.05, 0.78, 2.1, 0.4, 0.2, 50.0, 0.6, 0.02],
+        ];
+        let months = vec![vec![0.02; 10], vec![0.04, 0.04, 0.04, 0.04, -0.13]];
+
+        // Default selector: the canonical growth-goal / growth / ga_fitness chain.
+        let mut genes = vec![Gene::default(), Gene::default()];
+        let default_cfg = crate::genetic::EvaluationConfig::default();
+        apply_metrics(&mut genes, &metrics, &default_cfg, 1.0, None);
+        assert_eq!(genes[0].fitness, crate::scoring::ga_fitness(&metrics[0]));
+        assert_eq!(genes[1].fitness, crate::scoring::ga_fitness(&metrics[1]));
+
+        // The selector routes to ga_fitness_monthly_upside_v1 with the vector.
+        let mut selected_cfg = crate::genetic::EvaluationConfig::default();
+        selected_cfg.fitness_table = FitnessTable::MonthlyUpsideV1;
+        apply_metrics(&mut genes, &metrics, &selected_cfg, 1.0, Some(&months));
+        assert_eq!(
+            genes[0].fitness,
+            crate::scoring::ga_fitness_monthly_upside_v1(&months[0], &metrics[0])
+        );
+        assert_eq!(
+            genes[1].fitness,
+            crate::scoring::ga_fitness_monthly_upside_v1(&months[1], &metrics[1])
+        );
+        assert_ne!(
+            genes[0].fitness,
+            crate::scoring::ga_fitness(&metrics[0]),
+            "the MonthlyUpsideV1 selector must not fall through to the canonical scorer"
         );
     }
 }

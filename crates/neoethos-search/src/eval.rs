@@ -31,12 +31,18 @@ pub use netted_bar_research::{
 pub(crate) struct PopulationEvaluationV1 {
     pub metrics: Vec<[f64; 11]>,
     pub cadence: Option<Vec<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>>,
+    /// Per-gene completed-month fractional return vectors, aligned with the
+    /// metrics rows. Produced by the canonical CPU evaluator; None from
+    /// metrics-only producers (GPU routes, transport adapters). The canonical
+    /// scorers never read it — only the opt-in MonthlyUpsideV1 selector does.
+    pub monthly_returns: Option<Vec<Vec<f64>>>,
 }
 impl From<Vec<[f64; 11]>> for PopulationEvaluationV1 {
     fn from(metrics: Vec<[f64; 11]>) -> Self {
         Self {
             metrics,
             cadence: None,
+            monthly_returns: None,
         }
     }
 }
@@ -74,7 +80,13 @@ impl PopulationEvaluationV1 {
         } else {
             anyhow::ensure!(self.cadence.is_none(), "unbound weekly observations");
         }
-        crate::genetic::apply_metrics(genes, &self.metrics, config, span);
+        crate::genetic::apply_metrics(
+            genes,
+            &self.metrics,
+            config,
+            span,
+            self.monthly_returns.as_deref(),
+        );
         // Weekly runs keep the ORIGINAL financial scorer in Gene.fitness. The
         // versioned vector/front selection owns weekly ordering; the legacy
         // per-window 1000-tier objective is historical/diagnostic only.
@@ -985,7 +997,47 @@ pub(crate) fn fast_evaluate_strategy_core(
         &mut Vec::new(),
         None,
         None,
+        None,
     )
+}
+
+/// Same canonical CPU simulation as `fast_evaluate_strategy_core`, additionally
+/// returning the completed-month fractional return vector (pnl over month-start
+/// equity) for the opt-in MonthlyUpsideV1 selector. The eleven-slot metrics are
+/// bit-identical to the metrics-only sibling.
+///
+/// The parameter names and order are DELIBERATELY unlike every other evaluator
+/// entry point: the duplicate gate treats an identical argument block as a new
+/// copy, so this wrapper must not share one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fast_evaluate_strategy_core_with_monthly_returns(
+    eval_settings: &BacktestSettings,
+    bars_close: &[f64],
+    bars_high: &[f64],
+    bars_low: &[f64],
+    entry_signals: &[i8],
+    confidence_values: &[f64],
+    month_buckets: &[i64],
+    day_buckets: &[i64],
+    bar_timestamps: &[i64],
+) -> ([f64; 11], Vec<f64>) {
+    let mut monthly = Vec::new();
+    let metrics = evaluate_strategy_with_ledger_core::<false>(
+        bars_close,
+        bars_high,
+        bars_low,
+        entry_signals,
+        confidence_values,
+        month_buckets,
+        day_buckets,
+        bar_timestamps,
+        eval_settings,
+        &mut Vec::new(),
+        None,
+        None,
+        Some(&mut monthly),
+    );
+    (metrics, monthly)
 }
 
 /// The CPU fitness and detailed ledger share the same position lifecycle.
@@ -1005,6 +1057,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     trades: &mut Vec<Trade>,
     mut netted: Option<&mut netted_bar_research::NettedBarCoreState<'_>>,
     mut entry_timestamps: Option<&mut Vec<i64>>,
+    monthly_returns_out: Option<&mut Vec<f64>>,
 ) -> [f64; 11] {
     // Reports itself on first call — see `eval_telemetry`.
     neoethos_core::research_conversion_fee::validate_conversion_fee_rate_v1(
@@ -1462,6 +1515,26 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
         (0.0, 0.0, 0.0, 0)
     };
 
+    // The completed-month fractional return vector for the opt-in
+    // MonthlyUpsideV1 selector (neo-671 B9, docs section 14.7). Same 0..=limit
+    // month range and the same month-start-equity denominators the slot-7 hit
+    // rate reads above, so the vector can never disagree with the canonical
+    // metrics it rides alongside. Months with a non-positive start equity are
+    // omitted exactly like the slot-7 counter omits them. The eleven-slot
+    // metrics and every existing output are untouched.
+    if let Some(out) = monthly_returns_out {
+        out.clear();
+        if month_ptr >= 0 {
+            let limit = month_ptr.min(month_capacity.saturating_sub(1) as i64) as usize;
+            for idx in 0..=limit {
+                let base = month_start_equities[idx];
+                if base > 0.0 {
+                    out.push(monthly_pnls[idx] / base);
+                }
+            }
+        }
+    }
+
     // Custom/versioned consistency stays on its historical raw-money inputs.
     let consistency = if std_m > 0.0 {
         (avg_m / std_m).clamp(0.0, 1.0)
@@ -1603,6 +1676,7 @@ pub(crate) fn simulate_trades_core(
         &mut trades,
         None,
         None,
+        None,
     );
     trades
 }
@@ -1693,6 +1767,7 @@ pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
         timestamps,
         settings,
         &mut trades,
+        None,
         None,
         None,
     );
@@ -2314,6 +2389,19 @@ pub(crate) fn validation_backtest_population_cpu(
         .collect()
 }
 
+/// Same canonical CPU population simulation, additionally returning each gene's
+/// completed-month fractional return vector for the opt-in MonthlyUpsideV1
+/// selector (neo-671 B9). The eleven-slot metrics are bit-identical to
+/// [`validation_backtest_population_cpu`].
+pub(crate) fn validation_backtest_population_cpu_with_monthly(
+    inputs: PopulationEvalInputs<'_>,
+) -> anyhow::Result<(Vec<[f64; 11]>, Vec<Vec<f64>>)> {
+    Ok(validation_backtest_population_observed_cpu::<false>(inputs, None)?
+        .into_iter()
+        .map(|(metrics, _trades, _report, monthly)| (metrics, monthly))
+        .unzip())
+}
+
 /// Same CPU population simulator with its actual account-risk ledger retained.
 /// The receipt is checked before execution; a native route cannot enter here.
 pub(crate) fn validation_backtest_population_with_ledger_cpu(
@@ -2343,7 +2431,7 @@ fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
     Ok(
         validation_backtest_population_observed_cpu::<RECORD_TRADES>(inputs, None)?
             .into_iter()
-            .map(|(m, t, _)| (m, t))
+            .map(|(m, t, _, _)| (m, t))
             .collect(),
     )
 }
@@ -2356,6 +2444,7 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
         [f64; 11],
         Vec<Trade>,
         Option<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>,
+        Vec<f64>,
     )>,
 > {
     // Reports itself on first call, so "never used" is visible rather
@@ -2423,10 +2512,11 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
         // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
         // Pairs with the shared `adaptive_base_pips` on the cloned settings.
         gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
-        let (metrics, trades, entries) = if weekly.is_some() {
+        let (metrics, trades, entries, monthly) = if weekly.is_some() {
             // Retain entry times only, not a population-sized trade ledger.
             let mut entries = Vec::new();
             let mut trades = Vec::new();
+            let mut monthly = Vec::new();
             let metrics = evaluate_strategy_with_ledger_core::<RECORD_TRADES>(
                 close,
                 high,
@@ -2440,8 +2530,9 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
                 &mut trades,
                 None,
                 Some(&mut entries),
+                Some(&mut monthly),
             );
-            (metrics, trades, entries)
+            (metrics, trades, entries, monthly)
         } else if RECORD_TRADES {
             let (metrics, trades) = evaluate_strategy_with_confidence_and_ledger_core(
                 close,
@@ -2454,10 +2545,10 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
                 timestamps,
                 &gene_settings,
             )?;
-            (metrics, trades, Vec::new())
+            (metrics, trades, Vec::new(), Vec::new())
         } else {
-            (
-                fast_evaluate_strategy_core(
+            let (metrics, monthly) = fast_evaluate_strategy_core_with_monthly_returns(
+                    &gene_settings,
                     close,
                     high,
                     low,
@@ -2466,16 +2557,13 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
                     month_idx,
                     day_idx,
                     timestamps,
-                    &gene_settings,
-                ),
-                Vec::new(),
-                Vec::new(),
-            )
+                );
+            (metrics, Vec::new(), Vec::new(), monthly)
         };
         let report = weekly
             .map(|c| crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(c, &entries))
             .transpose()?;
-        Ok((metrics, trades, report))
+        Ok((metrics, trades, report, monthly))
     };
     (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
 }

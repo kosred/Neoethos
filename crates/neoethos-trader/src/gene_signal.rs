@@ -817,6 +817,7 @@ mod tests {
             smc_weight_displacement: 1.0,
             growth_objective: false,
             growth_goal: None,
+            fitness_table: Default::default(),
         };
         let adaptive = neoethos_search::stop_target::ResolvedAdaptiveStopsPolicyV1::checked_new(
             neoethos_search::stop_target::StopTargetSettings {

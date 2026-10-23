@@ -945,6 +945,15 @@ pub struct EvaluationConfig {
     /// Run-bound v6 goal-pace objective; None retains explicitly legacy v5.
     pub growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
     pub weekly_objective: Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
+    /// Which named scoring table the GA maximises (docs/autoresearch-loop.md
+    /// section 14.7; the autoresearch search-* capability features write this).
+    /// GaFitness keeps the canonical growth-goal / growth / ga_fitness
+    /// dispatch; MonthlyUpsideV1 routes fitness through
+    /// scoring::ga_fitness_monthly_upside_v1 using the evaluator's
+    /// completed-month return vector. Defaults are skipped in serialization so
+    /// existing artifacts stay byte-identical.
+    #[serde(default, skip_serializing_if = "crate::scoring::FitnessTable::is_default")]
+    pub fitness_table: crate::scoring::FitnessTable,
 }
 
 impl Default for EvaluationConfig {
@@ -1016,6 +1025,7 @@ impl Default for EvaluationConfig {
             growth_objective: false,
             growth_goal: None,
             weekly_objective: None,
+            fitness_table: crate::scoring::FitnessTable::default(),
         }
     }
 }

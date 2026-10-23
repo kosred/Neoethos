@@ -53,7 +53,10 @@
 //! only through an opt-in objective variant behind the
 //! `search-monthly-upside-objective` cargo feature on the autoresearch side
 //! (default OFF), which is excluded from the drawable space and named in the
-//! space report until the `DiscoveryConfig::fitness_table` selector lands
+//! space report. The `DiscoveryConfig::fitness_table` selector and the
+//! evaluator's completed-month return vector landed in the neo-671 follow-up:
+//! `FitnessTable::MonthlyUpsideV1` dispatches
+//! `genetic::evolution_math::apply_metrics` to this scorer with that vector
 //! (docs/autoresearch-loop.md §14.7).
 
 use neoethos_core::utils::series::median_ignore_nan;

@@ -86,7 +86,10 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         prop_firm_min_pass_rate,
         discovery_ledger_enabled,
         discovery_ledger_cache_dir,
-        discovery_ledger_archive_top_n,
+        // `..` because fitness_table is deliberately NOT digested yet
+        // (section 14.8 stamp gap): a pattern binding for it would join this
+        // destructure's duplicate span and trip the duplicate gate.
+        discovery_ledger_archive_top_n, ..
     } = config;
 
     let mut encoder = CanonicalDigestEncoderV1::new();

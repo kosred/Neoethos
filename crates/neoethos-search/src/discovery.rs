@@ -726,6 +726,16 @@ pub struct DiscoveryConfig {
     /// How many top archive (non-portfolio) genes to also record in the ledger.
     /// Wired from `models.discovery_ledger.archive_top_n`.
     pub discovery_ledger_archive_top_n: usize,
+    /// Which named scoring table the GA maximises (docs/autoresearch-loop.md
+    /// section 14.7; the autoresearch search-* capability features write this,
+    /// read-only to the loop). GaFitness keeps the canonical
+    /// growth-goal / growth / ga_fitness dispatch. Only MonthlyUpsideV1 is
+    /// bound today: it routes fitness through
+    /// scoring::ga_fitness_monthly_upside_v1 with the evaluator's
+    /// completed-month return vector. The selector is NOT part of the
+    /// canonical config digest yet (the documented section 14.8 stamp gap),
+    /// so a B9 run must not be deduplicated against a default run by hash.
+    pub fitness_table: crate::scoring::FitnessTable,
 }
 
 /// Configuration for the prop-firm window-pass gate.
@@ -916,6 +926,7 @@ impl Default for DiscoveryConfig {
             max_hours: 0.0,
             corr_threshold: 0.85,
             min_trades_per_day: 0.0,
+            fitness_table: crate::scoring::FitnessTable::default(),
             // Payoff shape and trade cadence belong in the search objective,
             // not in a config-less validity gate. Positive net expectancy after
             // actual costs remains unconditional in `TargetProfile::evaluate`.
@@ -1373,6 +1384,9 @@ impl DiscoveryConfig {
             // condition. `0.0` explicitly disables it; positive values remain
             // available for a run whose economic target requires a cadence.
             min_trades_per_day: model_settings.prop_search_val_min_trades_per_day.max(0.0),
+            // The objective selector is written by the autoresearch loop only;
+            // Settings-derived configs always run the canonical table.
+            fitness_table: crate::scoring::FitnessTable::default(),
             target_profile: TargetProfile {
                 // `.max(0.0)` is deliberate and load-bearing: a negative floor
                 // configured here would admit money-losers by arithmetic. The
@@ -1789,6 +1803,7 @@ impl DiscoveryConfig {
         // Risky uses the same run-bound realized-balance goal-pace objective
         // inside the GA and after replay. PropFirm/Strict remain unchanged.
         cfg.growth_objective = matches!(self.mode, DiscoveryMode::Risky);
+        cfg.fitness_table = self.fitness_table;
         cfg.growth_goal = cfg
             .growth_objective
             .then_some(crate::scoring::RiskyGrowthGoal {
@@ -9810,6 +9825,72 @@ where
     })
 }
 
+/// Run-scoped reviewed-bundle variant of
+/// [`run_discovery_cycle_with_quote_validated_outer_holdout_and_progress`].
+///
+/// A presented
+/// [`neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2`]
+/// replaces ONLY the process-wide `HistoricalEvaluation` capability require for
+/// this exact run. Every other receipt/cost/gate check is identical, including
+/// the single post-lock quote-replay provider call after the portfolio is
+/// final. The authority is move-only: this entrypoint consumes it by handing
+/// it to the provider exactly once, so the sealed replay can consume it; a
+/// foreign run-scoped authority is refused before discovery.
+pub fn run_reviewed_discovery_cycle_with_quote_validated_outer_holdout_and_progress<F, P>(
+    authority: neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2,
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    prop_firm_rules: PropFirmRiskRules,
+    mut replay_provider: P,
+    progress_fn: F,
+) -> Result<QuoteValidatedDiscoveryResultV1>
+where
+    F: FnMut(DiscoveryProgress),
+    P: FnMut(
+        neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2,
+        &DiscoveryResult,
+        &[Vec<i8>],
+        &CanonicalSearchArtifactScopeV2,
+    ) -> Result<crate::LockedPortfolioOuterHoldoutReplaySetV1>,
+{
+    let input_identity = input.receipt().identity_sha256()?;
+    anyhow::ensure!(
+        authority.canonical_run_identity_sha256() == input_identity,
+        "the presented run-scoped broker-financial-truth authority {} governs a different \
+         canonical run receipt {input_identity}; refusing discovery admission",
+        authority.canonical_run_identity_sha256(),
+    );
+    let mut authority = Some(authority);
+    let (result, quote_validated_outer_holdout) =
+        run_discovery_cycle_with_holdout_and_progress_authorized(
+            input,
+            config,
+            prop_firm_rules,
+            Some(&mut |result, ordered_signals, holdout_scope| {
+                let authority = authority.take().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the reviewed run-scoped authority was already consumed; the sealed \
+                         replay provider may run exactly once"
+                    )
+                })?;
+                replay_provider(authority, result, ordered_signals, holdout_scope)
+            }),
+            None,
+            None,
+            progress_fn,
+        )?;
+    let quote_validated_outer_holdout =
+        crate::quote_validated_outer_holdout_v1::require_quote_validated_outer_holdout_v1(
+            quote_validated_outer_holdout.as_ref(),
+        )
+        .map_err(anyhow::Error::new)?
+        .clone();
+    Ok(QuoteValidatedDiscoveryResultV1 {
+        result,
+        quote_validated_outer_holdout,
+    })
+}
+
 /// Validate a recorded research envelope as upstream INPUT for a fresh,
 /// hash-pinned NEW search. The old result supplies only its input/recipe
 /// provenance and ordered effective alphabet; old genomes, fitness and
@@ -17400,6 +17481,10 @@ pub fn build_discovery_profile(
     // binds it to `_name` with a written justification). Sixteen months of
     // "two runs differ and nobody can say why" is the cost of the old `..`.
     let DiscoveryConfig {
+        // Not in the run profile yet (section 14.8 stamp gap); bound so a new
+        // field can never be added to DiscoveryConfig without this destructure
+        // noticing it.
+        fitness_table: _profile_fitness_table @ _,
         timeframe_label,
         evaluation_symbol,
         evaluation_account_currency,

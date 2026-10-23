@@ -220,6 +220,7 @@ fn recording_does_not_change_risk_sized_metrics_or_compounding() {
         &mut trades,
         None,
         None,
+        None,
     );
     assert_eq!(fast.map(f64::to_bits), recorded.map(f64::to_bits));
     assert_eq!(trades.len(), 2);
@@ -600,7 +601,7 @@ fn weekly_observations_preserve_all_metrics_and_the_complete_cpu_ledger() {
 
     assert_eq!(observed.len(), 1);
     assert_eq!(baseline.len(), observed.len());
-    let (observed_metrics, observed_trades, report) = &observed[0];
+    let (observed_metrics, observed_trades, report, _monthly) = &observed[0];
     let (baseline_metrics, baseline_trades) = &baseline[0];
     assert_eq!(
         (*observed_metrics).map(f64::to_bits),
@@ -633,3 +634,138 @@ fn weekly_observations_preserve_all_metrics_and_the_complete_cpu_ledger() {
     );
     assert_eq!(report.weekend_entries, 0);
 }
+#[test]
+fn completed_month_returns_travel_with_bit_identical_metrics_and_match_the_ledger() {
+    let settings = settings();
+    let times = [
+        timestamp(1, 12, 0),
+        timestamp(1, 12, 5),
+        timestamp(1, 12, 10),
+        timestamp(2, 12, 0),
+        timestamp(2, 12, 5),
+        timestamp(2, 12, 10),
+        timestamp(3, 12, 0),
+        timestamp(3, 12, 5),
+        timestamp(3, 12, 10),
+        timestamp(8, 12, 0),
+        timestamp(8, 12, 5),
+        timestamp(8, 12, 10),
+        timestamp(9, 12, 0),
+        timestamp(9, 12, 5),
+        timestamp(9, 12, 10),
+        timestamp(10, 12, 0),
+        timestamp(10, 12, 5),
+        timestamp(10, 12, 10),
+        timestamp(15, 12, 0),
+        timestamp(15, 12, 5),
+        timestamp(15, 12, 10),
+        timestamp(16, 12, 0),
+        timestamp(16, 12, 5),
+        timestamp(16, 12, 10),
+        timestamp(17, 12, 0),
+        timestamp(17, 12, 5),
+        timestamp(17, 12, 10),
+    ];
+    // One guaranteed SL trade per month bucket: enter at 100, stop 98, low 97.
+    let close = [100.0; 27];
+    let high = [100.0; 27];
+    let low = [
+        100.0, 100.0, 97.0, 100.0, 100.0, 97.0, 100.0, 100.0, 97.0, 100.0, 100.0, 97.0, 100.0,
+        100.0, 97.0, 100.0, 100.0, 97.0, 100.0, 100.0, 97.0, 100.0, 100.0, 97.0, 100.0, 100.0,
+        97.0,
+    ];
+    let signals = [
+        1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0,
+    ];
+    let month_idx = [
+        0i64, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 8, 8, 8,
+    ];
+    let days = times
+        .iter()
+        .map(|ts| ts.div_euclid(86_400_000))
+        .collect::<Vec<_>>();
+
+    let (metrics, monthly) = fast_evaluate_strategy_core_with_monthly_returns(
+        &settings, &close, &high, &low, &signals, &[], &month_idx, &days, &times,
+    );
+    let plain = fast_evaluate_strategy_core(
+        &close, &high, &low, &signals, &[], &month_idx, &days, &times, &settings,
+    );
+    assert_eq!(
+        metrics.map(f64::to_bits),
+        plain.map(f64::to_bits),
+        "capturing the monthly vector must not move any metric bit"
+    );
+
+    // Independent oracle: the trade ledger's per-month pnl over the month-start
+    // equity, in trade order. All nine trades close, but only the first EIGHT
+    // months are complete (the ninth is still the current month at the end).
+    let trades = simulate_trades_core(&close, &high, &low, &times, &signals, &settings);
+    assert_eq!(trades.len(), 9, "one SL trade per month bucket");
+    let initial = settings.initial_equity();
+    let mut equity = initial;
+    let mut expected = Vec::new();
+    for trade in trades.iter().take(8) {
+        expected.push(trade.pnl / equity);
+        equity += trade.pnl;
+    }
+    assert_eq!(
+        monthly.len(),
+        expected.len(),
+        "one return per COMPLETED month, the current month excluded"
+    );
+    for (got, want) in monthly.iter().zip(&expected) {
+        assert!(
+            (got - want).abs() < 1e-12,
+            "completed-month return {got} != independent ledger reconstruction {want}"
+        );
+    }
+    assert!(
+        monthly.iter().all(|r| r.is_finite()),
+        "no corrupted month may be emitted"
+    );
+
+    // Slot 7 stays the fraction of the SAME completed months over the 4% bar.
+    let hit = monthly.iter().filter(|r| **r >= 0.04).count() as f64 / monthly.len() as f64;
+    assert!(
+        (metrics[7] - hit).abs() < 1e-12,
+        "slot 7 and the monthly vector must agree, got {} vs {hit}",
+        metrics[7]
+    );
+}
+
+#[test]
+fn population_evaluation_passes_the_monthly_vector_into_the_selected_fitness() {
+    let m = [10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01];
+    let months = vec![0.02; 10];
+
+    let mut selected_genes = vec![crate::Gene::default()];
+    let mut selected_cfg = crate::genetic::EvaluationConfig::default();
+    selected_cfg.fitness_table = crate::scoring::FitnessTable::MonthlyUpsideV1;
+    let observation = PopulationEvaluationV1 {
+        metrics: vec![m],
+        cadence: None,
+        monthly_returns: Some(vec![months.clone()]),
+    };
+    observation
+        .apply(&mut selected_genes, &selected_cfg, 1.0)
+        .unwrap();
+    assert_eq!(
+        selected_genes[0].fitness,
+        crate::scoring::ga_fitness_monthly_upside_v1(&months, &m),
+        "the observation must hand its monthly vector to the selected scorer"
+    );
+
+    // The metrics-only construction keeps the canonical default dispatch.
+    let mut plain_genes = vec![crate::Gene::default()];
+    let plain = PopulationEvaluationV1::from(vec![m]);
+    plain
+        .apply(&mut plain_genes, &crate::genetic::EvaluationConfig::default(), 1.0)
+        .unwrap();
+    assert_eq!(
+        plain_genes[0].fitness,
+        crate::scoring::ga_fitness(&m),
+        "the default selector must stay the canonical scorer"
+    );
+}
+

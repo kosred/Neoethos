@@ -1782,6 +1782,7 @@ mod tests {
             growth_objective: true,
             growth_goal: None,
             weekly_objective: None,
+            fitness_table: Default::default(),
         };
         policy.sealed_evaluation_v1 = Some(
             SealedEvaluationPolicyV1::from_evaluation(

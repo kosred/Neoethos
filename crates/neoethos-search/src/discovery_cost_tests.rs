@@ -77,7 +77,8 @@ fn assert_same_evaluation_config(actual: &EvaluationConfig, expected: &Evaluatio
     // No `..`: adding an evaluation field requires extending this proof.
     compare_fields! {
         values: [symbol, account_currency, max_hold_bars, trailing_enabled,
-            kill_zones_enabled, session_spread_pips, growth_objective, growth_goal, weekly_objective],
+            kill_zones_enabled, session_spread_pips, growth_objective, growth_goal, weekly_objective,
+            fitness_table],
         floats: [initial_equity, trailing_atr_multiplier, trailing_be_trigger_r,
             trailing_min_lock_pips, pip_value, spread_pips, commission_per_trade,
             pip_value_per_lot, swap_long_pips_per_day, swap_short_pips_per_day,
@@ -197,7 +198,7 @@ fn assert_same_resolved_discovery_config(actual: &DiscoveryConfig, expected: &Di
             runtime_overrides, mc_runs, mc_min_profitable, adaptive_thresholds,
             mode, prop_firm_gate_params, require_walkforward_for_export,
             discovery_ledger_enabled, discovery_ledger_cache_dir,
-            discovery_ledger_archive_top_n,
+            discovery_ledger_archive_top_n, fitness_table,
         ],
         floats: [
             evaluation_spread_pips, evaluation_commission_per_trade,

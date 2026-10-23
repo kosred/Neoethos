@@ -92,9 +92,12 @@
 //! is mechanically resolvable in the follow-up Phase B without
 //! risking the GA's fitness landscape mid-migration.
 
+pub mod fitness_table;
 pub mod ingredients;
 pub mod monthly_upside;
 pub mod named;
+
+pub use fitness_table::FitnessTable;
 
 pub use ingredients::{
     consistency_component, drawdown_penalty, expectancy_component, ga_pf_component, net_component,

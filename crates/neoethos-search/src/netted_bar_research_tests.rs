@@ -489,6 +489,7 @@ fn public_preparation_evaluates_exact_published_canonical_holdout_and_rejects_re
         growth_objective: false,
         growth_goal: None,
         weekly_objective: None,
+        fitness_table: Default::default(),
     };
     contract.validate_evaluation_costs(&evaluation).unwrap();
     let prepared =

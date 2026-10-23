@@ -1408,8 +1408,18 @@ in market rather than by trades, so **a strategy that is flat is not penalised**
 (the asymmetric monthly-upside fitness, neo-671): the PropFirm GA would evolve
 under the median monthly return with a one-sided upside bonus and a
 tail-loss-only penalty below a -2% worst month. It needs the evaluator's
-monthly-return vector, which the `[f64; 11]` metric array does not carry, so
-the B9 variant is excluded until the selector AND that vector reach the GA.
+monthly-return vector, which the `[f64; 11]` metric array does not carry.
+
+LANDED (2026-10-23, neo-671 follow-up): the selector enum, the
+`DiscoveryConfig` / `EvaluationConfig` field, the `apply_metrics` dispatch and
+the canonical CPU evaluator's completed-month return vector are all in place.
+With the `search-monthly-upside-objective` feature enabled, B9 selects
+`MonthlyUpsideV1` and the CPU evaluation path feeds the vector into
+`ga_fitness_monthly_upside_v1`. Known boundaries: the canonical config digest
+does not encode the selector yet (the §14.8 stamp-gap class — a B9 run must
+not be deduplicated against a default run by hash alone), and metrics-only
+producers (GPU routes, transport adapters) pass no vector, so the scorer's
+"no monthly observations" guard applies there.
 
 ### 14.8 `crates/neoethos-search/src/run_identity.rs` — six factors are invisible to the stamp
 
