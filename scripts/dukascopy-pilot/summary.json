@@ -1,0 +1,151 @@
+{
+  "generated_at_utc": "2026-10-23T11:07:24.145717+00:00",
+  "pilot_scope": "bounded pilot: exactly 4 UTC days (no full-history download)",
+  "instrument": "EURUSD",
+  "jetta_code": "EUR-USD",
+  "venue": "dukascopy",
+  "venue_role": "labeled research reference only; NOT the execution venue (execution truth = cTrader demo); never mixed into the sealed cost model",
+  "data_root": "C:\\Users\\konst\\AppData\\Local\\neoethos\\dukascopy-ref",
+  "store_dir": "C:\\Users\\konst\\AppData\\Local\\neoethos\\dukascopy-ref\\store",
+  "jetta_tick_history_start_utc": "2003-05-04 19:00:00+00:00",
+  "days": [
+    {
+      "date": "2016-06-01",
+      "instrument": "EURUSD",
+      "venue": "dukascopy",
+      "venue_role": "labeled research reference only; NOT the execution venue (execution truth = cTrader demo); never mixed into the sealed cost model",
+      "status": "ok",
+      "source": "dukascopy-downloader 1.1.0 (jetta.dukascopy.com)",
+      "attempts": 1,
+      "error": null,
+      "detail": null,
+      "requests": {
+        "planned": 24,
+        "fetched": 24,
+        "cached": 0,
+        "failed": 0
+      },
+      "download_seconds": 3.3,
+      "bytes_measured": 1168710,
+      "bytes_wire_bi5": 0,
+      "spread_stats_method": "spread_pips=(ask-bid)/0.0001; p99=linear-interpolation quantile; share_of_day=time-weighted: ms-span of ticks with spread<=1.0 pip divided by ms-span from first to last tick of the UTC day",
+      "tick_count": 92646,
+      "mean_spread_pips": 0.2521911361526673,
+      "median_spread_pips": 0.20000000000131024,
+      "p99_spread_pips": 0.9000000000014552,
+      "share_of_day_spread_le_1pip": 0.9854723511639483,
+      "ticks_with_ask_lt_bid": 0
+    },
+    {
+      "date": "2018-02-01",
+      "instrument": "EURUSD",
+      "venue": "dukascopy",
+      "venue_role": "labeled research reference only; NOT the execution venue (execution truth = cTrader demo); never mixed into the sealed cost model",
+      "status": "ok",
+      "source": "dukascopy-downloader 1.1.0 (jetta.dukascopy.com)",
+      "attempts": 1,
+      "error": null,
+      "detail": null,
+      "requests": {
+        "planned": 24,
+        "fetched": 24,
+        "cached": 0,
+        "failed": 0
+      },
+      "download_seconds": 27.9,
+      "bytes_measured": 1594110,
+      "bytes_wire_bi5": 0,
+      "spread_stats_method": "spread_pips=(ask-bid)/0.0001; p99=linear-interpolation quantile; share_of_day=time-weighted: ms-span of ticks with spread<=1.0 pip divided by ms-span from first to last tick of the UTC day",
+      "tick_count": 120523,
+      "mean_spread_pips": 0.33561726807332254,
+      "median_spread_pips": 0.2999999999997449,
+      "p99_spread_pips": 0.9999999999998899,
+      "share_of_day_spread_le_1pip": 0.9780553015659903,
+      "ticks_with_ask_lt_bid": 0
+    },
+    {
+      "date": "2022-07-01",
+      "instrument": "EURUSD",
+      "venue": "dukascopy",
+      "venue_role": "labeled research reference only; NOT the execution venue (execution truth = cTrader demo); never mixed into the sealed cost model",
+      "status": "ok",
+      "source": "dukascopy-downloader 1.1.0 (jetta.dukascopy.com)",
+      "attempts": 1,
+      "error": null,
+      "detail": null,
+      "requests": {
+        "planned": 24,
+        "fetched": 24,
+        "cached": 0,
+        "failed": 0
+      },
+      "download_seconds": 21.8,
+      "bytes_measured": 1439733,
+      "bytes_wire_bi5": 0,
+      "spread_stats_method": "spread_pips=(ask-bid)/0.0001; p99=linear-interpolation quantile; share_of_day=time-weighted: ms-span of ticks with spread<=1.0 pip divided by ms-span from first to last tick of the UTC day",
+      "tick_count": 115505,
+      "mean_spread_pips": 0.3644543526254333,
+      "median_spread_pips": 0.30000000000196536,
+      "p99_spread_pips": 0.700000000000145,
+      "share_of_day_spread_le_1pip": 0.9974601830784697,
+      "ticks_with_ask_lt_bid": 0
+    },
+    {
+      "date": "2026-10-20",
+      "instrument": "EURUSD",
+      "venue": "dukascopy",
+      "venue_role": "labeled research reference only; NOT the execution venue (execution truth = cTrader demo); never mixed into the sealed cost model",
+      "status": "ok",
+      "source": "dukascopy-downloader 1.1.0 (jetta.dukascopy.com)",
+      "attempts": 1,
+      "error": null,
+      "detail": null,
+      "requests": {
+        "planned": 24,
+        "fetched": 24,
+        "cached": 0,
+        "failed": 0
+      },
+      "download_seconds": 3.0,
+      "bytes_measured": 929053,
+      "bytes_wire_bi5": 0,
+      "spread_stats_method": "spread_pips=(ask-bid)/0.0001; p99=linear-interpolation quantile; share_of_day=time-weighted: ms-span of ticks with spread<=1.0 pip divided by ms-span from first to last tick of the UTC day",
+      "tick_count": 77088,
+      "mean_spread_pips": 0.32903435035285244,
+      "median_spread_pips": 0.2999999999997449,
+      "p99_spread_pips": 3.5000000000007248,
+      "share_of_day_spread_le_1pip": 0.9576497829232996,
+      "ticks_with_ask_lt_bid": 0
+    }
+  ],
+  "feasibility_estimate_full_range_2016_2024": {
+    "status": "estimate-only; not executed",
+    "range_utc": "2016-01-01..2024-12-31 (inclusive)",
+    "calendar_days": 3288,
+    "trading_days_weekdays": 2348,
+    "request_chunks_estimate": 78912,
+    "estimated_hours_at_8_req_per_s_floor": 2.74,
+    "sample_days_used": [
+      "2016-06-01",
+      "2018-02-01",
+      "2022-07-01"
+    ],
+    "mean_ticks_per_day": 109558.0,
+    "bytes_per_tick_measured": 12.7864,
+    "estimated_total_ticks": 257242184,
+    "estimated_size_gb": 3.29,
+    "measured_throughput_bytes_per_second": 79293.5,
+    "estimated_download_hours_at_measured_throughput": 11.5,
+    "assumptions": [
+      "bytes_measured = compressed stored parquet bytes for jetta days (post-decode), raw .bi5 wire bytes for fallback days",
+      "ticks/day extrapolated from the in-range pilot days only (2026-10-20 excluded; it is the probe-overlap day)",
+      "weekend/holiday days cost a cheap empty response but are still counted in request_chunks_estimate",
+      "jetta API rate limit 8 req/s (package default) puts a hard floor on full-range wall time",
+      "dukascopy-downloader is resumable (per-chunk manifest), so the range can be fetched across sessions",
+      "storage size = the store's per-day parquet files as measured in this pilot"
+    ]
+  },
+  "method_notes": [
+    "spread_pips=(ask-bid)/0.0001; p99=linear-interpolation quantile; share_of_day=time-weighted: ms-span of ticks with spread<=1.0 pip divided by ms-span from first to last tick of the UTC day"
+  ]
+}
