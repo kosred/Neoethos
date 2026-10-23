@@ -1345,19 +1345,22 @@ cannot be enabled before the field exists.
 
 ### 14.7 `crates/neoethos-search/src/discovery.rs` — the objective knobs
 
-**Seven of the nine axis-B variants are not expressible against the compiled
-search**, because `DiscoveryConfig` has no objective selector: the GA's fitness
+**Seven of the ten axis-B variants are not expressible against the compiled
+search** (B0, B2, B3, B4, B7, B8, B9), because `DiscoveryConfig` has no
+objective selector: the GA's fitness
 is chosen by one `bool` (`EvaluationConfig::growth_objective`, set from
 `DiscoveryMode`), the triple-barrier horizon is read from
 `EvaluationConfig::max_hold_bars` which **ships at 0 and has no config recipient**
 (`discovery.rs:5483` then substitutes the documented 35), and there is no
 conditioning set, no cost-edge scoring flag and no portfolio-level objective.
 
-Today, therefore, exactly one axis-B variant is drawable per scenario — B5 under
-Risky (`ga_fitness_growth`, the mode's own Kelly log-growth objective) and B6
-under PropFirm (the window-pass gate) — plus the whole refusal vector (§7.9),
-whose four dimensions all have recipients already. `proposer.rs` reports the
-other seven as EXCLUDED, by name, with the symbol each needs; it does **not**
+Today, therefore, exactly one scenario-native axis-B variant is drawable per
+scenario — B5 under Risky (`ga_fitness_growth`, the mode's own Kelly log-growth
+objective) and B6 under PropFirm (the window-pass gate) — plus B1 (whose two
+levers are real `DiscoveryConfig` fields) under both, plus the whole refusal
+vector (§7.9), whose four dimensions all have recipients already.
+`proposer.rs` reports the seven knob-less variants as EXCLUDED, by name, with
+the symbol each needs; it does **not**
 draw them and quietly run the default objective, which would make the loop
 appear to explore the objective space while sweeping axis A under one implicit
 objective.
@@ -1372,6 +1375,7 @@ cargo feature on the autoresearch side:
     pub fitness_table: FitnessTable,          // feature: search-fitness-table
                                               //          search-in-market-fitness (NetPerBarInMarket)
                                               //          search-t-stat-objective  (ExpectancyTStat)
+                                              //          search-monthly-upside-objective (MonthlyUpsideV1)
     /// Triple-barrier vertical barrier, in base bars, for BOTH the prefilter's
     /// label and the evaluator. `0` keeps today's behaviour (the documented 35).
     pub label_max_hold_bars: usize,           // feature: search-label-horizon
@@ -1392,13 +1396,20 @@ with
 
 ```rust
 pub enum FitnessTable { GaFitness, ArchiveScore, WindowScore, QualityScore,
-                        NetPerBarInMarket, ExpectancyTStat }
+                        NetPerBarInMarket, ExpectancyTStat, MonthlyUpsideV1 }
 ```
 
 `FitnessTable::NetPerBarInMarket` is the one new function: net divided by bars
 in market rather than by trades, so **a strategy that is flat is not penalised**
 — which is the whole content of B1, and the only objective shape that can act on
 "the average trade loses 4.15 pips, so take fewer, different trades."
+
+`FitnessTable::MonthlyUpsideV1` binds `scoring::ga_fitness_monthly_upside_v1`
+(the asymmetric monthly-upside fitness, neo-671): the PropFirm GA would evolve
+under the median monthly return with a one-sided upside bonus and a
+tail-loss-only penalty below a -2% worst month. It needs the evaluator's
+monthly-return vector, which the `[f64; 11]` metric array does not carry, so
+the B9 variant is excluded until the selector AND that vector reach the GA.
 
 ### 14.8 `crates/neoethos-search/src/run_identity.rs` — six factors are invisible to the stamp
 

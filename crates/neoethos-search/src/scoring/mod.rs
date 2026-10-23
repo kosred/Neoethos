@@ -93,6 +93,7 @@
 //! risking the GA's fitness landscape mid-migration.
 
 pub mod ingredients;
+pub mod monthly_upside;
 pub mod named;
 
 pub use ingredients::{
@@ -104,6 +105,11 @@ pub use named::{
     RiskyGrowthGoal, SCORING_VERSION_CURRENT, ScoringVersion, archive_score, ga_fitness,
     ga_fitness_goal, ga_fitness_growth, quality_score, window_score,
 };
+
+/// Opt-in asymmetric monthly-upside fitness variant (research; NOT the
+/// default objective). See [`monthly_upside`] for the formula and the
+/// neo-671 reward-shape experiment it answers.
+pub use monthly_upside::ga_fitness_monthly_upside_v1;
 
 #[cfg(test)]
 mod tests {

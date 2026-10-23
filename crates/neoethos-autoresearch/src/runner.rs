@@ -50,6 +50,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::time::Instant;
 
+use neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2;
 use neoethos_core::config::Settings;
 use neoethos_search::deflated::TrialStatisticsReport;
 use neoethos_search::discovery::DiscoveryConfig;
@@ -717,6 +718,33 @@ pub trait SweepExecutor {
     /// receipt cannot contribute to a resumable research session.
     fn dataset_receipt(&self) -> &DatasetReceiptV1;
 
+    /// Install the run-scoped broker-financial-truth authority minted from an
+    /// exact reviewed bundle, or `None` when the global fail-closed gate
+    /// governs this run (unchanged behavior).
+    ///
+    /// The runner installs the authority it loaded BEFORE any sweep runs, so
+    /// the search invocation used by sweeps can consume the validated
+    /// authority through the quote-replay evaluator — never the legacy scalar
+    /// adapter. The default REFUSES a supplied authority: silently accepting
+    /// it and then evaluating on the legacy adapter would turn a validated run
+    /// into an unvalidated one.
+    fn install_reviewed_broker_financial_truth_authority(
+        &mut self,
+        authority: Option<BrokerFinancialTruthAuthorityV2>,
+    ) -> Result<()> {
+        let Some(authority) = authority else {
+            // No reviewed bundle was supplied: the global gate governs and
+            // there is nothing to install.
+            return Ok(());
+        };
+        bail!(
+            "{} cannot consume the run-scoped broker-financial-truth authority for reviewed \
+             run {}; refusing to run its sweeps on the legacy scalar adapter instead",
+            self.describe(),
+            authority.canonical_run_identity_sha256()
+        );
+    }
+
     /// Reconstruct the exact effective discovery/ledger config identity for one
     /// recorded batch. This is deliberately separate from the proposal stamp:
     /// runtime population resolution can make them different identities.
@@ -1043,18 +1071,23 @@ pub fn run_until_boundary_with_executor_v1(
     // turn guessed costs or returns into an autoresearch verdict.
     //
     // With an exact reviewed broker bundle, mint the run-scoped authority
-    // from the validated bundle instead; otherwise keep the global
-    // fail-closed gate.
-    let _reviewed_authority = load_reviewed_broker_financial_truth_authority_v2(
+    // from the validated bundle and INSTALL it on the executor so the sweep's
+    // financial evaluation consumes the quote-replay evaluator, never the
+    // legacy scalar adapter. Without a bundle, keep the global fail-closed
+    // gate (unchanged behavior).
+    let reviewed_authority = load_reviewed_broker_financial_truth_authority_v2(
         args.quote_replay_store.as_deref(),
         args.quote_replay_link.as_deref(),
         args.reviewed_evidence.as_deref(),
     )?;
-    if _reviewed_authority.is_none() {
+    if reviewed_authority.is_none() {
         neoethos_core::current_broker_financial_truth_capability_v1()
             .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
             .map_err(anyhow::Error::new)?;
     }
+    executor
+        .install_reviewed_broker_financial_truth_authority(reviewed_authority)
+        .context("installing the run-scoped broker-financial-truth authority on the sweep executor")?;
     assert_executor_receipt(&args.dataset_identity, executor)?;
 
     let started = Instant::now();

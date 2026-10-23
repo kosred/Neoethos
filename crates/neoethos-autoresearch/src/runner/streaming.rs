@@ -38,6 +38,8 @@ use neoethos_search::{
     CanonicalSearchWindowRoleV1, LockedPortfolioOuterHoldoutReplaySetV1,
 };
 
+use neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2;
+
 use crate::QuoteValidatedOosTouchEvidenceV1;
 use crate::journal::{CostBandCounts, OosWindow};
 use crate::session::{DatasetReceiptV1, DirectTimeframeReceiptV1, InSampleWindowV1, SweepId};
@@ -70,6 +72,11 @@ pub struct StreamingSweepExecutor {
     /// ordinary trendbar-only `run()` route leaves this absent while preparing
     /// quote coverage. Actual OOS evaluation requires it before reading prices.
     quote_validated_oos_replay: Option<LockedPortfolioOuterHoldoutReplaySetV1>,
+    /// The run-scoped broker-financial-truth authority minted from an exact
+    /// reviewed bundle, installed by the runner when one was supplied. While
+    /// present, the sweep's financial evaluation must consume it through the
+    /// quote-replay evaluator — never the legacy scalar adapter.
+    reviewed_broker_financial_truth_authority: Option<BrokerFinancialTruthAuthorityV2>,
     /// Where per-search discovery ledgers are written before their matrices are
     /// copied into the session store.
     scratch_root: PathBuf,
@@ -372,6 +379,7 @@ impl StreamingSweepExecutor {
             streaming_requested: true,
             dataset_receipt,
             quote_validated_oos_replay: None,
+            reviewed_broker_financial_truth_authority: None,
             scratch_root,
         })
     }
@@ -454,6 +462,70 @@ pub(super) fn validate_search_receipt_against_dataset_receipt(
                 dataset_receipt.in_sample_window.end_exclusive_ms
             );
         }
+    }
+    Ok(())
+}
+
+/// Which financial evaluation is authorized for one sweep search.
+///
+/// `reviewed_run_identity` is read from the installed run-scoped authority
+/// ([`BrokerFinancialTruthAuthorityV2::canonical_run_identity_sha256`]), the
+/// only source of a reviewed run identity in this crate; it cannot be
+/// fabricated anywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReviewedSweepFinancialRouteV1 {
+    /// No reviewed bundle governs this run: the global fail-closed gate
+    /// admitted it and the legacy route applies (unchanged behavior).
+    GlobalGateAdmittedLegacyRoute,
+    /// This search receipt is the exact reviewed run: its financial
+    /// evaluation must consume the run-scoped authority through the
+    /// quote-replay evaluator, never the legacy scalar adapter.
+    ReviewedRunQuoteReplayRequired,
+}
+
+/// Route one sweep search's financial evaluation under the installed
+/// run-scoped authority. A reviewed-bundle run whose search receipt is NOT
+/// the exact reviewed run is refused: the legacy scalar adapter may never
+/// evaluate a run that was admitted on a reviewed bundle.
+pub(super) fn reviewed_sweep_financial_route_v1(
+    reviewed_run_identity: Option<&str>,
+    receipt_identity: &str,
+) -> Result<ReviewedSweepFinancialRouteV1> {
+    let Some(reviewed) = reviewed_run_identity else {
+        return Ok(ReviewedSweepFinancialRouteV1::GlobalGateAdmittedLegacyRoute);
+    };
+    anyhow::ensure!(
+        receipt_identity == reviewed,
+        "the sweep search receipt {receipt_identity} is not the exact reviewed run {reviewed}; \
+         a run admitted on a reviewed bundle may not be evaluated by the legacy scalar adapter"
+    );
+    Ok(ReviewedSweepFinancialRouteV1::ReviewedRunQuoteReplayRequired)
+}
+
+/// Enforce the reviewed-bundle route for one batch receipt inside
+/// `execute`. Shared by both search invocations (native GPU and CPU) so a
+/// reviewed run can reach neither legacy discovery call.
+fn enforce_reviewed_sweep_route(
+    reviewed_authority: Option<&BrokerFinancialTruthAuthorityV2>,
+    receipt: &CanonicalSearchInputReceiptV2,
+) -> Result<()> {
+    let receipt_identity = receipt.identity_sha256()?;
+    let reviewed_route = reviewed_sweep_financial_route_v1(
+        reviewed_authority.map(|authority| authority.canonical_run_identity_sha256()),
+        &receipt_identity,
+    )?;
+    if reviewed_route == ReviewedSweepFinancialRouteV1::ReviewedRunQuoteReplayRequired {
+        // The run was admitted on a reviewed bundle, so this sweep's financial
+        // evaluation must consume the validated authority through the
+        // quote-replay evaluator. The sealed post-lock replay seam is not yet
+        // wired into the streaming search invocation; until it is, the search
+        // refuses rather than falling back to the legacy scalar adapter.
+        anyhow::bail!(
+            "reviewed-bundle sweep seam not wired: this search receipt {receipt_identity} is \
+             the exact reviewed run, but the streaming search invocation cannot yet evaluate \
+             its financial result through the sealed quote-replay evaluator; refusing the \
+             legacy scalar adapter"
+        );
     }
     Ok(())
 }
@@ -712,6 +784,24 @@ impl SweepExecutor for StreamingSweepExecutor {
         )
     }
 
+    fn install_reviewed_broker_financial_truth_authority(
+        &mut self,
+        authority: Option<BrokerFinancialTruthAuthorityV2>,
+    ) -> Result<()> {
+        let Some(authority) = authority else {
+            // No reviewed bundle: the global gate governs this run and the
+            // legacy route applies (unchanged behavior).
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.reviewed_broker_financial_truth_authority.is_none(),
+            "a run-scoped broker-financial-truth authority is already installed; replacement \
+             is refused"
+        );
+        self.reviewed_broker_financial_truth_authority = Some(authority);
+        Ok(())
+    }
+
     fn execute(&mut self, request: &SearchRequest<'_>) -> Result<SearchOutcome> {
         let began = std::time::Instant::now();
         let config = Self::charge_pessimistic_edge(request.config)?;
@@ -758,6 +848,7 @@ impl SweepExecutor for StreamingSweepExecutor {
         let in_sample_end_exclusive_ms = self.dataset_receipt.in_sample_window.end_exclusive_ms;
         let exact_anchor_identity = self.dataset_receipt.anchor_identity.clone();
         let exact_dataset_receipt = &self.dataset_receipt;
+        let reviewed_authority = self.reviewed_broker_financial_truth_authority.as_ref();
         let mut last_search_receipt = None;
         let mut last_search_config_hash = None;
 
@@ -800,6 +891,7 @@ impl SweepExecutor for StreamingSweepExecutor {
                     .receipt()
                     .context("seal prepared autoresearch batch receipt")?;
                 validate_search_receipt_against_dataset_receipt(exact_dataset_receipt, &receipt)?;
+                enforce_reviewed_sweep_route(reviewed_authority, &receipt)?;
                 Ok((input, no_physical_gpu_admission))
             },
             |_batch| {
@@ -873,6 +965,7 @@ impl SweepExecutor for StreamingSweepExecutor {
                     exact_dataset_receipt,
                     &search_receipt,
                 )?;
+                enforce_reviewed_sweep_route(reviewed_authority, &search_receipt)?;
                 let run_input =
                     CanonicalSearchRunInputV2::new(search_receipt, features, &self.in_sample_base)
                         .context(
@@ -3042,6 +3135,88 @@ mod tests {
         assert!(
             !path.exists(),
             "a search that selected nothing must write nothing"
+        );
+    }
+
+    // ── reviewed-bundle routing ──────────────────────────────────────────────
+
+    #[test]
+    fn reviewed_sweep_route_keeps_the_legacy_route_when_no_bundle_governs_the_run() {
+        let route = reviewed_sweep_financial_route_v1(None, "run-a").expect(
+            "no reviewed bundle: the global gate governs and the legacy route applies",
+        );
+        assert_eq!(
+            route,
+            ReviewedSweepFinancialRouteV1::GlobalGateAdmittedLegacyRoute
+        );
+    }
+
+    #[test]
+    fn reviewed_sweep_route_admits_only_the_exact_reviewed_run_receipt() {
+        let route = reviewed_sweep_financial_route_v1(Some("run-a"), "run-a")
+            .expect("the exact reviewed run receipt is admitted to the quote-replay route");
+        assert_eq!(
+            route,
+            ReviewedSweepFinancialRouteV1::ReviewedRunQuoteReplayRequired
+        );
+    }
+
+    #[test]
+    fn reviewed_sweep_route_refuses_a_different_receipt_never_the_scalar_adapter() {
+        let error = reviewed_sweep_financial_route_v1(Some("run-a"), "run-b").expect_err(
+            "a run admitted on a reviewed bundle may not be evaluated under a different receipt",
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("run-a"), "{message}");
+        assert!(message.contains("run-b"), "{message}");
+        assert!(message.contains("legacy scalar adapter"), "{message}");
+    }
+
+    #[test]
+    fn execute_consumes_the_installed_authority_before_the_legacy_search_call() {
+        // Source-level contract: the reviewed-bundle route check reads the
+        // installed authority's reviewed run identity and runs BEFORE either
+        // legacy discovery invocation inside `execute`, so a run admitted on
+        // a reviewed bundle can never reach the scalar adapter.
+        let source = include_str!("streaming.rs");
+        for required in [
+            "reviewed_broker_financial_truth_authority: Option<BrokerFinancialTruthAuthorityV2>",
+            "fn install_reviewed_broker_financial_truth_authority(",
+            "canonical_run_identity_sha256",
+            "reviewed_sweep_financial_route_v1",
+            "refusing the legacy scalar adapter",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing reviewed-route contract {required}"
+            );
+        }
+        // Everything after the `execute` signature is that function's body:
+        // the route enforcement must appear before either legacy discovery
+        // invocation inside it.
+        let execute_at = source
+            .find("fn execute(&mut self, request: &SearchRequest<'_>)")
+            .expect("execute must exist");
+        let body = &source[execute_at..];
+        let route_check = execute_at
+            + body
+                .find("enforce_reviewed_sweep_route")
+                .expect("execute must route the installed reviewed authority");
+        let gpu_legacy = execute_at
+            + body
+                .find("run_prepared_canonical_discovery_with_holdout_and_progress_v3")
+                .expect("execute must still hold the legacy gpu discovery call");
+        let cpu_legacy = execute_at
+            + body
+                .find("run_discovery_cycle_with_holdout(")
+                .expect("execute must still hold the legacy cpu discovery call");
+        assert!(
+            route_check < gpu_legacy,
+            "the reviewed-bundle route check must precede the gpu legacy call"
+        );
+        assert!(
+            route_check < cpu_legacy,
+            "the reviewed-bundle route check must precede the cpu legacy call"
         );
     }
 }

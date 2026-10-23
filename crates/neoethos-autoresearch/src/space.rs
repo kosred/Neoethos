@@ -103,6 +103,11 @@ pub struct Capabilities {
     pub t_stat_objective: bool,
     /// The portfolio, after correlation pruning, is the scored unit (B8).
     pub portfolio_objective: bool,
+    /// The asymmetric monthly-upside GA fitness is selectable (B9).
+    /// `#[serde(default)]` keeps a persisted capability set written by a
+    /// build that predates the knob deserialisable (missing field = OFF).
+    #[serde(default)]
+    pub monthly_upside_objective: bool,
 }
 
 impl Capabilities {
@@ -118,6 +123,7 @@ impl Capabilities {
             in_market_fitness: cfg!(feature = "search-in-market-fitness"),
             t_stat_objective: cfg!(feature = "search-t-stat-objective"),
             portfolio_objective: cfg!(feature = "search-portfolio-objective"),
+            monthly_upside_objective: cfg!(feature = "search-monthly-upside-objective"),
         }
     }
 
@@ -136,6 +142,7 @@ impl Capabilities {
             in_market_fitness: true,
             t_stat_objective: true,
             portfolio_objective: true,
+            monthly_upside_objective: true,
         }
     }
 }
@@ -156,6 +163,7 @@ pub enum RequiredKnob {
     InMarketFitness,
     TStatObjective,
     PortfolioObjective,
+    MonthlyUpsideObjective,
 }
 
 impl RequiredKnob {
@@ -170,6 +178,7 @@ impl RequiredKnob {
             Self::InMarketFitness => caps.in_market_fitness,
             Self::TStatObjective => caps.t_stat_objective,
             Self::PortfolioObjective => caps.portfolio_objective,
+            Self::MonthlyUpsideObjective => caps.monthly_upside_objective,
         }
     }
 
@@ -195,6 +204,12 @@ impl RequiredKnob {
             Self::PortfolioObjective => {
                 "neoethos_search::discovery::DiscoveryConfig::score_portfolio_after_pruning"
             }
+            // The scorer itself (`scoring::ga_fitness_monthly_upside_v1`) exists;
+            // what the search still lacks is the fitness-table selector that would
+            // bind it into the GA.
+            Self::MonthlyUpsideObjective => {
+                "neoethos_search::discovery::DiscoveryConfig::fitness_table"
+            }
         }
     }
 
@@ -210,6 +225,7 @@ impl RequiredKnob {
             Self::InMarketFitness => "search-in-market-fitness",
             Self::TStatObjective => "search-t-stat-objective",
             Self::PortfolioObjective => "search-portfolio-objective",
+            Self::MonthlyUpsideObjective => "search-monthly-upside-objective",
         }
     }
 
