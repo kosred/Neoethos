@@ -612,3 +612,68 @@ fn canonical_research_v3_exact_maps_shipped_genes_to_prepared_signals_and_sealed
         "LockedPortfolioOuterHoldoutReplaySetV3::new(locked,&self.replay_binding,&self.replay_policy,&snapshot,lanes,entry_inputs,execution_economics,"
     ));
 }
+
+#[test]
+fn reviewed_run_entrypoint_accepts_the_authority_and_bypasses_only_the_global_capability_require() {
+    // The reviewed-run entrypoint is the run-scoped variant of the
+    // quote-validated outer-holdout entrypoint: a presented V2 authority
+    // replaces ONLY the process-wide HistoricalEvaluation require, while every
+    // other receipt/cost/gate check (provider call, sealed evidence tail) stays
+    // identical. The authority must name this exact canonical run receipt.
+    let discovery = read("src/discovery.rs");
+    let reviewed = function_body(
+        &discovery,
+        "pub fn run_reviewed_discovery_cycle_with_quote_validated_outer_holdout_and_progress<F, P>(",
+    );
+    require_tokens(
+        reviewed,
+        &[
+            "authority: neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2",
+            "neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2,",
+            "canonical_run_identity_sha256()",
+            "input.receipt().identity_sha256()",
+            "run_discovery_cycle_with_holdout_and_progress_authorized(",
+            "authority.take()",
+            "replay_provider(authority, result, ordered_signals, holdout_scope)",
+            "require_quote_validated_outer_holdout_v1(",
+            "QuoteValidatedDiscoveryResultV1",
+        ],
+    );
+    assert!(
+        !reviewed.contains("current_broker_financial_truth_capability_v1"),
+        "the reviewed entrypoint must bypass the global capability require"
+    );
+    assert!(
+        !reviewed.contains("#[cfg(test)]"),
+        "the reviewed entrypoint is production admission, not a test-only bypass"
+    );
+    // The legacy entrypoint keeps its global require unchanged: the bypass is
+    // scoped to the reviewed entrypoint, never applied to the legacy path.
+    let legacy = function_body(
+        &discovery,
+        "pub fn run_discovery_cycle_with_quote_validated_outer_holdout_and_progress<F, P>(",
+    );
+    require_tokens(
+        legacy,
+        &[
+            "current_broker_financial_truth_capability_v1()",
+            "BrokerFinancialOperationV1::HistoricalEvaluation",
+        ],
+    );
+}
+
+#[test]
+fn reviewed_run_bridge_inputs_are_public_exports() {
+    let library = read("src/lib.rs");
+    for required in [
+        "run_reviewed_discovery_cycle_with_quote_validated_outer_holdout_and_progress",
+        "canonical_signal_plan_sha256_v1",
+    ] {
+        assert!(
+            library.contains(required),
+            "missing reviewed-run bridge export `{required}`"
+        );
+    }
+    let outer = read("src/quote_validated_outer_holdout_v1.rs");
+    require_tokens(&outer, &["pub fn canonical_signal_plan_sha256_v1("]);
+}

@@ -148,7 +148,13 @@ pub fn canonical_locked_portfolio_identity_sha256_v1<T: Serialize>(
     stable_sha256("neoethos.locked-final-portfolio.v1", locked_portfolio)
 }
 
-fn canonical_signal_plan_sha256_v1(
+/// Public canonical-bar signal-plan identity for the reviewed-run bridge.
+///
+/// The same domain-tagged hash is recomputed by
+/// [`evaluate_locked_portfolio_outer_holdout_v1`] from the locked signals and
+/// the exact ordered per-decision risk distances, so a replay set built with
+/// this value can only ever evaluate against the same plan it was sealed for.
+pub fn canonical_signal_plan_sha256_v1(
     canonical_search_input_receipt_sha256: &str,
     portfolio_identity_sha256: &str,
     search_config_hash: &str,

@@ -50,7 +50,10 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::time::Instant;
 
-use neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2;
+use neoethos_core::broker_financial_truth::{
+    BrokerFinancialTruthAuthorityV2, QuoteValidatedResearchReplayPolicyV1,
+    ReviewedQuoteReplayRuleIdentityV2,
+};
 use neoethos_core::config::Settings;
 use neoethos_search::deflated::TrialStatisticsReport;
 use neoethos_search::discovery::DiscoveryConfig;
@@ -96,6 +99,10 @@ pub struct RunArgs {
     pub quote_replay_link: Option<std::path::PathBuf>,
     /// Independently reviewed broker-financial-truth evidence JSON.
     pub reviewed_evidence: Option<std::path::PathBuf>,
+    /// Exact captured replay-policy JSON from the same finalist acquisition.
+    /// Required together with the reviewed bundle: the post-lock bridge cannot
+    /// invent execution staleness/latency assumptions.
+    pub quote_replay_policy: Option<std::path::PathBuf>,
 }
 
 impl RunArgs {
@@ -110,8 +117,22 @@ impl RunArgs {
             quote_replay_store: None,
             quote_replay_link: None,
             reviewed_evidence: None,
+            quote_replay_policy: None,
         }
     }
+}
+
+/// Exact replay-binding inputs for the reviewed run, read from the reviewed
+/// evidence through its public getters plus the captured replay policy. The
+/// post-lock bridge uses these to build the exact
+/// [`QuoteValidatedResearchReplayBindingV1`] the sealed evidence was reviewed
+/// against; a fabricated context fails the seal's exact binding checks.
+#[derive(Debug, Clone)]
+pub struct ReviewedBrokerTruthRunContextV1 {
+    pub account_id: i64,
+    pub symbol_id: i64,
+    pub reviewed_replay_rule: ReviewedQuoteReplayRuleIdentityV2,
+    pub replay_policy: QuoteValidatedResearchReplayPolicyV1,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -719,8 +740,9 @@ pub trait SweepExecutor {
     fn dataset_receipt(&self) -> &DatasetReceiptV1;
 
     /// Install the run-scoped broker-financial-truth authority minted from an
-    /// exact reviewed bundle, or `None` when the global fail-closed gate
-    /// governs this run (unchanged behavior).
+    /// exact reviewed bundle, together with the exact replay-binding context
+    /// read from the reviewed evidence, or `None` when the global fail-closed
+    /// gate governs this run (unchanged behavior).
     ///
     /// The runner installs the authority it loaded BEFORE any sweep runs, so
     /// the search invocation used by sweeps can consume the validated
@@ -730,9 +752,12 @@ pub trait SweepExecutor {
     /// into an unvalidated one.
     fn install_reviewed_broker_financial_truth_authority(
         &mut self,
-        authority: Option<BrokerFinancialTruthAuthorityV2>,
+        authority: Option<(
+            BrokerFinancialTruthAuthorityV2,
+            ReviewedBrokerTruthRunContextV1,
+        )>,
     ) -> Result<()> {
-        let Some(authority) = authority else {
+        let Some((authority, _context)) = authority else {
             // No reviewed bundle was supplied: the global gate governs and
             // there is nothing to install.
             return Ok(());
@@ -1005,9 +1030,15 @@ fn load_reviewed_broker_financial_truth_authority_v2(
     store_path: Option<&std::path::Path>,
     link_path: Option<&std::path::Path>,
     reviewed_path: Option<&std::path::Path>,
-) -> Result<Option<neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2>> {
-    match (store_path, link_path, reviewed_path) {
-        (Some(store_path), Some(link_path), Some(reviewed_path)) => {
+    replay_policy_path: Option<&std::path::Path>,
+) -> Result<
+    Option<(
+        neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2,
+        ReviewedBrokerTruthRunContextV1,
+    )>,
+> {
+    match (store_path, link_path, reviewed_path, replay_policy_path) {
+        (Some(store_path), Some(link_path), Some(reviewed_path), Some(replay_policy_path)) => {
             let store = neoethos_core::broker_financial_truth::BrokerTruthAcquisitionStoreV1::new(
                 store_path.to_path_buf(),
             );
@@ -1024,17 +1055,37 @@ fn load_reviewed_broker_financial_truth_authority_v2(
             let reviewed: neoethos_core::broker_financial_truth::ReviewedBrokerFinancialTruthEvidenceV2 =
                 serde_json::from_slice(&reviewed_bytes)
                     .context("parse reviewed broker-financial-truth evidence")?;
+            // The exact replay-binding inputs travel with the authority: the
+            // public evidence getters name the primary account/symbol and the
+            // independently reviewed replay rule, and the captured replay
+            // policy keeps the bridge from inventing execution assumptions.
+            let context = ReviewedBrokerTruthRunContextV1 {
+                account_id: reviewed.account_id(),
+                symbol_id: reviewed.symbol_id(),
+                reviewed_replay_rule: reviewed.reviewed_replay_rule_identity().clone(),
+                replay_policy: {
+                    let policy_bytes = std::fs::read(replay_policy_path).with_context(|| {
+                        format!(
+                            "read captured quote replay policy {}",
+                            replay_policy_path.display()
+                        )
+                    })?;
+                    serde_json::from_slice(&policy_bytes).context(
+                        "parse captured quote replay policy",
+                    )?
+                },
+            };
             let authority =
                 neoethos_core::broker_financial_truth::validate_reviewed_broker_financial_truth_authority_v2(
                     &store, &link_receipt, reviewed,
                 )
                 .map_err(anyhow::Error::new)
                 .context("validate the reviewed broker bundle and mint run-scoped authority")?;
-            Ok(Some(authority))
+            Ok(Some((authority, context)))
         }
-        (None, None, None) => Ok(None),
+        (None, None, None, None) => Ok(None),
         _ => anyhow::bail!(
-            "quote-replay store, link and reviewed evidence must be supplied together"
+            "quote-replay store, link, reviewed evidence and replay policy must be supplied together"
         ),
     }
 }
@@ -1079,6 +1130,7 @@ pub fn run_until_boundary_with_executor_v1(
         args.quote_replay_store.as_deref(),
         args.quote_replay_link.as_deref(),
         args.reviewed_evidence.as_deref(),
+        args.quote_replay_policy.as_deref(),
     )?;
     if reviewed_authority.is_none() {
         neoethos_core::current_broker_financial_truth_capability_v1()

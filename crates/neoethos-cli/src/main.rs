@@ -4720,6 +4720,7 @@ const AUTORESEARCH_FLAGS: &[&str] = &[
     "--quote-replay-store",
     "--quote-replay-link",
     "--reviewed-evidence",
+    "--quote-replay-policy",
     // Set by the schedule orchestrator on the children it spawns; it is parsed
     // in `main` from the full argv and would otherwise look unknown here.
     "--cpu-threads",
@@ -4809,6 +4810,8 @@ fn cmd_autoresearch(args: &[String]) -> Result<()> {
         parse_flag(args, "--quote-replay-link").map(std::path::PathBuf::from);
     run_args.reviewed_evidence =
         parse_flag(args, "--reviewed-evidence").map(std::path::PathBuf::from);
+    run_args.quote_replay_policy =
+        parse_flag(args, "--quote-replay-policy").map(std::path::PathBuf::from);
     if let Some(raw) = parse_flag(args, "--max-sweeps") {
         run_args.max_sweeps = match raw.trim().parse::<usize>() {
             Ok(v) if v > 0 => v,

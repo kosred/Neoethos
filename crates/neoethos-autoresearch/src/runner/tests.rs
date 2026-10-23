@@ -641,6 +641,7 @@ fn reviewed_bundle_inputs_must_be_supplied_together() {
         Some(std::path::Path::new("store")),
         Some(std::path::Path::new("link")),
         None,
+        None,
     )
     .expect_err("partial reviewed bundle inputs must fail closed");
     assert!(
@@ -651,8 +652,9 @@ fn reviewed_bundle_inputs_must_be_supplied_together() {
 
 #[test]
 fn no_reviewed_bundle_inputs_keep_the_global_gate() {
-    let authority = load_reviewed_broker_financial_truth_authority_v2(None, None, None)
-        .expect("no inputs means the global gate, not an error");
+    let authority =
+        load_reviewed_broker_financial_truth_authority_v2(None, None, None, None)
+            .expect("no inputs means the global gate, not an error");
     assert!(authority.is_none());
 }
 
@@ -662,6 +664,7 @@ fn unreadable_reviewed_bundle_inputs_fail_closed() {
         Some(std::path::Path::new("missing-store")),
         Some(std::path::Path::new("missing-link.json")),
         Some(std::path::Path::new("missing-reviewed.json")),
+        None,
     )
     .expect_err("unreadable reviewed bundle inputs must fail closed");
     assert!(!error.to_string().is_empty());
@@ -700,7 +703,9 @@ fn the_sweep_executor_port_carries_the_run_scoped_authority_type() {
     let source = include_str!("../runner.rs");
     for required in [
         "fn install_reviewed_broker_financial_truth_authority(",
-        "Option<BrokerFinancialTruthAuthorityV2>",
+        "Option<(",
+        "BrokerFinancialTruthAuthorityV2,",
+        "ReviewedBrokerTruthRunContextV1,",
         "canonical_run_identity_sha256()",
         "legacy scalar adapter",
     ] {
@@ -732,6 +737,31 @@ fn the_runner_installs_the_reviewed_authority_and_gates_only_unreviewed_runs() {
         assert!(
             source.contains(required),
             "runner.rs lost the reviewed-bundle contract {required}"
+        );
+    }
+}
+
+#[test]
+fn the_runner_builds_the_reviewed_replay_context_from_the_evidence_getters_and_policy() {
+    // The runner must turn the reviewed evidence into the exact replay-binding
+    // inputs the sweep bridge needs: the public evidence getters supply the
+    // primary account/symbol ids and the reviewed quote replay-rule identity,
+    // and the capture replay policy travels with the same install.
+    let source = include_str!("../runner.rs");
+    for required in [
+        "pub struct ReviewedBrokerTruthRunContextV1",
+        "account_id: i64",
+        "symbol_id: i64",
+        "reviewed_replay_rule: ReviewedQuoteReplayRuleIdentityV2",
+        "replay_policy: QuoteValidatedResearchReplayPolicyV1",
+        "reviewed.account_id()",
+        "reviewed.symbol_id()",
+        "reviewed.reviewed_replay_rule_identity()",
+        "quote_replay_policy",
+    ] {
+        assert!(
+            source.contains(required),
+            "runner.rs lost the reviewed-replay-context contract {required}"
         );
     }
 }
