@@ -259,7 +259,7 @@ pub struct FeatureFrameView {
 /// and contiguous windows stay allocation-free; arbitrary row selections keep
 /// the exact source IDs instead of inventing a new contiguous range.
 #[derive(Debug, Clone)]
-enum FeatureFrameRowIds {
+pub(crate) enum FeatureFrameRowIds {
     Contiguous { origin: usize },
     Explicit(Arc<Vec<u64>>),
 }
@@ -495,6 +495,39 @@ impl FeatureFrame {
             provenance,
             Vec::new(),
             0,
+        )
+    }
+
+    /// Reconstruct a frame from exact persisted cache parts (research-only
+    /// feature-frame cache). Validates the same timestamps/plan/provenance/
+    /// backing invariants as every production constructor; carries no source
+    /// generation leases because the loading process still holds the dataset's
+    /// own verified leases for garbage-collection pinning.
+    pub(crate) fn from_cache_payload(
+        timestamps: Vec<i64>,
+        columns: Vec<FeatureColumnF64>,
+        plan: Arc<FeaturePlanV1>,
+        provenance: Arc<DatasetFeatureArtifactProvenanceV1>,
+        row_ids: FeatureFrameRowIds,
+        normalization_fitted_state: Option<
+            Arc<crate::core::normalization::SearchNormalizationFittedStateV1>,
+        >,
+        feature_build_options: Option<Arc<FeatureBuildOptions>>,
+    ) -> Result<Self> {
+        let names = columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        Self::build_with_authority(
+            timestamps,
+            names,
+            FeatureData::InMemory(columns),
+            plan,
+            provenance,
+            Arc::new(Vec::new()),
+            row_ids,
+            normalization_fitted_state,
+            feature_build_options,
         )
     }
 

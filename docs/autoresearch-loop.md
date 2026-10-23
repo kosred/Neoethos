@@ -1468,6 +1468,40 @@ in declaration order, and include each in the hash:
 search refuses on (§7.9), so two runs that differ only there refused different
 candidates and are not the same experiment.
 
+### 14.9 Feature-frame cache and the exit-policy knobs (neo-671 B9 g200)
+
+**Receipt-keyed feature-frame cache** (`crates/neoethos-data/src/core/
+feature_frame_cache.rs`, CLI gate `crates/neoethos-cli/src/
+feature_frame_cache_gate.rs`, wired in `main.rs` canonical-research). The
+frozen EURUSD M15+H1,H4 feature cube takes ~90 minutes to rebuild; the cache
+persists a completed frame so a repeat search over the byte-identical dataset
+skips the build. Research-only: inactive unless `NEOETHOS_FEATURE_FRAME_CACHE_DIR`
+is set (unset, the build path is byte-identical). The key is a SHA-256 over the
+input-receipt digests — per-timeframe dataset identity/manifest/Vortex digests,
+the exact `FeatureBuildOptions`, the streaming working-set batch, and the
+resolved vector-ta math authority — so any digest change is a miss. The key is
+not the whole safety story: the CLI seals every stored entry with the exact
+`CanonicalSearchInputReceiptV2` computed from the freshly built frame, and a
+cache hit must recompute the same receipt bit-for-bit or the run fails loudly
+(no silent fallback). Disk usage is bounded by
+`NEOETHOS_FEATURE_FRAME_CACHE_MAX_BYTES` (default 32 GiB) with oldest-entry
+eviction; writes are staged and promoted atomically.
+
+**Exit-policy knob census** (measured against the frozen v5 settings, B9 g200):
+
+- Early profit-lock EXISTS as a config knob: `models.exit_policy.trailing_enabled`
+  (plus `trailing_be_trigger_r`, `trailing_stop_multiplier`,
+  `trailing_min_lock_pips`), read by `ExitPolicyOverrides::from_settings` into
+  the CPU evaluator's exit geometry. Shipped default is OFF; the g200 run
+  enables it (`true`, geometry at shipped defaults 1.0 / 1.0 / 2.0 pips) via its
+  own `--settings-source` override file — an existing knob, not a new gate; no
+  gate or cost assumption was changed.
+- Shorter holding horizon has NO config knob: `EvaluationConfig::max_hold_bars`
+  ships at 0 (unlimited) and has no `Settings` recipient; the only existing
+  exposure is the saved-candidate exit-policy diagnostic grid (max-hold 0/32/64/96
+  × trailing off/on) and per-artifact sealed exit policies. Documented as absent
+  rather than invented.
+
 ---
 
 ## 15. Constants, in one place

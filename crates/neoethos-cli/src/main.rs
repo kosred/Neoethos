@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod canonical_full_run;
 mod canonical_research;
+mod feature_frame_cache_gate;
 mod gpu_bench;
 mod gpu_bench_population;
 mod gpu_bench_prepare;
@@ -2704,12 +2705,50 @@ fn cmd_discover_on_budgeted_pool(
                 (quote_replay.is_none() && saved_research.is_none()) || stream_max_batches == 1,
                 "a saved continuation requires --stream-max-batches 1"
             );
+            // Research-only receipt-keyed feature-frame cache (neo-671): the
+            // operator enables it by setting NEOETHOS_FEATURE_FRAME_CACHE_DIR.
+            // Unset, every line below is a no-op and the production build path
+            // stays byte-identical.
+            let frame_cache_config =
+                neoethos_data::core::feature_frame_cache::feature_frame_cache_config_from_env();
+            let frame_cache_bindings = frame_cache_config
+                .as_ref()
+                .map(|_| {
+                    neoethos_data::core::feature_frame_cache::symbol_dataset_cache_bindings(
+                        &dataset,
+                    )
+                })
+                .transpose()?;
+            let frame_cache_state = std::cell::RefCell::new(None::<(String, bool)>);
             let mut outcome = neoethos_search::orchestration::run_streaming_working_set(
                 &streaming_plan,
                 base_ohlcv.close.len(),
                 |batch| {
                     let cursor = batch.as_ref().map(|value| value.cursor).unwrap_or(0);
                     emit_cpu_research_stage(&format!("feature_build_started cursor={cursor}"));
+                    if let (Some(cache_cfg), Some(bindings)) =
+                        (frame_cache_config.as_ref(), frame_cache_bindings.as_ref())
+                    {
+                        let key =
+                            neoethos_data::core::feature_frame_cache::feature_frame_cache_input_key(
+                                &symbol,
+                                bindings,
+                                &feature_options,
+                                batch.as_deref(),
+                            );
+                        *frame_cache_state.borrow_mut() = Some((key.clone(), false));
+                        if let Some(cached) =
+                            neoethos_data::core::feature_frame_cache::feature_frame_cache_load(
+                                &key, cache_cfg,
+                            )?
+                        {
+                            *frame_cache_state.borrow_mut() = Some((key, true));
+                            emit_cpu_research_stage(&format!(
+                                "feature_frame_cache_hit cursor={cursor}"
+                            ));
+                            return Ok(cached);
+                        }
+                    }
                     let features =
                         neoethos_data::prepare_multitimeframe_features_batch_with_options(
                             &dataset,
@@ -2718,6 +2757,16 @@ fn cmd_discover_on_budgeted_pool(
                             batch,
                         )?;
                     emit_cpu_research_stage(&format!("feature_build_completed cursor={cursor}"));
+                    if let (Some(cache_cfg), Some((key, false))) =
+                        (frame_cache_config.as_ref(), frame_cache_state.borrow().as_ref())
+                    {
+                        let bytes = neoethos_data::core::feature_frame_cache::feature_frame_cache_store(
+                            key, &features, cache_cfg,
+                        )?;
+                        emit_cpu_research_stage(&format!(
+                            "feature_frame_cache_stored bytes={bytes}"
+                        ));
+                    }
                     Ok(features)
                 },
                 |features| {
@@ -2729,6 +2778,21 @@ fn cmd_discover_on_budgeted_pool(
                     )?;
                     let receipt = run_input.receipt().clone();
                     emit_cpu_research_stage("content_receipt_completed");
+                    if let (Some(cache_cfg), Some((key, cache_hit))) =
+                        (frame_cache_config.as_ref(), frame_cache_state.borrow().as_ref())
+                    {
+                        feature_frame_cache_gate::verify_or_seal_receipt_sidecar(
+                            &cache_cfg.dir,
+                            key,
+                            *cache_hit,
+                            &receipt,
+                        )?;
+                        emit_cpu_research_stage(if *cache_hit {
+                            "feature_frame_cache_receipt_verified"
+                        } else {
+                            "feature_frame_cache_receipt_sealed"
+                        });
+                    }
                     let contract = canonical_full_run::seal_cpu_research_contract_for_input(
                         settings_ref,
                         &research_inputs.authority_root,
