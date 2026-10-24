@@ -10820,8 +10820,6 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.67.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b47c39f18824f9d87d3384a9ba334e59078ca9e39c1000969b6745463b12d3c4"
 dependencies = [
  "arcref",
  "arrow-arith",

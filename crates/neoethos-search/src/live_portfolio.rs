@@ -107,6 +107,10 @@ impl LiveTradingPolicyV1 {
             evaluation.growth_goal == authority.growth_goal(),
             "actual stage-1 growth goal disagrees with its resolved Search authority"
         );
+        anyhow::ensure!(
+            evaluation.weekly_objective.map(|o| o.limits) == authority.weekly_search_limits(),
+            "actual weekly objective disagrees with its sealed selection authority"
+        );
         let stamp = authority.resolved_config_stamp();
         let mut policy = Self::seal(
             authority.search_config_hash(),
@@ -116,6 +120,9 @@ impl LiveTradingPolicyV1 {
                 trailing_be_trigger_r: stamp.trailing_be_trigger_r,
                 trailing_stop_multiplier: stamp.trailing_give_back_r,
                 trailing_min_lock_pips: stamp.trailing_min_lock_pips,
+                // The hold horizon travels in the sealed evaluation, not in
+                // this trail-geometry policy reconstruction.
+                max_hold_bars: 0,
             },
             stamp.kill_zones_enabled,
             stamp.spread_pips,
@@ -260,6 +267,7 @@ impl LiveTradingPolicyV1 {
         self.sealed_evaluation_v1
             .as_ref()
             .map(SealedEvaluationPolicyV1::to_evaluation)
+            .transpose()?
             .ok_or_else(|| {
                 anyhow::anyhow!("legacy live policy lacks sealed signal/account evaluation")
             })
@@ -303,6 +311,9 @@ impl LiveTradingPolicyV1 {
             trailing_be_trigger_r: self.trailing_be_trigger_r,
             trailing_stop_multiplier: self.trailing_stop_multiplier,
             trailing_min_lock_pips: self.trailing_min_lock_pips,
+            // The hold horizon travels in the sealed evaluation, not in this
+            // trail-geometry policy reconstruction.
+            max_hold_bars: 0,
         }
     }
 
@@ -1731,6 +1742,7 @@ mod tests {
                 trailing_be_trigger_r: 1.25,
                 trailing_stop_multiplier: 0.75,
                 trailing_min_lock_pips: 3.0,
+                max_hold_bars: 0,
             },
             false,
             1.5,
@@ -1776,6 +1788,8 @@ mod tests {
             smc_weight_displacement: 1.21,
             growth_objective: true,
             growth_goal: None,
+            weekly_objective: None,
+            fitness_table: Default::default(),
         };
         policy.sealed_evaluation_v1 = Some(
             SealedEvaluationPolicyV1::from_evaluation(
@@ -1833,6 +1847,241 @@ mod tests {
         assert_eq!(restored.live_trading_policy, final_policy);
         result.effective_smc_gate_threshold = f64::NAN;
         assert!(LivePortfolioArtifact::from_discovery(false, &result).is_err());
+    }
+
+    #[test]
+    fn public_sealed_replay_refuses_a_stale_or_unbound_weekly_scoring_identity() {
+        let policy = sample_sealed_evaluation_policy();
+        let mut weekly = crate::scoring::weekly_cadence::test_weekly_objective();
+        weekly.limits.initial_equity = 12_345.67;
+        weekly.limits.per_trade_risk_band = (0.003, 0.023);
+        let identity = crate::run_identity::WeeklyScoringIdentityV1::current();
+
+        let mut wire = serde_json::to_value(&policy).unwrap();
+        wire["sealed_evaluation_v1"]["weekly_objective"] = serde_json::to_value(weekly).unwrap();
+        wire["sealed_evaluation_v1"]["weekly_scoring_identity"] =
+            serde_json::to_value(&identity).unwrap();
+        wire["sealed_evaluation_v1"]["growth_objective"] = false.into();
+        let mut weekly_policy: LiveTradingPolicyV1 = serde_json::from_value(wire).unwrap();
+        weekly_policy.identity_hash = weekly_policy.computed_identity_hash().unwrap();
+        weekly_policy.validate().unwrap();
+        assert!(weekly_policy.sealed_evaluation_config().is_ok());
+
+        let mut stale_wire = serde_json::to_value(&weekly_policy).unwrap();
+        stale_wire["sealed_evaluation_v1"]["weekly_scoring_identity"]["source_sha256"] =
+            "00".repeat(32).into();
+        let mut stale: LiveTradingPolicyV1 = serde_json::from_value(stale_wire).unwrap();
+        stale.identity_hash = stale.computed_identity_hash().unwrap();
+        let error = stale.sealed_evaluation_config().unwrap_err().to_string();
+        assert!(error.contains("stale"), "{error}");
+
+        let mut unbound_wire = serde_json::to_value(&weekly_policy).unwrap();
+        unbound_wire["sealed_evaluation_v1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("weekly_scoring_identity");
+        let mut unbound: LiveTradingPolicyV1 = serde_json::from_value(unbound_wire).unwrap();
+        unbound.identity_hash = unbound.computed_identity_hash().unwrap();
+        let error = unbound.sealed_evaluation_config().unwrap_err().to_string();
+        assert!(error.contains("unbound"), "{error}");
+    }
+
+    fn frozen_research_fixture() -> crate::CanonicalTrendbarResearchDiscoveryResultV3 {
+        let features = crate::quote_validated_outer_holdout_v1::explicit_broker_feature_fixture();
+        let mut genes = sample_discovery_result().portfolio;
+        genes[0].sl_pips = 20.0;
+        genes[0].tp_pips = 80.0;
+        genes[0].stop_vol_mult = 0.0;
+        let mut result = sample_discovery_result_for_features(genes, &features);
+        result.effective_feature_names = features.names.clone();
+        result.effective_smc_gate_threshold = 0.31;
+        let mut funnel = crate::funnel_profile::FunnelProfile::new("EURUSD", "M1");
+        funnel
+            .attach_live_trading_policy_v1(sample_sealed_evaluation_policy())
+            .unwrap();
+        result.funnel_profile = Some(funnel);
+        let contract = crate::CanonicalTrendbarResearchExecutionContractV3::new(
+            result.search_input_receipt.clone(),
+            crate::CanonicalTrendbarResearchCostAssumptionsV2 {
+                symbol: "EURUSD",
+                account_currency: "USD",
+                assumption_source_id: "neoethos.test.frozen-research",
+                assumption_source_sha256: &"a".repeat(64),
+                pip_size: 0.0001,
+                pip_value_per_lot: 10.0,
+                full_spread_pips_assumption: 1.2,
+                slippage_pips_per_fill_assumption: 0.1,
+                commission_account_per_lot_per_fill_assumption: 3.5,
+                swap_long_pips_per_day: 0.0,
+                swap_short_pips_per_day: 0.0,
+                pnl_conversion_fee_rate: 0.0,
+            },
+        )
+        .unwrap();
+        crate::CanonicalTrendbarResearchDiscoveryResultV3::new(contract, result).unwrap()
+    }
+
+    #[test]
+    fn frozen_research_reopens_the_same_plan_without_search_or_live_authority() {
+        let original = frozen_research_fixture();
+        let bytes = serde_json::to_vec_pretty(&original).unwrap();
+        let restored =
+            crate::CanonicalTrendbarResearchDiscoveryResultV3::from_json_bytes(&bytes).unwrap();
+        assert_eq!(
+            original.evidence_identity_sha256(),
+            restored.evidence_identity_sha256()
+        );
+        assert_eq!(serde_json::to_vec_pretty(&restored).unwrap(), bytes);
+        let features = crate::quote_validated_outer_holdout_v1::explicit_broker_feature_fixture();
+        let ohlcv = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+        let input = crate::data_selection::CanonicalSearchRunInputV2::new_for_test_values(
+            original.discovery_result().search_input_receipt.clone(),
+            &features,
+            &ohlcv,
+        )
+        .unwrap();
+        let mut identities = Vec::new();
+        for research in [&original, &restored] {
+            identities.push(
+                crate::discovery::with_canonical_research_finalist_v3(&input, research, |locked| {
+                    assert_eq!(locked.portfolio().len(), 1);
+                    assert_eq!(locked.portfolio()[0].strategy_id, "sample-live-gene");
+                    assert_eq!(locked.timestamps(), &features.timestamps[90..100]);
+                    assert_eq!(
+                        locked.search_config_hash(),
+                        research.discovery_result().search_config_hash
+                    );
+                    assert_eq!(
+                        locked.account_risk_policy().initial_balance().amount(),
+                        12_345.67
+                    );
+                    assert_eq!(locked.exit_policy().max_hold_bars, 37);
+                    assert_eq!(locked.ordered_signals()[0].len(), 10);
+                    Ok((
+                        locked.identity_sha256().to_owned(),
+                        locked.portfolio_identity_sha256().to_owned(),
+                    ))
+                })
+                .unwrap(),
+            );
+        }
+        assert_eq!(identities[0], identities[1]);
+        // Older research writers skipped the policy. Keep those results
+        // inspectable, but never reconstruct their signals from current settings.
+        let mut legacy_wire = serde_json::to_value(original.discovery_result()).unwrap();
+        legacy_wire["funnel_profile"]
+            .as_object_mut()
+            .unwrap()
+            .remove("live_trading_policy_v1");
+        let legacy = crate::CanonicalTrendbarResearchDiscoveryResultV3::new(
+            original.execution_contract().clone(),
+            serde_json::from_value(legacy_wire).unwrap(),
+        )
+        .unwrap();
+        let mut called = false;
+        let error = crate::discovery::with_canonical_research_finalist_v3(&input, &legacy, |_| {
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!called);
+        assert!(
+            error
+                .to_string()
+                .contains("lost its sealed Search signal policy")
+        );
+        assert_eq!(
+            restored.promotion_eligibility(),
+            crate::HistoricalResearchPromotionEligibilityV1::NotPromotionEligible
+        );
+    }
+
+    #[test]
+    fn zero_portfolio_recorded_input_dispatches_to_new_search_not_finalist_replay() {
+        let original = frozen_research_fixture();
+        let mut wire = serde_json::to_value(original.discovery_result()).unwrap();
+        wire["portfolio"] = serde_json::json!([]);
+        wire["candidates"] = serde_json::json!([]);
+        let zero_result = serde_json::from_value(wire).unwrap();
+        let recorded = crate::CanonicalTrendbarResearchDiscoveryResultV3::new(
+            original.execution_contract().clone(),
+            zero_result,
+        )
+        .unwrap();
+        assert!(recorded.discovery_result().portfolio.is_empty());
+        let features = crate::quote_validated_outer_holdout_v1::explicit_broker_feature_fixture();
+        let ohlcv = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+        let input = crate::data_selection::CanonicalSearchRunInputV2::new_for_test_values(
+            recorded.discovery_result().search_input_receipt.clone(),
+            &features,
+            &ohlcv,
+        )
+        .unwrap();
+        let expected_names = recorded.discovery_result().effective_feature_names.clone();
+        let contract = recorded.execution_contract().clone();
+        let prepared = crate::discovery::prepare_recorded_new_search(&recorded, &input, &contract)
+            .expect("zero-portfolio recorded input must prepare a fresh search");
+        assert_eq!(prepared, expected_names);
+        assert!(recorded.discovery_result().portfolio.is_empty());
+    }
+
+    #[test]
+    fn frozen_research_refuses_tampering_and_mismatched_reopened_features() {
+        let original = frozen_research_fixture();
+        let wire = serde_json::to_value(&original).unwrap();
+        let mut changed_policy = wire["discovery_result"]["funnel_profile"].clone();
+        changed_policy["live_trading_policy_v1"]["trailing_stop_multiplier"] =
+            serde_json::json!(9.5);
+        for (field, value) in [
+            ("effective_smc_gate_threshold", serde_json::json!(0.99)),
+            ("portfolio", serde_json::json!([])),
+            ("funnel_profile", changed_policy),
+            (
+                "search_config_hash",
+                serde_json::json!("fnv64:aaaaaaaaaaaaaaaa"),
+            ),
+        ] {
+            let mut changed = wire.clone();
+            changed["discovery_result"][field] = value;
+            assert!(
+                crate::CanonicalTrendbarResearchDiscoveryResultV3::from_json_bytes(
+                    &serde_json::to_vec(&changed).unwrap()
+                )
+                .is_err(),
+                "accepted changed {field}"
+            );
+        }
+        let mut changed = wire;
+        changed["unexpected_authority"] = serde_json::json!(true);
+        assert!(
+            crate::CanonicalTrendbarResearchDiscoveryResultV3::from_json_bytes(
+                &serde_json::to_vec(&changed).unwrap()
+            )
+            .is_err()
+        );
+
+        let changed_features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let ohlcv = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+        let receipt = crate::data_selection::CanonicalSearchInputReceiptV2::from_feature_frame(
+            changed_features.provenance().bindings()[0].dataset_identity(),
+            &changed_features,
+        )
+        .unwrap();
+        let input = crate::data_selection::CanonicalSearchRunInputV2::new_for_test_values(
+            receipt,
+            &changed_features,
+            &ohlcv,
+        )
+        .unwrap();
+        let mut called = false;
+        assert!(
+            crate::discovery::with_canonical_research_finalist_v3(&input, &original, |_| {
+                called = true;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!called, "consumer ran before exact receipt validation");
     }
 
     #[test]
@@ -2296,6 +2545,7 @@ mod tests {
                 trailing_be_trigger_r: 1.25,
                 trailing_stop_multiplier: 0.75,
                 trailing_min_lock_pips: 3.0,
+                max_hold_bars: 0,
             },
             "the exact exit policy priced by discovery must survive the artifact round-trip"
         );

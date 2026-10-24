@@ -1345,19 +1345,22 @@ cannot be enabled before the field exists.
 
 ### 14.7 `crates/neoethos-search/src/discovery.rs` — the objective knobs
 
-**Seven of the nine axis-B variants are not expressible against the compiled
-search**, because `DiscoveryConfig` has no objective selector: the GA's fitness
+**Seven of the ten axis-B variants are not expressible against the compiled
+search** (B0, B2, B3, B4, B7, B8, B9), because `DiscoveryConfig` has no
+objective selector: the GA's fitness
 is chosen by one `bool` (`EvaluationConfig::growth_objective`, set from
 `DiscoveryMode`), the triple-barrier horizon is read from
 `EvaluationConfig::max_hold_bars` which **ships at 0 and has no config recipient**
 (`discovery.rs:5483` then substitutes the documented 35), and there is no
 conditioning set, no cost-edge scoring flag and no portfolio-level objective.
 
-Today, therefore, exactly one axis-B variant is drawable per scenario — B5 under
-Risky (`ga_fitness_growth`, the mode's own Kelly log-growth objective) and B6
-under PropFirm (the window-pass gate) — plus the whole refusal vector (§7.9),
-whose four dimensions all have recipients already. `proposer.rs` reports the
-other seven as EXCLUDED, by name, with the symbol each needs; it does **not**
+Today, therefore, exactly one scenario-native axis-B variant is drawable per
+scenario — B5 under Risky (`ga_fitness_growth`, the mode's own Kelly log-growth
+objective) and B6 under PropFirm (the window-pass gate) — plus B1 (whose two
+levers are real `DiscoveryConfig` fields) under both, plus the whole refusal
+vector (§7.9), whose four dimensions all have recipients already.
+`proposer.rs` reports the seven knob-less variants as EXCLUDED, by name, with
+the symbol each needs; it does **not**
 draw them and quietly run the default objective, which would make the loop
 appear to explore the objective space while sweeping axis A under one implicit
 objective.
@@ -1372,6 +1375,7 @@ cargo feature on the autoresearch side:
     pub fitness_table: FitnessTable,          // feature: search-fitness-table
                                               //          search-in-market-fitness (NetPerBarInMarket)
                                               //          search-t-stat-objective  (ExpectancyTStat)
+                                              //          search-monthly-upside-objective (MonthlyUpsideV1)
     /// Triple-barrier vertical barrier, in base bars, for BOTH the prefilter's
     /// label and the evaluator. `0` keeps today's behaviour (the documented 35).
     pub label_max_hold_bars: usize,           // feature: search-label-horizon
@@ -1392,13 +1396,48 @@ with
 
 ```rust
 pub enum FitnessTable { GaFitness, ArchiveScore, WindowScore, QualityScore,
-                        NetPerBarInMarket, ExpectancyTStat }
+                        NetPerBarInMarket, ExpectancyTStat, MonthlyUpsideV1 }
 ```
 
 `FitnessTable::NetPerBarInMarket` is the one new function: net divided by bars
 in market rather than by trades, so **a strategy that is flat is not penalised**
 — which is the whole content of B1, and the only objective shape that can act on
 "the average trade loses 4.15 pips, so take fewer, different trades."
+
+`FitnessTable::MonthlyUpsideV1` binds `scoring::ga_fitness_monthly_upside_v1`
+(the asymmetric monthly-upside fitness, neo-671): the PropFirm GA would evolve
+under the median monthly return with a one-sided upside bonus and a
+tail-loss-only penalty below a -2% worst month. It needs the evaluator's
+monthly-return vector, which the `[f64; 11]` metric array does not carry.
+
+LANDED (2026-10-23, neo-671 follow-up): the selector enum, the
+`DiscoveryConfig` / `EvaluationConfig` field, the `apply_metrics` dispatch and
+the canonical CPU evaluator's completed-month return vector are all in place.
+With the `search-monthly-upside-objective` feature enabled, B9 selects
+`MonthlyUpsideV1` and the CPU evaluation path feeds the vector into
+`ga_fitness_monthly_upside_v1`. Known boundaries: the canonical config digest
+does not encode the selector yet (the §14.8 stamp-gap class — a B9 run must
+not be deduplicated against a default run by hash alone), and metrics-only
+producers (GPU routes, transport adapters) pass no vector, so the scorer's
+"no monthly observations" guard applies there.
+
+Operator plumbing (same series, neo-671): `neoethos-cli` declares the
+`search-monthly-upside-objective` passthrough feature (forwarding to
+`neoethos-autoresearch`). With it compiled in, `canonical-research` accepts
+`--fitness-table <ga_fitness|monthly_upside_v1>` for a FRESH search, forwards
+it to discovery and sets `DiscoveryConfig.fitness_table`; unknown names, saved
+continuations and quote replay are refused with the selector present. Without
+the feature the argument is rejected as unknown and the canonical three-way
+fitness dispatch stays byte-identical; `SCORING_VERSION_CURRENT` stays 7.
+
+The sealed evaluation-policy wire (`SealedEvaluationPolicyV1`, the policy
+round-trip the CPU funnel performs before generation 0) carries the selector
+the same way: `serde(default, skip_serializing_if = FitnessTable::is_default)`,
+so default snapshots and legacy bytes are unchanged and a non-default table
+survives the round-trip instead of being refused as an unknown field. The
+canonical config digest still does not encode the selector (the §14.8
+stamp-gap above); a B9 run is identified by its argument/run-arguments stamp,
+not by digest deduplication.
 
 ### 14.8 `crates/neoethos-search/src/run_identity.rs` — six factors are invisible to the stamp
 
@@ -1428,6 +1467,40 @@ in declaration order, and include each in the hash:
 `max_pbo` matters as much as the rest: it is the per-candidate CPCV ceiling the
 search refuses on (§7.9), so two runs that differ only there refused different
 candidates and are not the same experiment.
+
+### 14.9 Feature-frame cache and the exit-policy knobs (neo-671 B9 g200)
+
+**Receipt-keyed feature-frame cache** (`crates/neoethos-data/src/core/
+feature_frame_cache.rs`, CLI gate `crates/neoethos-cli/src/
+feature_frame_cache_gate.rs`, wired in `main.rs` canonical-research). The
+frozen EURUSD M15+H1,H4 feature cube takes ~90 minutes to rebuild; the cache
+persists a completed frame so a repeat search over the byte-identical dataset
+skips the build. Research-only: inactive unless `NEOETHOS_FEATURE_FRAME_CACHE_DIR`
+is set (unset, the build path is byte-identical). The key is a SHA-256 over the
+input-receipt digests — per-timeframe dataset identity/manifest/Vortex digests,
+the exact `FeatureBuildOptions`, the streaming working-set batch, and the
+resolved vector-ta math authority — so any digest change is a miss. The key is
+not the whole safety story: the CLI seals every stored entry with the exact
+`CanonicalSearchInputReceiptV2` computed from the freshly built frame, and a
+cache hit must recompute the same receipt bit-for-bit or the run fails loudly
+(no silent fallback). Disk usage is bounded by
+`NEOETHOS_FEATURE_FRAME_CACHE_MAX_BYTES` (default 32 GiB) with oldest-entry
+eviction; writes are staged and promoted atomically.
+
+**Exit-policy knob census** (measured against the frozen v5 settings, B9 g200):
+
+- Early profit-lock EXISTS as a config knob: `models.exit_policy.trailing_enabled`
+  (plus `trailing_be_trigger_r`, `trailing_stop_multiplier`,
+  `trailing_min_lock_pips`), read by `ExitPolicyOverrides::from_settings` into
+  the CPU evaluator's exit geometry. Shipped default is OFF; the g200 run
+  enables it (`true`, geometry at shipped defaults 1.0 / 1.0 / 2.0 pips) via its
+  own `--settings-source` override file — an existing knob, not a new gate; no
+  gate or cost assumption was changed.
+- Shorter holding horizon has NO config knob: `EvaluationConfig::max_hold_bars`
+  ships at 0 (unlimited) and has no `Settings` recipient; the only existing
+  exposure is the saved-candidate exit-policy diagnostic grid (max-hold 0/32/64/96
+  × trailing off/on) and per-artifact sealed exit policies. Documented as absent
+  rather than invented.
 
 ---
 

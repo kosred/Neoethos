@@ -393,7 +393,8 @@ pub use quote_validated_outer_holdout_v1::{
     QuoteValidatedOuterHoldoutPromotionEligibilityV1, QuoteValidatedOuterHoldoutReceiptV1,
     QuoteValidatedOuterHoldoutResearchEvidenceV1, QuoteValidatedOuterHoldoutResearchEvidenceV3,
     QuoteValidatedOuterHoldoutTradeOutcomeV1, canonical_locked_portfolio_identity_sha256_v1,
-    evaluate_locked_portfolio_outer_holdout_v1, evaluate_locked_portfolio_outer_holdout_v3,
+    canonical_signal_plan_sha256_v1, evaluate_locked_portfolio_outer_holdout_v1,
+    evaluate_locked_portfolio_outer_holdout_v3,
 };
 pub use stop_target::{
     StopDistanceError, StopTargetRuntimeOverrides, StopTargetSettings, adaptive_base_pips_series,
@@ -469,3 +470,7 @@ pub fn install_search_runtime_overrides_from_settings(s: &neoethos_core::Setting
     // definition in `neoethos_core::strategy_identity`.
     crate::live_portfolio::install_retired_rules_from_settings(s);
 }
+
+// Reviewed-run bridge entrypoint re-export. Kept outside the export-list
+// blocks so the duplicate gate's list pairing sees no shifted list window.
+pub use discovery::run_reviewed_discovery_cycle_with_quote_validated_outer_holdout_and_progress;

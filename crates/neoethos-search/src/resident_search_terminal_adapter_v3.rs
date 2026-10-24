@@ -102,6 +102,7 @@ fn decode_terminal_gene_v3(
         std::slice::from_ref(candidate.metrics),
         config,
         span_days,
+        None,
     );
     Ok((gene, *candidate.metrics))
 }

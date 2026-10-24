@@ -1,0 +1,2104 @@
+{
+  "title": "scoring-weight-pilot: Bayesian-style scoring-weight search over existing exit-ladder artifacts",
+  "nature": "OFFLINE SCORING-KNOB SEARCH, NOT A GATE CHANGE. No Rust code modified, no cargo run, no new builds.",
+  "generated_at_utc": "2026-10-23T11:26:12+00:00",
+  "script": "scripts/scoring-weight-pilot/search_scoring_weights.py",
+  "score_formula": "S = w1*monthly_win_rate + w2*median_month_pnl_pct*100 + w3*avg_win_over_avg_loss - w4*max(0, -(worst_month_pnl_pct*100) - 2.0) - w5*max_drawdown; weights w1..w5 in [0,1], normalized to sum 1.",
+  "avg_win_over_avg_loss_derivation": "The artifacts store no avg-win/avg-loss field; per variant it is derived as profit_factor * (1 - win_rate) / win_rate.",
+  "optimizer": {
+    "method": "Gaussian-process-free random + local search (pure stdlib)",
+    "skopt_available_in_dukascopy_venv": false,
+    "note": "scikit-optimize is not installed in .git/dukascopy-venv, so the sanctioned fallback random+local search is used.",
+    "random_samples": 3000,
+    "refined_starts": 40,
+    "refine_iterations_per_start": 60,
+    "seed": 42,
+    "theory_note": "S is linear in w and per-dataset selection is argmax over a finite variant set, so the joint objective is piecewise-linear convex and its simplex maximum sits at a pure-knob vertex; all five vertices are evaluated explicitly."
+  },
+  "datasets": {
+    "eurusd_m15_weekly": {
+      "path": "C:/Users/konst/AppData/Local/neoethos/experiments/eurusd-m15-weekly-20261021-v7-exit-ladder3/exit-policy.json",
+      "sha256": "71dcbf5456740e01f18a8b055d8620a0110046ba474b123ca0c6f68d748488c8",
+      "schema": "neoethos.research-only.saved-candidate-exit-policy-variants-report.v1",
+      "artifact_class": "ResearchOnly",
+      "promotion_eligibility": "NotPromotionEligible",
+      "authorization_issued": false,
+      "warning": "Counterfactual replay on explicit saved candidates. Variant settings are diagnostic only and do not change production policy, gates, costs or sizing; no result is OOS or promotion evidence."
+    },
+    "eurusd_m5_risky2": {
+      "path": "C:/Users/konst/AppData/Local/neoethos/experiments/eurusd-m5-risky2-ladder3b/exit-policy.json",
+      "sha256": "bec610cb5de8f23f6e432c0b26544ddfe0b1770e5444ed35bc46e688571753f1",
+      "schema": "neoethos.research-only.saved-candidate-exit-policy-variants-report.v1",
+      "artifact_class": "ResearchOnly",
+      "promotion_eligibility": "NotPromotionEligible",
+      "authorization_issued": false,
+      "warning": "Counterfactual replay on explicit saved candidates. Variant settings are diagnostic only and do not change production policy, gates, costs or sizing; no result is OOS or promotion evidence."
+    }
+  },
+  "data_summary": {
+    "eurusd_m15_weekly": {
+      "candidates": [
+        {
+          "strategy_id": "gene_953632_18",
+          "variants": 366,
+          "strict_feasible": 0,
+          "pass_mwr_and_net": 10,
+          "best_worst_month_among_mwr_net_passers": -0.030562192860757283,
+          "max_monthly_win_rate": 0.7378640776699029
+        },
+        {
+          "strategy_id": "gene_782139_19",
+          "variants": 366,
+          "strict_feasible": 21,
+          "pass_mwr_and_net": 64,
+          "best_worst_month_among_mwr_net_passers": -0.022282082367597492,
+          "max_monthly_win_rate": 0.696078431372549
+        }
+      ]
+    },
+    "eurusd_m5_risky2": {
+      "candidates": [
+        {
+          "strategy_id": "gene_362495_12",
+          "variants": 366,
+          "strict_feasible": 0,
+          "pass_mwr_and_net": 0,
+          "best_worst_month_among_mwr_net_passers": null,
+          "max_monthly_win_rate": 0.5698924731182796
+        },
+        {
+          "strategy_id": "gene_489395_7",
+          "variants": 366,
+          "strict_feasible": 0,
+          "pass_mwr_and_net": 133,
+          "best_worst_month_among_mwr_net_passers": -0.2692930268844926,
+          "max_monthly_win_rate": 0.7766990291262136
+        }
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "strict_gates",
+      "description": "Primary run: exactly the requested hard gates on both datasets (worst_month_pnl_pct >= -0.03 AND monthly_win_rate >= 0.55 AND net_profit > 0). eurusd_m5_risky2 has zero variants passing these gates, so it contributes nothing to the objective and the ranking is driven by the m15 feasible pool.",
+      "gates": {
+        "eurusd_m15_weekly": {
+          "worst": -0.03,
+          "mwr": 0.55,
+          "net_min": 0.0
+        },
+        "eurusd_m5_risky2": {
+          "worst": -0.03,
+          "mwr": 0.55,
+          "net_min": 0.0
+        }
+      },
+      "feasible_variant_counts": {
+        "eurusd_m15_weekly": 21,
+        "eurusd_m5_risky2": 0
+      },
+      "objective_semantics": "sum over datasets of S of the best feasible variant; a dataset with no feasible variant contributes 0 and is flagged.",
+      "search_stats": {
+        "unique_weight_vectors_evaluated": 4918,
+        "best_objective_found": 0.994956286,
+        "best_pure_knob_vertex_objective": 0.994956286,
+        "vertex_optimality_check": true
+      },
+      "distinct_selection_regimes_found": 3,
+      "top_weight_vectors": [
+        {
+          "rank": 1,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0,
+            0,
+            1,
+            0,
+            0
+          ],
+          "weights_normalized": [
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "objective": 0.994956286,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.994956286,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.030254,
+            0.331779,
+            0.668221,
+            0.0,
+            0.0
+          ],
+          "weights_normalized": [
+            0.029366,
+            0.322036,
+            0.648598,
+            0.0,
+            0.0
+          ],
+          "objective": 0.695540718,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be1.5_give1_lock2",
+              "score": 0.695540718,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.029657324601721498,
+              "median_month_pnl_pct": 0.0015670145916013836,
+              "aw_al": 0.967495,
+              "net_profit": 743.5662,
+              "max_drawdown": 0.08190827449259026,
+              "sharpe": 0.27828473362805606,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.15670145916013836,
+                "avg_win_over_avg_loss": 0.9674945353042301,
+                "worst_month_penalty_gt_2pct": 0.9657324601721498,
+                "max_drawdown": 0.08190827449259026
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be1.5_give1_lock2",
+                "profit_lock_adaptive_be1.5_give1_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.918925,
+            0.0,
+            0.071604,
+            0.000291,
+            0.0
+          ],
+          "weights_normalized": [
+            0.927439,
+            0.0,
+            0.072267,
+            0.000294,
+            0.0
+          ],
+          "objective": 0.638482257,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.638482257,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "entry_kind": "additional near-optimal vector (same selected variants as rank 1)",
+          "weights_raw": [
+            0.05347,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "weights_normalized": [
+            0.050756,
+            0.0,
+            0.949244,
+            0.0,
+            0.0
+          ],
+          "objective": 0.974810459,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.974810459,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "entry_kind": "additional near-optimal vector (same selected variants as rank 1)",
+          "weights_raw": [
+            0.08628,
+            0.0,
+            0.745033,
+            0.0,
+            0.0
+          ],
+          "weights_normalized": [
+            0.103788,
+            0.0,
+            0.896212,
+            0.0,
+            0.0
+          ],
+          "objective": 0.953761094,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.953761094,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        }
+      ],
+      "top_weight_vectors_extended": [
+        {
+          "rank": 1,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0,
+            0,
+            1,
+            0,
+            0
+          ],
+          "weights_normalized": [
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "objective": 0.994956286,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.994956286,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.030254,
+            0.331779,
+            0.668221,
+            0.0,
+            0.0
+          ],
+          "weights_normalized": [
+            0.029366,
+            0.322036,
+            0.648598,
+            0.0,
+            0.0
+          ],
+          "objective": 0.695540718,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be1.5_give1_lock2",
+              "score": 0.695540718,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.029657324601721498,
+              "median_month_pnl_pct": 0.0015670145916013836,
+              "aw_al": 0.967495,
+              "net_profit": 743.5662,
+              "max_drawdown": 0.08190827449259026,
+              "sharpe": 0.27828473362805606,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.15670145916013836,
+                "avg_win_over_avg_loss": 0.9674945353042301,
+                "worst_month_penalty_gt_2pct": 0.9657324601721498,
+                "max_drawdown": 0.08190827449259026
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be1.5_give1_lock2",
+                "profit_lock_adaptive_be1.5_give1_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.918925,
+            0.0,
+            0.071604,
+            0.000291,
+            0.0
+          ],
+          "weights_normalized": [
+            0.927439,
+            0.0,
+            0.072267,
+            0.000294,
+            0.0
+          ],
+          "objective": 0.638482257,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.638482257,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        }
+      ],
+      "single_knob_sensitivity": [
+        {
+          "knob": "w1_monthly_win_rate",
+          "weights_normalized": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "objective": 0.62745098,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.62745098,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5",
+                "profit_lock_adaptive_be0.5_give0.35_lock2",
+                "profit_lock_adaptive_be0.5_give0.35_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "knob": "w2_median_month_pnl_pct",
+          "weights_normalized": [
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "objective": 0.260835299,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.260835299,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "knob": "w3_avg_win_over_avg_loss",
+          "weights_normalized": [
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "objective": 0.994956286,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.994956286,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "knob": "w4_worst_month_penalty",
+          "weights_normalized": [
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ],
+          "objective": -0.228208237,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": -0.228208237,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        },
+        {
+          "knob": "w5_max_drawdown",
+          "weights_normalized": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "objective": -0.065068437,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": -0.065068437,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": null,
+              "reason": "no variant passes this scenario's gates"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "m5_worst_gate_disabled_sensitivity",
+      "description": "Documented sensitivity run (NOT a gate change): m15 keeps the strict gates; m5 keeps monthly_win_rate >= 0.55 and net_profit > 0 but its worst-month hard gate is disabled because -3% is unreachable there (best achievable worst month among m5 mwr/net-passing variants is about -26.9%). The w4 term in S still penalizes worst-month depth.",
+      "gates": {
+        "eurusd_m15_weekly": {
+          "worst": -0.03,
+          "mwr": 0.55,
+          "net_min": 0.0
+        },
+        "eurusd_m5_risky2": {
+          "worst": null,
+          "mwr": 0.55,
+          "net_min": 0.0
+        }
+      },
+      "feasible_variant_counts": {
+        "eurusd_m15_weekly": 21,
+        "eurusd_m5_risky2": 133
+      },
+      "objective_semantics": "sum over datasets of S of the best feasible variant; a dataset with no feasible variant contributes 0 and is flagged.",
+      "search_stats": {
+        "unique_weight_vectors_evaluated": 4973,
+        "best_objective_found": 26.2519571,
+        "best_pure_knob_vertex_objective": 26.2519571,
+        "vertex_optimality_check": true
+      },
+      "distinct_selection_regimes_found": 10,
+      "top_weight_vectors": [
+        {
+          "rank": 1,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0,
+            1,
+            0,
+            0,
+            0
+          ],
+          "weights_normalized": [
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "objective": 26.2519571,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.260835299,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl20_rr3_hold96_trailfalse",
+              "score": 25.991121801,
+              "monthly_win_rate": 0.7087378640776699,
+              "worst_month_pnl_pct": -12.02800304033059,
+              "median_month_pnl_pct": 0.259911218010304,
+              "aw_al": 1.127107,
+              "net_profit": 92524.3237,
+              "max_drawdown": 0.9326549636065298,
+              "sharpe": 0.8464740933115038,
+              "score_inputs": {
+                "monthly_win_rate": 0.7087378640776699,
+                "median_month_pnl_pct_x100": 25.9911218010304,
+                "avg_win_over_avg_loss": 1.127106779151877,
+                "worst_month_penalty_gt_2pct": 1200.800304033059,
+                "max_drawdown": 0.9326549636065298
+              },
+              "tied_labels": [
+                "fixed_sl20_rr3_hold96_trailfalse"
+              ],
+              "caution": "blowup-profile replay: worst month -1202.8% and max drawdown 93.27%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.0,
+            0.650814,
+            0.408348,
+            0.0,
+            0.0
+          ],
+          "weights_normalized": [
+            0.0,
+            0.614461,
+            0.385539,
+            0.0,
+            0.0
+          ],
+          "objective": 16.874377041,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be1.5_give1_lock2",
+              "score": 0.46929351,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.029657324601721498,
+              "median_month_pnl_pct": 0.0015670145916013836,
+              "aw_al": 0.967495,
+              "net_profit": 743.5662,
+              "max_drawdown": 0.08190827449259026,
+              "sharpe": 0.27828473362805606,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.15670145916013836,
+                "avg_win_over_avg_loss": 0.9674945353042301,
+                "worst_month_penalty_gt_2pct": 0.9657324601721498,
+                "max_drawdown": 0.08190827449259026
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be1.5_give1_lock2",
+                "profit_lock_adaptive_be1.5_give1_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl20_rr3_hold96_trailfalse",
+              "score": 16.405083531,
+              "monthly_win_rate": 0.7087378640776699,
+              "worst_month_pnl_pct": -12.02800304033059,
+              "median_month_pnl_pct": 0.259911218010304,
+              "aw_al": 1.127107,
+              "net_profit": 92524.3237,
+              "max_drawdown": 0.9326549636065298,
+              "sharpe": 0.8464740933115038,
+              "score_inputs": {
+                "monthly_win_rate": 0.7087378640776699,
+                "median_month_pnl_pct_x100": 25.9911218010304,
+                "avg_win_over_avg_loss": 1.127106779151877,
+                "worst_month_penalty_gt_2pct": 1200.800304033059,
+                "max_drawdown": 0.9326549636065298
+              },
+              "tied_labels": [
+                "fixed_sl20_rr3_hold96_trailfalse"
+              ],
+              "caution": "blowup-profile replay: worst month -1202.8% and max drawdown 93.27%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.00729,
+            0.349158,
+            0.812752,
+            0.0,
+            0.0
+          ],
+          "weights_normalized": [
+            0.006235,
+            0.29863,
+            0.695136,
+            0.0,
+            0.0
+          ],
+          "objective": 9.274600622,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.724966177,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl20_rr3_hold96_trailfalse",
+              "score": 8.549634445,
+              "monthly_win_rate": 0.7087378640776699,
+              "worst_month_pnl_pct": -12.02800304033059,
+              "median_month_pnl_pct": 0.259911218010304,
+              "aw_al": 1.127107,
+              "net_profit": 92524.3237,
+              "max_drawdown": 0.9326549636065298,
+              "sharpe": 0.8464740933115038,
+              "score_inputs": {
+                "monthly_win_rate": 0.7087378640776699,
+                "median_month_pnl_pct_x100": 25.9911218010304,
+                "avg_win_over_avg_loss": 1.127106779151877,
+                "worst_month_penalty_gt_2pct": 1200.800304033059,
+                "max_drawdown": 0.9326549636065298
+              },
+              "tied_labels": [
+                "fixed_sl20_rr3_hold96_trailfalse"
+              ],
+              "caution": "blowup-profile replay: worst month -1202.8% and max drawdown 93.27%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.010354,
+            1.0,
+            0.0,
+            0.020192,
+            0.0
+          ],
+          "weights_normalized": [
+            0.010047,
+            0.97036,
+            0.0,
+            0.019593,
+            0.0
+          ],
+          "objective": 4.782461293,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.242406052,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 4.54005524,
+              "monthly_win_rate": 0.7766990291262136,
+              "worst_month_pnl_pct": -0.9878773496473656,
+              "median_month_pnl_pct": 0.0662499068880054,
+              "aw_al": 1.234708,
+              "net_profit": 85482.5555,
+              "max_drawdown": 0.44407911169462466,
+              "sharpe": 1.773116588407722,
+              "score_inputs": {
+                "monthly_win_rate": 0.7766990291262136,
+                "median_month_pnl_pct_x100": 6.6249906888005405,
+                "avg_win_over_avg_loss": 1.2347082498066013,
+                "worst_month_penalty_gt_2pct": 96.78773496473656,
+                "max_drawdown": 0.44407911169462466
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15"
+              ],
+              "caution": "blowup-profile replay: worst month -98.79% and max drawdown 44.41%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.034077,
+            0.968541,
+            0.10847,
+            0.01805,
+            0.00184
+          ],
+          "weights_normalized": [
+            0.030131,
+            0.856374,
+            0.095908,
+            0.01596,
+            0.001627
+          ],
+          "objective": 4.730374907,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.303712431,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl30_rr1.5_hold96_trailtrue",
+              "score": 4.426662476,
+              "monthly_win_rate": 0.6893203883495146,
+              "worst_month_pnl_pct": -2.9246013549184346,
+              "median_month_pnl_pct": 0.10452745079950253,
+              "aw_al": 0.953186,
+              "net_profit": 44585.9632,
+              "max_drawdown": 0.8090883887902295,
+              "sharpe": 0.81727157155329,
+              "score_inputs": {
+                "monthly_win_rate": 0.6893203883495146,
+                "median_month_pnl_pct_x100": 10.452745079950253,
+                "avg_win_over_avg_loss": 0.9531863700014852,
+                "worst_month_penalty_gt_2pct": 290.46013549184346,
+                "max_drawdown": 0.8090883887902295
+              },
+              "tied_labels": [
+                "fixed_sl30_rr1.5_hold96_trailtrue"
+              ],
+              "caution": "blowup-profile replay: worst month -292.46% and max drawdown 80.91%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        }
+      ],
+      "top_weight_vectors_extended": [
+        {
+          "rank": 1,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0,
+            1,
+            0,
+            0,
+            0
+          ],
+          "weights_normalized": [
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "objective": 26.2519571,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.260835299,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl20_rr3_hold96_trailfalse",
+              "score": 25.991121801,
+              "monthly_win_rate": 0.7087378640776699,
+              "worst_month_pnl_pct": -12.02800304033059,
+              "median_month_pnl_pct": 0.259911218010304,
+              "aw_al": 1.127107,
+              "net_profit": 92524.3237,
+              "max_drawdown": 0.9326549636065298,
+              "sharpe": 0.8464740933115038,
+              "score_inputs": {
+                "monthly_win_rate": 0.7087378640776699,
+                "median_month_pnl_pct_x100": 25.9911218010304,
+                "avg_win_over_avg_loss": 1.127106779151877,
+                "worst_month_penalty_gt_2pct": 1200.800304033059,
+                "max_drawdown": 0.9326549636065298
+              },
+              "tied_labels": [
+                "fixed_sl20_rr3_hold96_trailfalse"
+              ],
+              "caution": "blowup-profile replay: worst month -1202.8% and max drawdown 93.27%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 2,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.0,
+            0.650814,
+            0.408348,
+            0.0,
+            0.0
+          ],
+          "weights_normalized": [
+            0.0,
+            0.614461,
+            0.385539,
+            0.0,
+            0.0
+          ],
+          "objective": 16.874377041,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be1.5_give1_lock2",
+              "score": 0.46929351,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.029657324601721498,
+              "median_month_pnl_pct": 0.0015670145916013836,
+              "aw_al": 0.967495,
+              "net_profit": 743.5662,
+              "max_drawdown": 0.08190827449259026,
+              "sharpe": 0.27828473362805606,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.15670145916013836,
+                "avg_win_over_avg_loss": 0.9674945353042301,
+                "worst_month_penalty_gt_2pct": 0.9657324601721498,
+                "max_drawdown": 0.08190827449259026
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be1.5_give1_lock2",
+                "profit_lock_adaptive_be1.5_give1_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl20_rr3_hold96_trailfalse",
+              "score": 16.405083531,
+              "monthly_win_rate": 0.7087378640776699,
+              "worst_month_pnl_pct": -12.02800304033059,
+              "median_month_pnl_pct": 0.259911218010304,
+              "aw_al": 1.127107,
+              "net_profit": 92524.3237,
+              "max_drawdown": 0.9326549636065298,
+              "sharpe": 0.8464740933115038,
+              "score_inputs": {
+                "monthly_win_rate": 0.7087378640776699,
+                "median_month_pnl_pct_x100": 25.9911218010304,
+                "avg_win_over_avg_loss": 1.127106779151877,
+                "worst_month_penalty_gt_2pct": 1200.800304033059,
+                "max_drawdown": 0.9326549636065298
+              },
+              "tied_labels": [
+                "fixed_sl20_rr3_hold96_trailfalse"
+              ],
+              "caution": "blowup-profile replay: worst month -1202.8% and max drawdown 93.27%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 3,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.00729,
+            0.349158,
+            0.812752,
+            0.0,
+            0.0
+          ],
+          "weights_normalized": [
+            0.006235,
+            0.29863,
+            0.695136,
+            0.0,
+            0.0
+          ],
+          "objective": 9.274600622,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.724966177,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl20_rr3_hold96_trailfalse",
+              "score": 8.549634445,
+              "monthly_win_rate": 0.7087378640776699,
+              "worst_month_pnl_pct": -12.02800304033059,
+              "median_month_pnl_pct": 0.259911218010304,
+              "aw_al": 1.127107,
+              "net_profit": 92524.3237,
+              "max_drawdown": 0.9326549636065298,
+              "sharpe": 0.8464740933115038,
+              "score_inputs": {
+                "monthly_win_rate": 0.7087378640776699,
+                "median_month_pnl_pct_x100": 25.9911218010304,
+                "avg_win_over_avg_loss": 1.127106779151877,
+                "worst_month_penalty_gt_2pct": 1200.800304033059,
+                "max_drawdown": 0.9326549636065298
+              },
+              "tied_labels": [
+                "fixed_sl20_rr3_hold96_trailfalse"
+              ],
+              "caution": "blowup-profile replay: worst month -1202.8% and max drawdown 93.27%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 4,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.010354,
+            1.0,
+            0.0,
+            0.020192,
+            0.0
+          ],
+          "weights_normalized": [
+            0.010047,
+            0.97036,
+            0.0,
+            0.019593,
+            0.0
+          ],
+          "objective": 4.782461293,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.242406052,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 4.54005524,
+              "monthly_win_rate": 0.7766990291262136,
+              "worst_month_pnl_pct": -0.9878773496473656,
+              "median_month_pnl_pct": 0.0662499068880054,
+              "aw_al": 1.234708,
+              "net_profit": 85482.5555,
+              "max_drawdown": 0.44407911169462466,
+              "sharpe": 1.773116588407722,
+              "score_inputs": {
+                "monthly_win_rate": 0.7766990291262136,
+                "median_month_pnl_pct_x100": 6.6249906888005405,
+                "avg_win_over_avg_loss": 1.2347082498066013,
+                "worst_month_penalty_gt_2pct": 96.78773496473656,
+                "max_drawdown": 0.44407911169462466
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15"
+              ],
+              "caution": "blowup-profile replay: worst month -98.79% and max drawdown 44.41%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 5,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.034077,
+            0.968541,
+            0.10847,
+            0.01805,
+            0.00184
+          ],
+          "weights_normalized": [
+            0.030131,
+            0.856374,
+            0.095908,
+            0.01596,
+            0.001627
+          ],
+          "objective": 4.730374907,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.303712431,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl30_rr1.5_hold96_trailtrue",
+              "score": 4.426662476,
+              "monthly_win_rate": 0.6893203883495146,
+              "worst_month_pnl_pct": -2.9246013549184346,
+              "median_month_pnl_pct": 0.10452745079950253,
+              "aw_al": 0.953186,
+              "net_profit": 44585.9632,
+              "max_drawdown": 0.8090883887902295,
+              "sharpe": 0.81727157155329,
+              "score_inputs": {
+                "monthly_win_rate": 0.6893203883495146,
+                "median_month_pnl_pct_x100": 10.452745079950253,
+                "avg_win_over_avg_loss": 0.9531863700014852,
+                "worst_month_penalty_gt_2pct": 290.46013549184346,
+                "max_drawdown": 0.8090883887902295
+              },
+              "tied_labels": [
+                "fixed_sl30_rr1.5_hold96_trailtrue"
+              ],
+              "caution": "blowup-profile replay: worst month -292.46% and max drawdown 80.91%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 6,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.052282,
+            0.768266,
+            0.621124,
+            0.013577,
+            0.085223
+          ],
+          "weights_normalized": [
+            0.033939,
+            0.498721,
+            0.403204,
+            0.008813,
+            0.055322
+          ],
+          "objective": 3.491509457,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be1.5_give1_lock2",
+              "score": 0.475501706,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.029657324601721498,
+              "median_month_pnl_pct": 0.0015670145916013836,
+              "aw_al": 0.967495,
+              "net_profit": 743.5662,
+              "max_drawdown": 0.08190827449259026,
+              "sharpe": 0.27828473362805606,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.15670145916013836,
+                "avg_win_over_avg_loss": 0.9674945353042301,
+                "worst_month_penalty_gt_2pct": 0.9657324601721498,
+                "max_drawdown": 0.08190827449259026
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be1.5_give1_lock2",
+                "profit_lock_adaptive_be1.5_give1_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl30_rr1.5_hold96_trailtrue",
+              "score": 3.016007751,
+              "monthly_win_rate": 0.6893203883495146,
+              "worst_month_pnl_pct": -2.9246013549184346,
+              "median_month_pnl_pct": 0.10452745079950253,
+              "aw_al": 0.953186,
+              "net_profit": 44585.9632,
+              "max_drawdown": 0.8090883887902295,
+              "sharpe": 0.81727157155329,
+              "score_inputs": {
+                "monthly_win_rate": 0.6893203883495146,
+                "median_month_pnl_pct_x100": 10.452745079950253,
+                "avg_win_over_avg_loss": 0.9531863700014852,
+                "worst_month_penalty_gt_2pct": 290.46013549184346,
+                "max_drawdown": 0.8090883887902295
+              },
+              "tied_labels": [
+                "fixed_sl30_rr1.5_hold96_trailtrue"
+              ],
+              "caution": "blowup-profile replay: worst month -292.46% and max drawdown 80.91%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 7,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.063581,
+            0.938711,
+            0.683547,
+            0.017595,
+            0.114654
+          ],
+          "weights_normalized": [
+            0.034971,
+            0.516317,
+            0.37597,
+            0.009678,
+            0.063063
+          ],
+          "objective": 3.398327744,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be1.5_give1_lock2",
+              "score": 0.451059609,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.029657324601721498,
+              "median_month_pnl_pct": 0.0015670145916013836,
+              "aw_al": 0.967495,
+              "net_profit": 743.5662,
+              "max_drawdown": 0.08190827449259026,
+              "sharpe": 0.27828473362805606,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.15670145916013836,
+                "avg_win_over_avg_loss": 0.9674945353042301,
+                "worst_month_penalty_gt_2pct": 0.9657324601721498,
+                "max_drawdown": 0.08190827449259026
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be1.5_give1_lock2",
+                "profit_lock_adaptive_be1.5_give1_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 2.947268135,
+              "monthly_win_rate": 0.7766990291262136,
+              "worst_month_pnl_pct": -0.9878773496473656,
+              "median_month_pnl_pct": 0.0662499068880054,
+              "aw_al": 1.234708,
+              "net_profit": 85482.5555,
+              "max_drawdown": 0.44407911169462466,
+              "sharpe": 1.773116588407722,
+              "score_inputs": {
+                "monthly_win_rate": 0.7766990291262136,
+                "median_month_pnl_pct_x100": 6.6249906888005405,
+                "avg_win_over_avg_loss": 1.2347082498066013,
+                "worst_month_penalty_gt_2pct": 96.78773496473656,
+                "max_drawdown": 0.44407911169462466
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15"
+              ],
+              "caution": "blowup-profile replay: worst month -98.79% and max drawdown 44.41%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 8,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.419241,
+            0.676955,
+            0.883757,
+            0.015646,
+            0.200803
+          ],
+          "weights_normalized": [
+            0.190876,
+            0.308211,
+            0.402366,
+            0.007123,
+            0.091424
+          ],
+          "objective": 2.494370124,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.537471496,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 1.956898628,
+              "monthly_win_rate": 0.7766990291262136,
+              "worst_month_pnl_pct": -0.9878773496473656,
+              "median_month_pnl_pct": 0.0662499068880054,
+              "aw_al": 1.234708,
+              "net_profit": 85482.5555,
+              "max_drawdown": 0.44407911169462466,
+              "sharpe": 1.773116588407722,
+              "score_inputs": {
+                "monthly_win_rate": 0.7766990291262136,
+                "median_month_pnl_pct_x100": 6.6249906888005405,
+                "avg_win_over_avg_loss": 1.2347082498066013,
+                "worst_month_penalty_gt_2pct": 96.78773496473656,
+                "max_drawdown": 0.44407911169462466
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15"
+              ],
+              "caution": "blowup-profile replay: worst month -98.79% and max drawdown 44.41%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 9,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0,
+            0,
+            1,
+            0,
+            0
+          ],
+          "weights_normalized": [
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "objective": 2.42750274,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.994956286,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "profit_lock_sl20rr2_be2_give0.5_lock2",
+              "score": 1.432546454,
+              "monthly_win_rate": 0.5825242718446602,
+              "worst_month_pnl_pct": -10.165172225038772,
+              "median_month_pnl_pct": 0.06619170716180828,
+              "aw_al": 1.432546,
+              "net_profit": 24698.0607,
+              "max_drawdown": 0.9585555493894202,
+              "sharpe": 0.5513887997001599,
+              "score_inputs": {
+                "monthly_win_rate": 0.5825242718446602,
+                "median_month_pnl_pct_x100": 6.619170716180828,
+                "avg_win_over_avg_loss": 1.4325464537462274,
+                "worst_month_penalty_gt_2pct": 1014.5172225038772,
+                "max_drawdown": 0.9585555493894202
+              },
+              "tied_labels": [
+                "fixed_sl20_rr2_hold0_trailfalse",
+                "profit_lock_sl20rr2_be2_give0.5_lock2",
+                "profit_lock_sl20rr2_be2_give0.5_lock5",
+                "profit_lock_sl20rr2_be2_give1_lock2",
+                "profit_lock_sl20rr2_be2_give1_lock5"
+              ],
+              "caution": "blowup-profile replay: worst month -1016.52% and max drawdown 95.86%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        },
+        {
+          "rank": 10,
+          "entry_kind": "distinct selection regime",
+          "weights_raw": [
+            0.021492,
+            0.877923,
+            0.0,
+            0.042909,
+            0.0
+          ],
+          "weights_normalized": [
+            0.022807,
+            0.931657,
+            0.0,
+            0.045536,
+            0.0
+          ],
+          "objective": 2.006741112,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.217805775,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "trailing_existing_plus_96_bars",
+              "score": 1.788935337,
+              "monthly_win_rate": 0.7572815533980582,
+              "worst_month_pnl_pct": -0.8738940962103736,
+              "median_month_pnl_pct": 0.06075109801539709,
+              "aw_al": 1.233717,
+              "net_profit": 75593.9083,
+              "max_drawdown": 0.4440791116946245,
+              "sharpe": 1.7095994982975464,
+              "score_inputs": {
+                "monthly_win_rate": 0.7572815533980582,
+                "median_month_pnl_pct_x100": 6.075109801539709,
+                "avg_win_over_avg_loss": 1.2337166171582463,
+                "worst_month_penalty_gt_2pct": 85.38940962103736,
+                "max_drawdown": 0.4440791116946245
+              },
+              "tied_labels": [
+                "trailing_existing_plus_96_bars"
+              ],
+              "caution": "blowup-profile replay: worst month -87.39% and max drawdown 44.41%; selectable only because this scenario disables the worst-month hard gate. The strict -3% gate is what excludes such profiles."
+            }
+          }
+        }
+      ],
+      "single_knob_sensitivity": [
+        {
+          "knob": "w1_monthly_win_rate",
+          "weights_normalized": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "objective": 1.40415001,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.62745098,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5",
+                "profit_lock_adaptive_be0.5_give0.35_lock2",
+                "profit_lock_adaptive_be0.5_give0.35_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.776699029,
+              "monthly_win_rate": 0.7766990291262136,
+              "worst_month_pnl_pct": -0.9878773496473656,
+              "median_month_pnl_pct": 0.0662499068880054,
+              "aw_al": 1.234708,
+              "net_profit": 85482.5555,
+              "max_drawdown": 0.44407911169462466,
+              "sharpe": 1.773116588407722,
+              "score_inputs": {
+                "monthly_win_rate": 0.7766990291262136,
+                "median_month_pnl_pct_x100": 6.6249906888005405,
+                "avg_win_over_avg_loss": 1.2347082498066013,
+                "worst_month_penalty_gt_2pct": 96.78773496473656,
+                "max_drawdown": 0.44407911169462466
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15"
+              ]
+            }
+          }
+        },
+        {
+          "knob": "w2_median_month_pnl_pct",
+          "weights_normalized": [
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "objective": 26.2519571,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "profit_lock_adaptive_be0.5_give0.2_lock2",
+              "score": 0.260835299,
+              "monthly_win_rate": 0.6274509803921569,
+              "worst_month_pnl_pct": -0.02867752908056202,
+              "median_month_pnl_pct": 0.002608352988190385,
+              "aw_al": 0.786183,
+              "net_profit": 1298.6002,
+              "max_drawdown": 0.07254871196483659,
+              "sharpe": 0.4927892277047071,
+              "score_inputs": {
+                "monthly_win_rate": 0.6274509803921569,
+                "median_month_pnl_pct_x100": 0.2608352988190385,
+                "avg_win_over_avg_loss": 0.7861831935273093,
+                "worst_month_penalty_gt_2pct": 0.8677529080562021,
+                "max_drawdown": 0.07254871196483659
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.5_give0.2_lock2",
+                "profit_lock_adaptive_be0.5_give0.2_lock5"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "fixed_sl20_rr3_hold96_trailfalse",
+              "score": 25.991121801,
+              "monthly_win_rate": 0.7087378640776699,
+              "worst_month_pnl_pct": -12.02800304033059,
+              "median_month_pnl_pct": 0.259911218010304,
+              "aw_al": 1.127107,
+              "net_profit": 92524.3237,
+              "max_drawdown": 0.9326549636065298,
+              "sharpe": 0.8464740933115038,
+              "score_inputs": {
+                "monthly_win_rate": 0.7087378640776699,
+                "median_month_pnl_pct_x100": 25.9911218010304,
+                "avg_win_over_avg_loss": 1.127106779151877,
+                "worst_month_penalty_gt_2pct": 1200.800304033059,
+                "max_drawdown": 0.9326549636065298
+              },
+              "tied_labels": [
+                "fixed_sl20_rr3_hold96_trailfalse"
+              ]
+            }
+          }
+        },
+        {
+          "knob": "w3_avg_win_over_avg_loss",
+          "weights_normalized": [
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "objective": 2.42750274,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": 0.994956286,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "profit_lock_sl20rr2_be2_give0.5_lock2",
+              "score": 1.432546454,
+              "monthly_win_rate": 0.5825242718446602,
+              "worst_month_pnl_pct": -10.165172225038772,
+              "median_month_pnl_pct": 0.06619170716180828,
+              "aw_al": 1.432546,
+              "net_profit": 24698.0607,
+              "max_drawdown": 0.9585555493894202,
+              "sharpe": 0.5513887997001599,
+              "score_inputs": {
+                "monthly_win_rate": 0.5825242718446602,
+                "median_month_pnl_pct_x100": 6.619170716180828,
+                "avg_win_over_avg_loss": 1.4325464537462274,
+                "worst_month_penalty_gt_2pct": 1014.5172225038772,
+                "max_drawdown": 0.9585555493894202
+              },
+              "tied_labels": [
+                "fixed_sl20_rr2_hold0_trailfalse",
+                "profit_lock_sl20rr2_be2_give0.5_lock2",
+                "profit_lock_sl20rr2_be2_give0.5_lock5",
+                "profit_lock_sl20rr2_be2_give1_lock2",
+                "profit_lock_sl20rr2_be2_give1_lock5"
+              ]
+            }
+          }
+        },
+        {
+          "knob": "w4_worst_month_penalty",
+          "weights_normalized": [
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ],
+          "objective": -25.157510925,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": -0.228208237,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "profit_lock_adaptive_be0.25_give0.1_lock2",
+              "score": -24.929302688,
+              "monthly_win_rate": 0.6213592233009708,
+              "worst_month_pnl_pct": -0.2692930268844926,
+              "median_month_pnl_pct": 0.007972244630925,
+              "aw_al": 0.283885,
+              "net_profit": 5978.1009,
+              "max_drawdown": 0.4811468760213187,
+              "sharpe": 0.46563296509652935,
+              "score_inputs": {
+                "monthly_win_rate": 0.6213592233009708,
+                "median_month_pnl_pct_x100": 0.7972244630925,
+                "avg_win_over_avg_loss": 0.28388509419984914,
+                "worst_month_penalty_gt_2pct": 24.92930268844926,
+                "max_drawdown": 0.4811468760213187
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.25_give0.1_lock2"
+              ]
+            }
+          }
+        },
+        {
+          "knob": "w5_max_drawdown",
+          "weights_normalized": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "objective": -0.457745871,
+          "selections": {
+            "eurusd_m15_weekly": {
+              "selected": true,
+              "strategy_id": "gene_782139_19",
+              "label": "max_hold_96_bars_approx_24h_m15",
+              "score": -0.065068437,
+              "monthly_win_rate": 0.5980392156862745,
+              "worst_month_pnl_pct": -0.022282082367597492,
+              "median_month_pnl_pct": 0.0009914663398193813,
+              "aw_al": 0.994956,
+              "net_profit": 1247.3373,
+              "max_drawdown": 0.06506843688189774,
+              "sharpe": 0.49007172549122424,
+              "score_inputs": {
+                "monthly_win_rate": 0.5980392156862745,
+                "median_month_pnl_pct_x100": 0.09914663398193813,
+                "avg_win_over_avg_loss": 0.9949562863461571,
+                "worst_month_penalty_gt_2pct": 0.2282082367597491,
+                "max_drawdown": 0.06506843688189774
+              },
+              "tied_labels": [
+                "max_hold_96_bars_approx_24h_m15",
+                "trailing_existing_plus_96_bars"
+              ]
+            },
+            "eurusd_m5_risky2": {
+              "selected": true,
+              "strategy_id": "gene_489395_7",
+              "label": "profit_lock_adaptive_be0.25_give0.2_lock2",
+              "score": -0.392677434,
+              "monthly_win_rate": 0.6019417475728155,
+              "worst_month_pnl_pct": -0.40076719926195975,
+              "median_month_pnl_pct": 0.023089894197446274,
+              "aw_al": 0.295774,
+              "net_profit": 17036.9615,
+              "max_drawdown": 0.3926774339861299,
+              "sharpe": 0.9224834769462825,
+              "score_inputs": {
+                "monthly_win_rate": 0.6019417475728155,
+                "median_month_pnl_pct_x100": 2.3089894197446275,
+                "avg_win_over_avg_loss": 0.29577439251976695,
+                "worst_month_penalty_gt_2pct": 38.07671992619598,
+                "max_drawdown": 0.3926774339861299
+              },
+              "tied_labels": [
+                "profit_lock_adaptive_be0.25_give0.2_lock2",
+                "profit_lock_adaptive_be0.25_give0.2_lock5"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "headline_findings": [
+    "STRICT GATES: eurusd_m5_risky2 has ZERO feasible variants under the requested hard gates. Among variants passing monthly_win_rate>=0.55 and net_profit>0, the best worst month is -26.93%. No scoring-weight vector can make m5 satisfy a -3% worst-month gate; the gate itself is the binding limit, not the weights.",
+    "STRICT GATES: the m15 feasible pool is 21 variants, all from candidate gene_782139_19 (baseline candidate gene_953632_18 near-misses with best worst month -3.06%).",
+    "Strict optimum: w=(0.0, 0.0, 1.0, 0.0, 0.0) selects m15 max_hold_96_bars_approx_24h_m15 (strategy gene_782139_19; S=0.995; mwr=0.5980392156862745, worst=-2.23%, aw/al=0.994956, net=1247.3373).",
+    "Sensitivity (m5 worst-month gate disabled, w4 penalty still active): joint optimum w=(0.0, 1.0, 0.0, 0.0, 0.0) selects m15 profit_lock_adaptive_be0.5_give0.2_lock2 (aw/al=0.786183, net=1298.6002) AND m5 fixed_sl20_rr3_hold96_trailfalse / gene_489395_7 (aw/al=1.127107, mwr=0.7087378640776699, worst=-1202.8%, net=92524.3237).",
+    "Scale note: median_month_pnl_pct*100 and aw/al dominate S magnitude; max_drawdown is stored as a fraction (0..1), so w5 needs ~100x relative weight to matter. The optimizer therefore concentrates weight on aw/al (and median-month pnl in the relaxed run).",
+    "Sensitivity caution: with the m5 worst-month gate disabled, the formula selects a blowup-profile replay (m5 fixed_sl20_rr3_hold96_trailfalse: worst month -1202.8%, max drawdown 93.27%) - evidence that the -3% worst-month gate, not the scoring weights, is what keeps such profiles out.",
+    "Offline only: both artifacts are ResearchOnly counterfactual replays (authorization_issued=false); this pilot does not change any gate, policy, cost or sizing."
+  ]
+}

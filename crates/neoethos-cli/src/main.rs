@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod canonical_full_run;
 mod canonical_research;
+mod feature_frame_cache_gate;
 mod gpu_bench;
 mod gpu_bench_population;
 mod gpu_bench_prepare;
@@ -2018,6 +2019,24 @@ struct CanonicalCpuResearchInputs {
     settings_source: std::path::PathBuf,
 }
 
+fn canonical_cpu_research_evidence_status(
+    completed: usize,
+    ledger: &neoethos_search::orchestration::StreamingRunLedger,
+) -> &'static str {
+    use neoethos_search::orchestration::BatchOutcome;
+
+    // A budget marker describes unattempted work, not a failed batch. Search
+    // coverage is reported separately through streaming_space_exhausted/cursor.
+    let attempted = ledger.batches_seen() - ledger.count_of(BatchOutcome::BudgetExhausted);
+    if completed == 0 {
+        "Failed"
+    } else if completed != attempted {
+        "Partial"
+    } else {
+        "Complete"
+    }
+}
+
 fn parse_canonical_cpu_research_inputs(
     args: &[String],
 ) -> Result<Option<CanonicalCpuResearchInputs>> {
@@ -2104,6 +2123,19 @@ fn discovery_config_from_cli(
     // Share the typed overrides with batch discovery. Receipt-bound research
     // must not silently inherit population_auto after an explicit false.
     apply_batch_discover_cli_overrides(args, &mut config)?;
+    #[cfg(feature = "search-monthly-upside-objective")]
+    if let Some(name) = parse_flag(args, "--fitness-table") {
+        // B9 opt-in selector (docs section 14.7). Only the two tables the
+        // canonical CPU evaluator can actually drive are accepted, and an
+        // unknown name fails loudly instead of silently falling back to the
+        // canonical three-way dispatch.
+        let normalized = name.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            normalized == "ga_fitness" || normalized == "monthly_upside_v1",
+            "--fitness-table must be ga_fitness or monthly_upside_v1"
+        );
+        config.fitness_table = neoethos_search::scoring::FitnessTable::from_name(&normalized);
+    }
     Ok(config.apply_mode_overrides())
 }
 
@@ -2150,6 +2182,24 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         .context("execute Discovery on the lease-bound CPU pool")?
 }
 
+fn restore_recorded_feature_options(
+    requested: neoethos_data::FeatureBuildOptions,
+    recorded: &neoethos_data::FeatureBuildOptions,
+) -> Result<neoethos_data::FeatureBuildOptions> {
+    anyhow::ensure!(
+        recorded.classic_ta_working_set.is_some(),
+        "recorded research has no exact Classic working set; cannot restore the raw working set"
+    );
+    let mut expected = requested;
+    expected.classic_ta_working_set = recorded.classic_ta_working_set.clone();
+    expected.quantitative_semantics = recorded.quantitative_semantics;
+    anyhow::ensure!(
+        expected == *recorded,
+        "recorded feature-build recipe differs from the requested research inputs"
+    );
+    Ok(recorded.clone())
+}
+
 fn cmd_discover_on_budgeted_pool(
     args: &[String],
     cpu: &neoethos_core::execution::BudgetedCpuScope<'_>,
@@ -2158,10 +2208,136 @@ fn cmd_discover_on_budgeted_pool(
         let settings = resolve_cli_settings(args)?;
         let canonical_cpu_research = parse_canonical_cpu_research_inputs(args)?;
         let mut quote_replay = canonical_research::QuoteReplayInputs::load(args)?;
+        let mut saved_research = canonical_research::SavedResearchInputs::load(args)?;
+        let new_search = canonical_research::NewSearchInputs::load(args)?;
         anyhow::ensure!(
-            quote_replay.is_none() || canonical_cpu_research.is_some(),
-            "quote replay requires receipt-bound canonical CPU research"
+            (quote_replay.is_none() && saved_research.is_none() && new_search.is_none())
+                || canonical_cpu_research.is_some(),
+            "saved/new-search continuation requires receipt-bound canonical CPU research"
         );
+        anyhow::ensure!(
+            new_search.is_none() || (quote_replay.is_none() && saved_research.is_none()),
+            "new-search recorded input cannot be combined with finalist/quote continuation"
+        );
+        if let Some(new_search) = &new_search {
+            tracing::info!(
+                target: "neoethos_cli::discover",
+                recorded_research_sha256 = %new_search.sha256,
+                recorded_research_source = %new_search.source.display(),
+                "starting a fresh NEW search from recorded input provenance"
+            );
+        }
+        // Research-only saved-candidate cost diagnosis. It reads a saved
+        // research envelope and re-costs its candidates; it never runs Search.
+        let diagnose_cost_out = parse_flag(args, "--diagnose-candidate-costs-out");
+        let diagnose_signals_out = parse_flag(args, "--diagnose-candidate-signals-out");
+        let diagnose_weekdays_out = parse_flag(args, "--diagnose-candidate-weekdays-out");
+        let diagnose_exit_out = parse_flag(args, "--diagnose-exit-policy-out");
+        let diagnose_weekday_selectors = parse_flag(args, "--diagnose-candidate-selectors");
+        let diagnose_candidate_selections = {
+            let weekday_mode = diagnose_weekdays_out.is_some();
+            let exit_mode = diagnose_exit_out.is_some();
+            anyhow::ensure!(
+                !(weekday_mode && exit_mode),
+                "candidate weekday and exit-policy diagnostics cannot be combined"
+            );
+            if weekday_mode || exit_mode {
+                anyhow::ensure!(
+                    saved_research.is_some(),
+                    "saved-candidate selector diagnostics require --resume-research and --resume-research-sha256"
+                );
+                anyhow::ensure!(
+                    diagnose_cost_out.is_none() && diagnose_signals_out.is_none(),
+                    "saved-candidate selector diagnostics cannot be combined with cost or signal diagnosis"
+                );
+                anyhow::ensure!(
+                    new_search.is_none() && quote_replay.is_none(),
+                    "saved-candidate selector diagnostics cannot be combined with fresh-search or quote replay"
+                );
+                let spec = diagnose_weekday_selectors.as_deref().context(
+                    "saved-candidate selector diagnostics require --diagnose-candidate-selectors",
+                )?;
+                let out = diagnose_weekdays_out
+                    .as_deref()
+                    .or(diagnose_exit_out.as_deref())
+                    .expect("one selector diagnostic output is selected");
+                anyhow::ensure!(
+                    !std::path::Path::new(out).exists(),
+                    "saved-candidate selector diagnostic output must be a new path: {out}"
+                );
+                let selections =
+                    neoethos_search::discovery::parse_saved_candidate_selections_v1(spec)?;
+                let saved = saved_research
+                    .as_ref()
+                    .and_then(|saved| saved.research.as_ref())
+                    .context("saved research was already consumed before identity validation")?;
+                neoethos_search::discovery::validate_saved_candidate_selections_v1(
+                    saved,
+                    &selections,
+                )?;
+                selections
+            } else {
+                anyhow::ensure!(
+                    diagnose_weekday_selectors.is_none(),
+                    "--diagnose-candidate-selectors requires --diagnose-candidate-weekdays-out or --diagnose-exit-policy-out"
+                );
+                Vec::new()
+            }
+        };
+        if let Some(out) = diagnose_signals_out.as_deref() {
+            anyhow::ensure!(
+                saved_research.is_some(),
+                "candidate signal behavior census requires --resume-research and --resume-research-sha256"
+            );
+            anyhow::ensure!(
+                diagnose_cost_out.is_none(),
+                "candidate signal behavior census cannot be combined with candidate cost diagnosis"
+            );
+            anyhow::ensure!(
+                diagnose_weekdays_out.is_none()
+                    && diagnose_exit_out.is_none()
+                    && diagnose_weekday_selectors.is_none(),
+                "candidate signal behavior census cannot be combined with candidate selector diagnostics"
+            );
+            anyhow::ensure!(
+                !std::path::Path::new(out).exists(),
+                "candidate signal behavior census output must be a new path: {out}"
+            );
+        }
+        let diagnose_cost_variants = match parse_flag(args, "--diagnose-cost-variants") {
+            Some(spec) => canonical_research::parse_diagnostic_cost_variants(&spec)?,
+            None => Vec::new(),
+        };
+        if diagnose_signals_out.is_some() {
+            anyhow::ensure!(
+                diagnose_cost_variants.is_empty(),
+                "candidate signal behavior census cannot be combined with cost variants"
+            );
+        }
+        if diagnose_cost_out.is_some() {
+            anyhow::ensure!(
+                saved_research.is_some(),
+                "candidate cost diagnosis requires --resume-research and --resume-research-sha256"
+            );
+            anyhow::ensure!(
+                !diagnose_cost_variants.is_empty(),
+                "candidate cost diagnosis requires --diagnose-cost-variants"
+            );
+            anyhow::ensure!(
+                diagnose_weekdays_out.is_none() && diagnose_exit_out.is_none(),
+                "candidate cost diagnosis cannot be combined with candidate selector diagnostics"
+            );
+        }
+        if diagnose_weekdays_out.is_some() || diagnose_exit_out.is_some() {
+            anyhow::ensure!(
+                diagnose_cost_variants.is_empty(),
+                "candidate selector diagnostics cannot be combined with cost variants"
+            );
+        }
+        let mut diagnose_cost_written: Option<String> = None;
+        let mut diagnose_signals_written: Option<String> = None;
+        let mut diagnose_weekdays_written: Option<String> = None;
+        let mut diagnose_exit_written: Option<String> = None;
         #[cfg(feature = "gpu-nvidia")]
         anyhow::ensure!(
             canonical_cpu_research.is_none(),
@@ -2448,8 +2624,49 @@ fn cmd_discover_on_budgeted_pool(
                 // the existing train-only projection; the options, retained
                 // names and fitted state are sealed into this batch's receipt.
                 drop_columns_without_normalization_training_support: true,
+                quantitative_semantics:
+                    neoethos_data::QuantitativeFeatureSemantics::RollingValidityV5,
                 ..neoethos_data::FeatureBuildOptions::default()
             };
+
+            // Resume the recorded working set, including a later streaming
+            // batch. Today's free RAM must not select a different vocabulary.
+            let (feature_options, streaming_plan) = if let Some(new_search) = &new_search {
+                let recorded = new_search
+                    .research
+                    .as_ref()
+                    .context("new-search recorded research missing")?
+                    .discovery_result()
+                    .search_input_receipt
+                    .feature_build_options()
+                    .context("new-search recorded research has no exact feature-build recipe")?;
+                (
+                    restore_recorded_feature_options(feature_options, recorded)?,
+                    neoethos_search::orchestration::StreamingPlan::disabled(),
+                )
+            } else if let Some(saved) = &saved_research {
+                let recorded = saved
+                    .research
+                    .as_ref()
+                    .context("saved research missing")?
+                    .discovery_result()
+                    .search_input_receipt
+                    .feature_build_options()
+                    .context("saved research has no exact feature-build recipe")?;
+                (
+                    restore_recorded_feature_options(feature_options, recorded)?,
+                    neoethos_search::orchestration::StreamingPlan::disabled(),
+                )
+            } else {
+                (
+                    feature_options,
+                    neoethos_search::orchestration::StreamingPlan::streaming(stream_max_batches),
+                )
+            };
+            let source_batch_cursor = feature_options
+                .classic_ta_working_set
+                .as_ref()
+                .map(|batch| batch.cursor);
 
             if let Some(parent) = std::path::Path::new(&out).parent()
                 && !parent.as_os_str().is_empty()
@@ -2465,7 +2682,12 @@ fn cmd_discover_on_budgeted_pool(
                 ],
             )?;
 
-            if let Some(replay) = &quote_replay {
+            for source in quote_replay
+                .as_ref()
+                .map(|value| &value.source)
+                .into_iter()
+                .chain(saved_research.as_ref().map(|value| &value.source))
+            {
                 for target in [
                     out.clone(),
                     format!("{out}.quote-replay.json"),
@@ -2473,21 +2695,60 @@ fn cmd_discover_on_budgeted_pool(
                 ] {
                     canonical_full_run::ensure_cpu_research_output_target(
                         std::path::Path::new(&target),
-                        &[replay.source.as_path()],
+                        &[source.as_path()],
                     )?;
                 }
             }
             let mut quote_evidence = Vec::new();
+            let mut locked_finalists = Vec::new();
             anyhow::ensure!(
-                quote_replay.is_none() || stream_max_batches == 1,
-                "a saved quote replay requires --stream-max-batches 1"
+                (quote_replay.is_none() && saved_research.is_none()) || stream_max_batches == 1,
+                "a saved continuation requires --stream-max-batches 1"
             );
+            // Research-only receipt-keyed feature-frame cache (neo-671): the
+            // operator enables it by setting NEOETHOS_FEATURE_FRAME_CACHE_DIR.
+            // Unset, every line below is a no-op and the production build path
+            // stays byte-identical.
+            let frame_cache_config =
+                neoethos_data::core::feature_frame_cache::feature_frame_cache_config_from_env();
+            let frame_cache_bindings = frame_cache_config
+                .as_ref()
+                .map(|_| {
+                    neoethos_data::core::feature_frame_cache::symbol_dataset_cache_bindings(
+                        &dataset,
+                    )
+                })
+                .transpose()?;
+            let frame_cache_state = std::cell::RefCell::new(None::<(String, bool)>);
             let mut outcome = neoethos_search::orchestration::run_streaming_working_set(
-                &neoethos_search::orchestration::StreamingPlan::streaming(stream_max_batches),
+                &streaming_plan,
                 base_ohlcv.close.len(),
                 |batch| {
                     let cursor = batch.as_ref().map(|value| value.cursor).unwrap_or(0);
                     emit_cpu_research_stage(&format!("feature_build_started cursor={cursor}"));
+                    if let (Some(cache_cfg), Some(bindings)) =
+                        (frame_cache_config.as_ref(), frame_cache_bindings.as_ref())
+                    {
+                        let key =
+                            neoethos_data::core::feature_frame_cache::feature_frame_cache_input_key(
+                                &symbol,
+                                bindings,
+                                &feature_options,
+                                batch.as_deref(),
+                            );
+                        *frame_cache_state.borrow_mut() = Some((key.clone(), false));
+                        if let Some(cached) =
+                            neoethos_data::core::feature_frame_cache::feature_frame_cache_load(
+                                &key, cache_cfg,
+                            )?
+                        {
+                            *frame_cache_state.borrow_mut() = Some((key, true));
+                            emit_cpu_research_stage(&format!(
+                                "feature_frame_cache_hit cursor={cursor}"
+                            ));
+                            return Ok(cached);
+                        }
+                    }
                     let features =
                         neoethos_data::prepare_multitimeframe_features_batch_with_options(
                             &dataset,
@@ -2496,6 +2757,16 @@ fn cmd_discover_on_budgeted_pool(
                             batch,
                         )?;
                     emit_cpu_research_stage(&format!("feature_build_completed cursor={cursor}"));
+                    if let (Some(cache_cfg), Some((key, false))) =
+                        (frame_cache_config.as_ref(), frame_cache_state.borrow().as_ref())
+                    {
+                        let bytes = neoethos_data::core::feature_frame_cache::feature_frame_cache_store(
+                            key, &features, cache_cfg,
+                        )?;
+                        emit_cpu_research_stage(&format!(
+                            "feature_frame_cache_stored bytes={bytes}"
+                        ));
+                    }
                     Ok(features)
                 },
                 |features| {
@@ -2507,6 +2778,21 @@ fn cmd_discover_on_budgeted_pool(
                     )?;
                     let receipt = run_input.receipt().clone();
                     emit_cpu_research_stage("content_receipt_completed");
+                    if let (Some(cache_cfg), Some((key, cache_hit))) =
+                        (frame_cache_config.as_ref(), frame_cache_state.borrow().as_ref())
+                    {
+                        feature_frame_cache_gate::verify_or_seal_receipt_sidecar(
+                            &cache_cfg.dir,
+                            key,
+                            *cache_hit,
+                            &receipt,
+                        )?;
+                        emit_cpu_research_stage(if *cache_hit {
+                            "feature_frame_cache_receipt_verified"
+                        } else {
+                            "feature_frame_cache_receipt_sealed"
+                        });
+                    }
                     let contract = canonical_full_run::seal_cpu_research_contract_for_input(
                         settings_ref,
                         &research_inputs.authority_root,
@@ -2524,7 +2810,7 @@ fn cmd_discover_on_budgeted_pool(
                         settings_ref,
                         &contract,
                     )?;
-                    let research_config = discovery_config_from_cli(
+                    let mut research_config = discovery_config_from_cli(
                         args,
                         &research_defaults,
                         &symbol,
@@ -2532,6 +2818,223 @@ fn cmd_discover_on_budgeted_pool(
                         &higher_list,
                         &account_currency,
                     )?;
+                    // The guard must live in this discovery-callback scope, not
+                    // inside the conditional block: the fresh Search/GA call below
+                    // is what reads the expected alphabet after prefiltering.
+                    let _recorded_expected_guard = if let Some(new_search) = &new_search {
+                        let recorded = new_search
+                            .research
+                            .as_ref()
+                            .context("new-search recorded research missing")?;
+                        let expected = neoethos_search::discovery::prepare_recorded_new_search(
+                            recorded, &run_input, &contract,
+                        )?;
+                        // Actual fresh-search state: do not load prior ledger
+                        // memory; the streaming index records this distinction.
+                        research_config.discovery_ledger_enabled = false;
+                        Some(
+                            neoethos_search::discovery::install_recorded_effective_feature_names(
+                                expected,
+                            ),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(saved) = saved_research.as_mut() {
+                        let research = saved
+                            .research
+                            .take()
+                            .context("saved research was already consumed")?;
+                        anyhow::ensure!(
+                            research.execution_contract().identity_sha256()?
+                                == contract.identity_sha256()?,
+                            "saved research contract differs from the reopened sources and settings"
+                        );
+                        let result_ref = research.discovery_result();
+                        if let Some(exit_out) = diagnose_exit_out.as_deref() {
+                            let diag_path = std::path::Path::new(exit_out);
+                            anyhow::ensure!(
+                                !diag_path.exists(),
+                                "candidate exit-policy diagnostic output must be a new path: {exit_out}"
+                            );
+                            if let Some(parent) = diag_path.parent()
+                                && !parent.as_os_str().is_empty()
+                            {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let census = neoethos_search::discovery::summarize_saved_candidate_exit_policy_variants_v1(
+                                &diagnose_candidate_selections,
+                                &run_input,
+                                &research_config,
+                                &research,
+                            )?;
+                            let document = serde_json::json!({
+                                "schema": "neoethos.research-only.saved-candidate-exit-policy-variants-report.v1",
+                                "artifact_class": "ResearchOnly",
+                                "promotion_eligibility": "NotPromotionEligible",
+                                "authorization_issued": false,
+                                "authority": "research-only-saved-candidate-exit-policy-counterfactual",
+                                "warning": "Counterfactual replay on explicit saved candidates. Variant settings are diagnostic only and do not change production policy, gates, costs or sizing; no result is OOS or promotion evidence.",
+                                "saved_research_sha256": &saved.sha256,
+                                "contract_identity_sha256": contract.identity_sha256()?,
+                                "saved_effective_feature_names": &result_ref.effective_feature_names,
+                                "exit_policy_variants": census,
+                            });
+                            neoethos_core::storage::json::write_json_atomic(diag_path, &document)?;
+                            emit_cpu_research_stage("saved_candidate_exit_policy_variants_written");
+                            diagnose_exit_written = Some(exit_out.to_owned());
+                            return Ok(research);
+                        }
+                        if let Some(weekdays_out) = diagnose_weekdays_out.as_deref() {
+                            let diag_path = std::path::Path::new(weekdays_out);
+                            anyhow::ensure!(
+                                !diag_path.exists(),
+                                "candidate weekday attribution output must be a new path: {weekdays_out}"
+                            );
+                            if let Some(parent) = diag_path.parent()
+                                && !parent.as_os_str().is_empty()
+                            {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let census = neoethos_search::discovery::summarize_saved_candidate_weekday_attribution_v1(
+                                &run_input,
+                                &research_config,
+                                &research,
+                                &diagnose_candidate_selections,
+                            )?;
+                            let document = serde_json::json!({
+                                "schema": "neoethos.research-only.saved-candidate-weekday-attribution-report.v1",
+                                "artifact_class": "ResearchOnly",
+                                "promotion_eligibility": "NotPromotionEligible",
+                                "authorization_issued": false,
+                                "authority": "research-only-saved-candidate-causal-signal-and-closed-ledger-attribution",
+                                "warning": "Signal-bar dates and next-execution-bar observations are descriptive, not eligibility. Closed-trade entries are the actual ledger. This report does not establish viability, promotion, or a defect.",
+                                "saved_research_sha256": &saved.sha256,
+                                "contract_identity_sha256": contract.identity_sha256()?,
+                                "saved_effective_feature_names": &result_ref.effective_feature_names,
+                                "weekday_attribution": census,
+                            });
+                            neoethos_core::storage::json::write_json_atomic(diag_path, &document)?;
+                            emit_cpu_research_stage("saved_candidate_weekday_attribution_written");
+                            diagnose_weekdays_written = Some(weekdays_out.to_owned());
+                            return Ok(research);
+                        }
+                        if let Some(signals_out) = diagnose_signals_out.as_deref() {
+                            let diag_path = std::path::Path::new(signals_out);
+                            anyhow::ensure!(
+                                !diag_path.exists(),
+                                "candidate signal behavior census output must be a new path: {signals_out}"
+                            );
+                            if let Some(parent) = diag_path.parent()
+                                && !parent.as_os_str().is_empty()
+                            {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let census = neoethos_search::discovery::summarize_research_candidate_signal_similarity_v1(
+                                &run_input,
+                                &research_config,
+                                &research,
+                            )?;
+                            let document = serde_json::json!({
+                                "schema": "neoethos.research-only.candidate-signal-behavior-census-report.v1",
+                                "artifact_class": "ResearchOnly",
+                                "promotion_eligibility": "NotPromotionEligible",
+                                "authorization_issued": false,
+                                "authority": "research-only-actual-saved-candidate-signals-not-trades-equity-or-promotion-authority",
+                                "warning": "Raw saved-candidate signal behavior on the sealed selection frame. Signal similarity is not confidence, sized-trade, equity, cost-band, or promotion evidence.",
+                                "saved_research_sha256": &saved.sha256,
+                                "contract_identity_sha256": contract.identity_sha256()?,
+                                "saved_effective_feature_names": &result_ref.effective_feature_names,
+                                "signal_behavior": census,
+                            });
+                            neoethos_core::storage::json::write_json_atomic(diag_path, &document)?;
+                            emit_cpu_research_stage("candidate_signal_behavior_census_written");
+                            diagnose_signals_written = Some(signals_out.to_owned());
+                            return Ok(research);
+                        }
+                        if let Some(diag_out) = diagnose_cost_out.as_deref() {
+                            let diag_path = std::path::Path::new(diag_out);
+                            anyhow::ensure!(
+                                !diag_path.exists(),
+                                "candidate cost diagnostic output must be a new path: {diag_out}"
+                            );
+                            if let Some(parent) = diag_path.parent()
+                                && !parent.as_os_str().is_empty()
+                            {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            let variants = diagnose_cost_variants
+                                .iter()
+                                .map(|(label, pips, commission)| {
+                                    neoethos_search::discovery::CandidateCostVariantV1 {
+                                        label: label.clone(),
+                                        round_trip_cost_pips: *pips,
+                                        round_trip_commission_per_lot: *commission,
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            let rows = neoethos_search::discovery::diagnose_research_candidates_under_cost_variants_v3(
+                                &run_input,
+                                &research_config,
+                                &research,
+                                &result_ref.candidates,
+                                &variants,
+                            )?;
+                            let variants_json = variants
+                                .iter()
+                                .map(|variant| {
+                                    serde_json::json!({
+                                        "label": &variant.label,
+                                        "round_trip_cost_pips": variant.round_trip_cost_pips,
+                                        "round_trip_commission_per_lot": variant.round_trip_commission_per_lot,
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            let document = serde_json::json!({
+                                "schema": "neoethos.research-only.candidate-cost-diagnostic.v1",
+                                "version": 1,
+                                "artifact_class": "ResearchOnly",
+                                "promotion_eligibility": "NotPromotionEligible",
+                                "authorization_issued": false,
+                                "authority": "research-only-raw-metrics-not-cost-band-not-execution-evidence",
+                                "warning": "Raw evaluated metrics for an explicit cost envelope on the saved selection frame. Not a cost-band verdict, not broker-validated execution evidence, and never promotion or live-sizing authority.",
+                                "saved_research_search_config_hash": &result_ref.search_config_hash,
+                                "sealed_policy_parity": "enforced by the research-only seam against policy.sealed_evaluation_config()",
+                                "contract_identity_sha256": contract.identity_sha256()?,
+                                "symbol": &symbol,
+                                "base_timeframe": &base,
+                                "candidates_evaluated": result_ref.candidates.len(),
+                                "variants": variants_json,
+                                "rows": rows,
+                            });
+                            neoethos_core::storage::json::write_json_atomic(diag_path, &document)?;
+                            emit_cpu_research_stage("candidate_cost_diagnostic_written");
+                            diagnose_cost_written = Some(diag_out.to_owned());
+                            return Ok(research);
+                        }
+                        emit_cpu_research_stage("frozen_finalist_resume_started");
+                        neoethos_search::discovery::with_canonical_research_finalist_v3(
+                            &run_input,
+                            &research,
+                            |locked| {
+                                locked_finalists.push(serde_json::json!({
+                                    "signal_plan_sha256": locked.identity_sha256(),
+                                    "portfolio_identity_sha256": locked.portfolio_identity_sha256(),
+                                    "scope_identity_sha256": locked.scope_identity_sha256(),
+                                    "search_config_hash": locked.search_config_hash(),
+                                    "holdout_scope": locked.holdout_scope(),
+                                    "evaluation_window": locked.locked_evaluation_window(),
+                                    "portfolio_count": locked.portfolio().len(),
+                                }));
+                                if let Some(provider) = quote_replay.as_mut() {
+                                    let replay = provider.replay(cpu, locked)?;
+                                    quote_evidence.push(neoethos_search::evaluate_locked_portfolio_outer_holdout_v3(locked, replay)?);
+                                }
+                                Ok(())
+                            },
+                        )?;
+                        return Ok(research);
+                    }
                     emit_cpu_research_stage("search_pipeline_started");
                     if let Some(provider) = quote_replay.as_mut() {
                         let (research, evidence) =
@@ -2548,6 +3051,20 @@ fn cmd_discover_on_budgeted_pool(
                         }
                         return Ok(research);
                     }
+                    // Explicit research-only outer-holdout evaluation. The
+                    // live export gate is untouched: the document is labelled
+                    // ResearchOnly / NotPromotionEligible and cannot feed back
+                    // into Search, promotion or live sizing.
+                    if let Some(oos_eval_out) = parse_flag(args, "--research-oos-eval-out") {
+                        return neoethos_search::discovery::run_canonical_trendbar_research_discovery_with_holdout_and_research_oos_v3(
+                            &run_input,
+                            &research_config,
+                            &contract,
+                            neoethos_search::PropFirmRiskRules::default(),
+                            std::path::Path::new(&oos_eval_out),
+                            emit_cpu_research_progress,
+                        );
+                    }
                     neoethos_search::run_canonical_trendbar_research_discovery_with_holdout_and_progress(
                         &run_input,
                         &research_config,
@@ -2557,6 +3074,27 @@ fn cmd_discover_on_budgeted_pool(
                     )
                 },
             )?;
+
+            if let Some(diag_out) = diagnose_exit_written {
+                println!("candidate_exit_policy_variants={diag_out}");
+                println!("candidate_exit_policy_variants_status=ResearchOnly");
+                return Ok((symbol.clone(), base.clone(), 0, 0));
+            }
+            if let Some(diag_out) = diagnose_weekdays_written {
+                println!("candidate_weekday_attribution={diag_out}");
+                println!("candidate_weekday_attribution_status=ResearchOnly");
+                return Ok((symbol.clone(), base.clone(), 0, 0));
+            }
+            if let Some(diag_out) = diagnose_signals_written {
+                println!("candidate_signal_behavior_census={diag_out}");
+                println!("candidate_signal_behavior_census_status=ResearchOnly");
+                return Ok((symbol.clone(), base.clone(), 0, 0));
+            }
+            if let Some(diag_out) = diagnose_cost_written {
+                println!("candidate_cost_diagnostic={diag_out}");
+                println!("candidate_cost_diagnostic_status=ResearchOnly");
+                return Ok((symbol.clone(), base.clone(), 0, 0));
+            }
 
             let canonical_survivors = outcome.survivors();
             let canonical_feature_names = outcome.canonical.names().to_vec();
@@ -2647,13 +3185,7 @@ fn cmd_discover_on_budgeted_pool(
             } else {
                 None
             };
-            let evidence_status = if completed.is_empty() {
-                "Failed"
-            } else if completed.len() < ledger.batches_seen() {
-                "Partial"
-            } else {
-                "Complete"
-            };
+            let evidence_status = canonical_cpu_research_evidence_status(completed.len(), &ledger);
             let selection_outcome = if portfolio_count == 0 {
                 "NoCandidatePortfolio"
             } else {
@@ -2669,6 +3201,23 @@ fn cmd_discover_on_budgeted_pool(
                 "quote_replay_status": quote_replay_status,
                 "quote_replay_evidence_path": quote_path,
                 "quote_replay_input_sha256": quote_replay.as_ref().map(|input| &input.sha256),
+                "selection_mode": if saved_research.is_some() {
+                    "FrozenResearchResumed"
+                } else if new_search.is_some() {
+                    "NewSearchFromRecordedInput"
+                } else {
+                    "NewSearch"
+                },
+                "saved_research_sha256": saved_research.as_ref().map(|input| &input.sha256),
+                "recorded_new_search_research_sha256": new_search.as_ref().map(|input| &input.sha256),
+                "fresh_search_memory_state": new_search.is_some(),
+                "search_memory_note": if new_search.is_some() {
+                    "fresh run; discovery ledger seeding disabled; old V5 search-memory state is not replayed or inferred"
+                } else {
+                    "ordinary mode"
+                },
+                "source_batch_cursor": source_batch_cursor,
+                "locked_finalists": locked_finalists,
                 "streaming_space_exhausted": streamed && next_cursor >= space_len,
                 "symbol": &symbol,
                 "base_timeframe": &base,
@@ -4245,6 +4794,10 @@ const AUTORESEARCH_FLAGS: &[&str] = &[
     "--session",
     "--scenario",
     "--dry-run",
+    "--quote-replay-store",
+    "--quote-replay-link",
+    "--reviewed-evidence",
+    "--quote-replay-policy",
     // Set by the schedule orchestrator on the children it spawns; it is parsed
     // in `main` from the full argv and would otherwise look unknown here.
     "--cpu-threads",
@@ -4328,6 +4881,14 @@ fn cmd_autoresearch(args: &[String]) -> Result<()> {
     run_args.dry_run = has_flag(args, "--dry-run");
     run_args.session = parse_flag(args, "--session");
     run_args.scenario = parse_flag(args, "--scenario");
+    run_args.quote_replay_store =
+        parse_flag(args, "--quote-replay-store").map(std::path::PathBuf::from);
+    run_args.quote_replay_link =
+        parse_flag(args, "--quote-replay-link").map(std::path::PathBuf::from);
+    run_args.reviewed_evidence =
+        parse_flag(args, "--reviewed-evidence").map(std::path::PathBuf::from);
+    run_args.quote_replay_policy =
+        parse_flag(args, "--quote-replay-policy").map(std::path::PathBuf::from);
     if let Some(raw) = parse_flag(args, "--max-sweeps") {
         run_args.max_sweeps = match raw.trim().parse::<usize>() {
             Ok(v) if v > 0 => v,
@@ -5070,10 +5631,25 @@ fn print_help() {
         "  canonical-cost-build --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --symbol EURUSD --basis-timeframe D1 --broker-symbol-contract <json> --settings-source <yaml> --out <json>"
     );
     println!(
-        "  canonical-research --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --broker-symbol-contract <json> --broker-account-snapshot <account-snapshot.json> --settings-source <yaml> --symbol EURUSD --base-timeframe H4 --out-dir <new-dir> [--higher D1] [--population 64] [--generations 16] [--max-batches 2]"
+        "  canonical-research --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --broker-symbol-contract <json> --broker-account-snapshot <account-snapshot.json> --settings-source <yaml> --symbol EURUSD --base-timeframe H4 --out-dir <new-dir> [--higher D1] [--population 64] [--generations 16] [--max-batches 2] [--research-oos-eval <json>]"
     );
     println!(
         "    saved quote replay: --quote-replay-bundle <json> --quote-replay-sha256 <sha> --quote-replay-store <dir> --max-batches 1"
+    );
+    println!(
+        "    fresh search from recorded inputs: --new-search-research <research.json> --new-search-research-sha256 <sha> --max-batches 1"
+    );
+    println!(
+        "    research-only saved-candidate cost diagnosis: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-costs-out <new-json> --diagnose-cost-variants label=<round-trip-pips>:<round-trip-commission>,..."
+    );
+    println!(
+        "    research-only saved-candidate signal behavior: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-signals-out <new-json>"
+    );
+    println!(
+        "    research-only saved-candidate weekday attribution: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-selectors <index:strategy_id:fnv64:hash,...> --diagnose-candidate-weekdays-out <new-json>"
+    );
+    println!(
+        "    research-only saved-candidate exit-policy variants: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-selectors <index:strategy_id:fnv64:hash,...> --diagnose-exit-policy-out <new-json>"
     );
     println!(
         "                               One bounded CPU research run from exact acquisition receipts through D1 costs, discovery and chronological holdout evidence. Never authorizes promotion."
@@ -5231,6 +5807,54 @@ mod tests {
         select_runtime_timeframe_identities, select_runtime_timeframe_identities_for_base,
     };
     use neoethos_core::sectioned_log::SubsystemSection;
+
+    #[test]
+    fn canonical_cpu_research_budget_stop_preserves_completed_evidence_and_real_failures() {
+        use neoethos_search::orchestration::{
+            BatchLedgerEntry, BatchOutcome::*, StreamingRunLedger,
+        };
+
+        let cases = [
+            (vec![EmptyPortfolio, BudgetExhausted], 1, "Complete"),
+            (vec![SurvivorsPromoted, BudgetExhausted], 1, "Complete"),
+            (vec![PredicateEarlyReject, BudgetExhausted], 1, "Complete"),
+            (vec![StreamingUnavailable], 1, "Complete"),
+            (vec![EmptyPortfolio], 1, "Complete"),
+            (
+                vec![EmptyPortfolio, FeatureBuildFailed, BudgetExhausted],
+                1,
+                "Partial",
+            ),
+            (vec![DiscoveryCycleFailed, EmptyPortfolio], 1, "Partial"),
+            (
+                vec![EmptyPortfolio, EmptyPortfolio, BudgetExhausted],
+                1,
+                "Partial",
+            ),
+            (vec![FeatureBuildFailed, BudgetExhausted], 0, "Failed"),
+            (vec![BudgetExhausted], 0, "Failed"),
+            (vec![], 0, "Failed"),
+        ];
+        for (outcomes, completed, expected) in cases {
+            let mut ledger = StreamingRunLedger::new();
+            for (cursor, outcome) in outcomes.into_iter().enumerate() {
+                ledger.record(BatchLedgerEntry::new(
+                    cursor,
+                    cursor + 1,
+                    0,
+                    0,
+                    outcome,
+                    0,
+                    "test",
+                ));
+            }
+            assert_eq!(
+                super::canonical_cpu_research_evidence_status(completed, &ledger),
+                expected,
+                "completed={completed}, ledger={ledger:?}"
+            );
+        }
+    }
 
     fn external_identity(
         namespace: &str,
@@ -5581,5 +6205,38 @@ mod tests {
         assert_eq!(record.operation, "discover");
         assert_eq!(record.status, "FAILED");
         assert_eq!(record.message, "discovery failed");
+    }
+
+    #[cfg(feature = "search-monthly-upside-objective")]
+    mod monthly_upside_selector_tests {
+        #[test]
+        fn canonical_config_picks_up_the_opt_in_fitness_selector() {
+            let defaults = neoethos_search::DiscoveryConfig::default();
+            let resolve = |args: &[String]| {
+                super::super::discovery_config_from_cli(
+                    args, &defaults, "EURUSD", "M15", &[], "USD",
+                )
+            };
+            let inherited = resolve(&[]).unwrap();
+            assert_eq!(
+                inherited.fitness_table,
+                neoethos_search::scoring::FitnessTable::GaFitness
+            );
+            let selected = resolve(&[
+                "--fitness-table".to_owned(),
+                "monthly_upside_v1".to_owned(),
+            ])
+            .unwrap();
+            assert_eq!(
+                selected.fitness_table,
+                neoethos_search::scoring::FitnessTable::MonthlyUpsideV1
+            );
+            for bad in ["bogus", "archive_score"] {
+                assert!(
+                    resolve(&["--fitness-table".to_owned(), bad.to_owned()]).is_err(),
+                    "{bad} must be refused"
+                );
+            }
+        }
     }
 }

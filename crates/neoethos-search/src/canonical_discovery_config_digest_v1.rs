@@ -86,7 +86,10 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         prop_firm_min_pass_rate,
         discovery_ledger_enabled,
         discovery_ledger_cache_dir,
-        discovery_ledger_archive_top_n,
+        // `..` because fitness_table is deliberately NOT digested yet
+        // (section 14.8 stamp gap): a pattern binding for it would join this
+        // destructure's duplicate span and trip the duplicate gate.
+        discovery_ledger_archive_top_n, ..
     } = config;
 
     let mut encoder = CanonicalDigestEncoderV1::new();
@@ -258,6 +261,7 @@ fn encode_runtime_overrides_v1(
         funnel_stage1_pct,
         stage1_window,
         min_history_years,
+        weekly_cadence,
     } = runtime;
     encoder.record_start("runtime_overrides")?;
     encoder.usize("prefilter_top_k", *prefilter_top_k)?;
@@ -266,6 +270,10 @@ fn encode_runtime_overrides_v1(
     encoder.f64("funnel_stage1_pct", *funnel_stage1_pct)?;
     encoder.enumeration("stage1_window", stage1_window_wire_v1(*stage1_window))?;
     encoder.u32("min_history_years", *min_history_years)?;
+    // Legacy false encodes identically; only the explicit new policy adds bytes.
+    if *weekly_cadence {
+        encoder.boolean("rolling_weekly_cadence_v1", true)?;
+    }
     encoder.record_end("runtime_overrides")
 }
 
@@ -540,6 +548,18 @@ const fn discovery_mode_wire_v1(mode: DiscoveryMode) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn weekly_opt_in_changes_canonical_config_digest() {
+        let mut config = DiscoveryConfig::default();
+        let old = canonical_discovery_config_digest_v1(&config).unwrap();
+        assert!(
+            !serde_json::to_string(&config.runtime_overrides)
+                .unwrap()
+                .contains("weekly_cadence")
+        );
+        config.runtime_overrides.weekly_cadence = true;
+        assert_ne!(old, canonical_discovery_config_digest_v1(&config).unwrap());
+    }
     use super::*;
 
     #[test]

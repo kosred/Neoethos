@@ -63,7 +63,13 @@ pub struct ScoringVersion(pub u32);
 /// Strict discovery still uses [`ga_fitness`] (v4 math, unchanged).
 /// v6: Risky discovery binds the configured goal/deadline to measured realized
 /// balance growth. The v5 function remains only for explicitly legacy callers.
-pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(6);
+///
+/// 2026-10-20: bumped to `7` — the PropFirm/Strict [`ga_fitness`] now scales its
+/// per-trade quality contributions by sample size (`rev=sample-confidence-v7`).
+/// Before the revision the PropFirm GA maximised PF/win-rate credit from one or
+/// two trades and produced candidates that could never trade a 60-day challenge
+/// window. Healthy-genome scores (>=100 trades) are unchanged.
+pub const SCORING_VERSION_CURRENT: ScoringVersion = ScoringVersion(7);
 
 pub use neoethos_gpu_contracts::resident_search_scoring_v2::RiskyGrowthGoal;
 
@@ -103,7 +109,13 @@ pub fn ga_fitness_goal(
 
 /// GA fitness — the value the genetic algorithm MAXIMISES per genome.
 ///
-/// Matches `genetic::evolution_math::score_from_metrics` byte-for-byte.
+/// 2026-10-20 revision (`sample-confidence-v7`): the profit-factor, win-rate and
+/// consistency contributions are scaled by `trades_confidence`, so a one-trade
+/// genome can no longer outrank an active strategy on PF=10/100%-win-rate alone.
+/// The PropFirm GA had converged on such lottery tickets: the rule-level
+/// diagnostic showed 601 of 612 challenge windows with zero trades, and the
+/// per-trade quality credit was the only positive gradient. At 100 trades the
+/// confidence is 1.0, so healthy-genome scores are unchanged.
 /// The mapping in `metrics: &[f64; 11]` is the canonical
 /// `[BacktestMetrics::to_metric_array]` order (see `eval.rs` lines
 /// 165-200 and `BACKTEST_METRICS_MONTHLY_TARGET_HIT_RATE_INDEX`):
@@ -625,6 +637,32 @@ mod tests {
             "low-trade (5) candidate must score lower than high-trade (100): {} vs {}",
             s_low,
             s_high
+        );
+    }
+
+    #[test]
+    fn ga_fitness_sample_confidence_penalises_a_one_trade_lottery() {
+        // 2026-10-20 revision: the same PF/win-rate/drawdown shape must score
+        // higher when it was measured over 100 trades than over 2. Before the
+        // revision this difference came only from the activity multiplier and
+        // was too small to stop the PropFirm GA converging on lottery genomes.
+        let mut lottery = [0.0; 11];
+        lottery[0] = 40.0;
+        lottery[1] = 0.20;
+        lottery[3] = 0.002;
+        lottery[4] = 1.0;
+        lottery[5] = 10.0;
+        lottery[6] = 20.0;
+        lottery[7] = 0.20;
+        lottery[8] = 2.0;
+        lottery[9] = 0.50;
+        let mut active = lottery;
+        active[8] = 100.0;
+        assert!(
+            ga_fitness(&active) > ga_fitness(&lottery),
+            "a 100-trade genome must outrank the same shape over two trades: {} vs {}",
+            ga_fitness(&active),
+            ga_fitness(&lottery)
         );
     }
 }

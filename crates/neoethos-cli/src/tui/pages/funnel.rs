@@ -485,7 +485,7 @@ mod tests {
         let research_path = research_dir.join("actual.research.json");
         let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../neoethos-search/test_fixtures/strategy_report_v6/a2d3ef812dd8b341f863f7a57df3f71172a94c95269fe51c49ece25e3623d327.research.json"
+            "/../neoethos-search/test_fixtures/strategy_report_v6/e6b6fa678b01daed3427bcef6c132d27c31d1662a4c4dcc3b02f2f74902b24aa.research.json"
         ));
         std::fs::write(&research_path, bytes).unwrap();
         // Neither metadata sidecar is a separate result/funnel.

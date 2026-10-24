@@ -93,6 +93,20 @@ pub fn current_quality_runtime_overrides() -> QualityRuntimeOverrides {
     QUALITY_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
 }
 
+/// Recorded by the evaluator that closed a simulated position. This is
+/// diagnostic metadata, not broker execution evidence. A device's generic
+/// stop code remains `Stop`; it does not establish whether a trail was active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeExitReason {
+    Stop,
+    Target,
+    TrailingStop,
+    MaxHold,
+    DataGap,
+    SessionClose,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Trade {
     pub entry_time: i64,
@@ -100,6 +114,10 @@ pub struct Trade {
     pub pnl: f64,
     pub pnl_pct: Option<f64>,
     pub duration_hours: Option<f64>,
+    /// Absent in older logs or when the producer did not report a reason.
+    /// Never infer a missing cause from PnL or the duration of the position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_reason: Option<TradeExitReason>,
     /// Max Favorable Excursion — best unrealized profit reached during the trade ($).
     #[serde(default)]
     pub mfe: f64,
@@ -756,7 +774,7 @@ impl StrategyQualityAnalyzer {
 
 /// Inclusive UTC calendar dates; O(1) weeks plus at most six remainder days.
 /// Endpoint validation also bounds every later elapsed-time subtraction.
-fn evaluation_weekdays(start_ms: i64, end_ms: i64) -> anyhow::Result<u64> {
+pub(crate) fn evaluation_weekdays(start_ms: i64, end_ms: i64) -> anyhow::Result<u64> {
     anyhow::ensure!(
         start_ms >= 0 && end_ms > start_ms,
         "quality evaluation interval must have ordered nonnegative endpoints"
@@ -1288,6 +1306,24 @@ impl StrategyRanker {
 #[cfg(test)]
 mod overrides_tests {
     use super::*;
+
+    #[test]
+    fn trade_exit_reason_roundtrips_and_legacy_logs_keep_the_cause_unknown() {
+        let mut trade = Trade {
+            duration_hours: Some(7080.0),
+            pnl: 100.0,
+            ..Trade::default()
+        };
+        let legacy = serde_json::to_value(&trade).unwrap();
+        assert!(legacy.get("exit_reason").is_none());
+        let restored: Trade = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.exit_reason, None);
+        trade.exit_reason = Some(TradeExitReason::MaxHold);
+        let encoded = serde_json::to_value(&trade).unwrap();
+        assert_eq!(encoded["exit_reason"], "max_hold");
+        let restored: Trade = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.exit_reason, Some(TradeExitReason::MaxHold));
+    }
 
     fn quality_timestamp(year: i32, month: u32, day: u32) -> i64 {
         Utc.with_ymd_and_hms(year, month, day, 0, 0, 0)

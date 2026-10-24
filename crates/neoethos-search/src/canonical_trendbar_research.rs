@@ -521,7 +521,7 @@ impl CanonicalTrendbarResearchExecutionContractV3 {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalTrendbarResearchDiscoveryResultV3 {
     schema_version: u16,
@@ -533,6 +533,15 @@ pub struct CanonicalTrendbarResearchDiscoveryResultV3 {
 }
 
 impl CanonicalTrendbarResearchDiscoveryResultV3 {
+    /// Reopen research evidence, not a trading or broker capability. Consumers
+    /// must additionally bind it to the freshly reopened canonical input.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        let result: Self =
+            serde_json::from_slice(bytes).context("decode saved canonical research")?;
+        result.validate()?;
+        Ok(result)
+    }
+
     pub(crate) fn new(
         execution_contract: CanonicalTrendbarResearchExecutionContractV3,
         discovery_result: DiscoveryResult,

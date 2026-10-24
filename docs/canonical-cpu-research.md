@@ -5,10 +5,23 @@ symbol snapshot, D1 screening-cost builder, streaming discovery and chronologica
 holdout evaluation in one invocation. It uses the explicitly supplied settings
 file for startup, CPU admission, runtime overrides and discovery.
 
-Candidate selection uses screening cost assumptions. By default, so does the
-final holdout. An explicitly supplied saved quote-replay bundle connects the
-existing quote and execution-economics consumer after the portfolio is locked.
+Candidate selection and sizing calibration use screening cost assumptions. The
+separate final holdout remains reserved until replay is requested. An explicitly
+supplied saved quote-replay bundle connects the existing quote and
+execution-economics consumer after the portfolio is locked.
 A negative screening run is not a verdict on the broker-cost pipeline.
+An empty result names the last observed population that fell to zero, rather
+than the stage with the largest raw rejection count. Missing terminal counters
+leave the cause unknown; the diagnostic points to recorded evidence without
+recommending weaker acceptance criteria.
+
+New CPU trade logs retain `logged_trades[].trades[].exit_reason`: `stop`,
+`target`, `trailing_stop`, `max_hold`, `data_gap` or `session_close`. The existing
+device-outcome adapter also preserves reported exit codes; its generic `stop`
+does not distinguish an original stop from a trailing stop. These are simulated
+exit diagnostics, not broker fills. Legacy logs omit this field and their exit
+cause must not be inferred from duration or PnL.
+
 Use [the account evidence entrypoint](broker-account-evidence.md) to inspect the
 actual account currency, broker PnL and reported commission/swap components.
 
@@ -53,10 +66,38 @@ causal conversion and signed cash components. Missing, duplicate, unused or
 inconsistent position inputs are refused. Deserialized metadata grants no
 authority; the existing validator must independently reopen the immutable evidence.
 
-The bundle must match the portfolio selected by this invocation, including its
-final SMC policy. A different selection is refused rather than silently rebinding
-old evidence. This is an explicit continuation interface, not automatic broker
-acquisition. Current account/deal snapshots alone are not sufficient to produce
+To continue an existing selection, add
+`--resume-research <research.json> --resume-research-sha256 <file-sha256>` and
+`--max-batches 1` to the same canonical command, with a new output directory.
+Use the original settings, broker snapshots, plan and matrix. The result's file
+hash, internal evidence identity, complete feature receipt and rebuilt cost
+contract must agree. Empty selections cannot be resumed. Search-budget overrides
+(`--population`, `--generations`, `--max-indicators`, `--candidates`) are refused
+because this mode does not run Search or repeat sizing calibration.
+
+Resume reopens the exact recorded feature working set, including a later batch,
+instead of selecting columns from today's free RAM. The existing funnel field
+`live_trading_policy_v1` now persists the archived signal/exit configuration;
+previous writers omitted it from JSON. A legacy result without that policy or
+the recorded recipe/working set is refused. The existing signal producer reconstructs
+the full SMC signals and final plan from canonical data and the archived policy.
+Changed source values, feature math, final windows or policy fail the binding;
+the command never silently reruns selection to repair a mismatch.
+
+Without a replay bundle, this mode records acquisition coordinates in the existing
+`research.json.streaming.json`: `selection_mode: FrozenResearchResumed`, the saved
+file hash, original `source_batch_cursor` and `locked_finalists` containing the
+signal-plan/portfolio/scope identities and exact evaluation window. These
+coordinates are preparation data, not quote evidence. Supply the same saved
+research plus all three quote flags when the reviewed bundle is available.
+Research inputs are bounded to 512 MiB (the complete candidate/evidence ledger
+can exceed 150 MiB); replay bundles retain their 64 MiB decoder limit. Both must
+be regular files.
+
+The bundle must match this frozen portfolio and final SMC policy. Omitting the
+resume flags retains the original new-search behavior, which can select a
+different portfolio and correctly refuse an older bundle. This interface does
+not automatically acquire broker evidence. Current account/deal snapshots alone are not sufficient to produce
 this bundle or establish historical fee policy. The local integration regression
 uses synthetic observations in real Vortex storage; it does not establish that a
 broker-backed finalist bundle has been acquired or that a strategy is profitable.
@@ -91,6 +132,38 @@ than the admitted population; cancellation or a refused/incomplete evaluation
 fails the handoff. Old profits measured at earlier thresholds cannot select the
 validation cohort. This does not relax quality or walk-forward requirements.
 
+For a new PropFirm CPU experiment, opt in through the supplied settings file:
+`models.discovery_runtime.weekly_cadence: true`. This adds the versioned rolling
+weekly objective; omitted/false retains legacy scoring. Every five consecutive
+UTC weekdays in the complete evaluation interval must contain a trade entry.
+Inactive prefixes, gaps and tails count. Multiple entries on one day cannot
+cover another day. Observed Sunday FX entries cover the following Monday
+when it lies inside the interval; Sunday and Monday cover the same day.
+Saturday entries and a terminal Sunday without an evaluated Monday cover no day.
+All fills retain their costs and trade counts. This sealed research calendar
+is not broker-session or holiday evidence. A window with fewer than five weekdays is refused.
+
+The existing CPU position lifecycle records completed trades' entry timestamps
+alongside its unchanged eleven financial metrics, without retaining a full
+population trade ledger. Feasible candidates precede infeasible candidates in
+parent/survivor selection, bounded archive retention and finalist admission.
+When all candidates are infeasible, normalized inactivity, net-loss and risk
+deficits still distinguish them. Exact deficit ties use the original objective.
+The full selection-window quality replay independently enforces cadence and
+records `rolling_five_weekday_cadence` rejections. None of this is OOS evidence.
+
+The weekly minimum is additional to the explicit run's existing acceptance
+floors. A profile still configured for 20 trades/month continues to require
+20; enabling this objective does not silently turn it into a weekly-only
+profile. Record any operator-authorized activity-profile change in a new
+settings snapshot, preserving the frozen old experiment and financial/risk
+floors. Weekly limits participate in the search identity; the exact interval
+and month convention are retained in `live_trading_policy_v1`'s sealed evaluator.
+GA handoff metadata retains aligned cadence observations and checkpoints retain
+them when present. Native routes refuse this objective before population
+execution because they do not produce these observations. Novelty blending is
+also refused rather than allowing novelty to override financial feasibility.
+
 `funnel_profile.walkforward_selection_cohort` retains all completed internal WF
 trials, including rejected candidates. Each links to the exact genome and its
 index in `discovery_result.candidates`, selection scope and search config hash.
@@ -101,6 +174,14 @@ prop-firm rule failures and invalid/incomplete fold measurements. A zero-trade
 fold remains part of the existing positive-fold denominator. Multiple reasons
 can apply to one candidate. Older profiles omit these diagnostics rather than
 inventing measurements. These selection diagnostics are not deployment artifacts.
+
+Internal WF/CPCV evaluate the already-normalized selection frame. The global
+normalizer is fitted on the first 80% selection prefix, which includes their
+internal test rows; there is no per-fold normalization refit. The outer
+calibration and final holdout rows are excluded from that fit. Internal WF/CPCV
+results and candidate-selection export therefore do not establish untouched
+chronological OOS evidence or promotion authority; promotion requires the
+separate quote-validated outer holdout.
 
 CPU research uses the existing normalization projection to exclude columns with
 no valid cell in the in-sample normalization interval. Both base and aligned

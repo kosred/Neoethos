@@ -6415,8 +6415,25 @@
       ],
       "bottleneck_stage": "",
       "bottleneck_rejected": 0,
-      "outcome": "synthetic-report-fixture-not-trading-evidence"
+      "outcome": "synthetic-report-fixture-not-trading-evidence",
+      "live_trading_policy_v1": {
+        "schema_version": 1,
+        "source_search_config_hash": "fnv64:0123456789abcdef",
+        "source_resolved_config_hash": "fnv64:fedcba9876543210",
+        "identity_hash": "fnv64:e21dc28e3879fee9",
+        "trailing_enabled": true,
+        "trailing_be_trigger_r": 1.25,
+        "trailing_stop_multiplier": 0.75,
+        "trailing_min_lock_pips": 3.0,
+        "kill_zones_enabled": false,
+        "baseline_spread_pips": 1.5,
+        "session_spread_pips": [
+          1.8,
+          0.6,
+          1.1
+        ]
+      }
     }
   },
-  "evidence_identity_sha256": "a2d3ef812dd8b341f863f7a57df3f71172a94c95269fe51c49ece25e3623d327"
+  "evidence_identity_sha256": "e6b6fa678b01daed3427bcef6c132d27c31d1662a4c4dcc3b02f2f74902b24aa"
 }

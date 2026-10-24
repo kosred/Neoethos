@@ -7,6 +7,10 @@ review the two printed temporary output paths, then install the reviewed files.
 The generator never writes here. Normal tests require the checked-in pair and
 compare it byte-for-byte with the current actual Search writers.
 
+The October 2026 refresh persists the existing funnel signal-policy field for
+frozen research continuation. Review confirmed that only that field and the
+research evidence identity changed; the compact portfolio bytes stayed identical.
+
 The pair uses the existing external `embedded-ctrader-fixture-unverified`
 two-column receipt with 80/10/10 scopes, typed selection evidence constructors,
 the real research-result constructor and the real compact V6 portfolio writer.

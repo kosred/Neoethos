@@ -13,6 +13,62 @@ use vortex_array::ToCanonical;
 
 const BASE_MS: i64 = 1_700_000_040_000;
 
+#[test]
+fn nested_patch_slices_preserve_original_values_and_lookup() {
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::patches::Patches;
+
+    let original = Patches::new(
+        4096,
+        0,
+        PrimitiveArray::from_iter([7u64, 1031, 2055, 3079]).into_array(),
+        PrimitiveArray::from_iter([0.1f64, -0.0, 3.125, -42.125]).into_array(),
+        Some(PrimitiveArray::from_iter([0u64, 1, 2, 3]).into_array()),
+    )
+    .expect("valid patches across four chunks");
+    let parent = original.slice(1024..4096).unwrap().unwrap();
+    let nested = parent.slice(5..2048).unwrap().unwrap();
+    assert_eq!(
+        nested.indices().to_primitive().as_slice::<u64>(),
+        &[1031, 2055]
+    );
+    assert_eq!(
+        nested
+            .values()
+            .to_primitive()
+            .as_slice::<f64>()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        vec![(-0.0f64).to_bits(), 3.125f64.to_bits()],
+        "patch values, including signed zero, must remain bit-identical"
+    );
+    let direct = original.slice(1029..3072).unwrap().unwrap();
+    for row in 0..2043 {
+        assert_eq!(
+            nested.search_index(row).unwrap(),
+            direct.search_index(row).unwrap()
+        );
+    }
+    let nested_again = nested.slice(3..2043).unwrap().unwrap();
+    assert_eq!(
+        nested_again.indices().to_primitive().as_slice::<u64>(),
+        &[2055]
+    );
+    assert_eq!(
+        nested_again.values().to_primitive().as_slice::<f64>(),
+        &[3.125]
+    );
+    let direct_again = original.slice(1032..3072).unwrap().unwrap();
+    for row in 0..2040 {
+        assert_eq!(
+            nested_again.search_index(row).unwrap(),
+            direct_again.search_index(row).unwrap()
+        );
+    }
+}
+
 fn fixture() -> Ohlcv {
     Ohlcv {
         timestamp: Some(vec![

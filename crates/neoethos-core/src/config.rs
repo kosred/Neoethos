@@ -1423,6 +1423,10 @@ impl Default for SearchRuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiscoveryRuntimeConfig {
+    /// Opt-in rolling five-UTC-weekday objective for new PropFirm CPU runs.
+    /// Existing stricter frequency and financial floors remain active.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub weekly_cadence: bool,
     /// Max features kept after the in-sample correlation prefilter; `0`
     /// disables the prefilter. (was `NEOETHOS_BOT_PREFILTER_TOP_K`)
     ///
@@ -1527,6 +1531,7 @@ impl Default for DiscoveryRuntimeConfig {
         Self {
             // 240, matching config.yaml. See the field docs — the previous 50
             // silently contradicted the shipped config.
+            weekly_cadence: false,
             prefilter_top_k: 240,
             // Discovery already receives only the training side of the outer
             // temporal split. Rank features on all of that admissible prefix;
@@ -1841,6 +1846,25 @@ pub struct ExitPolicyConfig {
     pub trailing_stop_multiplier: f64,
     /// Floor, in pips, on the profit the armed trail locks in.
     pub trailing_min_lock_pips: f64,
+    /// Maximum holding horizon, in bars, for the discovery evaluation's
+    /// time stop. Resolved by `DiscoveryConfig::from_settings`
+    /// (neoethos-search) into `DiscoveryConfig.max_hold_bars` and carried
+    /// through the evaluation config into `BacktestSettings.max_hold_bars`,
+    /// which closes every open position at entry + N bars.
+    ///
+    /// DEFAULT `0` = unchanged/disabled: no maximum-hold exit is armed,
+    /// byte-identical to every run produced before the knob existed. A
+    /// positive value lets the next research experiment use short holds
+    /// without editing code.
+    #[serde(skip_serializing_if = "max_hold_bars_is_disabled")]
+    pub max_hold_bars: usize,
+}
+
+/// `serde` skip predicate for [`ExitPolicyConfig::max_hold_bars`]: `0` — the
+/// shipped default — serialises as an ABSENT key, so existing artifacts and
+/// the generated desktop seed stay byte-identical.
+fn max_hold_bars_is_disabled(value: &usize) -> bool {
+    *value == 0
 }
 
 impl Default for ExitPolicyConfig {
@@ -1855,6 +1879,8 @@ impl Default for ExitPolicyConfig {
             // trail geometry, and the backtest, the CUDA kernel and live
             // trading all take it from here.
             trailing_min_lock_pips: DEFAULT_TRAILING_MIN_LOCK_PIPS,
+            // 0 = unchanged/disabled: keep the pre-knob behaviour exactly.
+            max_hold_bars: 0,
         }
     }
 }
@@ -4894,6 +4920,41 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&settings).unwrap();
         let deserialized: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(deserialized.system.symbol, settings.system.symbol);
+    }
+
+    #[test]
+    fn exit_policy_max_hold_bars_survives_settings_serde_round_trip() {
+        // The shipped default is 0 = unchanged/disabled: the evaluation arms no
+        // maximum-hold time stop, exactly like every run before the knob.
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.models.exit_policy.max_hold_bars, 0,
+            "shipped default must keep current behaviour (0 = no max-hold exit)"
+        );
+
+        // A configured horizon must survive the YAML round trip so the next
+        // experiment can use short holds without editing code.
+        settings.models.exit_policy.max_hold_bars = 24;
+        let yaml = serde_yaml_ng::to_string(&settings).unwrap();
+        assert!(
+            yaml.contains("max_hold_bars"),
+            "a configured (non-zero) max holding horizon must be serialised: {yaml}"
+        );
+        let deserialized: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            deserialized.models.exit_policy.max_hold_bars, 24,
+            "models.exit_policy.max_hold_bars must survive the settings round trip"
+        );
+
+        // An absent key keeps the disabled default.
+        let absent: Settings =
+            serde_yaml_ng::from_str("system:
+  symbol: EURUSD
+").unwrap();
+        assert_eq!(
+            absent.models.exit_policy.max_hold_bars, 0,
+            "an absent models.exit_policy.max_hold_bars must resolve to 0"
+        );
     }
 
     #[test]
