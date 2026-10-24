@@ -3133,19 +3133,29 @@ fn cmd_discover_on_budgeted_pool(
                 },
             ) {
                 Ok(outcome) => outcome,
-                Err(error)
-                    if error
-                        .downcast_ref::<neoethos_search::discovery::PrefilterRankingAuditCompleteV1>()
-                        .is_some() =>
-                {
-                    let audit_path = prefilter_audit_out
+                Err(error) => {
+                    // The audit writes its report atomically BEFORE returning
+                    // the typed sentinel, but the streaming runner wraps a
+                    // failed batch into its own infrastructure error. Treat
+                    // the report's existence as the completion signal either
+                    // way, so the diagnostic always exits 0.
+                    let audit_completed = prefilter_audit_out
                         .as_deref()
-                        .expect("prefilter ranking audit flag was set");
-                    println!("prefilter_ranking_audit={audit_path}");
-                    println!("prefilter_ranking_audit_status=ResearchOnly");
-                    return Ok((symbol.clone(), base.clone(), 0, 0));
+                        .map(|path| std::path::Path::new(path).exists())
+                        .unwrap_or(false)
+                        || error
+                            .downcast_ref::<neoethos_search::discovery::PrefilterRankingAuditCompleteV1>()
+                            .is_some();
+                    if audit_completed {
+                        let audit_path = prefilter_audit_out
+                            .as_deref()
+                            .expect("prefilter ranking audit flag was set");
+                        println!("prefilter_ranking_audit={audit_path}");
+                        println!("prefilter_ranking_audit_status=ResearchOnly");
+                        return Ok((symbol.clone(), base.clone(), 0, 0));
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             };
 
             if let Some(diag_out) = diagnose_exit_written {
