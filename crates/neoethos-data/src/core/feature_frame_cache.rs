@@ -4,8 +4,9 @@
 //! feature cube (~90 minutes on the frozen EURUSD M15+H1,H4 corpus). This
 //! module persists a completed frame under a key derived from the input
 //! identity - the per-timeframe dataset generation/manifest/Vortex digests,
-//! the exact feature-build recipe (including the streaming working-set batch)
-//! and the resolved vector-ta math authority - so an identical input digest
+//! the exact feature-build recipe (including the streaming working-set batch,
+//! keyed at a deterministic batch width so a machine's free-RAM probe cannot
+//! change the key) and the resolved vector-ta math authority - so an identical input digest
 //! skips the build. Any digest change produces a different key and therefore a
 //! miss. Correctness is NOT trusted to the key alone: the CLI seals each
 //! stored frame with its canonical search receipt and refuses a cache hit
@@ -25,10 +26,13 @@ use std::sync::Arc;
 
 use neoethos_feature_contracts::SourceArtifactBindingV1;
 
+use crate::core::feature_budget::MAX_COLUMNS_HARD_CEILING;
 use crate::core::features::{
     FeatureBuildOptions, FeatureCellValidity, FeatureColumnF64, FeatureFrame, FeatureFrameRowIds,
 };
-use crate::core::hpc_ta::{SweepBatch, resolved_canonical_feature_execution_authority_v1};
+use crate::core::hpc_ta::{
+    SweepBatch, resolved_canonical_feature_execution_authority_v1, search_working_set_batch,
+};
 use crate::core::normalization::SearchNormalizationFittedStateV1;
 use neoethos_feature_contracts::{DatasetFeatureArtifactProvenanceV1, FeaturePlanV1};
 
@@ -44,6 +48,18 @@ const CACHE_KEY_DOMAIN_V1: &[u8] = b"neoethos.feature-frame-cache-key.v1\0";
 const CACHE_META_SCHEMA_V1: &str = "neoethos.feature-frame-cache-entry.v1";
 const CACHE_META_VERSION_V1: u32 = 1;
 const CACHE_PAYLOAD_MAGIC_V1: &[u8] = b"NEOTFFC1";
+
+/// Batch width used ONLY to derive the streaming component of a cache key.
+///
+/// The live streaming sweep is sized from free RAM
+/// (`VocabularyBudget::for_run` -> `streaming_working_set_sizing`), so the
+/// same inputs produce different batch widths (and different slices) from run
+/// to run; hashing that width would turn every run into a cache miss. The key
+/// instead re-derives the batch at this fixed ceiling - the same hard cap the
+/// live vocabulary budget already enforces - so the key is a pure function of
+/// the inputs and the cursor, never of a machine's memory state. The receipt
+/// sidecar remains the integrity backstop for whatever frame is stored.
+pub const CACHE_KEY_DETERMINISTIC_BATCH_COLUMNS: usize = MAX_COLUMNS_HARD_CEILING;
 
 /// Research-only feature-frame cache configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,10 +97,12 @@ fn validate_cache_key(key: &str) -> Result<()> {
 /// The key covers every digest that identifies the input: the symbol, every
 /// timeframe's exact dataset identity/manifest/Vortex generation (as
 /// SourceArtifactBindingV1 values), the exact feature-build options, the
-/// streaming working-set batch (when present), and the resolved vector-ta math
-/// authority. The frame content is a deterministic function of exactly these
-/// inputs, so an equal key is an equal frame; any digest change yields a
-/// different key (a miss) and the old entry is eventually evicted.
+/// streaming working-set batch (when present, re-derived at a deterministic
+/// width - see [`CACHE_KEY_DETERMINISTIC_BATCH_COLUMNS`]), and the resolved
+/// vector-ta math authority. Any digest change yields a different key (a
+/// miss) and the old entry is eventually evicted. Correctness is never
+/// trusted to the key alone: the receipt sidecar seals the stored frame and
+/// a hit must reproduce that receipt bit for bit.
 pub fn feature_frame_cache_input_key(
     symbol: &str,
     bindings: &[SourceArtifactBindingV1],
@@ -117,7 +135,18 @@ pub fn feature_frame_cache_input_key(
         serde_json::to_vec(options).expect("feature build options must serialize canonically"),
     );
     if let Some(batch) = batch {
-        hasher.update(serde_json::to_vec(batch).expect("sweep batch must serialize canonically"));
+        // Hash a batch re-derived at a DETERMINISTIC width, never the live
+        // one: the live sweep is sized from free RAM, so hashing it would
+        // make every run on the same inputs miss the cache. The cursor still
+        // distinguishes batches inside one sweep.
+        let key_batch = search_working_set_batch(
+            batch.cursor,
+            CACHE_KEY_DETERMINISTIC_BATCH_COLUMNS,
+            batch.replace_base_vocabulary,
+        );
+        hasher.update(
+            serde_json::to_vec(&key_batch).expect("sweep batch must serialize canonically"),
+        );
     }
     let authority = resolved_canonical_feature_execution_authority_v1();
     hasher.update(format!("{:?}", authority.policy).as_bytes());
@@ -695,6 +724,34 @@ mod tests {
             base,
             feature_frame_cache_input_key("GBPUSD", &test_bindings(7), &options, None),
             "the symbol must change the key"
+        );
+    }
+
+    #[test]
+    fn key_is_stable_across_different_available_ram_probes() {
+        // Two runs on identical inputs whose free-RAM probes sized different
+        // live batch widths must still derive the SAME cache key: the key
+        // re-derives the batch at a deterministic width and must never hash
+        // the RAM-derived one (that made every real run a miss).
+        let options = test_options();
+        let bindings = test_bindings(7);
+        let narrow = search_working_set_batch(0, 96, true);
+        let wide = search_working_set_batch(0, 640, true);
+        assert!(
+            !narrow.is_empty() && !wide.is_empty(),
+            "both probe fixtures must select a non-empty working set"
+        );
+        assert_ne!(
+            serde_json::to_vec(&narrow).expect("narrow batch serializes"),
+            serde_json::to_vec(&wide).expect("wide batch serializes"),
+            "the two RAM probes must produce different live batches"
+        );
+        let key_narrow =
+            feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&narrow));
+        let key_wide = feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&wide));
+        assert_eq!(
+            key_narrow, key_wide,
+            "the cache key must not depend on the free-RAM-derived batch width"
         );
     }
 
