@@ -114,30 +114,31 @@ impl Stage1Window {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DiscoveryRuntimeOverrides {
+    /// See the identically named field on
+    /// `neoethos_core::config::DiscoveryRuntimeConfig` — that struct owns
+    /// the decision rationale; this copy only carries the resolved value
+    /// into the search runtime.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prefilter_direction_only_ranking: bool,
+    /// Family prefixes purged from the prefilter ranking; rationale and
+    /// matching rules live on `DiscoveryRuntimeConfig::prefilter_purge_prefixes`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefilter_purge_prefixes: Vec<String>,
     /// Explicit new-run weekly objective. False retains legacy scoring.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub weekly_cadence: bool,
     /// FLOOR on the number of features kept after the in-sample correlation
-    /// prefilter. `0` disables the prefilter entirely.
-    ///
-    /// Since 2026-08-10 the effective pool is derived from GA capacity by
-    /// [`resolve_prefilter_top_k`] and this value is its lower bound. See that
-    /// function for why a constant against a hardware-sized cube was the same
-    /// defect class as sizing memory from a user parameter, and for the numbers
-    /// that refuse the three obvious alternatives.
+    /// prefilter; `0` disables the prefilter entirely. The effective pool is
+    /// derived from GA capacity by [`resolve_prefilter_top_k`].
     pub prefilter_top_k: usize,
     /// Fraction of rows treated as in-sample when ranking features. Must be
     /// strictly positive and at most `1.0`.
     pub prefilter_insample_frac: f64,
-    /// Minimum number of features to force-keep from EACH present higher
+    /// Minimum number of features force-kept from EACH present higher
     /// timeframe group during the prefilter, on top of the global
-    /// `prefilter_top_k`. The correlation ranking is against the BASE
-    /// timeframe's 1-bar forward return, against which a near-constant
-    /// higher-TF indicator scores ~0 — so without this quota the global
-    /// top-K discards every multi-TF feature and the GA's multi-TF seed
-    /// templates find no `H1_`/`H4_`/… prefixes. `0` = legacy behaviour.
+    /// `prefilter_top_k`; `0` reproduces the legacy base-only behaviour.
     pub prefilter_min_per_timeframe: usize,
     /// Fraction of rows fed to the multi-stage funnel's first stage.
     /// Clamped to `[0.01, 1.0]` at use time.
@@ -145,61 +146,26 @@ pub struct DiscoveryRuntimeOverrides {
     /// Where in the input window to slice the stage-1 fast-evaluation
     /// rows. Defaults to [`Stage1Window::Earliest`] for OOS safety.
     pub stage1_window: Stage1Window,
-    /// **F-096 fix (2026-05-25)** — minimum historical-data window
-    /// in years that the discovery pipeline requires before it agrees
-    /// to run. Default `10` per operator real-data directive
-    /// 2026-05-24. Setting to `0` skips the check (test fixtures /
-    /// demo replays). The pre-flight check lives in
-    /// [`ensure_sufficient_history`] and runs at the top of
-    /// `run_discovery_cycle_with_progress`.
+    /// Minimum historical-data window (years) discovery requires before it
+    /// agrees to run; `0` skips the pre-flight check.
     pub min_history_years: u32,
+
 }
 
 impl Default for DiscoveryRuntimeOverrides {
     fn default() -> Self {
         Self {
             // 240, matching config.yaml AND
-            // `neoethos_core::config::DiscoveryRuntimeConfig::default()`. The
-            // three had drifted — code 50 / root yaml 240 / desktop yaml 50 —
-            // so a run's indicator pool was five times smaller or larger
-            // depending on whether a config file could be read, and no
-            // artifact recorded which branch ran. The other two sites were
-            // fixed by the indicator-vocabulary workflow and are pinned by
-            // `crates/neoethos-core/tests/shipped_config_matches_defaults.rs`;
-            // this is the third, applied from
-            // `docs/pending-edits-forbidden-territory.md` §2.
+            // `neoethos_core::config::DiscoveryRuntimeConfig::default()`.
             weekly_cadence: false,
             prefilter_top_k: 240,
-            // The outer discovery wrapper has already removed the untouched
-            // holdout. Ranking on only 80% of that admissible selection prefix
-            // is not a second out-of-sample check; it merely discards another
-            // fifth of the evidence available to choose the vocabulary.
             prefilter_insample_frac: 1.0,
             prefilter_min_per_timeframe: 6,
             funnel_stage1_pct: 0.25,
             stage1_window: Stage1Window::Earliest,
-            // **2026-05-26 operator directive (Κωνσταντίνος)**: the design
-            // intent was always "use 80/20 of WHATEVER data we have", not
-            // "require absolute 10y before running". The 80/20 train/val
-            // split is enforced downstream by
-            // `run_discovery_cycle_with_holdout` using the canonical outer-OOS
-            // fraction, which adapts to any window length. Setting the
-            // absolute-minimum gate to 0 by default
-            // means short windows (5y M5, 3y crypto, etc.) run through
-            // the same pipeline and the operator gets a *result* (even if
-            // empty portfolio because the strategies overfit) rather than
-            // a hard "Failed: insufficient history" preflight stop. Operators
-            // who want the strict 10y gate back set
-            // `models.discovery_runtime.min_history_years: 10` in config.
-            // (Before 2026-08-10 this comment named an env var; that reader is
-            // deleted — there is one place to set this and it is the config.)
-            //
-            // F-096 history (2026-05-24, now superseded): the previous
-            // default was 10 because synthetic-data leaks into discovery
-            // had produced misleading results. With Vortex now refusing
-            // synthetic fallbacks (#221) the leak risk is gone, so the
-            // 10y floor is no longer needed.
             min_history_years: 0,
+            prefilter_direction_only_ranking: false,
+            prefilter_purge_prefixes: Vec::new(),
         }
     }
 }
@@ -231,6 +197,25 @@ impl DiscoveryRuntimeOverrides {
             );
         }
         overrides.prefilter_min_per_timeframe = cfg.prefilter_min_per_timeframe;
+        overrides.prefilter_direction_only_ranking = cfg.prefilter_direction_only_ranking;
+        overrides.prefilter_purge_prefixes = cfg
+            .prefilter_purge_prefixes
+            .iter()
+            .map(|prefix| prefix.trim().to_ascii_lowercase())
+            .filter(|prefix| !prefix.is_empty())
+            .collect();
+        if !cfg.prefilter_purge_prefixes.is_empty()
+            && overrides.prefilter_purge_prefixes.len() != cfg.prefilter_purge_prefixes.len()
+        {
+            tracing::warn!(
+                target: "neoethos_search::config_resolution",
+                key = "models.discovery_runtime.prefilter_purge_prefixes",
+                configured = ?cfg.prefilter_purge_prefixes,
+                effective = ?overrides.prefilter_purge_prefixes,
+                "blank purge prefixes were dropped — a purge list entry must be a non-empty \
+                 feature-name prefix"
+            );
+        }
         if cfg.funnel_stage1_pct.is_finite() {
             let clamped = cfg.funnel_stage1_pct.clamp(0.01, 1.0);
             if (clamped - cfg.funnel_stage1_pct).abs() > f64::EPSILON {
@@ -2598,6 +2583,13 @@ pub struct DiscoveryRunProfile {
     pub funnel_stage1_pct: f64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub weekly_cadence: bool,
+    /// Direction-only prefilter ranking was active for this run (opt-in).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prefilter_direction_only_ranking: bool,
+    /// Volatility-family purge prefixes active for this run (opt-in, empty =
+    /// off).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefilter_purge_prefixes: Vec<String>,
     /// Per-kind validation-evidence hashes ready for the typed
     /// [`neoethos_core::contracts::ValidationEvidenceManifest`]. `None`
     /// per field indicates that artifact kind was not produced for
@@ -10772,50 +10764,10 @@ where
     // expectancy stayed at -4.15 pips per trade while payoff moved 0.91 → 2.53.
     // This changes which shapes are REACHABLE. The expectancy gate decides which
     // of them survive.
-    {
-        let bounds_cfg = crate::genetic::current_gene_stop_bounds_overrides();
-        let evaluation = config.evaluation_config(ohlcv.close.last().copied());
-        let pip = crate::genetic::adaptive_pip_size(evaluation.pip_value, &evaluation.symbol);
-        let atr = if bounds_cfg.atr_scaled {
-            crate::stop_target::median_atr_pips(&ohlcv.high, &ohlcv.low, &ohlcv.close, pip, 14)
-        } else {
-            None
-        };
-        match atr {
-            Some(atr_pips) => {
-                crate::genetic::install_gene_stop_atr_scale(atr_pips);
-                let resolved = crate::genetic::current_gene_stop_bounds();
-                tracing::info!(
-                    target: "neoethos_search::discovery",
-                    timeframe = %config.timeframe_label,
-                    atr_pips = atr_pips,
-                    sl_min_pips = resolved.sl_min_pips,
-                    sl_max_pips = resolved.sl_max_pips,
-                    tp_min_pips = resolved.tp_min_pips,
-                    tp_max_pips = resolved.tp_max_pips,
-                    rr_min = resolved.rr_min,
-                    rr_max = resolved.rr_max,
-                    "gene stop/target band scaled to this dataset's median ATR"
-                );
-            }
-            None => {
-                crate::genetic::clear_gene_stop_atr_scale();
-                let resolved = crate::genetic::current_gene_stop_bounds();
-                tracing::warn!(
-                    target: "neoethos_search::discovery",
-                    timeframe = %config.timeframe_label,
-                    atr_scaled_requested = bounds_cfg.atr_scaled,
-                    sl_min_pips = resolved.sl_min_pips,
-                    sl_max_pips = resolved.sl_max_pips,
-                    tp_min_pips = resolved.tp_min_pips,
-                    tp_max_pips = resolved.tp_max_pips,
-                    "gene stop/target band is the ABSOLUTE pip band — no ATR scale for this \
-                     dataset (too few bars, or a constant series, or atr_scaled disabled). On \
-                     anything above M5 this band is far tighter than one bar's range"
-                );
-            }
-        }
-    }
+    // One numerical authority for the gene stop/target band. Shared with the
+    // prefilter-ranking audit so that diagnostic reproduces the EXACT label
+    // geometry the GA cycle would have used.
+    install_gene_stop_band_scale_for_dataset(config, ohlcv);
 
     // ── CONFIG-IDENTITY GATE (2026-08-09) ─────────────────────────────────
     //
@@ -11068,6 +11020,9 @@ where
             sl_atr_mult: financial_geometry.stop_atr_multiplier,
             rr: financial_geometry.reward_risk_ratio,
             round_trip_cost_px: financial_geometry.round_trip_cost_price,
+            direction_only_ranking: config.runtime_overrides.prefilter_direction_only_ranking,
+            purge_prefixes: config.runtime_overrides.prefilter_purge_prefixes.clone(),
+            audit_ranking: false,
         };
         let (filtered_frame, census) = prefilter_features(&features, &ohlcv, &spec)?;
         features = filtered_frame;
@@ -11603,6 +11558,19 @@ pub(crate) struct PrefilterSpec {
     /// Round-trip cost in PRICE units, charged into both barriers so the label
     /// says "would this trade have paid" rather than "did price move".
     pub round_trip_cost_px: f64,
+    /// Direction-only ranking: each direction's correlation is computed on the
+    /// rows where that direction's label is decided (`+1`/`-1`) only, so a
+    /// volatility feature cannot rank on the label's decidedness (ATR-scaled
+    /// barriers decide how often a label is decided by construction).
+    pub direction_only_ranking: bool,
+    /// Feature-name prefixes purged from the ranking, the per-timeframe quota
+    /// AND the seed-template force-keep. Timeframe prefixes (`H1_`, `H4_`, …)
+    /// are stripped before matching. Empty = no purge.
+    pub purge_prefixes: Vec<String>,
+    /// Collect the full descending score table for every rankable column
+    /// instead of discarding it after top-K. Used by the prefilter ranking
+    /// audit; production runs keep this `false`.
+    pub audit_ranking: bool,
 }
 
 /// One numerical authority for the CPU and resident-CUDA prefilter label
@@ -11697,6 +11665,236 @@ pub(crate) fn resolve_prefilter_financial_geometry_from_evaluation_v2(
     }
 }
 
+/// Install this dataset's gene stop/target band scale, exactly like the
+/// discovery cycle does before the prefilter. Shared by the cycle and the
+/// prefilter-ranking audit so the diagnostic reproduces the EXACT label
+/// geometry a GA run would have used.
+fn install_gene_stop_band_scale_for_dataset(config: &DiscoveryConfig, ohlcv: &Ohlcv) {
+    let bounds_cfg = crate::genetic::current_gene_stop_bounds_overrides();
+    let evaluation = config.evaluation_config(ohlcv.close.last().copied());
+    let pip = crate::genetic::adaptive_pip_size(evaluation.pip_value, &evaluation.symbol);
+    let atr = if bounds_cfg.atr_scaled {
+        crate::stop_target::median_atr_pips(&ohlcv.high, &ohlcv.low, &ohlcv.close, pip, 14)
+    } else {
+        None
+    };
+    match atr {
+        Some(atr_pips) => {
+            crate::genetic::install_gene_stop_atr_scale(atr_pips);
+            let resolved = crate::genetic::current_gene_stop_bounds();
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                timeframe = %config.timeframe_label,
+                atr_pips = atr_pips,
+                sl_min_pips = resolved.sl_min_pips,
+                sl_max_pips = resolved.sl_max_pips,
+                tp_min_pips = resolved.tp_min_pips,
+                tp_max_pips = resolved.tp_max_pips,
+                rr_min = resolved.rr_min,
+                rr_max = resolved.rr_max,
+                "gene stop/target band scaled to this dataset's median ATR"
+            );
+        }
+        None => {
+            crate::genetic::clear_gene_stop_atr_scale();
+            let resolved = crate::genetic::current_gene_stop_bounds();
+            tracing::warn!(
+                target: "neoethos_search::discovery",
+                timeframe = %config.timeframe_label,
+                atr_scaled_requested = bounds_cfg.atr_scaled,
+                sl_min_pips = resolved.sl_min_pips,
+                sl_max_pips = resolved.sl_max_pips,
+                tp_min_pips = resolved.tp_min_pips,
+                tp_max_pips = resolved.tp_max_pips,
+                "gene stop/target band is the ABSOLUTE pip band — no ATR scale for this \
+                 dataset (too few bars, or a constant series, or atr_scaled disabled). On \
+                 anything above M5 this band is far tighter than one bar's range"
+            );
+        }
+    }
+}
+
+/// Typed completion signal for the prefilter-ranking audit. The audit writes
+/// its report and then returns this error so the CLI can short-circuit before
+/// the GA and still exit 0 with the report path on stdout.
+#[derive(Debug)]
+pub struct PrefilterRankingAuditCompleteV1;
+
+impl std::fmt::Display for PrefilterRankingAuditCompleteV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PREFILTER_RANKING_AUDIT_COMPLETE_V1")
+    }
+}
+
+impl std::error::Error for PrefilterRankingAuditCompleteV1 {}
+
+/// Family classification for one column, for the audit report.
+pub fn classify_prefilter_column_family_v1(name: &str) -> &'static str {
+    // The volatility families named by the indicator census hypothesis, plus
+    // the state families and a broad catch-all. Timeframe prefixes are
+    // stripped first so `H1_mass_7` classifies as `volatility`.
+    let bare = crate::prefilter_schema_v1::strip_timeframe_prefix_v1(name);
+    for family in crate::prefilter_schema_v1::PREFILTER_STATE_FAMILIES_V1 {
+        if bare.starts_with(family) {
+            return "state";
+        }
+    }
+    const VOLATILITY_PREFIXES: &[&str] = &[
+        "atr",
+        "atr_percentile",
+        "natr",
+        "garman_klass_volatility",
+        "neoethos_custom_gk",
+        "parkinson_volatility",
+        "quant_parkinson_vol",
+        "quant_rvol",
+        "mass",
+        "normalized_volume_true_range",
+        "yang_zhang_volatility",
+        "historical_volatility",
+        "ewma_volatility",
+        "cvi",
+        "bollinger_bands_width",
+        "deviation",
+        "stddev",
+        "quant_log_volatility",
+        "quant_vol_ratio",
+        "gopalakrishnan_range_index",
+    ];
+    if VOLATILITY_PREFIXES
+        .iter()
+        .any(|prefix| bare.starts_with(prefix))
+    {
+        return "volatility";
+    }
+    "other"
+}
+
+/// OFF-LINE PREFILTER RANKING AUDIT (no GA).
+///
+/// Runs the production prefilter twice on the exact same sealed selection
+/// frame — once with the default correlation ranking and once with the
+/// direction-only ranking (decided rows only) — and persists both complete
+/// score tables plus the label census to `out`. The report is ResearchOnly
+/// and carries no strategy, portfolio or promotion content.
+///
+/// The function then returns [`PrefilterRankingAuditCompleteV1`] as an error
+/// so the CLI can short-circuit before the GA with exit code 0.
+pub fn run_prefilter_ranking_audit_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    out: &Path,
+) -> Result<serde_json::Value> {
+    contract.validate_against_input(input)?;
+    let mut research_config = config.clone();
+    apply_research_contract_to_discovery_config(&mut research_config, contract);
+    let _research_execution =
+        crate::canonical_trendbar_research::install_canonical_trendbar_research_execution_v3(
+            contract,
+        )?;
+    crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
+
+    // Same input split as the production cycle: first-80% selection window.
+    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let selection = inputs.selection();
+    let features = selection.features();
+    let ohlcv = selection.ohlcv();
+    install_gene_stop_band_scale_for_dataset(&research_config, ohlcv);
+    let financial_geometry = resolve_prefilter_financial_geometry_v1(
+        &research_config,
+        ohlcv.close.last().copied(),
+    );
+    let available = features.names.len();
+    let prefilter_top_k = resolve_prefilter_top_k(
+        research_config.runtime_overrides.prefilter_top_k,
+        available,
+        research_config.population,
+        research_config.max_indicators,
+    );
+    anyhow::ensure!(
+        prefilter_top_k > 0 && available > prefilter_top_k,
+        "prefilter ranking audit requires an active prefilter: configured_top_k={}, available={available}, resolved={prefilter_top_k}",
+        research_config.runtime_overrides.prefilter_top_k
+    );
+    let spec = PrefilterSpec {
+        top_k: prefilter_top_k,
+        insample_frac: research_config
+            .runtime_overrides
+            .resolved_prefilter_insample_frac(),
+        min_per_tf: research_config.runtime_overrides.prefilter_min_per_timeframe,
+        max_hold_bars: financial_geometry.max_hold_bars,
+        atr_period: 14,
+        sl_atr_mult: financial_geometry.stop_atr_multiplier,
+        rr: financial_geometry.reward_risk_ratio,
+        round_trip_cost_px: financial_geometry.round_trip_cost_price,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: true,
+    };
+    let (_, census_default, ranking_default) =
+        prefilter_features_with_ranking(features, ohlcv, &spec)?;
+    let mut direction_only_spec = spec.clone();
+    direction_only_spec.direction_only_ranking = true;
+    let (_, census_direction_only, ranking_direction_only) =
+        prefilter_features_with_ranking(features, ohlcv, &direction_only_spec)?;
+
+    let census_json = |census: &PrefilterCensus| {
+        serde_json::json!({
+            "columns_considered": census.columns_considered,
+            "columns_kept": census.columns_kept,
+            "columns_unrankable": census.columns_unrankable,
+            "label_up": census.label_up,
+            "label_down": census.label_down,
+            "label_vertical": census.label_vertical,
+            "label_ambiguous": census.label_ambiguous,
+            "label_undefined": census.label_undefined,
+            "label_short_win": census.label_short_win,
+            "label_short_loss": census.label_short_loss,
+            "label_vertical_short": census.label_vertical_short,
+            "label_fell_back_to_forward_return": census.label_fell_back_to_forward_return
+        })
+    };
+    let ranking_json = |ranking: &[(usize, String, f64, f64, u32, bool)]| {
+        ranking
+            .iter()
+            .map(|(index, name, score, instability, timeframe_group, purged)| {
+                serde_json::json!({
+                    "index": index,
+                    "name": name,
+                    "score": score,
+                    "instability": instability,
+                    "timeframe_group": timeframe_group,
+                    "purged": purged
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let report = serde_json::json!({
+        "schema": "neoethos.research-only.prefilter-ranking-audit.v1",
+        "artifact_class": "ResearchOnly",
+        "promotion_eligibility": "NotPromotionEligible",
+        "authorization_issued": false,
+        "warning": "Offline prefilter ranking comparison on the sealed selection frame. Rankings are vocabulary selection, not directional edge, financial viability, OOS or promotion evidence. No GA ran and no portfolio exists.",
+        "columns_considered": available,
+        "top_k": prefilter_top_k,
+        "ranking_default": ranking_json(&ranking_default),
+        "ranking_direction_only": ranking_json(&ranking_direction_only),
+        "label_census_default": census_json(&census_default),
+        "label_census_direction_only": census_json(&census_direction_only)
+    });
+    write_json_atomic(out, &report)?;
+    tracing::info!(
+        target: "neoethos_search::prefilter",
+        report = %out.display(),
+        columns = available,
+        top_k = prefilter_top_k,
+        default_ranked = ranking_default.len(),
+        direction_only_ranked = ranking_direction_only.len(),
+        "prefilter ranking audit report written; short-circuiting before the GA"
+    );
+    Err(anyhow::Error::new(PrefilterRankingAuditCompleteV1))
+}
 /// Counted outcomes of one prefilter pass. Nothing on this path is discarded
 /// without a name and a number.
 #[derive(Debug, Default, Clone)]
@@ -11997,6 +12195,21 @@ fn prefilter_features(
     ohlcv: &Ohlcv,
     spec: &PrefilterSpec,
 ) -> Result<(FeatureFrame, PrefilterCensus)> {
+    let mut inner_spec = spec.clone();
+    inner_spec.audit_ranking = false;
+    let (frame, census, _ranking) =
+        prefilter_features_with_ranking(features, ohlcv, &inner_spec)?;
+    Ok((frame, census))
+}
+
+/// The prefilter core. When `spec.audit_ranking` is set it also returns the
+/// complete descending score table (every rankable column, not just top-K)
+/// for the ranking audit; production keeps it `false` and pays nothing.
+fn prefilter_features_with_ranking(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    spec: &PrefilterSpec,
+) -> Result<(FeatureFrame, PrefilterCensus, Vec<(usize, String, f64, f64, u32, bool)>)> {
     let n_rows = features.n_samples();
     let n_cols = features.n_features();
     if n_rows < 2 || n_cols <= spec.top_k {
@@ -12005,7 +12218,7 @@ fn prefilter_features(
             columns_kept: n_cols,
             ..PrefilterCensus::default()
         };
-        return Ok((features.clone(), census));
+        return Ok((features.clone(), census, Vec::new()));
     }
     let _base_timeframe_guard =
         crate::genetic::search_engine::base_timeframe_context_from_features(features).map(
@@ -12115,7 +12328,7 @@ fn prefilter_features(
             "prefilter selection window is too short to rank features; preserving the complete \
              frame instead of excluding columns on an empty label-safe sample"
         );
-        return Ok((features.clone(), census));
+        return Ok((features.clone(), census, Vec::new()));
     }
 
     struct ColumnScore {
@@ -12126,7 +12339,50 @@ fn prefilter_features(
         rankable: bool,
     }
 
+    // Volatility-family purge (opt-in). A purged column is excluded by name
+    // from the ranking AND from every re-insertion path below (per-TF quota,
+    // seed-template force-keep). Timeframe prefixes are stripped before the
+    // prefix match so `H1_atr_7` matches a purge of `atr`.
+    let purged: HashSet<usize> = if spec.purge_prefixes.is_empty() {
+        HashSet::new()
+    } else {
+        features
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| {
+                let bare = crate::prefilter_schema_v1::strip_timeframe_prefix_v1(name);
+                spec.purge_prefixes
+                    .iter()
+                    .any(|prefix| bare.starts_with(prefix.as_str()))
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    };
+    if !purged.is_empty() {
+        tracing::warn!(
+            target: "neoethos_search::prefilter",
+            purged_columns = purged.len(),
+            prefixes = ?spec.purge_prefixes,
+            "volatility-family purge is ACTIVE — purged columns are excluded by name from \
+             the ranking, the per-timeframe quota and the seed-template force-keep"
+        );
+    }
+
     let score_column = |col_idx: usize, col: &neoethos_data::FeatureColumnF64| -> ColumnScore {
+        if purged.contains(&col_idx) {
+            // Purged columns are excluded by name, exactly like unrankable
+            // columns — they are never scored 0.0 and left to lose a
+            // tie-break, and the per-TF quota / template loops cannot
+            // resurrect them because they never enter `correlations`.
+            return ColumnScore {
+                idx: col_idx,
+                score: f64::NEG_INFINITY,
+                instability: 0.0,
+                had_nonfinite: false,
+                rankable: false,
+            };
+        }
         if sealed_schema.column_class_flags()[col_idx]
             & crate::prefilter_schema_v1::COLUMN_CLASS_STATE_V1
             != 0
@@ -12152,6 +12408,7 @@ fn prefilter_features(
         for window in &windows {
             let mut xs: Vec<f64> = Vec::with_capacity(window.len());
             let mut ys: Vec<f64> = Vec::with_capacity(window.len());
+            let mut xs_short: Vec<f64> = Vec::with_capacity(window.len());
             let mut ys_short: Vec<f64> = Vec::with_capacity(window.len());
             for &row in window {
                 // The label series is bar-indexed and the feature cube is
@@ -12162,14 +12419,40 @@ fn prefilter_features(
                 if row >= n_rows || row >= labels.len() {
                     continue;
                 }
-                xs.push(if col.validity[row].is_valid() {
+                let x = if col.validity[row].is_valid() {
                     col.values[row]
                 } else {
                     f64::NAN
-                });
-                ys.push(labels[row]);
-                if let Some(short) = short_labels.as_ref() {
-                    ys_short.push(short.get(row).copied().unwrap_or(f64::NAN));
+                };
+                if spec.direction_only_ranking {
+                    // DIRECTION-ONLY RANKING (opt-in). Each direction is
+                    // scored on the rows where ITS OWN label is decided
+                    // (`+1`/`-1`) only. Vertical and ambiguous rows (`0`)
+                    // are excluded, so a volatility feature cannot rank on
+                    // the label's decidedness — the ATR-scaled barriers
+                    // decide how often a label is decided by construction,
+                    // and `abs(corr)` used to convert that decidedness
+                    // correlation into a high rank. The rank now answers
+                    // "given a barrier is hit, does this column predict
+                    // WHICH one".
+                    let long_label = labels[row];
+                    if long_label.is_finite() && long_label != 0.0 {
+                        xs.push(x);
+                        ys.push(long_label);
+                    }
+                    if let Some(short) = short_labels.as_ref() {
+                        let short_label = short.get(row).copied().unwrap_or(f64::NAN);
+                        if short_label.is_finite() && short_label != 0.0 {
+                            xs_short.push(x);
+                            ys_short.push(short_label);
+                        }
+                    }
+                } else {
+                    xs.push(x);
+                    ys.push(labels[row]);
+                    if let Some(short) = short_labels.as_ref() {
+                        ys_short.push(short.get(row).copied().unwrap_or(f64::NAN));
+                    }
                 }
             }
             let outcome = neoethos_data::core::stats_f64::pearson_pairwise(&xs, &ys);
@@ -12186,8 +12469,14 @@ fn prefilter_features(
                 None
             };
             if short_labels.is_some() {
-                let short_outcome =
-                    neoethos_data::core::stats_f64::pearson_pairwise(&xs, &ys_short);
+                // Direction-only scores the short direction on its own
+                // decided rows; the default scores it on the same rows as
+                // the long direction (the two labels share the bar index).
+                let short_outcome = if spec.direction_only_ranking {
+                    neoethos_data::core::stats_f64::pearson_pairwise(&xs_short, &ys_short)
+                } else {
+                    neoethos_data::core::stats_f64::pearson_pairwise(&xs, &ys_short)
+                };
                 if short_outcome.skipped > 0 {
                     had_nonfinite = true;
                 }
@@ -12382,6 +12671,9 @@ fn prefilter_features(
                 }
             }
             for &(idx, _) in &correlations {
+                if purged.contains(&idx) {
+                    continue;
+                }
                 let group = sealed_schema.timeframe_group_ids()[idx];
                 if group == 0 {
                     continue;
@@ -12407,6 +12699,7 @@ fn prefilter_features(
         // dropped. Two unrelated decisions on one flag, with nothing saying so.
         // BEHAVIOUR CHANGE: at `min_per_tf = 0` the template columns are now
         // kept; at any positive value nothing changes.
+        let mut purged_template_keeps: Vec<&String> = Vec::new();
         for (idx, force_keep) in sealed_schema
             .template_force_keep_flags()
             .iter()
@@ -12414,8 +12707,23 @@ fn prefilter_features(
             .enumerate()
         {
             if force_keep != 0 {
+                if purged.contains(&idx) {
+                    // A purge is a purge: the seed templates resolve
+                    // against the surviving alphabet and simply skip the
+                    // roles this column used to fill.
+                    purged_template_keeps.push(&features.names[idx]);
+                    continue;
+                }
                 kept.insert(idx);
             }
+        }
+        if !purged_template_keeps.is_empty() {
+            tracing::warn!(
+                target: "neoethos_search::prefilter",
+                purged_template_columns = ?purged_template_keeps,
+                "the volatility purge dropped columns the seed templates reference — the \
+                 warm-start resolves against the surviving alphabet and skips those roles"
+            );
         }
         keep_indices = kept.into_iter().collect();
     }
@@ -12425,7 +12733,47 @@ fn prefilter_features(
     let n_keep = keep_indices.len();
     census.columns_kept = n_keep;
 
-    Ok((features.select_columns(&keep_indices)?, census))
+    // The complete descending score table, ordered exactly like the sort
+    // above (score desc, parent index asc) so top-K membership is a prefix.
+    // State force-keeps keep their INFINITY slots at the head; purged and
+    // unrankable columns are appended with `purged`/`score=NaN` so the audit
+    // can name every exclusion without guessing from the kept list.
+    // Tuple rows: (index, name, score, instability, timeframe_group, purged).
+    let mut ranking: Vec<(usize, String, f64, f64, u32, bool)> = Vec::new();
+    if spec.audit_ranking {
+        let mut rankable: Vec<&ColumnScore> = scored.iter().filter(|e| e.rankable).collect();
+        rankable.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.idx.cmp(&b.idx))
+        });
+        ranking.extend(rankable.iter().map(|entry| {
+            (
+                entry.idx,
+                features.names[entry.idx].clone(),
+                entry.score,
+                entry.instability,
+                sealed_schema.timeframe_group_ids()[entry.idx],
+                false,
+            )
+        }));
+        for entry in &scored {
+            if entry.rankable {
+                continue;
+            }
+            ranking.push((
+                entry.idx,
+                features.names[entry.idx].clone(),
+                f64::NAN,
+                0.0,
+                sealed_schema.timeframe_group_ids()[entry.idx],
+                purged.contains(&entry.idx),
+            ));
+        }
+    }
+
+    Ok((features.select_columns(&keep_indices)?, census, ranking))
 }
 
 /// Genes that must be expected to touch a given column before that column
@@ -17600,9 +17948,13 @@ pub fn build_discovery_profile(
         stage1_window,
         min_history_years,
         weekly_cadence,
+        prefilter_direction_only_ranking,
+        prefilter_purge_prefixes,
     } = runtime_overrides;
     DiscoveryRunProfile {
         weekly_cadence: *weekly_cadence,
+        prefilter_direction_only_ranking: *prefilter_direction_only_ranking,
+        prefilter_purge_prefixes: prefilter_purge_prefixes.clone(),
         population_eval_engines,
         population_execution_run_receipt_v2: population_execution_run_receipt_v2.cloned(),
         timeframe_label: timeframe_label.clone(),

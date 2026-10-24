@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 21] = [
+const OPTIONAL: [&str; 22] = [
     "--higher",
     "--population",
     "--generations",
@@ -51,6 +51,7 @@ const OPTIONAL: [&str; 21] = [
     "--diagnose-exit-policy-out",
     "--new-search-research",
     "--new-search-research-sha256",
+    "--prefilter-ranking-audit-out",
 ];
 
 const RESUME_FLAGS: [&str; 2] = ["--resume-research", "--resume-research-sha256"];
@@ -554,6 +555,7 @@ fn forward_optional_diagnostic_flags(args: &Arguments, discovery_args: &mut Vec<
         "--diagnose-candidate-weekdays-out",
         "--diagnose-candidate-selectors",
         "--diagnose-exit-policy-out",
+        "--prefilter-ranking-audit-out",
     ] {
         if let Some(value) = args.0.get(flag) {
             push(discovery_args, flag, value);

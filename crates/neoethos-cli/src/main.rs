@@ -2234,6 +2234,34 @@ fn cmd_discover_on_budgeted_pool(
         let diagnose_weekdays_out = parse_flag(args, "--diagnose-candidate-weekdays-out");
         let diagnose_exit_out = parse_flag(args, "--diagnose-exit-policy-out");
         let diagnose_weekday_selectors = parse_flag(args, "--diagnose-candidate-selectors");
+        // Research-only offline prefilter-ranking audit (no GA): ranks the full
+        // pre-prefilter vocabulary under the default correlation ranking AND
+        // the direction-only ranking and persists both tables, then
+        // short-circuits before Search via PrefilterRankingAuditCompleteV1.
+        let prefilter_audit_out = parse_flag(args, "--prefilter-ranking-audit-out");
+        if prefilter_audit_out.is_some() {
+            anyhow::ensure!(
+                canonical_cpu_research.is_some(),
+                "prefilter ranking audit requires canonical CPU research inputs"
+            );
+            anyhow::ensure!(
+                saved_research.is_none() && quote_replay.is_none() && new_search.is_none(),
+                "prefilter ranking audit cannot be combined with saved, quote-replay or new-search continuation"
+            );
+            anyhow::ensure!(
+                diagnose_cost_out.is_none()
+                    && diagnose_signals_out.is_none()
+                    && diagnose_weekdays_out.is_none()
+                    && diagnose_exit_out.is_none()
+                    && diagnose_weekday_selectors.is_none(),
+                "prefilter ranking audit cannot be combined with saved-candidate diagnostics"
+            );
+            let audit_path = prefilter_audit_out.as_deref().expect("flag is set");
+            anyhow::ensure!(
+                !std::path::Path::new(audit_path).exists(),
+                "prefilter ranking audit output must be a new path: {audit_path}"
+            );
+        }
         let diagnose_candidate_selections = {
             let weekday_mode = diagnose_weekdays_out.is_some();
             let exit_mode = diagnose_exit_out.is_some();
@@ -2720,7 +2748,8 @@ fn cmd_discover_on_budgeted_pool(
                 })
                 .transpose()?;
             let frame_cache_state = std::cell::RefCell::new(None::<(String, bool)>);
-            let mut outcome = neoethos_search::orchestration::run_streaming_working_set(
+            let mut outcome =
+                match neoethos_search::orchestration::run_streaming_working_set(
                 &streaming_plan,
                 base_ohlcv.close.len(),
                 |batch| {
@@ -2840,6 +2869,35 @@ fn cmd_discover_on_budgeted_pool(
                     } else {
                         None
                     };
+                    // Research-only offline prefilter-ranking audit: ranks the
+                    // complete pre-prefilter vocabulary under BOTH rankings and
+                    // persists the report, then short-circuits before the GA
+                    // with PrefilterRankingAuditCompleteV1 (caught by the
+                    // caller below, exit 0, no research.json written).
+                    if let Some(audit_out) = prefilter_audit_out.as_deref() {
+                        let diag_path = std::path::Path::new(audit_out);
+                        anyhow::ensure!(
+                            !diag_path.exists(),
+                            "prefilter ranking audit output must be a new path: {audit_out}"
+                        );
+                        if let Some(parent) = diag_path.parent()
+                            && !parent.as_os_str().is_empty()
+                        {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        emit_cpu_research_stage("prefilter_ranking_audit_started");
+                        // Writes the report, then always short-circuits.
+                        neoethos_search::discovery::run_prefilter_ranking_audit_v1(
+                            &run_input,
+                            &research_config,
+                            &contract,
+                            diag_path,
+                        )?;
+                        unreachable!(
+                            "the prefilter ranking audit always short-circuits with \
+                             PrefilterRankingAuditCompleteV1"
+                        );
+                    }
                     if let Some(saved) = saved_research.as_mut() {
                         let research = saved
                             .research
@@ -3073,7 +3131,22 @@ fn cmd_discover_on_budgeted_pool(
                         emit_cpu_research_progress,
                     )
                 },
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(error)
+                    if error
+                        .downcast_ref::<neoethos_search::discovery::PrefilterRankingAuditCompleteV1>()
+                        .is_some() =>
+                {
+                    let audit_path = prefilter_audit_out
+                        .as_deref()
+                        .expect("prefilter ranking audit flag was set");
+                    println!("prefilter_ranking_audit={audit_path}");
+                    println!("prefilter_ranking_audit_status=ResearchOnly");
+                    return Ok((symbol.clone(), base.clone(), 0, 0));
+                }
+                Err(error) => return Err(error),
+            };
 
             if let Some(diag_out) = diagnose_exit_written {
                 println!("candidate_exit_policy_variants={diag_out}");
@@ -4798,6 +4871,7 @@ const AUTORESEARCH_FLAGS: &[&str] = &[
     "--quote-replay-link",
     "--reviewed-evidence",
     "--quote-replay-policy",
+    "--prefilter-ranking-audit-out",
     // Set by the schedule orchestrator on the children it spawns; it is parsed
     // in `main` from the full argv and would otherwise look unknown here.
     "--cpu-threads",
@@ -5650,6 +5724,9 @@ fn print_help() {
     );
     println!(
         "    research-only saved-candidate exit-policy variants: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-selectors <index:strategy_id:fnv64:hash,...> --diagnose-exit-policy-out <new-json>"
+    );
+    println!(
+        "    research-only offline prefilter-ranking audit (no GA): --prefilter-ranking-audit-out <new-json> — ranks the full pre-prefilter vocabulary under the default correlation ranking AND the direction-only ranking, then short-circuits before Search"
     );
     println!(
         "                               One bounded CPU research run from exact acquisition receipts through D1 costs, discovery and chronological holdout evidence. Never authorizes promotion."

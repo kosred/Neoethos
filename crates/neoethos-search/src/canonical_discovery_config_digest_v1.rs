@@ -262,6 +262,8 @@ fn encode_runtime_overrides_v1(
         stage1_window,
         min_history_years,
         weekly_cadence,
+        prefilter_direction_only_ranking,
+        prefilter_purge_prefixes,
     } = runtime;
     encoder.record_start("runtime_overrides")?;
     encoder.usize("prefilter_top_k", *prefilter_top_k)?;
@@ -273,6 +275,19 @@ fn encode_runtime_overrides_v1(
     // Legacy false encodes identically; only the explicit new policy adds bytes.
     if *weekly_cadence {
         encoder.boolean("rolling_weekly_cadence_v1", true)?;
+    }
+    // Both new knobs encode ONLY when active, so the default configuration
+    // hashes exactly as it did before this feature existed and pre-knob
+    // artifacts stay comparable.
+    if *prefilter_direction_only_ranking {
+        encoder.boolean("prefilter_direction_only_ranking_v1", true)?;
+    }
+    if !prefilter_purge_prefixes.is_empty() {
+        encoder.record_start("prefilter_purge_prefixes_v1")?;
+        for (index, prefix) in prefilter_purge_prefixes.iter().enumerate() {
+            encoder.string(&index.to_string(), prefix)?;
+        }
+        encoder.record_end("prefilter_purge_prefixes_v1")?;
     }
     encoder.record_end("runtime_overrides")
 }

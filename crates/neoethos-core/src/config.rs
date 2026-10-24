@@ -1524,6 +1524,35 @@ pub struct DiscoveryRuntimeConfig {
     /// See [`PropFirmGateConfig`]. (was the
     /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides)
     pub prop_firm_gate: PropFirmGateConfig,
+    /// Opt-in DIRECTION-ONLY prefilter ranking (neo-671 volatility-decoupling
+    /// experiment, default `false` = unchanged behaviour).
+    ///
+    /// The default ranking scores each column by `max(|corr|, |corr_short|)`
+    /// of the column against the full first-passage label, whose vertical/
+    /// ambiguous rows are `0`. The label barriers are ATR-scaled by
+    /// construction, so a volatility feature correlates with whether the label
+    /// is DECIDED (wide barriers → more vertical rows) even when it carries no
+    /// directional information — and the absolute value turns that
+    /// decidedness correlation into a high rank. The GA then inherits a
+    /// volatility-state vocabulary with weak directional edge.
+    ///
+    /// When `true`, the correlation for each direction is computed on the rows
+    /// where that direction's label is decided (`+1`/`-1`) only; vertical and
+    /// ambiguous rows are excluded. The rank then answers "given a barrier is
+    /// hit, does this column predict WHICH one" instead of "does this column
+    /// predict whether a barrier is hit". Same barrier geometry, same window,
+    /// same top-K and quotas.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prefilter_direction_only_ranking: bool,
+    /// Opt-in volatility-family purge for the prefilter (default empty =
+    /// unchanged). Every column whose timeframe-stripped name starts with one
+    /// of these prefixes is excluded from the ranking AND from the per-TF
+    /// quota and seed-template force-keep — a purge, not a tie-break. Intended
+    /// for the neo-671 volatility-decoupling experiments (e.g.
+    /// `[atr, atr_percentile, natr, garman_klass_volatility,
+    /// parkinson_volatility, quant_rvol, mass, normalized_volume_true_range]`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefilter_purge_prefixes: Vec<String>,
 }
 
 impl Default for DiscoveryRuntimeConfig {
@@ -1539,6 +1568,8 @@ impl Default for DiscoveryRuntimeConfig {
             // unnecessarily narrows the vocabulary available to the GA.
             prefilter_insample_frac: 1.0,
             prefilter_min_per_timeframe: 6,
+            prefilter_direction_only_ranking: false,
+            prefilter_purge_prefixes: Vec::new(),
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
             min_history_years: 0,
@@ -4955,6 +4986,48 @@ mod tests {
             absent.models.exit_policy.max_hold_bars, 0,
             "an absent models.exit_policy.max_hold_bars must resolve to 0"
         );
+    }
+
+    #[test]
+    fn prefilter_volatility_knobs_survive_settings_serde_round_trip() {
+        // Shipped defaults: both knobs OFF, so today's behaviour is unchanged.
+        let mut settings = Settings::default();
+        assert!(!settings.models.discovery_runtime.prefilter_direction_only_ranking);
+        assert!(settings
+            .models
+            .discovery_runtime
+            .prefilter_purge_prefixes
+            .is_empty());
+
+        // A configured knob pair must survive the YAML round trip.
+        settings.models.discovery_runtime.prefilter_direction_only_ranking = true;
+        settings.models.discovery_runtime.prefilter_purge_prefixes =
+            vec!["atr".to_string(), "mass".to_string()];
+        let yaml = serde_yaml_ng::to_string(&settings).unwrap();
+        assert!(
+            yaml.contains("prefilter_direction_only_ranking"),
+            "an enabled direction-only knob must be serialised: {yaml}"
+        );
+        let back: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(back.models.discovery_runtime.prefilter_direction_only_ranking);
+        assert_eq!(
+            back.models.discovery_runtime.prefilter_purge_prefixes,
+            vec!["atr".to_string(), "mass".to_string()]
+        );
+
+        // Absent keys keep the disabled defaults.
+        let absent: Settings = serde_yaml_ng::from_str(
+            "system:
+  symbol: EURUSD
+",
+        )
+        .unwrap();
+        assert!(!absent.models.discovery_runtime.prefilter_direction_only_ranking);
+        assert!(absent
+            .models
+            .discovery_runtime
+            .prefilter_purge_prefixes
+            .is_empty());
     }
 
     #[test]

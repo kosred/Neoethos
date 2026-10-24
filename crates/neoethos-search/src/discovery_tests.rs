@@ -2142,6 +2142,8 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         // 10 years of bars. The pre-flight check honours min_history_years == 0
         // as the explicit "skip" sentinel (see ensure_sufficient_history).
         min_history_years: 0,
+        prefilter_direction_only_ranking: false,
+        prefilter_purge_prefixes: Vec::new(),
     };
     // Stale-test fix (2026-07-02): the insample-frac fallback moved 0.80 → 0.70
     // in the resolver; the assertions now track the CURRENT fallback.
@@ -2156,6 +2158,8 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         funnel_stage1_pct: 0.0001,
         stage1_window: Stage1Window::Earliest,
         min_history_years: 0,
+        prefilter_direction_only_ranking: false,
+        prefilter_purge_prefixes: Vec::new(),
     };
     assert!((too_small.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
     assert!((too_small.resolved_funnel_stage1_pct() - 0.01).abs() < 1e-9);
@@ -2185,6 +2189,8 @@ fn discovery_profile_exports_runtime_override_resolution() {
         stage1_window: Stage1Window::Earliest,
         // Tests opt-out of the 10y minimum (synthetic fixtures, no real data).
         min_history_years: 0,
+        prefilter_direction_only_ranking: false,
+        prefilter_purge_prefixes: Vec::new(),
     };
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
@@ -2329,6 +2335,9 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: 0.0,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: false,
     };
 
     // Legacy (no quota): top-3 by |corr| are the 3 base columns; no HTF.
@@ -2367,6 +2376,201 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
     );
 }
 
+/// Synthetic block fixture for the volatility-decoupling tests: bars
+/// alternate between NARROW-range blocks (decided labels, drift sign known)
+/// and WIDE-range blocks (vertical labels), so a range/volatility proxy
+/// predicts the label's DECIDEDNESS while a drift-sign proxy predicts its
+/// DIRECTION among decided rows.
+fn volatility_decoupling_fixture() -> (FeatureFrame, Ohlcv) {
+    let n = 300usize;
+    let narrow = 0.005f64;
+    let wide = 0.045f64;
+    let drift = 0.004f64;
+    // Blocks: [up][wide][down][wide], 75 bars each.
+    let block_len = n / 4;
+    let mut close = vec![100.0f64; n];
+    let mut range = vec![narrow; n];
+    for i in 1..n {
+        let block = i / block_len;
+        let block_drift = match block {
+            0 => drift,
+            2 => -drift,
+            _ => drift, // wide blocks keep a slow drift too
+        };
+        if block == 1 || block == 3 {
+            range[i] = wide;
+        }
+        close[i] = close[i - 1] + block_drift;
+    }
+    let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(n);
+    let high: Vec<f64> = close.iter().zip(&range).map(|(c, r)| c + r).collect();
+    let low: Vec<f64> = close.iter().zip(&range).map(|(c, r)| c - r).collect();
+    let ohlcv = Ohlcv {
+        timestamp: Some(timestamps.clone()),
+        open: close.clone(),
+        high,
+        low,
+        close: close.clone(),
+        volume: Some(vec![1.0; n]),
+    };
+    let names = vec![
+        "vol_proxy".to_string(),
+        "dir_signal".to_string(),
+        "noise_x".to_string(),
+    ];
+    let data = ndarray::Array2::from_shape_fn((n, names.len()), |(i, j)| match j {
+        0 => range[i],
+        1 => {
+            if i < n / 2 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        _ => ((i * 7) % 5) as f64,
+    });
+    let frame = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_matrix(
+        timestamps, names, data,
+    )
+    .expect("valid volatility-decoupling fixture");
+    (frame, ohlcv)
+}
+
+fn volatility_decoupling_spec(top_k: usize, direction_only: bool, purge: Vec<String>) -> PrefilterSpec {
+    PrefilterSpec {
+        top_k,
+        insample_frac: 1.0,
+        min_per_tf: 0,
+        // The labeller's ATR is a TRUE RANGE mean (high-low plus the gap to
+        // the previous close), so a drifting bar's TR is drift + range. With
+        // narrow TR 0.009 and sl 3.0 the stop is 0.027: the up barrier decides
+        // at bar 9 and the down barrier at bar 6, inside this horizon; the
+        // WIDE block (TR 0.049, stop 0.147) and every mixed-ATR boundary bar
+        // stay vertical for the full horizon, so every decided row has the
+        // narrow range and the direction proxy matches the drift sign.
+        max_hold_bars: 10,
+        atr_period: 2,
+        sl_atr_mult: 3.0,
+        rr: 1.5,
+        round_trip_cost_px: 0.0,
+        direction_only_ranking: direction_only,
+        purge_prefixes: purge,
+        audit_ranking: true,
+    }
+}
+
+#[test]
+fn direction_only_ranking_scores_direction_on_decided_rows_only() {
+    // The knob mechanics: each direction correlation is computed on the
+    // rows where that direction label is DECIDED (+1/-1). A direction
+    // signal diluted by vertical rows scores higher under direction-only
+    // than under the default full-window correlation, and a feature that
+    // is constant among decided rows (the range proxy) becomes unrankable
+    // under direction-only while staying rankable (near zero) by default.
+    let (frame, ohlcv) = volatility_decoupling_fixture();
+    let default_spec = volatility_decoupling_spec(2, false, Vec::new());
+    let (_, default_census, default_ranking) =
+        prefilter_features_with_ranking(&frame, &ohlcv, &default_spec)
+            .expect("default ranking succeeds");
+    assert!(
+        !default_census.label_fell_back_to_forward_return,
+        "the fixture must produce decided first-passage labels"
+    );
+    assert!(
+        default_census.label_up >= 50 && default_census.label_down >= 50,
+        "both directions must decide in the fixture: up={} down={}",
+        default_census.label_up,
+        default_census.label_down
+    );
+    let default_score = |name: &str| {
+        default_ranking
+            .iter()
+            .find(|entry| entry.1 == name)
+            .map(|entry| entry.2)
+            .unwrap_or(f64::NAN)
+    };
+    // Full-window correlation of the direction signal is diluted by the
+    // vertical (0-label) rows: roughly sqrt(decided fraction).
+    let full = default_score("dir_signal");
+    assert!(
+        full.is_finite() && (0.4..0.9).contains(&full),
+        "default ranking dilutes the direction signal with vertical rows, got {full}"
+    );
+    // The range proxy stays rankable by default.
+    assert!(default_score("vol_proxy").is_finite());
+
+    let direction_only_spec = volatility_decoupling_spec(2, true, Vec::new());
+    let (_, direction_census, direction_ranking) =
+        prefilter_features_with_ranking(&frame, &ohlcv, &direction_only_spec)
+            .expect("direction-only ranking succeeds");
+    assert!(
+        !direction_census.label_fell_back_to_forward_return,
+        "direction-only fixture must keep decided labels"
+    );
+    let direction_entry = |name: &str| {
+        direction_ranking
+            .iter()
+            .find(|entry| entry.1 == name)
+            .cloned()
+    };
+    let dir = direction_entry("dir_signal").expect("dir_signal present");
+    assert!(
+        dir.2 > 0.9,
+        "direction-only ranking must score the direction signal near 1.0, got {}",
+        dir.2
+    );
+    assert!(
+        dir.2 > full + 0.1,
+        "direction-only ranking must beat the diluted full-window score ({full})"
+    );
+    let vol = direction_entry("vol_proxy").expect("vol_proxy present");
+    assert!(
+        vol.2.abs() < 0.05,
+        "direction-only ranking must not manufacture directional content for the range proxy, got {}",
+        vol.2
+    );
+}
+
+#[test]
+fn volatility_purge_excludes_family_from_ranking_and_kept_set() {
+    let (frame, ohlcv) = volatility_decoupling_fixture();
+    // Without the purge, all three columns fit inside top-2 and the
+    // volatility proxy survives.
+    let (kept, _) =
+        prefilter_features(&frame, &ohlcv, &volatility_decoupling_spec(2, false, Vec::new()))
+            .expect("unpurged top-2 succeeds");
+    assert!(kept.names.iter().any(|n| n == "vol_proxy"));
+    // With the family purged the same top-2 must exclude it by name; a
+    // purged column is dropped from the ranking and cannot be resurrected
+    // by the per-TF quota or the seed-template force-keep.
+    let (kept_purged, census) = prefilter_features(
+        &frame,
+        &ohlcv,
+        &volatility_decoupling_spec(2, false, vec!["vol".to_string()]),
+    )
+    .expect("purged top-2 succeeds");
+    assert!(
+        !kept_purged.names.iter().any(|n| n == "vol_proxy"),
+        "purged volatility family must not survive top-K: {:?}",
+        kept_purged.names
+    );
+    assert_eq!(kept_purged.names.len(), 2);
+    assert_eq!(census.columns_kept, 2);
+    // Purge entries are FAMILY prefixes matched against the
+    // timeframe-stripped column name, so a plain `vol` purges a higher-TF
+    // spelling too, while a timeframe-qualified entry matches nothing
+    // (documented, not silent).
+    let (kept_h1, _) = prefilter_features(
+        &frame,
+        &ohlcv,
+        &volatility_decoupling_spec(2, false, vec!["H1_vol".to_string()]),
+    )
+    .expect("prefixed purge top-2 succeeds");
+    assert!(
+        kept_h1.names.iter().any(|n| n == "vol_proxy"),
+        "a timeframe-qualified purge entry must not match the base spelling"
+    );
+}
 /// A trending series with real intrabar range must produce DECIDED
 /// first-passage labels — otherwise the prefilter's new target carries no
 /// information and the degenerate-label guard would silently take the run back
@@ -2403,6 +2607,9 @@ fn first_passage_labels_decide_on_a_trending_series_and_are_fully_counted() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: 0.0,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: false,
     };
     let (labels, census) = first_passage_labels(&ohlcv, &spec);
     assert_eq!(labels.long.len(), n);
@@ -2475,6 +2682,9 @@ fn the_round_trip_cost_moves_both_barriers_the_same_way() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: cost,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: false,
     };
     let (_, free) = first_passage_labels(&ohlcv, &spec(0.0));
     let (_, charged) = first_passage_labels(&ohlcv, &spec(0.0005));
@@ -2501,6 +2711,9 @@ fn prefilter_uses_one_label_safe_selection_window() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: 0.0,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: false,
     };
     let (windows, available) = prefilter_fit_windows(10_000, &base);
     assert_eq!(
@@ -2551,6 +2764,9 @@ fn a_nan_prefixed_column_is_ranked_on_its_finite_rows_not_scored_zero() {
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: 0.0,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: false,
     };
     let (labels, _) = first_passage_labels(&ohlcv, &spec);
     let distinct_finite_labels = labels
@@ -6946,6 +7162,9 @@ fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_r
         sl_atr_mult: 1.0,
         rr: 2.0,
         round_trip_cost_px: 0.0,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: false,
     };
     let (filtered, _census) = prefilter_features(&frame, &ohlcv, &spec).unwrap();
     let (without_recipe, _) = prefilter_features(&counterfactual_frame, &ohlcv, &spec).unwrap();
