@@ -108,6 +108,8 @@ pub struct StrategyReportDto {
     pub head: StrategyEntry,
     pub monthly: Vec<MonthRow>,
     pub yearly: Vec<MonthRow>,
+    /// Full selected IS scope in original account units, including idle months.
+    pub monthly_account: Vec<neoethos_search::quality::MonthlyStrategyMetricsV1>,
 }
 
 // Private projections of existing fields, NOT a new persisted schema.
@@ -650,6 +652,27 @@ fn build(cache: &Path, dir_key: &str, base: &str, with_monthly: bool) -> Result<
         DiagnosticUnavailable("diagnostic trades fall outside the selected IS scope".to_owned())
     );
     let curve = diagnostic_curve(bound.trades).map_err(diagnostic_unavailable)?;
+    let monthly_account = if with_monthly {
+        let ledger = bound
+            .trades
+            .iter()
+            .map(|row| neoethos_search::quality::Trade {
+                entry_time: row.entry_time,
+                exit_time: row.exit_time,
+                pnl: row.pnl,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        neoethos_search::quality::monthly_closed_trade_metrics_v1(
+            &ledger,
+            bound.quality.initial_capital,
+            window.timestamp_start_ms(),
+            window.timestamp_end_ms(),
+        )
+        .map_err(diagnostic_unavailable)?
+    } else {
+        Vec::new()
+    };
     let years = (curve.end_ms - curve.start_ms) as f64 / 86_400_000.0 / 365.25;
     let cagr = (years > 0.0)
         .then(|| ((curve.equity / SEED).powf(1.0 / years) - 1.0) * 100.0)
@@ -696,6 +719,7 @@ fn build(cache: &Path, dir_key: &str, base: &str, with_monthly: bool) -> Result<
     };
     Ok(StrategyReportDto {
         head,
+        monthly_account,
         monthly: if with_monthly {
             curve.monthly
         } else {

@@ -519,6 +519,15 @@ fn genuine_search_v6_writer_pair_reaches_report_inventory_list_and_details_witho
         );
     }
     assert_eq!(report.monthly.len(), 1);
+    assert_eq!(report.monthly_account.len(), 1);
+    let account_month = &report.monthly_account[0];
+    assert_eq!(account_month.month_utc, "2025-01");
+    assert_eq!(account_month.starting_balance, 1000.0);
+    assert_eq!(account_month.ending_balance, 1100.0);
+    assert_eq!(account_month.net_profit, 100.0);
+    assert_eq!(account_month.closed_trades, 4);
+    assert_eq!(account_month.max_closed_balance_drawdown_money, 50.0);
+    assert_eq!(account_month.profit_factor, Some(3.0));
     assert_eq!(
         (
             report.monthly[0].month.as_str(),

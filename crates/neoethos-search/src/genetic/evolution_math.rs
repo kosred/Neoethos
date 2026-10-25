@@ -1428,9 +1428,9 @@ pub fn apply_metrics(
             if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideV1 {
                 // Opt-in B9 (docs section 14.7): the explicit selector wins over
                 // the legacy boolean chain and reads the evaluator's
-                // completed-month return vector. A missing vector (metrics-only
-                // producer) graduates to the scorer's "no monthly observations"
-                // -100.0 guard rather than silently using another table.
+                // completed-month return vector. PopulationEvaluationV1::apply
+                // refuses missing/misaligned transport; a legitimately empty
+                // per-gene series still takes the scorer's -100.0 guard.
                 let months = monthly_returns
                     .and_then(|series| series.get(index))
                     .map(Vec::as_slice)

@@ -5,8 +5,7 @@
 //! module persists a completed frame under a key derived from the input
 //! identity - the per-timeframe dataset generation/manifest/Vortex digests,
 //! the exact feature-build recipe (including the streaming working-set batch,
-//! keyed at a deterministic batch width so a machine's free-RAM probe cannot
-//! change the key) and the resolved vector-ta math authority - so an identical input digest
+//! with its actual selected columns and order) and the resolved vector-ta math authority - so an identical input digest
 //! skips the build. Any digest change produces a different key and therefore a
 //! miss. Correctness is NOT trusted to the key alone: the CLI seals each
 //! stored frame with its canonical search receipt and refuses a cache hit
@@ -26,13 +25,10 @@ use std::sync::Arc;
 
 use neoethos_feature_contracts::SourceArtifactBindingV1;
 
-use crate::core::feature_budget::MAX_COLUMNS_HARD_CEILING;
 use crate::core::features::{
     FeatureBuildOptions, FeatureCellValidity, FeatureColumnF64, FeatureFrame, FeatureFrameRowIds,
 };
-use crate::core::hpc_ta::{
-    SweepBatch, resolved_canonical_feature_execution_authority_v1, search_working_set_batch,
-};
+use crate::core::hpc_ta::{SweepBatch, resolved_canonical_feature_execution_authority_v1};
 use crate::core::normalization::SearchNormalizationFittedStateV1;
 use neoethos_feature_contracts::{DatasetFeatureArtifactProvenanceV1, FeaturePlanV1};
 
@@ -44,22 +40,12 @@ pub const ENV_FEATURE_FRAME_CACHE_MAX_BYTES: &str = "NEOETHOS_FEATURE_FRAME_CACH
 /// Default disk budget: 32 GiB (approximately three frozen EURUSD cube entries).
 pub const DEFAULT_FEATURE_FRAME_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
-const CACHE_KEY_DOMAIN_V1: &[u8] = b"neoethos.feature-frame-cache-key.v1\0";
+// V1 normalized only the key to a larger unseeded batch, so its entries can
+// contain a different frame. Never admit them under the corrected recipe key.
+const CACHE_KEY_DOMAIN_V2: &[u8] = b"neoethos.feature-frame-cache-key.v2\0";
 const CACHE_META_SCHEMA_V1: &str = "neoethos.feature-frame-cache-entry.v1";
 const CACHE_META_VERSION_V1: u32 = 1;
 const CACHE_PAYLOAD_MAGIC_V1: &[u8] = b"NEOTFFC1";
-
-/// Batch width used ONLY to derive the streaming component of a cache key.
-///
-/// The live streaming sweep is sized from free RAM
-/// (`VocabularyBudget::for_run` -> `streaming_working_set_sizing`), so the
-/// same inputs produce different batch widths (and different slices) from run
-/// to run; hashing that width would turn every run into a cache miss. The key
-/// instead re-derives the batch at this fixed ceiling - the same hard cap the
-/// live vocabulary budget already enforces - so the key is a pure function of
-/// the inputs and the cursor, never of a machine's memory state. The receipt
-/// sidecar remains the integrity backstop for whatever frame is stored.
-pub const CACHE_KEY_DETERMINISTIC_BATCH_COLUMNS: usize = MAX_COLUMNS_HARD_CEILING;
 
 /// Research-only feature-frame cache configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,12 +67,18 @@ pub fn feature_frame_cache_config_from_env() -> Option<FeatureFrameCacheConfig> 
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_FEATURE_FRAME_CACHE_MAX_BYTES);
-    Some(FeatureFrameCacheConfig { dir, max_total_bytes })
+    Some(FeatureFrameCacheConfig {
+        dir,
+        max_total_bytes,
+    })
 }
 
 fn validate_cache_key(key: &str) -> Result<()> {
     ensure!(
-        key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        key.len() == 64
+            && key
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "feature-frame cache key must be 64 lowercase hex characters, got {key:?}"
     );
     Ok(())
@@ -97,8 +89,7 @@ fn validate_cache_key(key: &str) -> Result<()> {
 /// The key covers every digest that identifies the input: the symbol, every
 /// timeframe's exact dataset identity/manifest/Vortex generation (as
 /// SourceArtifactBindingV1 values), the exact feature-build options, the
-/// streaming working-set batch (when present, re-derived at a deterministic
-/// width - see [`CACHE_KEY_DETERMINISTIC_BATCH_COLUMNS`]), and the resolved
+/// actual streaming working-set batch (including its ordered selections), and the resolved
 /// vector-ta math authority. Any digest change yields a different key (a
 /// miss) and the old entry is eventually evicted. Correctness is never
 /// trusted to the key alone: the receipt sidecar seals the stored frame and
@@ -110,7 +101,7 @@ pub fn feature_frame_cache_input_key(
     batch: Option<&SweepBatch>,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(CACHE_KEY_DOMAIN_V1);
+    hasher.update(CACHE_KEY_DOMAIN_V2);
     hasher.update((symbol.len() as u64).to_le_bytes());
     hasher.update(symbol.as_bytes());
     let mut sorted: Vec<&SourceArtifactBindingV1> = bindings.iter().collect();
@@ -135,18 +126,9 @@ pub fn feature_frame_cache_input_key(
         serde_json::to_vec(options).expect("feature build options must serialize canonically"),
     );
     if let Some(batch) = batch {
-        // Hash a batch re-derived at a DETERMINISTIC width, never the live
-        // one: the live sweep is sized from free RAM, so hashing it would
-        // make every run on the same inputs miss the cache. The cursor still
-        // distinguishes batches inside one sweep.
-        let key_batch = search_working_set_batch(
-            batch.cursor,
-            CACHE_KEY_DETERMINISTIC_BATCH_COLUMNS,
-            batch.replace_base_vocabulary,
-        );
-        hasher.update(
-            serde_json::to_vec(&key_batch).expect("sweep batch must serialize canonically"),
-        );
+        // A hit returns the entire frame; there is no later missing-column
+        // augmentation. Bind the exact recipe that the builder will consume.
+        hasher.update(serde_json::to_vec(batch).expect("sweep batch must serialize canonically"));
     }
     let authority = resolved_canonical_feature_execution_authority_v1();
     hasher.update(format!("{:?}", authority.policy).as_bytes());
@@ -287,8 +269,7 @@ pub fn feature_frame_cache_load(
         let name_len = u32::from_le_bytes(name_len) as usize;
         let mut name_bytes = vec![0u8; name_len];
         reader.read_exact(&mut name_bytes)?;
-        let name =
-            String::from_utf8(name_bytes).context("feature-frame cache column name utf8")?;
+        let name = String::from_utf8(name_bytes).context("feature-frame cache column name utf8")?;
         let mut values = Vec::with_capacity(rows);
         for _ in 0..rows {
             let mut bytes = [0u8; 8];
@@ -556,8 +537,10 @@ mod tests {
             format!("generation-{hash_byte}"),
             [hash_byte; 32],
             BarTimestampConvention::BarOpen,
-            vec![SourceSegmentV1::new(0, 100, 1_600_000_000_000, 1_600_100_000_000)
-                .expect("test segment")],
+            vec![
+                SourceSegmentV1::new(0, 100, 1_600_000_000_000, 1_600_100_000_000)
+                    .expect("test segment"),
+            ],
         )
         .expect("test source binding")
     }
@@ -710,7 +693,10 @@ mod tests {
             next_cursor: 1,
             base_indicator_ids: vec!["rsi"],
             replace_base_vocabulary: false,
-            pairs: vec![crate::core::hpc_ta::SweepPair { id: "rsi", period: 14 }],
+            pairs: vec![crate::core::hpc_ta::SweepPair {
+                id: "rsi",
+                period: 14,
+            }],
             planned_columns: 1,
             space_len: 1,
             exhausted: false,
@@ -728,15 +714,13 @@ mod tests {
     }
 
     #[test]
-    fn key_is_stable_across_different_available_ram_probes() {
-        // Two runs on identical inputs whose free-RAM probes sized different
-        // live batch widths must still derive the SAME cache key: the key
-        // re-derives the batch at a deterministic width and must never hash
-        // the RAM-derived one (that made every real run a miss).
+    fn cache_key_binds_the_actual_working_set_and_seeded_order() {
+        // The cache stores a complete frame. Different RAM-sized recipes or
+        // seeded selections must miss; repeating the exact recipe must hit.
         let options = test_options();
         let bindings = test_bindings(7);
-        let narrow = search_working_set_batch(0, 96, true);
-        let wide = search_working_set_batch(0, 640, true);
+        let narrow = crate::core::hpc_ta::search_working_set_batch(0, 96, true);
+        let wide = crate::core::hpc_ta::search_working_set_batch(0, 640, true);
         assert!(
             !narrow.is_empty() && !wide.is_empty(),
             "both probe fixtures must select a non-empty working set"
@@ -749,9 +733,23 @@ mod tests {
         let key_narrow =
             feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&narrow));
         let key_wide = feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&wide));
-        assert_eq!(
+        assert_ne!(
             key_narrow, key_wide,
-            "the cache key must not depend on the free-RAM-derived batch width"
+            "different selected columns must not retrieve the same complete cached frame"
+        );
+        assert_eq!(
+            key_narrow,
+            feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&narrow.clone()))
+        );
+        let seeded =
+            |seed| crate::core::hpc_ta::search_working_set_batch_seeded(0, 640, true, seed);
+        let left = seeded(17);
+        let right = seeded(29);
+        assert_ne!(left, right);
+        assert_ne!(
+            feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&left)),
+            feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&right)),
+            "cursor equality cannot erase a different indicator/period selection"
         );
     }
 
@@ -789,11 +787,12 @@ mod tests {
             },
         )
         .expect("frame with options");
-        let key =
-            feature_frame_cache_input_key("EURUSD", &test_bindings(7), &test_options(), None);
+        let key = feature_frame_cache_input_key("EURUSD", &test_bindings(7), &test_options(), None);
         let stored_bytes = feature_frame_cache_store(&key, &frame, &cfg).expect("store");
         assert!(stored_bytes > 0, "payload must be non-empty");
-        let loaded = feature_frame_cache_load(&key, &cfg).expect("load").expect("entry");
+        let loaded = feature_frame_cache_load(&key, &cfg)
+            .expect("load")
+            .expect("entry");
         assert_frames_equivalent(&frame, &loaded);
     }
 
@@ -805,9 +804,12 @@ mod tests {
         let key = feature_frame_cache_input_key("EURUSD", &test_bindings(7), &test_options(), None);
         feature_frame_cache_store(&key, &frame, &cfg).expect("store");
 
-        let missing = feature_frame_cache_input_key("EURUSD", &test_bindings(9), &test_options(), None);
+        let missing =
+            feature_frame_cache_input_key("EURUSD", &test_bindings(9), &test_options(), None);
         assert!(
-            feature_frame_cache_load(&missing, &cfg).expect("load").is_none(),
+            feature_frame_cache_load(&missing, &cfg)
+                .expect("load")
+                .is_none(),
             "unknown key is a plain miss"
         );
 
@@ -856,8 +858,10 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let generous = test_config(&temp, DEFAULT_FEATURE_FRAME_CACHE_MAX_BYTES);
         let frame = test_frame();
-        let key_a = feature_frame_cache_input_key("EURUSD", &test_bindings(7), &test_options(), None);
-        let key_b = feature_frame_cache_input_key("EURUSD", &test_bindings(8), &test_options(), None);
+        let key_a =
+            feature_frame_cache_input_key("EURUSD", &test_bindings(7), &test_options(), None);
+        let key_b =
+            feature_frame_cache_input_key("EURUSD", &test_bindings(8), &test_options(), None);
         let bytes_a = feature_frame_cache_store(&key_a, &frame, &generous).expect("store A");
         std::thread::sleep(std::time::Duration::from_millis(30));
         let bounded = test_config(&temp, bytes_a);

@@ -51,3 +51,11 @@ promotion and live authorization flags remain unavailable.
 This fixture does not exercise the App's private cost-sidecar publisher, the
 complete discovery job, HTTP/UI rendering, independent final evaluation, or
 broker execution.
+
+`legacy_quality_without_monthly_returns.json` contains the three unchanged
+quality objects from commit `a5a5d74e`'s `e6b6fa678b01daed3427bcef6c132d27c31d1662a4c4dcc3b02f2f74902b24aa.research.json`.
+The compatibility test checks that decoding them adds neither `monthly_returns`
+nor `monthly_breakdown`. Explicit empty/new monthly arrays also keep their wire
+values. This is quality-payload compatibility, not a claim that every historical
+envelope is readable: the old synthetic envelope has a separate null numeric
+trade-duration field that strict decoding already refuses.

@@ -3094,22 +3094,28 @@ fn compute_discovery_forward_test_artifacts_returns_empty_for_empty_portfolio() 
 }
 
 #[test]
-fn compute_discovery_forward_test_artifacts_rejects_tails_missing_features() {
+fn discovery_validation_artifacts_reject_tails_missing_features_on_both_routes() {
     let config = DiscoveryConfig::default();
     let portfolio = vec![profitable_gene("alpha-1")];
     let (_, _, holdout_scope, mut tail_features, tail_ohlcv) = sample_split_search_values();
     tail_features.names = vec!["unrelated_feature".to_string()];
-    let err = compute_discovery_forward_test_artifacts(
-        &portfolio,
-        &["signal".to_string()],
-        &tail_features,
-        &tail_ohlcv,
-        &holdout_scope,
-        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
-        &config,
-    )
-    .expect_err("tail without the effective feature must be rejected");
-    assert!(err.to_string().contains("missing feature 'signal'"));
+    for prop_firm in [false, true] {
+        let result = if prop_firm {
+            compute_discovery_prop_firm_artifacts(
+                &portfolio, &["signal".to_string()], &tail_features, &tail_ohlcv,
+                &holdout_scope, STRICT_VALIDATION_SEARCH_CONFIG_HASH, &config,
+                PropFirmRiskRules::default(),
+            ).map(|_| ())
+        } else {
+            compute_discovery_forward_test_artifacts(
+                &portfolio, &["signal".to_string()], &tail_features, &tail_ohlcv,
+                &holdout_scope, STRICT_VALIDATION_SEARCH_CONFIG_HASH, &config,
+            ).map(|_| ())
+        };
+        let error = result.expect_err("tail without the effective feature must be rejected");
+        assert!(error.to_string().contains("live feature set is missing 'signal'"),
+            "prop_firm={prop_firm}: {error:#}");
+    }
 }
 
 #[test]
@@ -3577,25 +3583,6 @@ fn compute_discovery_prop_firm_artifacts_returns_empty_for_empty_portfolio() {
     assert!(artifacts.is_empty());
 }
 
-#[test]
-fn compute_discovery_prop_firm_artifacts_rejects_tails_missing_features() {
-    let config = DiscoveryConfig::default();
-    let portfolio = vec![profitable_gene("alpha-1")];
-    let (_, _, holdout_scope, mut tail_features, tail_ohlcv) = sample_split_search_values();
-    tail_features.names = vec!["unrelated_feature".to_string()];
-    let err = compute_discovery_prop_firm_artifacts(
-        &portfolio,
-        &["signal".to_string()],
-        &tail_features,
-        &tail_ohlcv,
-        &holdout_scope,
-        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
-        &config,
-        PropFirmRiskRules::default(),
-    )
-    .expect_err("tail without the effective feature must be rejected");
-    assert!(err.to_string().contains("missing feature 'signal'"));
-}
 
 #[test]
 fn compute_discovery_prop_firm_artifacts_produces_one_artifact_per_strategy() {
@@ -7010,7 +6997,7 @@ fn quality_metrics_payload_archives_the_two_month_fractional_return_vector() {
             &account_metrics,
         )
         .expect("synthetic quality analysis");
-    metrics.monthly_returns = monthly.clone();
+    metrics.monthly_returns = Some(monthly.clone());
     let json = serde_json::to_value(&metrics).expect("quality payload serializes");
     let archived = json
         .get("monthly_returns")

@@ -638,11 +638,11 @@ fn weekly_backend_uses_the_existing_sealed_cpu_route_and_keeps_all_metric_bits()
         21.0,
     )
     .unwrap();
-    let observed = crate::backend::evaluate_population_with_cadence_and_evidence(
+    let observed = crate::backend::evaluate_population_observed_with_evidence(
         inputs(),
         backend,
         &evidence,
-        &objective,
+        Some(&objective),
     )
     .unwrap();
     assert_eq!(
@@ -665,11 +665,11 @@ fn weekly_backend_uses_the_existing_sealed_cpu_route_and_keeps_all_metric_bits()
     }
     objective.cadence.evaluation_start_ms += 1;
     assert!(
-        crate::backend::evaluate_population_with_cadence_and_evidence(
+        crate::backend::evaluate_population_observed_with_evidence(
             inputs(),
             backend,
             &evidence,
-            &objective
+            Some(&objective)
         )
         .unwrap_err()
         .contains("interval differs")

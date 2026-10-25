@@ -1415,11 +1415,11 @@ LANDED (2026-10-23, neo-671 follow-up): the selector enum, the
 the canonical CPU evaluator's completed-month return vector are all in place.
 With the `search-monthly-upside-objective` feature enabled, B9 selects
 `MonthlyUpsideV1` and the CPU evaluation path feeds the vector into
-`ga_fitness_monthly_upside_v1`. Known boundaries: the canonical config digest
-does not encode the selector yet (the §14.8 stamp-gap class — a B9 run must
-not be deduplicated against a default run by hash alone), and metrics-only
-producers (GPU routes, transport adapters) pass no vector, so the scorer's
-"no monthly observations" guard applies there.
+`ga_fitness_monthly_upside_v1`. The 2026-10-25 correctness repair preserves
+same-execution monthly observations on the sealed CPU route with or without
+weekly cadence. Missing or misaligned monthly transport is a run error; a
+legitimately empty per-gene series still takes the scorer's rejection guard.
+Metrics-only producers cannot satisfy the monthly objective.
 
 Operator plumbing (same series, neo-671): `neoethos-cli` declares the
 `search-monthly-upside-objective` passthrough feature (forwarding to
@@ -1435,9 +1435,22 @@ round-trip the CPU funnel performs before generation 0) carries the selector
 the same way: `serde(default, skip_serializing_if = FitnessTable::is_default)`,
 so default snapshots and legacy bytes are unchanged and a non-default table
 survives the round-trip instead of being refused as an unknown field. The
-canonical config digest still does not encode the selector (the §14.8
-stamp-gap above); a B9 run is identified by its argument/run-arguments stamp,
-not by digest deduplication.
+canonical config digest now binds nondefault `fitness_table` and nonzero
+`max_hold_bars`, while retaining historical default digest bytes. Its exhaustive
+configuration destructure requires an explicit decision for future fields.
+
+Quality screening now archives `monthly_breakdown` from the same closed-trade
+ledger and full evaluated interval. Each UTC exit-month row includes opening
+and closing account balance, net PnL after recorded costs, return percent,
+trade/win/loss counts, win rate, gross profit/loss, profit factor and monthly
+closed-balance drawdown. Idle months remain present and endpoint partial months
+are marked; undefined ratios remain null. These rows include the current partial
+month and are distinct from the legacy completed-month fractional scorer vector
+`monthly_returns`. The Strategy Report displays all months in original account
+units through this same aggregator, with its existing unsealed IS status.
+Neither data path establishes independent OOS, floating-equity drawdown or broker
+execution. Absent historical monthly fields stay absent when reserialized;
+explicit empty arrays stay explicit, preserving their identity-bearing values.
 
 ### 14.8 `crates/neoethos-search/src/run_identity.rs` — six factors are invisible to the stamp
 
@@ -1486,6 +1499,15 @@ cache hit must recompute the same receipt bit-for-bit or the run fails loudly
 (no silent fallback). Disk usage is bounded by
 `NEOETHOS_FEATURE_FRAME_CACHE_MAX_BYTES` (default 32 GiB) with oldest-entry
 eviction; writes are staged and promoted atomically.
+
+The 2026-10-25 V2 key binds the ACTUAL ordered working-set batch, including
+RAM-sized width and seeded selections. V1 normalized only the key to an unseeded
+4096-column recipe while storing the smaller actual frame. A cache hit returns
+that whole frame without augmentation, so this could attribute the wrong batch
+and advance the wrong cursor even with an intact receipt. V1 entries therefore
+miss under V2 and are rebuilt under the exact requested recipe. Changes only to
+GA/scoring options still reuse an identical feature recipe. Stored old numerical
+columns are not thereby shown to be incorrect.
 
 **Exit-policy knob census** (measured against the frozen v5 settings, B9 g200):
 

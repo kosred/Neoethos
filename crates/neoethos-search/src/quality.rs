@@ -7,6 +7,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
+#[path = "quality_monthly.rs"]
+mod monthly;
+pub use monthly::{MonthlyStrategyMetricsV1, monthly_closed_trade_metrics_v1};
+
 const TARGET_DOWNSIDE_SORTINO_SEMANTICS_V1: &str = "neoethos.target-downside-sortino.v1";
 const TARGET_DOWNSIDE_SORTINO_PRIMARY_SOURCE_V1: &str =
     "https://www.cmegroup.com/education/files/rr-sortino-a-sharper-ratio.pdf";
@@ -248,9 +252,14 @@ pub struct StrategyMetrics {
     pub avg_r_multiple: f64,
     #[serde(default)]
     pub mfe_capture_ratio: f64,
-    /// Per-completed-month fractional return series archived per candidate.
-    #[serde(default)]
-    pub monthly_returns: Vec<f64>,
+    /// Completed-month fractional scorer inputs. None preserves historical
+    /// absence; Some([]) preserves the explicit unknown series emitted by V6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_returns: Option<Vec<f64>>,
+    /// Calendar-month closed-trade money observations over the evaluated span,
+    /// including idle and partial months. Never a broker or floating-equity claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_breakdown: Option<Vec<MonthlyStrategyMetricsV1>>,
 }
 
 #[derive(Debug, Clone)]
@@ -372,7 +381,7 @@ impl StrategyQualityAnalyzer {
                 && (net - canonical_metrics[0]).abs() <= rounding_bound,
             "quality evaluation canonical PnL differs from its supplied ledger"
         );
-        Ok(self.analyze_strategy_inner(
+        let mut metrics = self.analyze_strategy_inner(
             strategy_id,
             trades,
             initial_balance,
@@ -382,7 +391,14 @@ impl StrategyQualityAnalyzer {
                 weekdays,
                 canonical_metrics,
             )),
-        ))
+        );
+        metrics.monthly_breakdown = Some(monthly_closed_trade_metrics_v1(
+            trades,
+            initial_balance,
+            evaluation_start_ms,
+            evaluation_end_ms,
+        )?);
+        Ok(metrics)
     }
 
     fn analyze_strategy_inner(
@@ -740,7 +756,8 @@ impl StrategyQualityAnalyzer {
             avg_monthly_return_pct,
             // Filled by discovery's quality screen from the same replay's
             // ledger monthly_returns_out; trade-only diagnostics stay empty.
-            monthly_returns: Vec::new(),
+            monthly_returns: Some(Vec::new()),
+            monthly_breakdown: None,
             profit_per_trade: net_expectancy_per_trade,
             net_expectancy_stderr,
             net_expectancy_t_stat,
@@ -1217,7 +1234,8 @@ pub(crate) fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
         positive_months: 0,
         negative_months: 0,
         avg_monthly_return_pct: 0.0,
-        monthly_returns: Vec::new(),
+        monthly_returns: Some(Vec::new()),
+        monthly_breakdown: None,
         profit_per_trade: 0.0,
         net_expectancy_stderr: 0.0,
         net_expectancy_t_stat: 0.0,
@@ -1309,6 +1327,10 @@ impl StrategyRanker {
         write_json_atomic(path, &rankings).map_err(|err| std::io::Error::other(err.to_string()))
     }
 }
+
+#[cfg(test)]
+#[path = "quality_monthly_tests.rs"]
+mod monthly_tests;
 
 #[cfg(test)]
 mod overrides_tests {

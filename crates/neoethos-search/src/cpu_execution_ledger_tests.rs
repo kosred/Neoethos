@@ -688,10 +688,26 @@ fn completed_month_returns_travel_with_bit_identical_metrics_and_match_the_ledge
         .collect::<Vec<_>>();
 
     let (metrics, monthly) = fast_evaluate_strategy_core_with_monthly_returns(
-        &settings, &close, &high, &low, &signals, &[], &month_idx, &days, &times,
+        &settings,
+        &close,
+        &high,
+        &low,
+        &signals,
+        &[],
+        &month_idx,
+        &days,
+        &times,
     );
     let plain = fast_evaluate_strategy_core(
-        &close, &high, &low, &signals, &[], &month_idx, &days, &times, &settings,
+        &close,
+        &high,
+        &low,
+        &signals,
+        &[],
+        &month_idx,
+        &days,
+        &times,
+        &settings,
     );
     assert_eq!(
         metrics.map(f64::to_bits),
@@ -738,7 +754,9 @@ fn completed_month_returns_travel_with_bit_identical_metrics_and_match_the_ledge
 
 #[test]
 fn population_evaluation_passes_the_monthly_vector_into_the_selected_fitness() {
-    let m = [10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01];
+    let m = [
+        10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01,
+    ];
     let months = vec![0.02; 10];
 
     let mut selected_genes = vec![crate::Gene::default()];
@@ -762,7 +780,11 @@ fn population_evaluation_passes_the_monthly_vector_into_the_selected_fitness() {
     let mut plain_genes = vec![crate::Gene::default()];
     let plain = PopulationEvaluationV1::from(vec![m]);
     plain
-        .apply(&mut plain_genes, &crate::genetic::EvaluationConfig::default(), 1.0)
+        .apply(
+            &mut plain_genes,
+            &crate::genetic::EvaluationConfig::default(),
+            1.0,
+        )
         .unwrap();
     assert_eq!(
         plain_genes[0].fitness,
@@ -771,3 +793,21 @@ fn population_evaluation_passes_the_monthly_vector_into_the_selected_fitness() {
     );
 }
 
+#[test]
+fn monthly_selector_refuses_missing_or_misaligned_execution_observations() {
+    let mut config = crate::genetic::EvaluationConfig::default();
+    config.fitness_table = crate::scoring::FitnessTable::MonthlyUpsideV1;
+    let mut genes = [crate::Gene::default()];
+    let metrics = vec![[1.0; 11]];
+    for monthly_returns in [None, Some(Vec::new())] {
+        let observation = PopulationEvaluationV1 {
+            metrics: metrics.clone(),
+            cadence: None,
+            monthly_returns,
+        };
+        let error = observation
+            .apply(&mut genes, &config, 30.0)
+            .expect_err("missing transport is not an unprofitable strategy");
+        assert!(error.to_string().contains("monthly"));
+    }
+}

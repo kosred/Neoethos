@@ -48,6 +48,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         max_rows,
         max_rows_by_timeframe,
         max_hours,
+        max_hold_bars: holding_horizon_bars,
         corr_threshold,
         min_trades_per_day,
         target_profile,
@@ -77,6 +78,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         sensitivity_spread_pips,
         sensitivity_commission_per_lot,
         adaptive_thresholds,
+        fitness_table: fitness_selector,
         mode,
         prop_firm_gate_params,
         risky_start_balance,
@@ -86,10 +88,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         prop_firm_min_pass_rate,
         discovery_ledger_enabled,
         discovery_ledger_cache_dir,
-        // `..` because fitness_table is deliberately NOT digested yet
-        // (section 14.8 stamp gap): a pattern binding for it would join this
-        // destructure's duplicate span and trip the duplicate gate.
-        discovery_ledger_archive_top_n, ..
+        discovery_ledger_archive_top_n,
     } = config;
 
     let mut encoder = CanonicalDigestEncoderV1::new();
@@ -164,6 +163,14 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         "discovery_ledger_archive_top_n",
         *discovery_ledger_archive_top_n,
     )?;
+    // Preserve historical default identities while binding every active
+    // selector. Exhaustive destructuring above makes new omissions fail build.
+    if !fitness_selector.is_default() {
+        encoder.string("fitness_table", fitness_selector.name())?;
+    }
+    if *holding_horizon_bars != 0 {
+        encoder.usize("max_hold_bars", *holding_horizon_bars)?;
+    }
     Ok(encoder.finish())
 }
 
@@ -570,6 +577,41 @@ const fn discovery_mode_wire_v1(mode: DiscoveryMode) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_fitness_selector_and_holding_horizon_have_distinct_config_identities() {
+        let original = DiscoveryConfig::default();
+        let baseline = canonical_discovery_config_digest_v1(&original).unwrap();
+        assert_eq!(
+            baseline,
+            [
+                41, 153, 192, 155, 135, 78, 190, 251, 128, 74, 131, 116, 45, 136, 196, 188, 70, 24,
+                4, 141, 115, 42, 187, 250, 100, 4, 162, 227, 108, 72, 101, 0
+            ],
+            "historical default identity must remain unchanged"
+        );
+        let mut identities = std::collections::HashSet::new();
+        for horizon in [0, 64, 128] {
+            for table in [
+                crate::scoring::FitnessTable::GaFitness,
+                crate::scoring::FitnessTable::MonthlyUpsideV1,
+            ] {
+                let mut config = original.clone();
+                config.max_hold_bars = horizon;
+                config.fitness_table = table;
+                let actual = canonical_discovery_config_digest_v1(&config).unwrap();
+                assert!(
+                    identities.insert(actual),
+                    "selector/horizon combinations must be distinct"
+                );
+                if horizon == 0 && table.is_default() {
+                    assert_eq!(actual, baseline);
+                } else {
+                    assert_ne!(actual, baseline, "unbound {horizon}/{table:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn weekly_opt_in_changes_canonical_config_digest() {
         let mut config = DiscoveryConfig::default();

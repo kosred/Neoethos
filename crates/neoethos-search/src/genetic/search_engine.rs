@@ -1113,21 +1113,12 @@ fn evaluate_genes_cached_observed(
                     anyhow!("goal-pace v6 requires the validated CPU route; native scoring is not implemented: {error}")
                 })?;
             }
-            if let Some(objective) = &config.weekly_objective {
-                return crate::backend::evaluate_population_with_cadence_and_evidence(
-                    inputs,
-                    crate::backend::current_evaluation_backend(),
-                    &evidence,
-                    objective,
-                )
-                .map_err(|e| anyhow!(e));
-            }
-            crate::backend::evaluate_population_core_with_backend_and_evidence(
+            crate::backend::evaluate_population_observed_with_evidence(
                 inputs,
                 crate::backend::current_evaluation_backend(),
                 &evidence,
+                config.weekly_objective.as_ref(),
             )
-            .map(Into::into)
             .map_err(|error| anyhow!(error))
         }
         None => crate::backend::evaluate_population_core_with_backend(
@@ -5783,7 +5774,7 @@ mod evaluated_generation_handoff_tests {
             explicit_cpu_research_admission, parent,
         };
         use crate::scoring::weekly_cadence::*;
-        let (scope, features, ohlcv) = parent(14_400);
+        let (scope, features, ohlcv) = parent(60_000);
         let run = crate::population_execution_evidence_v1::begin_exact_population_execution_run_v1(
             explicit_cpu_research_admission(&features),
             &scope,
@@ -5847,6 +5838,28 @@ mod evaluated_generation_handoff_tests {
         )
         .unwrap();
         assert_eq!(old[0].map(f64::to_bits), new.metrics[0].map(f64::to_bits));
+        config.weekly_objective = None;
+        config.fitness_table = crate::scoring::FitnessTable::MonthlyUpsideV1;
+        let monthly_only = evaluate_genes_cached_observed(
+            &features,
+            &ohlcv,
+            &genes,
+            &config,
+            &cache,
+            &sizing,
+            Some((&run, ExactResidentDatasetViewRequestV1::Full)),
+        )?;
+        assert!(monthly_only.cadence.is_none());
+        let months = monthly_only
+            .monthly_returns
+            .as_ref()
+            .expect("nonweekly CPU search must retain its actual monthly observations");
+        assert_eq!(months.len(), genes.len());
+        assert!(!months[0].is_empty());
+        assert_eq!(
+            old[0].map(f64::to_bits),
+            monthly_only.metrics[0].map(f64::to_bits)
+        );
         assert_eq!(
             new.cadence.as_ref().unwrap()[0].trades as f64,
             new.metrics[0][8]

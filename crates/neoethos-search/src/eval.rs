@@ -57,6 +57,15 @@ impl PopulationEvaluationV1 {
             self.metrics.len() == genes.len(),
             "evaluation observation count mismatch"
         );
+        if config.fitness_table == crate::scoring::fitness_table::FitnessTable::MonthlyUpsideV1 {
+            let months = self.monthly_returns.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("monthly objective requires same-execution monthly observations")
+            })?;
+            anyhow::ensure!(
+                months.len() == genes.len(),
+                "monthly observation count mismatch"
+            );
+        }
         if let Some(objective) = config.weekly_objective {
             objective.checked_for_evaluation(
                 config.initial_equity,

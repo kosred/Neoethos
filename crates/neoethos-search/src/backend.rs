@@ -229,6 +229,9 @@ pub fn evaluate_population_core_with_backend(
         .map(|batch| batch.metrics)
 }
 
+// Kept only as the metrics-only regression adapter; production search consumes
+// the full observed batch below so cadence/monthly evidence cannot be dropped.
+#[cfg(test)]
 pub(crate) fn evaluate_population_core_with_backend_and_evidence(
     inputs: crate::eval::PopulationEvalInputs<'_>,
     backend: EvaluationBackend,
@@ -256,29 +259,31 @@ pub fn evaluate_population_core_with_backend_and_audit(
         .map(|batch| batch.metrics)
 }
 
-pub(crate) fn evaluate_population_with_cadence_and_evidence(
+pub(crate) fn evaluate_population_observed_with_evidence(
     inputs: crate::eval::PopulationEvalInputs<'_>,
     backend: EvaluationBackend,
     evidence: &crate::population_execution_evidence_v1::ExactPopulationEvaluationV1<'_>,
-    objective: &crate::scoring::weekly_cadence::WeeklySearchObjectiveV1,
+    objective: Option<&crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
 ) -> Result<crate::eval::PopulationEvaluationV1, String> {
-    objective
-        .checked_for_evaluation(
-            inputs.settings.initial_equity(),
-            false,
-            (
-                inputs.settings.risk_per_trade_min,
-                inputs.settings.risk_per_trade_max,
-            ),
-        )
-        .map_err(|e| e.to_string())?;
+    if let Some(objective) = objective {
+        objective
+            .checked_for_evaluation(
+                inputs.settings.initial_equity(),
+                false,
+                (
+                    inputs.settings.risk_per_trade_min,
+                    inputs.settings.risk_per_trade_max,
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+    }
     let audit = crate::gpu_native::cpu_strategy::CpuStrategyAuditContext::production(0);
     evaluate_population_core_with_backend_and_audit_inner(
         inputs,
         backend,
         &audit,
         Some(evidence),
-        Some(objective),
+        objective,
     )
 }
 

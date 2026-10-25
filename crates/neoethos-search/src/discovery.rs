@@ -14887,7 +14887,7 @@ where
                     // serialized quality payload, one fraction per completed
                     // month. Empty here is honest: a producer with no monthly
                     // series archives an empty array.
-                    metrics.monthly_returns = monthly_returns;
+                    metrics.monthly_returns = Some(monthly_returns);
 
                     // Per-session exposure, over EVERY screened candidate. Same
                     // bucket boundaries the cost model charges by construction —
