@@ -51,8 +51,13 @@ jobs:
                   shutil.copyfileobj(src,dst)
           print('M5 SHA256',hashlib.sha256(p.read_bytes()).hexdigest(),flush=True)
           f=vx.open(str(p))
-          print('Vortex length',len(f),'schema',f.schema,flush=True)
-          t=f.to_arrow().read_all()
+          print('Vortex public methods', [m for m in dir(f) if not m.startswith('_')],flush=True)
+          if hasattr(f, 'scan'):
+              print('scan methods', [m for m in dir(f.scan()) if not m.startswith('_')],flush=True)
+          print('Vortex repr',repr(f),flush=True)
+          t=f.to_arrow() if hasattr(f,'to_arrow') else (f.scan().to_arrow() if hasattr(f,'scan') else None)
+          if hasattr(t, 'read_all'): t=t.read_all()
+          assert t is not None, 'No supported to_arrow method found'
           print('Arrow schema', t.schema,'rows',t.num_rows,flush=True)
           print('First 3',t.slice(0,3).to_pylist(),flush=True)
           print('Last 3',t.slice(max(0,t.num_rows-3),3).to_pylist(),flush=True)
