@@ -1,0 +1,90 @@
+name: Pre-OOS funnel diagnostics (research only)
+
+# This experiment is isolated from master and intentionally has no final
+# holdout, broker execution, deployment or trading actions.
+on:
+  push:
+    branches:
+      - exp/pre-oos-funnel-ci-20261025
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pre-oos-funnel-research
+  cancel-in-progress: true
+
+jobs:
+  funnel-report:
+    name: Analyze pre-OOS selection evidence
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the reporter distinguishes the two modes and three Stage 1 windows
+        run: python3 scripts/pre_oos_funnel_audit.py --self-test
+      - name: Analyze saved pre-OOS funnels, when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/pre_oos_funnel_audit.py --input-dir pre-oos-artifacts --output pre-oos-report.md
+          cat pre-oos-report.md
+      - name: Preserve the evidence summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-oos-funnel-report
+          path: pre-oos-report.md
+          if-no-files-found: warn
+          retention-days: 14
+
+  search-contracts:
+    name: Risky and PropFirm search gate regression tests (no final OOS)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config mold \
+            libasound2-dev libudev-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libx11-dev libdbus-1-dev
+      - name: Install repository's pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+      - name: Cache Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pre-oos-search-contracts
+      - name: Exercise the exact selection and mode-specific filter contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pre-oos-logs
+          for name in \
+            lightweight_verdict_preserves_no_test_and_mode_specific_math \
+            walkforward_diagnostics_preserve_failed_folds_without_return_tapes \
+            mode_specific_wf_risk_constraints_remain_distinct \
+            the_funnel_keeps_every_reject_reason_the_quality_screen_records \
+            each_mode_keeps_its_own_risk_band \
+            risky_mode_keeps_the_operators_activity_floor
+          do
+            echo "=== TEST: $name ==="
+            cargo test --locked -p neoethos-search --no-default-features --lib "$name" -- --nocapture \
+              2>&1 | tee "pre-oos-logs/$name.log"
+          done
+      - name: Preserve diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-oos-contract-logs
+          path: pre-oos-logs/
+          if-no-files-found: warn
+          retention-days: 14
