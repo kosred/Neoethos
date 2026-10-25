@@ -2280,7 +2280,8 @@
         "avg_mfe": 0.0,
         "avg_mae": 0.0,
         "avg_r_multiple": 0.0,
-        "mfe_capture_ratio": 0.0
+        "mfe_capture_ratio": 0.0,
+        "monthly_returns": []
       },
       {
         "strategy_id": "report-not-selected",
@@ -2338,7 +2339,8 @@
         "avg_mfe": 0.0,
         "avg_mae": 0.0,
         "avg_r_multiple": 0.0,
-        "mfe_capture_ratio": 0.0
+        "mfe_capture_ratio": 0.0,
+        "monthly_returns": []
       },
       {
         "strategy_id": "report-selected-a",
@@ -2392,7 +2394,8 @@
         "avg_mfe": 0.0,
         "avg_mae": 0.0,
         "avg_r_multiple": 0.0,
-        "mfe_capture_ratio": 0.0
+        "mfe_capture_ratio": 0.0,
+        "monthly_returns": []
       }
     ],
     "logged_trades": [
@@ -6278,7 +6281,7 @@
           "reasons_truncated": 0
         },
         {
-          "name": "profitable_archive_size",
+          "name": "ga_returned_candidates_observation",
           "count_in": 0,
           "count_out": 0,
           "rejected": 0,
@@ -6435,5 +6438,5 @@
       }
     }
   },
-  "evidence_identity_sha256": "e6b6fa678b01daed3427bcef6c132d27c31d1662a4c4dcc3b02f2f74902b24aa"
+  "evidence_identity_sha256": "d2c6a8f8e68b52c49d81b409734b8acc2250c9875d4aa04e56c41b43f65f2588"
 }

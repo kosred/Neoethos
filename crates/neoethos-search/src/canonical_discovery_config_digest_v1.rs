@@ -264,6 +264,7 @@ fn encode_runtime_overrides_v1(
         weekly_cadence,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
+        label_cost_symmetric,
     } = runtime;
     encoder.record_start("runtime_overrides")?;
     encoder.usize("prefilter_top_k", *prefilter_top_k)?;
@@ -288,6 +289,12 @@ fn encode_runtime_overrides_v1(
             encoder.string(&index.to_string(), prefix)?;
         }
         encoder.record_end("prefilter_purge_prefixes_v1")?;
+    }
+    // Legacy false encodes identically; only the explicit opt-in adds bytes,
+    // so default runs keep the exact digest (and frame-cache key) they had
+    // before the knob existed.
+    if *label_cost_symmetric {
+        encoder.boolean("label_cost_symmetric_v1", true)?;
     }
     encoder.record_end("runtime_overrides")
 }
@@ -574,6 +581,26 @@ mod tests {
         );
         config.runtime_overrides.weekly_cadence = true;
         assert_ne!(old, canonical_discovery_config_digest_v1(&config).unwrap());
+    }
+
+    #[test]
+    fn label_cost_symmetric_opt_in_changes_canonical_config_digest() {
+        let mut config = DiscoveryConfig::default();
+        let old = canonical_discovery_config_digest_v1(&config).unwrap();
+        // The legacy false encodes identically — the knob only adds digest
+        // bytes when the operator opts in, so default runs keep the exact
+        // digest (and therefore frame-cache key) they had before the knob
+        // existed.
+        assert!(
+            !serde_json::to_string(&config.runtime_overrides)
+                .unwrap()
+                .contains("label_cost_symmetric")
+        );
+        config.runtime_overrides.label_cost_symmetric = true;
+        assert_ne!(old, canonical_discovery_config_digest_v1(&config).unwrap());
+        // Turning it back off must restore the exact legacy digest.
+        config.runtime_overrides.label_cost_symmetric = false;
+        assert_eq!(old, canonical_discovery_config_digest_v1(&config).unwrap());
     }
     use super::*;
 

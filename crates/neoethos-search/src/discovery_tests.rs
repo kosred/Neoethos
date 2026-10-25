@@ -659,6 +659,7 @@ fn run_finalization_milestone_fixture(
                 &days,
                 &features.timestamps,
                 &resolver.settings_for_gene(gene),
+                None,
             )
             .expect("milestone fixture measured candidate metrics")
             .0
@@ -2144,6 +2145,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         min_history_years: 0,
         prefilter_direction_only_ranking: false,
         prefilter_purge_prefixes: Vec::new(),
+        label_cost_symmetric: false,
     };
     // Stale-test fix (2026-07-02): the insample-frac fallback moved 0.80 → 0.70
     // in the resolver; the assertions now track the CURRENT fallback.
@@ -2160,9 +2162,27 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
         min_history_years: 0,
         prefilter_direction_only_ranking: false,
         prefilter_purge_prefixes: Vec::new(),
+        label_cost_symmetric: false,
     };
     assert!((too_small.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
     assert!((too_small.resolved_funnel_stage1_pct() - 0.01).abs() < 1e-9);
+}
+
+#[test]
+fn label_cost_symmetric_flows_from_settings_into_runtime_overrides() {
+    // Default: OFF everywhere.
+    let mut settings = neoethos_core::Settings::default();
+    assert!(!settings.models.discovery_runtime.label_cost_symmetric);
+    assert!(
+        !DiscoveryRuntimeOverrides::from_settings(&settings).label_cost_symmetric,
+        "the knob must default to off so legacy runs are untouched"
+    );
+    // Opt-in: survives the operator's config into the search runtime.
+    settings.models.discovery_runtime.label_cost_symmetric = true;
+    assert!(
+        DiscoveryRuntimeOverrides::from_settings(&settings).label_cost_symmetric,
+        "models.discovery_runtime.label_cost_symmetric=true must reach the prefilter"
+    );
 }
 
 #[test]
@@ -2191,6 +2211,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
         min_history_years: 0,
         prefilter_direction_only_ranking: false,
         prefilter_purge_prefixes: Vec::new(),
+        label_cost_symmetric: false,
     };
     let result = DiscoveryResult {
         search_input_receipt: sample_search_input_receipt(),
@@ -2338,6 +2359,7 @@ fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
         direction_only_ranking: false,
         purge_prefixes: Vec::new(),
         audit_ranking: false,
+        cost_symmetric: false,
     };
 
     // Legacy (no quota): top-3 by |corr| are the 3 base columns; no HTF.
@@ -2456,6 +2478,7 @@ fn volatility_decoupling_spec(top_k: usize, direction_only: bool, purge: Vec<Str
         direction_only_ranking: direction_only,
         purge_prefixes: purge,
         audit_ranking: true,
+        cost_symmetric: false,
     }
 }
 
@@ -2610,6 +2633,7 @@ fn first_passage_labels_decide_on_a_trending_series_and_are_fully_counted() {
         direction_only_ranking: false,
         purge_prefixes: Vec::new(),
         audit_ranking: false,
+        cost_symmetric: false,
     };
     let (labels, census) = first_passage_labels(&ohlcv, &spec);
     assert_eq!(labels.long.len(), n);
@@ -2685,6 +2709,7 @@ fn the_round_trip_cost_moves_both_barriers_the_same_way() {
         direction_only_ranking: false,
         purge_prefixes: Vec::new(),
         audit_ranking: false,
+        cost_symmetric: false,
     };
     let (_, free) = first_passage_labels(&ohlcv, &spec(0.0));
     let (_, charged) = first_passage_labels(&ohlcv, &spec(0.0005));
@@ -2694,6 +2719,230 @@ fn the_round_trip_cost_moves_both_barriers_the_same_way() {
         charged.label_down >= free.label_down,
         "charging the round trip must not make a long's stop HARDER to reach: free={free:?} \
          charged={charged:?}"
+    );
+}
+
+/// Deterministic drifting series for the label-cost census tests.
+///
+/// Constant per-bar range + a mild upward drift ⇒ near-constant rolling ATR,
+/// so every bar's stop distance is the same and — at rr == 1 — the ONLY
+/// asymmetry between the two barriers is the round-trip cost treatment. The
+/// drift is small enough to keep the symmetric race near 50/50 (see the
+/// census test's tolerances) but keeps the series "trending" rather than
+/// white noise. xorshift64*: deterministic, no RNG dependency.
+fn label_cost_balance_fixture() -> (Ohlcv, f64) {
+    let n = 8000usize;
+    let range = 0.0002f64;
+    let drift = 0.000_002f64;
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next_unit = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 33) as f64) / (1u64 << 30) as f64 // [0, 2)
+    };
+    let mut close = vec![1.1000f64; n];
+    for i in 1..n {
+        close[i] = close[i - 1] + drift + (next_unit() - 1.0) * range;
+    }
+    let timestamps = neoethos_data::test_fixtures::canonical_test_timestamps(n);
+    let high: Vec<f64> = close.iter().map(|c| c + range).collect();
+    let low: Vec<f64> = close.iter().map(|c| c - range).collect();
+    let ohlcv = Ohlcv {
+        timestamp: Some(timestamps),
+        open: close.clone(),
+        high,
+        low,
+        close,
+        volume: Some(vec![1.0; n]),
+    };
+    // True range is constant: high-low = 2·range = 0.0004, so ATR = 0.0004 and
+    // the stop distance (sl_atr_mult = 1.0) is 0.0004. Cost = 0.00016:
+    // legacy puts the loss barrier at 0.0004-0.00016 = 0.00024 (1.2 bar steps)
+    // and the take at 0.0004+0.00016 = 0.00056 → ~80/20 decided census (inside
+    // the pinned 70-90 window). Symmetric shifts both barriers to 0.00056 →
+    // a fair 50/50 race.
+    (ohlcv, 0.00016f64)
+}
+
+/// THE DEFECT AND THE FIX, in one assertion pair.
+///
+/// The legacy (default) cost treatment ADDS the round-trip cost to the take
+/// distance and SUBTRACTS it from the stop distance. In net-P&L terms that
+/// is correct (a win nets exactly the take, a loss exactly the stop), but
+/// first passage is a race in PRICE space, so the nearer stop barrier is hit
+/// ~80% of the time on a near-driftless series — the label is ~80% losing BY
+/// CONSTRUCTION, and the ranking/GA inherit that tilt. That ~80% is
+/// EXPECTED behaviour for the default and is pinned here as such, not as a
+/// regression.
+///
+/// With cost_symmetric, the cost is ADDED TO BOTH barrier distances: each
+/// side must clear its own distance PLUS the round trip (the same both-ways
+/// charge neoethos_models' symmetric label geometry applies), so at rr == 1
+/// the decided census is ~50/50 — a fair up/down race.
+#[test]
+fn label_cost_symmetric_balances_decided_census_while_default_tilts_toward_losses() {
+    let (ohlcv, cost) = label_cost_balance_fixture();
+    let spec = |symmetric: bool| PrefilterSpec {
+        top_k: 4,
+        insample_frac: 1.0,
+        min_per_tf: 0,
+        max_hold_bars: 64,
+        atr_period: 14,
+        sl_atr_mult: 1.0,
+        rr: 1.0,
+        round_trip_cost_px: cost,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: false,
+        cost_symmetric: symmetric,
+    };
+    let (_, legacy) = first_passage_labels(&ohlcv, &spec(false));
+    let (_, symmetric) = first_passage_labels(&ohlcv, &spec(true));
+
+    let decided = legacy.label_up + legacy.label_down;
+    assert!(
+        decided >= 6000,
+        "fixture must mostly decide inside the horizon: {legacy:?}"
+    );
+    let legacy_down_pct = 100.0 * legacy.label_down as f64 / decided as f64;
+    assert!(
+        (70.0..=90.0).contains(&legacy_down_pct),
+        "legacy cost treatment must tilt the decided census toward losses (~80%), got {legacy_down_pct:.1}% down ({legacy:?})"
+    );
+
+    let decided_symmetric = symmetric.label_up + symmetric.label_down;
+    assert!(
+        decided_symmetric >= 6000,
+        "symmetric mode must keep a high decision rate: {symmetric:?}"
+    );
+    let symmetric_up_pct = 100.0 * symmetric.label_up as f64 / decided_symmetric as f64;
+    assert!(
+        (45.0..=55.0).contains(&symmetric_up_pct),
+        "symmetric cost must balance the decided census (up≈down), got {symmetric_up_pct:.1}% up ({symmetric:?})"
+    );
+
+    // The SHORT label mirrors the long: same tilt in legacy mode, same
+    // balance in symmetric mode.
+    let legacy_short_decided = legacy.label_short_win + legacy.label_short_loss;
+    let legacy_short_loss_pct =
+        100.0 * legacy.label_short_loss as f64 / legacy_short_decided as f64;
+    assert!(
+        (70.0..=90.0).contains(&legacy_short_loss_pct),
+        "legacy short label must tilt toward losses too, got {legacy_short_loss_pct:.1}% ({legacy:?})"
+    );
+    let symmetric_short_decided = symmetric.label_short_win + symmetric.label_short_loss;
+    let symmetric_short_win_pct =
+        100.0 * symmetric.label_short_win as f64 / symmetric_short_decided as f64;
+    assert!(
+        (45.0..=55.0).contains(&symmetric_short_win_pct),
+        "symmetric short label must balance (win≈loss), got {symmetric_short_win_pct:.1}% ({symmetric:?})"
+    );
+}
+
+/// The opt-in knob must not move a single default-run label: with
+/// cost_symmetric == false the produced vectors are byte-identical to the
+/// legacy barrier formula, replicated here as an independent oracle
+/// (both of a long's barriers shift UP by the cost, both of a short's shift
+/// DOWN — the pre-knob math).
+#[test]
+fn default_label_cost_treatment_is_byte_identical_to_legacy_barrier_math() {
+    let (ohlcv, cost) = label_cost_balance_fixture();
+    let spec = PrefilterSpec {
+        top_k: 4,
+        insample_frac: 1.0,
+        min_per_tf: 0,
+        max_hold_bars: 40,
+        atr_period: 14,
+        sl_atr_mult: 1.0,
+        rr: 1.0,
+        round_trip_cost_px: cost,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: false,
+        cost_symmetric: false,
+    };
+    let (actual, _) = first_passage_labels(&ohlcv, &spec);
+
+    let n = ohlcv.close.len();
+    let atr = rolling_atr_f64(&ohlcv, spec.atr_period);
+    let hold = spec.max_hold_bars.max(1);
+    let mut long = vec![f64::NAN; n];
+    let mut short = vec![f64::NAN; n];
+    for i in 0..n {
+        let entry = ohlcv.close[i];
+        let a = atr[i];
+        if !entry.is_finite() || !a.is_finite() || a <= 0.0 || i + 1 >= n {
+            long[i] = 0.0;
+            short[i] = 0.0;
+            continue;
+        }
+        let take_distance = a;
+        let stop_distance = a;
+        // Legacy barriers, long and short.
+        let long_tp = entry + take_distance + cost;
+        let long_sl = entry - stop_distance + cost;
+        let short_tp = entry - take_distance - cost;
+        let short_sl = entry + stop_distance - cost;
+        let horizon_end = (i + hold).min(n - 1);
+        for f in (i + 1)..=horizon_end {
+            let hi = ohlcv.high[f];
+            let lo = ohlcv.low[f];
+            let hi_ok = hi.is_finite();
+            let lo_ok = lo.is_finite();
+            if long[i].is_nan() {
+                let both = hi_ok && hi >= long_tp && lo_ok && lo <= long_sl;
+                let up = hi_ok && hi >= long_tp;
+                let down = lo_ok && lo <= long_sl;
+                if both || up || down {
+                    long[i] = if both {
+                        0.0
+                    } else if up {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                }
+            }
+            if short[i].is_nan() {
+                let both = lo_ok && lo <= short_tp && hi_ok && hi >= short_sl;
+                let win = lo_ok && lo <= short_tp;
+                let loss = hi_ok && hi >= short_sl;
+                if both || win || loss {
+                    short[i] = if both {
+                        0.0
+                    } else if win {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                }
+            }
+            if !long[i].is_nan() && !short[i].is_nan() {
+                break;
+            }
+        }
+        if long[i].is_nan() {
+            long[i] = 0.0;
+        }
+        if short[i].is_nan() {
+            short[i] = 0.0;
+        }
+    }
+    let first_diff = actual
+        .long
+        .iter()
+        .zip(long.iter())
+        .enumerate()
+        .find(|(_, (a, b))| a.to_bits() != b.to_bits())
+        .map(|(idx, (a, b))| format!("idx {idx} actual {a:?} oracle {b:?}"));
+    assert!(
+        actual.long == long,
+        "default (cost_symmetric=false) long labels must be byte-identical to the legacy math; first diff: {first_diff:?}"
+    );
+    assert_eq!(
+        actual.short, short,
+        "default (cost_symmetric=false) short labels must be byte-identical to the legacy math"
     );
 }
 
@@ -2714,6 +2963,7 @@ fn prefilter_uses_one_label_safe_selection_window() {
         direction_only_ranking: false,
         purge_prefixes: Vec::new(),
         audit_ranking: false,
+        cost_symmetric: false,
     };
     let (windows, available) = prefilter_fit_windows(10_000, &base);
     assert_eq!(
@@ -2767,6 +3017,7 @@ fn a_nan_prefixed_column_is_ranked_on_its_finite_rows_not_scored_zero() {
         direction_only_ranking: false,
         purge_prefixes: Vec::new(),
         audit_ranking: false,
+        cost_symmetric: false,
     };
     let (labels, _) = first_passage_labels(&ohlcv, &spec);
     let distinct_finite_labels = labels
@@ -6658,6 +6909,135 @@ fn the_funnel_keeps_every_reject_reason_the_quality_screen_records() {
     assert!(crate::funnel_profile::MAX_REJECT_REASONS_PER_STAGE >= 14);
 }
 
+/// THE PER-MONTH ARCHIVE (operator 2026-10-25): every research.json quality
+/// entry must carry the completed-month fractional return vector the canonical
+/// CPU ledger already computes for B9 (its monthly_returns_out: one fraction
+/// per completed month = month P&L over month-start equity). Synthetic daily
+/// series spanning two COMPLETE months plus one bar of a third (the first bar
+/// of the third month is what finalizes the second inside the ledger). One
+/// fixed-1-lot long per month, each taking +10 pips: month 1 nets +100 on 1000
+/// start equity and month 2 nets +100 on 1100 carried equity, so the archived
+/// vector must read exactly [0.10, 100/1100]. RED-first: this test does not
+/// compile until StrategyMetrics::monthly_returns exists and the
+/// confidence-ledger evaluator accepts the monthly out-parameter.
+#[test]
+fn quality_metrics_payload_archives_the_two_month_fractional_return_vector() {
+    let day_ms = 86_400_000i64;
+    let bars_per_month = [20usize, 20usize, 1usize];
+    let mut timestamps = Vec::new();
+    let mut months = Vec::new();
+    let mut days = Vec::new();
+    // 2024-01-01T00:00:00Z is a Monday; the daily grid keeps the analyzer's
+    // weekday gate happy across the whole span.
+    let base = 1_704_067_200_000i64;
+    for (m, len) in bars_per_month.iter().enumerate() {
+        for _ in 0..*len {
+            timestamps.push(base + (timestamps.len() as i64) * day_ms);
+            months.push(m as i64);
+            days.push(timestamps.len() as i64);
+        }
+    }
+    let n = timestamps.len();
+    let close = vec![1.0f64; n];
+    let mut high = vec![1.0f64; n];
+    let low = vec![0.9995f64; n];
+    // Causal entries: the signal on bar 0 fills bar 1, the signal on bar 20
+    // fills bar 21. Each take sits at entry + 10 pips and is hit one bar after
+    // the fill; the 20-pip stop (0.998) stays below every low (0.9995).
+    let mut signals = vec![0i8; n];
+    signals[0] = 1;
+    signals[20] = 1;
+    high[2] = 1.0010;
+    high[22] = 1.0010;
+    let settings = crate::eval::BacktestSettings {
+        initial_equity_override: Some(1000.0),
+        pip_value: 0.0001,
+        pip_value_per_lot: 10.0,
+        sl_pips: 20.0,
+        tp_pips: 10.0,
+        spread_pips: 0.0,
+        commission_per_trade: 0.0,
+        swap_long_pips_per_day: 0.0,
+        swap_short_pips_per_day: 0.0,
+        pnl_conversion_fee_rate: 0.0,
+        max_hold_bars: 5,
+        min_hold_bars: 0,
+        max_trades_per_day: 0,
+        gap_threshold_ms: 0,
+        kill_zones_enabled: false,
+        trailing_enabled: false,
+        risk_based_sizing: false,
+        ..crate::eval::BacktestSettings::default()
+    };
+    let mut monthly = Vec::new();
+    let (account_metrics, trades) =
+        crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &[],
+            &months,
+            &days,
+            &timestamps,
+            &settings,
+            Some(&mut monthly),
+        )
+        .expect("synthetic two-month replay");
+    assert_eq!(trades.len(), 2, "one trade per completed month: {trades:?}");
+    assert_eq!(
+        monthly.len(),
+        2,
+        "two completed months must archive two entries: {monthly:?}"
+    );
+    assert!((monthly[0] - 0.10).abs() < 1e-12, "month 1: +100 on 1000 start equity: {monthly:?}");
+    assert!(
+        (monthly[1] - 100.0 / 1100.0).abs() < 1e-12,
+        "month 2: +100 on 1100 carried equity: {monthly:?}"
+    );
+
+    // The quality payload end-to-end: the analyzer output for the same replay
+    // carries the vector, and the serialized research.json entry exposes it as
+    // a JSON array (empty/unknown stays an EMPTY ARRAY, never absent).
+    let analyzer = crate::quality::StrategyQualityAnalyzer::default();
+    let mut metrics = analyzer
+        .analyze_strategy_with_evaluation(
+            "synthetic-two-month",
+            &trades,
+            1000.0,
+            timestamps[0],
+            timestamps[n - 1],
+            &account_metrics,
+        )
+        .expect("synthetic quality analysis");
+    metrics.monthly_returns = monthly.clone();
+    let json = serde_json::to_value(&metrics).expect("quality payload serializes");
+    let archived = json
+        .get("monthly_returns")
+        .and_then(serde_json::Value::as_array)
+        .expect("research.json quality entries carry monthly_returns as an array");
+    assert_eq!(archived.len(), 2);
+    assert!(
+        (archived[0].as_f64().expect("finite fraction") - 0.10).abs() < 1e-12,
+        "serialized month 1 fraction: {json}"
+    );
+    assert!(
+        (archived[1].as_f64().expect("finite fraction") - 100.0 / 1100.0).abs() < 1e-12,
+        "serialized month 2 fraction: {json}"
+    );
+    // And an unknown/empty producer serializes as an EMPTY ARRAY, not absent.
+    let empty = crate::quality::empty_metrics("no-series");
+    let empty_json = serde_json::to_value(&empty).expect("empty payload serializes");
+    assert_eq!(
+        empty_json
+            .get("monthly_returns")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "an unknown monthly series must serialize as an empty array"
+    );
+}
+
 /// A cost band that sits BELOW the cost the run already charges cannot fail
 /// anybody: the edges replace the whole cost, cost is monotone, so every
 /// screened survivor clears both edges by construction and the census reads
@@ -7165,6 +7545,7 @@ fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_r
         direction_only_ranking: false,
         purge_prefixes: Vec::new(),
         audit_ranking: false,
+        cost_symmetric: false,
     };
     let (filtered, _census) = prefilter_features(&frame, &ohlcv, &spec).unwrap();
     let (without_recipe, _) = prefilter_features(&counterfactual_frame, &ohlcv, &spec).unwrap();

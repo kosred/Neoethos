@@ -1730,6 +1730,10 @@ pub(crate) fn validate_sizing_confidences(
 /// One replay returns both the metrics and the actual entry-sized trades.
 /// Consumers cannot accidentally combine risk-sized metrics with a fixed-lot
 /// ledger, and walk-forward does not have to simulate every window twice.
+/// `monthly_returns_out` optionally captures the completed-month fractional
+/// return vector (month P&L over month-start equity) — the same series the
+/// opt-in MonthlyUpsideV1 selector (B9) consumes; pass `None` when the
+/// consumer has no monthly series.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
     close: &[f64],
@@ -1741,6 +1745,7 @@ pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
     day_idx: &[i64],
     timestamps: &[i64],
     settings: &BacktestSettings,
+    monthly_returns_out: Option<&mut Vec<f64>>,
 ) -> anyhow::Result<([f64; 11], Vec<Trade>)> {
     let bars = close.len();
     if high.len() != bars
@@ -1769,7 +1774,7 @@ pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
         &mut trades,
         None,
         None,
-        None,
+        monthly_returns_out,
     );
     Ok((metrics, trades))
 }
@@ -1802,6 +1807,7 @@ pub(crate) fn simulate_trades_with_confidence_core(
         &days,
         timestamps,
         settings,
+        None,
     )
     .map(|(_, trades)| trades)
 }
@@ -2544,6 +2550,7 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
                 day_idx,
                 timestamps,
                 &gene_settings,
+                None,
             )?;
             (metrics, trades, Vec::new(), Vec::new())
         } else {
@@ -3647,6 +3654,7 @@ mod overrides_tests {
                         &days,
                         &times,
                         &settings,
+                        None,
                     )
                     .unwrap();
                     let fast = fast_evaluate_strategy_core(

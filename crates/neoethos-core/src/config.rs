@@ -1553,6 +1553,33 @@ pub struct DiscoveryRuntimeConfig {
     /// parkinson_volatility, quant_rvol, mass, normalized_volume_true_range]`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prefilter_purge_prefixes: Vec<String>,
+    /// Opt-in SYMMETRIC round-trip cost treatment for the discovery prefilter's
+    /// triple-barrier / first-passage label (neo-671 label-cost experiment,
+    /// default `false` = unchanged behaviour).
+    ///
+    /// The legacy (default) barriers charge the round-trip cost to the take
+    /// side only in PRICE terms: the take barrier sits at
+    /// `entry + take + cost` while the stop barrier sits at
+    /// `entry - stop + cost` (cost ADDED to the take distance, SUBTRACTED from
+    /// the stop distance). In net-P&L terms that is correct — a win nets
+    /// exactly `take` and a loss nets exactly `stop` — but first passage is
+    /// a race in PRICE space, so the stop (now `stop - cost` from entry) is
+    /// hit far more often than the take (`take + cost` away). At the band
+    /// midpoint the decided census is therefore ~80% losses BY CONSTRUCTION,
+    /// and the feature ranking and the GA inherit that loss tilt.
+    ///
+    /// When `true`, the cost is ADDED TO BOTH barrier distances:
+    /// `entry + take + cost` vs `entry - stop - cost` (mirrored for the
+    /// short label). Each side must clear its own distance PLUS the round trip
+    /// — the same both-ways charge the `models.label_geometry: symmetric`
+    /// mode of `neoethos_models` applies. On a driftless series the race is
+    /// fair: with `rr == 1` the decided census is ~50/50; with `rr > 1`
+    /// only the honest rr tilt remains and the cost no longer tilts it further.
+    ///
+    /// The resident GPU screening path refuses this knob for now (the
+    /// device-side label still applies the legacy tilt); use the CPU route.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub label_cost_symmetric: bool,
 }
 
 impl Default for DiscoveryRuntimeConfig {
@@ -1570,6 +1597,7 @@ impl Default for DiscoveryRuntimeConfig {
             prefilter_min_per_timeframe: 6,
             prefilter_direction_only_ranking: false,
             prefilter_purge_prefixes: Vec::new(),
+            label_cost_symmetric: false,
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
             min_history_years: 0,
@@ -5028,6 +5056,32 @@ mod tests {
             .discovery_runtime
             .prefilter_purge_prefixes
             .is_empty());
+    }
+
+    #[test]
+    fn label_cost_symmetric_survives_settings_serde_round_trip() {
+        // Shipped default: OFF, so today's label barriers are unchanged.
+        let mut settings = Settings::default();
+        assert!(!settings.models.discovery_runtime.label_cost_symmetric);
+
+        // An enabled knob must survive the YAML round trip.
+        settings.models.discovery_runtime.label_cost_symmetric = true;
+        let yaml = serde_yaml_ng::to_string(&settings).unwrap();
+        assert!(
+            yaml.contains("label_cost_symmetric"),
+            "an enabled symmetric-cost label knob must be serialised: {yaml}"
+        );
+        let back: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(back.models.discovery_runtime.label_cost_symmetric);
+
+        // An absent key keeps the disabled default.
+        let absent: Settings = serde_yaml_ng::from_str(
+            "system:
+  symbol: EURUSD
+",
+        )
+        .unwrap();
+        assert!(!absent.models.discovery_runtime.label_cost_symmetric);
     }
 
     #[test]

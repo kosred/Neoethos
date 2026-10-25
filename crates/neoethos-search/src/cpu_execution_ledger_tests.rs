@@ -361,6 +361,7 @@ fn account_risk_ledger_prices_signal_confidence_compounding_and_all_costs() {
         &days,
         &times,
         &policy,
+        None,
     )
     .expect("complete account-risk replay");
     // Long entry=101, TP=121. Risk cash=100, stop cash/lot=1000 => 0.1 lot.
@@ -403,6 +404,7 @@ fn account_risk_ledger_prices_signal_confidence_compounding_and_all_costs() {
         &days,
         &times,
         &fixed_policy,
+        None,
     )
     .expect("fixed-1-lot replay on the same fixture");
     assert_eq!(

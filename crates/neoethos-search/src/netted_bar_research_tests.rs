@@ -223,6 +223,7 @@ fn all_one_multipliers_and_fixed_brackets_match_legacy_core_bit_for_bit() {
             &run.days,
             &run.timestamps,
             &run.settings,
+            None,
         )
         .unwrap();
     assert_eq!(

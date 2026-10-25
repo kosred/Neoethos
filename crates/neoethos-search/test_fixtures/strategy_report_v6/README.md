@@ -11,6 +11,15 @@ The October 2026 refresh persists the existing funnel signal-policy field for
 frozen research continuation. Review confirmed that only that field and the
 research evidence identity changed; the compact portfolio bytes stayed identical.
 
+The 2026-10-25 refresh archives the per-month money series: every research.json
+quality entry now carries the completed-month fractional return vector
+(`monthly_returns`) the canonical CPU ledger evaluator emits — the same series
+the opt-in MonthlyUpsideV1 selector (B9) consumes. Review confirmed the only
+research.json changes are those monthly_returns additions on the three quality
+entries, the funnel stage rename introduced by the measured GA census commit
+(which had left the checked-in pair stale on this branch) and the derived
+evidence identity hash; the compact portfolio bytes stayed identical.
+
 The pair uses the existing external `embedded-ctrader-fixture-unverified`
 two-column receipt with 80/10/10 scopes, typed selection evidence constructors,
 the real research-result constructor and the real compact V6 portfolio writer.

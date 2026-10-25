@@ -248,6 +248,9 @@ pub struct StrategyMetrics {
     pub avg_r_multiple: f64,
     #[serde(default)]
     pub mfe_capture_ratio: f64,
+    /// Per-completed-month fractional return series archived per candidate.
+    #[serde(default)]
+    pub monthly_returns: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -735,6 +738,9 @@ impl StrategyQualityAnalyzer {
             positive_months: monthly_metrics.positive,
             negative_months: monthly_metrics.negative,
             avg_monthly_return_pct,
+            // Filled by discovery's quality screen from the same replay's
+            // ledger monthly_returns_out; trade-only diagnostics stay empty.
+            monthly_returns: Vec::new(),
             profit_per_trade: net_expectancy_per_trade,
             net_expectancy_stderr,
             net_expectancy_t_stat,
@@ -1211,6 +1217,7 @@ pub(crate) fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
         positive_months: 0,
         negative_months: 0,
         avg_monthly_return_pct: 0.0,
+        monthly_returns: Vec::new(),
         profit_per_trade: 0.0,
         net_expectancy_stderr: 0.0,
         net_expectancy_t_stat: 0.0,
@@ -1427,6 +1434,7 @@ mod overrides_tests {
             &days,
             &timestamps,
             &settings,
+            None,
         )
         .unwrap();
         assert_eq!(

@@ -126,6 +126,13 @@ pub struct DiscoveryRuntimeOverrides {
     /// matching rules live on `DiscoveryRuntimeConfig::prefilter_purge_prefixes`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prefilter_purge_prefixes: Vec<String>,
+    /// Symmetric round-trip cost treatment for the prefilter's first-passage
+    /// label; rationale and barrier math live on
+    /// `neoethos_core::config::DiscoveryRuntimeConfig::label_cost_symmetric`
+    /// and `first_passage_labels`. Only the explicit opt-in adds digest
+    /// bytes, so default runs keep their exact legacy digest/cache key.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub label_cost_symmetric: bool,
     /// Explicit new-run weekly objective. False retains legacy scoring.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub weekly_cadence: bool,
@@ -166,6 +173,7 @@ impl Default for DiscoveryRuntimeOverrides {
             min_history_years: 0,
             prefilter_direction_only_ranking: false,
             prefilter_purge_prefixes: Vec::new(),
+            label_cost_symmetric: false,
         }
     }
 }
@@ -198,6 +206,7 @@ impl DiscoveryRuntimeOverrides {
         }
         overrides.prefilter_min_per_timeframe = cfg.prefilter_min_per_timeframe;
         overrides.prefilter_direction_only_ranking = cfg.prefilter_direction_only_ranking;
+        overrides.label_cost_symmetric = cfg.label_cost_symmetric;
         overrides.prefilter_purge_prefixes = cfg
             .prefilter_purge_prefixes
             .iter()
@@ -2590,6 +2599,10 @@ pub struct DiscoveryRunProfile {
     /// off).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prefilter_purge_prefixes: Vec<String>,
+    /// Symmetric round-trip cost barriers were active for this run's prefilter
+    /// label (opt-in).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub label_cost_symmetric: bool,
     /// Per-kind validation-evidence hashes ready for the typed
     /// [`neoethos_core::contracts::ValidationEvidenceManifest`]. `None`
     /// per field indicates that artifact kind was not produced for
@@ -6571,6 +6584,7 @@ fn evaluate_gene_with_ledger_v1(
         day_idx,
         timestamps,
         settings,
+        None,
     )
 }
 
@@ -11023,6 +11037,7 @@ where
             direction_only_ranking: config.runtime_overrides.prefilter_direction_only_ranking,
             purge_prefixes: config.runtime_overrides.prefilter_purge_prefixes.clone(),
             audit_ranking: false,
+            cost_symmetric: config.runtime_overrides.label_cost_symmetric,
         };
         let (filtered_frame, census) = prefilter_features(&features, &ohlcv, &spec)?;
         features = filtered_frame;
@@ -11057,6 +11072,7 @@ where
                 0.0
             },
             round_trip_cost_px = spec.round_trip_cost_px,
+            label_cost_symmetric = spec.cost_symmetric,
             "prefilter — target is the triple-barrier label in BOTH directions, geometry read \
              from this run's gene stop band, ranking fitted once on the label-safe selection \
              window, correlation two-pass f64. CPCV remains a post-GA finalist gate."
@@ -11571,6 +11587,12 @@ pub(crate) struct PrefilterSpec {
     /// instead of discarding it after top-K. Used by the prefilter ranking
     /// audit; production runs keep this `false`.
     pub audit_ranking: bool,
+    /// Symmetric round-trip cost treatment for the label barriers: the cost
+    /// is ADDED TO BOTH distances (each side clears its own distance plus
+    /// the round trip) instead of added to the take and subtracted from the
+    /// stop. `false` = the legacy byte-identical math. See
+    /// `first_passage_labels` for the exact barriers.
+    pub cost_symmetric: bool,
 }
 
 /// One numerical authority for the CPU and resident-CUDA prefilter label
@@ -11831,6 +11853,7 @@ pub fn run_prefilter_ranking_audit_v1(
         direction_only_ranking: false,
         purge_prefixes: Vec::new(),
         audit_ranking: true,
+        cost_symmetric: research_config.runtime_overrides.label_cost_symmetric,
     };
     let (_, census_default, ranking_default) =
         prefilter_features_with_ranking(features, ohlcv, &spec)?;
@@ -12074,6 +12097,10 @@ fn first_passage_labels(
         let a = atr[i];
         if !entry.is_finite() || !a.is_finite() || a <= 0.0 || i + 1 >= n {
             census.label_undefined += 1;
+            // Undefined rows are represented as 0.0 (no decision) so the
+            // labels contract never leaks NaN into ranking/GA consumers.
+            long_labels[i] = 0.0;
+            short_labels[i] = 0.0;
             continue;
         }
         let stop_distance = sl_mult * a;
@@ -12099,10 +12126,17 @@ fn first_passage_labels(
         //    the cost, and both of a short's shift DOWN — that is what "charge
         //    the round trip to the trade" actually looks like.
         let long_tp = entry + take_distance + cost;
-        let long_sl = entry - stop_distance + cost;
+        let mut long_sl = entry - stop_distance + cost;
         let short_tp = entry - take_distance - cost;
-        let short_sl = entry + stop_distance - cost;
+        let mut short_sl = entry + stop_distance - cost;
         let horizon_end = (i + hold).min(n - 1);
+        // cost_symmetric=true (opt-in): charge the round trip symmetrically —
+        // both barriers shift AWAY from entry by the cost, so a driftless walk
+        // no longer structurally favors the losing side (~80% loss labels).
+        if spec.cost_symmetric {
+            long_sl -= 2.0 * cost;
+            short_sl += 2.0 * cost;
+        }
 
         let mut long_label = 0.0f64;
         let mut short_label = 0.0f64;
@@ -14824,6 +14858,7 @@ where
                             .expect("quality candidates have shared SMC"),
                         &sig,
                     )?;
+                    let mut monthly_returns = Vec::new();
                     let (account_metrics, trades) =
                         crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
                             &ohlcv.close,
@@ -14835,6 +14870,7 @@ where
                             &quality_days,
                             &features.timestamps,
                             &screen_resolver.settings_for_gene(&gene),
+                            Some(&mut monthly_returns),
                         )?;
                     completed_quality_replays.fetch_add(1, AtomicOrdering::Relaxed);
                     let mut metrics = analyzer.analyze_strategy_with_evaluation(
@@ -14845,6 +14881,13 @@ where
                         quality_end_ms,
                         &account_metrics,
                     )?;
+                    // Per-month archive: the same completed-month fractional
+                    // return vector this replay already computed (and B9's
+                    // MonthlyUpsideV1 selector consumes) rides into the
+                    // serialized quality payload, one fraction per completed
+                    // month. Empty here is honest: a producer with no monthly
+                    // series archives an empty array.
+                    metrics.monthly_returns = monthly_returns;
 
                     // Per-session exposure, over EVERY screened candidate. Same
                     // bucket boundaries the cost model charges by construction —
@@ -15999,7 +16042,10 @@ where
                     &quality_days,
                     &features.timestamps,
                     &fallback_resolver.settings_for_gene(&gene),
+                    None,
                 )?;
+            // Best-effort fallback rows predate the per-month archive producer;
+            // their monthly_returns stays empty (unknown), never invented.
             quality_metrics.push(analyzer.analyze_strategy_with_evaluation(
                 &gene.strategy_id,
                 &trades,
@@ -17950,11 +17996,13 @@ pub fn build_discovery_profile(
         weekly_cadence,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
+        label_cost_symmetric,
     } = runtime_overrides;
     DiscoveryRunProfile {
         weekly_cadence: *weekly_cadence,
         prefilter_direction_only_ranking: *prefilter_direction_only_ranking,
         prefilter_purge_prefixes: prefilter_purge_prefixes.clone(),
+        label_cost_symmetric: *label_cost_symmetric,
         population_eval_engines,
         population_execution_run_receipt_v2: population_execution_run_receipt_v2.cloned(),
         timeframe_label: timeframe_label.clone(),
@@ -18965,6 +19013,7 @@ mod candidate_validation_order_tests {
                     &days,
                     &features.timestamps,
                     &resolver.settings_for_gene(gene),
+                    None,
                 )?;
             let mut measured = quality_analyzer_for_config(&config)
                 .analyze_strategy_with_evaluation(
