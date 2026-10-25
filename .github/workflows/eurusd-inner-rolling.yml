@@ -1,0 +1,58 @@
+name: EURUSD inner rolling fold edge audit (research only)
+
+on:
+  push:
+    branches:
+      - exp/pre-oos-funnel-ci-20261025
+    paths:
+      - '.github/workflows/eurusd-inner-rolling.yml'
+      - 'scripts/eurusd_inner_rolling_edge.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  early-fold-stability:
+    name: Five chronological folds, six families, dynamic risk
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned numerical research tools
+        run: python -m pip install 'vortex-data==0.88.0' 'numpy==2.2.6' 'pandas==2.3.3' 'numba==0.61.2'
+      - name: Compile scripts and verify dynamic-lot constraints
+        run: |
+          python -m py_compile scripts/eurusd_dynamic_edge_lab.py scripts/eurusd_inner_rolling_edge.py
+          python scripts/eurusd_leverage_sweep.py --self-test
+      - name: Download immutable historical data
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --connect-timeout 20 \
+            -o EURUSD.tar \
+            https://github.com/kosred/neoethos-data/releases/download/snapshot-2026-08-09/EURUSD.tar
+          echo '042aa66fde29e697bd30d93d85c4762076c06e292097e42680ed0067b06ca061  EURUSD.tar' | sha256sum -c -
+      - name: Find candidate stability within training-only chronological folds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/eurusd_inner_rolling_edge.py \
+            --archive EURUSD.tar --out eurusd-inner-rolling-results \
+            | tee eurusd-inner-rolling-console.log
+          test -s eurusd-inner-rolling-results/results.json
+          test -s eurusd-inner-rolling-results/report.md
+          cat eurusd-inner-rolling-results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive training-fold evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eurusd-inner-rolling-results
+          path: |
+            eurusd-inner-rolling-results/
+            eurusd-inner-rolling-console.log
+          if-no-files-found: warn
+          retention-days: 30
