@@ -24,8 +24,8 @@ jobs:
             -o EURUSD.tar \
             https://github.com/kosred/neoethos-data/releases/download/snapshot-2026-08-09/EURUSD.tar
           echo '042aa66fde29e697bd30d93d85c4762076c06e292097e42680ed0067b06ca061  EURUSD.tar' | sha256sum -c -
-          echo "=== M5 archive entries ==="
-          tar -tf EURUSD.tar | grep -E '(^|/)M5(/|$)' | head -30
+          echo "=== First 60 archive entries ==="
+          tar -tf EURUSD.tar | sed -n '1,60p'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -40,7 +40,7 @@ jobs:
           import vortex as vx
           import numpy as np
           with tarfile.open('EURUSD.tar') as tar:
-              ms=[m for m in tar.getmembers() if m.isfile() and m.name.split('/')[-1]=='data.vortex' and 'M5' in m.name.split('/')]
+              ms=[m for m in tar.getmembers() if m.isfile() and m.name.split('/')[-1].lower()=='data.vortex' and any(part.lower()=='m5' for part in m.name.split('/'))]
               print('M5 vortex matches:', [(m.name,m.size) for m in ms],flush=True)
               assert len(ms)==1, 'Ambiguous or absent M5 data.vortex'
               m=ms[0]
