@@ -64,7 +64,7 @@ def load(archive):
 @njit(cache=True)
 def simulate(sig, op, hi, lo, cl, timestamp, atr_pips, start, stop,
              initial_usd, risk_fraction, max_entries_day, rr, hold_bars,
-             spread_pips, extra_fee_pips):
+             spread_pips, extra_fee_pips, max_notional_multiple=30.0):
     equity = initial_usd
     peak = equity
     max_dd = 0.0
@@ -179,7 +179,7 @@ def simulate(sig, op, hi, lo, cl, timestamp, atr_pips, start, stop,
         if sl <= 0:
             continue
         raw = equity * risk_fraction / (sl * PIP_VALUE)
-        notional_max = (equity * 30.0) / (op[i] * 100000.0)
+        notional_max = (equity * max_notional_multiple) / (op[i] * 100000.0)
         if raw > notional_max:
             bound_notional += 1
         else:
