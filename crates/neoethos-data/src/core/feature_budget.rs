@@ -36,6 +36,22 @@ pub const STAGING_RAM_FRACTION: f64 = 0.25;
 /// reject it if the measured allocation headroom is insufficient.
 pub const MIN_COLUMNS: usize = 66;
 
+/// Operator override for the planning headroom, for controlled comparisons.
+///
+/// The vocabulary budget is derived from a live memory probe, so two runs of the
+/// SAME settings can admit a different number of indicator columns (and a
+/// different streaming batch width) when the machine's free RAM differs. That
+/// makes A/B comparisons of two search recipes unsound: the frame content, not
+/// the recipe, decided the outcome. Setting this variable to a byte count pins
+/// the planning headroom, so the admitted vocabulary and the streaming shape
+/// become a pure function of the dataset and the pinned value.
+///
+/// The pin is planning only. Execution preflight still measures real headroom
+/// and refuses an unaffordable complete plan; when the current probe is smaller
+/// than the pin the shortfall is reported loudly (see `log`).
+pub const ENV_PINNED_PLANNING_HEADROOM_BYTES: &str =
+    "NEOETHOS_PINNED_FEATURE_BUDGET_HEADROOM_BYTES";
+
 /// Absolute ceiling regardless of how much RAM the box has.
 ///
 /// `ALL_INDICATORS` is 342 ids and the widest declares twelve outputs, so the
@@ -83,7 +99,29 @@ impl VocabularyBudget {
     /// the SAME budget to every timeframe — otherwise the admitted id set (and
     /// therefore the column width) varies per timeframe.
     pub fn for_frame(rows: usize) -> Self {
-        Self::from_available(rows, neoethos_core::allocation_headroom_bytes())
+        let actual = neoethos_core::allocation_headroom_bytes();
+        Self::for_frame_from_headroom(rows, actual, pinned_planning_headroom_bytes_from_env())
+    }
+
+    /// Deterministic core of [`VocabularyBudget::for_frame`] with the planning
+    /// headroom resolved explicitly, so a pinned budget can be tested without a
+    /// machine probe or process-global environment mutation.
+    ///
+    /// When `pinned` is present it REPLACES the probe; the actual probe is kept
+    /// only so [`VocabularyBudget::log`] can report a shortfall. Never adds
+    /// permission: the execution preflight still measures real headroom.
+    pub fn for_frame_from_headroom(rows: usize, actual: u64, pinned: Option<u64>) -> Self {
+        Self::from_available(rows, pinned.unwrap_or(actual))
+    }
+
+    /// Planning headroom this budget was sized from, and the live probe it
+    /// replaced (if any).
+    pub fn planning_headroom(&self) -> PlanningHeadroomV1 {
+        PlanningHeadroomV1 {
+            headroom_bytes: self.available_bytes,
+            pinned: pinned_planning_headroom_bytes_from_env().is_some(),
+            probe_bytes: neoethos_core::allocation_headroom_bytes(),
+        }
     }
 
     /// Size ONE budget for a whole multi-timeframe run from its WIDEST frame.
@@ -168,6 +206,34 @@ impl VocabularyBudget {
                  Execution preflight must still admit the complete frozen output."
             );
         }
+        let provenance = self.planning_headroom();
+        if provenance.pinned {
+            let shortfall = provenance.shortfall_bytes();
+            tracing::info!(
+                target: "neoethos_data::feature_budget",
+                stage,
+                rows = self.rows,
+                pinned = true,
+                planned_headroom_gb = format!("{:.2}", provenance.headroom_bytes as f64 / 1e9),
+                probe_headroom_gb = format!("{:.2}", provenance.probe_bytes as f64 / 1e9),
+                shortfall_gb = format!("{:.2}", shortfall as f64 / 1e9),
+                "planning headroom is PINNED by {ENV_PINNED_PLANNING_HEADROOM_BYTES}: the admitted \
+                 vocabulary and streaming batch are a function of the dataset and the pin, not of this \
+                 machine's free RAM. Execution preflight still measures the real headroom."
+            );
+            if shortfall > 0 {
+                tracing::warn!(
+                    target: "neoethos_data::feature_budget",
+                    stage,
+                    pinned_headroom_gb = format!("{:.2}", provenance.headroom_bytes as f64 / 1e9),
+                    probe_headroom_gb = format!("{:.2}", provenance.probe_bytes as f64 / 1e9),
+                    shortfall_gb = format!("{:.2}", shortfall as f64 / 1e9),
+                    "the pinned planning headroom EXCEEDS the current allocation probe — the complete \
+                     pinned plan may be refused by the execution preflight. This is a machine-capacity \
+                     shortfall, not a vocabulary change: the pinned recipe is unchanged."
+                );
+            }
+        }
         if admitted_planned_columns < planned_columns {
             tracing::warn!(
                 target: "neoethos_data::feature_budget",
@@ -181,6 +247,47 @@ impl VocabularyBudget {
             );
         }
     }
+}
+
+/// Where a budget's planning headroom came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanningHeadroomV1 {
+    /// Headroom the budget was sized from (the pin when one is set).
+    pub headroom_bytes: u64,
+    /// True when an operator pin replaced the live probe.
+    pub pinned: bool,
+    /// The live probe at the moment the budget was built.
+    pub probe_bytes: u64,
+}
+
+impl PlanningHeadroomV1 {
+    /// The live probe is smaller than the pinned planning headroom, so the
+    /// complete plan may be refused by the execution preflight.
+    pub fn shortfall_bytes(&self) -> u64 {
+        if self.pinned {
+            self.headroom_bytes.saturating_sub(self.probe_bytes)
+        } else {
+            0
+        }
+    }
+}
+
+/// Parse a pinned planning headroom. Zero and unparsable values are ignored so
+/// a typo cannot silently plan an empty vocabulary.
+pub fn pinned_planning_headroom_from_value(value: Option<&str>) -> Option<u64> {
+    value
+        .map(str::trim)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+}
+
+/// Operator pin for the planning headroom, when set in this process.
+pub fn pinned_planning_headroom_bytes_from_env() -> Option<u64> {
+    pinned_planning_headroom_from_value(
+        std::env::var(ENV_PINNED_PLANNING_HEADROOM_BYTES)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Which ids fit the budget, in deterministic `ALL_INDICATORS` order.
@@ -303,6 +410,62 @@ mod tests {
         // Order-stable across calls.
         let (adm2, _, _) = admit_indicators(&ids, &budget);
         assert_eq!(adm, adm2);
+    }
+
+    #[test]
+    fn pinned_headroom_replaces_the_probe_and_keeps_the_arithmetic() {
+        let actual = 8_000_000_000u64;
+        let pinned = 32_000_000_000u64;
+        let budget =
+            VocabularyBudget::for_frame_from_headroom(REFERENCE_ROWS, actual, Some(pinned));
+        assert_eq!(budget.available_bytes, pinned);
+        assert_eq!(
+            budget.max_columns,
+            VocabularyBudget::from_available(REFERENCE_ROWS, pinned).max_columns
+        );
+        assert!(budget.max_columns > VocabularyBudget::from_available(REFERENCE_ROWS, actual).max_columns);
+    }
+
+    #[test]
+    fn a_pin_makes_the_recipe_independent_of_the_live_probe() {
+        let pinned = 16_000_000_000u64;
+        let starved = VocabularyBudget::for_frame_from_headroom(REFERENCE_ROWS, 4_000_000_000, Some(pinned));
+        let generous = VocabularyBudget::for_frame_from_headroom(REFERENCE_ROWS, 60_000_000_000, Some(pinned));
+        assert_eq!(starved, generous, "same pin, same rows must plan the same vocabulary");
+        // Without a pin the probe decides, which is exactly the unsound case.
+        let probed_small = VocabularyBudget::for_frame_from_headroom(REFERENCE_ROWS, 4_000_000_000, None);
+        assert_ne!(probed_small, starved);
+    }
+
+    #[test]
+    fn pin_parsing_ignores_zero_and_garbage() {
+        assert_eq!(pinned_planning_headroom_from_value(Some("34359738368")), Some(34_359_738_368));
+        assert_eq!(pinned_planning_headroom_from_value(Some("  1073741824 ")), Some(1_073_741_824));
+        assert_eq!(pinned_planning_headroom_from_value(Some("0")), None);
+        assert_eq!(pinned_planning_headroom_from_value(Some("twelve")), None);
+        assert_eq!(pinned_planning_headroom_from_value(None), None);
+    }
+
+    #[test]
+    fn shortfall_is_reported_only_when_a_pin_exceeds_the_probe() {
+        let under = PlanningHeadroomV1 {
+            headroom_bytes: 16_000_000_000,
+            pinned: true,
+            probe_bytes: 20_000_000_000,
+        };
+        assert_eq!(under.shortfall_bytes(), 0);
+        let over = PlanningHeadroomV1 {
+            headroom_bytes: 32_000_000_000,
+            pinned: true,
+            probe_bytes: 12_000_000_000,
+        };
+        assert_eq!(over.shortfall_bytes(), 20_000_000_000);
+        let unpinned = PlanningHeadroomV1 {
+            headroom_bytes: 32_000_000_000,
+            pinned: false,
+            probe_bytes: 12_000_000_000,
+        };
+        assert_eq!(unpinned.shortfall_bytes(), 0, "an unpinned budget always sized from the probe");
     }
 
     #[test]
