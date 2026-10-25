@@ -40,7 +40,7 @@ jobs:
           import vortex as vx
           import numpy as np
           with tarfile.open('EURUSD.tar') as tar:
-              ms=[m for m in tar.getmembers() if m.isfile() and m.name.split('/')[-1].lower()=='data.vortex' and any(part.lower()=='m5' for part in m.name.split('/'))]
+              ms=[m for m in tar.getmembers() if m.isfile() and m.name.split('/')[-1].lower()=='data.vortex' and any(part.lower()=='timeframe=m5' for part in m.name.split('/'))]
               print('M5 vortex matches:', [(m.name,m.size) for m in ms],flush=True)
               assert len(ms)==1, 'Ambiguous or absent M5 data.vortex'
               m=ms[0]
