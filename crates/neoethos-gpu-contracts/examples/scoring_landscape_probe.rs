@@ -95,5 +95,36 @@ fn main(){
                 if score_a>=score_b {"calm"} else {"growth"});
         }
     }
+    // The production host GA uses min-max fitness over ALL finite scores,
+    // including zero-trade -100 sentinel, before blending 20% novelty.
+    // Compare *identical profitable genomes* with/without the sentinel
+    // in that normalization pool. Source:
+    // neoethos-search/src/genetic/search_engine.rs:3900..3950.
+    let excellent=variant(base,0,2000.0);
+    let mediocre=variant(base,0,20.0);
+    let missing_trades=variant(base,8,0.0);
+    let a=score_risky_ga_fitness_goal_v6(&excellent,10_000.0,180.0,goal);
+    let b=score_risky_ga_fitness_goal_v6(&mediocre,10_000.0,180.0,goal);
+    let sentinel=score_risky_ga_fitness_goal_v6(&missing_trades,10_000.0,180.0,goal);
+    assert_eq!(sentinel,-100.0);
+    assert!(a>b && b>=0.0);
+    let weight=0.20;
+    let max_nov=0.90;
+    let novelty_a=0.10/max_nov;
+    let novelty_b=0.90/max_nov;
+    let norm_with_bad_a=(a-sentinel)/(a-sentinel);
+    let norm_with_bad_b=(b-sentinel)/(a-sentinel);
+    let with_a=(1.0-weight)*norm_with_bad_a+weight*novelty_a;
+    let with_b=(1.0-weight)*norm_with_bad_b+weight*novelty_b;
+    let norm_clean_a=(a-b)/(a-b);
+    let norm_clean_b=(b-b)/(a-b);
+    let clean_a=(1.0-weight)*norm_clean_a+weight*novelty_a;
+    let clean_b=(1.0-weight)*norm_clean_b+weight*novelty_b;
+    println!("NOVELTY_SENTINEL\tbest_profit_fitness={a:.10}\tsmall_profit_fitness={b:.10}\tzero_trade_sentinel={sentinel:.1}\tweight={weight:.2}");
+    println!("NOVELTY_WITH_SENTINEL\tbest_profit_blended={with_a:.10}\tsmall_profit_blended={with_b:.10}\twinner={}",if with_a>with_b {"best-profit"} else {"novelty"});
+    println!("NOVELTY_WITHOUT_SENTINEL\tbest_profit_blended={clean_a:.10}\tsmall_profit_blended={clean_b:.10}\twinner={}",if clean_a>clean_b {"best-profit"} else {"novelty"});
+    assert!(with_b>with_a,"bad-genome -100 sentinel must expose the compressed-profit selection inversion");
+    assert!(clean_a>clean_b,"without invalid sentinel true profit signal should dominate on this fixture");
+    println!("NOVELTY_SENTINEL_RANK_INVERSION_PASS math_identical_to_host_normalization=1 input_is_counterfactual=1");
     println!("SCORING_SENSITIVITY_PASS real_v4_exact=1 real_v5_exact=1 real_v6_exact=1 counterfactual_production_change=0 MARKET_DATA=NONE");
 }
