@@ -1,0 +1,55 @@
+name: EURUSD pre-OOS Stage 1 window experiment
+
+on:
+  push:
+    branches:
+      - exp/pre-oos-funnel-ci-20261025
+    paths:
+      - ".github/workflows/eurusd-stage1-ablation.yml"
+      - "scripts/eurusd_stage1_ablation.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eurusd-selection-only:
+    name: EURUSD M5 25-50-100 x Risky-PropFirm proxy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Load Vortex market archive and numerical research dependencies
+        run: python -m pip install 'vortex-data==0.88.0' 'numpy==2.4.6'
+      - name: Verify exact public EURUSD market archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 20 \
+            --output EURUSD.tar \
+            https://github.com/kosred/neoethos-data/releases/download/snapshot-2026-08-09/EURUSD.tar
+          echo "042aa66fde29e697bd30d93d85c4762076c06e292097e42680ed0067b06ca061  EURUSD.tar" | sha256sum --check
+      - name: Run selection-only deterministic stage-window ablation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/eurusd_stage1_ablation.py
+          python scripts/eurusd_stage1_ablation.py --archive EURUSD.tar --out stage1-baseline-results \
+            | tee stage1-baseline-console.log
+          test -s stage1-baseline-results/results.json
+          test -s stage1-baseline-results/report.md
+          cat stage1-baseline-results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve exact results and run transcript, even after error
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eurusd-stage1-pre-oos-results
+          path: |
+            stage1-baseline-results/
+            stage1-baseline-console.log
+          if-no-files-found: warn
+          retention-days: 30
