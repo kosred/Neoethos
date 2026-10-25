@@ -1,0 +1,70 @@
+name: NeoEthos GA 400x1000 capacity smoke (research only)
+
+on:
+  push:
+    branches:
+      - exp/pre-oos-funnel-ci-20261025
+    paths:
+      - '.github/workflows/ga-400x1000-capacity.yml'
+      - 'crates/neoethos-search/tests/ga_400x1000_capacity_probe.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-ga-operators:
+    name: Rust GA crossover/mutation/archive stress at 400x1000
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resource preflight, actual host quota
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "### Actual runner" >> "$GITHUB_STEP_SUMMARY"
+          echo "CPU count:"; nproc
+          echo "CPU info:"; grep -m1 "model name" /proc/cpuinfo
+          echo "RAM:"; free -h
+          echo "Cgroup memory max:"; cat /sys/fs/cgroup/memory.max || true
+          echo "Storage:"; df -h .
+          echo '400 x 1000 genetic evaluations = 400,000 operator passes. This smoke does not evaluate trading bars or OOS.'
+      - name: Install Linux native dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config mold \
+            libasound2-dev libudev-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libx11-dev libdbus-1-dev
+      - name: Install repository compiler toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+      - name: Recover dependency compilation cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pre-oos-search-contracts
+      - name: Test genuine NeoEthos host evolution for pop 400 x gen 1000
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ga-capacity-artifacts
+          /usr/bin/time -v \
+            cargo test --locked -p neoethos-search --no-default-features \
+              --test ga_400x1000_capacity_probe -- --nocapture \
+              2>&1 | tee ga-capacity-artifacts/ga-400x1000.log
+          grep 'GA_CAPACITY RESULT PASS' ga-capacity-artifacts/ga-400x1000.log \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "This is a genetics/host-memory capacity smoke, not a full historic evaluator run." >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve resource and benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ga-400x1000-capacity-log
+          path: ga-capacity-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
