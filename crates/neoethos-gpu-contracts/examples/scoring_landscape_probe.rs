@@ -63,8 +63,8 @@ fn main(){
     }
     let net20=score_prop_firm_ga_fitness_v4(&variant(base,0,20.));
     let net120=score_prop_firm_ga_fitness_v4(&variant(base,0,120.));
-    let dd1=score_prop_firm_ga_fitness_v4(&variant(base,3,base[3]+.01));
-    let daily1=score_prop_firm_ga_fitness_v4(&variant(base,10,base[10]+.01));
+    let dd1=score_prop_firm_ga_fitness_v4(&variant(base,3,base[3]+0.01));
+    let daily1=score_prop_firm_ga_fitness_v4(&variant(base,10,base[10]+0.01));
     let pf_below=score_prop_firm_ga_fitness_v4(&variant(base,5,0.9999));
     let pf_above=score_prop_firm_ga_fitness_v4(&variant(base,5,1.0001));
     let net_effect=net120-net20;
