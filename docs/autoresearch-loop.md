@@ -1509,6 +1509,22 @@ miss under V2 and are rebuilt under the exact requested recipe. Changes only to
 GA/scoring options still reuse an identical feature recipe. Stored old numerical
 columns are not thereby shown to be incorrect.
 
+Equivalent restored recipes reuse the V2 entry: a complete validated batch in
+`FeatureBuildOptions.classic_ta_working_set` canonicalizes to the same key as
+that identical live batch argument. Conflicting dual recipes and incomplete
+recorded selections retain distinct keys, so a hit cannot bypass the builder's
+refusal. This permits recorded-input scorer experiments on the same actual cube
+without rebuilding it under a different representation.
+
+The saved exit-policy diagnostic's `baseline_sealed_policy` preserves the exact
+archived holding horizon and trailing settings. Earlier diagnostics forced that
+baseline to unlimited holding and trailing off, which caused explicit mismatch
+flags for nondefault policies. Variant metadata now names the executed settings,
+and `monthly_breakdown` uses the shared UTC exit-month account ledger aggregator,
+including idle/partial months. The older `ledger.monthly` field remains a
+trade-only entry-month sum of initial-capital fractions; it is not the same
+measure. All such variants remain selection diagnostics, not OOS evidence.
+
 **Exit-policy knob census** (measured against the frozen v5 settings, B9 g200):
 
 - Early profit-lock EXISTS as a config knob: `models.exit_policy.trailing_enabled`

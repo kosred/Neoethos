@@ -7631,6 +7631,9 @@ fn saved_candidate_variant_settings_v1(
     base: &crate::eval::BacktestSettings,
     variant: &SavedCandidateExitPolicyVariantV1,
 ) -> crate::eval::BacktestSettings {
+    if variant.label == "baseline_sealed_policy" {
+        return base.clone();
+    }
     let mut settings = base.clone();
     settings.max_hold_bars = variant.max_hold_bars;
     settings.trailing_enabled = variant.trailing_enabled;
@@ -7833,8 +7836,8 @@ pub fn summarize_saved_candidate_exit_policy_variants_v1(
             };
             variant_rows.push(serde_json::json!({
                 "label": variant.label,
-                "max_hold_bars": variant.max_hold_bars,
-                "trailing_enabled": variant.trailing_enabled,
+                "max_hold_bars": settings.max_hold_bars,
+                "trailing_enabled": settings.trailing_enabled,
                 "sl_pips": settings.sl_pips,
                 "tp_pips": settings.tp_pips,
                 "adaptive_scaling_disabled": variant.disable_adaptive,
@@ -7846,6 +7849,12 @@ pub fn summarize_saved_candidate_exit_policy_variants_v1(
                     "values": metrics.to_vec(),
                 },
                 "ledger": saved_candidate_exit_summary_v1(&trades),
+                "monthly_breakdown": crate::quality::monthly_closed_trade_metrics_v1(
+                    &trades,
+                    settings.initial_equity(),
+                    timestamps[0],
+                    *timestamps.last().unwrap(),
+                )?,
                 "weekly_cadence": cadence,
             }));
         }

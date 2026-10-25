@@ -100,6 +100,21 @@ pub fn feature_frame_cache_input_key(
     options: &FeatureBuildOptions,
     batch: Option<&SweepBatch>,
 ) -> String {
+    // The builder accepts an exact complete batch either as a live argument or
+    // inside restored options. Canonicalize those equivalent requests to the
+    // existing V2 live-batch key, preserving already verified cache entries.
+    // Invalid/incomplete or conflicting recorded recipes retain distinct keys
+    // so a cache hit cannot bypass the builder's refusal.
+    let mut key_options = options.clone();
+    let mut key_batch = batch;
+    if let Some(recorded) = options.classic_ta_working_set.as_ref()
+        && recorded.replace_base_vocabulary
+        && recorded.validate().is_ok()
+        && batch.is_none_or(|requested| requested == recorded)
+    {
+        key_options.classic_ta_working_set = None;
+        key_batch = Some(recorded);
+    }
     let mut hasher = Sha256::new();
     hasher.update(CACHE_KEY_DOMAIN_V2);
     hasher.update((symbol.len() as u64).to_le_bytes());
@@ -123,9 +138,9 @@ pub fn feature_frame_cache_input_key(
         }
     }
     hasher.update(
-        serde_json::to_vec(options).expect("feature build options must serialize canonically"),
+        serde_json::to_vec(&key_options).expect("feature build options must serialize canonically"),
     );
-    if let Some(batch) = batch {
+    if let Some(batch) = key_batch {
         // A hit returns the entire frame; there is no later missing-column
         // augmentation. Bind the exact recipe that the builder will consume.
         hasher.update(serde_json::to_vec(batch).expect("sweep batch must serialize canonically"));
@@ -710,6 +725,43 @@ mod tests {
             base,
             feature_frame_cache_input_key("GBPUSD", &test_bindings(7), &options, None),
             "the symbol must change the key"
+        );
+    }
+
+    #[test]
+    fn cache_key_reuses_an_identical_restored_recipe_without_admitting_conflicts() {
+        let options = test_options();
+        let bindings = test_bindings(7);
+        let selected = crate::core::hpc_ta::search_working_set_batch(0, 96, true);
+        let normal = feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&selected));
+        let mut restored = options.clone();
+        restored.classic_ta_working_set = Some(selected.clone());
+        assert_eq!(
+            normal,
+            feature_frame_cache_input_key("EURUSD", &bindings, &restored, None),
+            "saved replay and fresh build consume exactly the same complete recipe"
+        );
+        assert_eq!(
+            normal,
+            feature_frame_cache_input_key("EURUSD", &bindings, &restored, Some(&selected))
+        );
+
+        let other = crate::core::hpc_ta::search_working_set_batch(0, 640, true);
+        let conflicting =
+            feature_frame_cache_input_key("EURUSD", &bindings, &restored, Some(&other));
+        assert_ne!(conflicting, normal);
+        assert_ne!(
+            conflicting,
+            feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&other))
+        );
+
+        let mut incomplete = selected.clone();
+        incomplete.replace_base_vocabulary = false;
+        restored.classic_ta_working_set = Some(incomplete.clone());
+        assert_ne!(
+            feature_frame_cache_input_key("EURUSD", &bindings, &restored, None),
+            feature_frame_cache_input_key("EURUSD", &bindings, &options, Some(&incomplete)),
+            "the owner refuses incomplete recorded recipes even if the requested-batch form is valid"
         );
     }
 

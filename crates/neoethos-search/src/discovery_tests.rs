@@ -8063,6 +8063,18 @@ fn saved_candidate_exit_variants_only_change_exit_controls() {
     assert_eq!(unchanged.max_hold_bars, 0);
     assert!(!unchanged.trailing_enabled);
     assert_eq!(unchanged.risk_based_sizing, true);
+    let mut sealed_nondefault = base.clone();
+    sealed_nondefault.max_hold_bars = 128;
+    sealed_nondefault.trailing_enabled = true;
+    let restored = saved_candidate_variant_settings_v1(&sealed_nondefault, baseline);
+    assert_eq!(
+        restored.max_hold_bars, 128,
+        "baseline must replay the archived holding horizon"
+    );
+    assert!(
+        restored.trailing_enabled,
+        "baseline must replay the archived trailing policy"
+    );
     let max_hold = variants
         .iter()
         .find(|variant| variant.label == "max_hold_96_bars_approx_24h_m15")
