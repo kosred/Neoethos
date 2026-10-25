@@ -1,0 +1,47 @@
+name: Exact Rust GA scoring landscape research
+
+on:
+  push:
+    branches:
+      - exp/pre-oos-funnel-ci-20261025
+    paths:
+      - '.github/workflows/scoring-landscape.yml'
+      - 'crates/neoethos-gpu-contracts/examples/scoring_landscape_probe.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  score-ablation:
+    name: Existing GA formulas plus hypothetical sensitivity only
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scoring-landscape
+      - name: Exercise existing CPU/GPU-shared named fitness formulas exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p scoring-landscape-results
+          cargo run --locked -p neoethos-gpu-contracts \
+            --example scoring_landscape_probe --release \
+            | tee scoring-landscape-results/score-landscape.log
+          grep -E 'ISOLATED_(MAGNITUDE|RATIO)|SCORING_SENSITIVITY_PASS' scoring-landscape-results/score-landscape.log \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Record entire numerical experiment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoring-landscape-results
+          path: scoring-landscape-results/
+          if-no-files-found: warn
+          retention-days: 30
