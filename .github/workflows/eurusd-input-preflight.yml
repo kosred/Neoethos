@@ -1,0 +1,63 @@
+name: EURUSD research input preflight
+
+on:
+  push:
+    branches:
+      - exp/pre-oos-funnel-ci-20261025
+    paths:
+      - .github/workflows/eurusd-input-preflight.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - name: Download pinned EURUSD snapshot and verify exact checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --connect-timeout 20 \
+            -o EURUSD.tar \
+            https://github.com/kosred/neoethos-data/releases/download/snapshot-2026-08-09/EURUSD.tar
+          echo '042aa66fde29e697bd30d93d85c4762076c06e292097e42680ed0067b06ca061  EURUSD.tar' | sha256sum -c -
+          echo "=== M5 archive entries ==="
+          tar -tf EURUSD.tar | grep -E '(^|/)M5(/|$)' | head -30
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Vortex reader
+        run: python -m pip install 'vortex-data==0.88.0' numpy
+      - name: Inspect actual archive layout, data schema and validity (NO OOS use)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import tarfile, pathlib, hashlib
+          import vortex as vx
+          import numpy as np
+          with tarfile.open('EURUSD.tar') as tar:
+              ms=[m for m in tar.getmembers() if m.isfile() and m.name.split('/')[-1]=='data.vortex' and 'M5' in m.name.split('/')]
+              print('M5 vortex matches:', [(m.name,m.size) for m in ms],flush=True)
+              assert len(ms)==1, 'Ambiguous or absent M5 data.vortex'
+              m=ms[0]
+              assert m.size<100_000_000
+              p=pathlib.Path('/tmp/eurusd-m5.vortex')
+              with tar.extractfile(m) as src, p.open('wb') as dst:
+                  import shutil
+                  shutil.copyfileobj(src,dst)
+          print('M5 SHA256',hashlib.sha256(p.read_bytes()).hexdigest(),flush=True)
+          f=vx.open(str(p))
+          print('Vortex length',len(f),'schema',f.schema,flush=True)
+          t=f.to_arrow().read_all()
+          print('Arrow schema', t.schema,'rows',t.num_rows,flush=True)
+          print('First 3',t.slice(0,3).to_pylist(),flush=True)
+          print('Last 3',t.slice(max(0,t.num_rows-3),3).to_pylist(),flush=True)
+          for key in ('open','high','low','close','timestamp','time'):
+              if key in t.column_names:
+                  c=t.column(key)
+                  print('column',key,'nulls',c.null_count,'type',c.type,flush=True)
+          PY
