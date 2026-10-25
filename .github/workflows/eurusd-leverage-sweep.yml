@@ -1,0 +1,64 @@
+name: EURUSD dynamic-lot leverage grid (research only)
+
+on:
+  push:
+    branches:
+      - exp/pre-oos-funnel-ci-20261025
+    paths:
+      - '.github/workflows/eurusd-leverage-sweep.yml'
+      - 'scripts/eurusd_leverage_sweep.py'
+      - 'scripts/eurusd_dynamic_edge_lab.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eurusd-leverage-research
+  cancel-in-progress: false
+
+jobs:
+  leverage-sensitivity:
+    name: EURUSD M5 lots vs margin caps, two proxy modes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned numerical dependencies
+        run: python -m pip install 'vortex-data==0.88.0' 'numpy==2.2.6' 'pandas==2.3.3' 'numba==0.61.2'
+      - name: Verify leverage feasibility, dynamic lots and no artificial edge from nonbinding leverage
+        run: |
+          python -m py_compile scripts/eurusd_dynamic_edge_lab.py scripts/eurusd_leverage_sweep.py
+          python scripts/eurusd_leverage_sweep.py --self-test
+      - name: Download immutable EURUSD M5 historical snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 20 \
+            --output EURUSD.tar \
+            https://github.com/kosred/neoethos-data/releases/download/snapshot-2026-08-09/EURUSD.tar
+          echo "042aa66fde29e697bd30d93d85c4762076c06e292097e42680ed0067b06ca061  EURUSD.tar" | sha256sum --check
+      - name: Run research ablations without opening final OOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/eurusd_leverage_sweep.py \
+            --archive EURUSD.tar \
+            --out eurusd-leverage-sweep-results \
+            | tee eurusd-leverage-sweep-console.log
+          test -s eurusd-leverage-sweep-results/results.json
+          test -s eurusd-leverage-sweep-results/report.md
+          cat eurusd-leverage-sweep-results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive scenario ledger and audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eurusd-leverage-sweep-results
+          path: |
+            eurusd-leverage-sweep-results/
+            eurusd-leverage-sweep-console.log
+          if-no-files-found: warn
+          retention-days: 30
