@@ -6,6 +6,9 @@ on:
   push:
     branches:
       - exp/pre-oos-funnel-ci-20261025
+    paths:
+      - '.github/workflows/pre-oos-funnel-ci.yml'
+      - 'scripts/pre_oos_funnel_audit.py'
   workflow_dispatch:
 
 permissions:
@@ -13,7 +16,7 @@ permissions:
 
 concurrency:
   group: pre-oos-funnel-research
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   funnel-report:
