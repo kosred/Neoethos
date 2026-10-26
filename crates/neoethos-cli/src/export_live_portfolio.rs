@@ -16,6 +16,11 @@
 
 use anyhow::{bail, Context, Result};
 
+#[derive(serde::Deserialize)]
+struct ResearchWrapper {
+    discovery_result: neoethos_search::DiscoveryResult,
+}
+
 pub fn run(args: &[String]) -> Result<()> {
     let research = flag(args, "--research")
         .context("export-live-portfolio requires --research <research.json>")?;
@@ -25,23 +30,20 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let bytes = std::fs::read(&research)
         .with_context(|| format!("research artifact {research} is not readable"))?;
-    let wrapper: serde_json::Value = serde_json::from_slice(&bytes)
+    // Deserialize straight into the wrapper instead of a generic Value: the
+    // canonical artifact can exceed 500 MB, and a Value clone would double the
+    // peak memory for no benefit.
+    let wrapper: ResearchWrapper = serde_json::from_slice(&bytes)
         .with_context(|| format!("research artifact {research} is not valid JSON"))?;
-    let discovery = wrapper
-        .get("discovery_result")
-        .context("research artifact has no discovery_result")?;
-    let result: neoethos_search::DiscoveryResult = serde_json::from_value(discovery.clone())
-        .context("research artifact discovery_result does not match the DiscoveryResult schema")?;
+    let result = wrapper.discovery_result;
     if result.portfolio.is_empty() {
         bail!("research artifact has an empty portfolio; nothing to export");
     }
     neoethos_search::save_live_portfolio_json(&out, &result)
         .with_context(|| format!("failed to write live portfolio {out}"))?;
     println!(
-        "exported live portfolio: genes={} symbol={} base={} out={out}",
-        result.portfolio.len(),
-        result.symbols.first().map(String::as_str).unwrap_or("?"),
-        result.base_timeframe
+        "exported live portfolio: genes={} out={out}",
+        result.portfolio.len()
     );
     Ok(())
 }
