@@ -338,8 +338,10 @@ impl Arguments {
         if let Some(name) = parsed.0.get("--fitness-table") {
             let normalized = name.trim().to_ascii_lowercase();
             ensure!(
-                normalized == "ga_fitness" || normalized == "monthly_upside_v1",
-                "--fitness-table must be ga_fitness or monthly_upside_v1"
+                normalized == "ga_fitness"
+                    || normalized == "monthly_upside_v1"
+                    || normalized == "monthly_upside_dd_averse_v1",
+                "--fitness-table must be ga_fitness, monthly_upside_v1 or monthly_upside_dd_averse_v1"
             );
             ensure!(
                 resume_flags == 0 && quote_flags == 0,
@@ -1161,18 +1163,30 @@ mod tests {
 
         #[test]
         fn fitness_table_selector_is_accepted_for_fresh_search_and_forwarded_once() {
-            let mut raw = valid_arguments();
-            push(&mut raw, "--fitness-table", "monthly_upside_v1");
-            let args = Arguments::parse(&raw).expect("B9 selector is a fresh-search knob");
+            for name in ["ga_fitness", "monthly_upside_v1", "monthly_upside_dd_averse_v1"] {
+                let mut raw = valid_arguments();
+                push(&mut raw, "--fitness-table", name);
+                let args = Arguments::parse(&raw)
+                    .unwrap_or_else(|error| panic!("fresh-search selector {name}: {error}"));
+                let mut forwarded = Vec::new();
+                forward_optional_mode_flags(&args, &mut forwarded);
+                assert_eq!(forwarded, vec!["--fitness-table".to_owned(), name.to_owned()]);
+            }
+
+            // The drawdown-averse table is the third accepted fresh-search
+            // selector (neo-671 2026-10-26) and forwards unchanged.
+            let mut dd_averse = valid_arguments();
+            push(&mut dd_averse, "--fitness-table", "monthly_upside_dd_averse_v1");
+            let args = Arguments::parse(&dd_averse).expect("dd-averse selector is a fresh-search knob");
             let mut forwarded = Vec::new();
             forward_optional_mode_flags(&args, &mut forwarded);
             assert_eq!(
                 forwarded,
-                vec!["--fitness-table".to_owned(), "monthly_upside_v1".to_owned()]
+                vec![
+                    "--fitness-table".to_owned(),
+                    "monthly_upside_dd_averse_v1".to_owned()
+                ]
             );
-            let mut explicit_default = valid_arguments();
-            push(&mut explicit_default, "--fitness-table", "ga_fitness");
-            assert!(Arguments::parse(&explicit_default).is_ok());
         }
 
         #[test]
