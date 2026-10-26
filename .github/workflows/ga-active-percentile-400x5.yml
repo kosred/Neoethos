@@ -1,4 +1,4 @@
-name: GA 400x5 active-percentile real Rust engine smoke
+name: GA 400x5 host evolution with test evaluator (no market)
 
 on:
   push:
@@ -46,27 +46,27 @@ jobs:
             --features experimental-active-percentile \
             experimental_percentile::tests -- --nocapture \
             2>&1 | tee ga-active-percentile-results/unit-tests.log
-      - name: Run real Rust GA and historical backtest evaluator, 400x5
+      - name: Run genuine Rust genetic/selection/archive GA 400x5 with test metrics
         shell: bash
         run: |
           set -euo pipefail
           /usr/bin/time -v cargo test --locked -p neoethos-search --lib \
             --no-default-features --features experimental-active-percentile \
-            ga_400_x_5_entire_real_rust_generation_loop_with_captured_ctrader_bars \
+            ga_400_x_5_complete_real_genetic_loop_with_test_evaluator \
             -- --nocapture \
-            2>&1 | tee ga-active-percentile-results/ga-400x5.log
-          grep 'SMOKE_GA_COMPLETED' ga-active-percentile-results/ga-400x5.log \
+            2>&1 | tee ga-active-percentile-results/ga-400x5-experimental.log
+          grep 'GENETIC_SMOKE_COMPLETED' ga-active-percentile-results/ga-400x5-experimental.log \
             | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Run SAME 400x5 true Rust evaluator with prior selector (feature OFF)
+      - name: Run matched host-GA 400x5 with prior selector (feature OFF)
         shell: bash
         run: |
           set -euo pipefail
           /usr/bin/time -v cargo test --locked -p neoethos-search --lib \
             --no-default-features \
-            ga_400_x_5_entire_real_rust_generation_loop_with_captured_ctrader_bars \
+            ga_400_x_5_complete_real_genetic_loop_with_test_evaluator \
             -- --nocapture \
             2>&1 | tee ga-active-percentile-results/ga-400x5-baseline.log
-          grep 'SMOKE_GA_COMPLETED' ga-active-percentile-results/ga-400x5-baseline.log \
+          grep 'GENETIC_SMOKE_COMPLETED' ga-active-percentile-results/ga-400x5-baseline.log \
             | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Archive all logs even on failure
         if: always()
