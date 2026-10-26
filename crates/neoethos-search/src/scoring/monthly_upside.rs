@@ -139,6 +139,100 @@ pub fn ga_fitness_monthly_upside_v1(monthly_returns: &[f64], metrics: &[f64; 11]
     base + upside_bonus + tail_penalty + win_rate_bonus
 }
 
+// ---------------------------------------------------------------------------
+// ga_fitness_monthly_upside_dd_averse_v1 — B9 plus an explicit risk profile.
+// ---------------------------------------------------------------------------
+
+/// Overall-drawdown threshold above which the dd-averse table starts penalizing.
+pub const DD_AVERSE_MAX_DD_FREE: f64 = 0.10;
+/// Penalty per unit of drawdown above the threshold (score points per 100 %).
+pub const DD_AVERSE_DD_WEIGHT: f64 = 200.0;
+/// Cap on the overall-drawdown penalty.
+pub const DD_AVERSE_DD_CAP_PCT: f64 = 60.0;
+/// Daily-drawdown threshold above which the dd-averse table starts penalizing.
+pub const DD_AVERSE_MAX_DAILY_DD_FREE: f64 = 0.03;
+/// Penalty per unit of daily drawdown above the threshold.
+pub const DD_AVERSE_DAILY_DD_WEIGHT: f64 = 300.0;
+/// Cap on the daily-drawdown penalty.
+pub const DD_AVERSE_DAILY_DD_CAP_PCT: f64 = 20.0;
+/// Per-trade win-rate floor: below it the score loses points.
+pub const DD_AVERSE_WIN_RATE_FLOOR: f64 = 0.60;
+/// Penalty per unit of win rate below the floor.
+pub const DD_AVERSE_WIN_RATE_WEIGHT: f64 = 100.0;
+/// Cap on the win-rate floor penalty.
+pub const DD_AVERSE_WIN_RATE_CAP_PCT: f64 = 25.0;
+/// Bonus awarded when the win rate clears a HIGH-confidence bar.
+pub const DD_AVERSE_HIGH_WIN_RATE: f64 = 0.70;
+pub const DD_AVERSE_HIGH_WIN_RATE_BONUS: f64 = 6.0;
+
+/// Asymmetric monthly-upside GA fitness (v1) WITH an explicit risk profile.
+///
+/// Identical base to [ga_fitness_monthly_upside_v1] — median monthly upside,
+/// one-sided upside bonus, tail-loss-only penalty, flat win-rate bonus — plus:
+///
+///   dd_penalty       = min(max(max_drawdown - 0.10, 0) * 200, 60)      // metrics[3]
+///   daily_dd_penalty = min(max(max_daily_drawdown - 0.03, 0) * 300, 20) // metrics[10]
+///   win_rate_floor   = min(max(0.60 - win_rate, 0) * 100, 25)           // metrics[4]
+///   high_win_bonus   = +6.0 iff win_rate >= 0.70
+///
+/// Why: the plain B9 table rewards monthly upside only, so the GA happily
+/// selects strategies that earn 2-5 %/month with 16-40 % drawdown. A prop-firm
+/// profile is not allowed to trade that; it needs the same returns at <=10 %
+/// overall drawdown and <=3 % daily drawdown. This table makes those two
+/// numbers part of the score, so drawdown becomes a gradient the search can
+/// follow instead of a post-filter it only learns about at the walkforward.
+///
+/// Guards are the B9 guards: non-finite metrics[1] (Sharpe) returns
+/// f64::NEG_INFINITY; trade count < 1, an empty month series or a
+/// non-finite month returns -100.0. Never mutates its inputs.
+pub fn ga_fitness_monthly_upside_dd_averse_v1(
+    monthly_returns: &[f64],
+    metrics: &[f64; 11],
+) -> f64 {
+    let base = ga_fitness_monthly_upside_v1(monthly_returns, metrics);
+    if base == f64::NEG_INFINITY || base == -100.0 {
+        return base;
+    }
+    let max_dd = metrics[3];
+    let max_daily_dd = metrics[10];
+    let win_rate = metrics[4];
+    let dd_penalties: [f64; 2] = [
+        (
+            DD_AVERSE_MAX_DD_FREE,
+            DD_AVERSE_DD_WEIGHT,
+            DD_AVERSE_DD_CAP_PCT,
+            max_dd,
+        ),
+        (
+            DD_AVERSE_MAX_DAILY_DD_FREE,
+            DD_AVERSE_DAILY_DD_WEIGHT,
+            DD_AVERSE_DAILY_DD_CAP_PCT,
+            max_daily_dd,
+        ),
+    ]
+    .map(|(free, weight, cap, observed)| {
+        if observed.is_finite() {
+            ((observed - free).max(0.0) * weight).min(cap)
+        } else {
+            cap
+        }
+    });
+    let dd_penalty = dd_penalties[0];
+    let daily_dd_penalty = dd_penalties[1];
+    let win_rate_penalty = if win_rate.is_finite() {
+        ((DD_AVERSE_WIN_RATE_FLOOR - win_rate).max(0.0) * DD_AVERSE_WIN_RATE_WEIGHT)
+            .min(DD_AVERSE_WIN_RATE_CAP_PCT)
+    } else {
+        DD_AVERSE_WIN_RATE_CAP_PCT
+    };
+    let high_win_bonus = if win_rate.is_finite() && win_rate >= DD_AVERSE_HIGH_WIN_RATE {
+        DD_AVERSE_HIGH_WIN_RATE_BONUS
+    } else {
+        0.0
+    };
+    base - dd_penalty - daily_dd_penalty - win_rate_penalty + high_win_bonus
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +404,77 @@ mod tests {
         let _ = ga_fitness_monthly_upside_v1(&months, &m);
         assert_eq!(months, before_months, "monthly returns were mutated");
         assert_eq!(m, before_metrics, "metrics were mutated");
+    }
+
+    #[test]
+    fn dd_averse_penalizes_overall_drawdown_above_ten_percent() {
+        let months = [0.03; 10];
+        let mut low = metrics(0.65, 400.0);
+        low[3] = 0.08; // 8 % drawdown — free
+        let mut high = low;
+        high[3] = 0.25; // 25 % drawdown
+        let s_low = ga_fitness_monthly_upside_dd_averse_v1(&months, &low);
+        let s_high = ga_fitness_monthly_upside_dd_averse_v1(&months, &high);
+        assert!(s_low > s_high, "dd 25% must score below dd 8% ({s_low} vs {s_high})");
+        // (0.25-0.10)*200 = 30 points exactly at the default weights.
+        assert!((s_low - s_high - 30.0).abs() < 1e-9, "dd penalty must be 30 points, got {}", s_low - s_high);
+    }
+
+    #[test]
+    fn dd_averse_penalizes_daily_drawdown_above_three_percent() {
+        let months = [0.03; 10];
+        let mut calm = metrics(0.65, 400.0);
+        calm[10] = 0.02;
+        let mut rough = calm;
+        rough[10] = 0.06; // 6 % daily drawdown → (0.06-0.03)*300 = 9 points
+        let s_calm = ga_fitness_monthly_upside_dd_averse_v1(&months, &calm);
+        let s_rough = ga_fitness_monthly_upside_dd_averse_v1(&months, &rough);
+        assert!((s_calm - s_rough - 9.0).abs() < 1e-9, "daily-dd penalty must be 9 points, got {}", s_calm - s_rough);
+    }
+
+    #[test]
+    fn dd_averse_penalizes_a_low_per_trade_win_rate() {
+        let months = [0.03; 10];
+        let mut low = metrics(0.52, 400.0);
+        let mut high = metrics(0.66, 400.0);
+        low[3] = 0.08;
+        high[3] = 0.08;
+        let s_low = ga_fitness_monthly_upside_dd_averse_v1(&months, &low);
+        let s_high = ga_fitness_monthly_upside_dd_averse_v1(&months, &high);
+        // 0.52 -> (0.60-0.52)*100 = 8 points of penalty; 0.66 -> free.
+        assert!((s_high - s_low - 8.0).abs() < 1e-9, "win-rate floor penalty must be 8 points, got {}", s_high - s_low);
+    }
+
+    #[test]
+    fn dd_averse_rewards_a_high_confidence_win_rate() {
+        let months = [0.03; 10];
+        let mut normal = metrics(0.62, 400.0);
+        let mut high_conf = metrics(0.75, 400.0);
+        normal[3] = 0.08;
+        high_conf[3] = 0.08;
+        let s_normal = ga_fitness_monthly_upside_dd_averse_v1(&months, &normal);
+        let s_high = ga_fitness_monthly_upside_dd_averse_v1(&months, &high_conf);
+        assert!((s_high - s_normal - 6.0).abs() < 1e-9, "high-confidence bonus must be 6 points, got {}", s_high - s_normal);
+    }
+
+    #[test]
+    fn dd_averse_is_b9_minus_penalties_for_a_clean_candidate() {
+        let months = [0.02, 0.03, 0.01, 0.04];
+        let mut m = metrics(0.66, 400.0);
+        m[3] = 0.05;
+        m[10] = 0.01;
+        let b9 = ga_fitness_monthly_upside_v1(&months, &m);
+        let dd = ga_fitness_monthly_upside_dd_averse_v1(&months, &m);
+        assert!((dd - b9).abs() < 1e-9, "clean candidate must score exactly its B9 base");
+    }
+
+    #[test]
+    fn dd_averse_guards_match_b9() {
+        let months = [0.03; 4];
+        let mut bad = metrics(0.60, 400.0);
+        bad[1] = f64::NAN;
+        assert_eq!(ga_fitness_monthly_upside_dd_averse_v1(&months, &bad), f64::NEG_INFINITY);
+        let zero = metrics(0.60, 0.0);
+        assert_eq!(ga_fitness_monthly_upside_dd_averse_v1(&months, &zero), -100.0);
     }
 }

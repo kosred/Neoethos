@@ -2131,8 +2131,10 @@ fn discovery_config_from_cli(
         // canonical three-way dispatch.
         let normalized = name.trim().to_ascii_lowercase();
         anyhow::ensure!(
-            normalized == "ga_fitness" || normalized == "monthly_upside_v1",
-            "--fitness-table must be ga_fitness or monthly_upside_v1"
+            normalized == "ga_fitness"
+                || normalized == "monthly_upside_v1"
+                || normalized == "monthly_upside_dd_averse_v1",
+            "--fitness-table must be ga_fitness, monthly_upside_v1 or monthly_upside_dd_averse_v1"
         );
         config.fitness_table = neoethos_search::scoring::FitnessTable::from_name(&normalized);
     }

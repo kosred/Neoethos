@@ -1396,7 +1396,8 @@ with
 
 ```rust
 pub enum FitnessTable { GaFitness, ArchiveScore, WindowScore, QualityScore,
-                        NetPerBarInMarket, ExpectancyTStat, MonthlyUpsideV1 }
+                        NetPerBarInMarket, ExpectancyTStat, MonthlyUpsideV1,
+                        MonthlyUpsideDdAverseV1 }
 ```
 
 `FitnessTable::NetPerBarInMarket` is the one new function: net divided by bars
@@ -1421,10 +1422,23 @@ weekly cadence. Missing or misaligned monthly transport is a run error; a
 legitimately empty per-gene series still takes the scorer's rejection guard.
 Metrics-only producers cannot satisfy the monthly objective.
 
+`FitnessTable::MonthlyUpsideDdAverseV1` binds
+`scoring::ga_fitness_monthly_upside_dd_averse_v1` (neo-671, 2026-10-26): the
+same B9 monthly-upside base PLUS an explicit risk profile — a penalty for
+overall drawdown above 10 % (`(dd-0.10)*200`, cap 60), a penalty for daily
+drawdown above 3 % (`(daily-0.03)*300`, cap 20), a floor penalty for a per-trade
+win rate below 60 %, and a +6 bonus at 70 % or better. It exists because the
+plain B9 table has no drawdown term: measured runs at lower risk bands did NOT
+lower drawdown (1.0-1.6 % band best DD 22.7 %, 1.2-2.0 % band 18.7 %,
+1.5-2.5 % band 16.6 %) — the GA compensated by selecting deeper-drawdown
+strategies. Making the two drawdowns part of the score turns them into a
+gradient the search can follow instead of a post-filter it meets only at the
+walkforward. Guards and monthly-vector transport are identical to B9.
+
 Operator plumbing (same series, neo-671): `neoethos-cli` declares the
 `search-monthly-upside-objective` passthrough feature (forwarding to
 `neoethos-autoresearch`). With it compiled in, `canonical-research` accepts
-`--fitness-table <ga_fitness|monthly_upside_v1>` for a FRESH search, forwards
+`--fitness-table <ga_fitness|monthly_upside_v1|monthly_upside_dd_averse_v1>` for a FRESH search, forwards
 it to discovery and sets `DiscoveryConfig.fitness_table`; unknown names, saved
 continuations and quote replay are refused with the selector present. Without
 the feature the argument is rejected as unknown and the canonical three-way

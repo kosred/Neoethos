@@ -112,7 +112,9 @@ pub use named::{
 /// Opt-in asymmetric monthly-upside fitness variant (research; NOT the
 /// default objective). See [`monthly_upside`] for the formula and the
 /// neo-671 reward-shape experiment it answers.
-pub use monthly_upside::ga_fitness_monthly_upside_v1;
+pub use monthly_upside::{
+    ga_fitness_monthly_upside_dd_averse_v1, ga_fitness_monthly_upside_v1,
+};
 
 #[cfg(test)]
 mod tests {

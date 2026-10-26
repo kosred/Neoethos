@@ -34,6 +34,13 @@ pub enum FitnessTable {
     /// `crate::scoring::ga_fitness_monthly_upside_v1` in
     /// `genetic::evolution_math::apply_metrics`.
     MonthlyUpsideV1,
+    /// B9 plus explicit drawdown aversion: same monthly-upside base, with a
+    /// penalty for overall drawdown above 10 %, a penalty for daily drawdown
+    /// above 3 %, and a floor penalty for per-trade win rate below 60 %. This
+    /// points the search at a prop-firm-shaped risk profile instead of raw
+    /// upside. BOUND to
+    /// `crate::scoring::ga_fitness_monthly_upside_dd_averse_v1`.
+    MonthlyUpsideDdAverseV1,
 }
 
 impl FitnessTable {
@@ -48,6 +55,7 @@ impl FitnessTable {
             Self::NetPerBarInMarket => "net_per_bar_in_market",
             Self::ExpectancyTStat => "expectancy_t_stat",
             Self::MonthlyUpsideV1 => "monthly_upside_v1",
+            Self::MonthlyUpsideDdAverseV1 => "monthly_upside_dd_averse_v1",
         }
     }
 
@@ -61,6 +69,7 @@ impl FitnessTable {
             "net_per_bar_in_market" => Self::NetPerBarInMarket,
             "expectancy_t_stat" => Self::ExpectancyTStat,
             "monthly_upside_v1" => Self::MonthlyUpsideV1,
+            "monthly_upside_dd_averse_v1" => Self::MonthlyUpsideDdAverseV1,
             _ => Self::GaFitness,
         }
     }
@@ -94,6 +103,10 @@ mod tests {
             ("net_per_bar_in_market", FitnessTable::NetPerBarInMarket),
             ("expectancy_t_stat", FitnessTable::ExpectancyTStat),
             ("monthly_upside_v1", FitnessTable::MonthlyUpsideV1),
+            (
+                "monthly_upside_dd_averse_v1",
+                FitnessTable::MonthlyUpsideDdAverseV1,
+            ),
         ] {
             assert_eq!(FitnessTable::from_name(name), table, "{name}");
             assert_eq!(table.name(), name, "{name}");
@@ -103,6 +116,11 @@ mod tests {
 
     #[test]
     fn serde_names_match_from_name_so_config_json_round_trips() {
+        let json = serde_json::to_string(&FitnessTable::MonthlyUpsideDdAverseV1).unwrap();
+        assert_eq!(json, "\"monthly_upside_dd_averse_v1\"");
+        let parsed_dd: FitnessTable =
+            serde_json::from_str(&json).expect("snake_case dd-averse selector deserializes");
+        assert_eq!(parsed_dd, FitnessTable::MonthlyUpsideDdAverseV1);
         let json = serde_json::to_string(&FitnessTable::MonthlyUpsideV1).unwrap();
         assert_eq!(json, "\"monthly_upside_v1\"");
         let parsed: FitnessTable =

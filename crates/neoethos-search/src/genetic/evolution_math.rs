@@ -1425,17 +1425,26 @@ pub fn apply_metrics(
 ) {
     for (index, (gene, m)) in genes.iter_mut().zip(metrics.iter()).enumerate() {
         gene.fitness =
-            if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideV1 {
-                // Opt-in B9 (docs section 14.7): the explicit selector wins over
-                // the legacy boolean chain and reads the evaluator's
-                // completed-month return vector. PopulationEvaluationV1::apply
-                // refuses missing/misaligned transport; a legitimately empty
-                // per-gene series still takes the scorer's -100.0 guard.
+            if matches!(
+                config.fitness_table,
+                crate::scoring::FitnessTable::MonthlyUpsideV1
+                    | crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1
+            ) {
+                // Opt-in B9 / B9-dd-averse (docs section 14.7): the explicit
+                // selector wins over the legacy boolean chain and reads the
+                // evaluator's completed-month return vector.
+                // PopulationEvaluationV1::apply refuses missing/misaligned
+                // transport; a legitimately empty per-gene series still takes
+                // the scorer's -100.0 guard.
                 let months = monthly_returns
                     .and_then(|series| series.get(index))
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                crate::scoring::ga_fitness_monthly_upside_v1(months, m)
+                if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1 {
+                    crate::scoring::ga_fitness_monthly_upside_dd_averse_v1(months, m)
+                } else {
+                    crate::scoring::ga_fitness_monthly_upside_v1(months, m)
+                }
             } else if let Some(goal) = config.growth_goal {
                 crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
             } else if config.growth_objective {
@@ -2646,5 +2655,25 @@ mod generator_audit_tests {
             crate::scoring::ga_fitness(&metrics[0]),
             "the MonthlyUpsideV1 selector must not fall through to the canonical scorer"
         );
+
+        // The dd-averse selector routes to the SAME monthly vector through its
+        // own scorer: identical when both candidates are under the drawdown
+        // thresholds, penalized when one is not.
+        let mut selected_cfg = crate::genetic::EvaluationConfig::default();
+        selected_cfg.fitness_table = FitnessTable::MonthlyUpsideDdAverseV1;
+        let clean = metrics.clone();
+        apply_metrics(&mut genes, &clean, &selected_cfg, 1.0, Some(&months));
+        assert_eq!(
+            genes[0].fitness,
+            crate::scoring::ga_fitness_monthly_upside_dd_averse_v1(&months[0], &clean[0])
+        );
+        let mut risky = clean.clone();
+        risky[0][3] = 0.30; // 30 % drawdown, far above the 10 % free band
+        apply_metrics(&mut genes, &risky, &selected_cfg, 1.0, Some(&months));
+        assert!(
+            genes[0].fitness < crate::scoring::ga_fitness_monthly_upside_v1(&months[0], &risky[0]),
+            "the dd-averse selector must penalize drawdown relative to B9"
+        );
     }
+
 }
