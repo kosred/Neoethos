@@ -1,0 +1,75 @@
+name: GA 400x5 active-percentile real Rust engine smoke
+
+on:
+  push:
+    branches:
+      - exp/pre-oos-funnel-ci-20261025
+    paths:
+      - '.github/workflows/ga-active-percentile-400x5.yml'
+      - 'crates/neoethos-search/src/genetic/search_engine.rs'
+      - 'crates/neoethos-search/src/genetic/experimental_percentile.rs'
+      - 'crates/neoethos-search/src/genetic/experimental_end_to_end.rs'
+      - 'crates/neoethos-search/Cargo.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  genetic-real-evaluator:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pre-oos-search-contracts
+      - name: Install native search dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config mold \
+            libasound2-dev libudev-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libx11-dev libdbus-1-dev
+      - name: Compile-test percentile ranking edge cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ga-active-percentile-results
+          cargo test --locked -p neoethos-search --lib --no-default-features \
+            --features experimental-active-percentile \
+            experimental_percentile::tests -- --nocapture \
+            2>&1 | tee ga-active-percentile-results/unit-tests.log
+      - name: Run real Rust GA and historical backtest evaluator, 400x5
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v cargo test --locked -p neoethos-search --lib \
+            --no-default-features --features experimental-active-percentile \
+            ga_400_x_5_entire_real_rust_generation_loop_with_captured_ctrader_bars \
+            -- --exact --nocapture \
+            2>&1 | tee ga-active-percentile-results/ga-400x5.log
+          grep 'SMOKE_GA_COMPLETED' ga-active-percentile-results/ga-400x5.log \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check baseline feature OFF compiles and preserves existing test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p neoethos-search --lib --no-default-features \
+            real_generation_loop_evaluates_every_slot_and_returns_last_population_without_archive \
+            -- --nocapture \
+            2>&1 | tee ga-active-percentile-results/old-selection-test.log
+      - name: Archive all logs even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ga-active-percentile-400x5-research
+          path: ga-active-percentile-results/
+          if-no-files-found: warn
+          retention-days: 30
