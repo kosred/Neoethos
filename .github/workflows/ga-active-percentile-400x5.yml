@@ -57,14 +57,17 @@ jobs:
             2>&1 | tee ga-active-percentile-results/ga-400x5.log
           grep 'SMOKE_GA_COMPLETED' ga-active-percentile-results/ga-400x5.log \
             | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Check baseline feature OFF compiles and preserves existing test
+      - name: Run SAME 400x5 true Rust evaluator with prior selector (feature OFF)
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p neoethos-search --lib --no-default-features \
-            real_generation_loop_evaluates_every_slot_and_returns_last_population_without_archive \
+          /usr/bin/time -v cargo test --locked -p neoethos-search --lib \
+            --no-default-features \
+            ga_400_x_5_entire_real_rust_generation_loop_with_captured_ctrader_bars \
             -- --nocapture \
-            2>&1 | tee ga-active-percentile-results/old-selection-test.log
+            2>&1 | tee ga-active-percentile-results/ga-400x5-baseline.log
+          grep 'SMOKE_GA_COMPLETED' ga-active-percentile-results/ga-400x5-baseline.log \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Archive all logs even on failure
         if: always()
         uses: actions/upload-artifact@v4
