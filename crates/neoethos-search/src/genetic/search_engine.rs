@@ -8,6 +8,9 @@ use super::evolution_math::{
     unique_candidate_or_retry,
 };
 use super::runtime_overrides::current_genetic_search_runtime_overrides;
+#[cfg(feature = "experimental-active-percentile")]
+#[path = "experimental_percentile.rs"]
+mod experimental_percentile;
 use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
 use crate::eval::BacktestSettings;
@@ -3898,32 +3901,55 @@ where
             let novelty_scores =
                 exact_sparse_jaccard_knn_novelty_v1(&index_sets, novelty_neighbors);
 
-            // Normalize and blend
-            let min_fit = scored
-                .iter()
-                .map(|(f, _, _, _)| *f)
-                .filter(|f| f.is_finite())
-                .fold(f64::INFINITY, f64::min);
-            let max_fit = scored
-                .iter()
-                .map(|(f, _, _, _)| *f)
-                .filter(|f| f.is_finite())
-                .fold(f64::NEG_INFINITY, f64::max);
-            let fit_range = (max_fit - min_fit).max(1e-9);
-            let max_nov = novelty_scores
-                .iter()
-                .copied()
-                .fold(0.0_f64, f64::max)
-                .max(1e-9);
-
-            for i in 0..n_pop {
-                if !scored[i].0.is_finite() {
-                    continue;
+            // Financial-score normalization strategy is gated by a compile
+            // feature on the experimental branch; production default remains
+            // bit-identical to the pre-existing all-finite min/max blend.
+            #[cfg(feature = "experimental-active-percentile")]
+            {
+                let raw = scored.iter().map(|x| x.0).collect::<Vec<_>>();
+                let traded = scored.iter().map(|x| x.3[8]).collect::<Vec<_>>();
+                let sorted_scores =
+                    experimental_percentile::blend(&raw, &traded, &novelty_scores, novelty_weight);
+                tracing::info!(
+                    target: "neoethos_search::search_engine",
+                    generation = generation + 1,
+                    active = traded.iter().filter(|t| t.is_finite() && **t >= 1.0).count(),
+                    population = n_pop,
+                    "research-only experimental eligible-percentile score selected"
+                );
+                for (candidate, value) in scored.iter_mut().zip(sorted_scores) {
+                    candidate.0 = value;
                 }
-                let norm_fit = (scored[i].0 - min_fit) / fit_range;
-                let norm_nov = novelty_scores[i] / max_nov;
-                // Modify the sorting score purely for the tournament survival/elites
-                scored[i].0 = (1.0 - novelty_weight) * norm_fit + novelty_weight * norm_nov;
+            }
+            #[cfg(not(feature = "experimental-active-percentile"))]
+            {
+                // Original production selection block retained unchanged.
+                let min_fit = scored
+                    .iter()
+                    .map(|(f, _, _, _)| *f)
+                    .filter(|f| f.is_finite())
+                    .fold(f64::INFINITY, f64::min);
+                let max_fit = scored
+                    .iter()
+                    .map(|(f, _, _, _)| *f)
+                    .filter(|f| f.is_finite())
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let fit_range = (max_fit - min_fit).max(1e-9);
+                let max_nov = novelty_scores
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, f64::max)
+                    .max(1e-9);
+
+                for i in 0..n_pop {
+                    if !scored[i].0.is_finite() {
+                        continue;
+                    }
+                    let norm_fit = (scored[i].0 - min_fit) / fit_range;
+                    let norm_nov = novelty_scores[i] / max_nov;
+                    // Modify the sorting score purely for tournament survival/elites
+                    scored[i].0 = (1.0 - novelty_weight) * norm_fit + novelty_weight * norm_nov;
+                }
             }
             timing.novelty += novelty_started.elapsed();
         }
