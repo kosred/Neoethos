@@ -8,7 +8,6 @@
 use neoethos_gpu_contracts::resident_search_scoring_v2::{
     score_prop_firm_ga_fitness_v4, score_risky_ga_fitness_goal_v6, RiskyGrowthGoal,
 };
-use std::cmp::Ordering;
 
 const POP: usize=400;
 const TOP: usize=20;
@@ -27,10 +26,10 @@ struct Rand(u64);
 impl Rand {
     fn new(seed:u64)->Self {Self(seed)}
     fn u(&mut self)->f64 {
-        self.0^=self.0<<13;
-        self.0^=self.0>>7;
-        self.0^=self.0<<17;
-        (self.0>>11) as f64/(1u64<<53) as f64
+        self0.0^=self0.0<<13;
+        self0.0^=self0.0>>7;
+        self0.0^=self0.0<<17;
+        (self0.0>>11) as f64/(1u64<<53) as f64
     }
 }
 
@@ -56,9 +55,9 @@ fn fixture(seed:u64, nontrader_fraction:f64, mode:&str)->Vec<Candidate>{
         let sharpe=if no_trade {0.} else {0.7+q*0.8};
         let max_dd=if no_trade {0.} else {0.005+(1.-q)*0.035+rng.u()*0.008};
         let pf=if no_trade {0.} else {1.15+q*0.3};
-        let wr=if no_trade {0.} else {(0.49+q*.10).clamp(0.,1.)};
-        let monthly=if no_trade {0.} else {(0.5+q*.3).clamp(0.,1.)};
-        let consistency=if no_trade {0.} else {(0.5+q*.2).clamp(0.,1.)};
+        let wr=if no_trade {0.} else {(0.49+q*0.10).clamp(0.,1.)};
+        let monthly=if no_trade {0.} else {(0.5+q*0.3).clamp(0.,1.)};
+        let consistency=if no_trade {0.} else {(0.5+q*0.2).clamp(0.,1.)};
         let daily_dd=if no_trade {0.} else {0.002+(1.-q)*0.005};
         let m=[net,sharpe,0.,max_dd,wr,pf,0.,monthly,trades,consistency,daily_dd];
         let score=if mode=="Risky-v6" {
@@ -99,7 +98,7 @@ fn calculate_order(candidates:&[Candidate], method:&str,weight:f64)->Vec<usize>{
             let mut end=start+1;
             while end<members.len() && candidates[members[start]].fitness==candidates[members[end]].fitness {end+=1}
             let midpoint=(start+end-1) as f64/2.;
-            let percentile=if members.len()==1 {.5} else {midpoint/(members.len()-1) as f64};
+            let percentile=if members.len()==1 {0.5} else {midpoint/(members.len()-1) as f64};
             for i in start..end {rankvec[members[i]]=percentile}
             start=end;
         }
@@ -191,7 +190,7 @@ fn run(){
             for (j,name) in METHODS.iter().enumerate(){
                 let (fit,net,quality,novelty,active,positive,overlap)=sums[j];
                 let n=SEEDS as f64;
-                println!("ABLAT mode={mode} no_trade_fraction={fraction:.2} method={name} mean_raw_fit_top20={:.6} mean_relative_net_top20={:.6} mean_quality_top20={:.6} mean_novelty_top20={:.6} active_top20={:.2} netpositive_top20={:.2} overlap_raw_top20={:.2} changed_vs_raw_trials={}/{}",
+                println!("ABLAT mode={mode} no_trade_fraction={fraction:0.2} method={name} mean_raw_fit_top20={:0.6} mean_relative_net_top20={:0.6} mean_quality_top20={:0.6} mean_novelty_top20={:0.6} active_top20={:0.2} netpositive_top20={:0.2} overlap_raw_top20={:0.2} changed_vs_raw_trials={}/{}",
                     fit/n,net/n,quality/n,novelty/n,active/n,positive/n,overlap/n,changed_counts[j],SEEDS);
             }
         }
