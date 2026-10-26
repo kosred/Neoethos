@@ -1,15 +1,7 @@
 name: GA 400x5 host evolution with test evaluator (no market)
 
+# Manual-only experiment. Do not reactivate automatic GitHub CI.
 on:
-  push:
-    branches:
-      - exp/pre-oos-funnel-ci-20261025
-    paths:
-      - '.github/workflows/ga-active-percentile-400x5.yml'
-      - 'crates/neoethos-search/src/genetic/search_engine.rs'
-      - 'crates/neoethos-search/src/genetic/experimental_percentile.rs'
-      - 'crates/neoethos-search/src/genetic/experimental_end_to_end.rs'
-      - 'crates/neoethos-search/Cargo.toml'
   workflow_dispatch:
 
 permissions:
