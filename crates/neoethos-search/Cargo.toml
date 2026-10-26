@@ -49,6 +49,8 @@ libc = "0.2.189"
 
 [features]
 default = []
+# Explicitly opt-in branch-only experiment; does not alter default selection.
+experimental-active-percentile = []
 # Profiler builds link NVIDIA's NVTX C API. Ordinary builds retain a no-op
 # instrumentation API and never require the NVIDIA toolkit/library.
 nvtx = []
