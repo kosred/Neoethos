@@ -26,10 +26,10 @@ struct Rand(u64);
 impl Rand {
     fn new(seed:u64)->Self {Self(seed)}
     fn u(&mut self)->f64 {
-        self0.0^=self0.0<<13;
-        self0.0^=self0.0>>7;
-        self0.0^=self0.0<<17;
-        (self0.0>>11) as f64/(1u64<<53) as f64
+        self.0^=self.0<<13;
+        self.0^=self.0>>7;
+        self.0^=self.0<<17;
+        (self.0>>11) as f64/(1u64<<53) as f64
     }
 }
 
