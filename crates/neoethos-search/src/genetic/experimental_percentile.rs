@@ -67,7 +67,7 @@ mod tests {
         let r = blend(&scores,&n,&nov,0.2);
         assert_eq!(r[0],r[1]);
         assert_eq!(r[1],r[2]);
-        assert_eq!(r[2],-100.);
+        assert_eq!(r[3],-100.);
         assert_eq!(blend(&[-100.,-100.], &[0.,0.], &[0.8,1.0],0.2),vec![-100.,-100.]);
     }
 
