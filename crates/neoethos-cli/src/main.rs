@@ -2238,6 +2238,7 @@ fn cmd_discover_on_budgeted_pool(
         let diagnose_signals_out = parse_flag(args, "--diagnose-candidate-signals-out");
         let diagnose_weekdays_out = parse_flag(args, "--diagnose-candidate-weekdays-out");
         let diagnose_exit_out = parse_flag(args, "--diagnose-exit-policy-out");
+        let diagnose_oos_out = parse_flag(args, "--diagnose-candidate-oos-out");
         let diagnose_weekday_selectors = parse_flag(args, "--diagnose-candidate-selectors");
         // Research-only offline prefilter-ranking audit (no GA): ranks the full
         // pre-prefilter vocabulary under the default correlation ranking AND
@@ -2258,6 +2259,7 @@ fn cmd_discover_on_budgeted_pool(
                     && diagnose_signals_out.is_none()
                     && diagnose_weekdays_out.is_none()
                     && diagnose_exit_out.is_none()
+                    && diagnose_oos_out.is_none()
                     && diagnose_weekday_selectors.is_none(),
                 "prefilter ranking audit cannot be combined with saved-candidate diagnostics"
             );
@@ -2270,11 +2272,16 @@ fn cmd_discover_on_budgeted_pool(
         let diagnose_candidate_selections = {
             let weekday_mode = diagnose_weekdays_out.is_some();
             let exit_mode = diagnose_exit_out.is_some();
+            let oos_mode = diagnose_oos_out.is_some();
             anyhow::ensure!(
-                !(weekday_mode && exit_mode),
+                [weekday_mode, exit_mode, oos_mode]
+                    .iter()
+                    .filter(|value| **value)
+                    .count()
+                    <= 1,
                 "candidate weekday and exit-policy diagnostics cannot be combined"
             );
-            if weekday_mode || exit_mode {
+            if weekday_mode || exit_mode || oos_mode {
                 anyhow::ensure!(
                     saved_research.is_some(),
                     "saved-candidate selector diagnostics require --resume-research and --resume-research-sha256"
@@ -2293,6 +2300,7 @@ fn cmd_discover_on_budgeted_pool(
                 let out = diagnose_weekdays_out
                     .as_deref()
                     .or(diagnose_exit_out.as_deref())
+                    .or(diagnose_oos_out.as_deref())
                     .expect("one selector diagnostic output is selected");
                 anyhow::ensure!(
                     !std::path::Path::new(out).exists(),
@@ -2753,8 +2761,7 @@ fn cmd_discover_on_budgeted_pool(
                 })
                 .transpose()?;
             let frame_cache_state = std::cell::RefCell::new(None::<(String, bool)>);
-            let mut outcome =
-                match neoethos_search::orchestration::run_streaming_working_set(
+            let mut outcome = match neoethos_search::orchestration::run_streaming_working_set(
                 &streaming_plan,
                 base_ohlcv.close.len(),
                 |batch| {
@@ -2791,12 +2798,14 @@ fn cmd_discover_on_budgeted_pool(
                             batch,
                         )?;
                     emit_cpu_research_stage(&format!("feature_build_completed cursor={cursor}"));
-                    if let (Some(cache_cfg), Some((key, false))) =
-                        (frame_cache_config.as_ref(), frame_cache_state.borrow().as_ref())
-                    {
-                        let bytes = neoethos_data::core::feature_frame_cache::feature_frame_cache_store(
-                            key, &features, cache_cfg,
-                        )?;
+                    if let (Some(cache_cfg), Some((key, false))) = (
+                        frame_cache_config.as_ref(),
+                        frame_cache_state.borrow().as_ref(),
+                    ) {
+                        let bytes =
+                            neoethos_data::core::feature_frame_cache::feature_frame_cache_store(
+                                key, &features, cache_cfg,
+                            )?;
                         emit_cpu_research_stage(&format!(
                             "feature_frame_cache_stored bytes={bytes}"
                         ));
@@ -2812,9 +2821,10 @@ fn cmd_discover_on_budgeted_pool(
                     )?;
                     let receipt = run_input.receipt().clone();
                     emit_cpu_research_stage("content_receipt_completed");
-                    if let (Some(cache_cfg), Some((key, cache_hit))) =
-                        (frame_cache_config.as_ref(), frame_cache_state.borrow().as_ref())
-                    {
+                    if let (Some(cache_cfg), Some((key, cache_hit))) = (
+                        frame_cache_config.as_ref(),
+                        frame_cache_state.borrow().as_ref(),
+                    ) {
                         feature_frame_cache_gate::verify_or_seal_receipt_sidecar(
                             &cache_cfg.dir,
                             key,
@@ -2914,6 +2924,19 @@ fn cmd_discover_on_budgeted_pool(
                             "saved research contract differs from the reopened sources and settings"
                         );
                         let result_ref = research.discovery_result();
+                        if let Some(oos_out) = diagnose_oos_out.as_deref() {
+                            let path = std::path::Path::new(oos_out);
+                            anyhow::ensure!(
+                                !path.exists(),
+                                "saved-candidate OOS output must be new"
+                            );
+                            let document = neoethos_search::discovery::evaluate_saved_candidates_outer_holdout_v1(
+                                &run_input, &research_config, &research, &diagnose_candidate_selections,
+                            )?;
+                            neoethos_core::storage::json::write_json_atomic(path, &document)?;
+                            emit_cpu_research_stage("saved_candidate_oos_written");
+                            return Ok(research);
+                        }
                         if let Some(exit_out) = diagnose_exit_out.as_deref() {
                             let diag_path = std::path::Path::new(exit_out);
                             anyhow::ensure!(
@@ -5741,6 +5764,9 @@ fn print_help() {
         "    research-only saved-candidate exit-policy variants: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-selectors <index:strategy_id:fnv64:hash,...> --diagnose-exit-policy-out <new-json>"
     );
     println!(
+        "    research-only frozen-candidate OOS: --resume-research <json> --resume-research-sha256 <sha> --max-batches 1 --diagnose-candidate-selectors <index:strategy_id:fnv64:hash,...> --diagnose-candidate-oos-out <new-json>"
+    );
+    println!(
         "    research-only offline prefilter-ranking audit (no GA): --prefilter-ranking-audit-out <new-json> — ranks the full pre-prefilter vocabulary under the default correlation ranking AND the direction-only ranking, then short-circuits before Search"
     );
     println!(
@@ -6306,7 +6332,12 @@ mod tests {
             let defaults = neoethos_search::DiscoveryConfig::default();
             let resolve = |args: &[String]| {
                 super::super::discovery_config_from_cli(
-                    args, &defaults, "EURUSD", "M15", &[], "USD",
+                    args,
+                    &defaults,
+                    "EURUSD",
+                    "M15",
+                    &[],
+                    "USD",
                 )
             };
             let inherited = resolve(&[]).unwrap();
@@ -6314,11 +6345,8 @@ mod tests {
                 inherited.fitness_table,
                 neoethos_search::scoring::FitnessTable::GaFitness
             );
-            let selected = resolve(&[
-                "--fitness-table".to_owned(),
-                "monthly_upside_v1".to_owned(),
-            ])
-            .unwrap();
+            let selected =
+                resolve(&["--fitness-table".to_owned(), "monthly_upside_v1".to_owned()]).unwrap();
             assert_eq!(
                 selected.fitness_table,
                 neoethos_search::scoring::FitnessTable::MonthlyUpsideV1

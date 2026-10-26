@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 22] = [
+const OPTIONAL: [&str; 23] = [
     "--higher",
     "--population",
     "--generations",
@@ -49,6 +49,7 @@ const OPTIONAL: [&str; 22] = [
     "--diagnose-candidate-weekdays-out",
     "--diagnose-candidate-selectors",
     "--diagnose-exit-policy-out",
+    "--diagnose-candidate-oos-out",
     "--new-search-research",
     "--new-search-research-sha256",
     "--prefilter-ranking-audit-out",
@@ -133,10 +134,50 @@ fn read_recorded_research(
         return Ok(None);
     }
     let source = PathBuf::from(values[flags[0]]);
-    let (bytes, sha256) = read_pinned_input(&source, values[flags[1]], label, 512 * 1024 * 1024)?;
-    let research =
-        neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3::from_json_bytes(&bytes)?;
+    // Completed candidate archives exceed 512 MiB. Hash during bounded streaming
+    // decoding so replay does not retain a second full JSON buffer beside them.
+    use sha2::Digest;
+    use std::io::Read;
+    const LIMIT: u64 = 1024 * 1024 * 1024;
+    let file = fs::File::open(&source)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= LIMIT,
+        "{label} is not a bounded regular research file"
+    );
+    let reader = ResearchHashReader {
+        inner: file.take(LIMIT + 1),
+        hash: sha2::Sha256::new(),
+        count: 0,
+    };
+    let mut buffered = std::io::BufReader::with_capacity(128 * 1024, reader);
+    let research: neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3 =
+        serde_json::from_reader(&mut buffered).context("decode saved canonical research")?;
+    let reader = buffered.into_inner();
+    let sha256 = format!("{:x}", reader.hash.finalize());
+    ensure!(
+        reader.count <= LIMIT,
+        "{label} exceeded its research file limit"
+    );
+    ensure!(sha256 == values[flags[1]], "{label} SHA256 mismatch");
+    research.validate()?;
     Ok(Some((research, sha256, source)))
+}
+
+struct ResearchHashReader<R> {
+    inner: R,
+    hash: sha2::Sha256,
+    count: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for ResearchHashReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        let count = self.inner.read(buffer)?;
+        self.hash.update(&buffer[..count]);
+        self.count += count as u64;
+        Ok(count)
+    }
 }
 
 pub(crate) struct SavedResearchInputs {
@@ -161,6 +202,7 @@ impl SavedResearchInputs {
                 || arg == "--diagnose-candidate-signals-out"
                 || arg == "--diagnose-candidate-weekdays-out"
                 || arg == "--diagnose-exit-policy-out"
+                || arg == "--diagnose-candidate-oos-out"
         });
         if !research_only_diagnostic {
             neoethos_search::ensure_non_empty_portfolio(
@@ -330,6 +372,7 @@ impl Arguments {
                     && parsed.0.get("--diagnose-candidate-signals-out").is_none()
                     && parsed.0.get("--diagnose-candidate-weekdays-out").is_none()
                     && parsed.0.get("--diagnose-exit-policy-out").is_none()
+                    && parsed.0.get("--diagnose-candidate-oos-out").is_none()
                     && parsed.0.get("--diagnose-candidate-selectors").is_none(),
                 "new-search recorded inputs cannot be combined with candidate diagnostics"
             );
@@ -381,20 +424,26 @@ impl Arguments {
             ensure!(
                 parsed.0.get("--diagnose-candidate-weekdays-out").is_none()
                     && parsed.0.get("--diagnose-exit-policy-out").is_none()
+                    && parsed.0.get("--diagnose-candidate-oos-out").is_none()
                     && parsed.0.get("--diagnose-candidate-selectors").is_none(),
                 "candidate signal behavior census cannot be combined with candidate selector diagnostics"
             );
         }
         let weekday_out = parsed.0.get("--diagnose-candidate-weekdays-out");
         let exit_out = parsed.0.get("--diagnose-exit-policy-out");
-        let selector_out = weekday_out.or(exit_out);
+        let oos_out = parsed.0.get("--diagnose-candidate-oos-out");
+        let selector_out = weekday_out.or(exit_out).or(oos_out);
         let weekday_selectors = parsed.0.get("--diagnose-candidate-selectors");
         ensure!(
             selector_out.is_some() == weekday_selectors.is_some(),
             "candidate selector diagnostics require an output flag and --diagnose-candidate-selectors together"
         );
         ensure!(
-            !(weekday_out.is_some() && exit_out.is_some()),
+            [weekday_out, exit_out, oos_out]
+                .iter()
+                .filter(|value| value.is_some())
+                .count()
+                <= 1,
             "candidate weekday and exit-policy diagnostics cannot be combined"
         );
         if selector_out.is_some() {
@@ -558,6 +607,7 @@ fn forward_optional_diagnostic_flags(args: &Arguments, discovery_args: &mut Vec<
         "--diagnose-candidate-weekdays-out",
         "--diagnose-candidate-selectors",
         "--diagnose-exit-policy-out",
+        "--diagnose-candidate-oos-out",
         "--prefilter-ranking-audit-out",
     ] {
         if let Some(value) = args.0.get(flag) {
@@ -1098,7 +1148,14 @@ mod tests {
             "C:/out/weekdays.json",
         );
         assert!(Arguments::parse(&both).is_err());
-        for raw in [weekday, exit] {
+        let oos =
+            selector_diagnostic_arguments("--diagnose-candidate-oos-out", "C:/out/frozen-oos.json");
+        assert_selector_forwarded(&oos, "--diagnose-candidate-oos-out");
+        assert!(Arguments::parse(&without_selector_pair(&oos)).is_err());
+        let mut mixed = oos.clone();
+        push(&mut mixed, "--diagnose-exit-policy-out", "C:/out/exit.json");
+        assert!(Arguments::parse(&mixed).is_err());
+        for raw in [weekday, exit, oos] {
             let mut with_signal = raw.clone();
             push(
                 &mut with_signal,
@@ -1115,6 +1172,30 @@ mod tests {
             push(&mut with_cost, "--diagnose-cost-variants", "base=1.0:2.0");
             assert!(Arguments::parse(&with_cost).is_err());
         }
+    }
+
+    #[test]
+    fn streamed_research_hash_covers_chunk_boundaries_and_trailing_bytes() {
+        use sha2::Digest;
+        use std::io::Read;
+        let bytes = b"{\"frozen\":true}\n  ";
+        let mut reader = ResearchHashReader {
+            inner: std::io::Cursor::new(bytes),
+            hash: sha2::Sha256::new(),
+            count: 0,
+        };
+        let mut observed = Vec::new();
+        let mut chunk = [0u8; 3];
+        loop {
+            let n = reader.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            observed.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(observed, bytes);
+        assert_eq!(reader.count, bytes.len() as u64);
+        assert_eq!(reader.hash.finalize(), sha2::Sha256::digest(bytes));
     }
 
     #[test]
@@ -1164,21 +1245,33 @@ mod tests {
 
         #[test]
         fn fitness_table_selector_is_accepted_for_fresh_search_and_forwarded_once() {
-            for name in ["ga_fitness", "monthly_upside_v1", "monthly_upside_dd_averse_v1"] {
+            for name in [
+                "ga_fitness",
+                "monthly_upside_v1",
+                "monthly_upside_dd_averse_v1",
+            ] {
                 let mut raw = valid_arguments();
                 push(&mut raw, "--fitness-table", name);
                 let args = Arguments::parse(&raw)
                     .unwrap_or_else(|error| panic!("fresh-search selector {name}: {error}"));
                 let mut forwarded = Vec::new();
                 forward_optional_mode_flags(&args, &mut forwarded);
-                assert_eq!(forwarded, vec!["--fitness-table".to_owned(), name.to_owned()]);
+                assert_eq!(
+                    forwarded,
+                    vec!["--fitness-table".to_owned(), name.to_owned()]
+                );
             }
 
             // The drawdown-averse table is the third accepted fresh-search
             // selector (neo-671 2026-10-26) and forwards unchanged.
             let mut dd_averse = valid_arguments();
-            push(&mut dd_averse, "--fitness-table", "monthly_upside_dd_averse_v1");
-            let args = Arguments::parse(&dd_averse).expect("dd-averse selector is a fresh-search knob");
+            push(
+                &mut dd_averse,
+                "--fitness-table",
+                "monthly_upside_dd_averse_v1",
+            );
+            let args =
+                Arguments::parse(&dd_averse).expect("dd-averse selector is a fresh-search knob");
             let mut forwarded = Vec::new();
             forward_optional_mode_flags(&args, &mut forwarded);
             assert_eq!(
@@ -1189,8 +1282,13 @@ mod tests {
                 ]
             );
             let mut dd_budget = valid_arguments();
-            push(&mut dd_budget, "--fitness-table", "monthly_upside_dd_budget_v1");
-            let args = Arguments::parse(&dd_budget).expect("dd-budget selector is a fresh-search knob");
+            push(
+                &mut dd_budget,
+                "--fitness-table",
+                "monthly_upside_dd_budget_v1",
+            );
+            let args =
+                Arguments::parse(&dd_budget).expect("dd-budget selector is a fresh-search knob");
             let mut forwarded = Vec::new();
             forward_optional_mode_flags(&args, &mut forwarded);
             assert_eq!(

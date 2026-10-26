@@ -1761,3 +1761,29 @@ rediscovered as a surprise.
 `E_screen_pess` is therefore in **account currency per trade**, not pips. §9.4's
 worked example renders pips; the quantity is the same, the unit is the one the
 backtest already books in.
+
+
+### Frozen candidate OOS and centered MinMax (2026-10-27)
+
+`canonical-research` can evaluate explicit archived candidates on the reserved
+chronological holdout without another Search. Supply `--resume-research`, its
+`--resume-research-sha256`, `--max-batches 1`, explicit
+`--diagnose-candidate-selectors index:strategy_id:fnv64:hash,...` (at most eight),
+and `--diagnose-candidate-oos-out <new-json>`. The replay checks the original
+contract, feature names, candidate identities, split and sealed evaluation
+policy. It remains ResearchOnly / NotPromotionEligible. OOS reports include
+initial balance, mode, monthly closed-trade ledger and closed trades. Whole-span
+prop-firm diagnostics do not establish a rolling challenge pass, and do not
+represent the Risky capital/deadline objective. Preserve an already inspected
+holdout's exposure history; repeated evaluations are not fresh independent proof.
+
+The four vector-ta `minmax` outputs are excluded from new production feature
+plans. Their centered formula reads through `i + order` while publishing at `i`;
+forward-filled `last_min`/`last_max` inherit the same future dependence. The
+existing one-period higher-timeframe close lag does not supply the missing
+confirmation delay. The regression test changes only a future high and proves
+that the historical pivot changes. Archived genes and results stay preserved,
+but genes using these outputs have contaminated historical evidence. Do not
+replace their feature indices with different columns or call a failed exact
+replay a financial OOS loss. A causal delayed replacement requires a new name
+and feature recipe plus prefix-invariance tests.

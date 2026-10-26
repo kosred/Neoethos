@@ -2458,7 +2458,11 @@ fn volatility_decoupling_fixture() -> (FeatureFrame, Ohlcv) {
     (frame, ohlcv)
 }
 
-fn volatility_decoupling_spec(top_k: usize, direction_only: bool, purge: Vec<String>) -> PrefilterSpec {
+fn volatility_decoupling_spec(
+    top_k: usize,
+    direction_only: bool,
+    purge: Vec<String>,
+) -> PrefilterSpec {
     PrefilterSpec {
         top_k,
         insample_frac: 1.0,
@@ -2559,9 +2563,12 @@ fn volatility_purge_excludes_family_from_ranking_and_kept_set() {
     let (frame, ohlcv) = volatility_decoupling_fixture();
     // Without the purge, all three columns fit inside top-2 and the
     // volatility proxy survives.
-    let (kept, _) =
-        prefilter_features(&frame, &ohlcv, &volatility_decoupling_spec(2, false, Vec::new()))
-            .expect("unpurged top-2 succeeds");
+    let (kept, _) = prefilter_features(
+        &frame,
+        &ohlcv,
+        &volatility_decoupling_spec(2, false, Vec::new()),
+    )
+    .expect("unpurged top-2 succeeds");
     assert!(kept.names.iter().any(|n| n == "vol_proxy"));
     // With the family purged the same top-2 must exclude it by name; a
     // purged column is dropped from the ranking and cannot be resurrected
@@ -3102,19 +3109,35 @@ fn discovery_validation_artifacts_reject_tails_missing_features_on_both_routes()
     for prop_firm in [false, true] {
         let result = if prop_firm {
             compute_discovery_prop_firm_artifacts(
-                &portfolio, &["signal".to_string()], &tail_features, &tail_ohlcv,
-                &holdout_scope, STRICT_VALIDATION_SEARCH_CONFIG_HASH, &config,
+                &portfolio,
+                &["signal".to_string()],
+                &tail_features,
+                &tail_ohlcv,
+                &holdout_scope,
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                &config,
                 PropFirmRiskRules::default(),
-            ).map(|_| ())
+            )
+            .map(|_| ())
         } else {
             compute_discovery_forward_test_artifacts(
-                &portfolio, &["signal".to_string()], &tail_features, &tail_ohlcv,
-                &holdout_scope, STRICT_VALIDATION_SEARCH_CONFIG_HASH, &config,
-            ).map(|_| ())
+                &portfolio,
+                &["signal".to_string()],
+                &tail_features,
+                &tail_ohlcv,
+                &holdout_scope,
+                STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+                &config,
+            )
+            .map(|_| ())
         };
         let error = result.expect_err("tail without the effective feature must be rejected");
-        assert!(error.to_string().contains("live feature set is missing 'signal'"),
-            "prop_firm={prop_firm}: {error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("live feature set is missing 'signal'"),
+            "prop_firm={prop_firm}: {error:#}"
+        );
     }
 }
 
@@ -3382,7 +3405,42 @@ fn research_only_oos_document_is_labelled_and_carries_one_entry_per_strategy() {
         );
         assert!(strategy["forward_test"]["bars"].as_u64().unwrap_or(0) > 0);
         assert!(strategy["prop_firm_rules"]["all_rules_passed"].is_boolean());
+        assert!(strategy["monthly_breakdown"].is_array());
+        assert!(strategy["logged_trades"].is_array());
+        assert_eq!(strategy["goal_windows"]["mode"], "prop_firm");
+        assert_eq!(
+            strategy["goal_windows"]["rules"]["require_profit_target"],
+            true
+        );
     }
+    let mut risky_config = config.clone();
+    risky_config.mode = DiscoveryMode::Risky;
+    let risky = PreparedLockedHoldoutResearch::new(
+        &portfolio,
+        &features.names,
+        &features,
+        &ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &risky_config,
+        threshold,
+    )
+    .unwrap();
+    let goal = risky
+        .goal_window_report(
+            &portfolio[0],
+            &risky.ordered_signals[0],
+            &risky.ordered_confidences[0],
+        )
+        .unwrap();
+    assert_eq!(goal["mode"], "risky");
+    assert_eq!(goal["window_days"], 180);
+    assert_eq!(goal["target_balance"], 50000.0);
+    assert!(goal["windows"].is_array());
+    assert!(
+        goal.get("rules").is_none(),
+        "Risky is not graded by prop rules"
+    );
 }
 
 #[test]
@@ -3582,7 +3640,6 @@ fn compute_discovery_prop_firm_artifacts_returns_empty_for_empty_portfolio() {
     .expect("empty portfolio should produce zero artifacts");
     assert!(artifacts.is_empty());
 }
-
 
 #[test]
 fn compute_discovery_prop_firm_artifacts_produces_one_artifact_per_strategy() {
@@ -6957,27 +7014,29 @@ fn quality_metrics_payload_archives_the_two_month_fractional_return_vector() {
         ..crate::eval::BacktestSettings::default()
     };
     let mut monthly = Vec::new();
-    let (account_metrics, trades) =
-        crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
-            &close,
-            &high,
-            &low,
-            &signals,
-            &[],
-            &months,
-            &days,
-            &timestamps,
-            &settings,
-            Some(&mut monthly),
-        )
-        .expect("synthetic two-month replay");
+    let (account_metrics, trades) = crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
+        &close,
+        &high,
+        &low,
+        &signals,
+        &[],
+        &months,
+        &days,
+        &timestamps,
+        &settings,
+        Some(&mut monthly),
+    )
+    .expect("synthetic two-month replay");
     assert_eq!(trades.len(), 2, "one trade per completed month: {trades:?}");
     assert_eq!(
         monthly.len(),
         2,
         "two completed months must archive two entries: {monthly:?}"
     );
-    assert!((monthly[0] - 0.10).abs() < 1e-12, "month 1: +100 on 1000 start equity: {monthly:?}");
+    assert!(
+        (monthly[0] - 0.10).abs() < 1e-12,
+        "month 1: +100 on 1000 start equity: {monthly:?}"
+    );
     assert!(
         (monthly[1] - 100.0 / 1100.0).abs() < 1e-12,
         "month 2: +100 on 1100 carried equity: {monthly:?}"
@@ -7205,19 +7264,19 @@ fn the_max_hold_horizon_reaches_the_discovery_backtest() {
     let on = crate::discovery::DiscoveryConfig::from_settings(&settings);
     assert_eq!(on.max_hold_bars, 24, "from_settings must carry the field");
     assert_eq!(
-        template(&on).max_hold_bars, 24,
+        template(&on).max_hold_bars,
+        24,
         "the configured horizon must reach the settings template"
     );
     assert_eq!(
-        on.evaluation_config(None).max_hold_bars, 24,
+        on.evaluation_config(None).max_hold_bars,
+        24,
         "the configured horizon must reach Generation 0"
     );
 
     // Default 0 stays disabled end to end — byte-identical to every run
     // produced before the knob existed.
-    let off = crate::discovery::DiscoveryConfig::from_settings(
-        &neoethos_core::Settings::default(),
-    );
+    let off = crate::discovery::DiscoveryConfig::from_settings(&neoethos_core::Settings::default());
     assert_eq!(off.max_hold_bars, 0);
     assert_eq!(template(&off).max_hold_bars, 0);
     assert_eq!(off.evaluation_config(None).max_hold_bars, 0);

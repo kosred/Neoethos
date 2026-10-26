@@ -156,7 +156,6 @@ pub struct DiscoveryRuntimeOverrides {
     /// Minimum historical-data window (years) discovery requires before it
     /// agrees to run; `0` skips the pre-flight check.
     pub min_history_years: u32,
-
 }
 
 impl Default for DiscoveryRuntimeOverrides {
@@ -6442,6 +6441,13 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
                 initial_balance: self.settings.config.initial_balance,
                 rules: prop_firm_rules,
             });
+            let monthly = crate::quality::monthly_closed_trade_metrics_v1(
+                &trades,
+                self.settings.config.initial_balance,
+                *self.timestamps.first().context("empty OOS timestamps")?,
+                *self.timestamps.last().context("empty OOS timestamps")?,
+            )?;
+            let goal_windows = self.goal_window_report(gene, signals, confidences)?;
             strategies.push(serde_json::json!({
                 "strategy_id": gene.strategy_id,
                 "exact_gene_hash": crate::artifact_io::stable_json_hash(gene)?,
@@ -6457,6 +6463,9 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
                     "trade_count": summary.metrics.trade_count,
                 },
                 "prop_firm_rules": prop_firm,
+                "monthly_breakdown": monthly,
+                "logged_trades": trades,
+                "goal_windows": goal_windows,
             }));
         }
         let window = serde_json::to_value(self.holdout_scope.evaluated_window())?;
@@ -6467,11 +6476,115 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
             "authorization_issued": false,
             "warning": "Numerical evaluation on the reserved final holdout using the run's screening cost assumptions and sealed signal policy. It is NOT broker-quote validated and is not admissible for promotion or live trading.",
             "search_config_hash": self.search_config_hash,
+            "mode": format!("{:?}", self.settings.config.mode),
+            "initial_balance": self.settings.config.initial_balance,
+            "risk_per_trade_min": self.settings.config.risk_per_trade_min,
+            "risk_per_trade_max": self.settings.config.risk_per_trade_max,
+            "risky_target_balance": self.settings.config.risky_target_balance,
+            "risky_horizon_days": self.settings.config.risky_horizon_days,
+            "prop_firm_summary_scope": "whole evaluated span diagnostics; not a rolling challenge pass verdict; not a Risky objective",
             "holdout_scope": {
                 "receipt_sha256": self.holdout_scope.receipt_sha256(),
                 "evaluated_window": window,
             },
             "strategies": strategies,
+        }))
+    }
+
+    fn goal_window_report(
+        &self,
+        gene: &Gene,
+        signals: &[i8],
+        confidences: &[f64],
+    ) -> Result<serde_json::Value> {
+        let config = self.settings.config;
+        let risky = config.mode == DiscoveryMode::Risky;
+        let mut overrides = config.derive_prop_firm_gate();
+        overrides.n_windows = 12;
+        if risky {
+            anyhow::ensure!(
+                config.risky_horizon_days.is_finite() && config.risky_horizon_days >= 1.,
+                "invalid Risky horizon"
+            );
+            overrides.window_days = config.risky_horizon_days as usize;
+        }
+        let windows = plan_prop_firm_windows(
+            self.ohlcv,
+            self.timestamps,
+            &overrides,
+            &self.settings,
+            gene.stop_vol_mult > 0.,
+        )?;
+        if !risky {
+            let (rate, count, failures) = compute_prop_firm_pass_rate(
+                gene,
+                signals,
+                confidences,
+                self.ohlcv,
+                self.timestamps,
+                config,
+                &overrides,
+                &self.settings,
+                &windows,
+            )?;
+            return Ok(serde_json::json!({
+                "mode": "prop_firm", "window_days": overrides.window_days,
+                "rules": overrides.rules, "windows": count, "pass_rate": rate,
+                "passed": failures.passed, "daily_loss_breaches": failures.daily_loss_breaches,
+                "overall_drawdown_breaches": failures.overall_drawdown_breaches,
+                "profit_target_failures": failures.profit_target_failures,
+                "min_trading_days_failures": failures.min_trading_days_failures,
+                "consistency_violations": failures.consistency_violations,
+                "warning": "Overlapping research windows; empirical pass fraction is not a future probability or broker execution evidence",
+            }));
+        }
+        let mut outcomes = Vec::with_capacity(windows.len());
+        for (start, end, base) in windows {
+            let mut settings = self.settings.settings_for_gene(gene);
+            if settings.adaptive_vol_mult > 0. {
+                settings.adaptive_base_pips = base;
+            }
+            let trades = simulate_trades_with_confidence_core(
+                &self.ohlcv.close[start..end],
+                &self.ohlcv.high[start..end],
+                &self.ohlcv.low[start..end],
+                &self.timestamps[start..end],
+                &signals[start..end],
+                &confidences[start..end],
+                &settings,
+            )?;
+            let mut balance = config.initial_balance;
+            let mut peak = balance;
+            let mut dd = 0.0_f64;
+            let mut target_days = None;
+            let mut floor_hit = false;
+            for trade in &trades {
+                balance += trade.pnl;
+                peak = peak.max(balance);
+                dd = dd.max((peak - balance) / peak);
+                if balance >= config.risky_target_balance {
+                    target_days = trade
+                        .exit_time
+                        .map(|exit| (exit - self.timestamps[start]) as f64 / 86_400_000.);
+                    break;
+                }
+                if balance <= 10. {
+                    floor_hit = true;
+                    break;
+                }
+            }
+            outcomes.push(serde_json::json!({
+                "start_ms": self.timestamps[start], "end_ms": self.timestamps[end - 1],
+                "balance_at_stop": balance, "target_days": target_days,
+                "target_reached": target_days.is_some(), "floor_hit": floor_hit,
+                "max_closed_balance_drawdown": dd, "trades_in_window": trades.len(),
+            }));
+        }
+        Ok(serde_json::json!({
+            "mode": "risky", "initial_balance": config.initial_balance,
+            "target_balance": config.risky_target_balance, "window_days": overrides.window_days,
+            "sizing": "native confidence-sized compounding with original costs and lot limits",
+            "windows": outcomes, "warning": "Overlapping research windows; not independent future success probabilities",
         }))
     }
 
@@ -6995,6 +7108,50 @@ fn selected_saved_candidate_genes_v1(
         selected.push((selection.index, gene.clone()));
     }
     Ok(selected)
+}
+
+/// Evaluate explicit, identity-checked archived candidates without running Search.
+/// The saved policy and the canonical three-way split remain authoritative.
+pub fn evaluate_saved_candidates_outer_holdout_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<serde_json::Value> {
+    let selected = selected_saved_candidate_genes_v1(research.discovery_result(), selections)?;
+    let genes = selected
+        .into_iter()
+        .map(|(_, gene)| gene)
+        .collect::<Vec<_>>();
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let holdout = replay
+        .inputs
+        .holdout()
+        .context("saved candidate replay needs a reserved holdout")?;
+    let result = research.discovery_result();
+    anyhow::ensure!(
+        result.holdout_scope.as_ref() == Some(holdout.scope()),
+        "saved candidate holdout differs from the reopened canonical input"
+    );
+    let policy = result
+        .funnel_profile
+        .as_ref()
+        .and_then(|funnel| funnel.live_trading_policy_v1())
+        .context("saved candidate holdout lost its sealed signal policy")?;
+    let prepared = PreparedLockedHoldoutResearch::new_with_policy(
+        &genes,
+        &result.effective_feature_names,
+        holdout.features(),
+        holdout.ohlcv(),
+        holdout.scope(),
+        &result.search_config_hash,
+        &replay.research_config,
+        result.effective_smc_gate_threshold,
+        Some(policy),
+    )?;
+    let mut document = prepared.research_only_oos_document(PropFirmRiskRules::default())?;
+    document["saved_evidence_identity_sha256"] = research.evidence_identity_sha256().into();
+    Ok(document)
 }
 
 const SAVED_CANDIDATE_METRIC_NAMES: [&str; 11] = [
@@ -11832,10 +11989,8 @@ pub fn run_prefilter_ranking_audit_v1(
     let features = selection.features();
     let ohlcv = selection.ohlcv();
     install_gene_stop_band_scale_for_dataset(&research_config, ohlcv);
-    let financial_geometry = resolve_prefilter_financial_geometry_v1(
-        &research_config,
-        ohlcv.close.last().copied(),
-    );
+    let financial_geometry =
+        resolve_prefilter_financial_geometry_v1(&research_config, ohlcv.close.last().copied());
     let available = features.names.len();
     let prefilter_top_k = resolve_prefilter_top_k(
         research_config.runtime_overrides.prefilter_top_k,
@@ -11853,7 +12008,9 @@ pub fn run_prefilter_ranking_audit_v1(
         insample_frac: research_config
             .runtime_overrides
             .resolved_prefilter_insample_frac(),
-        min_per_tf: research_config.runtime_overrides.prefilter_min_per_timeframe,
+        min_per_tf: research_config
+            .runtime_overrides
+            .prefilter_min_per_timeframe,
         max_hold_bars: financial_geometry.max_hold_bars,
         atr_period: 14,
         sl_atr_mult: financial_geometry.stop_atr_multiplier,
@@ -11890,16 +12047,18 @@ pub fn run_prefilter_ranking_audit_v1(
     let ranking_json = |ranking: &[(usize, String, f64, f64, u32, bool)]| {
         ranking
             .iter()
-            .map(|(index, name, score, instability, timeframe_group, purged)| {
-                serde_json::json!({
-                    "index": index,
-                    "name": name,
-                    "score": score,
-                    "instability": instability,
-                    "timeframe_group": timeframe_group,
-                    "purged": purged
-                })
-            })
+            .map(
+                |(index, name, score, instability, timeframe_group, purged)| {
+                    serde_json::json!({
+                        "index": index,
+                        "name": name,
+                        "score": score,
+                        "instability": instability,
+                        "timeframe_group": timeframe_group,
+                        "purged": purged
+                    })
+                },
+            )
             .collect::<Vec<_>>()
     };
     let report = serde_json::json!({
@@ -12240,8 +12399,7 @@ fn prefilter_features(
 ) -> Result<(FeatureFrame, PrefilterCensus)> {
     let mut inner_spec = spec.clone();
     inner_spec.audit_ranking = false;
-    let (frame, census, _ranking) =
-        prefilter_features_with_ranking(features, ohlcv, &inner_spec)?;
+    let (frame, census, _ranking) = prefilter_features_with_ranking(features, ohlcv, &inner_spec)?;
     Ok((frame, census))
 }
 
@@ -12252,7 +12410,11 @@ fn prefilter_features_with_ranking(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     spec: &PrefilterSpec,
-) -> Result<(FeatureFrame, PrefilterCensus, Vec<(usize, String, f64, f64, u32, bool)>)> {
+) -> Result<(
+    FeatureFrame,
+    PrefilterCensus,
+    Vec<(usize, String, f64, f64, u32, bool)>,
+)> {
     let n_rows = features.n_samples();
     let n_cols = features.n_features();
     if n_rows < 2 || n_cols <= spec.top_k {
