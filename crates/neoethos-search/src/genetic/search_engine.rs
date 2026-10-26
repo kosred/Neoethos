@@ -11,6 +11,9 @@ use super::runtime_overrides::current_genetic_search_runtime_overrides;
 #[cfg(feature = "experimental-active-percentile")]
 #[path = "experimental_percentile.rs"]
 mod experimental_percentile;
+#[cfg(all(test, feature = "experimental-active-percentile"))]
+#[path = "experimental_end_to_end.rs"]
+mod experimental_end_to_end;
 use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
 use crate::eval::BacktestSettings;
