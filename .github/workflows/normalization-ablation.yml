@@ -1,0 +1,47 @@
+name: GA Normalization 400 candidate A/B (research only)
+
+on:
+  push:
+    branches:
+      - exp/pre-oos-funnel-ci-20261025
+    paths:
+      - '.github/workflows/normalization-ablation.yml'
+      - 'crates/neoethos-gpu-contracts/examples/normalization_ablation.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare-normalizations:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-07
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scoring-landscape
+      - name: Compare selection on same 400 candidate metrics and fixed seeds
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p normalization-ablation-results
+          cargo run --locked --release -p neoethos-gpu-contracts \
+            --example normalization_ablation \
+            | tee normalization-ablation-results/ablation.log
+          grep 'RANK_INVARIANTS_PASS' normalization-ablation-results/ablation.log
+          grep 'NORMALIZATION_ABLATION_PASS' normalization-ablation-results/ablation.log
+          echo "Six selection methods, 64 seeded populations per mode/fraction, 400 candidates each." >> "$GITHUB_STEP_SUMMARY"
+          echo 'Results are synthetic selection pressure, not market backtest.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: normalization-ablation-results
+          path: normalization-ablation-results/
+          if-no-files-found: warn
+          retention-days: 30
