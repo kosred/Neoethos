@@ -130,7 +130,7 @@ def plan():
     result=dict(schema=1,created=datetime.datetime.now(datetime.timezone.utc).isoformat(),repo=str(REPO),
         exe=str(REPO/'target-dd/debug/neoethos-cli.exe'),exe_sha256=sha(REPO/'target-dd/debug/neoethos-cli.exe'),
         common=common,profiles=profiles,frozen=frozen,population=200,generations=200,candidates=512,cpu_threads=4,
-        max_hours=72,max_job_hours=2.5,start_free_gib=20,abort_free_gib=3,job_limit_gib=22,min_disk_gib=18,
+        max_hours=72,max_job_hours=2.5,start_free_gib=18,abort_free_gib=3,job_limit_gib=20,min_disk_gib=18,feature_headroom_bytes=8*GIB,
         holdout_notice='Chronological reserved tail has been inspected in older campaigns. Reuse is diagnostic OOS, not new independent confirmation. No outcome-driven tuning of this predeclared matrix.',
         objectives={'risky':'100 or1000 ->50000 in180days, actual confidence-sized compounding; report floor10 and drawdown',
         'prop_firm':'100000; 4% monthly target;8% operator research target/60days;5% daily,10% total loss limits; min4days; no challenge passed claim from whole-span diagnostics'},
@@ -187,7 +187,7 @@ def wait_resources(plan,deadline):
 def run_job(plan,name,args,deadline):
     wait_resources(plan,deadline)
     if sha(plan['exe'])!=plan['exe_sha256']:raise RuntimeError('Pinned binary changed; refusing new launches')
-    env=os.environ.copy();env['NEOETHOS_PINNED_FEATURE_BUDGET_HEADROOM_BYTES']='12884901888'
+    env=os.environ.copy();env['NEOETHOS_PINNED_FEATURE_BUDGET_HEADROOM_BYTES']=str(plan['feature_headroom_bytes'])
     # This campaign owns no shared-cache mutation or eviction policy.
     env.pop('NEOETHOS_FEATURE_FRAME_CACHE_DIR',None);env.pop('NEOETHOS_FEATURE_FRAME_CACHE_MAX_BYTES',None)
     logs=ROOT/'logs';logs.mkdir(exist_ok=True)
