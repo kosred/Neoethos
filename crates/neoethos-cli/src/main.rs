@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod canonical_full_run;
 mod canonical_research;
+mod export_live_portfolio;
 mod feature_frame_cache_gate;
 mod gpu_bench;
 mod gpu_bench_population;
@@ -246,6 +247,7 @@ fn main() -> Result<()> {
         "discovery-promote-weekly" => cmd_discovery_promote_weekly(&args[2..]),
         "trader-replay" => cmd_trader_replay(&args[2..]),
         "forward-test" => cmd_forward_test(&args[2..]),
+        "export-live-portfolio" => export_live_portfolio::run(&args[2..]),
         "blend-test" => cmd_blend_test(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "bench" => gpu_bench::run(&args[2..]),
