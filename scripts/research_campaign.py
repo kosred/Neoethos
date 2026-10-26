@@ -251,6 +251,7 @@ def summarize_oos(path, profile, notice):
     emit('financial_review_written',job=profile['name'],strategies=rows)
 
 def run():
+    (ROOT/'runs').mkdir(parents=True,exist_ok=True)
     plan=json.loads((ROOT/'plan.json').read_text());statepath=ROOT/'state.json'
     state=json.loads(statepath.read_text()) if statepath.exists() else {'started':time.time(),'completed':[],'failed':[]}
     deadline=state['started']+plan['max_hours']*3600
