@@ -340,8 +340,9 @@ impl Arguments {
             ensure!(
                 normalized == "ga_fitness"
                     || normalized == "monthly_upside_v1"
-                    || normalized == "monthly_upside_dd_averse_v1",
-                "--fitness-table must be ga_fitness, monthly_upside_v1 or monthly_upside_dd_averse_v1"
+                    || normalized == "monthly_upside_dd_averse_v1"
+                    || normalized == "monthly_upside_dd_budget_v1",
+                "--fitness-table must be ga_fitness, monthly_upside_v1, monthly_upside_dd_averse_v1 or monthly_upside_dd_budget_v1"
             );
             ensure!(
                 resume_flags == 0 && quote_flags == 0,
@@ -1185,6 +1186,18 @@ mod tests {
                 vec![
                     "--fitness-table".to_owned(),
                     "monthly_upside_dd_averse_v1".to_owned()
+                ]
+            );
+            let mut dd_budget = valid_arguments();
+            push(&mut dd_budget, "--fitness-table", "monthly_upside_dd_budget_v1");
+            let args = Arguments::parse(&dd_budget).expect("dd-budget selector is a fresh-search knob");
+            let mut forwarded = Vec::new();
+            forward_optional_mode_flags(&args, &mut forwarded);
+            assert_eq!(
+                forwarded,
+                vec![
+                    "--fitness-table".to_owned(),
+                    "monthly_upside_dd_budget_v1".to_owned()
                 ]
             );
         }

@@ -75,6 +75,25 @@ pub const TAIL_PENALTY_WEIGHT: f64 = 1.0;
 pub const WIN_RATE_FLOOR: f64 = 0.50;
 pub const WIN_RATE_FLOOR_BONUS: f64 = 5.0;
 
+/// Percent-scale median, best and worst month of a finite monthly-return series.
+///
+/// Callers must have rejected non-finite months first (the B9-family guards do),
+/// so `median_ignore_nan` degenerates to the ordinary median here.
+fn monthly_series_stats(monthly_returns: &[f64]) -> (f64, f64, f64) {
+    let median_pct = median_ignore_nan(monthly_returns) * 100.0;
+    let best_pct = monthly_returns
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        * 100.0;
+    let worst_pct = monthly_returns
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+        * 100.0;
+    (median_pct, best_pct, worst_pct)
+}
+
 /// Asymmetric monthly-upside GA fitness (v1), in percent-scale score units.
 ///
 /// `monthly_returns` are fractional monthly returns (0.02 = +2%); `metrics`
@@ -103,17 +122,7 @@ pub fn ga_fitness_monthly_upside_v1(monthly_returns: &[f64], metrics: &[f64; 11]
 
     // All values are finite from here on, so median_ignore_nan degenerates to
     // the ordinary median (it is the shared, tested implementation).
-    let median_pct = median_ignore_nan(monthly_returns) * 100.0;
-    let best_pct = monthly_returns
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max)
-        * 100.0;
-    let worst_pct = monthly_returns
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min)
-        * 100.0;
+    let (median_pct, best_pct, worst_pct) = monthly_series_stats(monthly_returns);
 
     let base = median_pct.clamp(MEDIAN_CLAMP_MIN_PCT, MEDIAN_CLAMP_MAX_PCT);
 
@@ -231,6 +240,94 @@ pub fn ga_fitness_monthly_upside_dd_averse_v1(
         0.0
     };
     base - dd_penalty - daily_dd_penalty - win_rate_penalty + high_win_bonus
+}
+
+// ---------------------------------------------------------------------------
+// ga_fitness_monthly_upside_dd_budget_v1 — profit per unit of drawdown budget.
+// ---------------------------------------------------------------------------
+
+/// Drawdown budget the profit term is divided by. At exactly this drawdown the
+/// profit term is multiplied by zero; above it the product is negative.
+pub const DD_BUDGET_PCT: f64 = 0.15;
+/// Longest stretch (in months) under the running peak that is not punished.
+pub const DD_BUDGET_UNDERWATER_FREE_MONTHS: usize = 6;
+/// Score points subtracted per month of underwater time beyond the free window.
+pub const DD_BUDGET_UNDERWATER_PENALTY_PER_MONTH: f64 = 0.5;
+/// Cap on the underwater penalty.
+pub const DD_BUDGET_UNDERWATER_PENALTY_CAP: f64 = 12.0;
+
+/// Longest run of completed months spent below the running peak of the
+/// compounded monthly equity curve. Empty or single-month series return 0.
+pub fn longest_underwater_months(monthly_returns: &[f64]) -> usize {
+    let mut equity = 1.0_f64;
+    let mut peak = 1.0_f64;
+    let mut streak = 0_usize;
+    let mut longest = 0_usize;
+    for r in monthly_returns {
+        if !r.is_finite() {
+            return 0;
+        }
+        equity *= 1.0 + r;
+        if equity > peak {
+            peak = equity;
+            streak = 0;
+        } else {
+            streak += 1;
+            longest = longest.max(streak);
+        }
+    }
+    longest
+}
+
+/// GA fitness that rewards profit PER UNIT OF DRAWDOWN BUDGET instead of raw
+/// upside. Identical month-series guards to B9, then:
+///
+///   base      = clip(median_pct, -10, 200) + upside_bonus + win_rate_bonus
+///   factor    = 1 - max_drawdown / 0.15            (clamped to [-1, 1])
+///   underwater = longest run of months below the running peak, from the same
+///                monthly vector; penalty = max(0, underwater - 6) * 0.5, cap 12
+///   score     = base * factor + tail_penalty - underwater_penalty
+///
+/// This is the answer to the 2026-10-26 incentive finding: B9 has no drawdown
+/// term at all, and the additive dd-averse table (penalties capped at 60/20/25)
+/// still let the search keep 17-49 % drawdown candidates because a large profit
+/// base simply outran the additive penalty. Here drawdown multiplies the profit
+/// term, so above the 15 % budget profit is counted NEGATIVE, and time spent
+/// underwater beyond six months is subtracted independently. The metric array
+/// cannot carry recovery time, so it is computed from `monthly_returns`, which
+/// the evaluator already transports for the B9 family.
+pub fn ga_fitness_monthly_upside_dd_budget_v1(
+    monthly_returns: &[f64],
+    metrics: &[f64; 11],
+) -> f64 {
+    let b9 = ga_fitness_monthly_upside_v1(monthly_returns, metrics);
+    if b9 == f64::NEG_INFINITY || b9 == -100.0 {
+        return b9;
+    }
+    // B9 = profit_term + tail_penalty; reconstruct the profit term from the
+    // shared scorer instead of duplicating its component math here.
+    let (_, _, worst_pct) = monthly_series_stats(monthly_returns);
+    let tail_penalty = if worst_pct < -TAIL_THRESHOLD_PCT {
+        (TAIL_THRESHOLD_PCT + worst_pct) * TAIL_PENALTY_WEIGHT
+    } else {
+        0.0
+    };
+    let profit_term = b9 - tail_penalty;
+    let drawdown = metrics[3];
+    let factor = if drawdown.is_finite() {
+        (1.0 - drawdown / DD_BUDGET_PCT).clamp(-1.0, 1.0)
+    } else {
+        -1.0
+    };
+    let underwater = longest_underwater_months(monthly_returns);
+    let underwater_penalty = if underwater > DD_BUDGET_UNDERWATER_FREE_MONTHS {
+        ((underwater - DD_BUDGET_UNDERWATER_FREE_MONTHS) as f64
+            * DD_BUDGET_UNDERWATER_PENALTY_PER_MONTH)
+            .min(DD_BUDGET_UNDERWATER_PENALTY_CAP)
+    } else {
+        0.0
+    };
+    profit_term * factor + tail_penalty - underwater_penalty
 }
 
 #[cfg(test)]
@@ -469,12 +566,74 @@ mod tests {
     }
 
     #[test]
-    fn dd_averse_guards_match_b9() {
+    fn dd_averse_and_dd_budget_guards_match_b9() {
         let months = [0.03; 4];
         let mut bad = metrics(0.60, 400.0);
         bad[1] = f64::NAN;
-        assert_eq!(ga_fitness_monthly_upside_dd_averse_v1(&months, &bad), f64::NEG_INFINITY);
         let zero = metrics(0.60, 0.0);
-        assert_eq!(ga_fitness_monthly_upside_dd_averse_v1(&months, &zero), -100.0);
+        for scorer in [
+            ga_fitness_monthly_upside_dd_averse_v1 as fn(&[f64], &[f64; 11]) -> f64,
+            ga_fitness_monthly_upside_dd_budget_v1,
+        ] {
+            assert_eq!(scorer(&months, &bad), f64::NEG_INFINITY);
+            assert_eq!(scorer(&months, &zero), -100.0);
+        }
     }
+
+    #[test]
+    fn dd_budget_multiplies_upside_by_the_drawdown_budget_factor() {
+        let months = [0.01; 12];
+        let mut low = metrics(0.60, 400.0);
+        low[3] = 0.05; // 5 % of a 15 % budget -> factor 2/3
+        let mut high = low;
+        high[3] = 0.30; // twice the budget -> factor clamped to -1
+        let s_low = ga_fitness_monthly_upside_dd_budget_v1(&months, &low);
+        let s_high = ga_fitness_monthly_upside_dd_budget_v1(&months, &high);
+        assert!(s_low > s_high, "low drawdown must outrank high drawdown");
+        assert!(s_high < 0.0, "above-budget drawdown must make profit negative, got {s_high}");
+        // base_profit = median 1.0 + win bonus 5.0 = 6.0; low factor 2/3 -> 4.0.
+        assert!((s_low - 4.0).abs() < 1e-9, "expected 4.0, got {s_low}");
+    }
+
+    #[test]
+    fn dd_budget_exactly_at_budget_zeroes_the_profit_term() {
+        let months = [0.01; 12];
+        let mut at_budget = metrics(0.60, 400.0);
+        at_budget[3] = DD_BUDGET_PCT;
+        let s = ga_fitness_monthly_upside_dd_budget_v1(&months, &at_budget);
+        assert!(s.abs() < 1e-9, "at-budget drawdown must zero the profit term, got {s}");
+    }
+
+    #[test]
+    fn longest_underwater_months_counts_the_longest_run_below_peak() {
+        // Peak at month 1 (+10 %), then three months below it, then a new high.
+        let months = [0.10, -0.05, -0.05, 0.10, 0.10];
+        assert_eq!(longest_underwater_months(&months), 3);
+        // Eight consecutive months below the +10 % peak.
+        let mut long_run = vec![0.10];
+        long_run.extend(std::iter::repeat_n(-0.01, 8));
+        assert_eq!(longest_underwater_months(&long_run), 8);
+        // Always at a new high -> zero underwater months.
+        assert_eq!(longest_underwater_months(&[0.01; 6]), 0);
+        assert_eq!(longest_underwater_months(&[]), 0);
+    }
+
+    #[test]
+    fn dd_budget_penalizes_time_spent_underwater_at_equal_medians() {
+        // Twelve months, equal medians (4.5 %), equal drawdown budget points;
+        // only the time-underwater profile differs.
+        let mut underwater = vec![0.10];
+        underwater.extend(std::iter::repeat_n(-0.01, 8));
+        underwater.extend(std::iter::repeat_n(0.10, 3));
+        let flat = [0.045; 12];
+        let mut m = metrics(0.60, 400.0);
+        m[3] = 0.05;
+        let s_underwater = ga_fitness_monthly_upside_dd_budget_v1(&underwater, &m);
+        let s_flat = ga_fitness_monthly_upside_dd_budget_v1(&flat, &m);
+        assert!(
+            s_underwater < s_flat,
+            "the long-underwater series must score below the flat one ({s_underwater} vs {s_flat})"
+        );
+    }
+
 }

@@ -61,6 +61,7 @@ impl PopulationEvaluationV1 {
             config.fitness_table,
             crate::scoring::fitness_table::FitnessTable::MonthlyUpsideV1
                 | crate::scoring::fitness_table::FitnessTable::MonthlyUpsideDdAverseV1
+                | crate::scoring::fitness_table::FitnessTable::MonthlyUpsideDdBudgetV1
         ) {
             let months = self.monthly_returns.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("monthly objective requires same-execution monthly observations")

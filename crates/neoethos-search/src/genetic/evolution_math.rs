@@ -1429,6 +1429,7 @@ pub fn apply_metrics(
                 config.fitness_table,
                 crate::scoring::FitnessTable::MonthlyUpsideV1
                     | crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1
+                    | crate::scoring::FitnessTable::MonthlyUpsideDdBudgetV1
             ) {
                 // Opt-in B9 / B9-dd-averse (docs section 14.7): the explicit
                 // selector wins over the legacy boolean chain and reads the
@@ -1442,6 +1443,10 @@ pub fn apply_metrics(
                     .unwrap_or(&[]);
                 if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1 {
                     crate::scoring::ga_fitness_monthly_upside_dd_averse_v1(months, m)
+                } else if config.fitness_table
+                    == crate::scoring::FitnessTable::MonthlyUpsideDdBudgetV1
+                {
+                    crate::scoring::ga_fitness_monthly_upside_dd_budget_v1(months, m)
                 } else {
                     crate::scoring::ga_fitness_monthly_upside_v1(months, m)
                 }
@@ -2673,6 +2678,20 @@ mod generator_audit_tests {
         assert!(
             genes[0].fitness < crate::scoring::ga_fitness_monthly_upside_v1(&months[0], &risky[0]),
             "the dd-averse selector must penalize drawdown relative to B9"
+        );
+
+        // The dd-budget selector multiplies the profit term by the drawdown
+        // budget factor, so the same 30 % drawdown candidate turns negative.
+        let mut budget_cfg = crate::genetic::EvaluationConfig::default();
+        budget_cfg.fitness_table = FitnessTable::MonthlyUpsideDdBudgetV1;
+        apply_metrics(&mut genes, &risky, &budget_cfg, 1.0, Some(&months));
+        assert_eq!(
+            genes[0].fitness,
+            crate::scoring::ga_fitness_monthly_upside_dd_budget_v1(&months[0], &risky[0])
+        );
+        assert!(
+            genes[0].fitness < 0.0,
+            "a 30 % drawdown candidate must score negative under the 15 % budget"
         );
     }
 

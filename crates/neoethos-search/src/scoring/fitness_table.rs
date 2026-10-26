@@ -41,6 +41,12 @@ pub enum FitnessTable {
     /// upside. BOUND to
     /// `crate::scoring::ga_fitness_monthly_upside_dd_averse_v1`.
     MonthlyUpsideDdAverseV1,
+    /// B9 reshaped into profit PER UNIT OF DRAWDOWN BUDGET: the upside term is
+    /// multiplied by `1 - drawdown/15 %` (so above the budget profit counts
+    /// negative) and months spent underwater beyond six are penalized. This is
+    /// the objective that actually motivates "maximum profit at low drawdown".
+    /// BOUND to `crate::scoring::ga_fitness_monthly_upside_dd_budget_v1`.
+    MonthlyUpsideDdBudgetV1,
 }
 
 impl FitnessTable {
@@ -56,6 +62,7 @@ impl FitnessTable {
             Self::ExpectancyTStat => "expectancy_t_stat",
             Self::MonthlyUpsideV1 => "monthly_upside_v1",
             Self::MonthlyUpsideDdAverseV1 => "monthly_upside_dd_averse_v1",
+            Self::MonthlyUpsideDdBudgetV1 => "monthly_upside_dd_budget_v1",
         }
     }
 
@@ -70,6 +77,7 @@ impl FitnessTable {
             "expectancy_t_stat" => Self::ExpectancyTStat,
             "monthly_upside_v1" => Self::MonthlyUpsideV1,
             "monthly_upside_dd_averse_v1" => Self::MonthlyUpsideDdAverseV1,
+            "monthly_upside_dd_budget_v1" => Self::MonthlyUpsideDdBudgetV1,
             _ => Self::GaFitness,
         }
     }
@@ -106,6 +114,10 @@ mod tests {
             (
                 "monthly_upside_dd_averse_v1",
                 FitnessTable::MonthlyUpsideDdAverseV1,
+            ),
+            (
+                "monthly_upside_dd_budget_v1",
+                FitnessTable::MonthlyUpsideDdBudgetV1,
             ),
         ] {
             assert_eq!(FitnessTable::from_name(name), table, "{name}");

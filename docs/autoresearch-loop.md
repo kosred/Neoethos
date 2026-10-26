@@ -1435,10 +1435,23 @@ strategies. Making the two drawdowns part of the score turns them into a
 gradient the search can follow instead of a post-filter it meets only at the
 walkforward. Guards and monthly-vector transport are identical to B9.
 
+
+`FitnessTable::MonthlyUpsideDdBudgetV1` binds
+`scoring::ga_fitness_monthly_upside_dd_budget_v1` (neo-671, 2026-10-26): the
+profit term is MULTIPLIED by `1 - drawdown/0.15` (clamped to [-1, 1]), so above
+a 15 % drawdown budget profit counts negative, and months spent underwater
+beyond six are subtracted from the score. It answers the measured incentive
+gap: B9 has no drawdown term, and the additive dd-averse table still let the
+search keep 17-49 % drawdown candidates because a large profit base outran a
+capped additive penalty; also, recovery time was invisible to the metric
+array. The dd-budget table derives underwater duration from the same monthly
+vector the B9 family already transports, so the GA is finally paid for
+maximum profit per unit of drawdown budget and for fast recovery.
+
 Operator plumbing (same series, neo-671): `neoethos-cli` declares the
 `search-monthly-upside-objective` passthrough feature (forwarding to
 `neoethos-autoresearch`). With it compiled in, `canonical-research` accepts
-`--fitness-table <ga_fitness|monthly_upside_v1|monthly_upside_dd_averse_v1>` for a FRESH search, forwards
+`--fitness-table <ga_fitness|monthly_upside_v1|monthly_upside_dd_averse_v1|monthly_upside_dd_budget_v1>` for a FRESH search, forwards
 it to discovery and sets `DiscoveryConfig.fitness_table`; unknown names, saved
 continuations and quote replay are refused with the selector present. Without
 the feature the argument is rejected as unknown and the canonical three-way

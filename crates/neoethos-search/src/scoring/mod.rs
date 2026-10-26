@@ -113,7 +113,8 @@ pub use named::{
 /// default objective). See [`monthly_upside`] for the formula and the
 /// neo-671 reward-shape experiment it answers.
 pub use monthly_upside::{
-    ga_fitness_monthly_upside_dd_averse_v1, ga_fitness_monthly_upside_v1,
+    ga_fitness_monthly_upside_dd_averse_v1, ga_fitness_monthly_upside_dd_budget_v1,
+    ga_fitness_monthly_upside_v1,
 };
 
 #[cfg(test)]
