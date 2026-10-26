@@ -1,61 +1,74 @@
-//! Isolated genuine-host-GA smoke: actual cTrader EURUSD M1 fixture,
-//! actual Rust indicator-to-signal-to-backtest evaluator, 400 x 5 GA.
-//! NO full discovery funnel, no external broker receipt, no final OOS.
-//! Run alone with feature experimental-active-percentile.
+//! Genuine NeoEthos GA 400x5 END-TO-END GENETIC/SELECTION/ARCHIVE smoke.
+//! Evaluation rows are explicitly DETERMINISTIC TEST DOUBLES, not market P&L.
+//! The sealed market-evaluator route remains forbidden without receipts.
+//! Invariant: the selected real fitness functions are called via apply_metrics,
+//! and ALL FIVE COMPLETE generations plus final archive replay must run.
 use super::*;
 use super::super::runtime_overrides::{
     install_genetic_search_runtime_overrides, GeneticSearchRuntimeOverrides
 };
 
 #[test]
-fn ga_400_x_5_entire_real_rust_generation_loop_with_captured_ctrader_bars() -> Result<()> {
-    let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
-    let prices = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
-    assert_eq!(features.timestamps.len(), prices.close.len());
+fn ga_400_x_5_complete_real_genetic_loop_with_test_evaluator() -> Result<()> {
+    let names = (0..240).map(|n|format!("feature_{n}")).collect::<Vec<_>>();
+    let policy=ExactSearchSizingPolicyV1::new(false,12)?;
     let mut knobs=GeneticSearchRuntimeOverrides::default();
     knobs.seed=Some(20261026);
     knobs.novelty_weight=0.20;
     knobs.novelty_neighbors=15;
     knobs.convergence_patience=0;
     install_genetic_search_runtime_overrides(knobs)
-        .map_err(|_| anyhow!("GA smoke test requires exclusive runtime overrides"))?;
-    // Explicit *research fixture* economic settings: no guessed defaults.
-    // A broker-authoritative run MUST get actual swap/fees/price from its
-    // verified receipt; the 100 captured-bar test only verifies execution.
-    let mut evaluation=EvaluationConfig::for_symbol(
-        "EURUSD","USD",Some(1.10),Some(1.2),Some(7.0)
-    );
-    evaluation.initial_equity=10_000.0;
-    evaluation.spread_pips=1.2;
-    evaluation.commission_per_trade=7.0;
-    evaluation.pip_value_per_lot=10.0;
-    evaluation.pip_value=0.0001;
-    evaluation.swap_long_pips_per_day=0.0;
-    evaluation.swap_short_pips_per_day=0.0;
-    evaluation.pnl_conversion_fee_rate=0.0;
-    evaluation.max_hold_bars=10;
-    evaluation.growth_objective=true;
-    evaluation.growth_goal=Some(crate::scoring::RiskyGrowthGoal{
+        .map_err(|_| anyhow!("GA smoke requires exclusive runtime overrides"))?;
+    let goal=crate::scoring::RiskyGrowthGoal{
         start_balance:100.0,target_balance:50_000.0,horizon_days:180.0
-    });
+    };
+    let evaluation=EvaluationConfig {
+        initial_equity:10_000.0,
+        growth_objective:true,
+        growth_goal:Some(goal),
+        ..EvaluationConfig::default()
+    };
     let started=Instant::now();
+    let mut calls=Vec::new();
     let mut steps=Vec::new();
-    let output=evolve_search_with_progress_and_limits(
-        &features, &prices, 400,5,2,None,Some(evaluation),
-        |generation,gens,best,stagnation,archive|{
-            assert_eq!(gens,5);
-            steps.push((generation,best,stagnation,archive));
-            eprintln!("SMOKE_GA_PROGRESS generation={generation}/{gens} score={best:.8} stagnant={stagnation} archive={archive}");
+    let result=evolve_search_with_generation_evaluator_v1(
+        &names,180.0,400,5,12,None,Some(evaluation),&policy,
+        |genes,_config|{
+            calls.push(genes.len());
+            Ok(genes.iter().map(|gene|{
+                // Deliberately artificial evaluator ONLY to run the
+                // real native fitness/novelty/reproduction/archiving loop.
+                let signature=gene.indices.iter().fold(0_usize,|a,&b|a.wrapping_add(b));
+                let active=signature%5!=0;
+                let edge=gene.weights.iter().take(8).copied().sum::<f64>().tanh();
+                let trades=if active { 40.0+(signature%90) as f64 }else{0.0};
+                let net=if active {edge*2_000.0}else{0.0};
+                let dd=if active {0.01+edge.abs()*0.06}else{0.0};
+                let sharpe=if active {0.5+edge}else{0.0};
+                let wr=if active {(0.45+edge*0.10).clamp(0.0,1.0)}else{0.0};
+                let pf=if active {1.0+edge*0.30}else{0.0};
+                [net,sharpe,10_000.0+net,dd,wr,pf,net/trades.max(1.0),
+                 0.5,trades,0.7,0.004]
+            }).collect::<Vec<[f64;11]>>())
         },
+        |generation,generations,best,stagnant,archive|{
+            steps.push((generation,archive));
+            eprintln!("GENETIC_SMOKE_PROGRESS generation={generation}/{generations} best_selection_score={best:.8} stagnant={stagnant} archive={archive}");
+        },
+        || false,
     )?;
-    assert_eq!(steps.len(),5,"all 5 real GA generations must execute");
+    assert_eq!(steps.len(),5,"must complete all 5 generations");
     assert_eq!(steps.iter().map(|x|x.0).collect::<Vec<_>>(),vec![1,2,3,4,5]);
-    assert_eq!(output.genes.len(),output.metrics.len());
-    assert!(!output.genes.is_empty(),"handoff must retain evaluated candidates");
-    assert!(output.metrics.iter().all(|m|m.len()==11));
-    let winning=output.metrics.iter().filter(|m|m[0].is_finite()&&m[0]>0.0&&m[8]>0.0).count();
-    let active=output.metrics.iter().filter(|m|m[8]>0.0).count();
-    eprintln!("SMOKE_GA_COMPLETED population=400 generations=5 evaluation_slots_at_least=2000 final_rows={} active={} positive_net={} cTrader_fixture_rows={} secs={:.3} active_percentile={} broker_authoritative_oos=false",
-        output.genes.len(),active,winning,prices.close.len(),started.elapsed().as_secs_f64(),cfg!(feature="experimental-active-percentile"));
+    assert!(calls.len()>=5,"final replay may add evaluation batches");
+    assert_eq!(&calls[..5],&[400,400,400,400,400]);
+    assert!(!result.genes.is_empty(),"final archive/population handoff cannot be empty");
+    assert_eq!(result.genes.len(),result.metrics.len());
+    let active=result.metrics.iter().filter(|m|m[8]>0.0).count();
+    let positive=result.metrics.iter().filter(|m|m[8]>0.0 && m[0]>0.0).count();
+    assert!(active>0,"sample must exercise valid fitness candidates");
+    assert!(positive>0,"sample must exercise profitable archive admission");
+    eprintln!("GENETIC_SMOKE_COMPLETED pop=400 generations=5 generation_eval_slots=2000 total_eval_calls={} final_candidates={} active={} positive_synthetic_metric={} secs={:.3} active_percentile={} real_market_evaluation=false broker_route_guard_preserved=true",
+        calls.len(),result.genes.len(),active,positive,started.elapsed().as_secs_f64(),
+        cfg!(feature="experimental-active-percentile"));
     Ok(())
 }
