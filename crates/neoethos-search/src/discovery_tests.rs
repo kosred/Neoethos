@@ -2133,6 +2133,7 @@ fn discovery_runtime_overrides_defaults_match_legacy_env_defaults() {
 #[test]
 fn discovery_runtime_overrides_clamp_invalid_values() {
     let overrides = DiscoveryRuntimeOverrides {
+        risky_survival_only: false,
         weekly_cadence: false,
         prefilter_top_k: 0,
         prefilter_insample_frac: f64::NAN,
@@ -2153,6 +2154,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
     assert!((overrides.resolved_funnel_stage1_pct() - 1.0).abs() < 1e-9);
 
     let too_small = DiscoveryRuntimeOverrides {
+        risky_survival_only: false,
         weekly_cadence: false,
         prefilter_top_k: 0,
         prefilter_insample_frac: 0.0,
@@ -2201,6 +2203,7 @@ fn default_discovery_config_does_not_read_environment() {
 fn discovery_profile_exports_runtime_override_resolution() {
     let mut config = DiscoveryConfig::default();
     config.runtime_overrides = DiscoveryRuntimeOverrides {
+        risky_survival_only: false,
         weekly_cadence: false,
         prefilter_top_k: 17,
         prefilter_insample_frac: 0.6,
@@ -4809,6 +4812,149 @@ fn each_mode_keeps_its_own_risk_band() {
 
     // The one that matters most: the same settings produce DIFFERENT sizing.
     assert!(risky.risk_per_trade_max > prop.risk_per_trade_max * 10.0);
+}
+
+#[test]
+fn risky_survival_policy_keeps_deep_drawdown_and_full_risk_without_prop_rules() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.system.trading_mode = "risky".into();
+    settings.models.discovery_runtime.risky_survival_only = true;
+    settings.risk.risky_min_risk_per_trade = Some(0.0);
+    settings.risk.risky_max_risk_per_trade = Some(1.0);
+    let risky = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(
+        (risky.risk_per_trade_min, risky.risk_per_trade_max),
+        (0.0, 1.0)
+    );
+    assert_eq!(risky.filtering.max_dd, 1.0);
+    assert!(risky.prop_firm_gate.is_none());
+    let mut gene = profitable_gene("surviving_deep_drawdown");
+    gene.max_drawdown = 0.95;
+    assert!(gene.passes_filter_with_profit(&risky.filtering, 1000.0));
+    let mut metrics = profitable_metrics("surviving_deep_drawdown");
+    metrics.max_drawdown_pct = 0.95;
+    assert!(survived_the_backtest(&metrics));
+    metrics.max_drawdown_pct = 1.0;
+    assert!(!survived_the_backtest(&metrics));
+
+    settings.system.trading_mode = "prop_firm".into();
+    let prop = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(prop.filtering.max_dd, 0.50);
+    assert!(prop.prop_firm_gate.is_some());
+    assert!(prop.risk_per_trade_max < 1.0);
+    settings.system.trading_mode = "risky".into();
+    settings.models.discovery_runtime.risky_survival_only = false;
+    assert_eq!(
+        DiscoveryConfig::from_settings(&settings).filtering.max_dd,
+        0.60
+    );
+    let legacy = serde_json::to_value(DiscoveryRuntimeOverrides::default()).unwrap();
+    assert!(legacy.get("risky_survival_only").is_none());
+}
+
+#[test]
+fn risky_survival_episode_uses_calendar_horizon_without_trimming_prop_firm() {
+    use neoethos_data::core::features::{FeatureCellValidity, FeatureColumnF64};
+    let mut ohlcv = sample_ohlcv();
+    let timestamps: Vec<_> = (0..ohlcv.len())
+        .map(|row| 1_700_000_000_000 + row as i64 * 86_400_000)
+        .collect();
+    ohlcv.timestamp = Some(timestamps.clone());
+    let features = neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns(
+        timestamps.clone(),
+        vec![
+            FeatureColumnF64::new(
+                "close",
+                ohlcv.close.clone(),
+                vec![FeatureCellValidity::Valid; ohlcv.len()],
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+    .into_shared_view()
+    .unwrap();
+    let mut config = DiscoveryConfig::default();
+    config.mode = DiscoveryMode::Risky;
+    config.risky_horizon_days = 20.0;
+    config.runtime_overrides.risky_survival_only = true;
+    let (episode, prices, budget) = trim_recent_history(&features, &ohlcv, &config).unwrap();
+    assert_eq!(episode.n_samples(), 21);
+    assert_eq!(budget, Some(21));
+    assert_eq!(episode.timestamps, timestamps[timestamps.len() - 21..]);
+    assert_eq!(
+        prices.timestamp.as_deref(),
+        Some(episode.timestamps.as_slice())
+    );
+    config.mode = DiscoveryMode::PropFirm;
+    assert_eq!(
+        trim_recent_history(&features, &ohlcv, &config)
+            .unwrap()
+            .0
+            .n_samples(),
+        ohlcv.len()
+    );
+    config.mode = DiscoveryMode::Risky;
+    config.runtime_overrides.risky_survival_only = false;
+    assert_eq!(
+        trim_recent_history(&features, &ohlcv, &config)
+            .unwrap()
+            .0
+            .n_samples(),
+        ohlcv.len()
+    );
+}
+
+#[test]
+fn risky_survival_windows_refuse_ruin_but_keep_a_recovering_capital_path() {
+    let start = 1_735_689_600_000;
+    let mut config = DiscoveryConfig::default();
+    config.mode = DiscoveryMode::Risky;
+    config.initial_balance = 100.0;
+    config.risky_target_balance = 50000.0;
+    config.runtime_overrides.risky_survival_only = true;
+    let mut trades = vec![
+        Trade {
+            entry_time: start,
+            exit_time: Some(start + 86_400_000),
+            pnl: -95.0,
+            mae: 95.0,
+            ..Default::default()
+        },
+        Trade {
+            entry_time: start + 86_400_000,
+            exit_time: Some(start + 172_800_000),
+            pnl: 49995.0,
+            ..Default::default()
+        },
+    ];
+    let outcome =
+        risky_goal_window_outcome(&trades, &config, start, start + 180 * 86_400_000).unwrap();
+    assert_eq!(outcome["target_reached"], true);
+    assert_eq!(outcome["capital_survived"], true);
+    assert_eq!(outcome["max_closed_balance_drawdown"], 0.95);
+    assert_eq!(outcome["balance_at_stop"], 50000.0);
+    assert!(outcome["monthly_breakdown_until_stop"].is_array());
+    // A trade that first loses the whole account cannot earn its later exit.
+    trades[0].mae = 100.0;
+    let ruined =
+        risky_goal_window_outcome(&trades, &config, start, start + 180 * 86_400_000).unwrap();
+    assert_eq!(ruined["target_reached"], false);
+    assert_eq!(ruined["capital_survived"], false);
+    assert_eq!(ruined["settled_trades_before_stop"], 0);
+    trades[0].mae = 5.0;
+    trades[0].pnl = -100.0;
+    let settled_ruin =
+        risky_goal_window_outcome(&trades, &config, start, start + 180 * 86_400_000).unwrap();
+    assert_eq!(settled_ruin["capital_survived"], false);
+    assert_eq!(settled_ruin["lowest_marked_balance"], 0.0);
+    // Old frozen reports retain the former closed-balance floor and wire shape.
+    config.runtime_overrides.risky_survival_only = false;
+    let legacy =
+        risky_goal_window_outcome(&trades, &config, start, start + 180 * 86_400_000).unwrap();
+    assert_eq!(legacy["floor_hit"], true);
+    assert_eq!(legacy["target_reached"], false);
+    assert!(legacy.get("policy").is_none());
 }
 
 #[test]

@@ -1796,3 +1796,33 @@ removing those copies. The serial campaign records available RAM and elapsed
 time every 30 seconds and the specific reason when its owned-child guard stops
 a run. This repair changes storage ownership, not the pinned feature recipe or
 the financial settings.
+
+### Risky survival policy after the operator correction (2026-10-27)
+
+`models.discovery_runtime.risky_survival_only: true` is an explicit new-run
+policy. Risky permits drawdowns below total capital loss, removes the legacy
+EUR10 goal-report floor, and retains no PropFirm window gate. The search uses
+the last configured goal-horizon calendar days of IS, with the original frozen
+IS feature fit and separate final holdout. This avoids treating multi-year
+survival or an extrapolated multi-year return as a six-month experiment.
+False retains archived behavior and its exact canonical configuration digest.
+PropFirm behavior remains governed by its own rules.
+
+The revised campaign declares confidence sizing across 0..100% of current
+capital and fixed-fraction IS comparisons at 5, 10, 20, 30, 50, 75 and 100%.
+These are searched sizing choices, not a universal low-risk ceiling. Native
+compounding, transaction costs and lot caps remain active. Capital exhaustion
+is a failure; reports must never credit a later winning exit as recovery after
+the account's observed adverse excursion consumed its capital. Per-window
+monthly ledgers expose whether growth is reasonably steady. The native
+goal-fitness table is the primary objective; B9 controls are preserved under
+their original settings and must not be described as unrestricted Risky.
+
+`scripts/research_campaign.py revise-risky` preserves the prior plan, all genes
+and completed controls, records the human's changed objective, creates the new
+profiles and retains the original overall compute deadline. An interrupted
+post-IS step resumes its hash-pinned `frozen-before-oos.json` checkpoint instead
+of starting the successful IS search again. Candidate selection is declared
+before OOS: two by actual IS growth pace and two by monthly consistency among
+positive, surviving IS candidates. Reused historical OOS remains exploratory;
+neither a positive aggregate nor one favorable window establishes the goal.

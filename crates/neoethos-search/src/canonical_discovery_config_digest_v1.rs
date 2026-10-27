@@ -269,6 +269,7 @@ fn encode_runtime_overrides_v1(
         stage1_window,
         min_history_years,
         weekly_cadence,
+        risky_survival_only,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
         label_cost_symmetric,
@@ -283,6 +284,9 @@ fn encode_runtime_overrides_v1(
     // Legacy false encodes identically; only the explicit new policy adds bytes.
     if *weekly_cadence {
         encoder.boolean("rolling_weekly_cadence_v1", true)?;
+    }
+    if *risky_survival_only {
+        encoder.boolean("risky_survival_only_v2", true)?;
     }
     // Both new knobs encode ONLY when active, so the default configuration
     // hashes exactly as it did before this feature existed and pre-knob
@@ -610,6 +614,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn risky_survival_opt_in_is_bound_without_changing_legacy_digest() {
+        let mut config = DiscoveryConfig::default();
+        let legacy = canonical_discovery_config_digest_v1(&config).unwrap();
+        config.runtime_overrides.risky_survival_only = true;
+        assert_ne!(
+            legacy,
+            canonical_discovery_config_digest_v1(&config).unwrap()
+        );
+        config.runtime_overrides.risky_survival_only = false;
+        assert_eq!(
+            legacy,
+            canonical_discovery_config_digest_v1(&config).unwrap()
+        );
     }
 
     #[test]

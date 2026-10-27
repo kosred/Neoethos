@@ -2416,10 +2416,12 @@ pub(crate) fn validation_backtest_population_cpu(
 pub(crate) fn validation_backtest_population_cpu_with_monthly(
     inputs: PopulationEvalInputs<'_>,
 ) -> anyhow::Result<(Vec<[f64; 11]>, Vec<Vec<f64>>)> {
-    Ok(validation_backtest_population_observed_cpu::<false>(inputs, None)?
-        .into_iter()
-        .map(|(metrics, _trades, _report, monthly)| (metrics, monthly))
-        .unzip())
+    Ok(
+        validation_backtest_population_observed_cpu::<false>(inputs, None)?
+            .into_iter()
+            .map(|(metrics, _trades, _report, monthly)| (metrics, monthly))
+            .unzip(),
+    )
 }
 
 /// Same CPU population simulator with its actual account-risk ledger retained.
@@ -2569,16 +2571,16 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
             (metrics, trades, Vec::new(), Vec::new())
         } else {
             let (metrics, monthly) = fast_evaluate_strategy_core_with_monthly_returns(
-                    &gene_settings,
-                    close,
-                    high,
-                    low,
-                    &signals,
-                    &confidences,
-                    month_idx,
-                    day_idx,
-                    timestamps,
-                );
+                &gene_settings,
+                close,
+                high,
+                low,
+                &signals,
+                &confidences,
+                month_idx,
+                day_idx,
+                timestamps,
+            );
             (metrics, Vec::new(), Vec::new(), monthly)
         };
         let report = weekly
@@ -3820,6 +3822,64 @@ mod overrides_tests {
             "empty confidence slice must force fixed-1-lot, got {}",
             m[0]
         );
+    }
+
+    #[test]
+    fn risk_sizing_compounds_current_equity_and_cannot_recover_after_full_loss() {
+        // Exactly representable synthetic prices isolate the balance oracle:
+        // win, win, loss, win at 1R, with no fees or fractional-pip roundoff.
+        let close = [1.0; 9];
+        let mut high = close;
+        let mut low = close;
+        for row in [2, 4, 8] {
+            high[row] = 1.75;
+        }
+        low[6] = 0.25;
+        let signals = [1, 0, 1, 0, 1, 0, 1, 0, 0];
+        let mut settings = BacktestSettings {
+            initial_equity_override: Some(100.0),
+            pip_value: 0.125,
+            pip_value_per_lot: 1.0,
+            sl_pips: 4.0,
+            tp_pips: 4.0,
+            spread_pips: 0.0,
+            commission_per_trade: 0.0,
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
+            kill_zones_enabled: false,
+            max_hold_bars: 0,
+            min_hold_bars: 0,
+            trailing_enabled: false,
+            risk_based_sizing: true,
+            risk_per_trade_min: 0.5,
+            risk_per_trade_max: 0.5,
+            ..Default::default()
+        };
+        let evaluate = |settings: &BacktestSettings| {
+            fast_evaluate_strategy_core(
+                &close,
+                &high,
+                &low,
+                &signals,
+                &[1.0; 9],
+                &[0; 9],
+                &[0; 9],
+                &[],
+                settings,
+            )
+        };
+        let partial = evaluate(&settings);
+        // 100 -> 150 -> 225 -> 112.5 -> 168.75; fixed-initial sizing differs.
+        assert!((partial[0] - 68.75).abs() < 1e-9);
+        assert_eq!(partial[8], 4.0);
+        settings.risk_per_trade_min = 1.0;
+        settings.risk_per_trade_max = 1.0;
+        let exhausted = evaluate(&settings);
+        // 100 -> 200 -> 400 -> 0; the later winning signal cannot resurrect it.
+        assert_eq!(exhausted[0], -100.0);
+        assert_eq!(exhausted[8], 3.0);
+        assert!(exhausted[3] >= 1.0);
     }
 
     #[test]

@@ -38,6 +38,13 @@ def validate_profile(s, profile):
         assert s['models']['prop_firm_min_pass_rate']==0
         assert d['prop_firm_gate']['pass_rate']==0
         assert (r['risky_min_risk_per_trade'],r['risky_max_risk_per_trade'])==tuple(profile['band'])
+        if profile.get('goal_policy')=='survival_only_v2':
+            assert d['risky_survival_only'] is True
+            assert profile['fitness']=='ga_fitness'
+            assert 0<=profile['band'][0]<=profile['band'][1]<=1
+            assert r['preset']=='none' and r['challenge_mode'] is False
+            assert r['daily_drawdown_limit']==1 and r['total_drawdown_limit']==1
+            assert r['max_portfolio_risk']==0 and r['monthly_profit_target_pct']==0
     else:
         assert s['models']['prop_firm_min_pass_rate']==0.1
         assert d['prop_firm_gate']['pass_rate']==0.1
@@ -139,6 +146,65 @@ def plan():
     atomic(ROOT/'plan.json',result)
     print('PLANNED',len(profiles),'fresh searches and',len(frozen),'preserved-gene replays')
 
+def revise_risky():
+    """Record the human's corrected objective; never tune from OOS outcomes."""
+    assert not (ROOT/'worker.lock').exists(),'Stop the owned worker before revision'
+    path=ROOT/'plan.json';current=json.loads(path.read_text())
+    assert not current.get('human_risky_revision'),'Revision already recorded'
+    archive=ROOT/'plan-before-human-risky-v2.json'
+    assert not archive.exists();shutil.copy2(path,archive)
+    state=json.loads((ROOT/'state.json').read_text())
+    controls=[p for p in current['profiles'] if p['mode']=='risky']
+    prop=[p for p in current['profiles'] if p['mode']=='prop_firm']
+    pending=[p for p in controls if p['name'] not in state['completed']
+        and (ROOT/'runs'/p['name']/'frozen-before-oos.json').exists()]
+    retired=[p['name'] for p in controls if p['name'] not in state['completed'] and p not in pending]
+    fresh=[]
+    bands=[('confidence',0.,1.),('risk10',.10,.10),('risk20',.20,.20),
+        ('risk30',.30,.30),('risk50',.50,.50),('risk75',.75,.75),
+        ('risk100',1.,1.),('risk5',.05,.05)]
+    for label,lo,hi in bands:
+        for balance in [100,1000]:
+            for seed in [20261021,20261029]:
+                fresh.append(dict(name=f'risky-v2-{balance}-{label}-s{seed}',mode='risky',
+                    balance=balance,band=[lo,hi],fitness='ga_fitness',rr=[.5,4.],
+                    hold=128,seed=seed,goal_policy='survival_only_v2'))
+    for balance in [100,1000]:
+        for seed in [20261021,20261029]:
+            fresh.append(dict(name=f'risky-v2-{balance}-confidence-hold32-s{seed}',mode='risky',
+                balance=balance,band=[0.,1.],fitness='ga_fitness',rr=[.5,4.],
+                hold=32,seed=seed,goal_policy='survival_only_v2'))
+    for profile in fresh:
+        template=next(p for p in controls if p['balance']==profile['balance'])
+        settings=yaml.safe_load(pathlib.Path(template['settings']).read_text())
+        risk=settings['risk'];models=settings['models'];runtime=models['discovery_runtime']
+        risk.update(preset='none',min_risk_per_trade=profile['band'][0],max_risk_per_trade=profile['band'][1],
+            risk_per_trade=profile['band'][1],risky_min_risk_per_trade=profile['band'][0],
+            risky_max_risk_per_trade=profile['band'][1],monthly_profit_target_pct=0.,
+            daily_drawdown_limit=1.,total_drawdown_limit=1.,max_portfolio_risk=0.,challenge_mode=False)
+        runtime['risky_survival_only']=True
+        models['search_runtime']['seed']=profile['seed']
+        models['exit_policy']['max_hold_bars']=profile['hold']
+        models['gene_stop_bounds'].update(rr_min=profile['rr'][0],rr_max=profile['rr'][1])
+        validate_profile(settings,profile)
+        dest=ROOT/'configs'/(profile['name']+'.yaml');assert not dest.exists()
+        dest.write_text(yaml.safe_dump(settings,sort_keys=False),encoding='utf-8')
+        profile.update(settings=str(dest),settings_sha256=sha(dest))
+    # Run a new unconstrained-confidence episode first, then finish the exact
+    # already-frozen control OOS without repeating its successful IS search.
+    finished=[p for p in controls if p['name'] in state['completed']]
+    current['profiles']=finished+fresh[:1]+pending+fresh[1:]+prop+[p for p in controls if p['name'] in retired]
+    current['retired_profiles']=retired
+    current['control_profiles']=[p['name'] for p in controls]
+    current['human_risky_revision']=dict(time=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        control_plan=str(archive),control_plan_sha256=sha(archive),new_profiles=len(fresh),
+        reason='Human explicitly clarified:50000EURwithin6months,capital survival and nearly steady compounding; no arbitrary risk/DD ceiling. Existing conservative tests are controls.',
+        scope='Research only. Native confidence0..100% or fixed risk fractions are IS search choices; all costs remain. Never allow recovery after capital exhaustion.',
+        selection='Native goal fitness on last180calendar days of IS; select2pace+2monthly-consistency candidates before OOS; no OOS tuning.')
+    current['objectives']['risky']='100/1000 ->50000 within180days; capital must survive; nearly steady multiplication. No60%DDcap/EUR10floor in survival_only_v2; report actual native paths/monthly losses/ruin.'
+    atomic(path,current);emit('human_risky_goal_revised',new_profiles=len(fresh),retired=retired,pending_control_oos=[p['name'] for p in pending])
+    print('REVISED',len(fresh),'new Risky profiles; preserved all controls and PropFirm settings')
+
 def available():
     class Memory(ctypes.Structure):
         _fields_=[('length',ctypes.c_ulong),('load',ctypes.c_ulong)]+[(k,ctypes.c_ulonglong) for k in ['physical','free','page','freepage','virtual','freevirtual','extended']]
@@ -218,8 +284,28 @@ def run_job(plan,name,args,deadline):
         if p and p.poll() is None:p.kill();p.wait()
         job.close()
 
-def screen(path):
+def screen(path,profile):
     assert not any(re.search(r'(^|_)minmax_',name) for name in ITEMS(path,'effective_feature_names')), 'Noncausal MinMax entered the new feature alphabet'
+    if profile.get('goal_policy')=='survival_only_v2':
+        import math,statistics
+        rows=[]
+        for q in ITEMS(path,'quality_metrics'):
+            if q.get('total_trades',0)<1 or q.get('net_profit',0)<=0 or not 0<=q.get('max_drawdown_pct',1)<1:continue
+            months=q.get('monthly_breakdown') or []
+            if not months:continue
+            span=(months[-1]['period_end_ms']-months[0]['period_start_ms'])/86400000
+            if span<=0:continue
+            pace=math.log1p(q['net_profit']/profile['balance'])*180/span/math.log(50000/profile['balance'])
+            full=[month for month in months if not month['is_partial']]
+            positive=sum(month['net_profit']>0 for month in full)/len(full) if full else 0
+            median=statistics.median(month['return_pct'] for month in full) if full else 0
+            rows.append((pace,positive,median,q['strategy_id']))
+        bypace=sorted(rows,reverse=True);bysteady=sorted(rows,key=lambda row:(row[1],row[2],row[0],row[3]),reverse=True)
+        chosen=[]
+        for row in bypace[:2]+bysteady[:2]+bypace:
+            if row[3] not in chosen:chosen.append(row[3])
+            if len(chosen)==4:break
+        return chosen
     rows=[]
     for q in ITEMS(path,'quality_metrics'):
         if q.get('total_trades',0)>=60 and q.get('profit_factor',0)>=1.15 and q.get('net_profit',0)>0:
@@ -242,8 +328,13 @@ def summarize_oos(path, profile, notice):
         if profile['mode']=='risky':
             assert windows['mode']=='risky'
             outcomes=windows['windows']
+            if profile.get('goal_policy')=='survival_only_v2':
+                assert all(w['policy']=='survival_only_v2' and w['capital_floor']==0 for w in outcomes)
             goal={'window_count':len(outcomes),'target_hits':sum(w['target_reached'] for w in outcomes),
                 'floor_hits':sum(w['floor_hit'] for w in outcomes),'best_stopping_balance':max((w['balance_at_stop'] for w in outcomes),default=None)}
+            if profile.get('goal_policy')=='survival_only_v2':
+                goal.update(capital_survival_windows=sum(w['capital_survived'] for w in outcomes),
+                    best_surviving_stopping_balance=max((w['balance_at_stop'] for w in outcomes if w['capital_survived']),default=None))
         else:
             assert windows['mode']=='prop_firm' and windows['rules']['require_profit_target']
             goal={'window_count':windows['windows'],'challenge_passes':windows['passed'],'empirical_pass_fraction':windows['pass_rate']}
@@ -262,6 +353,7 @@ def run():
     (ROOT/'runs').mkdir(parents=True,exist_ok=True)
     plan=json.loads((ROOT/'plan.json').read_text());statepath=ROOT/'state.json'
     state=json.loads(statepath.read_text()) if statepath.exists() else {'started':time.time(),'completed':[],'failed':[]}
+    state['retired']=plan.get('retired_profiles',[]);atomic(statepath,state)
     deadline=state['started']+plan['max_hours']*3600
     emit('campaign_started',fresh_runs=len(plan['profiles']))
     def finish(name,code):
@@ -279,17 +371,23 @@ def run():
         finish(name,run_job(plan,name,args,deadline))
     for profile in plan['profiles']:
         name=profile['name']
-        if name in state['completed'] or name in state['failed']:continue
+        if name in state['completed'] or name in state['failed'] or name in state['retired']:continue
         assert sha(profile['settings'])==profile['settings_sha256']
         validate_profile(yaml.safe_load(pathlib.Path(profile['settings']).read_text()),profile)
         out=ROOT/'runs'/name
         args=plan['common']+['--settings-source',profile['settings'],'--out-dir',str(out),'--max-batches','1','--cpu-threads','4','--population','200','--generations','200','--candidates','512','--max-indicators','5','--fitness-table',profile['fitness']]
-        code=run_job(plan,name,args,deadline)
-        if code:
-            finish(name,code)
-            if len(state['failed'])>=3:raise RuntimeError('Three failed jobs; stop rather than repeat an unresolved failure')
-            continue
-        source=out/'research.json';wanted=screen(source)
+        checkpoint=out/'frozen-before-oos.json'
+        if checkpoint.exists():
+            frozen=json.loads(checkpoint.read_text());source=pathlib.Path(frozen['source']);wanted=frozen['ids']
+            assert sha(source)==frozen['sha256'] and frozen['profile']['settings_sha256']==profile['settings_sha256']
+            emit('frozen_is_resumed',job=name,genes=wanted)
+        else:
+            code=run_job(plan,name,args,deadline)
+            if code:
+                finish(name,code)
+                if len(state['failed'])>=3:raise RuntimeError('Three failed jobs; stop rather than repeat an unresolved failure')
+                continue
+            source=out/'research.json';wanted=screen(source,profile)
         if wanted:
             # Freeze using selection-only metrics BEFORE reading any OOS output.
             frozen=dict(source=str(source),sha256=sha(source),ids=wanted,selectors=selectors(source,set(wanted)),profile=profile,scope_notice=plan['holdout_notice'])
@@ -309,8 +407,9 @@ def run():
     emit('campaign_complete',completed=state['completed'],failed=state['failed'])
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['plan','run','selftest']);args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('action',choices=['plan','revise-risky','run','selftest']);args=parser.parse_args()
     if args.action=='plan':plan()
+    elif args.action=='revise-risky':revise_risky()
     elif args.action=='selftest':
         job=Job(.125);p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(1)'],creationflags=subprocess.CREATE_NO_WINDOW)
         try:job.attach(p);assert p.wait()==0;print('PASS job attach, free GiB',available())

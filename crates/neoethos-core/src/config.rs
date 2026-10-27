@@ -1423,6 +1423,12 @@ impl Default for SearchRuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiscoveryRuntimeConfig {
+    /// New Risky research policy: permit every drawdown below total capital
+    /// loss. Position risk remains an explicit searched input, and the native
+    /// confidence-sized balance path must reach the configured deadline goal.
+    /// False preserves archived runs' 60% selection ceiling and EUR10 floor.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_survival_only: bool,
     /// Opt-in rolling five-UTC-weekday objective for new PropFirm CPU runs.
     /// Existing stricter frequency and financial floors remain active.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1588,6 +1594,7 @@ impl Default for DiscoveryRuntimeConfig {
             // 240, matching config.yaml. See the field docs — the previous 50
             // silently contradicted the shipped config.
             weekly_cadence: false,
+            risky_survival_only: false,
             prefilter_top_k: 240,
             // Discovery already receives only the training side of the outer
             // temporal split. Rank features on all of that admissible prefix;
@@ -5006,10 +5013,12 @@ mod tests {
         );
 
         // An absent key keeps the disabled default.
-        let absent: Settings =
-            serde_yaml_ng::from_str("system:
+        let absent: Settings = serde_yaml_ng::from_str(
+            "system:
   symbol: EURUSD
-").unwrap();
+",
+        )
+        .unwrap();
         assert_eq!(
             absent.models.exit_policy.max_hold_bars, 0,
             "an absent models.exit_policy.max_hold_bars must resolve to 0"
@@ -5020,15 +5029,25 @@ mod tests {
     fn prefilter_volatility_knobs_survive_settings_serde_round_trip() {
         // Shipped defaults: both knobs OFF, so today's behaviour is unchanged.
         let mut settings = Settings::default();
-        assert!(!settings.models.discovery_runtime.prefilter_direction_only_ranking);
-        assert!(settings
-            .models
-            .discovery_runtime
-            .prefilter_purge_prefixes
-            .is_empty());
+        assert!(
+            !settings
+                .models
+                .discovery_runtime
+                .prefilter_direction_only_ranking
+        );
+        assert!(
+            settings
+                .models
+                .discovery_runtime
+                .prefilter_purge_prefixes
+                .is_empty()
+        );
 
         // A configured knob pair must survive the YAML round trip.
-        settings.models.discovery_runtime.prefilter_direction_only_ranking = true;
+        settings
+            .models
+            .discovery_runtime
+            .prefilter_direction_only_ranking = true;
         settings.models.discovery_runtime.prefilter_purge_prefixes =
             vec!["atr".to_string(), "mass".to_string()];
         let yaml = serde_yaml_ng::to_string(&settings).unwrap();
@@ -5037,7 +5056,11 @@ mod tests {
             "an enabled direction-only knob must be serialised: {yaml}"
         );
         let back: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
-        assert!(back.models.discovery_runtime.prefilter_direction_only_ranking);
+        assert!(
+            back.models
+                .discovery_runtime
+                .prefilter_direction_only_ranking
+        );
         assert_eq!(
             back.models.discovery_runtime.prefilter_purge_prefixes,
             vec!["atr".to_string(), "mass".to_string()]
@@ -5050,12 +5073,19 @@ mod tests {
 ",
         )
         .unwrap();
-        assert!(!absent.models.discovery_runtime.prefilter_direction_only_ranking);
-        assert!(absent
-            .models
-            .discovery_runtime
-            .prefilter_purge_prefixes
-            .is_empty());
+        assert!(
+            !absent
+                .models
+                .discovery_runtime
+                .prefilter_direction_only_ranking
+        );
+        assert!(
+            absent
+                .models
+                .discovery_runtime
+                .prefilter_purge_prefixes
+                .is_empty()
+        );
     }
 
     #[test]

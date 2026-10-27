@@ -116,6 +116,10 @@ impl Stage1Window {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DiscoveryRuntimeOverrides {
+    /// Explicit opt-in to the Risky capital-survival policy; absent/false
+    /// retains the exact archived research semantics.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_survival_only: bool,
     /// See the identically named field on
     /// `neoethos_core::config::DiscoveryRuntimeConfig` — that struct owns
     /// the decision rationale; this copy only carries the resolved value
@@ -164,6 +168,7 @@ impl Default for DiscoveryRuntimeOverrides {
             // 240, matching config.yaml AND
             // `neoethos_core::config::DiscoveryRuntimeConfig::default()`.
             weekly_cadence: false,
+            risky_survival_only: false,
             prefilter_top_k: 240,
             prefilter_insample_frac: 1.0,
             prefilter_min_per_timeframe: 6,
@@ -186,6 +191,7 @@ impl DiscoveryRuntimeOverrides {
     pub(crate) fn from_settings(settings: &neoethos_core::Settings) -> Self {
         let cfg = &settings.models.discovery_runtime;
         let mut overrides = Self::default();
+        overrides.risky_survival_only = cfg.risky_survival_only;
         overrides.weekly_cadence = cfg.weekly_cadence;
         overrides.prefilter_top_k = cfg.prefilter_top_k;
         if cfg.prefilter_insample_frac.is_finite()
@@ -1640,7 +1646,12 @@ impl DiscoveryConfig {
             // (see `calculate_income_score`) prefers the fastest compounders.
             // Floors stay loose-but-sane so genuinely broken genes (negative
             // edge, never-trading) still drop out.
-            self.filtering.max_dd = 0.60;
+            self.filtering.max_dd = if self.runtime_overrides.risky_survival_only {
+                1.0 // Total loss is still refused by survived_the_backtest.
+            } else {
+                0.60 // Frozen legacy research policy.
+            };
+            self.prop_firm_gate = None;
             self.filtering.min_profit = 0.0;
             self.filtering.min_trades = 1.0;
             self.filtering.min_sharpe = -5.0;
@@ -2591,6 +2602,8 @@ pub struct DiscoveryRunProfile {
     pub funnel_stage1_pct: f64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub weekly_cadence: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_survival_only: bool,
     /// Direction-only prefilter ranking was active for this run (opt-in).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub prefilter_direction_only_ranking: bool,
@@ -2941,6 +2954,25 @@ fn trim_recent_history(
     let row_cap = row_cap_for_config(config);
     if row_cap > 0 && row_cap < available_rows {
         start_idx = available_rows - row_cap;
+    }
+    if config.mode == DiscoveryMode::Risky && config.runtime_overrides.risky_survival_only {
+        // Search an actual deadline-length episode rather than require a fast
+        // compounder to survive many additional years after reaching its goal.
+        let horizon_ms = config.risky_horizon_days * 86_400_000.0;
+        anyhow::ensure!(
+            horizon_ms.is_finite() && horizon_ms >= 86_400_000.0 && horizon_ms < i64::MAX as f64,
+            "invalid Risky episode horizon"
+        );
+        let cutoff = base_timestamps[available_rows - 1]
+            .checked_sub(horizon_ms as i64)
+            .context("Risky episode timestamp overflow")?;
+        start_idx = start_idx.max(base_timestamps.partition_point(|&ts| ts < cutoff));
+        tracing::info!(target: "neoethos_search::discovery",
+            policy = "survival_only_v2", horizon_days = config.risky_horizon_days,
+            source_rows = available_rows, episode_rows = available_rows - start_idx,
+            first_timestamp_ms = base_timestamps[start_idx],
+            last_timestamp_ms = base_timestamps[available_rows - 1],
+            "Risky search uses the last in-sample goal-length episode; final holdout remains reserved");
     }
 
     let trimmed_rows = available_rows.saturating_sub(start_idx);
@@ -6553,32 +6585,12 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
                 &confidences[start..end],
                 &settings,
             )?;
-            let mut balance = config.initial_balance;
-            let mut peak = balance;
-            let mut dd = 0.0_f64;
-            let mut target_days = None;
-            let mut floor_hit = false;
-            for trade in &trades {
-                balance += trade.pnl;
-                peak = peak.max(balance);
-                dd = dd.max((peak - balance) / peak);
-                if balance >= config.risky_target_balance {
-                    target_days = trade
-                        .exit_time
-                        .map(|exit| (exit - self.timestamps[start]) as f64 / 86_400_000.);
-                    break;
-                }
-                if balance <= 10. {
-                    floor_hit = true;
-                    break;
-                }
-            }
-            outcomes.push(serde_json::json!({
-                "start_ms": self.timestamps[start], "end_ms": self.timestamps[end - 1],
-                "balance_at_stop": balance, "target_days": target_days,
-                "target_reached": target_days.is_some(), "floor_hit": floor_hit,
-                "max_closed_balance_drawdown": dd, "trades_in_window": trades.len(),
-            }));
+            outcomes.push(risky_goal_window_outcome(
+                &trades,
+                config,
+                self.timestamps[start],
+                self.timestamps[end - 1],
+            )?);
         }
         Ok(serde_json::json!({
             "mode": "risky", "initial_balance": config.initial_balance,
@@ -6621,6 +6633,76 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
             })
             .collect()
     }
+}
+
+/// Describe the native compounded path up to its first target or capital loss.
+/// Legacy reports retain their EUR10 closed-balance floor. The explicit new
+/// policy refuses a marked loss of the account before crediting a later exit;
+/// it never manufactures a recovery after capital has been exhausted.
+fn risky_goal_window_outcome(
+    trades: &[Trade],
+    config: &DiscoveryConfig,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<serde_json::Value> {
+    let survival_only = config.runtime_overrides.risky_survival_only;
+    let floor = if survival_only { 0.0 } else { 10.0 };
+    let mut balance = config.initial_balance;
+    let mut peak = balance;
+    let mut lowest_marked_balance = balance;
+    let mut dd = 0.0_f64;
+    let mut target_days = None;
+    let mut floor_hit = false;
+    let mut settled = 0usize;
+    for trade in trades {
+        lowest_marked_balance = lowest_marked_balance.min(balance - trade.mae);
+        if survival_only && lowest_marked_balance <= 0.0 {
+            floor_hit = true;
+            break;
+        }
+        balance += trade.pnl;
+        lowest_marked_balance = lowest_marked_balance.min(balance);
+        settled += 1;
+        peak = peak.max(balance);
+        dd = dd.max((peak - balance) / peak);
+        if balance >= config.risky_target_balance {
+            target_days = trade
+                .exit_time
+                .map(|exit| (exit - start_ms) as f64 / 86_400_000.);
+            break;
+        }
+        if balance <= floor {
+            floor_hit = true;
+            break;
+        }
+    }
+    let mut outcome = serde_json::json!({
+        "start_ms": start_ms, "end_ms": end_ms,
+        "balance_at_stop": balance, "target_days": target_days,
+        "target_reached": target_days.is_some(), "floor_hit": floor_hit,
+        "max_closed_balance_drawdown": dd, "trades_in_window": trades.len(),
+    });
+    if survival_only {
+        let observed_end = target_days
+            .and_then(|_| trades.get(settled.saturating_sub(1))?.exit_time)
+            .unwrap_or(end_ms);
+        let monthly = crate::quality::monthly_closed_trade_metrics_v1(
+            &trades[..settled],
+            config.initial_balance,
+            start_ms,
+            observed_end,
+        )?;
+        outcome["policy"] = "survival_only_v2".into();
+        outcome["capital_floor"] = 0.0.into();
+        outcome["capital_survived"] = (!floor_hit).into();
+        outcome["lowest_marked_balance"] = lowest_marked_balance.into();
+        outcome["settled_trades_before_stop"] = settled.into();
+        outcome["monthly_breakdown_until_stop"] = serde_json::to_value(monthly)?;
+        outcome["survival_scope"] =
+            "MAE of observed closed positions before target; no broker liquidation authority"
+                .into();
+    }
+    Ok(outcome)
 }
 
 /// One cost envelope for the research-only saved-candidate cost diagnostic.
@@ -18165,11 +18247,13 @@ pub fn build_discovery_profile(
         stage1_window,
         min_history_years,
         weekly_cadence,
+        risky_survival_only,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
         label_cost_symmetric,
     } = runtime_overrides;
     DiscoveryRunProfile {
+        risky_survival_only: *risky_survival_only,
         weekly_cadence: *weekly_cadence,
         prefilter_direction_only_ranking: *prefilter_direction_only_ranking,
         prefilter_purge_prefixes: prefilter_purge_prefixes.clone(),
