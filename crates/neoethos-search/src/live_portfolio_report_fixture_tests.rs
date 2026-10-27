@@ -226,6 +226,20 @@ fn report_golden_pair_matches_the_real_search_writers_byte_for_byte() {
 }
 
 #[test]
+fn archived_quality_without_monthly_series_keeps_its_original_wire_value() {
+    let legacy = include_bytes!(
+        "../test_fixtures/strategy_report_v6/legacy_quality_without_monthly_returns.json"
+    );
+    let expected: serde_json::Value = serde_json::from_slice(legacy).unwrap();
+    let metrics: Vec<crate::quality::StrategyMetrics> = serde_json::from_slice(legacy).unwrap();
+    assert_eq!(
+        serde_json::to_value(&metrics).unwrap(),
+        expected,
+        "decoding old quality rows must not add fields to the identity-bearing payload"
+    );
+}
+
+#[test]
 #[ignore = "manual fixture regeneration only; writes a new temporary directory, never checked-in artifacts"]
 fn regenerate_report_golden_pair_to_temporary_directory() {
     let directory = std::env::temp_dir().join(format!(

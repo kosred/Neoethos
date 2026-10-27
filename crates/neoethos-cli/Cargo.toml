@@ -42,6 +42,13 @@ gpu-b-native = ["neoethos-search/gpu-b-native"]
 # rustc and nvcc alone — no libtorch download, no LIBTORCH env, no CUDA-version
 # matching against a prebuilt tensor library.
 gpu-bench-cuda = ["neoethos-search/gpu-cuda", "gpu-b-native"]
+# B9 opt-in passthrough (docs/autoresearch-loop.md section 14.7, neo-671):
+# enables the same named feature in neoethos-autoresearch so a CLI-built loop
+# can draw B9MonthlyUpside, and arms the canonical-research
+# --fitness-table selector. Default OFF: the shipped CLI keeps the canonical
+# three-way fitness dispatch byte-identical and refuses the selector as an
+# unknown argument.
+search-monthly-upside-objective = ["neoethos-autoresearch/search-monthly-upside-objective"]
 [dependencies]
 neoethos-core = { path = "../neoethos-core" }
 neoethos-broker-history = { path = "../neoethos-broker-history" }

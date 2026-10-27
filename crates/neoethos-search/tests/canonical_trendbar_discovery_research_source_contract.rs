@@ -297,7 +297,7 @@ fn search_input_can_be_built_only_from_the_exact_selected_series_generations() {
 fn research_evidence_identity_hashes_the_complete_serialized_discovery_result() {
     let discovery = read("src/discovery.rs");
     assert!(
-        discovery.contains("#[derive(Debug, Clone, Serialize)]\npub struct DiscoveryResult"),
+        discovery.contains("#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct DiscoveryResult"),
         "DiscoveryResult is not a serializable evidence payload"
     );
 

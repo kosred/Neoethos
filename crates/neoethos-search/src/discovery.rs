@@ -19,14 +19,14 @@ use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use crate::validation::{
     CanonicalBacktestArtifactFile, CombinatorialPurgedCV, ForwardTestInput,
     ForwardTestValidationArtifactFile, PropFirmRiskInput, PropFirmRiskRules,
-    PropFirmRiskValidationArtifactFile, ValidationStrategyIdentityV2, WalkforwardSummary,
-    WalkforwardValidationArtifactFile, compute_forward_test_summary,
-    compute_prop_firm_risk_summary, write_canonical_backtest_artifact_atomic,
-    write_forward_test_validation_artifact_atomic, write_prop_firm_risk_validation_artifact_atomic,
-    write_walkforward_validation_artifact_atomic,
+    PropFirmRiskValidationArtifactFile, PropFirmRiskValidationSummary,
+    ValidationStrategyIdentityV2, WalkforwardSummary, WalkforwardValidationArtifactFile,
+    compute_forward_test_summary, compute_prop_firm_risk_summary,
+    write_canonical_backtest_artifact_atomic, write_forward_test_validation_artifact_atomic,
+    write_prop_firm_risk_validation_artifact_atomic, write_walkforward_validation_artifact_atomic,
 };
 use anyhow::{Context, Result};
-use chrono::{Datelike, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use neoethos_core::contracts::{
     DeterminismPolicy, LiveValidationEvidence, TemporalFeatureContract, ValidationEvidenceManifest,
 };
@@ -34,7 +34,7 @@ use neoethos_data::{FeatureFrame, Ohlcv};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 const PERMUTATION_MONTE_CARLO_P_VALUE_SEMANTICS_V1: &str =
@@ -114,27 +114,42 @@ impl Stage1Window {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DiscoveryRuntimeOverrides {
+    /// Explicit opt-in to the Risky capital-survival policy; absent/false
+    /// retains the exact archived research semantics.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_survival_only: bool,
+    /// See the identically named field on
+    /// `neoethos_core::config::DiscoveryRuntimeConfig` — that struct owns
+    /// the decision rationale; this copy only carries the resolved value
+    /// into the search runtime.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prefilter_direction_only_ranking: bool,
+    /// Family prefixes purged from the prefilter ranking; rationale and
+    /// matching rules live on `DiscoveryRuntimeConfig::prefilter_purge_prefixes`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefilter_purge_prefixes: Vec<String>,
+    /// Symmetric round-trip cost treatment for the prefilter's first-passage
+    /// label; rationale and barrier math live on
+    /// `neoethos_core::config::DiscoveryRuntimeConfig::label_cost_symmetric`
+    /// and `first_passage_labels`. Only the explicit opt-in adds digest
+    /// bytes, so default runs keep their exact legacy digest/cache key.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub label_cost_symmetric: bool,
+    /// Explicit new-run weekly objective. False retains legacy scoring.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub weekly_cadence: bool,
     /// FLOOR on the number of features kept after the in-sample correlation
-    /// prefilter. `0` disables the prefilter entirely.
-    ///
-    /// Since 2026-08-10 the effective pool is derived from GA capacity by
-    /// [`resolve_prefilter_top_k`] and this value is its lower bound. See that
-    /// function for why a constant against a hardware-sized cube was the same
-    /// defect class as sizing memory from a user parameter, and for the numbers
-    /// that refuse the three obvious alternatives.
+    /// prefilter; `0` disables the prefilter entirely. The effective pool is
+    /// derived from GA capacity by [`resolve_prefilter_top_k`].
     pub prefilter_top_k: usize,
     /// Fraction of rows treated as in-sample when ranking features. Must be
     /// strictly positive and at most `1.0`.
     pub prefilter_insample_frac: f64,
-    /// Minimum number of features to force-keep from EACH present higher
+    /// Minimum number of features force-kept from EACH present higher
     /// timeframe group during the prefilter, on top of the global
-    /// `prefilter_top_k`. The correlation ranking is against the BASE
-    /// timeframe's 1-bar forward return, against which a near-constant
-    /// higher-TF indicator scores ~0 — so without this quota the global
-    /// top-K discards every multi-TF feature and the GA's multi-TF seed
-    /// templates find no `H1_`/`H4_`/… prefixes. `0` = legacy behaviour.
+    /// `prefilter_top_k`; `0` reproduces the legacy base-only behaviour.
     pub prefilter_min_per_timeframe: usize,
     /// Fraction of rows fed to the multi-stage funnel's first stage.
     /// Clamped to `[0.01, 1.0]` at use time.
@@ -142,13 +157,8 @@ pub struct DiscoveryRuntimeOverrides {
     /// Where in the input window to slice the stage-1 fast-evaluation
     /// rows. Defaults to [`Stage1Window::Earliest`] for OOS safety.
     pub stage1_window: Stage1Window,
-    /// **F-096 fix (2026-05-25)** — minimum historical-data window
-    /// in years that the discovery pipeline requires before it agrees
-    /// to run. Default `10` per operator real-data directive
-    /// 2026-05-24. Setting to `0` skips the check (test fixtures /
-    /// demo replays). The pre-flight check lives in
-    /// [`ensure_sufficient_history`] and runs at the top of
-    /// `run_discovery_cycle_with_progress`.
+    /// Minimum historical-data window (years) discovery requires before it
+    /// agrees to run; `0` skips the pre-flight check.
     pub min_history_years: u32,
 }
 
@@ -156,46 +166,18 @@ impl Default for DiscoveryRuntimeOverrides {
     fn default() -> Self {
         Self {
             // 240, matching config.yaml AND
-            // `neoethos_core::config::DiscoveryRuntimeConfig::default()`. The
-            // three had drifted — code 50 / root yaml 240 / desktop yaml 50 —
-            // so a run's indicator pool was five times smaller or larger
-            // depending on whether a config file could be read, and no
-            // artifact recorded which branch ran. The other two sites were
-            // fixed by the indicator-vocabulary workflow and are pinned by
-            // `crates/neoethos-core/tests/shipped_config_matches_defaults.rs`;
-            // this is the third, applied from
-            // `docs/pending-edits-forbidden-territory.md` §2.
+            // `neoethos_core::config::DiscoveryRuntimeConfig::default()`.
+            weekly_cadence: false,
+            risky_survival_only: false,
             prefilter_top_k: 240,
-            // The outer discovery wrapper has already removed the untouched
-            // holdout. Ranking on only 80% of that admissible selection prefix
-            // is not a second out-of-sample check; it merely discards another
-            // fifth of the evidence available to choose the vocabulary.
             prefilter_insample_frac: 1.0,
             prefilter_min_per_timeframe: 6,
             funnel_stage1_pct: 0.25,
             stage1_window: Stage1Window::Earliest,
-            // **2026-05-26 operator directive (Κωνσταντίνος)**: the design
-            // intent was always "use 80/20 of WHATEVER data we have", not
-            // "require absolute 10y before running". The 80/20 train/val
-            // split is enforced downstream by
-            // `run_discovery_cycle_with_holdout` using the canonical outer-OOS
-            // fraction, which adapts to any window length. Setting the
-            // absolute-minimum gate to 0 by default
-            // means short windows (5y M5, 3y crypto, etc.) run through
-            // the same pipeline and the operator gets a *result* (even if
-            // empty portfolio because the strategies overfit) rather than
-            // a hard "Failed: insufficient history" preflight stop. Operators
-            // who want the strict 10y gate back set
-            // `models.discovery_runtime.min_history_years: 10` in config.
-            // (Before 2026-08-10 this comment named an env var; that reader is
-            // deleted — there is one place to set this and it is the config.)
-            //
-            // F-096 history (2026-05-24, now superseded): the previous
-            // default was 10 because synthetic-data leaks into discovery
-            // had produced misleading results. With Vortex now refusing
-            // synthetic fallbacks (#221) the leak risk is gone, so the
-            // 10y floor is no longer needed.
             min_history_years: 0,
+            prefilter_direction_only_ranking: false,
+            prefilter_purge_prefixes: Vec::new(),
+            label_cost_symmetric: false,
         }
     }
 }
@@ -209,6 +191,8 @@ impl DiscoveryRuntimeOverrides {
     pub(crate) fn from_settings(settings: &neoethos_core::Settings) -> Self {
         let cfg = &settings.models.discovery_runtime;
         let mut overrides = Self::default();
+        overrides.risky_survival_only = cfg.risky_survival_only;
+        overrides.weekly_cadence = cfg.weekly_cadence;
         overrides.prefilter_top_k = cfg.prefilter_top_k;
         if cfg.prefilter_insample_frac.is_finite()
             && cfg.prefilter_insample_frac > 0.0
@@ -226,6 +210,26 @@ impl DiscoveryRuntimeOverrides {
             );
         }
         overrides.prefilter_min_per_timeframe = cfg.prefilter_min_per_timeframe;
+        overrides.prefilter_direction_only_ranking = cfg.prefilter_direction_only_ranking;
+        overrides.label_cost_symmetric = cfg.label_cost_symmetric;
+        overrides.prefilter_purge_prefixes = cfg
+            .prefilter_purge_prefixes
+            .iter()
+            .map(|prefix| prefix.trim().to_ascii_lowercase())
+            .filter(|prefix| !prefix.is_empty())
+            .collect();
+        if !cfg.prefilter_purge_prefixes.is_empty()
+            && overrides.prefilter_purge_prefixes.len() != cfg.prefilter_purge_prefixes.len()
+        {
+            tracing::warn!(
+                target: "neoethos_search::config_resolution",
+                key = "models.discovery_runtime.prefilter_purge_prefixes",
+                configured = ?cfg.prefilter_purge_prefixes,
+                effective = ?overrides.prefilter_purge_prefixes,
+                "blank purge prefixes were dropped — a purge list entry must be a non-empty \
+                 feature-name prefix"
+            );
+        }
         if cfg.funnel_stage1_pct.is_finite() {
             let clamped = cfg.funnel_stage1_pct.clamp(0.01, 1.0);
             if (clamped - cfg.funnel_stage1_pct).abs() > f64::EPSILON {
@@ -721,6 +725,19 @@ pub struct DiscoveryConfig {
     /// How many top archive (non-portfolio) genes to also record in the ledger.
     /// Wired from `models.discovery_ledger.archive_top_n`.
     pub discovery_ledger_archive_top_n: usize,
+    /// Max-hold-horizon bars for the evaluation time stop (0 = disabled).
+    /// Resolved by `from_settings` from `models.exit_policy.max_hold_bars`.
+    pub max_hold_bars: usize,
+    /// Which named scoring table the GA maximises (docs/autoresearch-loop.md
+    /// section 14.7; the autoresearch search-* capability features write this,
+    /// read-only to the loop). GaFitness keeps the canonical
+    /// growth-goal / growth / ga_fitness dispatch. Only MonthlyUpsideV1 is
+    /// bound today: it routes fitness through
+    /// scoring::ga_fitness_monthly_upside_v1 with the evaluator's
+    /// completed-month return vector. The selector is NOT part of the
+    /// canonical config digest yet (the documented section 14.8 stamp gap),
+    /// so a B9 run must not be deduplicated against a default run by hash.
+    pub fitness_table: crate::scoring::FitnessTable,
 }
 
 /// Configuration for the prop-firm window-pass gate.
@@ -837,6 +854,19 @@ pub fn resolve_prop_firm_discovery_gate(
     if let Some(value) = config.min_trading_days {
         rules.min_trading_days = value;
     }
+    // 2026-10-20 EXTERNAL-EVIDENCE CALIBRATION. FTMO's consistency /
+    // "Best Day" rule is a PAYOUT-phase constraint, not part of the 2-Step
+    // challenge pass/fail objectives. The official 2-Step objectives are the
+    // 10% (phase 1) / 5% (phase 2) profit target, 5% max daily loss, 10% max
+    // loss, at least 4 trading days, and an UNLIMITED trading period
+    // (https://ftmo.com/en/2-step-challenge/ ;
+    //  https://ftmo.com/en/trading-objectives/). Applying the 50% consistency
+    // cap to DISCOVERY challenge windows therefore made every scored window
+    // stricter than the challenge it is meant to model, and the 2026-10-20
+    // rule breakdown showed consistency denying 77 of 306 windows. The rule
+    // stays in PropFirmRiskRules for funded/payout validation, where it
+    // belongs, but is disabled for the search window gate.
+    rules.max_profit_consistency_ratio = 0.0;
 
     PropFirmGateOverrides {
         rules,
@@ -882,6 +912,10 @@ impl Default for DiscoveryConfig {
             // live loop applies. See the field's doc for why this is one knob
             // and not two.
             kill_zones_enabled: true,
+            // Same value `ExitPolicyConfig::default()` ships (0 = no
+            // max-hold exit), so the config-less fallback searches under the
+            // same horizon policy as before the knob existed.
+            max_hold_bars: 0,
             population: 1000,
             population_auto: true,
             generations: 10,
@@ -898,6 +932,7 @@ impl Default for DiscoveryConfig {
             max_hours: 0.0,
             corr_threshold: 0.85,
             min_trades_per_day: 0.0,
+            fitness_table: crate::scoring::FitnessTable::default(),
             // Payoff shape and trade cadence belong in the search objective,
             // not in a config-less validity gate. Positive net expectancy after
             // actual costs remains unconditional in `TargetProfile::evaluate`.
@@ -1330,6 +1365,10 @@ impl DiscoveryConfig {
             // #75/#217: the SAME field the live loop reads
             // (`live_trading.rs:732-735`). One knob, both sides.
             kill_zones_enabled: settings.risk.kill_zones_enabled,
+            // The maximum-holding-horizon knob, resolved from
+            // `models.exit_policy.max_hold_bars`. 0 = unchanged/disabled —
+            // exactly the behaviour every run had before the knob existed.
+            max_hold_bars: model_settings.exit_policy.max_hold_bars,
             population: model_settings.prop_search_population.max(10),
             population_auto: model_settings.prop_search_population_auto,
             generations: model_settings.prop_search_generations.max(1),
@@ -1355,6 +1394,9 @@ impl DiscoveryConfig {
             // condition. `0.0` explicitly disables it; positive values remain
             // available for a run whose economic target requires a cadence.
             min_trades_per_day: model_settings.prop_search_val_min_trades_per_day.max(0.0),
+            // The objective selector is written by the autoresearch loop only;
+            // Settings-derived configs always run the canonical table.
+            fitness_table: crate::scoring::FitnessTable::default(),
             target_profile: TargetProfile {
                 // `.max(0.0)` is deliberate and load-bearing: a negative floor
                 // configured here would admit money-losers by arithmetic. The
@@ -1528,7 +1570,14 @@ impl DiscoveryConfig {
             // Permissive filter floor — the GA's output is judged by the
             // prop-firm window-pass score, not by these legacy thresholds.
             self.filtering.max_dd = 0.50;
-            self.filtering.min_profit = 0.0;
+            // 2026-10-20: the permissive floor must not resurrect a fitness-SIGN
+            // requirement. It used to be 0.0, which silently re-imposed the legacy
+            // "fitness must be positive" threshold this branch exists to remove:
+            // after the PropFirm objective stopped rewarding one-trade lottery
+            // genomes, every archived candidate had negative fitness and the mode
+            // selected nothing before validation ever ran. Acceptance stays with the
+            // cost bands, walk-forward, calibration and the prop-firm window gate.
+            self.filtering.min_profit = f64::NEG_INFINITY;
             self.filtering.min_trades = 1.0;
             self.filtering.min_sharpe = -10.0;
             self.filtering.min_win_rate = 0.0;
@@ -1597,10 +1646,34 @@ impl DiscoveryConfig {
             // (see `calculate_income_score`) prefers the fastest compounders.
             // Floors stay loose-but-sane so genuinely broken genes (negative
             // edge, never-trading) still drop out.
-            self.filtering.max_dd = 0.60;
+            self.filtering.max_dd = if self.runtime_overrides.risky_survival_only {
+                1.0 // Total loss is still refused by survived_the_backtest.
+            } else {
+                0.60 // Frozen legacy research policy.
+            };
+            self.prop_firm_gate = None;
+            if self.runtime_overrides.risky_survival_only {
+                // Prop-firm delivery/shape preferences must not become Risky
+                // acceptance gates through the shared Settings constructor.
+                self.runtime_overrides.weekly_cadence = false;
+                self.min_trades_per_day = 0.0;
+                self.filtering.min_sharpe = -f64::MAX;
+                self.filtering.min_positive_months = 0;
+                self.filtering.min_trades_per_month = 0.0;
+                self.filtering.min_monthly_return_pct = 0.0;
+                self.filtering.opportunistic_enabled = false;
+                self.filtering.use_opportunistic_candidates = false;
+                self.target_profile.min_win_rate = 0.0;
+                self.target_profile.min_payoff_ratio = 0.0;
+                self.target_profile.max_in_market = 0.0;
+                self.target_profile.min_net_expectancy_per_trade = 0.0;
+                self.target_profile.min_expectancy_t_stat = 0.0;
+            }
             self.filtering.min_profit = 0.0;
             self.filtering.min_trades = 1.0;
-            self.filtering.min_sharpe = -5.0;
+            if !self.runtime_overrides.risky_survival_only {
+                self.filtering.min_sharpe = -5.0;
+            }
             self.filtering.min_win_rate = 0.0;
             self.filtering.min_profit_factor = 0.0;
             self.filtering.anomaly_guard = false;
@@ -1640,6 +1713,81 @@ impl DiscoveryConfig {
             .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
             .map_err(anyhow::Error::new)?;
         Ok(self.evaluation_config(price_hint))
+    }
+
+    pub(crate) fn weekly_search_limits(
+        &self,
+    ) -> Result<Option<crate::scoring::weekly_cadence::WeeklySearchLimitsV1>> {
+        if !self.runtime_overrides.weekly_cadence {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            matches!(self.mode, DiscoveryMode::PropFirm),
+            "weekly objective currently requires PropFirm mode"
+        );
+        let rules = self
+            .prop_firm_gate
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("weekly objective requires resolved PropFirm risk limits")
+            })?
+            .rules;
+        anyhow::ensure!(
+            self.filtering.min_profit == f64::NEG_INFINITY || self.filtering.min_profit.is_finite(),
+            "invalid weekly profit floor"
+        );
+        anyhow::ensure!(
+            [
+                self.filtering.max_dd,
+                rules.max_overall_drawdown_pct,
+                self.filtering.min_win_rate,
+                self.target_profile.min_win_rate
+            ]
+            .iter()
+            .all(|v| v.is_finite()),
+            "invalid weekly risk or win-rate floor"
+        );
+        let limits = crate::scoring::weekly_cadence::WeeklySearchLimitsV1 {
+            initial_equity: self.initial_balance,
+            per_trade_risk_band: (self.risk_per_trade_min, self.risk_per_trade_max),
+            max_drawdown: self.filtering.max_dd.min(rules.max_overall_drawdown_pct),
+            max_daily_drawdown: rules.max_daily_loss_pct,
+            min_trades_per_month: self.filtering.min_trades_per_month,
+            min_net_profit: self.filtering.min_profit.max(0.0),
+            min_net_expectancy: self.target_profile.min_net_expectancy_per_trade,
+            min_win_rate: self
+                .filtering
+                .min_win_rate
+                .max(self.target_profile.min_win_rate),
+            min_profit_factor: self.filtering.min_profit_factor,
+        };
+        limits.validate()?;
+        Ok(Some(limits))
+    }
+
+    pub(crate) fn weekly_objective_for_window(
+        &self,
+        timestamps: &[i64],
+    ) -> Result<Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>> {
+        let Some(limits) = self.weekly_search_limits()? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            timestamps.windows(2).all(|w| w[0] < w[1]),
+            "weekly evaluation timestamps must be strictly increasing"
+        );
+        let objective = crate::scoring::weekly_cadence::WeeklySearchObjectiveV1::current(
+            crate::scoring::weekly_cadence::WeeklyCadenceContractV1::new(
+                *timestamps
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("empty weekly input"))?,
+                *timestamps.last().unwrap(),
+                crate::quality::current_quality_runtime_overrides().trading_days_per_month,
+            )?,
+            limits,
+        );
+        objective.validate_current()?;
+        Ok(Some(objective))
     }
 
     pub(crate) fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
@@ -1689,6 +1837,7 @@ impl DiscoveryConfig {
         // Risky uses the same run-bound realized-balance goal-pace objective
         // inside the GA and after replay. PropFirm/Strict remain unchanged.
         cfg.growth_objective = matches!(self.mode, DiscoveryMode::Risky);
+        cfg.fitness_table = self.fitness_table;
         cfg.growth_goal = cfg
             .growth_objective
             .then_some(crate::scoring::RiskyGrowthGoal {
@@ -1728,6 +1877,9 @@ impl DiscoveryConfig {
                 cfg.pnl_conversion_fee_rate = f64::NAN;
             }
         }
+        // Max-hold horizon of the resolved exit policy; set AFTER the
+        // research-contract seal so both branches carry the configured value.
+        cfg.max_hold_bars = self.max_hold_bars;
         cfg
     }
 
@@ -1760,7 +1912,82 @@ pub(crate) fn apply_research_contract_to_discovery_config(
     config.pnl_conversion_fee_rate = contract.pnl_conversion_fee_rate();
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Run-level tally of [`CostBandVerdict`] across every screened candidate.
+///
+/// Read `optimistic_edge_only` before reading the survivor count. Those
+/// candidates cleared every configured gate and are still not results: they are
+/// profitable only at the cheap end of a cost the operator cannot pin down to a
+/// tenth of a pip.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostBandCensus {
+    pub survives: usize,
+    pub optimistic_edge_only: usize,
+    pub fails: usize,
+    pub unmeasured: usize,
+    pub not_discriminating: usize,
+}
+
+impl CostBandCensus {
+    pub fn total(&self) -> usize {
+        self.survives
+            + self.optimistic_edge_only
+            + self.fails
+            + self.unmeasured
+            + self.not_discriminating
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryValidationGates {
+    pub walkforward_passed: bool,
+    pub cpcv_passed: bool,
+    pub canonical_backtest_artifacts: usize,
+    pub walkforward_validation_artifacts: usize,
+    pub cpcv_fold_count: usize,
+    pub cpcv_profitable_fold_ratio: f64,
+    /// Probability of Backtest Overfitting (CSCV over the CPCV splits, López
+    /// de Prado): the fraction of splits where the IN-SAMPLE champion of the
+    /// candidate set ranked at-or-below the median OUT-of-sample. `None` when
+    /// not computable (too few candidates or the gate is disabled).
+    pub pbo: Option<f64>,
+    /// False only when PBO was computed AND exceeded `config.max_pbo` —
+    /// a portfolio whose selection process looks like luck is not exportable.
+    pub pbo_passed: bool,
+    /// How many candidate strategies fed the PBO estimate.
+    pub pbo_candidates: usize,
+    /// Honesty counter: how many candidates the whole run RANKED before any
+    /// gate — the selection pressure the survivors' metrics were bought with.
+    pub trials_tested: usize,
+    pub temporal_contract_hash: Option<String>,
+    /// Set when the prop-firm window-pass gate
+    /// (`NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE=1`) replaces the walkforward
+    /// + CPCV consistency gates. Each portfolio member has already passed
+    /// FTMO-style rules on at least `pass_rate` of N random 30-day
+    /// windows from the dataset; this is what an actual prop-firm
+    /// challenge measures, so the much stricter "every walkforward
+    /// split must be profitable" requirement is bypassed here.
+    pub prop_firm_window_passed: bool,
+    pub prop_firm_window_pass_rate: f64,
+    pub prop_firm_window_count: usize,
+    /// NEVER-ZERO (2026-06-09, operator non-negotiable): set when the strict
+    /// funnel rejected EVERY candidate and discovery promoted the best-found
+    /// genes as a best-effort portfolio instead of dying empty. These genes did
+    /// NOT pass the prop bar — `prop_firm_window_passed`/`walkforward_passed`/
+    /// `cpcv_passed` are all forced false so `is_portfolio_export_ready()` stays
+    /// honest. Downstream consumers (the autonomous trader) MUST treat a
+    /// fallback portfolio cautiously (e.g. demo-only / heavily down-sized).
+    #[serde(default)]
+    pub fallback_mode: bool,
+    /// Which strict stage was the bottleneck that emptied the portfolio (e.g.
+    /// `"passed_prop_firm_window"`). Empty unless `fallback_mode`.
+    #[serde(default)]
+    pub fallback_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveryResult {
     /// Immutable identity/generation/manifest/Vortex/feature-plan proof for
     /// every value this run consumed. Persisted outputs must carry this exact
@@ -2270,7 +2497,8 @@ impl DiscoveryResult {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggedStrategyTrades {
     pub strategy_id: String,
     pub opportunistic: bool,
@@ -2306,53 +2534,6 @@ pub struct DiscoveryFilterProfile {
     pub elite_mode: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct DiscoveryValidationGates {
-    pub walkforward_passed: bool,
-    pub cpcv_passed: bool,
-    pub canonical_backtest_artifacts: usize,
-    pub walkforward_validation_artifacts: usize,
-    pub cpcv_fold_count: usize,
-    pub cpcv_profitable_fold_ratio: f64,
-    /// Probability of Backtest Overfitting (CSCV over the CPCV splits, López
-    /// de Prado): the fraction of splits where the IN-SAMPLE champion of the
-    /// candidate set ranked at-or-below the median OUT-of-sample. `None` when
-    /// not computable (too few candidates or the gate is disabled).
-    pub pbo: Option<f64>,
-    /// False only when PBO was computed AND exceeded `config.max_pbo` —
-    /// a portfolio whose selection process looks like luck is not exportable.
-    pub pbo_passed: bool,
-    /// How many candidate strategies fed the PBO estimate.
-    pub pbo_candidates: usize,
-    /// Honesty counter: how many candidates the whole run RANKED before any
-    /// gate — the selection pressure the survivors' metrics were bought with.
-    pub trials_tested: usize,
-    pub temporal_contract_hash: Option<String>,
-    /// Set when the prop-firm window-pass gate
-    /// (`NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE=1`) replaces the walkforward
-    /// + CPCV consistency gates. Each portfolio member has already passed
-    /// FTMO-style rules on at least `pass_rate` of N random 30-day
-    /// windows from the dataset; this is what an actual prop-firm
-    /// challenge measures, so the much stricter "every walkforward
-    /// split must be profitable" requirement is bypassed here.
-    pub prop_firm_window_passed: bool,
-    pub prop_firm_window_pass_rate: f64,
-    pub prop_firm_window_count: usize,
-    /// NEVER-ZERO (2026-06-09, operator non-negotiable): set when the strict
-    /// funnel rejected EVERY candidate and discovery promoted the best-found
-    /// genes as a best-effort portfolio instead of dying empty. These genes did
-    /// NOT pass the prop bar — `prop_firm_window_passed`/`walkforward_passed`/
-    /// `cpcv_passed` are all forced false so `is_portfolio_export_ready()` stays
-    /// honest. Downstream consumers (the autonomous trader) MUST treat a
-    /// fallback portfolio cautiously (e.g. demo-only / heavily down-sized).
-    #[serde(default)]
-    pub fallback_mode: bool,
-    /// Which strict stage was the bottleneck that emptied the portfolio (e.g.
-    /// `"passed_prop_firm_window"`). Empty unless `fallback_mode`.
-    #[serde(default)]
-    pub fallback_reason: String,
-}
-
 impl DiscoveryValidationGates {
     pub fn pending() -> Self {
         Self {
@@ -2376,18 +2557,21 @@ impl DiscoveryValidationGates {
     }
 
     pub fn is_portfolio_export_ready(&self) -> bool {
-        // MANDATORY out-of-sample validation (operator directive 2026-06-30):
-        // a strategy is export-ready ONLY if it passed BOTH out-of-sample gates
-        // — walkforward AND CPCV. The prop-firm window is an ADDITIONAL
-        // requirement for prop-firm runs (folded into `walkforward_passed` via
-        // the mode-aware criterion), never a bypass. This closes the hole where
-        // a strategy that FAILED walkforward (e.g. AUDUSD: 20 live trades, all
-        // losing) was still exported because it cleared the prop-firm window.
+        // Configured selection gates: walk-forward, CPCV and PBO. These run
+        // during selection on the globally selection-fitted feature frame.
+        // Internal folds reuse the same normalizer, whose fit rows include
+        // those folds' later test rows; there is no per-fold refit. They are
+        // selection diagnostics, not independent chronological OOS evidence,
+        // and confer no trading or promotion authority.
         //
-        // 2026-07-02: plus the PBO gate — when the Probability of Backtest
-        // Overfitting was measured and exceeded the configured ceiling, the
-        // selection process is statistically indistinguishable from luck and
-        // nothing gets exported, no matter how good the survivors look.
+        // The prop-firm window is an ADDITIONAL requirement for prop-firm runs
+        // (folded into walkforward_passed via the mode-aware criterion), never
+        // a bypass. This closes the hole where a strategy that FAILED
+        // walkforward was still exported because it cleared the prop-firm window.
+        //
+        // PBO is a configured-ceiling check: a measured pbo above the
+        // configured ceiling rejects selection; it does not by itself prove the
+        // selection process is indistinguishable from luck.
         self.walkforward_passed && self.cpcv_passed && self.pbo_passed
     }
 }
@@ -2435,6 +2619,21 @@ pub struct DiscoveryRunProfile {
     pub prefilter_insample_frac: f64,
     pub prefilter_min_per_timeframe: usize,
     pub funnel_stage1_pct: f64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub weekly_cadence: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_survival_only: bool,
+    /// Direction-only prefilter ranking was active for this run (opt-in).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prefilter_direction_only_ranking: bool,
+    /// Volatility-family purge prefixes active for this run (opt-in, empty =
+    /// off).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefilter_purge_prefixes: Vec<String>,
+    /// Symmetric round-trip cost barriers were active for this run's prefilter
+    /// label (opt-in).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub label_cost_symmetric: bool,
     /// Per-kind validation-evidence hashes ready for the typed
     /// [`neoethos_core::contracts::ValidationEvidenceManifest`]. `None`
     /// per field indicates that artifact kind was not produced for
@@ -2607,11 +2806,8 @@ pub fn ensure_non_empty_portfolio(result: &DiscoveryResult, context: &str) -> Re
     if !result.portfolio.is_empty() {
         return Ok(());
     }
-    // F-343 (#14): an empty portfolio is the most common — and most
-    // confusing — discovery outcome. Instead of a generic "produced an
-    // empty portfolio", turn the rejection funnel into an actionable
-    // diagnosis: which stage threw everything away, the reasons it gave,
-    // and a concrete remedy the operator can act on.
+    // Explain the observed terminal rejection, not the largest count loss:
+    // feature, row and candidate counts are different populations.
     let diagnosis = result
         .funnel_profile
         .as_ref()
@@ -2626,33 +2822,29 @@ pub fn ensure_non_empty_portfolio(result: &DiscoveryResult, context: &str) -> Re
     anyhow::bail!("Discovery produced no strategies for {context}. {diagnosis}");
 }
 
-/// Turn a rejection [`FunnelProfile`] into a one-paragraph, operator-
-/// actionable explanation of WHY the portfolio is empty: the bottleneck
-/// stage, the reasons it rejected things, and a concrete remedy.
+/// Describe the last observed population becoming empty. The funnel's
+/// largest-rejection counter is useful for profiling, not causal attribution.
 fn describe_empty_portfolio_funnel(funnel: &crate::funnel_profile::FunnelProfile) -> String {
-    // Prefer the funnel's own bottleneck; fall back to the stage that
-    // rejected the most among stages that actually received input.
-    let bottleneck = if !funnel.bottleneck_stage.is_empty() {
-        funnel
-            .stages
-            .iter()
-            .find(|s| s.name == funnel.bottleneck_stage)
-    } else {
-        None
-    }
-    .or_else(|| {
-        funnel
-            .stages
-            .iter()
-            .filter(|s| s.count_in > 0)
-            .max_by_key(|s| s.rejected)
-    });
-
-    let Some(stage) = bottleneck else {
-        return "The search produced nothing at all — no candidate strategies were \
-                generated. Try a longer history window or more generations."
+    // Zero-to-zero rows include unvisited stages and stages after exhaustion.
+    // A later nonempty population invalidates an earlier exhaustion diagnosis
+    // (for example, an empty profitable archive followed by admitted candidates).
+    let Some(stage) = funnel
+        .stages
+        .iter()
+        .rfind(|stage| stage.count_in > 0 || stage.count_out > 0)
+    else {
+        return "No populated funnel stage was recorded; the cause of the empty \
+                portfolio is unknown. Inspect the saved run and stage logs."
             .to_string();
     };
+    if stage.count_out > 0 {
+        return format!(
+            "No terminal rejection was recorded: the last populated stage '{}' \
+             retained {} of {}. Inspect the subsequent selection/export logs; \
+             earlier rejection counts do not explain the empty portfolio.",
+            stage.name, stage.count_out, stage.count_in,
+        );
+    }
 
     let reasons = if stage.top_reasons.is_empty() {
         String::new()
@@ -2668,7 +2860,7 @@ fn describe_empty_portfolio_funnel(funnel: &crate::funnel_profile::FunnelProfile
     };
 
     format!(
-        "Bottleneck: stage '{}' let {} of {} through (rejected {}).{} Hint: {}",
+        "Terminal rejection: stage '{}' let {} of {} through (rejected {}).{} Next check: {}",
         stage.name,
         stage.count_out,
         stage.count_in,
@@ -2678,61 +2870,50 @@ fn describe_empty_portfolio_funnel(funnel: &crate::funnel_profile::FunnelProfile
     )
 }
 
-/// Map a canonical funnel stage name to a concrete remedy. Stage names
-/// are the 16 defined in [`crate::funnel_profile`].
+/// Point to evidence to inspect; rejection alone does not justify relaxing a gate.
 fn remedy_for_stage(stage: &str) -> &'static str {
     match stage {
         "data_loaded" | "rows_after_trimming" => {
-            "not enough history — fetch more bars (Settings → Data) or pick a higher timeframe."
+            "inspect source coverage, warm-up and the recorded trimming boundaries."
         }
         "features_built" | "features_after_prefilter" => {
-            "the feature prefilter removed everything — widen the indicator set or check the \
-             imported data for gaps."
+            "inspect feature validity, training-window support and the recorded prefilter reasons."
         }
-        "stage1_candidates_generated" | "profitable_archive_size" => {
-            "the genetic search found no profitable seeds — raise population / generations, or \
-             allow more indicators per strategy."
+        "stage1_candidates_generated"
+        | "profitable_archive_size"
+        | "ga_returned_candidates_observation" => {
+            "inspect the candidate census and measured net results after costs."
         }
         "full_is_evaluated" | "passed_base_filter" => {
-            "every candidate failed the base filter — relax max-drawdown / min-profit in the \
-             discovery filters."
+            "inspect each candidate's measured max-drawdown / min-profit failure and configured limits."
         }
-        "nonzero_signals" => {
-            "strategies generated zero trades — relax entry thresholds or verify indicator \
-             warm-up has enough bars."
-        }
+        "nonzero_signals" => "inspect feature warm-up, signal validity and entry eligibility.",
         "passed_min_trades" => {
-            "candidates traded too rarely — lower the min-trades requirement or use a longer \
-             window."
+            "inspect trade counts, holding durations and the evaluation window's coverage."
         }
         "passed_quality" => {
-            "the quality screen rejected all survivors — lower the min Sharpe / win-rate / \
-             profit-factor, or enable opportunistic mode."
+            "inspect the recorded net expectancy, Sharpe, drawdown and cost-sensitivity failures."
         }
         "passed_prop_firm_window" => {
-            "nothing passed the prop-firm window gate — loosen the FTMO rule set, or switch off \
-             the prop-firm gate if you're not targeting a challenge."
+            "inspect per-window losses and the exact configured prop-firm rules."
         }
         "passed_correlation" => {
-            "survivors were too correlated with each other — raise the correlation threshold to \
-             admit more of them."
+            "inspect measured candidate correlations and portfolio membership decisions."
         }
         "passed_walkforward" => {
-            "strategies didn't hold up out-of-sample (walk-forward) — widen the search or reduce \
-             the number of walk-forward splits."
+            "inspect the saved walk-forward selection cohort: per-fold PnL, trade counts and \
+             rejection reasons. Legacy runs without that cohort cannot explain individual failures."
+        }
+        "passed_selection_calibration" => {
+            "inspect the saved selection-calibration cohort and each rejected sizing result."
         }
         "passed_cpcv" => {
-            "strategies failed CPCV cross-validation — lower the CPCV min-phi tolerance or disable \
-             CPCV for this run."
+            "inspect CPCV fold results, overfitting estimates and the configured acceptance criteria."
         }
         "export_ready" => {
-            "candidates passed every gate but failed final export-readiness — check the \
-             validation-gate configuration."
+            "inspect missing or failed validation evidence and final export-readiness checks."
         }
-        _ => {
-            "review the saved funnel JSON (cache/discovery/<symbol>_<tf>.json) for the full \
-              stage-by-stage breakdown."
-        }
+        _ => "review this run's saved funnel and stage logs for the recorded rejection details.",
     }
 }
 
@@ -2792,6 +2973,25 @@ fn trim_recent_history(
     let row_cap = row_cap_for_config(config);
     if row_cap > 0 && row_cap < available_rows {
         start_idx = available_rows - row_cap;
+    }
+    if config.mode == DiscoveryMode::Risky && config.runtime_overrides.risky_survival_only {
+        // Search an actual deadline-length episode rather than require a fast
+        // compounder to survive many additional years after reaching its goal.
+        let horizon_ms = config.risky_horizon_days * 86_400_000.0;
+        anyhow::ensure!(
+            horizon_ms.is_finite() && horizon_ms >= 86_400_000.0 && horizon_ms < i64::MAX as f64,
+            "invalid Risky episode horizon"
+        );
+        let cutoff = base_timestamps[available_rows - 1]
+            .checked_sub(horizon_ms as i64)
+            .context("Risky episode timestamp overflow")?;
+        start_idx = start_idx.max(base_timestamps.partition_point(|&ts| ts < cutoff));
+        tracing::info!(target: "neoethos_search::discovery",
+            policy = "survival_only_v2", horizon_days = config.risky_horizon_days,
+            source_rows = available_rows, episode_rows = available_rows - start_idx,
+            first_timestamp_ms = base_timestamps[start_idx],
+            last_timestamp_ms = base_timestamps[available_rows - 1],
+            "Risky search uses the last in-sample goal-length episode; final holdout remains reserved");
     }
 
     let trimmed_rows = available_rows.saturating_sub(start_idx);
@@ -3104,9 +3304,11 @@ pub fn faithful_oos_eval(
     portfolio_path: &std::path::Path,
     oos_start_ts_ms: i64,
 ) -> anyhow::Result<Vec<GeneOosResult>> {
-    neoethos_core::current_broker_financial_truth_capability_v1()
-        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
-        .map_err(anyhow::Error::new)?;
+    // Authority gate: the sealed canonical-trendbar research execution contract
+    // (installed by the research entry or by the under-contract wrapper below)
+    // OR the broker-financial-truth permit. Either way the gate is NOT removed:
+    // without an installed authority this refuses, exactly as before.
+    crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
     let _scope = crate::eval_telemetry::CallerScope::enter("faithful_oos");
     let artifact = crate::load_live_portfolio_json(portfolio_path)?;
     if artifact.genes.is_empty() {
@@ -3218,6 +3420,27 @@ pub fn faithful_oos_eval(
         });
     }
     Ok(out)
+}
+
+/// Faithful OOS evaluation under the SEALED canonical-trendbar research
+/// execution contract the original research was authorized with (the contract
+/// is stored inside the research artifact). This is the research-authority
+/// equivalent of `faithful_oos_eval`: it installs the contract for this call,
+/// runs the evaluation, and uninstalls when the returned scope drops. It does
+/// NOT touch the broker-financial-truth permit path, and without a valid
+/// contract the installation fails loudly.
+pub fn faithful_oos_eval_under_canonical_research_contract_v3(
+    config: &DiscoveryConfig,
+    data_dir: &std::path::Path,
+    portfolio_path: &std::path::Path,
+    oos_start_ts_ms: i64,
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+) -> anyhow::Result<Vec<GeneOosResult>> {
+    let _scope =
+        crate::canonical_trendbar_research::install_canonical_trendbar_research_execution_v3(
+            contract,
+        )?;
+    faithful_oos_eval(config, data_dir, portfolio_path, oos_start_ts_ms)
 }
 
 /// F-305 (2026-05-28): scale `min_trades_per_month` proportionally to
@@ -4354,9 +4577,10 @@ fn evaluate_cpcv_gate(
     if !config.enable_cpcv {
         tracing::warn!(
             target: "neoethos_search::discovery",
-            "CPCV gate is DISABLED via config.enable_cpcv=false — \
-             portfolio promoted without out-of-sample validation. \
-             For prop-firm production runs, set enable_cpcv=true."
+            "CPCV research selection check is DISABLED via config.enable_cpcv=false; \
+             0 folds were evaluated, so the configured internal selection check was \
+             skipped. This grants no OOS or trading authority. For prop-firm research \
+             runs, set enable_cpcv=true."
         );
         return Ok((true, 0, 1.0, None, true));
     }
@@ -4370,11 +4594,10 @@ fn evaluate_cpcv_gate(
     let offset = n.saturating_sub(capped_n);
     // ── COVERAGE, REPORTED (2026-08-10) 💰 ──────────────────────────────────
     //
-    // This gate validates the TAIL ONLY — `offset = n - capped_n` — and until
-    // now it returned pass/fail with no coverage figure anywhere. 200 000 rows
-    // against 1.05 M bars is 19% of history: the out-of-sample gate that
-    // promotes a strategy toward real money reported a clean pass on a fifth of
-    // the record, and nothing in the run said which fifth.
+    // This selection diagnostic validates the TAIL ONLY —
+    // offset = n - capped_n — and reports its coverage. It is not a
+    // real-money promotion gate and does not establish untouched chronological
+    // OOS authority; a pass covers only the most recent capped_n rows.
     //
     // Nothing is refused here. `cpcv_max_rows` is a memory bound, and refusing
     // a run because the operator's box is small is the wrong trade. What
@@ -5988,19 +6211,12 @@ fn evaluate_selection_calibration_cohort(
     crate::post_ga::post_ga_batch_width(rows, jobs.len())?;
     let projected =
         crate::live_portfolio::project_features_to_effective(features, effective_feature_names)?;
-    let (evaluation, bypass) = if let Some(policy) = sealed_policy {
-        let mut evaluation = policy.sealed_evaluation_config()?;
-        evaluation.smc_gate_threshold = effective_smc_gate_threshold;
-        (evaluation, policy.sealed_smc_gate_disabled()?)
-    } else {
-        (
-            config.evaluation_config_with_smc_gate(
-                ohlcv.close.last().copied(),
-                effective_smc_gate_threshold,
-            ),
-            crate::genetic::smc_gate_disabled(),
-        )
-    };
+    let (evaluation, bypass) = locked_holdout_evaluation(
+        config,
+        ohlcv.close.last().copied(),
+        effective_smc_gate_threshold,
+        sealed_policy,
+    )?;
     anyhow::ensure!(
         evaluation.smc_gate_threshold.is_finite() && evaluation.smc_gate_threshold >= 0.0,
         "selection calibration requires a finite non-negative final SMC gate"
@@ -6032,7 +6248,24 @@ fn evaluate_selection_calibration_cohort(
                 timestamps: &features.timestamps,
                 settings: &settings.settings_for_gene(gene),
             })?;
-            Ok(selection_calibration_trial(index, identity, summary))
+            if config.mode == DiscoveryMode::Risky && config.runtime_overrides.risky_survival_only {
+                let goals = native_risky_goal_windows(
+                    gene,
+                    &signals,
+                    &confidences,
+                    ohlcv,
+                    &features.timestamps,
+                    &settings,
+                )?;
+                Ok(selection_calibration_trial_for_goal(
+                    index,
+                    identity,
+                    summary,
+                    Some(goals),
+                ))
+            } else {
+                Ok(selection_calibration_trial(index, identity, summary))
+            }
         })?;
     crate::post_ga::check_cancel()?;
     Ok(SelectionCalibrationCohort {
@@ -6046,6 +6279,15 @@ fn selection_calibration_trial(
     candidate_archive_index: usize,
     strategy_identity: ValidationStrategyIdentityV2,
     summary: crate::validation::ForwardTestSummary,
+) -> crate::funnel_profile::SelectionCalibrationTrial {
+    selection_calibration_trial_for_goal(candidate_archive_index, strategy_identity, summary, None)
+}
+
+fn selection_calibration_trial_for_goal(
+    candidate_archive_index: usize,
+    strategy_identity: ValidationStrategyIdentityV2,
+    summary: crate::validation::ForwardTestSummary,
+    risky_goal_windows: Option<serde_json::Value>,
 ) -> crate::funnel_profile::SelectionCalibrationTrial {
     let invalid_slots = summary
         .metrics
@@ -6061,6 +6303,8 @@ fn selection_calibration_trial(
             "invalid calibration metrics: canonical slots {invalid_slots:?}; non-finite span_days={}",
             !summary.span_days.is_finite()
         ))
+    } else if let Some(goals) = risky_goal_windows.as_ref() {
+        risky_goal_calibration_rejection(goals)
     } else {
         crate::live_portfolio::LiveSizingEvidenceV1::validate_calibration_metrics(
             strategy_identity.strategy_id(),
@@ -6075,7 +6319,60 @@ fn selection_calibration_trial(
         summary: (!nonfinite).then_some(summary),
         profitable_for_selection: rejection_reason.is_none(),
         rejection_reason,
+        risky_goal_windows,
     }
+}
+
+fn risky_goal_calibration_rejection(goals: &serde_json::Value) -> Option<String> {
+    let windows = goals.get("windows").and_then(serde_json::Value::as_array);
+    let Some(windows) = windows.filter(|windows| !windows.is_empty()) else {
+        return Some("Risky calibration has no complete goal-horizon windows".into());
+    };
+    let ruined = windows
+        .iter()
+        .filter(|window| window["capital_survived"] != true)
+        .count();
+    if ruined > 0 {
+        return Some(format!(
+            "Risky capital exhausted in {ruined}/{} goal-horizon windows",
+            windows.len()
+        ));
+    }
+    if !windows
+        .iter()
+        .any(|window| window["target_reached"] == true)
+    {
+        return Some(format!(
+            "Risky target {} not reached within {} days in any calibration window",
+            goals["target_balance"], goals["window_days"]
+        ));
+    }
+    None
+}
+
+/// Account-risk robustness must preserve the same confidence-sized compounded
+/// strategy as Search. The fixed-lot timing diagnostic is a distinct policy.
+fn account_robustness_net(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    timestamps: &[i64],
+    signals: &[i8],
+    confidences: &[f64],
+    settings: &crate::eval::BacktestSettings,
+) -> Result<f64> {
+    Ok(simulate_trades_with_confidence_core(
+        close,
+        high,
+        low,
+        timestamps,
+        signals,
+        confidences,
+        settings,
+    )?
+    .iter()
+    .map(|trade| trade.pnl)
+    .sum())
 }
 
 fn selected_calibration_artifacts(
@@ -6122,10 +6419,17 @@ fn selected_calibration_artifacts(
             let summary = trial.summary.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("selected gene has no finite calibration summary")
             })?;
-            crate::live_portfolio::LiveSizingEvidenceV1::validate_calibration_metrics(
-                &gene.strategy_id,
-                &summary.metrics,
-            )?;
+            let checked = selection_calibration_trial_for_goal(
+                trial.candidate_archive_index,
+                trial.strategy_identity.clone(),
+                summary.clone(),
+                trial.risky_goal_windows.clone(),
+            );
+            anyhow::ensure!(
+                checked.profitable_for_selection,
+                "selected calibration no longer passes its mode policy: {:?}",
+                checked.rejection_reason
+            );
             ForwardTestValidationArtifactFile::new(
                 scope.clone(),
                 search_config_hash,
@@ -6188,34 +6492,13 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
     ) -> Result<Self> {
         let n = validation_row_count(features, ohlcv)?;
         validate_holdout_values_against_scope(holdout_scope, &features.timestamps, n)?;
-        let projected = if features.names == effective_feature_names {
-            Cow::Borrowed(features)
-        } else {
-            let keep = effective_feature_names
-                .iter()
-                .map(|name| {
-                    features.names.iter().position(|candidate| candidate == name)
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "holdout tail is missing feature '{}' from the discovery effective feature set",
-                            name
-                        ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Cow::Owned(features.select_columns(&keep)?)
-        };
-        let (evaluation, bypass) = if let Some(policy) = sealed_policy {
-            let mut evaluation = policy.sealed_evaluation_config()?;
-            evaluation.smc_gate_threshold = effective_smc_gate_threshold;
-            (evaluation, policy.sealed_smc_gate_disabled()?)
-        } else {
-            (
-                config.evaluation_config_with_smc_gate(
-                    ohlcv.close.last().copied(),
-                    effective_smc_gate_threshold,
-                ),
-                crate::genetic::smc_gate_disabled(),
-            )
-        };
+        let projected = project_locked_holdout_features(features, effective_feature_names)?;
+        let (evaluation, bypass) = locked_holdout_evaluation(
+            config,
+            ohlcv.close.last().copied(),
+            effective_smc_gate_threshold,
+            sealed_policy,
+        )?;
         let (ordered_signals, ordered_confidences) =
             locked_holdout_signals_and_confidences_with_policy(
                 portfolio,
@@ -6273,6 +6556,170 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
             .collect()
     }
 
+    /// Research-only numerical evaluation of this locked portfolio on the
+    /// provided slice. Deliberately NOT an artifact file: it carries no scope
+    /// authority and cannot enter promotion or live validation.
+    ///
+    /// 2026-10-20: the reserved final holdout stays reserved for quote replay,
+    /// but the operator needs a clearly-labelled numerical OOS report that is
+    /// not admissible for promotion. This produces exactly that: one forward
+    /// summary and one FTMO-rule summary per strategy under the run's own
+    /// screening cost assumptions and sealed signal policy.
+    fn research_only_oos_document(
+        &self,
+        prop_firm_rules: PropFirmRiskRules,
+    ) -> Result<serde_json::Value> {
+        let (months, days) = month_day_indices(self.timestamps);
+        let mut strategies = Vec::with_capacity(self.portfolio.len());
+        for ((gene, signals), confidences) in self
+            .portfolio
+            .iter()
+            .zip(self.ordered_signals.iter())
+            .zip(self.ordered_confidences.iter())
+        {
+            let settings = self.settings.settings_for_gene(gene);
+            let summary = compute_forward_test_summary(ForwardTestInput {
+                close: &self.ohlcv.close,
+                high: &self.ohlcv.high,
+                low: &self.ohlcv.low,
+                signals,
+                confidences,
+                months: &months,
+                days: &days,
+                timestamps: self.timestamps,
+                settings: &settings,
+            })?;
+            let trades = simulate_trades_with_confidence_core(
+                &self.ohlcv.close,
+                &self.ohlcv.high,
+                &self.ohlcv.low,
+                self.timestamps,
+                signals,
+                confidences,
+                &settings,
+            )?;
+            let risk_only = self.settings.config.mode == DiscoveryMode::Risky
+                && self.settings.config.runtime_overrides.risky_survival_only;
+            let prop_firm = (!risk_only).then(|| {
+                compute_prop_firm_risk_summary(PropFirmRiskInput {
+                    trades: &trades,
+                    initial_balance: self.settings.config.initial_balance,
+                    rules: prop_firm_rules,
+                })
+            });
+            let monthly = crate::quality::monthly_closed_trade_metrics_v1(
+                &trades,
+                self.settings.config.initial_balance,
+                *self.timestamps.first().context("empty OOS timestamps")?,
+                *self.timestamps.last().context("empty OOS timestamps")?,
+            )?;
+            let goal_windows = self.goal_window_report(gene, signals, confidences)?;
+            let mut strategy = serde_json::json!({
+                "strategy_id": gene.strategy_id,
+                "exact_gene_hash": crate::artifact_io::stable_json_hash(gene)?,
+                "forward_test": {
+                    "bars": summary.bars,
+                    "span_days": summary.span_days,
+                    "net_profit": summary.metrics.net_profit,
+                    "sharpe": summary.metrics.sharpe,
+                    "max_drawdown": summary.metrics.max_drawdown,
+                    "win_rate": summary.metrics.win_rate,
+                    "profit_factor": summary.metrics.profit_factor,
+                    "expectancy": summary.metrics.expectancy,
+                    "trade_count": summary.metrics.trade_count,
+                },
+                "prop_firm_rules": prop_firm,
+                "monthly_breakdown": monthly,
+                "logged_trades": trades,
+                "goal_windows": goal_windows,
+            });
+            if risk_only {
+                strategy.as_object_mut().unwrap().remove("prop_firm_rules");
+            }
+            strategies.push(strategy);
+        }
+        let window = serde_json::to_value(self.holdout_scope.evaluated_window())?;
+        let mut document = serde_json::json!({
+            "schema": "neoethos.research-only.oos-evaluation.v1",
+            "artifact_class": "ResearchOnly",
+            "promotion_eligibility": "NotPromotionEligible",
+            "authorization_issued": false,
+            "warning": "Numerical evaluation on the reserved final holdout using the run's screening cost assumptions and sealed signal policy. It is NOT broker-quote validated and is not admissible for promotion or live trading.",
+            "search_config_hash": self.search_config_hash,
+            "mode": format!("{:?}", self.settings.config.mode),
+            "initial_balance": self.settings.config.initial_balance,
+            "risk_per_trade_min": self.settings.config.risk_per_trade_min,
+            "risk_per_trade_max": self.settings.config.risk_per_trade_max,
+            "risky_target_balance": self.settings.config.risky_target_balance,
+            "risky_horizon_days": self.settings.config.risky_horizon_days,
+            "prop_firm_summary_scope": "whole evaluated span diagnostics; not a rolling challenge pass verdict; not a Risky objective",
+            "holdout_scope": {
+                "receipt_sha256": self.holdout_scope.receipt_sha256(),
+                "evaluated_window": window,
+            },
+            "strategies": strategies,
+        });
+        if self.settings.config.mode == DiscoveryMode::Risky
+            && self.settings.config.runtime_overrides.risky_survival_only
+        {
+            document
+                .as_object_mut()
+                .unwrap()
+                .remove("prop_firm_summary_scope");
+            document["evaluation_policy"] = "risky_goal_survival_v2".into();
+        }
+        Ok(document)
+    }
+
+    fn goal_window_report(
+        &self,
+        gene: &Gene,
+        signals: &[i8],
+        confidences: &[f64],
+    ) -> Result<serde_json::Value> {
+        let config = self.settings.config;
+        if config.mode == DiscoveryMode::Risky {
+            return native_risky_goal_windows(
+                gene,
+                signals,
+                confidences,
+                self.ohlcv,
+                self.timestamps,
+                &self.settings,
+            );
+        }
+        let mut overrides = config.derive_prop_firm_gate();
+        overrides.n_windows = 12;
+        let windows = plan_prop_firm_windows(
+            self.ohlcv,
+            self.timestamps,
+            &overrides,
+            &self.settings,
+            gene.stop_vol_mult > 0.,
+        )?;
+        let (rate, count, failures) = compute_prop_firm_pass_rate(
+            gene,
+            signals,
+            confidences,
+            self.ohlcv,
+            self.timestamps,
+            config,
+            &overrides,
+            &self.settings,
+            &windows,
+        )?;
+        Ok(serde_json::json!({
+                "mode": "prop_firm", "window_days": overrides.window_days,
+                "rules": overrides.rules, "windows": count, "pass_rate": rate,
+                "passed": failures.passed, "daily_loss_breaches": failures.daily_loss_breaches,
+                "overall_drawdown_breaches": failures.overall_drawdown_breaches,
+                "profit_target_failures": failures.profit_target_failures,
+                "min_trading_days_failures": failures.min_trading_days_failures,
+                "consistency_violations": failures.consistency_violations,
+                "warning": "Overlapping research windows; empirical pass fraction is not a future probability or broker execution evidence",
+        }))
+    }
+
     fn prop_firm_artifacts(
         &self,
         rules: PropFirmRiskRules,
@@ -6308,8 +6755,2239 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
     }
 }
 
+/// Same native Risky evaluation for selection calibration and frozen OOS.
+/// The caller supplies the admitted time scope; this helper never selects or
+/// changes genes, settings, costs or the independent final-holdout boundary.
+fn native_risky_goal_windows(
+    gene: &Gene,
+    signals: &[i8],
+    confidences: &[f64],
+    ohlcv: &Ohlcv,
+    timestamps: &[i64],
+    resolver: &GeneEvalSettingsResolver<'_>,
+) -> Result<serde_json::Value> {
+    let config = resolver.config;
+    anyhow::ensure!(
+        config.mode == DiscoveryMode::Risky,
+        "Risky evaluator requires Risky mode"
+    );
+    anyhow::ensure!(
+        config.risky_horizon_days.is_finite() && config.risky_horizon_days >= 1.,
+        "invalid Risky horizon"
+    );
+    let rows = ohlcv.close.len();
+    anyhow::ensure!(
+        [
+            ohlcv.high.len(),
+            ohlcv.low.len(),
+            timestamps.len(),
+            signals.len(),
+            confidences.len()
+        ]
+        .iter()
+        .all(|length| *length == rows),
+        "Risky goal windows require aligned prices, timestamps, signals and confidence"
+    );
+    let mut window_plan = config.derive_prop_firm_gate();
+    window_plan.n_windows = 12;
+    window_plan.window_days = config.risky_horizon_days as usize;
+    let windows = plan_prop_firm_windows(
+        ohlcv,
+        timestamps,
+        &window_plan,
+        resolver,
+        gene.stop_vol_mult > 0.,
+    )?;
+    let mut outcomes = Vec::with_capacity(windows.len());
+    for (start, end, base) in windows {
+        let mut settings = resolver.settings_for_gene(gene);
+        if settings.adaptive_vol_mult > 0. {
+            settings.adaptive_base_pips = base;
+        }
+        let trades = simulate_trades_with_confidence_core(
+            &ohlcv.close[start..end],
+            &ohlcv.high[start..end],
+            &ohlcv.low[start..end],
+            &timestamps[start..end],
+            &signals[start..end],
+            &confidences[start..end],
+            &settings,
+        )?;
+        outcomes.push(risky_goal_window_outcome(
+            &trades,
+            config,
+            timestamps[start],
+            timestamps[end - 1],
+        )?);
+    }
+    Ok(serde_json::json!({
+        "mode": "risky", "initial_balance": config.initial_balance,
+        "target_balance": config.risky_target_balance, "window_days": window_plan.window_days,
+        "sizing": "native confidence-sized compounding with original costs and lot limits",
+        "windows": outcomes, "warning": "Overlapping research windows; not independent future success probabilities",
+    }))
+}
+
+/// Describe the native compounded path up to its first target or capital loss.
+/// Legacy reports retain their EUR10 closed-balance floor. The explicit new
+/// policy refuses a marked loss of the account before crediting a later exit;
+/// it never manufactures a recovery after capital has been exhausted.
+fn risky_goal_window_outcome(
+    trades: &[Trade],
+    config: &DiscoveryConfig,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<serde_json::Value> {
+    let survival_only = config.runtime_overrides.risky_survival_only;
+    let floor = if survival_only { 0.0 } else { 10.0 };
+    let mut balance = config.initial_balance;
+    let mut peak = balance;
+    let mut lowest_marked_balance = balance;
+    let mut dd = 0.0_f64;
+    let mut target_days = None;
+    let mut floor_hit = false;
+    let mut settled = 0usize;
+    for trade in trades {
+        lowest_marked_balance = lowest_marked_balance.min(balance - trade.mae);
+        if survival_only && lowest_marked_balance <= 0.0 {
+            floor_hit = true;
+            break;
+        }
+        balance += trade.pnl;
+        lowest_marked_balance = lowest_marked_balance.min(balance);
+        settled += 1;
+        peak = peak.max(balance);
+        dd = dd.max((peak - balance) / peak);
+        if balance >= config.risky_target_balance {
+            target_days = trade
+                .exit_time
+                .map(|exit| (exit - start_ms) as f64 / 86_400_000.);
+            break;
+        }
+        if balance <= floor {
+            floor_hit = true;
+            break;
+        }
+    }
+    let mut outcome = serde_json::json!({
+        "start_ms": start_ms, "end_ms": end_ms,
+        "balance_at_stop": balance, "target_days": target_days,
+        "target_reached": target_days.is_some(), "floor_hit": floor_hit,
+        "max_closed_balance_drawdown": dd, "trades_in_window": trades.len(),
+    });
+    if survival_only {
+        let observed_end = target_days
+            .and_then(|_| trades.get(settled.saturating_sub(1))?.exit_time)
+            .unwrap_or(end_ms);
+        let monthly = crate::quality::monthly_closed_trade_metrics_v1(
+            &trades[..settled],
+            config.initial_balance,
+            start_ms,
+            observed_end,
+        )?;
+        outcome["policy"] = "survival_only_v2".into();
+        outcome["capital_floor"] = 0.0.into();
+        outcome["capital_survived"] = (!floor_hit).into();
+        outcome["lowest_marked_balance"] = lowest_marked_balance.into();
+        outcome["settled_trades_before_stop"] = settled.into();
+        outcome["monthly_breakdown_until_stop"] = serde_json::to_value(monthly)?;
+        outcome["survival_scope"] =
+            "MAE of observed closed positions before target; no broker liquidation authority"
+                .into();
+    }
+    Ok(outcome)
+}
+
+/// One cost envelope for the research-only saved-candidate cost diagnostic.
+#[derive(Debug, Clone)]
+pub struct CandidateCostVariantV1 {
+    /// Stable label recorded on every row (e.g. old_unverified / broker_0_5).
+    pub label: String,
+    /// Round-trip spread plus two fills of slippage, in pips. Replaces the
+    /// simulator spread channel for this variant only.
+    pub round_trip_cost_pips: f64,
+    /// Round-trip commission per lot. Replaces the commission channel for this
+    /// variant only.
+    pub round_trip_commission_per_lot: f64,
+}
+
+/// One row of the research-only saved-candidate cost diagnostic.
+///
+/// These are RAW evaluated metrics under an explicit cost envelope. They are
+/// not gate verdicts: no cost-band classifier runs here (the production band
+/// launches population scenarios; see CostBandVerdict for that evidence), and
+/// callers must not relabel these numbers as a cost-band pass.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateCostDiagnosticRowV1 {
+    pub variant: String,
+    pub strategy_id: String,
+    pub exact_gene_hash: String,
+    /// Round-trip cost actually charged in this variant.
+    pub charged_round_trip_cost_pips: f64,
+    pub charged_round_trip_commission_per_lot: f64,
+    pub metrics: CandidateCostMetricSetV1,
+    pub window: CandidateCostWindowV1,
+}
+
+/// The evaluated metrics of one saved candidate under one cost envelope.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateCostMetricSetV1 {
+    /// Trades closed by the replay.
+    pub trades: usize,
+    /// Same definition the production quality analyzer and the gate use:
+    /// trades x resolved trading-days-per-month / weekdays in the evaluated
+    /// interval (NOT a calendar-month rescale).
+    pub trades_per_month: f64,
+    pub win_rate_pct: f64,
+    pub profit_factor: f64,
+    pub net_account: f64,
+    pub per_trade_account: f64,
+    pub return_pct: f64,
+    pub drawdown_pct: f64,
+}
+
+/// Half-open evaluation span the candidate was replayed over.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateCostWindowV1 {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+fn evaluate_gene_with_ledger_v1(
+    ohlcv: &Ohlcv,
+    timestamps: &[i64],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    signals: &[i8],
+    confidences: &[f64],
+    settings: &crate::eval::BacktestSettings,
+) -> Result<([f64; 11], Vec<Trade>)> {
+    crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
+        &ohlcv.close,
+        &ohlcv.high,
+        &ohlcv.low,
+        signals,
+        confidences,
+        month_idx,
+        day_idx,
+        timestamps,
+        settings,
+        None,
+    )
+}
+
+fn evaluate_gene_under_cost_variant(
+    strategy_id: &str,
+    signals: &[i8],
+    confidences: &[f64],
+    ohlcv: &Ohlcv,
+    timestamps: &[i64],
+    month_idx: &[i64],
+    day_idx: &[i64],
+    settings: &crate::eval::BacktestSettings,
+    initial_balance: f64,
+    evaluation_span: (i64, i64),
+    analyzer: &StrategyQualityAnalyzer,
+    variant: &CandidateCostVariantV1,
+) -> Result<crate::quality::StrategyMetrics> {
+    anyhow::ensure!(
+        variant.round_trip_cost_pips.is_finite() && variant.round_trip_cost_pips >= 0.0,
+        "candidate-cost variant '{}' has an invalid round-trip cost",
+        variant.label
+    );
+    anyhow::ensure!(
+        variant.round_trip_commission_per_lot.is_finite()
+            && variant.round_trip_commission_per_lot >= 0.0,
+        "candidate-cost variant '{}' has an invalid round-trip commission",
+        variant.label
+    );
+    anyhow::ensure!(
+        evaluation_span.1 > evaluation_span.0 && evaluation_span.0 >= 0,
+        "candidate-cost diagnostic needs an ordered nonnegative evaluation span"
+    );
+    let mut variant_settings = settings.clone();
+    variant_settings.spread_pips = variant.round_trip_cost_pips;
+    variant_settings.session_spread_profile = None;
+    variant_settings.commission_per_trade = variant.round_trip_commission_per_lot;
+    let (canonical_metrics, trades) = evaluate_gene_with_ledger_v1(
+        ohlcv,
+        timestamps,
+        month_idx,
+        day_idx,
+        signals,
+        confidences,
+        &variant_settings,
+    )?;
+    analyzer.analyze_strategy_with_evaluation(
+        strategy_id,
+        &trades,
+        initial_balance,
+        evaluation_span.0,
+        evaluation_span.1,
+        &canonical_metrics,
+    )
+}
+
+fn candidate_cost_rows(
+    strategy_id: &str,
+    exact_gene_hash: String,
+    metrics: &crate::quality::StrategyMetrics,
+    variant: &CandidateCostVariantV1,
+    evaluation_span: (i64, i64),
+) -> CandidateCostDiagnosticRowV1 {
+    CandidateCostDiagnosticRowV1 {
+        variant: variant.label.clone(),
+        strategy_id: strategy_id.to_owned(),
+        exact_gene_hash,
+        charged_round_trip_cost_pips: variant.round_trip_cost_pips,
+        charged_round_trip_commission_per_lot: variant.round_trip_commission_per_lot,
+        metrics: CandidateCostMetricSetV1 {
+            trades: metrics.total_trades,
+            trades_per_month: metrics.trades_per_month,
+            win_rate_pct: metrics.win_rate * 100.0,
+            profit_factor: metrics.profit_factor,
+            net_account: metrics.profit_per_trade * metrics.total_trades as f64,
+            per_trade_account: metrics.profit_per_trade,
+            return_pct: metrics.total_return_pct,
+            drawdown_pct: metrics.max_drawdown_pct,
+        },
+        window: CandidateCostWindowV1 {
+            start_ms: evaluation_span.0,
+            end_ms: evaluation_span.1,
+        },
+    }
+}
+
+/// Research-only cost sensitivity for SAVED discovery candidates.
+///
+/// Re-evaluates an explicit candidate list (e.g. loaded from a saved
+/// research.json) on the exact receipt-bound selection frame of this input,
+/// under one or more cost envelopes. It does not run Search, does not touch
+/// the reserved final holdout, produces no artifacts/receipts and grants no
+/// authority: callers persist the returned rows as ResearchOnly.
+///
+/// The cost envelope is the ONLY variable: the saved research execution
+/// contract is applied to a clone of `config` first (symbol, account currency,
+/// contract spread/commission, swaps and conversion fee), then each variant
+/// overrides only spread_pips and commission_per_trade. The caller must pass
+/// the original run's non-cost configuration (risk bands, trailing/exit
+/// policy, kill zones, initial balance): this function does not invent them.
+///
+/// Candidate gene indices are interpreted ONLY against
+/// research.discovery_result().effective_feature_names, projected by exact
+/// name (never against a differently ordered fresh prefilter). The frame must
+/// contain every saved feature name; a missing name fails loud instead of
+/// silently reinterpreting an index.
+struct PreparedSavedCandidateReplay<'a> {
+    _execution: crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionScopeV3,
+    inputs: CanonicalDiscoveryRunInputs<'a>,
+    projected: neoethos_data::FeatureFrame,
+    research_config: DiscoveryConfig,
+    evaluation: crate::genetic::EvaluationConfig,
+    bypass: bool,
+}
+
+impl<'a> PreparedSavedCandidateReplay<'a> {
+    fn signals(&self, candidates: &[Gene]) -> Result<(Vec<Vec<i8>>, Vec<Vec<f64>>)> {
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "candidate cost diagnostic requires at least one saved candidate"
+        );
+        for gene in candidates {
+            if let Some(index) = gene.indices.iter().copied().max() {
+                anyhow::ensure!(
+                    (index as usize) < self.projected.names.len(),
+                    "saved candidate '{}' references feature index {} beyond the {} saved effective features",
+                    gene.strategy_id,
+                    index,
+                    self.projected.names.len()
+                );
+            }
+        }
+        locked_holdout_signals_and_confidences_with_policy(
+            candidates,
+            &self.projected,
+            self.inputs.selection().ohlcv(),
+            &self.evaluation,
+            self.bypass,
+        )
+    }
+}
+
+fn prepare_saved_candidate_replay<'a>(
+    input: &'a CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+) -> Result<PreparedSavedCandidateReplay<'a>> {
+    research.validate()?;
+    let contract = research.execution_contract();
+    contract.validate_against_input(input)?;
+    // Keep the exact saved execution scope alive through the consumer. The
+    // context owns this guard; callers must not split the guard from the
+    // materialized signals/similarity work.
+    let execution = install_research_replay_execution_scope(contract)?;
+    let result = research.discovery_result();
+    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let selection = inputs.selection();
+    anyhow::ensure!(
+        &result.selection_scope == selection.scope(),
+        "saved research selection window differs from the reopened canonical input"
+    );
+    let mut research_config = config.clone();
+    apply_research_contract_to_discovery_config(&mut research_config, contract);
+    anyhow::ensure!(
+        research_config.evaluation_spread_pips.is_finite()
+            && research_config.evaluation_spread_pips >= 0.0
+            && research_config.evaluation_commission_per_trade.is_finite()
+            && research_config.evaluation_commission_per_trade >= 0.0,
+        "saved research contract did not pin finite baseline costs"
+    );
+    let policy = result
+        .funnel_profile
+        .as_ref()
+        .and_then(|funnel| funnel.live_trading_policy_v1())
+        .ok_or_else(|| anyhow::anyhow!("saved research lost its sealed Search signal policy"))?;
+    policy.validate()?;
+    let sealed_adaptive_stops = policy.sealed_adaptive_stops_policy()?;
+    let current_adaptive_stops =
+        crate::stop_target::ResolvedAdaptiveStopsPolicyV1::capture_current()?;
+    ensure_adaptive_stops_policy_matches_sealed(&current_adaptive_stops, sealed_adaptive_stops)?;
+    anyhow::ensure!(
+        policy.source_search_config_hash == result.search_config_hash,
+        "saved research search_config_hash {} disagrees with its sealed policy {} — refusing to price candidates from an inconsistent archive",
+        result.search_config_hash,
+        policy.source_search_config_hash
+    );
+    let sealed_evaluation = policy.sealed_evaluation_config()?;
+    ensure_research_config_matches_sealed_evaluation(
+        &research_config,
+        selection.ohlcv().close.last().copied(),
+        result.effective_smc_gate_threshold,
+        &sealed_evaluation,
+    )?;
+    let (evaluation, bypass) = locked_holdout_evaluation(
+        &research_config,
+        selection.ohlcv().close.last().copied(),
+        result.effective_smc_gate_threshold,
+        Some(policy),
+    )?;
+    let projected =
+        project_locked_holdout_features(selection.features(), &result.effective_feature_names)?
+            .into_owned();
+    Ok(PreparedSavedCandidateReplay {
+        _execution: execution,
+        inputs,
+        projected,
+        research_config,
+        evaluation,
+        bypass,
+    })
+}
+
+pub fn diagnose_research_candidates_under_cost_variants_v3(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    candidates: &[Gene],
+    variants: &[CandidateCostVariantV1],
+) -> Result<Vec<CandidateCostDiagnosticRowV1>> {
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let selection = replay.inputs.selection();
+    let projected = &replay.projected;
+    let research_config = &replay.research_config;
+    anyhow::ensure!(
+        !variants.is_empty(),
+        "candidate cost diagnostic requires at least one cost variant"
+    );
+    let (signals, confidences) = replay.signals(candidates)?;
+    let resolver = GeneEvalSettingsResolver::for_slice(
+        &research_config,
+        candidates.iter(),
+        &selection.ohlcv().high,
+        &selection.ohlcv().low,
+        &selection.ohlcv().close,
+    )?;
+    let timestamps = projected.timestamps.as_slice();
+    let (month_idx, day_idx) = month_day_indices(timestamps);
+    let evaluation_start_ms = *timestamps
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("candidate cost diagnostic has no evaluated bars"))?;
+    let evaluation_end_ms = *timestamps
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("candidate cost diagnostic has no evaluated bars"))?;
+    let evaluation_span = (evaluation_start_ms, evaluation_end_ms);
+    let analyzer = quality_analyzer_for_config(&research_config);
+    let initial_balance = research_config.initial_balance;
+    let mut rows = Vec::with_capacity(candidates.len() * variants.len());
+    for (gene, (gene_signals, gene_confidences)) in candidates
+        .iter()
+        .zip(signals.iter().zip(confidences.iter()))
+    {
+        let base_settings = resolver.settings_for_gene(gene);
+        let exact_gene_hash = crate::artifact_io::stable_json_hash(gene)?;
+        for variant in variants {
+            let metrics = evaluate_gene_under_cost_variant(
+                &gene.strategy_id,
+                gene_signals,
+                gene_confidences,
+                selection.ohlcv(),
+                timestamps,
+                &month_idx,
+                &day_idx,
+                &base_settings,
+                initial_balance,
+                evaluation_span,
+                &analyzer,
+                variant,
+            )?;
+            rows.push(candidate_cost_rows(
+                gene.strategy_id.as_str(),
+                exact_gene_hash.clone(),
+                &metrics,
+                variant,
+                evaluation_span,
+            ));
+        }
+    }
+    Ok(rows)
+}
+/// One explicitly named saved candidate for the bounded weekday attribution
+/// diagnostic. The index alone is not identity: the strategy id and the exact
+/// stable JSON hash are both verified against the saved archive before any
+/// feature reconstruction or replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedCandidateSelectionV1 {
+    pub index: usize,
+    pub strategy_id: String,
+    pub exact_gene_hash: String,
+}
+
+/// Parse the explicit index:strategy_id:fnv64:<hex> selector list. There is
+/// no default all-candidate mode: an empty or malformed selection is refused.
+pub fn parse_saved_candidate_selections_v1(spec: &str) -> Result<Vec<SavedCandidateSelectionV1>> {
+    let mut selections = Vec::new();
+    for token in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let parts = token.split(':').collect::<Vec<_>>();
+        anyhow::ensure!(
+            parts.len() == 4 && parts[2] == "fnv64",
+            "saved candidate selector '{}' must be index:strategy_id:fnv64:<hex>",
+            token
+        );
+        let index = parts[0].parse::<usize>().with_context(|| {
+            format!("saved candidate selector '{}' has an invalid index", token)
+        })?;
+        anyhow::ensure!(
+            !parts[1].trim().is_empty(),
+            "saved candidate selector '{}' has an empty strategy id",
+            token
+        );
+        anyhow::ensure!(
+            parts[3].len() == 16 && parts[3].chars().all(|c| c.is_ascii_hexdigit()),
+            "saved candidate selector '{}' has an invalid fnv64 hash",
+            token
+        );
+        selections.push(SavedCandidateSelectionV1 {
+            index,
+            strategy_id: parts[1].to_owned(),
+            exact_gene_hash: format!("fnv64:{}", parts[3].to_ascii_lowercase()),
+        });
+    }
+    anyhow::ensure!(
+        !selections.is_empty(),
+        "saved candidate weekday attribution requires explicit candidate selectors"
+    );
+    anyhow::ensure!(
+        selections.len() <= 8,
+        "saved candidate weekday attribution accepts at most eight explicit candidates"
+    );
+    let mut seen_indices = HashSet::new();
+    let mut seen_strategy_ids = HashSet::new();
+    for selection in &selections {
+        anyhow::ensure!(
+            seen_indices.insert(selection.index),
+            "saved candidate weekday attribution selects index {} more than once",
+            selection.index
+        );
+        anyhow::ensure!(
+            seen_strategy_ids.insert(selection.strategy_id.as_str()),
+            "saved candidate weekday attribution selects strategy id '{}' more than once",
+            selection.strategy_id
+        );
+    }
+    Ok(selections)
+}
+
+/// Validate explicit selections against the archived candidate identities
+/// without touching a feature frame. This is the CLI pre-feature identity gate.
+pub fn validate_saved_candidate_selections_v1(
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<()> {
+    selected_saved_candidate_genes_v1(research.discovery_result(), selections).map(|_| ())
+}
+
+fn saved_candidate_gene_for_selection_v1<'a>(
+    candidates: &'a [Gene],
+    selection: &SavedCandidateSelectionV1,
+) -> Result<&'a Gene> {
+    let gene = candidates.get(selection.index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "saved candidate weekday attribution index {} is outside the archived candidate list of {}",
+            selection.index,
+            candidates.len()
+        )
+    })?;
+    anyhow::ensure!(
+        gene.strategy_id == selection.strategy_id,
+        "saved candidate weekday attribution index {} is '{}', not requested '{}'",
+        selection.index,
+        gene.strategy_id,
+        selection.strategy_id
+    );
+    let actual_hash = stable_json_hash(gene)?;
+    anyhow::ensure!(
+        actual_hash == selection.exact_gene_hash,
+        "saved candidate weekday attribution index {} hash {} differs from requested {}",
+        selection.index,
+        actual_hash,
+        selection.exact_gene_hash
+    );
+    Ok(gene)
+}
+
+fn selected_saved_candidate_genes_v1(
+    result: &crate::DiscoveryResult,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<Vec<(usize, Gene)>> {
+    anyhow::ensure!(
+        !selections.is_empty(),
+        "saved candidate weekday attribution requires explicit candidate selectors"
+    );
+    anyhow::ensure!(
+        selections.len() <= 8,
+        "saved candidate weekday attribution accepts at most eight explicit candidates"
+    );
+    let mut selected = Vec::with_capacity(selections.len());
+    let mut seen = HashSet::new();
+    for selection in selections {
+        anyhow::ensure!(
+            seen.insert(selection.index),
+            "saved candidate weekday attribution selects index {} more than once",
+            selection.index
+        );
+        let gene = saved_candidate_gene_for_selection_v1(&result.candidates, selection)?;
+        selected.push((selection.index, gene.clone()));
+    }
+    Ok(selected)
+}
+
+/// Evaluate explicit, identity-checked archived candidates without running Search.
+/// The saved policy and the canonical three-way split remain authoritative.
+pub fn evaluate_saved_candidates_outer_holdout_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<serde_json::Value> {
+    let selected = selected_saved_candidate_genes_v1(research.discovery_result(), selections)?;
+    let genes = selected
+        .into_iter()
+        .map(|(_, gene)| gene)
+        .collect::<Vec<_>>();
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let holdout = replay
+        .inputs
+        .holdout()
+        .context("saved candidate replay needs a reserved holdout")?;
+    let result = research.discovery_result();
+    anyhow::ensure!(
+        result.holdout_scope.as_ref() == Some(holdout.scope()),
+        "saved candidate holdout differs from the reopened canonical input"
+    );
+    let policy = result
+        .funnel_profile
+        .as_ref()
+        .and_then(|funnel| funnel.live_trading_policy_v1())
+        .context("saved candidate holdout lost its sealed signal policy")?;
+    let prepared = PreparedLockedHoldoutResearch::new_with_policy(
+        &genes,
+        &result.effective_feature_names,
+        holdout.features(),
+        holdout.ohlcv(),
+        holdout.scope(),
+        &result.search_config_hash,
+        &replay.research_config,
+        result.effective_smc_gate_threshold,
+        Some(policy),
+    )?;
+    let mut document = prepared.research_only_oos_document(PropFirmRiskRules::default())?;
+    document["saved_evidence_identity_sha256"] = research.evidence_identity_sha256().into();
+    Ok(document)
+}
+
+const SAVED_CANDIDATE_METRIC_NAMES: [&str; 11] = [
+    "net_profit",
+    "sharpe",
+    "peak_equity",
+    "max_drawdown",
+    "win_rate",
+    "profit_factor",
+    "expectancy",
+    "monthly_target_hit_rate",
+    "trade_count",
+    "consistency",
+    "max_daily_drawdown",
+];
+
+const SAVED_CANDIDATE_METRIC_MISMATCH_TOLERANCE_V1: f64 = 1e-6;
+
+fn saved_candidate_metric_value_v1(gene: &Gene, slot: usize) -> Option<f64> {
+    match slot {
+        1 => Some(gene.sharpe_ratio),
+        3 => Some(gene.max_drawdown),
+        4 => Some(gene.win_rate),
+        5 => Some(gene.profit_factor),
+        6 => Some(gene.expectancy),
+        8 => Some(gene.trades_count as f64),
+        9 => Some(gene.consistency),
+        _ => None,
+    }
+}
+
+fn saved_candidate_metric_deltas_v1(
+    gene: &Gene,
+    actual: &[f64; 11],
+) -> (Vec<Option<f64>>, Vec<String>) {
+    let mut deltas = Vec::with_capacity(actual.len());
+    let mut reasons = Vec::new();
+    for (slot, name) in SAVED_CANDIDATE_METRIC_NAMES.iter().enumerate() {
+        match saved_candidate_metric_value_v1(gene, slot) {
+            Some(saved) => {
+                let delta = actual[slot] - saved;
+                deltas.push(Some(delta));
+                let material = if slot == 8 {
+                    actual[slot] != saved
+                } else {
+                    !delta.is_finite() || delta.abs() > SAVED_CANDIDATE_METRIC_MISMATCH_TOLERANCE_V1
+                };
+                if material {
+                    reasons.push(format!(
+                        "{}: actual {:.12} vs saved {:.12} (delta {:.12})",
+                        name, actual[slot], saved, delta
+                    ));
+                }
+            }
+            None => deltas.push(None),
+        }
+    }
+    (deltas, reasons)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SavedCandidateSignalDayCountsV1 {
+    observed_bars: u64,
+    raw_post_gate_nonzero_signal_bars: u64,
+    nonzero_prior_signal_at_next_execution_bar: u64,
+    closed_entries: u64,
+}
+
+fn saved_candidate_utc_date_v1(timestamp_ms: i64) -> Result<NaiveDate> {
+    Utc.timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|timestamp| timestamp.date_naive())
+        .ok_or_else(|| anyhow::anyhow!("timestamp {} is outside the UTC calendar", timestamp_ms))
+}
+
+fn saved_candidate_calendar_dates_v1(start_ms: i64, end_ms: i64) -> Result<Vec<NaiveDate>> {
+    let start = saved_candidate_utc_date_v1(start_ms)?;
+    let end = saved_candidate_utc_date_v1(end_ms)?;
+    anyhow::ensure!(
+        end >= start,
+        "saved candidate weekday attribution needs an ordered UTC selection calendar"
+    );
+    let mut dates = Vec::new();
+    let mut date = start;
+    loop {
+        dates.push(date);
+        if date == end {
+            break;
+        }
+        date = date
+            .succ_opt()
+            .ok_or_else(|| anyhow::anyhow!("saved candidate UTC calendar overflow"))?;
+    }
+    Ok(dates)
+}
+
+/// Attribute each bar to its own UTC date and map the prior-bar signal to the
+/// next bar execution timestamp. The final bar signal has no execution bar
+/// and is returned as an explicit omitted count, never silently mapped.
+fn saved_candidate_signal_day_counts_v1(
+    signal: &[i8],
+    dates: &[NaiveDate],
+) -> Result<(BTreeMap<NaiveDate, SavedCandidateSignalDayCountsV1>, u64)> {
+    anyhow::ensure!(
+        signal.len() == dates.len(),
+        "saved candidate signal/date length mismatch"
+    );
+    anyhow::ensure!(
+        !signal.is_empty(),
+        "saved candidate weekday attribution has no signal bars"
+    );
+    let mut counts = BTreeMap::<NaiveDate, SavedCandidateSignalDayCountsV1>::new();
+    let mut final_signal_without_next_bar = 0_u64;
+    for (index, value) in signal.iter().copied().enumerate() {
+        anyhow::ensure!(
+            matches!(value, -1 | 0 | 1),
+            "saved candidate signal at row {} is {}, not -1/0/1",
+            index,
+            value
+        );
+        counts.entry(dates[index]).or_default().observed_bars += 1;
+        if value != 0 {
+            counts
+                .entry(dates[index])
+                .or_default()
+                .raw_post_gate_nonzero_signal_bars += 1;
+            if index + 1 < dates.len() {
+                counts
+                    .entry(dates[index + 1])
+                    .or_default()
+                    .nonzero_prior_signal_at_next_execution_bar += 1;
+            } else {
+                final_signal_without_next_bar += 1;
+            }
+        }
+    }
+    Ok((counts, final_signal_without_next_bar))
+}
+
+fn saved_candidate_settings_provenance_v1(
+    settings: &crate::eval::BacktestSettings,
+) -> serde_json::Value {
+    let session_profile = settings.session_spread_profile.as_ref().map(|profile| {
+        serde_json::json!({
+            "asian_pips": profile.asian_pips,
+            "overlap_pips": profile.overlap_pips,
+            "late_ny_pips": profile.late_ny_pips,
+        })
+    });
+    serde_json::json!({
+        "initial_equity": settings.initial_equity(),
+        "risk_based_sizing": settings.risk_based_sizing,
+        "risk_per_trade_min": settings.risk_per_trade_min,
+        "risk_per_trade_max": settings.risk_per_trade_max,
+        "high_quality_confidence": settings.high_quality_confidence,
+        "sl_pips": settings.sl_pips,
+        "tp_pips": settings.tp_pips,
+        "adaptive_vol_mult": settings.adaptive_vol_mult,
+        "adaptive_base_pips_present": settings.adaptive_base_pips.is_some(),
+        "max_hold_bars": settings.max_hold_bars,
+        "max_trades_per_day": settings.max_trades_per_day,
+        "trailing_enabled": settings.trailing_enabled,
+        "trailing_atr_multiplier": settings.trailing_atr_multiplier,
+        "trailing_be_trigger_r": settings.trailing_be_trigger_r,
+        "trailing_min_lock_pips": settings.trailing_min_lock_pips,
+        "spread_pips": settings.spread_pips,
+        "session_spread_profile": session_profile,
+        "commission_per_trade": settings.commission_per_trade,
+        "pip_value": settings.pip_value,
+        "pip_value_per_lot": settings.pip_value_per_lot,
+        "kill_zones_enabled": settings.kill_zones_enabled,
+        "swap_long_pips_per_day": settings.swap_long_pips_per_day,
+        "swap_short_pips_per_day": settings.swap_short_pips_per_day,
+        "pnl_conversion_fee_rate": settings.pnl_conversion_fee_rate,
+    })
+}
+
+fn prepare_saved_candidate_diagnostic_v1<'a>(
+    input: &'a CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<(PreparedSavedCandidateReplay<'a>, Vec<(usize, Gene)>)> {
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let selected = selected_saved_candidate_genes_v1(research.discovery_result(), selections)?;
+    Ok((replay, selected))
+}
+
+fn saved_candidate_signal_rows_v1(
+    replay: &PreparedSavedCandidateReplay<'_>,
+    selected: &[(usize, Gene)],
+) -> Result<(Vec<Gene>, Vec<Vec<i8>>, Vec<Vec<f64>>)> {
+    let genes = selected
+        .iter()
+        .map(|(_, gene)| gene.clone())
+        .collect::<Vec<_>>();
+    let (signals, confidences) = replay.signals(&genes)?;
+    Ok((genes, signals, confidences))
+}
+
+fn saved_candidate_diagnostic_provenance_v1(
+    result: &crate::DiscoveryResult,
+    timestamps: &[i64],
+) -> serde_json::Value {
+    serde_json::json!({
+        "ordered_effective_feature_count": result.effective_feature_names.len(),
+        "ordered_effective_feature_names": result.effective_feature_names,
+        "saved_feature_plan_identity": result.search_input_receipt.feature_plan_identity(),
+        "saved_feature_provenance_identity": result.search_input_receipt.feature_provenance_identity(),
+        "saved_feature_content_sha256": result.search_input_receipt.feature_content_sha256(),
+        "sealed_smc_gate_threshold": result.effective_smc_gate_threshold,
+        "saved_selection_start_ms": timestamps[0],
+        "saved_selection_end_ms": timestamps[timestamps.len() - 1],
+    })
+}
+
+/// Research-only, explicit small-set attribution of saved-candidate signals
+/// and actual closed-trade entries by UTC selection date. It reuses the sealed
+/// saved replay, the existing per-gene settings resolver and the existing CPU
+/// ledger; it does not invent a second evaluator or a second cadence rule.
+pub fn summarize_saved_candidate_weekday_attribution_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    selections: &[SavedCandidateSelectionV1],
+) -> Result<serde_json::Value> {
+    let (replay, selected) =
+        prepare_saved_candidate_diagnostic_v1(input, config, research, selections)?;
+    let result = research.discovery_result();
+    let selection = replay.inputs.selection();
+    let timestamps = replay.projected.timestamps.as_slice();
+    anyhow::ensure!(
+        !timestamps.is_empty(),
+        "saved candidate weekday attribution has no selection bars"
+    );
+    let (month_idx, day_idx) = month_day_indices(timestamps);
+    let calendar =
+        saved_candidate_calendar_dates_v1(timestamps[0], timestamps[timestamps.len() - 1])?;
+    let dates_by_bar = timestamps
+        .iter()
+        .copied()
+        .map(saved_candidate_utc_date_v1)
+        .collect::<Result<Vec<_>>>()?;
+    let objective = replay
+        .research_config
+        .weekly_objective_for_window(timestamps)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "saved candidate weekday attribution requires the sealed rolling weekly cadence objective"
+            )
+        })?;
+    let resolver = GeneEvalSettingsResolver::for_slice(
+        &replay.research_config,
+        selected.iter().map(|(_, gene)| gene),
+        &selection.ohlcv().high,
+        &selection.ohlcv().low,
+        &selection.ohlcv().close,
+    )?;
+    let (_genes, signals, confidences) = saved_candidate_signal_rows_v1(&replay, &selected)?;
+    let mut candidates = Vec::with_capacity(selected.len());
+    for (position, ((index, gene), (signal, confidence))) in selected
+        .iter()
+        .zip(signals.iter().zip(confidences.iter()))
+        .enumerate()
+    {
+        let settings = resolver.settings_for_gene(gene);
+        let (actual_metrics, trades) = evaluate_gene_with_ledger_v1(
+            selection.ohlcv(),
+            timestamps,
+            &month_idx,
+            &day_idx,
+            signal,
+            confidence,
+            &settings,
+        )?;
+        let (mut day_counts, final_signal_without_next_bar) =
+            saved_candidate_signal_day_counts_v1(signal, &dates_by_bar)?;
+        let mut closed_entry_days = BTreeMap::<NaiveDate, u64>::new();
+        for trade in &trades {
+            let entry_date = saved_candidate_utc_date_v1(trade.entry_time)?;
+            anyhow::ensure!(
+                calendar.iter().any(|date| *date == entry_date),
+                "closed entry at {} is outside the saved UTC selection calendar",
+                trade.entry_time
+            );
+            *closed_entry_days.entry(entry_date).or_default() += 1;
+            day_counts.entry(entry_date).or_default().closed_entries += 1;
+        }
+        let (metric_deltas, mut mismatch_reasons) =
+            saved_candidate_metric_deltas_v1(gene, &actual_metrics);
+        if trades.len() != gene.trades_count {
+            mismatch_reasons.push(format!(
+                "trade_count: actual ledger {} vs saved {}",
+                trades.len(),
+                gene.trades_count
+            ));
+        }
+        let material_mismatch = !mismatch_reasons.is_empty();
+        let actual_metric_values = actual_metrics.to_vec();
+        let mut delta_map = serde_json::Map::new();
+        for (name, delta) in SAVED_CANDIDATE_METRIC_NAMES
+            .iter()
+            .zip(metric_deltas.iter())
+        {
+            delta_map.insert((*name).to_owned(), serde_json::json!(delta));
+        }
+        let dates = calendar
+            .iter()
+            .map(|date| {
+                let counts = day_counts.get(date).copied().unwrap_or_default();
+                let weekend = date.weekday().num_days_from_monday() >= 5;
+                serde_json::json!({
+                    "utc_date": date.format("%Y-%m-%d").to_string(),
+                    "weekend": weekend,
+                    "expected_trading_day": !weekend,
+                    "observed_bars": counts.observed_bars,
+                    "raw_post_gate_nonzero_signal_bars": counts.raw_post_gate_nonzero_signal_bars,
+                    "nonzero_prior_signal_at_next_execution_bar": counts.nonzero_prior_signal_at_next_execution_bar,
+                    "closed_entries": counts.closed_entries,
+                })
+            })
+            .collect::<Vec<_>>();
+        let raw_signal_total = calendar
+            .iter()
+            .map(|date| {
+                day_counts
+                    .get(date)
+                    .copied()
+                    .unwrap_or_default()
+                    .raw_post_gate_nonzero_signal_bars
+            })
+            .sum::<u64>();
+        let next_execution_total = calendar
+            .iter()
+            .map(|date| {
+                day_counts
+                    .get(date)
+                    .copied()
+                    .unwrap_or_default()
+                    .nonzero_prior_signal_at_next_execution_bar
+            })
+            .sum::<u64>();
+        let zero_raw_signal_date_count = calendar
+            .iter()
+            .filter(|date| {
+                day_counts
+                    .get(date)
+                    .copied()
+                    .unwrap_or_default()
+                    .raw_post_gate_nonzero_signal_bars
+                    == 0
+            })
+            .count();
+        let zero_next_execution_observation_date_count = calendar
+            .iter()
+            .filter(|date| {
+                day_counts
+                    .get(date)
+                    .copied()
+                    .unwrap_or_default()
+                    .nonzero_prior_signal_at_next_execution_bar
+                    == 0
+            })
+            .count();
+        let entry_times = trades
+            .iter()
+            .map(|trade| trade.entry_time)
+            .collect::<Vec<_>>();
+        let weekly_cadence = crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
+            &objective.cadence,
+            &entry_times,
+        )?;
+        let ledger = trades
+            .iter()
+            .map(|trade| {
+                serde_json::json!({
+                    "entry_time_ms": trade.entry_time,
+                    "entry_utc_date": saved_candidate_utc_date_v1(trade.entry_time).ok().map(|date| date.format("%Y-%m-%d").to_string()),
+                    "exit_time_ms": trade.exit_time,
+                    "exit_utc_date": trade.exit_time.and_then(|ms| saved_candidate_utc_date_v1(ms).ok()).map(|date| date.format("%Y-%m-%d").to_string()),
+                    "pnl": trade.pnl,
+                    "exit_reason": trade.exit_reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.push(serde_json::json!({
+            "candidate": {
+                "index": index,
+                "strategy_id": gene.strategy_id,
+                "exact_gene_hash": selections[position].exact_gene_hash,
+            },
+            "saved_metrics": {
+                "fitness": gene.fitness,
+                "sharpe": gene.sharpe_ratio,
+                "max_drawdown": gene.max_drawdown,
+                "win_rate": gene.win_rate,
+                "profit_factor": gene.profit_factor,
+                "expectancy": gene.expectancy,
+                "trade_count": gene.trades_count,
+                "consistency": gene.consistency,
+                "unavailable_metric_slots": ["net_profit", "peak_equity", "monthly_target_hit_rate", "max_daily_drawdown"],
+            },
+            "actual_metrics": {
+                "names": SAVED_CANDIDATE_METRIC_NAMES,
+                "values": actual_metric_values,
+            },
+            "metric_deltas": delta_map,
+            "material_mismatch": material_mismatch,
+            "material_mismatch_reasons": mismatch_reasons,
+            "ledger_trade_count": trades.len(),
+            "saved_trade_count": gene.trades_count,
+            "entry_exit_ledger": ledger,
+            "weekly_cadence": weekly_cadence,
+            "settings_provenance": saved_candidate_settings_provenance_v1(&settings),
+            "summary": {
+                "calendar_date_count": calendar.len(),
+                "expected_trading_day_count": calendar.iter().filter(|date| date.weekday().num_days_from_monday() < 5).count(),
+                "weekend_date_count": calendar.iter().filter(|date| date.weekday().num_days_from_monday() >= 5).count(),
+                "observed_bar_count": signal.len(),
+                "raw_post_gate_nonzero_signal_bar_total": raw_signal_total,
+                "nonzero_prior_signal_at_next_execution_bar_total": next_execution_total,
+                "final_signal_without_next_execution_bar_omitted_count": final_signal_without_next_bar,
+                "closed_entry_total_at_actual_entry_time": trades.len(),
+                "closed_entry_date_count": closed_entry_days.len(),
+                "zero_raw_signal_date_count": zero_raw_signal_date_count,
+                "zero_next_execution_observation_date_count": zero_next_execution_observation_date_count,
+            },
+            "dates": dates,
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema": "neoethos.research-only.saved-candidate-weekday-attribution.v1",
+        "candidate_count": candidates.len(),
+        "selection_bars": timestamps.len(),
+        "provenance": saved_candidate_diagnostic_provenance_v1(result, timestamps),
+        "weekly_objective": {
+            "cadence": objective.cadence,
+            "limits": objective.limits,
+            "scoring_semantics_version": objective.scoring_semantics_version,
+        },
+        "candidates": candidates,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct SavedCandidateExitPolicyVariantV1 {
+    label: String,
+    max_hold_bars: usize,
+    trailing_enabled: bool,
+    trailing_atr_multiplier: Option<f64>,
+    trailing_be_trigger_r: Option<f64>,
+    trailing_give_back_r: Option<f64>,
+    trailing_min_lock_pips: Option<f64>,
+    sl_pips_override: Option<f64>,
+    tp_pips_override: Option<f64>,
+    disable_adaptive: bool,
+}
+
+fn saved_candidate_exit_policy_variant_v1(
+    label: impl Into<String>,
+    max_hold_bars: usize,
+    trailing_enabled: bool,
+    trailing_atr_multiplier: Option<f64>,
+    trailing_be_trigger_r: Option<f64>,
+    trailing_give_back_r: Option<f64>,
+    trailing_min_lock_pips: Option<f64>,
+    sl_pips_override: Option<f64>,
+    tp_pips_override: Option<f64>,
+    disable_adaptive: bool,
+) -> SavedCandidateExitPolicyVariantV1 {
+    SavedCandidateExitPolicyVariantV1 {
+        label: label.into(),
+        max_hold_bars,
+        trailing_enabled,
+        trailing_atr_multiplier,
+        trailing_be_trigger_r,
+        trailing_give_back_r,
+        trailing_min_lock_pips,
+        sl_pips_override,
+        tp_pips_override,
+        disable_adaptive,
+    }
+}
+
+fn saved_candidate_exit_policy_variants_v1() -> Vec<SavedCandidateExitPolicyVariantV1> {
+    let mut variants = vec![
+        saved_candidate_exit_policy_variant_v1(
+            "baseline_sealed_policy",
+            0,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "max_hold_32_bars",
+            32,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "max_hold_96_bars_approx_24h_m15",
+            96,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "trailing_existing_parameters",
+            0,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "trailing_early_lock",
+            0,
+            true,
+            Some(0.5),
+            Some(0.5),
+            None,
+            Some(2.0),
+            None,
+            None,
+            false,
+        ),
+        saved_candidate_exit_policy_variant_v1(
+            "trailing_existing_plus_96_bars",
+            96,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+    ];
+    // Profit-lock ladder: trigger the trailing stop early and lock a bounded
+    // give-back floor. Evaluated on the sealed adaptive geometry and on three
+    // representative fixed geometries. This is the direct, measurable answer to
+    // "the entries show MFE but the exits give it back".
+    for (geometry_label, sl_override, tp_override, disable_adaptive) in [
+        ("adaptive", None, None, false),
+        ("sl20rr2", Some(20.0_f64), Some(40.0_f64), true),
+        ("sl30rr2", Some(30.0_f64), Some(60.0_f64), true),
+        ("sl40rr2", Some(40.0_f64), Some(80.0_f64), true),
+    ] {
+        // Give-back must stay BELOW the trigger: a trail distance of zero (or
+        // negative, clamped to zero) degenerates into an instant exit the moment
+        // the trigger is touched and manufactures absurd trade counts and net
+        // figures. Only strictly positive trail distances are valid ladder rungs.
+        for (be_trigger_r, give_back_r) in [
+            (0.25_f64, 0.1_f64),
+            (0.25, 0.2),
+            (0.5, 0.2),
+            (0.5, 0.35),
+            (1.0, 0.2),
+            (1.0, 0.5),
+            // Winner-run rungs: engage the trail later so winners have room
+            // to reach the 1.5-2R region instead of being locked at ~0.75R.
+            (1.5, 0.5),
+            (1.5, 1.0),
+            (2.0, 0.5),
+            (2.0, 1.0),
+        ] {
+            for min_lock_pips in [2.0_f64, 5.0] {
+                variants.push(saved_candidate_exit_policy_variant_v1(
+                    format!(
+                        "profit_lock_{geometry_label}_be{be_trigger_r}_give{give_back_r}_lock{min_lock_pips}"
+                    ),
+                    0,
+                    true,
+                    None,
+                    Some(be_trigger_r),
+                    Some(give_back_r),
+                    Some(min_lock_pips),
+                    sl_override,
+                    tp_override,
+                    disable_adaptive,
+                ));
+            }
+        }
+    }
+    // Counterfactual fixed-geometry sweep. Adaptive scaling is disabled so
+    // the same entry signals are evaluated with explicit stop/target pips.
+    for stop_pips in [5.0_f64, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0] {
+        for reward_risk in [0.5_f64, 1.0, 1.5, 2.0, 3.0] {
+            for max_hold_bars in [0_usize, 32, 64, 96] {
+                for trailing_enabled in [false, true] {
+                    variants.push(saved_candidate_exit_policy_variant_v1(
+                        format!(
+                            "fixed_sl{stop_pips}_rr{reward_risk}_hold{max_hold_bars}_trail{trailing_enabled}"
+                        ),
+                        max_hold_bars,
+                        trailing_enabled,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(stop_pips),
+                        Some(stop_pips * reward_risk),
+                        true,
+                    ));
+                }
+            }
+        }
+    }
+    variants
+}
+
+fn saved_candidate_variant_settings_v1(
+    base: &crate::eval::BacktestSettings,
+    variant: &SavedCandidateExitPolicyVariantV1,
+) -> crate::eval::BacktestSettings {
+    if variant.label == "baseline_sealed_policy" {
+        return base.clone();
+    }
+    let mut settings = base.clone();
+    settings.max_hold_bars = variant.max_hold_bars;
+    settings.trailing_enabled = variant.trailing_enabled;
+    if let Some(value) = variant.trailing_atr_multiplier {
+        settings.trailing_atr_multiplier = value;
+    }
+    if let Some(value) = variant.trailing_be_trigger_r {
+        settings.trailing_be_trigger_r = value;
+    }
+    if let Some(value) = variant.trailing_give_back_r {
+        settings.trailing_atr_multiplier = (settings.trailing_be_trigger_r - value).max(0.0);
+    }
+    if let Some(value) = variant.trailing_min_lock_pips {
+        settings.trailing_min_lock_pips = value;
+    }
+    if variant.disable_adaptive {
+        settings.adaptive_vol_mult = 0.0;
+        settings.adaptive_base_pips = None;
+    }
+    if let Some(value) = variant.sl_pips_override {
+        settings.sl_pips = value;
+    }
+    if let Some(value) = variant.tp_pips_override {
+        settings.tp_pips = value;
+    }
+    settings
+}
+
+fn saved_candidate_exit_summary_v1(trades: &[Trade]) -> serde_json::Value {
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    let mut durations = Vec::with_capacity(trades.len());
+    let mut pnl_sum = 0.0_f64;
+    let mut mfe_sum = 0.0_f64;
+    let mut mae_sum = 0.0_f64;
+    let mut wins = 0usize;
+    for trade in trades {
+        let reason = format!("{:?}", trade.exit_reason);
+        *reasons.entry(reason).or_default() += 1;
+        let duration_hours = trade
+            .exit_time
+            .map(|exit| (exit - trade.entry_time) as f64 / 3_600_000.0)
+            .unwrap_or(0.0);
+        durations.push(duration_hours);
+        pnl_sum += trade.pnl;
+        mfe_sum += trade.mfe;
+        mae_sum += trade.mae;
+        if trade.pnl > 0.0 {
+            wins += 1;
+        }
+    }
+    durations.sort_by(|left, right| left.total_cmp(right));
+    let median = if durations.is_empty() {
+        0.0
+    } else {
+        durations[durations.len() / 2]
+    };
+    let mean = if durations.is_empty() {
+        0.0
+    } else {
+        durations.iter().sum::<f64>() / durations.len() as f64
+    };
+    // Monthly profitability is the operator's actual acceptance question. Group
+    // cost-charged per-trade returns by entry month (UTC) and report the whole
+    // distribution summary, not only the annual total.
+    let mut monthly: std::collections::BTreeMap<String, (usize, usize, f64)> =
+        std::collections::BTreeMap::new();
+    for trade in trades {
+        if let Some(pnl_pct) = trade.pnl_pct {
+            let month = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(trade.entry_time)
+                .map(|entry| entry.format("%Y-%m").to_string());
+            if let Some(month) = month {
+                let row = monthly.entry(month).or_default();
+                row.0 += 1;
+                row.1 += usize::from(pnl_pct > 0.0);
+                row.2 += pnl_pct;
+            }
+        }
+    }
+    let monthly_series: Vec<serde_json::Value> = monthly
+        .iter()
+        .map(|(month, (trades, wins, pnl_pct))| {
+            serde_json::json!({
+                "month": month,
+                "trades": trades,
+                "wins": wins,
+                "trade_win_rate": if *trades == 0 { 0.0 } else { *wins as f64 / *trades as f64 },
+                "pnl_pct": pnl_pct,
+            })
+        })
+        .collect();
+    let monthly_values: Vec<f64> = monthly.values().map(|(_, _, pnl)| *pnl).collect();
+    let positive_months = monthly_values.iter().filter(|value| **value > 0.0).count();
+    let negative_months = monthly_values.iter().filter(|value| **value < 0.0).count();
+    let months_observed = monthly_values.len();
+    let worst_month_pnl_pct = monthly_values.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut sorted_monthly = monthly_values.clone();
+    sorted_monthly.sort_by(|left, right| left.total_cmp(right));
+    let median_month_pnl_pct = if sorted_monthly.is_empty() {
+        0.0
+    } else {
+        sorted_monthly[sorted_monthly.len() / 2]
+    };
+    let monthly_win_rate = if positive_months + negative_months == 0 {
+        0.0
+    } else {
+        positive_months as f64 / (positive_months + negative_months) as f64
+    };
+    serde_json::json!({
+        "trade_count": trades.len(),
+        "win_count": wins,
+        "pnl_sum": pnl_sum,
+        "mfe_sum": mfe_sum,
+        "mae_sum": mae_sum,
+        "duration_hours_min": durations.first().copied().unwrap_or(0.0),
+        "duration_hours_median": median,
+        "duration_hours_mean": mean,
+        "duration_hours_max": durations.last().copied().unwrap_or(0.0),
+        "exit_reason_counts": reasons,
+        "monthly": {
+            "months_observed": months_observed,
+            "positive_months": positive_months,
+            "negative_months": negative_months,
+            "monthly_win_rate": monthly_win_rate,
+            "worst_month_pnl_pct": if months_observed == 0 { 0.0 } else { worst_month_pnl_pct },
+            "median_month_pnl_pct": median_month_pnl_pct,
+            "series": monthly_series,
+        },
+    })
+}
+
+/// Research-only counterfactual replay under existing exit controls.
+pub fn summarize_saved_candidate_exit_policy_variants_v1(
+    selections: &[SavedCandidateSelectionV1],
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+) -> Result<serde_json::Value> {
+    let (replay, selected) =
+        prepare_saved_candidate_diagnostic_v1(input, config, research, selections)?;
+    let result = research.discovery_result();
+    let selection = replay.inputs.selection();
+    let timestamps = replay.projected.timestamps.as_slice();
+    anyhow::ensure!(
+        !timestamps.is_empty(),
+        "saved candidate exit-policy diagnostic has no selection bars"
+    );
+    let (month_idx, day_idx) = month_day_indices(timestamps);
+    // PropFirm runs seal a rolling weekly cadence objective; Risky runs do not
+    // (their gate is the 180-day growth horizon). The diagnostic stays valid for
+    // both: cadence rows are reported only when the sealed objective exists.
+    let objective = replay
+        .research_config
+        .weekly_objective_for_window(timestamps)?;
+    let resolver = GeneEvalSettingsResolver::for_slice(
+        &replay.research_config,
+        selected.iter().map(|(_, gene)| gene),
+        &selection.ohlcv().high,
+        &selection.ohlcv().low,
+        &selection.ohlcv().close,
+    )?;
+    let variants = saved_candidate_exit_policy_variants_v1();
+    let (_genes, signals, confidences) = saved_candidate_signal_rows_v1(&replay, &selected)?;
+    let mut candidates = Vec::with_capacity(selected.len());
+    for (position, ((index, gene), (signal, confidence))) in selected
+        .iter()
+        .zip(signals.iter().zip(confidences.iter()))
+        .enumerate()
+    {
+        let base_settings = resolver.settings_for_gene(gene);
+        let mut variant_rows = Vec::with_capacity(variants.len());
+        let mut baseline_metrics = None;
+        let mut baseline_ledger = 0usize;
+        for variant in &variants {
+            let settings = saved_candidate_variant_settings_v1(&base_settings, variant);
+            let (metrics, trades) = evaluate_gene_with_ledger_v1(
+                selection.ohlcv(),
+                timestamps,
+                &month_idx,
+                &day_idx,
+                signal,
+                confidence,
+                &settings,
+            )?;
+            if variant.label == "baseline_sealed_policy" {
+                baseline_metrics = Some(metrics);
+                baseline_ledger = trades.len();
+            }
+            let entry_times = trades
+                .iter()
+                .map(|trade| trade.entry_time)
+                .collect::<Vec<_>>();
+            let cadence = match &objective {
+                Some(objective) => Some(
+                    crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
+                        &objective.cadence,
+                        &entry_times,
+                    )?,
+                ),
+                None => None,
+            };
+            variant_rows.push(serde_json::json!({
+                "label": variant.label,
+                "max_hold_bars": settings.max_hold_bars,
+                "trailing_enabled": settings.trailing_enabled,
+                "sl_pips": settings.sl_pips,
+                "tp_pips": settings.tp_pips,
+                "adaptive_scaling_disabled": variant.disable_adaptive,
+                "trailing_atr_multiplier": settings.trailing_atr_multiplier,
+                "trailing_be_trigger_r": settings.trailing_be_trigger_r,
+                "trailing_min_lock_pips": settings.trailing_min_lock_pips,
+                "metrics": {
+                    "names": SAVED_CANDIDATE_METRIC_NAMES,
+                    "values": metrics.to_vec(),
+                },
+                "ledger": saved_candidate_exit_summary_v1(&trades),
+                "monthly_breakdown": crate::quality::monthly_closed_trade_metrics_v1(
+                    &trades,
+                    settings.initial_equity(),
+                    timestamps[0],
+                    *timestamps.last().unwrap(),
+                )?,
+                "weekly_cadence": cadence,
+            }));
+        }
+        let baseline_metrics = baseline_metrics
+            .ok_or_else(|| anyhow::anyhow!("exit-policy diagnostic has no baseline variant"))?;
+        let (metric_deltas, mut mismatch_reasons) =
+            saved_candidate_metric_deltas_v1(gene, &baseline_metrics);
+        if baseline_ledger != gene.trades_count {
+            mismatch_reasons.push(format!(
+                "baseline trade_count: actual ledger {} vs saved {}",
+                baseline_ledger, gene.trades_count
+            ));
+        }
+        candidates.push(serde_json::json!({
+            "candidate": {
+                "index": index,
+                "strategy_id": gene.strategy_id,
+                "exact_gene_hash": selections[position].exact_gene_hash,
+            },
+            "saved_trade_count": gene.trades_count,
+            "baseline_ledger_trade_count": baseline_ledger,
+            "baseline_metric_deltas": {
+                "names": SAVED_CANDIDATE_METRIC_NAMES,
+                "values": metric_deltas,
+            },
+            "material_mismatch": !mismatch_reasons.is_empty(),
+            "material_mismatch_reasons": mismatch_reasons,
+            "base_settings_provenance": saved_candidate_settings_provenance_v1(&base_settings),
+            "variants": variant_rows,
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema": "neoethos.research-only.saved-candidate-exit-policy-variants.v1",
+        "candidate_count": candidates.len(),
+        "selection_bars": timestamps.len(),
+        "provenance": saved_candidate_diagnostic_provenance_v1(result, timestamps),
+        "weekly_objective": objective.as_ref().map_or(serde_json::Value::Null, |objective| {
+            serde_json::json!({
+                "cadence": objective.cadence,
+                "limits": objective.limits,
+                "scoring_semantics_version": objective.scoring_semantics_version,
+            })
+        }),
+        "variants": variants
+            .iter()
+            .map(|variant| serde_json::json!({
+                "label": variant.label,
+                "max_hold_bars": variant.max_hold_bars,
+                "trailing_enabled": variant.trailing_enabled,
+                "trailing_atr_multiplier": variant.trailing_atr_multiplier,
+                "trailing_be_trigger_r": variant.trailing_be_trigger_r,
+                "trailing_min_lock_pips": variant.trailing_min_lock_pips,
+            }))
+            .collect::<Vec<_>>(),
+        "candidates": candidates,
+    }))
+}
+
+/// Fixed descriptive near-similarity thresholds for the saved-candidate
+/// signal census. These are report buckets, not selection knobs.
+pub const CANDIDATE_SIGNAL_NEAR_THRESHOLDS: [f64; 3] = [0.90, 0.95, 0.99];
+const CANDIDATE_SIGNAL_CHUNK: usize = 64;
+const CANDIDATE_SIGNAL_TOP_PAIRS: usize = 64;
+const CANDIDATE_SIGNAL_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+const CANDIDATE_SIGNAL_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateSignalIdentityV1 {
+    pub index: usize,
+    pub strategy_id: String,
+    pub exact_gene_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateSignalExactGroupV1 {
+    all_zero: bool,
+    active_bars: usize,
+    long_bars: usize,
+    short_bars: usize,
+    candidates: Vec<CandidateSignalIdentityV1>,
+}
+
+#[derive(Clone)]
+struct CandidateSignalFingerprintV1 {
+    identity: CandidateSignalIdentityV1,
+    long: Vec<u64>,
+    short: Vec<u64>,
+    active_bars: usize,
+    long_bars: usize,
+    short_bars: usize,
+    signal_hash: u64,
+    all_zero: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CandidateSignalPairStatV1 {
+    left: usize,
+    right: usize,
+    similarity: f64,
+    same_direction_bars: usize,
+    opposite_direction_bars: usize,
+    active_union_bars: usize,
+    both_zero_bars: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateSignalAggregateV1 {
+    exact_signal_groups: Vec<CandidateSignalExactGroupV1>,
+    all_zero_candidates: usize,
+    defined_pairs: usize,
+    undefined_zero_union_pairs: usize,
+    exact_signal_candidate_total: usize,
+    same_direction_bars_sum: u64,
+    opposite_direction_bars_sum: u64,
+    active_union_bars_sum: u64,
+    threshold_counts: [usize; CANDIDATE_SIGNAL_NEAR_THRESHOLDS.len()],
+    top_pairs: Vec<CandidateSignalPairStatV1>,
+}
+
+fn candidate_signal_hash(signal: &[i8]) -> u64 {
+    let mut hash = CANDIDATE_SIGNAL_HASH_SEED;
+    for value in signal {
+        hash ^= u64::from(*value as u8);
+        hash = hash.wrapping_mul(CANDIDATE_SIGNAL_HASH_PRIME);
+    }
+    hash
+}
+
+fn candidate_signal_bitsets(
+    signal: &[i8],
+    n_bars: usize,
+    identity: CandidateSignalIdentityV1,
+) -> anyhow::Result<CandidateSignalFingerprintV1> {
+    anyhow::ensure!(
+        signal.len() == n_bars,
+        "saved candidate '{}' signal length {} differs from {n_bars} bars",
+        identity.strategy_id,
+        signal.len()
+    );
+    let words = n_bars.div_ceil(64);
+    let mut long = vec![0_u64; words];
+    let mut short = vec![0_u64; words];
+    let mut long_bars = 0usize;
+    let mut short_bars = 0usize;
+    for (row, value) in signal.iter().copied().enumerate() {
+        let bit = 1_u64 << (row % 64);
+        let word = row / 64;
+        match value {
+            1 => {
+                long[word] |= bit;
+                long_bars += 1;
+            }
+            -1 => {
+                short[word] |= bit;
+                short_bars += 1;
+            }
+            0 => {}
+            other => anyhow::bail!(
+                "saved candidate '{}' signal at row {row} is {other}, not -1/0/1",
+                identity.strategy_id
+            ),
+        }
+    }
+    Ok(CandidateSignalFingerprintV1 {
+        identity,
+        long,
+        short,
+        active_bars: long_bars + short_bars,
+        long_bars,
+        short_bars,
+        signal_hash: candidate_signal_hash(signal),
+        all_zero: long_bars + short_bars == 0,
+    })
+}
+
+fn candidate_signal_pair_stat(
+    left: usize,
+    right: usize,
+    fingerprints: &[CandidateSignalFingerprintV1],
+    n_bars: usize,
+) -> Option<CandidateSignalPairStatV1> {
+    let left = &fingerprints[left];
+    let right = &fingerprints[right];
+    // One fused pass over the four sign words: active union and both
+    // directional overlaps are accumulated together, avoiding five separate
+    // bit-word scans per candidate pair.
+    let mut active_union_bars = 0usize;
+    let mut same_direction_bars = 0usize;
+    let mut opposite_direction_bars = 0usize;
+    for index in 0..left.long.len() {
+        let left_long = left.long[index];
+        let left_short = left.short[index];
+        let right_long = right.long[index];
+        let right_short = right.short[index];
+        active_union_bars +=
+            ((left_long | left_short) | (right_long | right_short)).count_ones() as usize;
+        same_direction_bars += (left_long & right_long).count_ones() as usize
+            + (left_short & right_short).count_ones() as usize;
+        opposite_direction_bars += (left_long & right_short).count_ones() as usize
+            + (left_short & right_long).count_ones() as usize;
+    }
+    if active_union_bars == 0 {
+        return None;
+    }
+    Some(CandidateSignalPairStatV1 {
+        left: 0,
+        right: 0,
+        similarity: same_direction_bars as f64 / active_union_bars as f64,
+        same_direction_bars,
+        opposite_direction_bars,
+        active_union_bars,
+        both_zero_bars: n_bars - active_union_bars,
+    })
+}
+
+fn aggregate_candidate_signal_behavior(
+    fingerprints: &[CandidateSignalFingerprintV1],
+    n_bars: usize,
+) -> CandidateSignalAggregateV1 {
+    let mut exact_buckets: std::collections::HashMap<u64, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, fingerprint) in fingerprints.iter().enumerate() {
+        exact_buckets
+            .entry(fingerprint.signal_hash)
+            .or_default()
+            .push(index);
+    }
+    let mut exact_signal_groups = Vec::new();
+    let mut exact_signal_candidate_count = 0usize;
+    let mut all_zero_candidates = 0usize;
+    for indices in exact_buckets.into_values() {
+        if indices.len() < 2 {
+            if fingerprints[indices[0]].all_zero {
+                all_zero_candidates += 1;
+            }
+            continue;
+        }
+        let mut remaining = indices;
+        while let Some(first) = remaining.pop() {
+            let first_fp = &fingerprints[first];
+            let mut group = vec![first];
+            remaining.retain(|&index| {
+                let fp = &fingerprints[index];
+                if fp.long == first_fp.long && fp.short == first_fp.short {
+                    group.push(index);
+                    false
+                } else {
+                    true
+                }
+            });
+            if group.len() > 1 {
+                group.sort_unstable();
+                let group_fp = &fingerprints[group[0]];
+                if group_fp.all_zero {
+                    all_zero_candidates += group.len();
+                }
+                exact_signal_candidate_count += group.len();
+                exact_signal_groups.push(CandidateSignalExactGroupV1 {
+                    all_zero: group_fp.all_zero,
+                    active_bars: group_fp.active_bars,
+                    long_bars: group_fp.long_bars,
+                    short_bars: group_fp.short_bars,
+                    candidates: group
+                        .into_iter()
+                        .map(|index| fingerprints[index].identity.clone())
+                        .collect(),
+                });
+            } else if first_fp.all_zero {
+                all_zero_candidates += 1;
+            }
+        }
+    }
+    exact_signal_groups
+        .sort_by(|left, right| left.candidates[0].index.cmp(&right.candidates[0].index));
+
+    let mut defined_pairs = 0usize;
+    let mut undefined_zero_union_pairs = 0usize;
+    let mut same_direction_bars_sum = 0u64;
+    let mut opposite_direction_bars_sum = 0u64;
+    let mut active_union_bars_sum = 0u64;
+    let mut threshold_counts = [0usize; CANDIDATE_SIGNAL_NEAR_THRESHOLDS.len()];
+    let mut top_pairs: Vec<CandidateSignalPairStatV1> =
+        Vec::with_capacity(CANDIDATE_SIGNAL_TOP_PAIRS);
+    for left in 0..fingerprints.len() {
+        for right in (left + 1)..fingerprints.len() {
+            let Some(mut stat) = candidate_signal_pair_stat(left, right, fingerprints, n_bars)
+            else {
+                undefined_zero_union_pairs += 1;
+                continue;
+            };
+            stat.left = left;
+            stat.right = right;
+            defined_pairs += 1;
+            same_direction_bars_sum += stat.same_direction_bars as u64;
+            opposite_direction_bars_sum += stat.opposite_direction_bars as u64;
+            active_union_bars_sum += stat.active_union_bars as u64;
+            for (slot, threshold) in CANDIDATE_SIGNAL_NEAR_THRESHOLDS.iter().enumerate() {
+                if stat.similarity >= *threshold {
+                    threshold_counts[slot] += 1;
+                }
+            }
+            if top_pairs.len() < CANDIDATE_SIGNAL_TOP_PAIRS {
+                top_pairs.push(stat);
+            } else {
+                let (worst_index, worst) = top_pairs
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, left), (_, right)| {
+                        left.similarity
+                            .total_cmp(&right.similarity)
+                            .then_with(|| right.left.cmp(&left.left))
+                            .then_with(|| right.right.cmp(&left.right))
+                    })
+                    .map(|(index, stat)| (index, *stat))
+                    .expect("nonempty top pairs");
+                let better = stat
+                    .similarity
+                    .total_cmp(&worst.similarity)
+                    .then_with(|| worst.left.cmp(&stat.left))
+                    .then_with(|| worst.right.cmp(&stat.right))
+                    .is_gt();
+                if better {
+                    top_pairs[worst_index] = stat;
+                }
+            }
+        }
+    }
+    top_pairs.sort_by(|left, right| {
+        right
+            .similarity
+            .total_cmp(&left.similarity)
+            .then_with(|| left.left.cmp(&right.left))
+            .then_with(|| left.right.cmp(&right.right))
+    });
+    CandidateSignalAggregateV1 {
+        exact_signal_groups,
+        all_zero_candidates,
+        defined_pairs,
+        undefined_zero_union_pairs,
+        exact_signal_candidate_total: exact_signal_candidate_count,
+        same_direction_bars_sum,
+        opposite_direction_bars_sum,
+        active_union_bars_sum,
+        threshold_counts,
+        top_pairs,
+    }
+}
+
+pub fn summarize_research_candidate_signal_similarity_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+) -> anyhow::Result<serde_json::Value> {
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    let result = research.discovery_result();
+    let candidates = &result.candidates;
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "saved candidate signal behavior census requires at least one saved candidate"
+    );
+    let n_bars = replay.inputs.selection().ohlcv().len();
+    anyhow::ensure!(
+        n_bars > 0,
+        "saved candidate signal behavior census has no bars"
+    );
+    let mut fingerprints = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(CANDIDATE_SIGNAL_CHUNK) {
+        let (signals, confidences) = replay.signals(chunk)?;
+        anyhow::ensure!(
+            signals.len() == chunk.len(),
+            "saved candidate signal replay returned {} signal rows for {} candidates",
+            signals.len(),
+            chunk.len()
+        );
+        anyhow::ensure!(
+            confidences.len() == chunk.len(),
+            "saved candidate signal replay returned {} confidence rows for {} candidates",
+            confidences.len(),
+            chunk.len()
+        );
+        for (gene, signal) in chunk.iter().zip(signals.iter()) {
+            let identity = CandidateSignalIdentityV1 {
+                index: fingerprints.len(),
+                strategy_id: gene.strategy_id.clone(),
+                exact_gene_hash: crate::artifact_io::stable_json_hash(gene)?,
+            };
+            fingerprints.push(candidate_signal_bitsets(signal, n_bars, identity)?);
+        }
+        // Signals/confidences are chunk-scoped; only compact bitsets and
+        // identities survive. No all-candidate f64 arrays are retained.
+        drop(signals);
+        drop(confidences);
+    }
+    anyhow::ensure!(
+        fingerprints.len() == candidates.len(),
+        "saved candidate signal behavior census lost candidates"
+    );
+
+    let aggregate = aggregate_candidate_signal_behavior(&fingerprints, n_bars);
+    let exact_signal_groups = aggregate
+        .exact_signal_groups
+        .into_iter()
+        .map(|group| {
+            let candidate_identities = group.candidates;
+            serde_json::json!({
+                "all_zero": group.all_zero,
+                "support_bars": group.active_bars,
+                "long_active_bars": group.long_bars,
+                "short_active_bars": group.short_bars,
+                "candidate_identities": candidate_identities,
+            })
+        })
+        .collect::<Vec<_>>();
+    let near_thresholds = CANDIDATE_SIGNAL_NEAR_THRESHOLDS
+        .iter()
+        .copied()
+        .zip(aggregate.threshold_counts)
+        .map(|(threshold, count)| {
+            serde_json::json!({
+                "similarity_threshold": threshold,
+                "defined_pairs_at_or_above_threshold": count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let top_pairs = aggregate
+        .top_pairs
+        .into_iter()
+        .map(|stat| {
+            serde_json::json!({
+                "left_candidate": fingerprints[stat.left].identity,
+                "right_candidate": fingerprints[stat.right].identity,
+                "signal_similarity": stat.similarity,
+                "same_direction_active_bars": stat.same_direction_bars,
+                "opposite_direction_active_bars": stat.opposite_direction_bars,
+                "active_union_bars": stat.active_union_bars,
+                "both_zero_bars": stat.both_zero_bars,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "schema": "neoethos.research-only.candidate-signal-behavior-census.v1",
+        "candidate_count": fingerprints.len(),
+        "signal_bars": n_bars,
+        "provenance": {
+            "ordered_effective_feature_count": result.effective_feature_names.len(),
+            "ordered_effective_feature_names": result.effective_feature_names,
+            "saved_feature_plan_identity": result.search_input_receipt.feature_plan_identity(),
+            "saved_feature_provenance_identity": result.search_input_receipt.feature_provenance_identity(),
+            "saved_feature_content_sha256": result.search_input_receipt.feature_content_sha256(),
+            "sealed_smc_gate_threshold": result.effective_smc_gate_threshold,
+            "saved_selection_start_ms": replay.inputs.selection().features().timestamps.first()
+                .ok_or_else(|| anyhow::anyhow!("saved candidate signal behavior census has no timestamps"))?,
+            "saved_selection_end_ms": replay.inputs.selection().features().timestamps.last()
+                .ok_or_else(|| anyhow::anyhow!("saved candidate signal behavior census has no timestamps"))?,
+        },
+        "summary": {
+            "all_zero_candidate_count": aggregate.all_zero_candidates,
+            "defined_pair_count": aggregate.defined_pairs,
+            "undefined_zero_union_pair_count": aggregate.undefined_zero_union_pairs,
+            "same_direction_active_bars_sum": aggregate.same_direction_bars_sum,
+            "opposite_direction_active_bars_sum": aggregate.opposite_direction_bars_sum,
+            "active_union_bars_total": aggregate.active_union_bars_sum,
+            "exact_signal_group_total": exact_signal_groups.len(),
+            "exact_signal_candidate_total": aggregate.exact_signal_candidate_total,
+        },
+        "exact_signal_groups": exact_signal_groups,
+        "near_thresholds": near_thresholds,
+        "top_pairs": top_pairs,
+    }))
+}
+
+/// Install the saved research execution scope for the diagnostic replay.
+///
+/// Without this RAII scope the discovery evaluation path falls back to ambient
+/// symbol/price metadata: for an EUR account the pip basis (quote pip value
+/// divided by the contract D1 conversion price) would be recomputed from a
+/// different price. The canonical wrappers keep this exact scope alive for
+/// their whole replay; the diagnostic must do the same instead of inventing a
+/// second scope implementation or silently accepting ambient economics.
+pub(crate) fn install_research_replay_execution_scope(
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+) -> Result<crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionScopeV3> {
+    crate::canonical_trendbar_research::install_canonical_trendbar_research_execution_v3(contract)
+}
+
+/// The diagnostic replay must not silently trust ambient adaptive stops: the
+/// resolved stop recipe is a separate archived object from EvaluationConfig and
+/// the per-gene resolver reads the process-owned adaptive producer. Compare the
+/// WHOLE policy (enabled flag, reward/risk fallback and every stop-target
+/// setting) so a mismatch is refused explicitly instead of changing stops.
+fn ensure_adaptive_stops_policy_matches_sealed(
+    current: &crate::stop_target::ResolvedAdaptiveStopsPolicyV1,
+    sealed: &crate::stop_target::ResolvedAdaptiveStopsPolicyV1,
+) -> Result<()> {
+    anyhow::ensure!(
+        current == sealed,
+        "ambient adaptive-stop policy differs from the sealed Search policy — refusing to price saved adaptive candidates under a different stop recipe"
+    );
+    Ok(())
+}
+
+/// Refuse to price saved candidates under a reconstructed configuration whose
+/// replay-relevant fields differ from the archived sealed Search policy.
+///
+/// The legacy resolved-config stamp and the full Search config hash are
+/// different hash domains, so equality of the two proves nothing. The sealed
+/// policy carries the ACTUAL stage-1 evaluation (initial equity, risk bands,
+/// exit geometry, kill zones, swaps, conversion fee, pip value, session spread,
+/// SMC weights, growth objective). This guard compares exactly those fields and
+/// only leaves the cost envelope to the caller's explicit variants.
+fn ensure_research_config_matches_sealed_evaluation(
+    config: &DiscoveryConfig,
+    price_hint: Option<f64>,
+    final_gate: f64,
+    sealed: &EvaluationConfig,
+) -> Result<()> {
+    let rebuilt = config.evaluation_config_with_smc_gate(price_hint, final_gate);
+    let mismatch = |field: &str, rebuilt: String, sealed: String| -> Result<()> {
+        anyhow::bail!(
+            "reconstructed discovery config field {field} = {rebuilt} differs from the sealed Search policy = {sealed}; refusing to price saved candidates under a configuration that is not the original run"
+        )
+    };
+    if let Some(objective) = sealed.weekly_objective {
+        objective
+            .validate_current()
+            .map_err(|error| anyhow::anyhow!("sealed weekly objective is not current: {error}"))?;
+    }
+    anyhow::ensure!(
+        config.weekly_search_limits()? == sealed.weekly_objective.map(|o| o.limits),
+        "reconstructed weekly objective differs from the sealed Search policy"
+    );
+    if rebuilt.symbol != sealed.symbol {
+        return mismatch("symbol", rebuilt.symbol.clone(), sealed.symbol.clone());
+    }
+    if rebuilt.account_currency != sealed.account_currency {
+        return mismatch(
+            "account_currency",
+            rebuilt.account_currency.clone(),
+            sealed.account_currency.clone(),
+        );
+    }
+    let floats = [
+        (
+            "initial_equity",
+            rebuilt.initial_equity,
+            sealed.initial_equity,
+        ),
+        (
+            "trailing_atr_multiplier",
+            rebuilt.trailing_atr_multiplier,
+            sealed.trailing_atr_multiplier,
+        ),
+        (
+            "trailing_be_trigger_r",
+            rebuilt.trailing_be_trigger_r,
+            sealed.trailing_be_trigger_r,
+        ),
+        (
+            "trailing_min_lock_pips",
+            rebuilt.trailing_min_lock_pips,
+            sealed.trailing_min_lock_pips,
+        ),
+        ("pip_value", rebuilt.pip_value, sealed.pip_value),
+        ("spread_pips", rebuilt.spread_pips, sealed.spread_pips),
+        (
+            "commission_per_trade",
+            rebuilt.commission_per_trade,
+            sealed.commission_per_trade,
+        ),
+        (
+            "pip_value_per_lot",
+            rebuilt.pip_value_per_lot,
+            sealed.pip_value_per_lot,
+        ),
+        (
+            "swap_long_pips_per_day",
+            rebuilt.swap_long_pips_per_day,
+            sealed.swap_long_pips_per_day,
+        ),
+        (
+            "swap_short_pips_per_day",
+            rebuilt.swap_short_pips_per_day,
+            sealed.swap_short_pips_per_day,
+        ),
+        (
+            "pnl_conversion_fee_rate",
+            rebuilt.pnl_conversion_fee_rate,
+            sealed.pnl_conversion_fee_rate,
+        ),
+        (
+            "risk_per_trade_min",
+            rebuilt.risk_per_trade_min,
+            sealed.risk_per_trade_min,
+        ),
+        (
+            "risk_per_trade_max",
+            rebuilt.risk_per_trade_max,
+            sealed.risk_per_trade_max,
+        ),
+        (
+            "high_quality_confidence",
+            rebuilt.high_quality_confidence,
+            sealed.high_quality_confidence,
+        ),
+        ("smc_weight_ob", rebuilt.smc_weight_ob, sealed.smc_weight_ob),
+        (
+            "smc_weight_fvg",
+            rebuilt.smc_weight_fvg,
+            sealed.smc_weight_fvg,
+        ),
+        (
+            "smc_weight_liq",
+            rebuilt.smc_weight_liq,
+            sealed.smc_weight_liq,
+        ),
+        (
+            "smc_weight_mtf",
+            rebuilt.smc_weight_mtf,
+            sealed.smc_weight_mtf,
+        ),
+        (
+            "smc_weight_premium",
+            rebuilt.smc_weight_premium,
+            sealed.smc_weight_premium,
+        ),
+        (
+            "smc_weight_inducement",
+            rebuilt.smc_weight_inducement,
+            sealed.smc_weight_inducement,
+        ),
+        (
+            "smc_weight_bos",
+            rebuilt.smc_weight_bos,
+            sealed.smc_weight_bos,
+        ),
+        (
+            "smc_weight_choch",
+            rebuilt.smc_weight_choch,
+            sealed.smc_weight_choch,
+        ),
+        (
+            "smc_weight_eqh",
+            rebuilt.smc_weight_eqh,
+            sealed.smc_weight_eqh,
+        ),
+        (
+            "smc_weight_eql",
+            rebuilt.smc_weight_eql,
+            sealed.smc_weight_eql,
+        ),
+        (
+            "smc_weight_displacement",
+            rebuilt.smc_weight_displacement,
+            sealed.smc_weight_displacement,
+        ),
+    ];
+    for (field, rebuilt, sealed) in floats {
+        let scale = rebuilt.abs().max(sealed.abs()).max(1.0);
+        if !(rebuilt.is_finite() && sealed.is_finite()) || (rebuilt - sealed).abs() > 1e-9 * scale {
+            return mismatch(field, format!("{rebuilt}"), format!("{sealed}"));
+        }
+    }
+    if rebuilt.max_hold_bars != sealed.max_hold_bars
+        || rebuilt.trailing_enabled != sealed.trailing_enabled
+        || rebuilt.kill_zones_enabled != sealed.kill_zones_enabled
+        || rebuilt.growth_objective != sealed.growth_objective
+    {
+        return mismatch(
+            "replay flags",
+            format!(
+                "max_hold_bars={} trailing_enabled={} kill_zones_enabled={} growth_objective={}",
+                rebuilt.max_hold_bars,
+                rebuilt.trailing_enabled,
+                rebuilt.kill_zones_enabled,
+                rebuilt.growth_objective
+            ),
+            format!(
+                "max_hold_bars={} trailing_enabled={} kill_zones_enabled={} growth_objective={}",
+                sealed.max_hold_bars,
+                sealed.trailing_enabled,
+                sealed.kill_zones_enabled,
+                sealed.growth_objective
+            ),
+        );
+    }
+    if rebuilt.session_spread_pips != sealed.session_spread_pips {
+        return mismatch(
+            "session_spread_pips",
+            format!("{:?}", rebuilt.session_spread_pips),
+            format!("{:?}", sealed.session_spread_pips),
+        );
+    }
+    let rebuilt_goal = serde_json::to_string(&rebuilt.growth_goal).unwrap_or_default();
+    let sealed_goal = serde_json::to_string(&sealed.growth_goal).unwrap_or_default();
+    if rebuilt_goal != sealed_goal {
+        return mismatch("growth_goal", rebuilt_goal, sealed_goal);
+    }
+    Ok(())
+}
 /// Replay each portfolio gene on a held-out tail window and produce one
-/// [`ForwardTestValidationArtifactFile`] per strategy. The caller passes
+/// ForwardTestValidationArtifactFile per strategy. The caller passes
 /// the *raw* tail (with the same `feature_names` ordering it had before
 /// discovery) and `effective_feature_names` produced by discovery; the
 /// helper aligns the tail's columns to the post-prefilter set so the
@@ -6709,6 +9387,7 @@ struct QualityScreenRejects {
     /// Failed both the strict and the opportunistic metric bars. Equal to the
     /// sum of the ten fields below it, by construction.
     base_quality: usize,
+    weekly_cadence: Option<usize>,
     bq_account_wiped: usize,
     bq_profile_net_expectancy: usize,
     bq_profile_expectancy_significance: usize,
@@ -6735,31 +9414,6 @@ struct QualityScreenRejects {
     mc_near_miss: usize,
     /// Went unprofitable once the stress spread/commission were applied.
     sensitivity: usize,
-}
-
-/// Run-level tally of [`CostBandVerdict`] across every screened candidate.
-///
-/// Read `optimistic_edge_only` before reading the survivor count. Those
-/// candidates cleared every configured gate and are still not results: they are
-/// profitable only at the cheap end of a cost the operator cannot pin down to a
-/// tenth of a pip.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct CostBandCensus {
-    pub survives: usize,
-    pub optimistic_edge_only: usize,
-    pub fails: usize,
-    pub unmeasured: usize,
-    pub not_discriminating: usize,
-}
-
-impl CostBandCensus {
-    pub fn total(&self) -> usize {
-        self.survives
-            + self.optimistic_edge_only
-            + self.fails
-            + self.unmeasured
-            + self.not_discriminating
-    }
 }
 
 /// Can the configured band tell anything apart from the baseline it is measured
@@ -6861,6 +9515,7 @@ impl CostBandVerdict {
 impl QualityScreenRejects {
     fn total(&self) -> usize {
         self.base_quality
+            + self.weekly_cadence.unwrap_or(0)
             + self.regime
             + self.mc_error
             + self.sensitivity_error
@@ -6914,6 +9569,74 @@ impl QualityScreenRejects {
             ),
         ]
     }
+}
+
+fn gene_artifact_metrics_finite_v1(gene: &Gene) -> bool {
+    let scalars = [
+        gene.long_threshold,
+        gene.short_threshold,
+        gene.fitness,
+        gene.sharpe_ratio,
+        gene.win_rate,
+        gene.max_drawdown,
+        gene.profit_factor,
+        gene.expectancy,
+        gene.tp_pips,
+        gene.sl_pips,
+        gene.slice_pass_rate,
+        gene.consistency,
+        gene.stop_vol_mult,
+    ];
+    scalars.iter().all(|value| value.is_finite())
+        && gene.weights.iter().all(|value| value.is_finite())
+}
+
+fn retain_finite_artifact_ranked_candidates_v1(ranked: &mut Vec<(usize, Gene)>) -> usize {
+    let before = ranked.len();
+    ranked.retain(|(_, gene)| gene_artifact_metrics_finite_v1(gene));
+    before.saturating_sub(ranked.len())
+}
+
+fn ensure_gene_artifact_metrics_finite_v1(genes: &[Gene], boundary: &str) -> Result<()> {
+    let violations: Vec<String> = genes
+        .iter()
+        .enumerate()
+        .filter(|(_, gene)| !gene_artifact_metrics_finite_v1(gene))
+        .map(|(index, gene)| {
+            if gene.strategy_id.is_empty() {
+                format!("#{index}<unnamed>")
+            } else {
+                format!("#{index} {}", gene.strategy_id)
+            }
+        })
+        .collect();
+    if !violations.is_empty() {
+        anyhow::bail!(
+            "{boundary} contains {} nonfinite gene artifact metric/weight value(s) at {}; \
+             refusing to publish an artifact whose JSON would contain null f64 fields",
+            violations.len(),
+            violations.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Validate the exact final result at the publication boundary before any caller
+/// can emit a success artifact. This intentionally fails closed instead of
+/// dropping, reindexing or rewriting archived genes: candidate indices,
+/// metrics and validation-cohort identities must stay aligned with the archive.
+pub fn validate_discovery_result_publication_v1(result: &DiscoveryResult) -> Result<()> {
+    ensure_gene_artifact_metrics_finite_v1(
+        &result.candidates,
+        "DiscoveryResult.candidates (ranked candidate archive)",
+    )?;
+    ensure_gene_artifact_metrics_finite_v1(&result.portfolio, "DiscoveryResult.portfolio")?;
+    // The full strict serialize/deserialize roundtrip and exact-record
+    // comparison live in the bounded regression test only: encoding a second
+    // full DiscoveryResult copy here would allocate artifacts up to 745MB at
+    // runtime while the direct finite guards above already prevent the
+    // demonstrated null-f64 publication defect.
+    Ok(())
 }
 
 pub fn run_discovery_cycle(
@@ -7563,6 +10286,146 @@ where
     })
 }
 
+/// Run-scoped reviewed-bundle variant of
+/// [`run_discovery_cycle_with_quote_validated_outer_holdout_and_progress`].
+///
+/// A presented
+/// [`neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2`]
+/// replaces ONLY the process-wide `HistoricalEvaluation` capability require for
+/// this exact run. Every other receipt/cost/gate check is identical, including
+/// the single post-lock quote-replay provider call after the portfolio is
+/// final. The authority is move-only: this entrypoint consumes it by handing
+/// it to the provider exactly once, so the sealed replay can consume it; a
+/// foreign run-scoped authority is refused before discovery.
+pub fn run_reviewed_discovery_cycle_with_quote_validated_outer_holdout_and_progress<F, P>(
+    authority: neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2,
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    prop_firm_rules: PropFirmRiskRules,
+    mut replay_provider: P,
+    progress_fn: F,
+) -> Result<QuoteValidatedDiscoveryResultV1>
+where
+    F: FnMut(DiscoveryProgress),
+    P: FnMut(
+        neoethos_core::broker_financial_truth::BrokerFinancialTruthAuthorityV2,
+        &DiscoveryResult,
+        &[Vec<i8>],
+        &CanonicalSearchArtifactScopeV2,
+    ) -> Result<crate::LockedPortfolioOuterHoldoutReplaySetV1>,
+{
+    let input_identity = input.receipt().identity_sha256()?;
+    anyhow::ensure!(
+        authority.canonical_run_identity_sha256() == input_identity,
+        "the presented run-scoped broker-financial-truth authority {} governs a different \
+         canonical run receipt {input_identity}; refusing discovery admission",
+        authority.canonical_run_identity_sha256(),
+    );
+    let mut authority = Some(authority);
+    let (result, quote_validated_outer_holdout) =
+        run_discovery_cycle_with_holdout_and_progress_authorized(
+            input,
+            config,
+            prop_firm_rules,
+            Some(&mut |result, ordered_signals, holdout_scope| {
+                let authority = authority.take().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the reviewed run-scoped authority was already consumed; the sealed \
+                         replay provider may run exactly once"
+                    )
+                })?;
+                replay_provider(authority, result, ordered_signals, holdout_scope)
+            }),
+            None,
+            None,
+            progress_fn,
+        )?;
+    let quote_validated_outer_holdout =
+        crate::quote_validated_outer_holdout_v1::require_quote_validated_outer_holdout_v1(
+            quote_validated_outer_holdout.as_ref(),
+        )
+        .map_err(anyhow::Error::new)?
+        .clone();
+    Ok(QuoteValidatedDiscoveryResultV1 {
+        result,
+        quote_validated_outer_holdout,
+    })
+}
+
+/// Validate a recorded research envelope as upstream INPUT for a fresh,
+/// hash-pinned NEW search. The old result supplies only its input/recipe
+/// provenance and ordered effective alphabet; old genomes, fitness and
+/// portfolio are never returned or reused.
+thread_local! {
+    static RECORDED_EFFECTIVE_FEATURE_NAMES: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub struct RecordedEffectiveFeatureNamesGuard {
+    previous: Option<Vec<String>>,
+}
+
+impl Drop for RecordedEffectiveFeatureNamesGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        RECORDED_EFFECTIVE_FEATURE_NAMES.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+pub fn install_recorded_effective_feature_names(
+    expected: Vec<String>,
+) -> RecordedEffectiveFeatureNamesGuard {
+    let previous =
+        RECORDED_EFFECTIVE_FEATURE_NAMES.with(|slot| slot.borrow_mut().replace(expected));
+    RecordedEffectiveFeatureNamesGuard { previous }
+}
+
+fn ensure_recorded_effective_feature_names(observed: &[String]) -> Result<()> {
+    let expected = RECORDED_EFFECTIVE_FEATURE_NAMES.with(|slot| slot.borrow().clone());
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        expected.as_slice() == observed,
+        "recorded ordered effective feature alphabet differs from the current prefilter: expected {} names, observed {} names; refusing before GA",
+        expected.len(),
+        observed.len()
+    );
+    Ok(())
+}
+
+pub fn validate_recorded_new_search_input(
+    recorded: &crate::canonical_trendbar_research::CanonicalTrendbarResearchDiscoveryResultV3,
+    input: &CanonicalSearchRunInputV2<'_>,
+    current_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+) -> Result<Vec<String>> {
+    recorded.validate()?;
+    let recorded_contract = recorded.execution_contract();
+    recorded_contract.validate_against_input(input)?;
+    anyhow::ensure!(
+        recorded_contract.identity_sha256()? == current_contract.identity_sha256()?,
+        "recorded research input/settings/cost identity differs from the current reopened inputs; refusing a non-comparable new search"
+    );
+    let expected = recorded.discovery_result().effective_feature_names.clone();
+    anyhow::ensure!(
+        !expected.is_empty(),
+        "recorded new-search input has no ordered effective feature alphabet"
+    );
+    Ok(expected)
+}
+
+/// Production handoff for the recorded-input NEW-search mode. It validates
+/// input identity, installs the recorded ordered alphabet as a validation-only
+/// expectation, and starts a fresh search state without replaying old genomes,
+/// fitness, portfolio or discovery-ledger memory.
+pub fn prepare_recorded_new_search(
+    recorded: &crate::canonical_trendbar_research::CanonicalTrendbarResearchDiscoveryResultV3,
+    input: &CanonicalSearchRunInputV2<'_>,
+    current_contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+) -> Result<Vec<String>> {
+    validate_recorded_new_search_input(recorded, input, current_contract)
+}
+
 /// Full receipt-bound CUDA/CPU discovery for canonical-trendbar research.
 /// The returned envelope is structurally research-only and cannot authorize
 /// live execution or promotion.
@@ -7604,6 +10467,68 @@ where
     )
 }
 
+/// Canonical CPU research plus an explicitly requested research-only numerical
+/// evaluation of the reserved final holdout.
+///
+/// This is the defensive out-of-sample posture: the live export gate (PBO,
+/// quote-validated evidence) is untouched. The produced document is labelled
+/// ResearchOnly / NotPromotionEligible and exists only so an operator can see
+/// how the locked portfolio behaved on the tail that selection never saw. It
+/// must never be fed back into Search or used for promotion/live sizing.
+pub fn run_canonical_trendbar_research_discovery_with_holdout_and_research_oos_v3<F>(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    prop_firm_rules: PropFirmRiskRules,
+    oos_eval_out: &std::path::Path,
+    progress_fn: F,
+) -> Result<crate::canonical_trendbar_research::CanonicalTrendbarResearchDiscoveryResultV3>
+where
+    F: FnMut(DiscoveryProgress),
+{
+    let research = run_canonical_trendbar_research_discovery_with_holdout_and_progress(
+        input,
+        config,
+        contract,
+        prop_firm_rules,
+        progress_fn,
+    )?;
+    let result = research.discovery_result();
+    if !result.portfolio.is_empty() {
+        let mut research_config = config.clone();
+        apply_research_contract_to_discovery_config(&mut research_config, contract);
+        let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+        let holdout = inputs
+            .holdout()
+            .expect("with_holdout always constructs a held-out evidence suffix");
+        let holdout_scope = result
+            .holdout_scope()?
+            .ok_or_else(|| anyhow::anyhow!("research-only OOS lost its holdout scope"))?
+            .clone();
+        let sealed_policy = result
+            .funnel_profile
+            .as_ref()
+            .and_then(|funnel| funnel.live_trading_policy_v1())
+            .ok_or_else(|| {
+                anyhow::anyhow!("research-only OOS lost its sealed Search signal policy")
+            })?;
+        let prepared = PreparedLockedHoldoutResearch::new_with_policy(
+            &result.portfolio,
+            &result.effective_feature_names,
+            holdout.features(),
+            holdout.ohlcv(),
+            &holdout_scope,
+            &result.search_config_hash,
+            &research_config,
+            result.effective_smc_gate_threshold,
+            Some(sealed_policy),
+        )?;
+        let document = prepared.research_only_oos_document(prop_firm_rules)?;
+        write_json_atomic(oos_eval_out, &document)?;
+    }
+    Ok(research)
+}
+
 /// Explicit canonical CPU research plus the prelocked quote/economics
 /// continuation. The provider runs only after the same final full-SMC signal
 /// preparation used by the existing holdout consumers. It receives no mutable
@@ -7640,56 +10565,23 @@ where
             contract,
         )?;
     let mut quote_evidence = None;
-    let mut observe = |result: &DiscoveryResult,
-                       prepared: &PreparedLockedHoldoutResearch<'_>|
-     -> Result<()> {
-        // Bind the artifact actually shipped to the model handoff. Its existing
-        // export filter can remove genes; the original prepared array is not an
-        // interchangeable portfolio identity.
-        let artifact = crate::LivePortfolioArtifact::from_discovery(
-            result
-                .search_input_receipt
-                .normalization_fitted_state()
-                .is_some(),
-            result,
-        )?;
-        let full_portfolio_hash = crate::canonical_locked_portfolio_identity_sha256_v1(&artifact)?;
-        let mut signals = Vec::with_capacity(artifact.genes.len());
-        let mut confidences = Vec::with_capacity(artifact.genes.len());
-        for gene in &artifact.genes {
-            let index = prepared
-                .portfolio
-                .iter()
-                .position(|candidate| candidate.strategy_id == gene.strategy_id)
-                .ok_or_else(|| anyhow::anyhow!("shipped gene is absent from prelocked signals"))?;
-            ValidationStrategyIdentityV2::from_gene(gene)?
-                .validate_against(&prepared.portfolio[index])?;
-            signals.push(prepared.ordered_signals[index].clone());
-            confidences.push(prepared.ordered_confidences[index].clone());
-        }
-        let multipliers = vec![vec![1.0; prepared.timestamps.len()]; artifact.genes.len()];
-        let evaluation = artifact.live_trading_policy.sealed_evaluation_config()?;
-        let locked = crate::LockedCanonicalSignalPlanV3::new(
-            &artifact.genes,
-            &full_portfolio_hash,
-            &signals,
-            &confidences,
-            &multipliers,
-            prepared.ohlcv,
-            prepared.holdout_scope,
-            prepared.search_config_hash,
-            crate::CanonicalSignalExitPolicyV2::from_evaluation(&evaluation),
-            crate::CanonicalSignalAccountRiskPolicyV3::from_evaluation(&evaluation)?,
-            artifact
-                .live_trading_policy
-                .sealed_adaptive_stops_policy()?,
-        )?;
-        let replay = replay_provider(&locked)?;
-        quote_evidence = Some(crate::evaluate_locked_portfolio_outer_holdout_v3(
-            &locked, replay,
-        )?);
-        Ok(())
-    };
+    let mut observe =
+        |result: &DiscoveryResult, prepared: &PreparedLockedHoldoutResearch<'_>| -> Result<()> {
+            quote_evidence = Some(with_locked_finalist_plan(
+                result,
+                prepared.ohlcv,
+                prepared.holdout_scope,
+                &prepared.ordered_signals,
+                &prepared.ordered_confidences,
+                |locked| {
+                    let replay = replay_provider(locked)?;
+                    Ok(crate::evaluate_locked_portfolio_outer_holdout_v3(
+                        locked, replay,
+                    )?)
+                },
+            )?);
+            Ok(())
+        };
     let (result, _) = run_discovery_cycle_with_holdout_and_progress_authorized(
         input,
         &research_config,
@@ -7703,6 +10595,147 @@ where
         crate::CanonicalTrendbarResearchDiscoveryResultV3::new(contract.clone(), result)?,
         quote_evidence,
     ))
+}
+
+fn project_locked_holdout_features<'a>(
+    features: &'a FeatureFrame,
+    effective_feature_names: &[String],
+) -> Result<Cow<'a, FeatureFrame>> {
+    if features.names == effective_feature_names {
+        return Ok(Cow::Borrowed(features));
+    }
+    Ok(Cow::Owned(
+        crate::live_portfolio::project_features_to_effective(features, effective_feature_names)?,
+    ))
+}
+
+fn locked_holdout_evaluation(
+    config: &DiscoveryConfig,
+    price_hint: Option<f64>,
+    final_gate: f64,
+    policy: Option<&crate::live_portfolio::LiveTradingPolicyV1>,
+) -> Result<(EvaluationConfig, bool)> {
+    if let Some(policy) = policy {
+        let mut evaluation = policy.sealed_evaluation_config()?;
+        evaluation.smc_gate_threshold = final_gate;
+        Ok((evaluation, policy.sealed_smc_gate_disabled()?))
+    } else {
+        Ok((
+            config.evaluation_config_with_smc_gate(price_hint, final_gate),
+            crate::genetic::smc_gate_disabled(),
+        ))
+    }
+}
+
+/// Continue the exact saved selection without invoking Search or calibration.
+/// Rebuild signals from reopened canonical values and the archived policy;
+/// serialized signals and today's mutable evaluation settings are never used.
+/// The callback may export acquisition coordinates or run reviewed quote replay.
+pub fn with_canonical_research_finalist_v3<T>(
+    input: &CanonicalSearchRunInputV2<'_>,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    consume: impl FnOnce(&crate::LockedCanonicalSignalPlanV3<'_>) -> Result<T>,
+) -> Result<T> {
+    research.validate()?;
+    research
+        .execution_contract()
+        .validate_against_input(input)?;
+    let result = research.discovery_result();
+    ensure_non_empty_portfolio(result, "resume frozen canonical research")?;
+    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let holdout = inputs.holdout().expect("three-way canonical holdout");
+    anyhow::ensure!(
+        &result.selection_scope == inputs.selection().scope()
+            && result.calibration_scope.as_ref()
+                == inputs.calibration().map(ScopedDiscoveryInput::scope)
+            && result.holdout_scope.as_ref() == Some(holdout.scope()),
+        "saved research windows differ from the reopened canonical input"
+    );
+    let policy = result
+        .funnel_profile
+        .as_ref()
+        .and_then(|funnel| funnel.live_trading_policy_v1())
+        .ok_or_else(|| anyhow::anyhow!("saved research lost its sealed Search signal policy"))?;
+    let mut evaluation = policy.sealed_evaluation_config()?;
+    evaluation.smc_gate_threshold = result.effective_smc_gate_threshold;
+    let features =
+        project_locked_holdout_features(holdout.features(), &result.effective_feature_names)?;
+    let (signals, confidences) = locked_holdout_signals_and_confidences_with_policy(
+        &result.portfolio,
+        &features,
+        holdout.ohlcv(),
+        &evaluation,
+        policy.sealed_smc_gate_disabled()?,
+    )?;
+    with_locked_finalist_plan(
+        result,
+        holdout.ohlcv(),
+        holdout.scope(),
+        &signals,
+        &confidences,
+        consume,
+    )
+}
+
+fn with_locked_finalist_plan<T>(
+    result: &DiscoveryResult,
+    ohlcv: &Ohlcv,
+    scope: &CanonicalSearchArtifactScopeV2,
+    ordered_signals: &[Vec<i8>],
+    ordered_confidences: &[Vec<f64>],
+    consume: impl FnOnce(&crate::LockedCanonicalSignalPlanV3<'_>) -> Result<T>,
+) -> Result<T> {
+    // The export filter can remove genes: bind only the exact shipped artifact,
+    // preserving its order and the corresponding full-SMC signal vectors.
+    let artifact = crate::LivePortfolioArtifact::from_discovery(
+        result
+            .search_input_receipt
+            .normalization_fitted_state()
+            .is_some(),
+        result,
+    )?;
+    let full_portfolio_hash = crate::canonical_locked_portfolio_identity_sha256_v1(&artifact)?;
+    let mut signals = Vec::with_capacity(artifact.genes.len());
+    let mut confidences = Vec::with_capacity(artifact.genes.len());
+    for gene in &artifact.genes {
+        let index = result
+            .portfolio
+            .iter()
+            .position(|candidate| candidate.strategy_id == gene.strategy_id)
+            .ok_or_else(|| anyhow::anyhow!("shipped gene is absent from prelocked signals"))?;
+        ValidationStrategyIdentityV2::from_gene(gene)?
+            .validate_against(&result.portfolio[index])?;
+        signals.push(
+            ordered_signals
+                .get(index)
+                .context("missing locked signals")?
+                .clone(),
+        );
+        confidences.push(
+            ordered_confidences
+                .get(index)
+                .context("missing locked confidences")?
+                .clone(),
+        );
+    }
+    let multipliers = vec![vec![1.0; ohlcv.len()]; artifact.genes.len()];
+    let evaluation = artifact.live_trading_policy.sealed_evaluation_config()?;
+    let locked = crate::LockedCanonicalSignalPlanV3::new(
+        &artifact.genes,
+        &full_portfolio_hash,
+        &signals,
+        &confidences,
+        &multipliers,
+        ohlcv,
+        scope,
+        &result.search_config_hash,
+        crate::CanonicalSignalExitPolicyV2::from_evaluation(&evaluation),
+        crate::CanonicalSignalAccountRiskPolicyV3::from_evaluation(&evaluation)?,
+        artifact
+            .live_trading_policy
+            .sealed_adaptive_stops_policy()?,
+    )?;
+    consume(&locked)
 }
 
 fn run_discovery_cycle_with_holdout_and_progress_authorized<F>(
@@ -8157,8 +11190,9 @@ where
             crate::genetic::clear_adaptive_threshold_ladder();
             tracing::warn!(
                 target: "neoethos_search::discovery",
-                "F-277: adaptive ladder derivation returned None (degenerate \
-                 feature cube: empty or zero-variance). Falling back to static ladder."
+                "F-277: adaptive ladder derivation returned None (empty or \
+                 zero-variance feature cube, or normalized medians collapsed to \
+                 insufficiently distinct levels). Falling back to static ladder."
             );
         }
     } else {
@@ -8185,50 +11219,10 @@ where
     // expectancy stayed at -4.15 pips per trade while payoff moved 0.91 → 2.53.
     // This changes which shapes are REACHABLE. The expectancy gate decides which
     // of them survive.
-    {
-        let bounds_cfg = crate::genetic::current_gene_stop_bounds_overrides();
-        let evaluation = config.evaluation_config(ohlcv.close.last().copied());
-        let pip = crate::genetic::adaptive_pip_size(evaluation.pip_value, &evaluation.symbol);
-        let atr = if bounds_cfg.atr_scaled {
-            crate::stop_target::median_atr_pips(&ohlcv.high, &ohlcv.low, &ohlcv.close, pip, 14)
-        } else {
-            None
-        };
-        match atr {
-            Some(atr_pips) => {
-                crate::genetic::install_gene_stop_atr_scale(atr_pips);
-                let resolved = crate::genetic::current_gene_stop_bounds();
-                tracing::info!(
-                    target: "neoethos_search::discovery",
-                    timeframe = %config.timeframe_label,
-                    atr_pips = atr_pips,
-                    sl_min_pips = resolved.sl_min_pips,
-                    sl_max_pips = resolved.sl_max_pips,
-                    tp_min_pips = resolved.tp_min_pips,
-                    tp_max_pips = resolved.tp_max_pips,
-                    rr_min = resolved.rr_min,
-                    rr_max = resolved.rr_max,
-                    "gene stop/target band scaled to this dataset's median ATR"
-                );
-            }
-            None => {
-                crate::genetic::clear_gene_stop_atr_scale();
-                let resolved = crate::genetic::current_gene_stop_bounds();
-                tracing::warn!(
-                    target: "neoethos_search::discovery",
-                    timeframe = %config.timeframe_label,
-                    atr_scaled_requested = bounds_cfg.atr_scaled,
-                    sl_min_pips = resolved.sl_min_pips,
-                    sl_max_pips = resolved.sl_max_pips,
-                    tp_min_pips = resolved.tp_min_pips,
-                    tp_max_pips = resolved.tp_max_pips,
-                    "gene stop/target band is the ABSOLUTE pip band — no ATR scale for this \
-                     dataset (too few bars, or a constant series, or atr_scaled disabled). On \
-                     anything above M5 this band is far tighter than one bar's range"
-                );
-            }
-        }
-    }
+    // One numerical authority for the gene stop/target band. Shared with the
+    // prefilter-ranking audit so that diagnostic reproduces the EXACT label
+    // geometry the GA cycle would have used.
+    install_gene_stop_band_scale_for_dataset(config, ohlcv);
 
     // ── CONFIG-IDENTITY GATE (2026-08-09) ─────────────────────────────────
     //
@@ -8481,6 +11475,10 @@ where
             sl_atr_mult: financial_geometry.stop_atr_multiplier,
             rr: financial_geometry.reward_risk_ratio,
             round_trip_cost_px: financial_geometry.round_trip_cost_price,
+            direction_only_ranking: config.runtime_overrides.prefilter_direction_only_ranking,
+            purge_prefixes: config.runtime_overrides.prefilter_purge_prefixes.clone(),
+            audit_ranking: false,
+            cost_symmetric: config.runtime_overrides.label_cost_symmetric,
         };
         let (filtered_frame, census) = prefilter_features(&features, &ohlcv, &spec)?;
         features = filtered_frame;
@@ -8515,6 +11513,7 @@ where
                 0.0
             },
             round_trip_cost_px = spec.round_trip_cost_px,
+            label_cost_symmetric = spec.cost_symmetric,
             "prefilter — target is the triple-barrier label in BOTH directions, geometry read \
              from this run's gene stop band, ranking fitted once on the label-safe selection \
              window, correlation two-pass f64. CPCV remains a post-GA finalist gate."
@@ -8576,6 +11575,7 @@ where
     );
     // Capture names after prefilter — gene indices refer to this list.
     let effective_feature_names = features.names.clone();
+    ensure_recorded_effective_feature_names(&effective_feature_names)?;
 
     // The resident execution parent is the exact post-trim, post-prefilter
     // dataset consumed by every population lane in this run. The public
@@ -8691,7 +11691,9 @@ where
         .map_err(anyhow::Error::new)?;
     let migration_enabled_for_run = crate::genetic::migration_enabled();
     let month_capacity = crate::eval::current_backtest_runtime_overrides().month_capacity;
-    let stage1_evaluation_config = config.evaluation_config(ohlcv_stage1.close.last().copied());
+    let mut stage1_evaluation_config = config.evaluation_config(ohlcv_stage1.close.last().copied());
+    stage1_evaluation_config.weekly_objective =
+        config.weekly_objective_for_window(&features_stage1.timestamps)?;
     let exact_stage1_view =
         crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1::ContiguousRange {
             start: stage1_start,
@@ -8883,14 +11885,9 @@ where
     let effective_smc_gate_threshold = search.effective_smc_gate_threshold;
     let stage1_count = search.genes.len();
     funnel.record_stage("stage1_candidates_generated", 0, stage1_count);
-    // The archive that survived the GA is what we hand the IS evaluator. The
-    // genes themselves carry a `fitness` field reflecting the stage-1
-    // evaluation, so "profitable" here means fitness > 0.0. The GA already
-    // applies its own profitable-archive filter (`apply_metrics` archives
-    // only nonnegative-fitness genes), so this stage is informational —
-    // count_in == count_out unless the GA archive logic changes.
-    let profitable_count = search.genes.iter().filter(|g| g.fitness > 0.0).count();
-    funnel.record_stage("profitable_archive_size", stage1_count, profitable_count);
+    // Fitness signs and observed positive net are diagnostics, never admission
+    // gates or substitutes for archive-owner counts and independent validation.
+    funnel.record_ga_handoff(&search);
 
     let mut result = finalize_candidates_with_progress(
         search.genes,
@@ -9018,6 +12015,25 @@ pub(crate) struct PrefilterSpec {
     /// Round-trip cost in PRICE units, charged into both barriers so the label
     /// says "would this trade have paid" rather than "did price move".
     pub round_trip_cost_px: f64,
+    /// Direction-only ranking: each direction's correlation is computed on the
+    /// rows where that direction's label is decided (`+1`/`-1`) only, so a
+    /// volatility feature cannot rank on the label's decidedness (ATR-scaled
+    /// barriers decide how often a label is decided by construction).
+    pub direction_only_ranking: bool,
+    /// Feature-name prefixes purged from the ranking, the per-timeframe quota
+    /// AND the seed-template force-keep. Timeframe prefixes (`H1_`, `H4_`, …)
+    /// are stripped before matching. Empty = no purge.
+    pub purge_prefixes: Vec<String>,
+    /// Collect the full descending score table for every rankable column
+    /// instead of discarding it after top-K. Used by the prefilter ranking
+    /// audit; production runs keep this `false`.
+    pub audit_ranking: bool,
+    /// Symmetric round-trip cost treatment for the label barriers: the cost
+    /// is ADDED TO BOTH distances (each side clears its own distance plus
+    /// the round trip) instead of added to the take and subtracted from the
+    /// stop. `false` = the legacy byte-identical math. See
+    /// `first_passage_labels` for the exact barriers.
+    pub cost_symmetric: bool,
 }
 
 /// One numerical authority for the CPU and resident-CUDA prefilter label
@@ -9112,6 +12128,239 @@ pub(crate) fn resolve_prefilter_financial_geometry_from_evaluation_v2(
     }
 }
 
+/// Install this dataset's gene stop/target band scale, exactly like the
+/// discovery cycle does before the prefilter. Shared by the cycle and the
+/// prefilter-ranking audit so the diagnostic reproduces the EXACT label
+/// geometry a GA run would have used.
+fn install_gene_stop_band_scale_for_dataset(config: &DiscoveryConfig, ohlcv: &Ohlcv) {
+    let bounds_cfg = crate::genetic::current_gene_stop_bounds_overrides();
+    let evaluation = config.evaluation_config(ohlcv.close.last().copied());
+    let pip = crate::genetic::adaptive_pip_size(evaluation.pip_value, &evaluation.symbol);
+    let atr = if bounds_cfg.atr_scaled {
+        crate::stop_target::median_atr_pips(&ohlcv.high, &ohlcv.low, &ohlcv.close, pip, 14)
+    } else {
+        None
+    };
+    match atr {
+        Some(atr_pips) => {
+            crate::genetic::install_gene_stop_atr_scale(atr_pips);
+            let resolved = crate::genetic::current_gene_stop_bounds();
+            tracing::info!(
+                target: "neoethos_search::discovery",
+                timeframe = %config.timeframe_label,
+                atr_pips = atr_pips,
+                sl_min_pips = resolved.sl_min_pips,
+                sl_max_pips = resolved.sl_max_pips,
+                tp_min_pips = resolved.tp_min_pips,
+                tp_max_pips = resolved.tp_max_pips,
+                rr_min = resolved.rr_min,
+                rr_max = resolved.rr_max,
+                "gene stop/target band scaled to this dataset's median ATR"
+            );
+        }
+        None => {
+            crate::genetic::clear_gene_stop_atr_scale();
+            let resolved = crate::genetic::current_gene_stop_bounds();
+            tracing::warn!(
+                target: "neoethos_search::discovery",
+                timeframe = %config.timeframe_label,
+                atr_scaled_requested = bounds_cfg.atr_scaled,
+                sl_min_pips = resolved.sl_min_pips,
+                sl_max_pips = resolved.sl_max_pips,
+                tp_min_pips = resolved.tp_min_pips,
+                tp_max_pips = resolved.tp_max_pips,
+                "gene stop/target band is the ABSOLUTE pip band — no ATR scale for this \
+                 dataset (too few bars, or a constant series, or atr_scaled disabled). On \
+                 anything above M5 this band is far tighter than one bar's range"
+            );
+        }
+    }
+}
+
+/// Typed completion signal for the prefilter-ranking audit. The audit writes
+/// its report and then returns this error so the CLI can short-circuit before
+/// the GA and still exit 0 with the report path on stdout.
+#[derive(Debug)]
+pub struct PrefilterRankingAuditCompleteV1;
+
+impl std::fmt::Display for PrefilterRankingAuditCompleteV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PREFILTER_RANKING_AUDIT_COMPLETE_V1")
+    }
+}
+
+impl std::error::Error for PrefilterRankingAuditCompleteV1 {}
+
+/// Family classification for one column, for the audit report.
+pub fn classify_prefilter_column_family_v1(name: &str) -> &'static str {
+    // The volatility families named by the indicator census hypothesis, plus
+    // the state families and a broad catch-all. Timeframe prefixes are
+    // stripped first so `H1_mass_7` classifies as `volatility`.
+    let bare = crate::prefilter_schema_v1::strip_timeframe_prefix_v1(name);
+    for family in crate::prefilter_schema_v1::PREFILTER_STATE_FAMILIES_V1 {
+        if bare.starts_with(family) {
+            return "state";
+        }
+    }
+    const VOLATILITY_PREFIXES: &[&str] = &[
+        "atr",
+        "atr_percentile",
+        "natr",
+        "garman_klass_volatility",
+        "neoethos_custom_gk",
+        "parkinson_volatility",
+        "quant_parkinson_vol",
+        "quant_rvol",
+        "mass",
+        "normalized_volume_true_range",
+        "yang_zhang_volatility",
+        "historical_volatility",
+        "ewma_volatility",
+        "cvi",
+        "bollinger_bands_width",
+        "deviation",
+        "stddev",
+        "quant_log_volatility",
+        "quant_vol_ratio",
+        "gopalakrishnan_range_index",
+    ];
+    if VOLATILITY_PREFIXES
+        .iter()
+        .any(|prefix| bare.starts_with(prefix))
+    {
+        return "volatility";
+    }
+    "other"
+}
+
+/// OFF-LINE PREFILTER RANKING AUDIT (no GA).
+///
+/// Runs the production prefilter twice on the exact same sealed selection
+/// frame — once with the default correlation ranking and once with the
+/// direction-only ranking (decided rows only) — and persists both complete
+/// score tables plus the label census to `out`. The report is ResearchOnly
+/// and carries no strategy, portfolio or promotion content.
+///
+/// The function then returns [`PrefilterRankingAuditCompleteV1`] as an error
+/// so the CLI can short-circuit before the GA with exit code 0.
+pub fn run_prefilter_ranking_audit_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+    out: &Path,
+) -> Result<serde_json::Value> {
+    contract.validate_against_input(input)?;
+    let mut research_config = config.clone();
+    apply_research_contract_to_discovery_config(&mut research_config, contract);
+    let _research_execution =
+        crate::canonical_trendbar_research::install_canonical_trendbar_research_execution_v3(
+            contract,
+        )?;
+    crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
+
+    // Same input split as the production cycle: first-80% selection window.
+    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let selection = inputs.selection();
+    let features = selection.features();
+    let ohlcv = selection.ohlcv();
+    install_gene_stop_band_scale_for_dataset(&research_config, ohlcv);
+    let financial_geometry =
+        resolve_prefilter_financial_geometry_v1(&research_config, ohlcv.close.last().copied());
+    let available = features.names.len();
+    let prefilter_top_k = resolve_prefilter_top_k(
+        research_config.runtime_overrides.prefilter_top_k,
+        available,
+        research_config.population,
+        research_config.max_indicators,
+    );
+    anyhow::ensure!(
+        prefilter_top_k > 0 && available > prefilter_top_k,
+        "prefilter ranking audit requires an active prefilter: configured_top_k={}, available={available}, resolved={prefilter_top_k}",
+        research_config.runtime_overrides.prefilter_top_k
+    );
+    let spec = PrefilterSpec {
+        top_k: prefilter_top_k,
+        insample_frac: research_config
+            .runtime_overrides
+            .resolved_prefilter_insample_frac(),
+        min_per_tf: research_config
+            .runtime_overrides
+            .prefilter_min_per_timeframe,
+        max_hold_bars: financial_geometry.max_hold_bars,
+        atr_period: 14,
+        sl_atr_mult: financial_geometry.stop_atr_multiplier,
+        rr: financial_geometry.reward_risk_ratio,
+        round_trip_cost_px: financial_geometry.round_trip_cost_price,
+        direction_only_ranking: false,
+        purge_prefixes: Vec::new(),
+        audit_ranking: true,
+        cost_symmetric: research_config.runtime_overrides.label_cost_symmetric,
+    };
+    let (_, census_default, ranking_default) =
+        prefilter_features_with_ranking(features, ohlcv, &spec)?;
+    let mut direction_only_spec = spec.clone();
+    direction_only_spec.direction_only_ranking = true;
+    let (_, census_direction_only, ranking_direction_only) =
+        prefilter_features_with_ranking(features, ohlcv, &direction_only_spec)?;
+
+    let census_json = |census: &PrefilterCensus| {
+        serde_json::json!({
+            "columns_considered": census.columns_considered,
+            "columns_kept": census.columns_kept,
+            "columns_unrankable": census.columns_unrankable,
+            "label_up": census.label_up,
+            "label_down": census.label_down,
+            "label_vertical": census.label_vertical,
+            "label_ambiguous": census.label_ambiguous,
+            "label_undefined": census.label_undefined,
+            "label_short_win": census.label_short_win,
+            "label_short_loss": census.label_short_loss,
+            "label_vertical_short": census.label_vertical_short,
+            "label_fell_back_to_forward_return": census.label_fell_back_to_forward_return
+        })
+    };
+    let ranking_json = |ranking: &[(usize, String, f64, f64, u32, bool)]| {
+        ranking
+            .iter()
+            .map(
+                |(index, name, score, instability, timeframe_group, purged)| {
+                    serde_json::json!({
+                        "index": index,
+                        "name": name,
+                        "score": score,
+                        "instability": instability,
+                        "timeframe_group": timeframe_group,
+                        "purged": purged
+                    })
+                },
+            )
+            .collect::<Vec<_>>()
+    };
+    let report = serde_json::json!({
+        "schema": "neoethos.research-only.prefilter-ranking-audit.v1",
+        "artifact_class": "ResearchOnly",
+        "promotion_eligibility": "NotPromotionEligible",
+        "authorization_issued": false,
+        "warning": "Offline prefilter ranking comparison on the sealed selection frame. Rankings are vocabulary selection, not directional edge, financial viability, OOS or promotion evidence. No GA ran and no portfolio exists.",
+        "columns_considered": available,
+        "top_k": prefilter_top_k,
+        "ranking_default": ranking_json(&ranking_default),
+        "ranking_direction_only": ranking_json(&ranking_direction_only),
+        "label_census_default": census_json(&census_default),
+        "label_census_direction_only": census_json(&census_direction_only)
+    });
+    write_json_atomic(out, &report)?;
+    tracing::info!(
+        target: "neoethos_search::prefilter",
+        report = %out.display(),
+        columns = available,
+        top_k = prefilter_top_k,
+        default_ranked = ranking_default.len(),
+        direction_only_ranked = ranking_direction_only.len(),
+        "prefilter ranking audit report written; short-circuiting before the GA"
+    );
+    Err(anyhow::Error::new(PrefilterRankingAuditCompleteV1))
+}
 /// Counted outcomes of one prefilter pass. Nothing on this path is discarded
 /// without a name and a number.
 #[derive(Debug, Default, Clone)]
@@ -9291,6 +12540,10 @@ fn first_passage_labels(
         let a = atr[i];
         if !entry.is_finite() || !a.is_finite() || a <= 0.0 || i + 1 >= n {
             census.label_undefined += 1;
+            // Undefined rows are represented as 0.0 (no decision) so the
+            // labels contract never leaks NaN into ranking/GA consumers.
+            long_labels[i] = 0.0;
+            short_labels[i] = 0.0;
             continue;
         }
         let stop_distance = sl_mult * a;
@@ -9316,10 +12569,17 @@ fn first_passage_labels(
         //    the cost, and both of a short's shift DOWN — that is what "charge
         //    the round trip to the trade" actually looks like.
         let long_tp = entry + take_distance + cost;
-        let long_sl = entry - stop_distance + cost;
+        let mut long_sl = entry - stop_distance + cost;
         let short_tp = entry - take_distance - cost;
-        let short_sl = entry + stop_distance - cost;
+        let mut short_sl = entry + stop_distance - cost;
         let horizon_end = (i + hold).min(n - 1);
+        // cost_symmetric=true (opt-in): charge the round trip symmetrically —
+        // both barriers shift AWAY from entry by the cost, so a driftless walk
+        // no longer structurally favors the losing side (~80% loss labels).
+        if spec.cost_symmetric {
+            long_sl -= 2.0 * cost;
+            short_sl += 2.0 * cost;
+        }
 
         let mut long_label = 0.0f64;
         let mut short_label = 0.0f64;
@@ -9412,6 +12672,24 @@ fn prefilter_features(
     ohlcv: &Ohlcv,
     spec: &PrefilterSpec,
 ) -> Result<(FeatureFrame, PrefilterCensus)> {
+    let mut inner_spec = spec.clone();
+    inner_spec.audit_ranking = false;
+    let (frame, census, _ranking) = prefilter_features_with_ranking(features, ohlcv, &inner_spec)?;
+    Ok((frame, census))
+}
+
+/// The prefilter core. When `spec.audit_ranking` is set it also returns the
+/// complete descending score table (every rankable column, not just top-K)
+/// for the ranking audit; production keeps it `false` and pays nothing.
+fn prefilter_features_with_ranking(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    spec: &PrefilterSpec,
+) -> Result<(
+    FeatureFrame,
+    PrefilterCensus,
+    Vec<(usize, String, f64, f64, u32, bool)>,
+)> {
     let n_rows = features.n_samples();
     let n_cols = features.n_features();
     if n_rows < 2 || n_cols <= spec.top_k {
@@ -9420,8 +12698,14 @@ fn prefilter_features(
             columns_kept: n_cols,
             ..PrefilterCensus::default()
         };
-        return Ok((features.clone(), census));
+        return Ok((features.clone(), census, Vec::new()));
     }
+    let _base_timeframe_guard =
+        crate::genetic::search_engine::base_timeframe_context_from_features(features).map(
+            |(base, prefixed)| {
+                crate::genetic::seed_templates::enter_search_base_timeframe(&base, prefixed)
+            },
+        );
     let sealed_schema =
         crate::prefilter_schema_v1::seal_prefilter_column_classification_v1(&features.names)
             .ok_or_else(|| {
@@ -9524,7 +12808,7 @@ fn prefilter_features(
             "prefilter selection window is too short to rank features; preserving the complete \
              frame instead of excluding columns on an empty label-safe sample"
         );
-        return Ok((features.clone(), census));
+        return Ok((features.clone(), census, Vec::new()));
     }
 
     struct ColumnScore {
@@ -9535,7 +12819,50 @@ fn prefilter_features(
         rankable: bool,
     }
 
+    // Volatility-family purge (opt-in). A purged column is excluded by name
+    // from the ranking AND from every re-insertion path below (per-TF quota,
+    // seed-template force-keep). Timeframe prefixes are stripped before the
+    // prefix match so `H1_atr_7` matches a purge of `atr`.
+    let purged: HashSet<usize> = if spec.purge_prefixes.is_empty() {
+        HashSet::new()
+    } else {
+        features
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| {
+                let bare = crate::prefilter_schema_v1::strip_timeframe_prefix_v1(name);
+                spec.purge_prefixes
+                    .iter()
+                    .any(|prefix| bare.starts_with(prefix.as_str()))
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    };
+    if !purged.is_empty() {
+        tracing::warn!(
+            target: "neoethos_search::prefilter",
+            purged_columns = purged.len(),
+            prefixes = ?spec.purge_prefixes,
+            "volatility-family purge is ACTIVE — purged columns are excluded by name from \
+             the ranking, the per-timeframe quota and the seed-template force-keep"
+        );
+    }
+
     let score_column = |col_idx: usize, col: &neoethos_data::FeatureColumnF64| -> ColumnScore {
+        if purged.contains(&col_idx) {
+            // Purged columns are excluded by name, exactly like unrankable
+            // columns — they are never scored 0.0 and left to lose a
+            // tie-break, and the per-TF quota / template loops cannot
+            // resurrect them because they never enter `correlations`.
+            return ColumnScore {
+                idx: col_idx,
+                score: f64::NEG_INFINITY,
+                instability: 0.0,
+                had_nonfinite: false,
+                rankable: false,
+            };
+        }
         if sealed_schema.column_class_flags()[col_idx]
             & crate::prefilter_schema_v1::COLUMN_CLASS_STATE_V1
             != 0
@@ -9561,6 +12888,7 @@ fn prefilter_features(
         for window in &windows {
             let mut xs: Vec<f64> = Vec::with_capacity(window.len());
             let mut ys: Vec<f64> = Vec::with_capacity(window.len());
+            let mut xs_short: Vec<f64> = Vec::with_capacity(window.len());
             let mut ys_short: Vec<f64> = Vec::with_capacity(window.len());
             for &row in window {
                 // The label series is bar-indexed and the feature cube is
@@ -9571,14 +12899,40 @@ fn prefilter_features(
                 if row >= n_rows || row >= labels.len() {
                     continue;
                 }
-                xs.push(if col.validity[row].is_valid() {
+                let x = if col.validity[row].is_valid() {
                     col.values[row]
                 } else {
                     f64::NAN
-                });
-                ys.push(labels[row]);
-                if let Some(short) = short_labels.as_ref() {
-                    ys_short.push(short.get(row).copied().unwrap_or(f64::NAN));
+                };
+                if spec.direction_only_ranking {
+                    // DIRECTION-ONLY RANKING (opt-in). Each direction is
+                    // scored on the rows where ITS OWN label is decided
+                    // (`+1`/`-1`) only. Vertical and ambiguous rows (`0`)
+                    // are excluded, so a volatility feature cannot rank on
+                    // the label's decidedness — the ATR-scaled barriers
+                    // decide how often a label is decided by construction,
+                    // and `abs(corr)` used to convert that decidedness
+                    // correlation into a high rank. The rank now answers
+                    // "given a barrier is hit, does this column predict
+                    // WHICH one".
+                    let long_label = labels[row];
+                    if long_label.is_finite() && long_label != 0.0 {
+                        xs.push(x);
+                        ys.push(long_label);
+                    }
+                    if let Some(short) = short_labels.as_ref() {
+                        let short_label = short.get(row).copied().unwrap_or(f64::NAN);
+                        if short_label.is_finite() && short_label != 0.0 {
+                            xs_short.push(x);
+                            ys_short.push(short_label);
+                        }
+                    }
+                } else {
+                    xs.push(x);
+                    ys.push(labels[row]);
+                    if let Some(short) = short_labels.as_ref() {
+                        ys_short.push(short.get(row).copied().unwrap_or(f64::NAN));
+                    }
                 }
             }
             let outcome = neoethos_data::core::stats_f64::pearson_pairwise(&xs, &ys);
@@ -9595,8 +12949,14 @@ fn prefilter_features(
                 None
             };
             if short_labels.is_some() {
-                let short_outcome =
-                    neoethos_data::core::stats_f64::pearson_pairwise(&xs, &ys_short);
+                // Direction-only scores the short direction on its own
+                // decided rows; the default scores it on the same rows as
+                // the long direction (the two labels share the bar index).
+                let short_outcome = if spec.direction_only_ranking {
+                    neoethos_data::core::stats_f64::pearson_pairwise(&xs_short, &ys_short)
+                } else {
+                    neoethos_data::core::stats_f64::pearson_pairwise(&xs, &ys_short)
+                };
                 if short_outcome.skipped > 0 {
                     had_nonfinite = true;
                 }
@@ -9791,6 +13151,9 @@ fn prefilter_features(
                 }
             }
             for &(idx, _) in &correlations {
+                if purged.contains(&idx) {
+                    continue;
+                }
                 let group = sealed_schema.timeframe_group_ids()[idx];
                 if group == 0 {
                     continue;
@@ -9816,6 +13179,7 @@ fn prefilter_features(
         // dropped. Two unrelated decisions on one flag, with nothing saying so.
         // BEHAVIOUR CHANGE: at `min_per_tf = 0` the template columns are now
         // kept; at any positive value nothing changes.
+        let mut purged_template_keeps: Vec<&String> = Vec::new();
         for (idx, force_keep) in sealed_schema
             .template_force_keep_flags()
             .iter()
@@ -9823,8 +13187,23 @@ fn prefilter_features(
             .enumerate()
         {
             if force_keep != 0 {
+                if purged.contains(&idx) {
+                    // A purge is a purge: the seed templates resolve
+                    // against the surviving alphabet and simply skip the
+                    // roles this column used to fill.
+                    purged_template_keeps.push(&features.names[idx]);
+                    continue;
+                }
                 kept.insert(idx);
             }
+        }
+        if !purged_template_keeps.is_empty() {
+            tracing::warn!(
+                target: "neoethos_search::prefilter",
+                purged_template_columns = ?purged_template_keeps,
+                "the volatility purge dropped columns the seed templates reference — the \
+                 warm-start resolves against the surviving alphabet and skips those roles"
+            );
         }
         keep_indices = kept.into_iter().collect();
     }
@@ -9834,7 +13213,47 @@ fn prefilter_features(
     let n_keep = keep_indices.len();
     census.columns_kept = n_keep;
 
-    Ok((features.select_columns(&keep_indices)?, census))
+    // The complete descending score table, ordered exactly like the sort
+    // above (score desc, parent index asc) so top-K membership is a prefix.
+    // State force-keeps keep their INFINITY slots at the head; purged and
+    // unrankable columns are appended with `purged`/`score=NaN` so the audit
+    // can name every exclusion without guessing from the kept list.
+    // Tuple rows: (index, name, score, instability, timeframe_group, purged).
+    let mut ranking: Vec<(usize, String, f64, f64, u32, bool)> = Vec::new();
+    if spec.audit_ranking {
+        let mut rankable: Vec<&ColumnScore> = scored.iter().filter(|e| e.rankable).collect();
+        rankable.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.idx.cmp(&b.idx))
+        });
+        ranking.extend(rankable.iter().map(|entry| {
+            (
+                entry.idx,
+                features.names[entry.idx].clone(),
+                entry.score,
+                entry.instability,
+                sealed_schema.timeframe_group_ids()[entry.idx],
+                false,
+            )
+        }));
+        for entry in &scored {
+            if entry.rankable {
+                continue;
+            }
+            ranking.push((
+                entry.idx,
+                features.names[entry.idx].clone(),
+                f64::NAN,
+                0.0,
+                sealed_schema.timeframe_group_ids()[entry.idx],
+                purged.contains(&entry.idx),
+            ));
+        }
+    }
+
+    Ok((features.select_columns(&keep_indices)?, census, ranking))
 }
 
 /// Genes that must be expected to touch a given column before that column
@@ -10238,9 +13657,101 @@ fn plan_prop_firm_windows(
     Ok(windows)
 }
 
+/// Window-level rule-failure accounting for the prop-firm gate.
+///
+/// The gate only reports a pass RATE. When that rate is zero the number alone
+/// cannot distinguish "the profit target is unreachable" from "the consistency
+/// rule rejects every window", and the two call for opposite responses. This
+/// diagnostic attributes each failing window to the rule that denied it, so a
+/// zero pass rate is measured instead of guessed. It changes no decision.
+#[derive(Debug, Default, Clone, Copy)]
+struct PropFirmWindowDiagnostics {
+    windows: usize,
+    no_trade_windows: usize,
+    passed: usize,
+    daily_loss_breaches: usize,
+    overall_drawdown_breaches: usize,
+    consistency_violations: usize,
+    trade_limit_violations: usize,
+    min_trading_days_failures: usize,
+    profit_target_failures: usize,
+    total_trades: usize,
+    total_trading_days: usize,
+    best_net_return_pct: f64,
+    worst_net_return_pct: f64,
+}
+
+impl PropFirmWindowDiagnostics {
+    fn record(&mut self, summary: &PropFirmRiskValidationSummary, trades: usize) {
+        self.windows += 1;
+        self.total_trades += trades;
+        self.total_trading_days += summary.trading_days_observed;
+        if trades == 0 {
+            self.no_trade_windows += 1;
+        }
+        if summary.net_return_pct.is_finite() {
+            if self.windows == 1 {
+                self.best_net_return_pct = summary.net_return_pct;
+                self.worst_net_return_pct = summary.net_return_pct;
+            } else {
+                self.best_net_return_pct = self.best_net_return_pct.max(summary.net_return_pct);
+                self.worst_net_return_pct = self.worst_net_return_pct.min(summary.net_return_pct);
+            }
+        }
+        if summary.all_rules_passed {
+            self.passed += 1;
+            return;
+        }
+        if summary.daily_loss_breach {
+            self.daily_loss_breaches += 1;
+        }
+        if summary.overall_drawdown_breach {
+            self.overall_drawdown_breaches += 1;
+        }
+        if summary.consistency_violation {
+            self.consistency_violations += 1;
+        }
+        if summary.trade_limit_violation {
+            self.trade_limit_violations += 1;
+        }
+        if !summary.min_trading_days_ok {
+            self.min_trading_days_failures += 1;
+        }
+        if !summary.profit_target_met {
+            self.profit_target_failures += 1;
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if other.windows == 0 {
+            return;
+        }
+        let seen_windows = self.windows;
+        self.windows += other.windows;
+        self.no_trade_windows += other.no_trade_windows;
+        self.passed += other.passed;
+        self.daily_loss_breaches += other.daily_loss_breaches;
+        self.overall_drawdown_breaches += other.overall_drawdown_breaches;
+        self.consistency_violations += other.consistency_violations;
+        self.trade_limit_violations += other.trade_limit_violations;
+        self.min_trading_days_failures += other.min_trading_days_failures;
+        self.profit_target_failures += other.profit_target_failures;
+        self.total_trades += other.total_trades;
+        self.total_trading_days += other.total_trading_days;
+        if seen_windows == 0 {
+            self.best_net_return_pct = other.best_net_return_pct;
+            self.worst_net_return_pct = other.worst_net_return_pct;
+        } else {
+            self.best_net_return_pct = self.best_net_return_pct.max(other.best_net_return_pct);
+            self.worst_net_return_pct = self.worst_net_return_pct.min(other.worst_net_return_pct);
+        }
+    }
+}
+
 /// Simulate the candidate on the pre-planned prop-firm windows and check each
 /// against `compute_prop_firm_risk_summary`. Returns the fraction of windows
-/// whose `all_rules_passed` flag is true.
+/// whose `all_rules_passed` flag is true, plus the rule-level failure counts
+/// that explain that fraction.
 ///
 /// This measures what an actual prop-firm challenge measures (one
 /// 30-day window, FTMO rules) — much more directly relevant than the
@@ -10258,7 +13769,7 @@ fn compute_prop_firm_pass_rate(
     overrides: &PropFirmGateOverrides,
     resolver: &GeneEvalSettingsResolver<'_>,
     windows: &[PropFirmWindow],
-) -> Result<(f64, usize)> {
+) -> Result<(f64, usize, PropFirmWindowDiagnostics)> {
     let rows = ohlcv.close.len();
     anyhow::ensure!(
         signals.len() == rows
@@ -10269,13 +13780,14 @@ fn compute_prop_firm_pass_rate(
         "prop-firm windows require exactly aligned OHLC, timestamps, signals and confidence"
     );
     if windows.is_empty() {
-        return Ok((0.0, 0));
+        return Ok((0.0, 0, PropFirmWindowDiagnostics::default()));
     }
     let mut settings = resolver.settings_for_gene(gene);
     let initial_balance = config.initial_account_balance()?.amount();
 
     let mut passes = 0usize;
     let mut counted = 0usize;
+    let mut diagnostics = PropFirmWindowDiagnostics::default();
     for (start_idx, end_idx, window_base) in windows {
         let (start_idx, end_idx) = (*start_idx, *end_idx);
         anyhow::ensure!(
@@ -10302,15 +13814,16 @@ fn compute_prop_firm_pass_rate(
             initial_balance,
             rules: overrides.rules,
         });
+        diagnostics.record(&summary, trades.len());
         if summary.all_rules_passed {
             passes += 1;
         }
         counted += 1;
     }
     if counted == 0 {
-        return Ok((0.0, 0));
+        return Ok((0.0, 0, diagnostics));
     }
-    Ok((passes as f64 / counted as f64, counted))
+    Ok((passes as f64 / counted as f64, counted, diagnostics))
 }
 
 /// AREA 2 / Stage A (2026-06-09) — serializes GPU launches across the
@@ -10557,17 +14070,42 @@ where
     } else {
         None
     };
-    let mut ranked_candidates = rank_candidates_on_matching_window(
-        candidates,
-        candidate_metrics,
-        stage1_evaluation.initial_equity,
-        stage1_timestamps,
-        growth_goal,
-    )?;
+    let weekly_net = stage1_evaluation
+        .weekly_objective
+        .map(|_| candidate_metrics.iter().map(|m| m[0]).collect::<Vec<_>>());
+    let mut ranked_candidates = if stage1_evaluation.weekly_objective.is_some() {
+        // The GA hands over weekly-vector order. Preserve it (and each original
+        // index) through the candidate cap, weekly net lookup and ID
+        // disambiguation; raw Gene.fitness is not the weekly selection owner.
+        indexed_candidates_preserving_ga_order(candidates, &candidate_metrics)?
+    } else {
+        rank_candidates_on_matching_window(
+            candidates,
+            candidate_metrics,
+            stage1_evaluation.initial_equity,
+            stage1_timestamps,
+            growth_goal,
+        )?
+    };
     let ga_returned_candidates = ranked_candidates.len();
     let max_candidates =
         candidate_truncation_limit(config.candidate_count, ranked_candidates.len());
     ranked_candidates.truncate(max_candidates);
+    // A gene whose serialized artifact metrics are nonfinite (NaN/±Inf — e.g.
+    // the Risky bankruptcy NEG_INFINITY fitness sentinel) cannot be published
+    // without a null f64 field. Remove it here, at the ranked-admission
+    // boundary, keeping every survivor's ORIGINAL index so weekly_net,
+    // candidate_metrics and later cohorts stay aligned. The removal is
+    // attributed below, never silent.
+    let nonfinite_admission_removed =
+        retain_finite_artifact_ranked_candidates_v1(&mut ranked_candidates);
+    if nonfinite_admission_removed > 0 {
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            nonfinite_admission_removed,
+            "ranked candidate admission removed genes with nonfinite artifact metrics; original indexes of survivors are preserved"
+        );
+    }
     let renamed_candidate_ids = crate::post_ga::disambiguate_candidate_ids(&mut ranked_candidates);
     if renamed_candidate_ids > 0 {
         tracing::info!(
@@ -10579,6 +14117,10 @@ where
         .iter()
         .map(|(_, gene)| gene.clone())
         .collect();
+    ensure_gene_artifact_metrics_finite_v1(
+        &ranked_candidate_genes,
+        "ranked candidate archive before publication",
+    )?;
     progress_fn(DiscoveryProgress::CandidatesRanked {
         candidate_count: ga_returned_candidates,
         truncated_to: max_candidates,
@@ -10586,16 +14128,23 @@ where
     let mut candidate_census = crate::funnel_profile::DiscoveryCandidateCensus {
         ga_returned_candidates,
         validation_candidate_limit: config.candidate_count,
-        validation_candidates_admitted: max_candidates,
+        validation_candidates_admitted: ranked_candidates.len(),
         validation_candidates_capped: ga_returned_candidates.saturating_sub(max_candidates),
-        walkforward_not_tested: max_candidates,
+        walkforward_not_tested: ranked_candidates.len(),
         ..Default::default()
     };
     funnel.record_stage(
         "validation_candidates_admitted",
         ga_returned_candidates,
-        max_candidates,
+        ranked_candidates.len(),
     );
+    if nonfinite_admission_removed > 0 {
+        funnel.add_reject_reason(
+            "validation_candidates_admitted",
+            "nonfinite_artifact_metrics",
+            nonfinite_admission_removed,
+        );
+    }
     if candidate_census.validation_candidates_capped > 0 {
         funnel.add_reject_reason(
             "validation_candidates_admitted",
@@ -10675,6 +14224,7 @@ where
     let mut reject_win_rate = 0usize;
     let mut reject_profit_factor = 0usize;
     let mut reject_fitness = 0usize;
+    let mut reject_net = 0usize;
     let mut reject_other = 0usize;
     // AN ABANDONED BATCH STOPS HERE. Emptying the ladder's input is how the
     // rejection is enforced: signal generation, the quality screen, the
@@ -10688,14 +14238,22 @@ where
     } else {
         ranked_candidates
             .iter()
-            .filter(|(_, g)| {
-                let ok = g.passes_filter(&config.filtering);
+            .filter(|(index, g)| {
+                let measured_net = weekly_net.as_ref().map(|net| net[*index]);
+                let ok = measured_net.map_or_else(
+                    || g.passes_filter(&config.filtering),
+                    |net| net.is_finite() && g.passes_filter_with_profit(&config.filtering, net),
+                );
                 if !ok {
                     // Cheap heuristic: pick the FIRST violated threshold so the
                     // counts roughly partition the rejections. Not every Gene
                     // populates every metric, so the buckets are a guide rather
                     // than an audit trail.
-                    if !g.max_drawdown.is_nan() && g.max_drawdown > config.filtering.max_dd {
+                    if measured_net
+                        .is_some_and(|net| !net.is_finite() || net <= config.filtering.min_profit)
+                    {
+                        reject_net += 1;
+                    } else if !g.max_drawdown.is_nan() && g.max_drawdown > config.filtering.max_dd {
                         reject_dd += 1;
                     } else if !g.win_rate.is_nan() && g.win_rate < config.filtering.min_win_rate {
                         reject_win_rate += 1;
@@ -10744,6 +14302,9 @@ where
             reject_profit_factor,
         );
     }
+    if reject_net > 0 {
+        funnel.add_reject_reason("passed_base_filter", "net_profit_too_low", reject_net);
+    }
     if reject_fitness > 0 {
         funnel.add_reject_reason("passed_base_filter", "fitness_too_low", reject_fitness);
     }
@@ -10771,6 +14332,7 @@ where
             win_rate_too_low = reject_win_rate,
             profit_factor_too_low = reject_profit_factor,
             fitness_too_low = reject_fitness,
+            net_profit_too_low = reject_net,
             other_threshold = reject_other,
             max_dd_floor = config.filtering.max_dd,
             min_win_rate_floor = config.filtering.min_win_rate,
@@ -10880,6 +14442,9 @@ where
     // ran, so turning logging off could also turn off the positive-expectancy
     // decision. Run the base quality screen whenever candidates exist; logging
     // controls only whether trade details are retained.
+    let weekly_gate = config
+        .weekly_objective_for_window(&features.timestamps)?
+        .map(|objective| (objective, std::sync::atomic::AtomicUsize::new(0)));
     if !filtered.is_empty() {
         let candidate_deep_robustness = !matches!(config.mode, DiscoveryMode::Risky);
         progress_fn(DiscoveryProgress::StageAdvanced {
@@ -11739,6 +15304,7 @@ where
                             .expect("quality candidates have shared SMC"),
                         &sig,
                     )?;
+                    let mut monthly_returns = Vec::new();
                     let (account_metrics, trades) =
                         crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
                             &ohlcv.close,
@@ -11750,6 +15316,7 @@ where
                             &quality_days,
                             &features.timestamps,
                             &screen_resolver.settings_for_gene(&gene),
+                            Some(&mut monthly_returns),
                         )?;
                     completed_quality_replays.fetch_add(1, AtomicOrdering::Relaxed);
                     let mut metrics = analyzer.analyze_strategy_with_evaluation(
@@ -11760,6 +15327,13 @@ where
                         quality_end_ms,
                         &account_metrics,
                     )?;
+                    // Per-month archive: the same completed-month fractional
+                    // return vector this replay already computed (and B9's
+                    // MonthlyUpsideV1 selector consumes) rides into the
+                    // serialized quality payload, one fraction per completed
+                    // month. Empty here is honest: a producer with no monthly
+                    // series archives an empty array.
+                    metrics.monthly_returns = Some(monthly_returns);
 
                     // Per-session exposure, over EVERY screened candidate. Same
                     // bucket boundaries the cost model charges by construction —
@@ -11792,6 +15366,18 @@ where
                         trades_outside_grid,
                     };
 
+                    if let Some((objective, rejected)) = &weekly_gate {
+                        let entries = trades.iter().map(|t| t.entry_time).collect::<Vec<_>>();
+                        let cadence =
+                            crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
+                                &objective.cadence,
+                                &entries,
+                            )?;
+                        if !cadence.feasible() {
+                            rejected.fetch_add(1, AtomicOrdering::Relaxed);
+                            return Ok((None, trial_row));
+                        }
+                    }
                     let verdict =
                         classify_base_quality(&metrics, &config.target_profile, &config.filtering);
                     let opportunistic_quality = match verdict {
@@ -12047,6 +15633,9 @@ where
             mc_floor: rejected_mc_floor.load(AtomicOrdering::Relaxed),
             mc_near_miss: mc_near_miss.load(AtomicOrdering::Relaxed),
             sensitivity: rejected_sensitivity.load(AtomicOrdering::Relaxed),
+            weekly_cadence: weekly_gate
+                .as_ref()
+                .map(|(_, counter)| counter.load(AtomicOrdering::Relaxed)),
         };
         // Arithmetic self-check: the ten criteria must partition the
         // base-quality rejects exactly. If they ever disagree the breakdown is
@@ -12283,6 +15872,10 @@ where
     // The prefixes carry that distinction so a reader does not have to know it.
     if quality_rejects.total() > 0 {
         for (reason, count) in [
+            (
+                "rolling_five_weekday_cadence",
+                quality_rejects.weekly_cadence.unwrap_or(0),
+            ),
             ("total.base_quality", quality_rejects.base_quality),
             ("regime_robustness", quality_rejects.regime),
             ("monte_carlo_perturbation", quality_rejects.mc_floor),
@@ -12431,7 +16024,7 @@ where
                         .expect("screened candidates have shared SMC"),
                     &sig,
                 )?;
-                let (rate, counted) = compute_prop_firm_pass_rate(
+                let (rate, counted, window_diagnostics) = compute_prop_firm_pass_rate(
                     &pair.1,
                     &sig,
                     &confidences,
@@ -12442,15 +16035,17 @@ where
                     &pf_resolver,
                     &pf_windows,
                 )?;
-                Ok((pair, rate, counted))
+                Ok((pair, rate, counted, window_diagnostics))
             })?;
         // Diagnostic: bucket what the gate did to each candidate.
         let mut dbg_counted_zero = 0usize;
         let mut dbg_below_pass_rate = 0usize;
         let mut dbg_counted_sum = 0usize;
         let mut dbg_max_rate: f64 = 0.0;
-        for (_, rate, counted) in &scored_all {
+        let mut rule_diag = PropFirmWindowDiagnostics::default();
+        for (_, rate, counted, window_diagnostics) in &scored_all {
             dbg_counted_sum += *counted;
+            rule_diag.merge(window_diagnostics);
             if *counted == 0 {
                 dbg_counted_zero += 1;
             } else if *rate < pf_pass_rate_floor {
@@ -12484,9 +16079,35 @@ where
             timestamps_len = timestamps_owned.len(),
             "prop-firm gate breakdown — why candidates were rejected"
         );
-        let mut scored: Vec<((usize, Gene), f64, usize)> = scored_all
+        // RULE-LEVEL attribution. A zero `max_rate` says every window failed,
+        // not which rule denied it; the profit target and the consistency ratio
+        // call for opposite corrective actions, so both are counted here.
+        if rule_diag.windows > 0 {
+            tracing::info!(
+                target: "neoethos_search::prop_firm_dbg",
+                candidates_in = candidates_in_count,
+                windows = rule_diag.windows,
+                windows_passed_all_rules = rule_diag.passed,
+                no_trade_windows = rule_diag.no_trade_windows,
+                fail_daily_loss = rule_diag.daily_loss_breaches,
+                fail_overall_drawdown = rule_diag.overall_drawdown_breaches,
+                fail_consistency = rule_diag.consistency_violations,
+                fail_trade_limit = rule_diag.trade_limit_violations,
+                fail_min_trading_days = rule_diag.min_trading_days_failures,
+                fail_profit_target = rule_diag.profit_target_failures,
+                best_window_net_return_pct = rule_diag.best_net_return_pct,
+                worst_window_net_return_pct = rule_diag.worst_net_return_pct,
+                avg_trades_per_window = rule_diag.total_trades as f64 / rule_diag.windows as f64,
+                avg_trading_days_per_window =
+                    rule_diag.total_trading_days as f64 / rule_diag.windows as f64,
+                profit_target_pct = pf.rules.min_profit_target_pct,
+                consistency_ratio = pf.rules.max_profit_consistency_ratio,
+                "prop-firm window rule breakdown - which rule denies every window"
+            );
+        }
+        let mut scored: Vec<((usize, Gene), f64, usize, PropFirmWindowDiagnostics)> = scored_all
             .into_iter()
-            .filter(|(_, rate, counted)| *counted > 0 && *rate >= pf.pass_rate)
+            .filter(|(_, rate, counted, _)| *counted > 0 && *rate >= pf.pass_rate)
             .collect();
         // Sort by pass-rate descending; ties broken by gene fitness.
         scored.sort_by(|a, b| {
@@ -12500,7 +16121,7 @@ where
                 })
         });
         let mut next_filtered: Vec<(usize, Gene)> = Vec::with_capacity(scored.len());
-        for (pair, rate, _) in scored {
+        for (pair, rate, _, _) in scored {
             next_filtered.push(pair);
             prop_firm_pass_rates.push(rate);
         }
@@ -12615,10 +16236,17 @@ where
     }
     funnel.walkforward_selection_cohort = Some(wf_cohort);
     let profitable_calibration_genes = if let Some(calibration) = calibration_input {
+        let risky_goal_calibration =
+            config.mode == DiscoveryMode::Risky && config.runtime_overrides.risky_survival_only;
+        let calibration_policy = if risky_goal_calibration {
+            "Risky target/deadline and capital survival"
+        } else {
+            "profitable live sizing"
+        };
         progress_fn(DiscoveryProgress::StageAdvanced {
             stage: "holdout_forward_test",
             detail: format!(
-                "selection calibration for all {} internal-WF survivors before active portfolio capacity {}; final holdout remains reserved",
+                "{calibration_policy} selection calibration for all {} internal-WF survivors before active portfolio capacity {}; final holdout remains reserved",
                 candidate_census.walkforward_passed, config.portfolio_size,
             ),
         });
@@ -12657,13 +16285,18 @@ where
         if profitable.len() < cohort.trials.len() {
             funnel.add_reject_reason(
                 "passed_selection_calibration",
-                "calibration_sizing_gate_failed",
+                if risky_goal_calibration {
+                    "risky_goal_or_survival_calibration_failed"
+                } else {
+                    "calibration_sizing_gate_failed"
+                },
                 cohort.trials.len() - profitable.len(),
             );
         }
         tracing::info!(
             target: "neoethos_search::discovery",
             calibration_tested = cohort.trials.len(), calibration_profitable = profitable.len(),
+            calibration_policy,
             active_portfolio_capacity = config.portfolio_size,
             "completed the selection-used research cohort before active portfolio selection; this is not an untouched final test"
         );
@@ -12867,7 +16500,10 @@ where
                     &quality_days,
                     &features.timestamps,
                     &fallback_resolver.settings_for_gene(&gene),
+                    None,
                 )?;
+            // Best-effort fallback rows predate the per-month archive producer;
+            // their monthly_returns stays empty (unknown), never invented.
             quality_metrics.push(analyzer.analyze_strategy_with_evaluation(
                 &gene.strategy_id,
                 &trades,
@@ -12959,6 +16595,8 @@ where
             &ohlcv.low[w0..],
             &ohlcv.close[w0..],
         )?;
+        let account_risk_robustness =
+            config.mode == DiscoveryMode::Risky && config.runtime_overrides.risky_survival_only;
 
         let verdicts: Vec<(bool, String)> = portfolio
             .par_iter()
@@ -12967,11 +16605,42 @@ where
                 let settings = robust_resolver.settings_for_gene(gene);
                 let sig_full = &portfolio_signals[gi];
                 if sig_full.len() != n_all {
+                    anyhow::ensure!(
+                        !account_risk_robustness,
+                        "Risky account robustness signal length mismatch"
+                    );
                     return Ok((true, "skipped (signal length mismatch)".to_string()));
                 }
                 let sig_win = &sig_full[w0..];
-                let net_of = |sigs: &[i8]| -> f64 {
-                    simulate_trades_core(
+                let real_confidences = if account_risk_robustness {
+                    account_sizing_confidences(
+                        features,
+                        gene,
+                        &eval_cfg_rb,
+                        account_smc.as_ref().context("Risky robustness lost SMC")?,
+                        sig_full,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let conf_win = if account_risk_robustness {
+                    &real_confidences[w0..]
+                } else {
+                    &[]
+                };
+                let net_of = |sigs: &[i8], confidence: &[f64]| -> Result<f64> {
+                    if account_risk_robustness {
+                        return account_robustness_net(
+                            &ohlcv.close[w0..],
+                            &ohlcv.high[w0..],
+                            &ohlcv.low[w0..],
+                            ts_win,
+                            sigs,
+                            confidence,
+                            &settings,
+                        );
+                    }
+                    Ok(simulate_trades_core(
                         &ohlcv.close[w0..],
                         &ohlcv.high[w0..],
                         &ohlcv.low[w0..],
@@ -12981,9 +16650,9 @@ where
                     )
                     .iter()
                     .map(|t| t.pnl)
-                    .sum()
+                    .sum())
                 };
-                let real_net = net_of(sig_win);
+                let real_net = net_of(sig_win, conf_win)?;
                 let signal_bars = sig_win.iter().filter(|s| **s != 0).count();
                 if real_net <= 0.0 || signal_bars < 30 {
                     // Too little recent evidence to test against — pass through;
@@ -12997,9 +16666,22 @@ where
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
                 let mut beats = 0usize;
                 let mut shuffled: Vec<i8> = sig_win.to_vec();
+                let mut paired = sig_win
+                    .iter()
+                    .copied()
+                    .zip(conf_win.iter().copied())
+                    .collect::<Vec<_>>();
                 for _ in 0..N_PERM {
-                    shuffled.shuffle(&mut rng);
-                    if net_of(&shuffled) >= real_net {
+                    let random_net = if account_risk_robustness {
+                        paired.shuffle(&mut rng);
+                        let (signals, confidence): (Vec<_>, Vec<_>) =
+                            paired.iter().copied().unzip();
+                        net_of(&signals, &confidence)?
+                    } else {
+                        shuffled.shuffle(&mut rng);
+                        net_of(&shuffled, &[])?
+                    };
+                    if random_net >= real_net {
                         beats += 1;
                     }
                 }
@@ -13020,9 +16702,29 @@ where
                     variant.short_threshold *= factor;
                     let sig_v = signals_for_gene_full(features, ohlcv, &variant, &eval_cfg_rb)?;
                     if sig_v.len() != n_all {
+                        anyhow::ensure!(
+                            !account_risk_robustness,
+                            "Risky plateau signal length mismatch"
+                        );
                         continue;
                     }
-                    let net_v = net_of(&sig_v[w0..]);
+                    let confidence = if account_risk_robustness {
+                        account_sizing_confidences(
+                            features,
+                            &variant,
+                            &eval_cfg_rb,
+                            account_smc.as_ref().context("Risky plateau lost SMC")?,
+                            &sig_v,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
+                    let confidence = if account_risk_robustness {
+                        &confidence[w0..]
+                    } else {
+                        &[]
+                    };
+                    let net_v = net_of(&sig_v[w0..], confidence)?;
                     if net_v < PLATEAU_MIN_RATIO * real_net {
                         return Ok((
                             false,
@@ -13377,6 +17079,7 @@ where
         effective_smc_gate_threshold,
     };
     result.validate_evaluated_scopes()?;
+    validate_discovery_result_publication_v1(&result)?;
     progress_fn(DiscoveryProgress::Completed {
         candidate_count: result.candidates.len(),
         filtered_count,
@@ -13460,6 +17163,21 @@ fn rank_candidates_on_matching_window(
         .into_iter()
         .map(|(index, gene, _)| (index, gene))
         .collect())
+}
+
+/// Weekly mode already receives the GA weekly-vector order. The post-GA
+/// candidate cap must preserve that order and the original paired index: the
+/// weekly net lookup keys on that index, and re-sorting by raw financial
+/// Gene.fitness would undo feasible/vector precedence before the cap.
+fn indexed_candidates_preserving_ga_order(
+    candidates: Vec<Gene>,
+    metrics: &[[f64; 11]],
+) -> Result<Vec<(usize, Gene)>> {
+    anyhow::ensure!(
+        candidates.len() == metrics.len(),
+        "GA candidate/metric alignment mismatch"
+    );
+    Ok(candidates.into_iter().enumerate().collect())
 }
 
 fn candidate_truncation_limit(requested: usize, available: usize) -> usize {
@@ -13700,10 +17418,12 @@ pub fn ensure_portfolio_export_ready(result: &DiscoveryResult) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "Portfolio export requires passing validation gates (walkforward_passed={} cpcv_passed={}). \
-         Lower the walk-forward splits or disable CPCV in config.yaml and re-run.",
+        "Portfolio selection export requires all configured selection gates \
+         (walkforward_passed={} cpcv_passed={} pbo_passed={}). The criteria are unchanged; \
+         inspect the recorded walk-forward, CPCV and PBO evidence.",
         result.validation_gates.walkforward_passed,
-        result.validation_gates.cpcv_passed
+        result.validation_gates.cpcv_passed,
+        result.validation_gates.pbo_passed
     );
 }
 
@@ -14693,6 +18413,14 @@ pub fn build_discovery_profile(
     // binds it to `_name` with a written justification). Sixteen months of
     // "two runs differ and nobody can say why" is the cost of the old `..`.
     let DiscoveryConfig {
+        // Not in the run profile yet (section 14.8 stamp gap); bound so a new
+        // field can never be added to DiscoveryConfig without this destructure
+        // noticing it.
+        fitness_table: _profile_fitness_table @ _,
+        // Bound like `fitness_table` (not yet recorded in the run profile —
+        // section 14.8 stamp gap); a new field can never be added to
+        // DiscoveryConfig without this destructure noticing it.
+        max_hold_bars: _max_hold_bars @ _,
         timeframe_label,
         evaluation_symbol,
         evaluation_account_currency,
@@ -14789,8 +18517,18 @@ pub fn build_discovery_profile(
         funnel_stage1_pct: _, // recorded resolved below
         stage1_window,
         min_history_years,
+        weekly_cadence,
+        risky_survival_only,
+        prefilter_direction_only_ranking,
+        prefilter_purge_prefixes,
+        label_cost_symmetric,
     } = runtime_overrides;
     DiscoveryRunProfile {
+        risky_survival_only: *risky_survival_only,
+        weekly_cadence: *weekly_cadence,
+        prefilter_direction_only_ranking: *prefilter_direction_only_ranking,
+        prefilter_purge_prefixes: prefilter_purge_prefixes.clone(),
+        label_cost_symmetric: *label_cost_symmetric,
         population_eval_engines,
         population_execution_run_receipt_v2: population_execution_run_receipt_v2.cloned(),
         timeframe_label: timeframe_label.clone(),
@@ -15801,6 +19539,7 @@ mod candidate_validation_order_tests {
                     &days,
                     &features.timestamps,
                     &resolver.settings_for_gene(gene),
+                    None,
                 )?;
             let mut measured = quality_analyzer_for_config(&config)
                 .analyze_strategy_with_evaluation(
@@ -16589,6 +20328,75 @@ mod candidate_validation_order_tests {
 #[cfg(test)]
 #[path = "discovery_holdout_signal_tests.rs"]
 mod holdout_signal_tests;
+
+#[cfg(test)]
+mod weekly_handoff_tests {
+    use super::*;
+
+    fn candidate(fitness: f64, strategy_id: &str) -> Gene {
+        Gene {
+            fitness,
+            strategy_id: strategy_id.to_string(),
+            ..Gene::default()
+        }
+    }
+
+    #[test]
+    fn weekly_order_and_original_index_survive_cap_and_net_lookup() {
+        let feasible = candidate(-1.70425, "feasible_first");
+        let infeasible = candidate(-0.2146797, "infeasible_higher_raw_fitness");
+        let feasible_net = 0.031;
+        let infeasible_net = -0.004;
+        let metrics = vec![
+            [
+                feasible_net,
+                0.0,
+                10_000.0,
+                0.09,
+                0.55,
+                1.2,
+                1.0,
+                0.0,
+                100.0,
+                0.1,
+                0.04,
+            ],
+            [
+                infeasible_net,
+                0.0,
+                10_000.0,
+                0.2,
+                0.4,
+                0.9,
+                -0.1,
+                0.0,
+                50.0,
+                0.1,
+                0.2,
+            ],
+        ];
+        let mut ranked =
+            indexed_candidates_preserving_ga_order(vec![feasible, infeasible], &metrics).unwrap();
+        let weekly_net: Vec<f64> = metrics.iter().map(|m| m[0]).collect();
+        ranked.truncate(candidate_truncation_limit(1, ranked.len()));
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].0, 0, "original GA index must survive the cap");
+        assert_eq!(ranked[0].1.strategy_id, "feasible_first");
+        assert_eq!(weekly_net[ranked[0].0], feasible_net);
+        assert!(
+            ranked[0].1.fitness < -0.5,
+            "the feasible candidate is deliberately negative on raw financial fitness"
+        );
+    }
+
+    #[test]
+    fn weekly_order_helper_rejects_unaligned_metrics() {
+        let error =
+            indexed_candidates_preserving_ga_order(vec![candidate(0.0, "only_candidate")], &[])
+                .expect_err("misaligned metrics must be refused");
+        assert!(error.to_string().contains("alignment mismatch"));
+    }
+}
 
 #[cfg(test)]
 #[path = "discovery_tests.rs"]

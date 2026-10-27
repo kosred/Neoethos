@@ -301,6 +301,15 @@ pub fn ctrader_test_feature_frame_with_normalization(
     )
 }
 
+/// Attach an explicit recorded build recipe to a test frame. Test-only seam;
+/// no production defaults are inferred.
+pub fn with_test_feature_build_options(
+    frame: crate::FeatureFrame,
+    options: crate::FeatureBuildOptions,
+) -> crate::FeatureFrame {
+    frame.with_feature_build_options(options)
+}
+
 /// Raw, explicitly unverified fixture with a recorded producer recipe. This
 /// preserves real raw backing for cross-crate lazy-fit/prefix tests; it grants
 /// no canonical publication, candidate or trading authority.

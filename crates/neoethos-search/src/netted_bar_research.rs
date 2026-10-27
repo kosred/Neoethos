@@ -286,6 +286,8 @@ impl PreparedNettedCanonicalBarResearchV1 {
             &self.settings,
             &mut trades,
             Some(&mut state),
+            None,
+            None,
         );
         ensure!(
             !state.nonfinite_metrics

@@ -1345,19 +1345,22 @@ cannot be enabled before the field exists.
 
 ### 14.7 `crates/neoethos-search/src/discovery.rs` — the objective knobs
 
-**Seven of the nine axis-B variants are not expressible against the compiled
-search**, because `DiscoveryConfig` has no objective selector: the GA's fitness
+**Seven of the ten axis-B variants are not expressible against the compiled
+search** (B0, B2, B3, B4, B7, B8, B9), because `DiscoveryConfig` has no
+objective selector: the GA's fitness
 is chosen by one `bool` (`EvaluationConfig::growth_objective`, set from
 `DiscoveryMode`), the triple-barrier horizon is read from
 `EvaluationConfig::max_hold_bars` which **ships at 0 and has no config recipient**
 (`discovery.rs:5483` then substitutes the documented 35), and there is no
 conditioning set, no cost-edge scoring flag and no portfolio-level objective.
 
-Today, therefore, exactly one axis-B variant is drawable per scenario — B5 under
-Risky (`ga_fitness_growth`, the mode's own Kelly log-growth objective) and B6
-under PropFirm (the window-pass gate) — plus the whole refusal vector (§7.9),
-whose four dimensions all have recipients already. `proposer.rs` reports the
-other seven as EXCLUDED, by name, with the symbol each needs; it does **not**
+Today, therefore, exactly one scenario-native axis-B variant is drawable per
+scenario — B5 under Risky (`ga_fitness_growth`, the mode's own Kelly log-growth
+objective) and B6 under PropFirm (the window-pass gate) — plus B1 (whose two
+levers are real `DiscoveryConfig` fields) under both, plus the whole refusal
+vector (§7.9), whose four dimensions all have recipients already.
+`proposer.rs` reports the seven knob-less variants as EXCLUDED, by name, with
+the symbol each needs; it does **not**
 draw them and quietly run the default objective, which would make the loop
 appear to explore the objective space while sweeping axis A under one implicit
 objective.
@@ -1372,6 +1375,7 @@ cargo feature on the autoresearch side:
     pub fitness_table: FitnessTable,          // feature: search-fitness-table
                                               //          search-in-market-fitness (NetPerBarInMarket)
                                               //          search-t-stat-objective  (ExpectancyTStat)
+                                              //          search-monthly-upside-objective (MonthlyUpsideV1)
     /// Triple-barrier vertical barrier, in base bars, for BOTH the prefilter's
     /// label and the evaluator. `0` keeps today's behaviour (the documented 35).
     pub label_max_hold_bars: usize,           // feature: search-label-horizon
@@ -1392,13 +1396,88 @@ with
 
 ```rust
 pub enum FitnessTable { GaFitness, ArchiveScore, WindowScore, QualityScore,
-                        NetPerBarInMarket, ExpectancyTStat }
+                        NetPerBarInMarket, ExpectancyTStat, MonthlyUpsideV1,
+                        MonthlyUpsideDdAverseV1 }
 ```
 
 `FitnessTable::NetPerBarInMarket` is the one new function: net divided by bars
 in market rather than by trades, so **a strategy that is flat is not penalised**
 — which is the whole content of B1, and the only objective shape that can act on
 "the average trade loses 4.15 pips, so take fewer, different trades."
+
+`FitnessTable::MonthlyUpsideV1` binds `scoring::ga_fitness_monthly_upside_v1`
+(the asymmetric monthly-upside fitness, neo-671): the PropFirm GA would evolve
+under the median monthly return with a one-sided upside bonus and a
+tail-loss-only penalty below a -2% worst month. It needs the evaluator's
+monthly-return vector, which the `[f64; 11]` metric array does not carry.
+
+LANDED (2026-10-23, neo-671 follow-up): the selector enum, the
+`DiscoveryConfig` / `EvaluationConfig` field, the `apply_metrics` dispatch and
+the canonical CPU evaluator's completed-month return vector are all in place.
+With the `search-monthly-upside-objective` feature enabled, B9 selects
+`MonthlyUpsideV1` and the CPU evaluation path feeds the vector into
+`ga_fitness_monthly_upside_v1`. The 2026-10-25 correctness repair preserves
+same-execution monthly observations on the sealed CPU route with or without
+weekly cadence. Missing or misaligned monthly transport is a run error; a
+legitimately empty per-gene series still takes the scorer's rejection guard.
+Metrics-only producers cannot satisfy the monthly objective.
+
+`FitnessTable::MonthlyUpsideDdAverseV1` binds
+`scoring::ga_fitness_monthly_upside_dd_averse_v1` (neo-671, 2026-10-26): the
+same B9 monthly-upside base PLUS an explicit risk profile — a penalty for
+overall drawdown above 10 % (`(dd-0.10)*200`, cap 60), a penalty for daily
+drawdown above 3 % (`(daily-0.03)*300`, cap 20), a floor penalty for a per-trade
+win rate below 60 %, and a +6 bonus at 70 % or better. It exists because the
+plain B9 table has no drawdown term: measured runs at lower risk bands did NOT
+lower drawdown (1.0-1.6 % band best DD 22.7 %, 1.2-2.0 % band 18.7 %,
+1.5-2.5 % band 16.6 %) — the GA compensated by selecting deeper-drawdown
+strategies. Making the two drawdowns part of the score turns them into a
+gradient the search can follow instead of a post-filter it meets only at the
+walkforward. Guards and monthly-vector transport are identical to B9.
+
+
+`FitnessTable::MonthlyUpsideDdBudgetV1` binds
+`scoring::ga_fitness_monthly_upside_dd_budget_v1` (neo-671, 2026-10-26): the
+profit term is MULTIPLIED by `1 - drawdown/0.15` (clamped to [-1, 1]), so above
+a 15 % drawdown budget profit counts negative, and months spent underwater
+beyond six are subtracted from the score. It answers the measured incentive
+gap: B9 has no drawdown term, and the additive dd-averse table still let the
+search keep 17-49 % drawdown candidates because a large profit base outran a
+capped additive penalty; also, recovery time was invisible to the metric
+array. The dd-budget table derives underwater duration from the same monthly
+vector the B9 family already transports, so the GA is finally paid for
+maximum profit per unit of drawdown budget and for fast recovery.
+
+Operator plumbing (same series, neo-671): `neoethos-cli` declares the
+`search-monthly-upside-objective` passthrough feature (forwarding to
+`neoethos-autoresearch`). With it compiled in, `canonical-research` accepts
+`--fitness-table <ga_fitness|monthly_upside_v1|monthly_upside_dd_averse_v1|monthly_upside_dd_budget_v1>` for a FRESH search, forwards
+it to discovery and sets `DiscoveryConfig.fitness_table`; unknown names, saved
+continuations and quote replay are refused with the selector present. Without
+the feature the argument is rejected as unknown and the canonical three-way
+fitness dispatch stays byte-identical; `SCORING_VERSION_CURRENT` stays 7.
+
+The sealed evaluation-policy wire (`SealedEvaluationPolicyV1`, the policy
+round-trip the CPU funnel performs before generation 0) carries the selector
+the same way: `serde(default, skip_serializing_if = FitnessTable::is_default)`,
+so default snapshots and legacy bytes are unchanged and a non-default table
+survives the round-trip instead of being refused as an unknown field. The
+canonical config digest now binds nondefault `fitness_table` and nonzero
+`max_hold_bars`, while retaining historical default digest bytes. Its exhaustive
+configuration destructure requires an explicit decision for future fields.
+
+Quality screening now archives `monthly_breakdown` from the same closed-trade
+ledger and full evaluated interval. Each UTC exit-month row includes opening
+and closing account balance, net PnL after recorded costs, return percent,
+trade/win/loss counts, win rate, gross profit/loss, profit factor and monthly
+closed-balance drawdown. Idle months remain present and endpoint partial months
+are marked; undefined ratios remain null. These rows include the current partial
+month and are distinct from the legacy completed-month fractional scorer vector
+`monthly_returns`. The Strategy Report displays all months in original account
+units through this same aggregator, with its existing unsealed IS status.
+Neither data path establishes independent OOS, floating-equity drawdown or broker
+execution. Absent historical monthly fields stay absent when reserialized;
+explicit empty arrays stay explicit, preserving their identity-bearing values.
 
 ### 14.8 `crates/neoethos-search/src/run_identity.rs` — six factors are invisible to the stamp
 
@@ -1428,6 +1507,65 @@ in declaration order, and include each in the hash:
 `max_pbo` matters as much as the rest: it is the per-candidate CPCV ceiling the
 search refuses on (§7.9), so two runs that differ only there refused different
 candidates and are not the same experiment.
+
+### 14.9 Feature-frame cache and the exit-policy knobs (neo-671 B9 g200)
+
+**Receipt-keyed feature-frame cache** (`crates/neoethos-data/src/core/
+feature_frame_cache.rs`, CLI gate `crates/neoethos-cli/src/
+feature_frame_cache_gate.rs`, wired in `main.rs` canonical-research). The
+frozen EURUSD M15+H1,H4 feature cube takes ~90 minutes to rebuild; the cache
+persists a completed frame so a repeat search over the byte-identical dataset
+skips the build. Research-only: inactive unless `NEOETHOS_FEATURE_FRAME_CACHE_DIR`
+is set (unset, the build path is byte-identical). The key is a SHA-256 over the
+input-receipt digests — per-timeframe dataset identity/manifest/Vortex digests,
+the exact `FeatureBuildOptions`, the streaming working-set batch, and the
+resolved vector-ta math authority — so any digest change is a miss. The key is
+not the whole safety story: the CLI seals every stored entry with the exact
+`CanonicalSearchInputReceiptV2` computed from the freshly built frame, and a
+cache hit must recompute the same receipt bit-for-bit or the run fails loudly
+(no silent fallback). Disk usage is bounded by
+`NEOETHOS_FEATURE_FRAME_CACHE_MAX_BYTES` (default 32 GiB) with oldest-entry
+eviction; writes are staged and promoted atomically.
+
+The 2026-10-25 V2 key binds the ACTUAL ordered working-set batch, including
+RAM-sized width and seeded selections. V1 normalized only the key to an unseeded
+4096-column recipe while storing the smaller actual frame. A cache hit returns
+that whole frame without augmentation, so this could attribute the wrong batch
+and advance the wrong cursor even with an intact receipt. V1 entries therefore
+miss under V2 and are rebuilt under the exact requested recipe. Changes only to
+GA/scoring options still reuse an identical feature recipe. Stored old numerical
+columns are not thereby shown to be incorrect.
+
+Equivalent restored recipes reuse the V2 entry: a complete validated batch in
+`FeatureBuildOptions.classic_ta_working_set` canonicalizes to the same key as
+that identical live batch argument. Conflicting dual recipes and incomplete
+recorded selections retain distinct keys, so a hit cannot bypass the builder's
+refusal. This permits recorded-input scorer experiments on the same actual cube
+without rebuilding it under a different representation.
+
+The saved exit-policy diagnostic's `baseline_sealed_policy` preserves the exact
+archived holding horizon and trailing settings. Earlier diagnostics forced that
+baseline to unlimited holding and trailing off, which caused explicit mismatch
+flags for nondefault policies. Variant metadata now names the executed settings,
+and `monthly_breakdown` uses the shared UTC exit-month account ledger aggregator,
+including idle/partial months. The older `ledger.monthly` field remains a
+trade-only entry-month sum of initial-capital fractions; it is not the same
+measure. All such variants remain selection diagnostics, not OOS evidence.
+
+**Exit-policy knob census** (measured against the frozen v5 settings, B9 g200):
+
+- Early profit-lock EXISTS as a config knob: `models.exit_policy.trailing_enabled`
+  (plus `trailing_be_trigger_r`, `trailing_stop_multiplier`,
+  `trailing_min_lock_pips`), read by `ExitPolicyOverrides::from_settings` into
+  the CPU evaluator's exit geometry. Shipped default is OFF; the g200 run
+  enables it (`true`, geometry at shipped defaults 1.0 / 1.0 / 2.0 pips) via its
+  own `--settings-source` override file — an existing knob, not a new gate; no
+  gate or cost assumption was changed.
+- Shorter holding horizon has NO config knob: `EvaluationConfig::max_hold_bars`
+  ships at 0 (unlimited) and has no `Settings` recipient; the only existing
+  exposure is the saved-candidate exit-policy diagnostic grid (max-hold 0/32/64/96
+  × trailing off/on) and per-artifact sealed exit policies. Documented as absent
+  rather than invented.
 
 ---
 
@@ -1623,3 +1761,85 @@ rediscovered as a surprise.
 `E_screen_pess` is therefore in **account currency per trade**, not pips. §9.4's
 worked example renders pips; the quantity is the same, the unit is the one the
 backtest already books in.
+
+
+### Frozen candidate OOS and centered MinMax (2026-10-27)
+
+`canonical-research` can evaluate explicit archived candidates on the reserved
+chronological holdout without another Search. Supply `--resume-research`, its
+`--resume-research-sha256`, `--max-batches 1`, explicit
+`--diagnose-candidate-selectors index:strategy_id:fnv64:hash,...` (at most eight),
+and `--diagnose-candidate-oos-out <new-json>`. The replay checks the original
+contract, feature names, candidate identities, split and sealed evaluation
+policy. It remains ResearchOnly / NotPromotionEligible. OOS reports include
+initial balance, mode, monthly closed-trade ledger and closed trades. Whole-span
+prop-firm diagnostics do not establish a rolling challenge pass, and do not
+represent the Risky capital/deadline objective. Preserve an already inspected
+holdout's exposure history; repeated evaluations are not fresh independent proof.
+
+The four vector-ta `minmax` outputs are excluded from new production feature
+plans. Their centered formula reads through `i + order` while publishing at `i`;
+forward-filled `last_min`/`last_max` inherit the same future dependence. The
+existing one-period higher-timeframe close lag does not supply the missing
+confirmation delay. The regression test changes only a future high and proves
+that the historical pivot changes. Archived genes and results stay preserved,
+but genes using these outputs have contaminated historical evidence. Do not
+replace their feature indices with different columns or call a failed exact
+replay a financial OOS loss. A causal delayed replacement requires a new name
+and feature recipe plus prefix-invariance tests.
+
+The canonical CPU builder moves each completed or cached frame into shared
+backing before discovery borrows it. Otherwise `row_window` on an owned
+`InMemory` frame clones the entire cube separately for selection, calibration
+and holdout. Sharing preserves the exact cells, validity and provenance while
+removing those copies. The serial campaign records available RAM and elapsed
+time every 30 seconds and the specific reason when its owned-child guard stops
+a run. This repair changes storage ownership, not the pinned feature recipe or
+the financial settings.
+
+### Risky survival policy after the operator correction (2026-10-27)
+
+`models.discovery_runtime.risky_survival_only: true` is an explicit new-run
+policy. Risky permits drawdowns below total capital loss, removes the legacy
+EUR10 goal-report floor, and retains no PropFirm window gate. The search uses
+the last configured goal-horizon calendar days of IS, with the original frozen
+IS feature fit and separate final holdout. This avoids treating multi-year
+survival or an extrapolated multi-year return as a six-month experiment.
+False retains archived behavior and its exact canonical configuration digest.
+PropFirm behavior remains governed by its own rules.
+
+The new policy also clears inherited PropFirm trade-frequency, monthly-return,
+weekly-cadence and trade-shape floors. Selection calibration evaluates native
+180-day Risky account paths: all sampled complete windows must retain capital,
+and at least one must reach the configured target. Each trial retains its
+window outcomes and monthly ledger, including failed goals. This is a
+selection criterion, not independent evidence or a future success probability.
+It replaces the generic whole-span positive-net/profit-factor/Kelly sizing
+gate only for this versioned Risky policy. Monthly steadiness remains visible
+for ranking and review rather than an invented PropFirm return threshold.
+
+Risky permutation and threshold-plateau diagnostics now use confidence-sized
+account compounding. Permutations keep signals paired with their entry sizing
+confidence; threshold variants recompute confidence. The legacy fixed-one-lot
+timing diagnostic remains unchanged for archived policy and PropFirm. Risky
+OOS reports under the new policy omit PropFirm rule verdicts. Common temporal
+integrity, cost accounting and overfitting checks retain their existing roles.
+
+The revised campaign declares confidence sizing across 0..100% of current
+capital and fixed-fraction IS comparisons at 5, 10, 20, 30, 50, 75 and 100%.
+These are searched sizing choices, not a universal low-risk ceiling. Native
+compounding, transaction costs and lot caps remain active. Capital exhaustion
+is a failure; reports must never credit a later winning exit as recovery after
+the account's observed adverse excursion consumed its capital. Per-window
+monthly ledgers expose whether growth is reasonably steady. The native
+goal-fitness table is the primary objective; B9 controls are preserved under
+their original settings and must not be described as unrestricted Risky.
+
+`scripts/research_campaign.py revise-risky` preserves the prior plan, all genes
+and completed controls, records the human's changed objective, creates the new
+profiles and retains the original overall compute deadline. An interrupted
+post-IS step resumes its hash-pinned `frozen-before-oos.json` checkpoint instead
+of starting the successful IS search again. Candidate selection is declared
+before OOS: two by actual IS growth pace and two by monthly consistency among
+positive, surviving IS candidates. Reused historical OOS remains exploratory;
+neither a positive aggregate nor one favorable window establishes the goal.

@@ -7,7 +7,7 @@
   "maxSize": "16mb",
   "mode": "weak",
   "ignoreIdentifiers": true,
-  "ignore": ["**/target/**", "**/node_modules/**", "**/vendor/**", "**/.git/**"],
+  "ignore": ["**/target/**", "**/node_modules/**", "**/vendor/**", "**/.git/**", "**/target-hold/**", "**/target-horizon/**", "**/target-dd/**", "**/target-*/**", "**/.work/**"],
   "reporters": ["json"],
   "output": ".git/repo-map/duplicates",
   "noColors": true,

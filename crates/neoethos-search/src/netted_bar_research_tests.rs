@@ -223,6 +223,7 @@ fn all_one_multipliers_and_fixed_brackets_match_legacy_core_bit_for_bit() {
             &run.days,
             &run.timestamps,
             &run.settings,
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -488,6 +489,8 @@ fn public_preparation_evaluates_exact_published_canonical_holdout_and_rejects_re
         smc_weight_displacement: 1.0,
         growth_objective: false,
         growth_goal: None,
+        weekly_objective: None,
+        fitness_table: Default::default(),
     };
     contract.validate_evaluation_costs(&evaluation).unwrap();
     let prepared =

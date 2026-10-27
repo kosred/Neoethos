@@ -1,5 +1,6 @@
 use super::runtime_overrides::current_strategy_evaluation_runtime_overrides;
 use rand::Rng;
+use serde::{Deserialize as SealedDeserialize, Serialize as SealedSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -691,7 +692,13 @@ impl Gene {
     }
 
     pub fn passes_filter(&self, cfg: &FilteringConfig) -> bool {
-        if self.fitness <= cfg.min_profit {
+        self.passes_filter_with_profit(cfg, self.fitness)
+    }
+
+    /// New objectives must compare the monetary floor with actual measured net,
+    /// never a bounded dimensionless feasibility score.
+    pub(crate) fn passes_filter_with_profit(&self, cfg: &FilteringConfig, profit: f64) -> bool {
+        if profit <= cfg.min_profit {
             return false;
         }
         if self.max_drawdown > cfg.max_dd {
@@ -721,6 +728,25 @@ impl Gene {
             || cfg.min_monthly_return_pct > 0.0
             || cfg.log_trades
             || (cfg.opportunistic_enabled && cfg.use_opportunistic_candidates)
+    }
+
+    /// True only when every finite term survives the same index merge that
+    /// normalize performs but the algebraic sum is zero. This is a degenerate
+    /// newly bred child, not a malformed input: callers must replace it rather
+    /// than let normalize inject the fixed +1 fallback.
+    pub(crate) fn has_total_weight_cancellation(&self, n_indicators: usize) -> bool {
+        let n_indicators = n_indicators.max(1);
+        if self.indices.is_empty() || self.weights.len() != self.indices.len() {
+            return false;
+        }
+        let mut merged = std::collections::BTreeMap::<usize, f64>::new();
+        for (index, weight) in self.indices.iter().zip(&self.weights) {
+            if !weight.is_finite() {
+                return false;
+            }
+            *merged.entry(index % n_indicators).or_insert(0.0) += *weight;
+        }
+        !merged.is_empty() && merged.values().all(|weight| weight.abs() <= 1e-6)
     }
 
     pub fn normalize(&mut self, n_indicators: usize, min_indicators: usize) {
@@ -812,8 +838,40 @@ impl Gene {
     }
 }
 
+/// Observed counts for one search invocation, independent of financial merit.
+/// Slots include repeated survivors; distinct genomes exclude those repeats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeeklyVectorArchiveCensusV1 {
+    pub capacity: usize,
+    pub evaluated: usize,
+    pub retained: usize,
+    pub capacity_rejected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationCensusV1 {
+    pub schema_version: u16,
+    pub generation_evaluation_slots: u64,
+    pub final_policy_replay_evaluation_slots: u64,
+    pub total_evaluation_slots: u64,
+    /// None means the complete evaluation history was not observed.
+    pub whole_run_distinct_genomes: Option<usize>,
+    /// Actual retained archive entries before merging the last population.
+    pub archive_entries: usize,
+    pub final_population: usize,
+    pub returned_candidates: usize,
+    pub duplicate_handoff_entries: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_vector_archive: Option<WeeklyVectorArchiveCensusV1>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    pub weekly_cadence_v1:
+        Option<Vec<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>>,
+    /// Absent for legacy checkpoints or routes without measured accounting.
+    pub generation_census_v1: Option<GenerationCensusV1>,
     pub genes: Vec<Gene>,
     pub metrics: Vec<[f64; 11]>,
     /// Effective SMC gate used for the metrics in this result. This is the
@@ -821,11 +879,12 @@ pub struct SearchResult {
     pub effective_smc_gate_threshold: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, SealedSerialize, SealedDeserialize)]
 pub struct EvaluationConfig {
     pub symbol: String,
     pub account_currency: String,
     /// Run-scoped starting equity shared by Search and account-risk validation.
+    #[serde(rename = "initial_equity")]
     pub initial_equity: f64,
     pub max_hold_bars: usize,
     /// Exit geometry — resolved from `models.exit_policy`, never hardcoded.
@@ -833,6 +892,7 @@ pub struct EvaluationConfig {
     /// From 2026-06-06 to 2026-08-09 the three fields below were literals in
     /// `for_symbol` with no config recipient, so no run could measure the search
     /// without them. See `ExitPolicyOverrides` for what they cost.
+    #[serde(rename = "trailing_enabled")]
     pub trailing_enabled: bool,
     /// A multiple of the position's OWN STOP DISTANCE, not of ATR
     /// (`eval.rs:1030-1035`: `hi - trailing_atr_multiplier * pos_sl_pips * pip`).
@@ -845,6 +905,7 @@ pub struct EvaluationConfig {
     /// other three were set explicitly — a fourth number of the same policy,
     /// travelling by a different route. It now comes from the same config.
     pub trailing_min_lock_pips: f64,
+    #[serde(rename = "pip_value")]
     pub pip_value: f64,
     pub spread_pips: f64,
     pub commission_per_trade: f64,
@@ -855,12 +916,15 @@ pub struct EvaluationConfig {
     /// Search-time execution policy. These values must travel with the same
     /// run-scoped configuration as the financial inputs; otherwise Generation
     /// 0 and the post-GA validation funnel price different strategies.
+    #[serde(rename = "kill_zones_enabled")]
     pub kill_zones_enabled: bool,
     pub session_spread_pips: Option<[f64; 3]>,
+    #[serde(rename = "risk_per_trade_min")]
     pub risk_per_trade_min: f64,
     pub risk_per_trade_max: f64,
     pub high_quality_confidence: f64,
     pub smc_gate_threshold: f64,
+    #[serde(rename = "smc_weight_ob")]
     pub smc_weight_ob: f64,
     pub smc_weight_fvg: f64,
     pub smc_weight_liq: f64,
@@ -871,6 +935,7 @@ pub struct EvaluationConfig {
     pub smc_weight_choch: f64,
     pub smc_weight_eqh: f64,
     pub smc_weight_eql: f64,
+    #[serde(rename = "smc_weight_displacement")]
     pub smc_weight_displacement: f64,
     /// Selects Risky growth scoring instead of the unchanged PropFirm v4
     /// consistency formula. A bound `growth_goal` selects measured goal pace
@@ -879,6 +944,16 @@ pub struct EvaluationConfig {
     pub growth_objective: bool,
     /// Run-bound v6 goal-pace objective; None retains explicitly legacy v5.
     pub growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
+    pub weekly_objective: Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
+    /// Which named scoring table the GA maximises (docs/autoresearch-loop.md
+    /// section 14.7; the autoresearch search-* capability features write this).
+    /// GaFitness keeps the canonical growth-goal / growth / ga_fitness
+    /// dispatch; MonthlyUpsideV1 routes fitness through
+    /// scoring::ga_fitness_monthly_upside_v1 using the evaluator's
+    /// completed-month return vector. Defaults are skipped in serialization so
+    /// existing artifacts stay byte-identical.
+    #[serde(default, skip_serializing_if = "crate::scoring::FitnessTable::is_default")]
+    pub fitness_table: crate::scoring::FitnessTable,
 }
 
 impl Default for EvaluationConfig {
@@ -949,6 +1024,8 @@ impl Default for EvaluationConfig {
             smc_weight_displacement: smc.w_displacement,
             growth_objective: false,
             growth_goal: None,
+            weekly_objective: None,
+            fitness_table: crate::scoring::FitnessTable::default(),
         }
     }
 }

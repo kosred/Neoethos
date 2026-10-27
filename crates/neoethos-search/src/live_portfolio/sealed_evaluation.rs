@@ -46,10 +46,128 @@ pub(super) struct SealedEvaluationPolicyV1 {
     growth_objective: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekly_objective: Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
+    /// Current-equivalence binding for the weekly objective. Absent for
+    /// non-weekly snapshots and for historical weekly snapshots created before
+    /// the binding existed; those remain inspectable but are refused as replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekly_scoring_identity: Option<crate::run_identity::WeeklyScoringIdentityV1>,
+    /// Opt-in GA scoring-table selector (docs/autoresearch-loop.md section
+    /// 14.7). Absent for the canonical default and for historical snapshots;
+    /// serialized only when a non-default table was selected, so legacy wire
+    /// bytes and unknown-field refusal stay byte-identical.
+    #[serde(default, skip_serializing_if = "crate::scoring::FitnessTable::is_default")]
+    fitness_table: crate::scoring::FitnessTable,
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sealed_evaluator_reuses_the_wire_owner_without_changing_legacy_order_or_unknown_field_refusal()
+     {
+        let (evaluation, stops) = evaluation_and_stops();
+        let snapshot =
+            SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        let value = serde_json::to_value(&snapshot).unwrap();
+        // Field order frozen from the pre-weekly wire, not derived from the new owner.
+        let keys = [
+            "schema_version",
+            "smc_gate_disabled",
+            "adaptive_stops_v1",
+            "symbol",
+            "account_currency",
+            "initial_equity",
+            "max_hold_bars",
+            "trailing_enabled",
+            "trailing_atr_multiplier",
+            "trailing_be_trigger_r",
+            "trailing_min_lock_pips",
+            "pip_value",
+            "spread_pips",
+            "commission_per_trade",
+            "pip_value_per_lot",
+            "swap_long_pips_per_day",
+            "swap_short_pips_per_day",
+            "pnl_conversion_fee_rate",
+            "kill_zones_enabled",
+            "session_spread_pips",
+            "risk_per_trade_min",
+            "risk_per_trade_max",
+            "high_quality_confidence",
+            "smc_gate_threshold",
+            "smc_weight_ob",
+            "smc_weight_fvg",
+            "smc_weight_liq",
+            "smc_weight_mtf",
+            "smc_weight_premium",
+            "smc_weight_inducement",
+            "smc_weight_bos",
+            "smc_weight_choch",
+            "smc_weight_eqh",
+            "smc_weight_eql",
+            "smc_weight_displacement",
+            "growth_objective",
+            "growth_goal",
+        ];
+        let expected = keys
+            .into_iter()
+            .filter_map(|key| {
+                value.get(key).map(|v| {
+                    let body = if key == "adaptive_stops_v1" {
+                        serde_json::to_string(&stops).unwrap()
+                    } else {
+                        serde_json::to_string(v).unwrap()
+                    };
+                    format!("{}:{}", serde_json::to_string(key).unwrap(), body)
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            serde_json::to_string(&snapshot).unwrap(),
+            format!("{{{expected}}}")
+        );
+        let decoded: SealedEvaluationPolicyV1 = serde_json::from_value(value.clone()).unwrap();
+        let replay = decoded.to_evaluation().unwrap();
+        assert_eq!(
+            SealedEvaluationPolicyV1::from_evaluation(&replay, false, &stops).unwrap(),
+            snapshot
+        );
+        let mut unknown = value.clone();
+        unknown["unknown_evaluator_field"] = true.into();
+        assert!(serde_json::from_value::<SealedEvaluationPolicyV1>(unknown).is_err());
+        let mut missing = value;
+        missing.as_object_mut().unwrap().remove("initial_equity");
+        assert!(serde_json::from_value::<SealedEvaluationPolicyV1>(missing).is_err());
+    }
+
+    #[test]
+    fn weekly_snapshot_roundtrips_its_interval_and_limits_and_preserves_legacy_absence() {
+        let (mut evaluation, stops) = evaluation_and_stops();
+        evaluation.growth_objective = false;
+        let old = SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        let old_bytes = serde_json::to_vec(&old).unwrap();
+        assert!(!String::from_utf8_lossy(&old_bytes).contains("weekly_objective"));
+        evaluation.weekly_objective = Some(crate::scoring::weekly_cadence::test_weekly_objective());
+        let new = SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        let bytes = serde_json::to_vec(&new).unwrap();
+        let decoded: SealedEvaluationPolicyV1 = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(
+            decoded.to_evaluation().unwrap().weekly_objective,
+            evaluation.weekly_objective
+        );
+        assert_ne!(bytes, old_bytes);
+        let mut tampered = decoded;
+        tampered
+            .weekly_objective
+            .as_mut()
+            .unwrap()
+            .cadence
+            .evaluation_end_ms = 0;
+        assert!(tampered.validate().is_err());
+    }
     use super::*;
 
     fn evaluation_and_stops() -> (
@@ -83,7 +201,7 @@ mod tests {
         );
         let reopened: SealedEvaluationPolicyV1 = serde_json::from_slice(&legacy_bytes).unwrap();
         reopened.validate().unwrap();
-        assert_eq!(reopened.to_evaluation().growth_goal, None);
+        assert_eq!(reopened.to_evaluation().unwrap().growth_goal, None);
         assert_eq!(serde_json::to_vec(&reopened).unwrap(), legacy_bytes);
 
         let goal = crate::scoring::RiskyGrowthGoal {
@@ -98,13 +216,35 @@ mod tests {
         assert_ne!(bytes, legacy_bytes);
         let reopened: SealedEvaluationPolicyV1 = serde_json::from_slice(&bytes).unwrap();
         reopened.validate().unwrap();
-        assert_eq!(reopened.to_evaluation().growth_goal, Some(goal));
-        assert_eq!(reopened.to_evaluation().initial_equity, 10_000.0);
+        assert_eq!(reopened.to_evaluation().unwrap().growth_goal, Some(goal));
+        assert_eq!(reopened.to_evaluation().unwrap().initial_equity, 10_000.0);
         assert_eq!(serde_json::to_vec(&reopened).unwrap(), bytes);
         evaluation.growth_goal.as_mut().unwrap().horizon_days = 90.0;
         let changed =
             SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
         assert_ne!(serde_json::to_vec(&changed).unwrap(), bytes);
+    }
+
+    #[test]
+    fn monthly_upside_selector_roundtrips_the_sealed_wire_without_changing_legacy_bytes() {
+        let (mut evaluation, stops) = evaluation_and_stops();
+        evaluation.growth_objective = false;
+        let legacy = SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(!String::from_utf8_lossy(&legacy_bytes).contains("fitness_table"));
+        evaluation.fitness_table = crate::scoring::FitnessTable::MonthlyUpsideV1;
+        let snapshot =
+            SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("monthly_upside_v1"));
+        let reopened: SealedEvaluationPolicyV1 = serde_json::from_slice(&bytes).unwrap();
+        reopened.validate().unwrap();
+        assert_eq!(
+            reopened.to_evaluation().unwrap().fitness_table,
+            crate::scoring::FitnessTable::MonthlyUpsideV1
+        );
+        assert_eq!(serde_json::to_vec(&reopened).unwrap(), bytes);
+        assert_ne!(bytes, legacy_bytes);
     }
 
     #[test]
@@ -141,6 +281,47 @@ mod tests {
         evaluation.growth_objective = false;
         assert!(SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).is_err());
     }
+    #[test]
+    fn sealed_weekly_replay_requires_the_same_compiled_scoring_identity() {
+        let (mut evaluation, stops) = evaluation_and_stops();
+        evaluation.growth_objective = false;
+        evaluation.weekly_objective = Some(crate::scoring::weekly_cadence::test_weekly_objective());
+        let snapshot =
+            SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        assert_eq!(
+            snapshot.weekly_scoring_identity,
+            Some(crate::run_identity::WeeklyScoringIdentityV1::current())
+        );
+        snapshot.to_evaluation().unwrap();
+
+        let mut stale = serde_json::to_value(&snapshot).unwrap();
+        stale["weekly_scoring_identity"]["source_sha256"] = "00".repeat(32).into();
+        let stale: SealedEvaluationPolicyV1 = serde_json::from_value(stale).unwrap();
+        let error = stale.to_evaluation().unwrap_err().to_string();
+        assert!(error.contains("stale"), "{error}");
+        assert!(stale.validate().is_err());
+
+        let mut absent = serde_json::to_value(&snapshot).unwrap();
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("weekly_scoring_identity");
+        let absent: SealedEvaluationPolicyV1 = serde_json::from_value(absent).unwrap();
+        let error = absent.to_evaluation().unwrap_err().to_string();
+        assert!(error.contains("unbound"), "{error}");
+
+        let (plain_evaluation, plain_stops) = evaluation_and_stops();
+        let plain =
+            SealedEvaluationPolicyV1::from_evaluation(&plain_evaluation, false, &plain_stops)
+                .unwrap();
+        assert!(plain.weekly_scoring_identity.is_none());
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("weekly_scoring_identity")
+        );
+        plain.to_evaluation().unwrap();
+    }
 }
 
 impl SealedEvaluationPolicyV1 {
@@ -149,86 +330,65 @@ impl SealedEvaluationPolicyV1 {
         smc_gate_disabled: bool,
         adaptive_stops: &crate::stop_target::ResolvedAdaptiveStopsPolicyV1,
     ) -> anyhow::Result<Self> {
-        let snapshot = Self {
-            schema_version: 1,
-            smc_gate_disabled,
-            adaptive_stops_v1: adaptive_stops.clone(),
-            symbol: value.symbol.clone(),
-            account_currency: value.account_currency.clone(),
-            initial_equity: value.initial_equity,
-            max_hold_bars: value.max_hold_bars,
-            trailing_enabled: value.trailing_enabled,
-            trailing_atr_multiplier: value.trailing_atr_multiplier,
-            trailing_be_trigger_r: value.trailing_be_trigger_r,
-            trailing_min_lock_pips: value.trailing_min_lock_pips,
-            pip_value: value.pip_value,
-            spread_pips: value.spread_pips,
-            commission_per_trade: value.commission_per_trade,
-            pip_value_per_lot: value.pip_value_per_lot,
-            swap_long_pips_per_day: value.swap_long_pips_per_day,
-            swap_short_pips_per_day: value.swap_short_pips_per_day,
-            pnl_conversion_fee_rate: value.pnl_conversion_fee_rate,
-            kill_zones_enabled: value.kill_zones_enabled,
-            session_spread_pips: value.session_spread_pips,
-            risk_per_trade_min: value.risk_per_trade_min,
-            risk_per_trade_max: value.risk_per_trade_max,
-            high_quality_confidence: value.high_quality_confidence,
-            smc_gate_threshold: value.smc_gate_threshold,
-            smc_weight_ob: value.smc_weight_ob,
-            smc_weight_fvg: value.smc_weight_fvg,
-            smc_weight_liq: value.smc_weight_liq,
-            smc_weight_mtf: value.smc_weight_mtf,
-            smc_weight_premium: value.smc_weight_premium,
-            smc_weight_inducement: value.smc_weight_inducement,
-            smc_weight_bos: value.smc_weight_bos,
-            smc_weight_choch: value.smc_weight_choch,
-            smc_weight_eqh: value.smc_weight_eqh,
-            smc_weight_eql: value.smc_weight_eql,
-            smc_weight_displacement: value.smc_weight_displacement,
-            growth_objective: value.growth_objective,
-            growth_goal: value.growth_goal,
+        let weekly_objective = match value.weekly_objective {
+            Some(objective) => Some(objective.checked_for_evaluation(
+                value.initial_equity,
+                value.growth_objective,
+                (value.risk_per_trade_min, value.risk_per_trade_max),
+            )?),
+            None => None,
         };
+        let weekly_scoring_identity =
+            weekly_objective.map(|_| crate::run_identity::WeeklyScoringIdentityV1::current());
+        let mut body = serde_json::to_value(value)?;
+        let object = body.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("weekly evaluation snapshot must serialize as an object")
+        })?;
+        object.insert("schema_version".to_owned(), serde_json::Value::from(1u64));
+        object.insert(
+            "smc_gate_disabled".to_owned(),
+            serde_json::Value::Bool(smc_gate_disabled),
+        );
+        object.insert(
+            "adaptive_stops_v1".to_owned(),
+            serde_json::to_value(adaptive_stops)?,
+        );
+        object.insert(
+            "weekly_objective".to_owned(),
+            serde_json::to_value(weekly_objective)?,
+        );
+        object.insert(
+            "weekly_scoring_identity".to_owned(),
+            serde_json::to_value(weekly_scoring_identity)?,
+        );
+        let snapshot: Self = serde_json::from_value(body)?;
         snapshot.validate()?;
         Ok(snapshot)
     }
 
-    pub(super) fn to_evaluation(&self) -> EvaluationConfig {
-        EvaluationConfig {
-            symbol: self.symbol.clone(),
-            account_currency: self.account_currency.clone(),
-            initial_equity: self.initial_equity,
-            max_hold_bars: self.max_hold_bars,
-            trailing_enabled: self.trailing_enabled,
-            trailing_atr_multiplier: self.trailing_atr_multiplier,
-            trailing_be_trigger_r: self.trailing_be_trigger_r,
-            trailing_min_lock_pips: self.trailing_min_lock_pips,
-            pip_value: self.pip_value,
-            spread_pips: self.spread_pips,
-            commission_per_trade: self.commission_per_trade,
-            pip_value_per_lot: self.pip_value_per_lot,
-            swap_long_pips_per_day: self.swap_long_pips_per_day,
-            swap_short_pips_per_day: self.swap_short_pips_per_day,
-            pnl_conversion_fee_rate: self.pnl_conversion_fee_rate,
-            kill_zones_enabled: self.kill_zones_enabled,
-            session_spread_pips: self.session_spread_pips,
-            risk_per_trade_min: self.risk_per_trade_min,
-            risk_per_trade_max: self.risk_per_trade_max,
-            high_quality_confidence: self.high_quality_confidence,
-            smc_gate_threshold: self.smc_gate_threshold,
-            smc_weight_ob: self.smc_weight_ob,
-            smc_weight_fvg: self.smc_weight_fvg,
-            smc_weight_liq: self.smc_weight_liq,
-            smc_weight_mtf: self.smc_weight_mtf,
-            smc_weight_premium: self.smc_weight_premium,
-            smc_weight_inducement: self.smc_weight_inducement,
-            smc_weight_bos: self.smc_weight_bos,
-            smc_weight_choch: self.smc_weight_choch,
-            smc_weight_eqh: self.smc_weight_eqh,
-            smc_weight_eql: self.smc_weight_eql,
-            smc_weight_displacement: self.smc_weight_displacement,
-            growth_objective: self.growth_objective,
-            growth_goal: self.growth_goal,
-        }
+    pub(super) fn to_evaluation(&self) -> anyhow::Result<EvaluationConfig> {
+        self.validate()?;
+        let weekly_objective = match self.weekly_objective {
+            Some(objective) => Some(objective.checked_for_evaluation(
+                self.initial_equity,
+                self.growth_objective,
+                (self.risk_per_trade_min, self.risk_per_trade_max),
+            )?),
+            None => None,
+        };
+        let mut body = serde_json::to_value(self)?;
+        let object = body.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("sealed evaluation snapshot must serialize as an object")
+        })?;
+        object.remove("schema_version");
+        object.remove("smc_gate_disabled");
+        object.remove("adaptive_stops_v1");
+        object.remove("weekly_scoring_identity");
+        object.insert(
+            "weekly_objective".to_owned(),
+            serde_json::to_value(weekly_objective)?,
+        );
+        Ok(serde_json::from_value(body)?)
     }
 
     pub(super) fn smc_gate_disabled(&self) -> bool {
@@ -269,8 +429,36 @@ impl SealedEvaluationPolicyV1 {
         Ok(())
     }
 
+    /// Replay-boundary gate: the stored weekly objective may be inspected in
+    /// legacy form, but current replay needs the SAME compiled scoring identity.
+    fn validate_weekly_scoring_identity(&self) -> anyhow::Result<()> {
+        match (self.weekly_objective, self.weekly_scoring_identity.as_ref()) {
+            (Some(objective), Some(identity)) => {
+                objective.validate_current()?;
+                identity.validate_current()?;
+                Ok(())
+            }
+            (Some(objective), None) => anyhow::bail!(
+                "sealed weekly objective is unbound: no scoring identity in the stored snapshot (version {}); inspectable but not admissible as current replay",
+                objective.scoring_semantics_version
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "sealed weekly scoring identity is present without a weekly objective"
+            ),
+            (None, None) => Ok(()),
+        }
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         self.adaptive_stops_v1.validate()?;
+        self.validate_weekly_scoring_identity()?;
+        if let Some(objective) = self.weekly_objective {
+            objective.checked_for_evaluation(
+                self.initial_equity,
+                self.growth_objective,
+                (self.risk_per_trade_min, self.risk_per_trade_max),
+            )?;
+        }
         anyhow::ensure!(
             self.schema_version == 1,
             "unsupported sealed evaluation schema"

@@ -13,10 +13,13 @@
 //! returning `None` for a duration when the exit timestamp precedes the entry.
 //! Diverging would show up as a parity failure that looks like a kernel bug.
 
-use neoethos_gpu_contracts::POPULATION_EXIT_NONE;
 use neoethos_gpu_contracts::device::NeoPopulationOutcome;
+use neoethos_gpu_contracts::{
+    POPULATION_EXIT_GAP, POPULATION_EXIT_MAX_HOLD, POPULATION_EXIT_NONE, POPULATION_EXIT_STOP,
+    POPULATION_EXIT_TARGET,
+};
 
-use crate::quality::Trade;
+use crate::quality::{Trade, TradeExitReason};
 
 /// Milliseconds in an hour, matching the CPU walk's divisor exactly.
 const MS_PER_HOUR: f64 = 3_600_000.0;
@@ -52,6 +55,13 @@ pub fn trades_from_outcomes(
                 // than infinite, so it is reported as absent.
                 pnl_pct: (initial_balance != 0.0).then(|| outcome.pnl / initial_balance),
                 duration_hours,
+                exit_reason: match outcome.exit_reason {
+                    POPULATION_EXIT_STOP => Some(TradeExitReason::Stop),
+                    POPULATION_EXIT_TARGET => Some(TradeExitReason::Target),
+                    POPULATION_EXIT_MAX_HOLD => Some(TradeExitReason::MaxHold),
+                    POPULATION_EXIT_GAP => Some(TradeExitReason::DataGap),
+                    _ => None,
+                },
                 mfe: outcome.mfe,
                 mae: outcome.mae,
                 r_multiple: outcome.r_multiple,
@@ -99,6 +109,23 @@ mod tests {
         assert_eq!(trade.pnl_pct, Some(0.025));
         assert_eq!(trade.mfe, 12.0);
         assert_eq!(trade.mae, 4.0);
+        assert_eq!(trade.exit_reason, Some(TradeExitReason::Target));
+    }
+
+    #[test]
+    fn recorded_exit_codes_are_preserved_without_guessing_unknown_causes() {
+        for (code, expected) in [
+            (POPULATION_EXIT_STOP, Some(TradeExitReason::Stop)),
+            (POPULATION_EXIT_MAX_HOLD, Some(TradeExitReason::MaxHold)),
+            (POPULATION_EXIT_GAP, Some(TradeExitReason::DataGap)),
+            (99, None),
+        ] {
+            let mut closed = outcome(7, 1, 4, 250.0);
+            closed.exit_reason = code;
+            let trades = trades_from_outcomes(&[closed], 7, &timestamps(), 10_000.0);
+            assert_eq!(trades.len(), 1);
+            assert_eq!(trades[0].exit_reason, expected);
+        }
     }
 
     #[test]

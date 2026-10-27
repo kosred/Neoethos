@@ -454,6 +454,39 @@ fn shared_holdout_consumers_worker() {
         })
         .expect("all six real calibration replays, no portfolio capacity argument");
     assert_eq!(cohort.trials.len(), portfolio.len());
+    let mut risky_config = config.clone();
+    risky_config.mode = DiscoveryMode::Risky;
+    risky_config.runtime_overrides.risky_survival_only = true;
+    let risky_cohort = parallel_pool
+        .install(|| {
+            evaluate_selection_calibration_cohort(
+                &portfolio,
+                &portfolio,
+                &calibration_features.names,
+                &calibration_features,
+                &calibration_ohlcv,
+                &calibration_scope,
+                hash,
+                &risky_config,
+                final_gate,
+                None,
+            )
+        })
+        .unwrap();
+    assert_eq!(risky_cohort.trials.len(), portfolio.len());
+    assert!(
+        risky_cohort.trials.iter().all(|trial| trial
+            .risky_goal_windows
+            .as_ref()
+            .is_some_and(|goal| goal["mode"] == "risky")
+            && !trial.profitable_for_selection
+            && trial
+                .rejection_reason
+                .as_ref()
+                .unwrap()
+                .contains("no complete goal-horizon windows")),
+        "the short CPU fixture cannot establish a 180-day Risky goal"
+    );
     let reference = PreparedLockedHoldoutResearch::new(
         &portfolio,
         &calibration_features.names,
@@ -601,6 +634,32 @@ fn shared_holdout_consumers_worker() {
     );
     assert_eq!(losing_trial.summary.as_ref(), Some(&losing_summary));
     assert!(!losing_trial.profitable_for_selection);
+    // Explicit wire/reconstruction fixture, not financial evidence. A goal
+    // verdict must survive artifact construction without a second Kelly gate.
+    let goals = serde_json::json!({
+        "target_balance": 50000.0, "window_days": 180,
+        "windows": [{"capital_survived": true, "target_reached": true}]
+    });
+    let goal_trial = selection_calibration_trial_for_goal(
+        0,
+        ValidationStrategyIdentityV2::from_gene(&portfolio[0]).unwrap(),
+        losing_summary,
+        Some(goals),
+    );
+    assert!(goal_trial.profitable_for_selection);
+    let mut transport = restored;
+    transport.trials = vec![goal_trial];
+    let goal_artifacts =
+        selected_calibration_artifacts(&portfolio[..1], &calibration_scope, hash, &transport)
+            .unwrap();
+    assert!(goal_artifacts[0].summary().metrics.net_profit < 0.0);
+    transport.trials[0].risky_goal_windows.as_mut().unwrap()["windows"][0]["capital_survived"] =
+        false.into();
+    assert!(
+        selected_calibration_artifacts(&portfolio[..1], &calibration_scope, hash, &transport)
+            .is_err(),
+        "a stale passing boolean cannot override the retained Risky survival verdict"
+    );
     let mut substituted = portfolio.clone();
     substituted[0].weights[0] += 0.25;
     assert!(

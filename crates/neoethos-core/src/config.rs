@@ -1423,6 +1423,16 @@ impl Default for SearchRuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiscoveryRuntimeConfig {
+    /// New Risky research policy: permit every drawdown below total capital
+    /// loss. Position risk remains an explicit searched input, and the native
+    /// confidence-sized balance path must reach the configured deadline goal.
+    /// False preserves archived runs' 60% selection ceiling and EUR10 floor.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_survival_only: bool,
+    /// Opt-in rolling five-UTC-weekday objective for new PropFirm CPU runs.
+    /// Existing stricter frequency and financial floors remain active.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub weekly_cadence: bool,
     /// Max features kept after the in-sample correlation prefilter; `0`
     /// disables the prefilter. (was `NEOETHOS_BOT_PREFILTER_TOP_K`)
     ///
@@ -1520,6 +1530,62 @@ pub struct DiscoveryRuntimeConfig {
     /// See [`PropFirmGateConfig`]. (was the
     /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides)
     pub prop_firm_gate: PropFirmGateConfig,
+    /// Opt-in DIRECTION-ONLY prefilter ranking (neo-671 volatility-decoupling
+    /// experiment, default `false` = unchanged behaviour).
+    ///
+    /// The default ranking scores each column by `max(|corr|, |corr_short|)`
+    /// of the column against the full first-passage label, whose vertical/
+    /// ambiguous rows are `0`. The label barriers are ATR-scaled by
+    /// construction, so a volatility feature correlates with whether the label
+    /// is DECIDED (wide barriers → more vertical rows) even when it carries no
+    /// directional information — and the absolute value turns that
+    /// decidedness correlation into a high rank. The GA then inherits a
+    /// volatility-state vocabulary with weak directional edge.
+    ///
+    /// When `true`, the correlation for each direction is computed on the rows
+    /// where that direction's label is decided (`+1`/`-1`) only; vertical and
+    /// ambiguous rows are excluded. The rank then answers "given a barrier is
+    /// hit, does this column predict WHICH one" instead of "does this column
+    /// predict whether a barrier is hit". Same barrier geometry, same window,
+    /// same top-K and quotas.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prefilter_direction_only_ranking: bool,
+    /// Opt-in volatility-family purge for the prefilter (default empty =
+    /// unchanged). Every column whose timeframe-stripped name starts with one
+    /// of these prefixes is excluded from the ranking AND from the per-TF
+    /// quota and seed-template force-keep — a purge, not a tie-break. Intended
+    /// for the neo-671 volatility-decoupling experiments (e.g.
+    /// `[atr, atr_percentile, natr, garman_klass_volatility,
+    /// parkinson_volatility, quant_rvol, mass, normalized_volume_true_range]`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefilter_purge_prefixes: Vec<String>,
+    /// Opt-in SYMMETRIC round-trip cost treatment for the discovery prefilter's
+    /// triple-barrier / first-passage label (neo-671 label-cost experiment,
+    /// default `false` = unchanged behaviour).
+    ///
+    /// The legacy (default) barriers charge the round-trip cost to the take
+    /// side only in PRICE terms: the take barrier sits at
+    /// `entry + take + cost` while the stop barrier sits at
+    /// `entry - stop + cost` (cost ADDED to the take distance, SUBTRACTED from
+    /// the stop distance). In net-P&L terms that is correct — a win nets
+    /// exactly `take` and a loss nets exactly `stop` — but first passage is
+    /// a race in PRICE space, so the stop (now `stop - cost` from entry) is
+    /// hit far more often than the take (`take + cost` away). At the band
+    /// midpoint the decided census is therefore ~80% losses BY CONSTRUCTION,
+    /// and the feature ranking and the GA inherit that loss tilt.
+    ///
+    /// When `true`, the cost is ADDED TO BOTH barrier distances:
+    /// `entry + take + cost` vs `entry - stop - cost` (mirrored for the
+    /// short label). Each side must clear its own distance PLUS the round trip
+    /// — the same both-ways charge the `models.label_geometry: symmetric`
+    /// mode of `neoethos_models` applies. On a driftless series the race is
+    /// fair: with `rr == 1` the decided census is ~50/50; with `rr > 1`
+    /// only the honest rr tilt remains and the cost no longer tilts it further.
+    ///
+    /// The resident GPU screening path refuses this knob for now (the
+    /// device-side label still applies the legacy tilt); use the CPU route.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub label_cost_symmetric: bool,
 }
 
 impl Default for DiscoveryRuntimeConfig {
@@ -1527,6 +1593,8 @@ impl Default for DiscoveryRuntimeConfig {
         Self {
             // 240, matching config.yaml. See the field docs — the previous 50
             // silently contradicted the shipped config.
+            weekly_cadence: false,
+            risky_survival_only: false,
             prefilter_top_k: 240,
             // Discovery already receives only the training side of the outer
             // temporal split. Rank features on all of that admissible prefix;
@@ -1534,6 +1602,9 @@ impl Default for DiscoveryRuntimeConfig {
             // unnecessarily narrows the vocabulary available to the GA.
             prefilter_insample_frac: 1.0,
             prefilter_min_per_timeframe: 6,
+            prefilter_direction_only_ranking: false,
+            prefilter_purge_prefixes: Vec::new(),
+            label_cost_symmetric: false,
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
             min_history_years: 0,
@@ -1841,6 +1912,25 @@ pub struct ExitPolicyConfig {
     pub trailing_stop_multiplier: f64,
     /// Floor, in pips, on the profit the armed trail locks in.
     pub trailing_min_lock_pips: f64,
+    /// Maximum holding horizon, in bars, for the discovery evaluation's
+    /// time stop. Resolved by `DiscoveryConfig::from_settings`
+    /// (neoethos-search) into `DiscoveryConfig.max_hold_bars` and carried
+    /// through the evaluation config into `BacktestSettings.max_hold_bars`,
+    /// which closes every open position at entry + N bars.
+    ///
+    /// DEFAULT `0` = unchanged/disabled: no maximum-hold exit is armed,
+    /// byte-identical to every run produced before the knob existed. A
+    /// positive value lets the next research experiment use short holds
+    /// without editing code.
+    #[serde(skip_serializing_if = "max_hold_bars_is_disabled")]
+    pub max_hold_bars: usize,
+}
+
+/// `serde` skip predicate for [`ExitPolicyConfig::max_hold_bars`]: `0` — the
+/// shipped default — serialises as an ABSENT key, so existing artifacts and
+/// the generated desktop seed stay byte-identical.
+fn max_hold_bars_is_disabled(value: &usize) -> bool {
+    *value == 0
 }
 
 impl Default for ExitPolicyConfig {
@@ -1855,6 +1945,8 @@ impl Default for ExitPolicyConfig {
             // trail geometry, and the backtest, the CUDA kernel and live
             // trading all take it from here.
             trailing_min_lock_pips: DEFAULT_TRAILING_MIN_LOCK_PIPS,
+            // 0 = unchanged/disabled: keep the pre-knob behaviour exactly.
+            max_hold_bars: 0,
         }
     }
 }
@@ -4894,6 +4986,132 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&settings).unwrap();
         let deserialized: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(deserialized.system.symbol, settings.system.symbol);
+    }
+
+    #[test]
+    fn exit_policy_max_hold_bars_survives_settings_serde_round_trip() {
+        // The shipped default is 0 = unchanged/disabled: the evaluation arms no
+        // maximum-hold time stop, exactly like every run before the knob.
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.models.exit_policy.max_hold_bars, 0,
+            "shipped default must keep current behaviour (0 = no max-hold exit)"
+        );
+
+        // A configured horizon must survive the YAML round trip so the next
+        // experiment can use short holds without editing code.
+        settings.models.exit_policy.max_hold_bars = 24;
+        let yaml = serde_yaml_ng::to_string(&settings).unwrap();
+        assert!(
+            yaml.contains("max_hold_bars"),
+            "a configured (non-zero) max holding horizon must be serialised: {yaml}"
+        );
+        let deserialized: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            deserialized.models.exit_policy.max_hold_bars, 24,
+            "models.exit_policy.max_hold_bars must survive the settings round trip"
+        );
+
+        // An absent key keeps the disabled default.
+        let absent: Settings = serde_yaml_ng::from_str(
+            "system:
+  symbol: EURUSD
+",
+        )
+        .unwrap();
+        assert_eq!(
+            absent.models.exit_policy.max_hold_bars, 0,
+            "an absent models.exit_policy.max_hold_bars must resolve to 0"
+        );
+    }
+
+    #[test]
+    fn prefilter_volatility_knobs_survive_settings_serde_round_trip() {
+        // Shipped defaults: both knobs OFF, so today's behaviour is unchanged.
+        let mut settings = Settings::default();
+        assert!(
+            !settings
+                .models
+                .discovery_runtime
+                .prefilter_direction_only_ranking
+        );
+        assert!(
+            settings
+                .models
+                .discovery_runtime
+                .prefilter_purge_prefixes
+                .is_empty()
+        );
+
+        // A configured knob pair must survive the YAML round trip.
+        settings
+            .models
+            .discovery_runtime
+            .prefilter_direction_only_ranking = true;
+        settings.models.discovery_runtime.prefilter_purge_prefixes =
+            vec!["atr".to_string(), "mass".to_string()];
+        let yaml = serde_yaml_ng::to_string(&settings).unwrap();
+        assert!(
+            yaml.contains("prefilter_direction_only_ranking"),
+            "an enabled direction-only knob must be serialised: {yaml}"
+        );
+        let back: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(
+            back.models
+                .discovery_runtime
+                .prefilter_direction_only_ranking
+        );
+        assert_eq!(
+            back.models.discovery_runtime.prefilter_purge_prefixes,
+            vec!["atr".to_string(), "mass".to_string()]
+        );
+
+        // Absent keys keep the disabled defaults.
+        let absent: Settings = serde_yaml_ng::from_str(
+            "system:
+  symbol: EURUSD
+",
+        )
+        .unwrap();
+        assert!(
+            !absent
+                .models
+                .discovery_runtime
+                .prefilter_direction_only_ranking
+        );
+        assert!(
+            absent
+                .models
+                .discovery_runtime
+                .prefilter_purge_prefixes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn label_cost_symmetric_survives_settings_serde_round_trip() {
+        // Shipped default: OFF, so today's label barriers are unchanged.
+        let mut settings = Settings::default();
+        assert!(!settings.models.discovery_runtime.label_cost_symmetric);
+
+        // An enabled knob must survive the YAML round trip.
+        settings.models.discovery_runtime.label_cost_symmetric = true;
+        let yaml = serde_yaml_ng::to_string(&settings).unwrap();
+        assert!(
+            yaml.contains("label_cost_symmetric"),
+            "an enabled symmetric-cost label knob must be serialised: {yaml}"
+        );
+        let back: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(back.models.discovery_runtime.label_cost_symmetric);
+
+        // An absent key keeps the disabled default.
+        let absent: Settings = serde_yaml_ng::from_str(
+            "system:
+  symbol: EURUSD
+",
+        )
+        .unwrap();
+        assert!(!absent.models.discovery_runtime.label_cost_symmetric);
     }
 
     #[test]

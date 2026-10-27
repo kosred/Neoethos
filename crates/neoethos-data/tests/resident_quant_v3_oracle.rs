@@ -1,7 +1,7 @@
 use neoethos_data::core::features::{FeatureCellValidity, FeatureColumnF64};
 use neoethos_data::core::quant_features::{
     compute_quant_feature_columns, compute_quant_feature_columns_f64,
-    compute_quant_feature_columns_v4_f64,
+    compute_quant_feature_columns_v4_f64, compute_quant_feature_columns_v5_f64,
 };
 use neoethos_data::{CanonicalTimeframe, Ohlcv};
 
@@ -980,6 +980,55 @@ fn cum_delta_zscore_recovers_after_zero_range_delta_leaves_rolling_dependency() 
     );
     assert_eq!(cumulative_delta.validity[110], FeatureCellValidity::Valid);
     assert!(cumulative_delta.values[110].is_finite());
+}
+
+#[test]
+fn rolling_validity_v5_reuses_the_correction_without_migrating_other_quant_math() {
+    for timeframe in [
+        CanonicalTimeframe::M5,
+        CanonicalTimeframe::H1,
+        CanonicalTimeframe::H4,
+        CanonicalTimeframe::D1,
+    ] {
+        let mut bars = zero_range_recovery_fixture();
+        // Canonical timestamps must be in-range Unix milliseconds; row 0 at
+        // epoch 0 is rejected by the production timestamp validator.
+        bars.timestamp = Some(
+            (0..bars.len())
+                .map(|i| {
+                    1_577_836_800_000
+                        + i as i64 * timeframe.fixed_duration_ms().unwrap_or(UTC_DAY_MILLIS)
+                })
+                .collect(),
+        );
+        let legacy = compute_quant_feature_columns_f64(&bars).unwrap();
+        let corrected = compute_quant_feature_columns_v5_f64(&bars).unwrap();
+        assert_eq!(legacy.len(), corrected.len());
+        for (old, new) in legacy.iter().zip(&corrected) {
+            assert_eq!(old.name, new.name);
+            if old.name == "quant_cum_delta_zscore" {
+                assert_eq!(new.validity[50], FeatureCellValidity::Valid);
+                assert!(
+                    new.validity[60..110]
+                        .iter()
+                        .all(|v| *v == FeatureCellValidity::ZeroDenominator)
+                );
+                assert_eq!(new.validity[110], FeatureCellValidity::Valid);
+                assert!(new.values[110].is_finite());
+                assert_eq!(old.validity[110], FeatureCellValidity::ZeroDenominator);
+            } else {
+                assert_eq!(old.validity, new.validity, "{} {timeframe}", old.name);
+                assert!(
+                    old.values
+                        .iter()
+                        .zip(&new.values)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{} {timeframe}",
+                    old.name
+                );
+            }
+        }
+    }
 }
 
 #[test]

@@ -127,23 +127,32 @@ fn softmax_weights(
     selection_temperature: f64,
 ) -> Vec<f64> {
     let temperature = selection_temperature.max(1e-6);
-    let max_score = candidate_indices
+    let eligible: Vec<f64> = candidate_indices
         .iter()
         .filter_map(|idx| scores.get(*idx))
         .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    if !max_score.is_finite() {
+        .filter(|score| score.is_finite())
+        .collect();
+    if eligible.is_empty() {
+        // Explicit all-invalid fallback: no finite eligible genome exists.
+        // This is degenerate uniform fallback, never healthy selection and
+        // never promotion of an invalid genome above a finite one.
         return vec![1.0; candidate_indices.len()];
     }
+    let max_score = eligible.into_iter().fold(f64::NEG_INFINITY, f64::max);
 
     candidate_indices
         .iter()
         .map(|idx| {
-            let centered = (scores[*idx] - max_score) / temperature;
+            let score = scores[*idx];
+            if !score.is_finite() {
+                return 0.0;
+            }
+            let centered = (score - max_score) / temperature;
             if centered.is_finite() {
                 centered.exp().max(1e-12)
             } else {
-                1.0
+                0.0
             }
         })
         .collect()
@@ -656,6 +665,11 @@ fn random_coarse_weight(rng: &mut impl Rng) -> f64 {
 /// the adaptive ladder hasn't been installed for this process.
 const STATIC_THRESHOLD_LADDER: [f64; 6] = [0.10, 0.20, 0.35, 0.50, 0.70, 0.90];
 
+/// Relative tolerance for treating adjacent adaptive-ladder slots as the same
+/// randomized choice. Duplicate/near-duplicate slots silently overweight one
+/// threshold; such a ladder must use the static fallback instead.
+const ADAPTIVE_THRESHOLD_LADDER_DISTINCT_REL_TOLERANCE: f64 = 1e-9;
+
 /// F-277 (2026-05-28): process-wide adaptive threshold ladder derived
 /// from the actual feature-magnitude profile of the current discovery
 /// dataset. Installed once at the start of `run_discovery_cycle_with_progress`
@@ -891,6 +905,28 @@ pub fn derive_adaptive_threshold_ladder_from_features(
 // Keep the mathematical reduction independent of the live RAM probe so tests
 // can prove that different admitted schedules do not change the search space.
 // Production always enters through the adaptive planner above.
+/// Median abs value using the SAME convention as robust normalization:
+/// average the two central values for an even valid count, odd middle otherwise.
+fn adaptive_column_median_abs(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let middle = values.len() / 2;
+    let median = if values.len() % 2 == 1 {
+        let (_, &mut median, _) = values.select_nth_unstable_by(middle, f64::total_cmp);
+        median
+    } else {
+        let (lower, &mut upper, _) = values.select_nth_unstable_by(middle, f64::total_cmp);
+        let lower_middle = lower
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .expect("even-length sample has a lower middle");
+        lower_middle * 0.5 + upper * 0.5
+    };
+    (median.is_finite() && median >= 0.0).then_some(median)
+}
+
 fn derive_adaptive_threshold_ladder_with_projection_schedule(
     features: &neoethos_data::FeatureFrame,
     columns_per_batch: usize,
@@ -920,19 +956,14 @@ fn derive_adaptive_threshold_ladder_with_projection_schedule(
                 );
                 let mut medians = Vec::with_capacity(indices.len());
                 for column in &projection.columns {
-                    let mut abs_values = column
+                    let abs_values = column
                         .values
                         .iter()
                         .zip(&column.validity)
                         .filter_map(|(value, validity)| validity.is_valid().then_some(value.abs()))
                         .collect::<Vec<_>>();
-                    if abs_values.is_empty() {
-                        continue;
-                    }
-                    let middle = abs_values.len() / 2;
-                    let (_, median, _) = abs_values.select_nth_unstable_by(middle, f64::total_cmp);
-                    if median.is_finite() && *median >= 0.0 {
-                        medians.push(*median);
+                    if let Some(median) = adaptive_column_median_abs(abs_values) {
+                        medians.push(median);
                     }
                 }
                 Ok(medians)
@@ -963,11 +994,17 @@ fn derive_adaptive_threshold_ladder_with_projection_schedule(
         pct(0.90),
         pct(0.99),
     ];
-    // Final safety: ensure strictly non-decreasing (clamp+pct may
-    // collapse two adjacent points in degenerate inputs).
+    // A randomized six-slot grid is useful only when every adjacent slot is a
+    // distinct choice. Normalization can standardize the per-column median
+    // statistic to the same value across genuinely different columns, and
+    // even/odd median conventions can also create tiny artificial spreads.
+    // Reject both equal and near-equal slots; the discovery owner then uses the
+    // existing static fallback rather than silently weighting one threshold.
     for i in 1..ladder.len() {
-        if ladder[i] < ladder[i - 1] {
-            // Degenerate distribution — bail to static fallback.
+        let scale = ladder[i].abs().max(ladder[i - 1].abs()).max(1.0);
+        if ladder[i] < ladder[i - 1]
+            || ladder[i] - ladder[i - 1] <= ADAPTIVE_THRESHOLD_LADDER_DISTINCT_REL_TOLERANCE * scale
+        {
             return Ok(None);
         }
     }
@@ -1103,17 +1140,36 @@ pub fn unique_candidate_or_retry(
     rng: &mut impl Rng,
 ) -> Gene {
     candidate.normalize(n_indicators, 1);
-    if seen.insert_gene(&candidate) {
+    let accepted = seen.insert_gene(&candidate);
+    #[cfg(test)]
+    if !accepted {
+        super::search_engine::record_retry_counter(
+            super::search_engine::RetryDiagnosticCounterV1::DuplicateAttempt,
+        );
+    }
+    if accepted {
         return candidate;
     }
     let attempts = max_attempts.max(1);
     for _ in 0..attempts {
         let mut probe = new_random_gene(n_indicators, max_indicators, generation, smc_cfg, rng);
+        #[cfg(test)]
+        super::search_engine::record_retry_counter(
+            super::search_engine::RetryDiagnosticCounterV1::NewbornDraw,
+        );
         probe.normalize(n_indicators, 1);
         if seen.insert_gene(&probe) {
+            #[cfg(test)]
+            super::search_engine::record_retry_counter(
+                super::search_engine::RetryDiagnosticCounterV1::SuccessfulReplacement,
+            );
             return probe;
         }
     }
+    #[cfg(test)]
+    super::search_engine::record_retry_counter(
+        super::search_engine::RetryDiagnosticCounterV1::Exhaustion,
+    );
     candidate
 }
 
@@ -1342,6 +1398,13 @@ pub fn mutate(
     mutated.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
     mutated.generation = generation;
     reset_gene_metrics(&mut mutated);
+    if mutated.has_total_weight_cancellation(n_indicators) {
+        // A finite crossover child can algebraically cancel every term. Treat
+        // that as a degenerate offspring requiring explicit replacement, using
+        // the existing seeded newborn mechanism; normalize fixed +1 fallback
+        // would silently turn a canceled inherited term into a strong active one.
+        return new_random_gene(n_indicators, max_indicators, generation, smc_cfg, rng);
+    }
     mutated.normalize(n_indicators, 1);
     mutated
 }
@@ -1358,15 +1421,42 @@ pub fn apply_metrics(
     metrics: &[[f64; 11]],
     config: &super::strategy_gene::EvaluationConfig,
     evaluation_span_days: f64,
+    monthly_returns: Option<&[Vec<f64>]>,
 ) {
-    for (gene, m) in genes.iter_mut().zip(metrics.iter()) {
-        gene.fitness = if let Some(goal) = config.growth_goal {
-            crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
-        } else if config.growth_objective {
-            crate::scoring::ga_fitness_growth(m)
-        } else {
-            crate::scoring::ga_fitness(m)
-        };
+    for (index, (gene, m)) in genes.iter_mut().zip(metrics.iter()).enumerate() {
+        gene.fitness =
+            if matches!(
+                config.fitness_table,
+                crate::scoring::FitnessTable::MonthlyUpsideV1
+                    | crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1
+                    | crate::scoring::FitnessTable::MonthlyUpsideDdBudgetV1
+            ) {
+                // Opt-in B9 / B9-dd-averse (docs section 14.7): the explicit
+                // selector wins over the legacy boolean chain and reads the
+                // evaluator's completed-month return vector.
+                // PopulationEvaluationV1::apply refuses missing/misaligned
+                // transport; a legitimately empty per-gene series still takes
+                // the scorer's -100.0 guard.
+                let months = monthly_returns
+                    .and_then(|series| series.get(index))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1 {
+                    crate::scoring::ga_fitness_monthly_upside_dd_averse_v1(months, m)
+                } else if config.fitness_table
+                    == crate::scoring::FitnessTable::MonthlyUpsideDdBudgetV1
+                {
+                    crate::scoring::ga_fitness_monthly_upside_dd_budget_v1(months, m)
+                } else {
+                    crate::scoring::ga_fitness_monthly_upside_v1(months, m)
+                }
+            } else if let Some(goal) = config.growth_goal {
+                crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
+            } else if config.growth_objective {
+                crate::scoring::ga_fitness_growth(m)
+            } else {
+                crate::scoring::ga_fitness(m)
+            };
         gene.sharpe_ratio = m[1];
         gene.max_drawdown = m[3];
         gene.win_rate = m[4];
@@ -1503,6 +1593,43 @@ mod tests {
             distinct_adaptive_ratios.len()
         );
         assert!(adaptive_ratio_mutated, "adaptive ratio never mutated");
+
+        use rand::{SeedableRng, rngs::StdRng};
+        let names = crate::genetic::seed_templates::multi_tf_test_feature_names();
+        let seed_count = names.len();
+        let seeds = crate::genetic::seed_templates::seed_professional_templates(
+            50,
+            &names,
+            seed_count,
+            &mut StdRng::seed_from_u64(13),
+        );
+        assert!(
+            !seeds.is_empty(),
+            "full multi-TF schema must resolve templates"
+        );
+        for gene in &seeds {
+            assert!(
+                gene.sl_pips >= band.sl_min_pips - 1e-9 && gene.sl_pips <= band.sl_max_pips + 1e-9,
+                "template sl {} outside H4 band [{}, {}]",
+                gene.sl_pips,
+                band.sl_min_pips,
+                band.sl_max_pips
+            );
+            assert!(
+                gene.tp_pips >= band.tp_min_pips - 1e-9 && gene.tp_pips <= band.tp_max_pips + 1e-9,
+                "template tp {} outside H4 band [{}, {}]",
+                gene.tp_pips,
+                band.tp_min_pips,
+                band.tp_max_pips
+            );
+            let ratio = gene.tp_pips / gene.sl_pips;
+            assert!(
+                ratio >= band.rr_min - 1e-9 && ratio <= band.rr_max + 1e-9,
+                "template rr {ratio} outside [{}, {}]",
+                band.rr_min,
+                band.rr_max
+            );
+        }
 
         // Leave the process as we found it so no later test inherits an H4 scale.
         clear_gene_stop_atr_scale();
@@ -1761,35 +1888,199 @@ mod tests {
         );
     }
 
+    fn diverse_raw_ladder_frame() -> neoethos_data::FeatureFrame {
+        let n = 100usize;
+        let scales = [
+            0.001_f64, 0.002, 0.004, 0.007, 0.010, 0.020, 0.040, 0.080, 0.100, 0.120, 0.140, 0.160,
+        ];
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, scales.len()));
+        for r in 0..n {
+            for (j, scale) in scales.iter().enumerate() {
+                data[(r, j)] = (r as f64 + 1.0) * scale;
+            }
+        }
+        frame_of(data)
+    }
+
+    fn normalized_frame_of(a: ndarray::Array2<f64>) -> std::sync::Arc<neoethos_data::FeatureFrame> {
+        let raw = std::sync::Arc::new(frame_of(a));
+        let n = raw.n_samples();
+        let fit = raw
+            .fit_normalization(0..n, false, &neoethos_data::FeatureBuildControl::default())
+            .expect("robust normalization fit");
+        std::sync::Arc::new(
+            raw.with_fitted_normalization(&fit)
+                .expect("materialize robust normalization"),
+        )
+    }
+
     #[test]
     fn derive_ladder_produces_monotonic_ascending_values() {
-        // Sample with varied magnitudes per column.
-        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((100, 4));
-        for r in 0..100 {
-            data[(r, 0)] = (r as f64) * 0.01; // 0..1.0 — small magnitudes
-            data[(r, 1)] = (r as f64) * 0.05; // 0..5.0 — medium
-            data[(r, 2)] = (r as f64) * 0.10; // 0..10.0 — large (will clamp)
-            data[(r, 3)] = -(r as f64) * 0.02; // negative side
-        }
-        let ladder = derive_adaptive_threshold_ladder_from_features(&frame_of(data))
+        // A RAW fixture needs enough distinct per-column medians to supply six
+        // distinct quantiles. This is not a normalized-collapse fixture.
+        let frame = diverse_raw_ladder_frame();
+        let ladder = derive_adaptive_threshold_ladder_from_features(&frame)
             .expect("adaptive-threshold scan must not fail")
-            .expect("non-degenerate cube must produce ladder");
-        // Monotone ascending
+            .expect("diverse raw cube must produce ladder");
         for i in 1..ladder.len() {
             assert!(
-                ladder[i] >= ladder[i - 1],
-                "ladder[{i}]={} < ladder[{}]={}",
+                ladder[i] > ladder[i - 1],
+                "ladder[{i}]={} must be distinctly above ladder[{}]={}",
                 ladder[i],
                 i - 1,
                 ladder[i - 1]
             );
         }
-        // All clamped to safe range
-        for v in ladder.iter() {
-            assert!(v.is_finite());
-            assert!(*v >= 1e-4);
-            assert!(*v <= 10.0);
+    }
+
+    #[test]
+    fn derive_ladder_rejects_mad_normalized_odd_collapse() {
+        let n = 63usize;
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, 8));
+        let scales = [0.002_f64, 0.05, 0.7, 4.0, 0.001, 0.02];
+        for r in 0..n {
+            let centered = r as f64 - 31.0;
+            for (j, scale) in scales.iter().enumerate() {
+                data[(r, j)] = centered * scale;
+            }
+            data[(r, 6)] = if r % 17 == 0 { 1.0 } else { 0.0 };
+            data[(r, 7)] = if r % 29 == 0 { 1.0 } else { 0.0 };
         }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "normalized diverse columns collapse to one median statistic; fallback is required"
+        );
+    }
+
+    #[test]
+    fn adaptive_column_median_matches_robust_mean_of_central_pair() {
+        assert_eq!(adaptive_column_median_abs(vec![3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(
+            adaptive_column_median_abs(vec![4.0, 1.0, 3.0, 2.0]),
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn adaptive_column_median_handles_even_extremes_without_overflow() {
+        let median =
+            adaptive_column_median_abs(vec![f64::MAX, f64::MAX]).expect("finite extreme median");
+        assert!(
+            median.is_finite(),
+            "overflow-safe half-sum must stay finite"
+        );
+        let median = adaptive_column_median_abs(vec![f64::MAX, f64::MAX / 2.0, 1.0, 2.0])
+            .expect("finite mixed-extreme median");
+        assert!(
+            median.is_finite(),
+            "overflow-safe half-sum must stay finite"
+        );
+    }
+
+    #[test]
+    fn derive_ladder_rejects_asymmetric_even_shape_collapse() {
+        let n = 64usize;
+        let shapes: [fn(f64) -> f64; 8] = [
+            |x| x,
+            |x| x * x,
+            |x| x * x * x,
+            |x| x.sqrt(),
+            |x| x.ln(),
+            |x| (x / 20.0).exp(),
+            |x| 1.0 / x,
+            |x| (x / 5.0).sin(),
+        ];
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, shapes.len()));
+        for r in 0..n {
+            let x = (r + 1) as f64;
+            for (j, shape) in shapes.iter().enumerate() {
+                data[(r, j)] = shape(x);
+            }
+        }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "asymmetric even normalized shapes must collapse under the corrected median convention"
+        );
+    }
+
+    #[test]
+    fn derive_ladder_rejects_asymmetric_even_normalized_collapse() {
+        let n = 64usize;
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, 8));
+        let scales = [0.003_f64, 0.02, 0.3, 2.0, 0.001, 0.05, 0.9, 4.0];
+        for (j, scale) in scales.iter().enumerate() {
+            let mut values = Vec::with_capacity(n);
+            for r in 0..n / 2 {
+                values.push(-((r + 1) as f64) * scale);
+            }
+            for r in 0..n / 2 {
+                let positive = if r == n / 2 - 1 {
+                    100.0
+                } else {
+                    (r + 1) as f64
+                };
+                values.push(positive * scale);
+            }
+            for (r, value) in values.into_iter().enumerate() {
+                data[(r, j)] = value;
+            }
+        }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "asymmetric even normalized columns must fall back, not retain artificial spread"
+        );
+    }
+
+    #[test]
+    fn derive_ladder_rejects_continuous_sparse_mixture() {
+        let n = 64usize;
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, 8));
+        let scales = [0.002_f64, 0.05, 0.7, 4.0];
+        for r in 0..n {
+            let centered = r as f64 - 31.5;
+            for (j, scale) in scales.iter().enumerate() {
+                data[(r, j)] = centered * scale;
+            }
+            for (j, modulus) in [(4usize, 7usize), (5, 11), (6, 13), (7, 17)] {
+                data[(r, j)] = if r % modulus == 0 { 1.0 } else { 0.0 };
+            }
+        }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "four continuous + four sparse normalized columns must fall back"
+        );
+    }
+
+    #[test]
+    fn derive_ladder_rejects_sparse_only_normalized_columns() {
+        let n = 64usize;
+        let mut data: ndarray::Array2<f64> = ndarray::Array2::zeros((n, 6));
+        for r in 0..n {
+            for j in 0..6 {
+                data[(r, j)] = if r % (7 + j * 2) == 0 { 1.0 } else { 0.0 };
+            }
+        }
+        let frame = normalized_frame_of(data);
+        assert!(
+            derive_adaptive_threshold_ladder_from_features(&frame)
+                .expect("adaptive scan")
+                .is_none(),
+            "sparse-only normalized cube must fall back explicitly"
+        );
+        clear_adaptive_threshold_ladder();
+        assert_eq!(current_threshold_ladder(), STATIC_THRESHOLD_LADDER);
     }
 
     fn ladder_vortex_copy(
@@ -1824,8 +2115,8 @@ mod tests {
     }
 
     #[test]
-    fn derive_ladder_matches_hand_calculated_upper_medians_and_percentile_ranks() {
-        use FeatureCellValidity::{Gap, Stale, Valid, Warmup};
+    fn derive_ladder_matches_hand_calculated_median_and_percentile_ranks() {
+        use FeatureCellValidity::{Gap, Valid, Warmup};
         use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
 
         let central = f64::from_bits(0.8_f64.to_bits() + 1);
@@ -1844,20 +2135,20 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, median)| {
-                // Four valid magnitudes: [0.5m, 0.75m, m, 2m]. The upper
-                // median is exactly m, not the average of the middle pair.
+                // Five valid magnitudes: [0.25m, 0.5m, m, 2m, 3m]. The odd
+                // middle is exactly m under either median convention.
                 FeatureColumnF64::new(
                     format!("known_median_{index}"),
                     vec![
-                        -median * 0.5,
-                        median * 2.0,
+                        median * 0.25,
+                        median * 0.5,
                         median,
-                        -median * 0.75,
+                        median * 2.0,
+                        median * 3.0,
                         f64::MAX,
                         -99.0,
-                        42.0,
                     ],
-                    vec![Valid, Valid, Valid, Valid, Warmup, Gap, Stale],
+                    vec![Valid, Valid, Valid, Valid, Valid, Warmup, Gap],
                 )
                 .expect("known median column")
             })
@@ -1884,10 +2175,108 @@ mod tests {
         }
     }
 
+    fn independent_threshold_ladder(frame: &neoethos_data::FeatureFrame) -> Option<[u64; 6]> {
+        use neoethos_data::FeatureData;
+        let FeatureData::InMemory(raw_columns) = &frame.data else {
+            unreachable!()
+        };
+        let mut medians = raw_columns
+            .iter()
+            .filter_map(|column| {
+                let mut magnitudes = column
+                    .values
+                    .iter()
+                    .zip(&column.validity)
+                    .filter(|(value, validity)| value.is_finite() && validity.is_valid())
+                    .map(|(value, _)| value.abs())
+                    .collect::<Vec<_>>();
+                if magnitudes.is_empty() {
+                    return None;
+                }
+                magnitudes.sort_by(f64::total_cmp);
+                let middle = magnitudes.len() / 2;
+                if magnitudes.len() % 2 == 0 {
+                    // Overflow-safe mathematical average, matching the norm.
+                    Some(magnitudes[middle - 1] * 0.5 + magnitudes[middle] * 0.5)
+                } else {
+                    magnitudes.get(middle).copied()
+                }
+            })
+            .collect::<Vec<_>>();
+        if medians.is_empty() {
+            return None;
+        }
+        medians.sort_by(f64::total_cmp);
+        let pct = |percentile: f64| -> f64 {
+            let index = (percentile * (medians.len() - 1) as f64).round() as usize;
+            medians[index].clamp(1e-4, 10.0)
+        };
+        let ladder = [
+            pct(0.10),
+            pct(0.25),
+            pct(0.50),
+            pct(0.75),
+            pct(0.90),
+            pct(0.99),
+        ];
+        // Independent copy of the documented fallback contract: the six
+        // randomized slots are useful only while adjacent values differ.
+        let tolerance = 1e-9_f64;
+        let distinct = ladder.windows(2).all(|pair| {
+            let scale = pair[0].abs().max(pair[1].abs()).max(1.0);
+            pair[1] > pair[0] && pair[1] - pair[0] > tolerance * scale
+        });
+        distinct.then(|| ladder.map(f64::to_bits))
+    }
+
+    fn assert_adaptive_ladder_schedule_parity(
+        ram: &neoethos_data::FeatureFrame,
+        expected: Option<[u64; 6]>,
+    ) {
+        let temporary = tempfile::tempdir().expect("isolated parity Vortex root");
+        let vortex = ladder_vortex_copy(ram, temporary.path());
+        for workers in [1, 2, 5] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("isolated parity worker pool");
+            for frame in [ram, &vortex] {
+                let actual = pool
+                    .install(|| derive_adaptive_threshold_ladder_from_features(frame))
+                    .expect("live-planned ladder")
+                    .map(|ladder| ladder.map(f64::to_bits));
+                assert_eq!(actual, expected, "workers={workers}");
+                for (batch_columns, concurrent_batches) in [
+                    (1, 1),
+                    (1, 3),
+                    (2, 3),
+                    (5, 2),
+                    (19, 1),
+                    (usize::MAX, usize::MAX),
+                ] {
+                    let actual = pool
+                        .install(|| {
+                            derive_adaptive_threshold_ladder_with_projection_schedule(
+                                frame,
+                                batch_columns,
+                                concurrent_batches,
+                            )
+                        })
+                        .expect("scheduled ladder")
+                        .map(|ladder| ladder.map(f64::to_bits));
+                    assert_eq!(
+                        actual, expected,
+                        "workers={workers}, batch_columns={batch_columns}, concurrent_batches={concurrent_batches}",
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
-    fn derive_ladder_is_bit_exact_across_ram_vortex_workers_and_projection_schedules() {
+    fn derive_ladder_edge_fixture_is_bit_exact_across_ram_vortex_workers_and_schedules() {
         use FeatureCellValidity::{Gap, Valid, Warmup};
-        use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureData};
+        use neoethos_data::{FeatureCellValidity, FeatureColumnF64};
 
         let rows = 2_053;
         let columns = (0..19)
@@ -1924,71 +2313,19 @@ mod tests {
             columns,
         )
         .expect("mixed ladder fixture");
-        let FeatureData::InMemory(raw_columns) = &ram.data else {
-            unreachable!()
-        };
-        // Independent full-sort reference: no projection planner, parallel
-        // collection or select_nth implementation is reused by this oracle.
-        let mut medians = raw_columns
-            .iter()
-            .filter_map(|column| {
-                let mut magnitudes = column
-                    .values
-                    .iter()
-                    .zip(&column.validity)
-                    .filter(|(value, validity)| value.is_finite() && validity.is_valid())
-                    .map(|(value, _)| value.abs())
-                    .collect::<Vec<_>>();
-                magnitudes.sort_by(f64::total_cmp);
-                magnitudes.get(magnitudes.len() / 2).copied()
-            })
-            .collect::<Vec<_>>();
-        medians.sort_by(f64::total_cmp);
-        let expected = [0.10, 0.25, 0.50, 0.75, 0.90, 0.99].map(|percentile| {
-            let index = (percentile * (medians.len() - 1) as f64).round() as usize;
-            medians[index].clamp(1e-4, 10.0).to_bits()
-        });
-        let temporary = tempfile::tempdir().expect("isolated parity Vortex root");
-        let vortex = ladder_vortex_copy(&ram, temporary.path());
-        for workers in [1, 2, 5] {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(workers)
-                .build()
-                .expect("isolated parity worker pool");
-            for frame in [&ram, &vortex] {
-                assert_eq!(
-                    pool.install(|| derive_adaptive_threshold_ladder_from_features(frame))
-                        .expect("live-planned ladder")
-                        .expect("nonempty ladder")
-                        .map(f64::to_bits),
-                    expected,
-                );
-                for (batch_columns, concurrent_batches) in [
-                    (1, 1),
-                    (1, 3),
-                    (2, 3),
-                    (5, 2),
-                    (19, 1),
-                    (usize::MAX, usize::MAX),
-                ] {
-                    let actual = pool
-                        .install(|| {
-                            derive_adaptive_threshold_ladder_with_projection_schedule(
-                                frame,
-                                batch_columns,
-                                concurrent_batches,
-                            )
-                        })
-                        .expect("scheduled ladder")
-                        .expect("nonempty ladder")
-                        .map(f64::to_bits);
-                    assert_eq!(
-                        actual, expected,
-                        "workers={workers}, batch_columns={batch_columns}, concurrent_batches={concurrent_batches}",
-                    );
-                }
-            }
-        }
+        let expected = independent_threshold_ladder(&ram);
+        assert_adaptive_ladder_schedule_parity(&ram, expected);
+    }
+
+    #[test]
+    fn derive_ladder_diverse_raw_is_bit_exact_across_ram_vortex_workers_and_schedules() {
+        let ram = diverse_raw_ladder_frame();
+        let expected = independent_threshold_ladder(&ram);
+        assert!(
+            expected.is_some(),
+            "diverse RAW fixture must retain a Some ladder"
+        );
+        assert_adaptive_ladder_schedule_parity(&ram, expected);
     }
 
     #[test]
@@ -2014,4 +2351,348 @@ mod tests {
         clear_adaptive_threshold_ladder();
         assert_eq!(current_threshold_ladder(), STATIC_THRESHOLD_LADDER);
     }
+}
+
+#[cfg(test)]
+mod generator_audit_tests {
+    use super::*;
+    use crate::genetic::smc_indicators::smc_structural_flag_count;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    fn audit_gene(indices: Vec<usize>) -> Gene {
+        let (sl_pips, tp_pips) = current_gene_stop_bounds().mid_pair();
+        let mut gene = Gene {
+            weights: vec![0.4; indices.len()],
+            indices,
+            long_threshold: 0.2,
+            short_threshold: -0.2,
+            sl_pips,
+            tp_pips,
+            stop_vol_mult: 0.0,
+            ..Gene::default()
+        };
+        gene.normalize(8, 1);
+        gene
+    }
+
+    #[test]
+    fn crossover_inherits_one_indicator_only_from_b() {
+        let a = audit_gene(vec![0]);
+        let b = audit_gene(vec![1]);
+        let child = crossover(&a, &b, 1, &mut StdRng::seed_from_u64(7));
+        assert_eq!(child.indices, vec![1]);
+        let child_reversed = crossover(&b, &a, 1, &mut StdRng::seed_from_u64(7));
+        assert_eq!(child_reversed.indices, vec![0]);
+    }
+
+    #[test]
+    fn crossover_fixed_midpoint_is_parent_order_sensitive() {
+        let a = audit_gene(vec![0, 1]);
+        let b = audit_gene(vec![2, 3]);
+        let child = crossover(&a, &b, 1, &mut StdRng::seed_from_u64(11));
+        assert_eq!(child.indices, vec![0, 3]);
+        let swapped = crossover(&b, &a, 1, &mut StdRng::seed_from_u64(11));
+        assert_eq!(swapped.indices, vec![2, 1]);
+    }
+
+    #[test]
+    fn mutation_in_improvement_mode_keeps_arity_and_measures_locus_changes() {
+        let cfg = SmcSearchConfig::default();
+        let parent = audit_gene(vec![0, 1, 2]);
+        let mut rng = StdRng::seed_from_u64(1234);
+        let mut changed = 0usize;
+        let mut neutral = 0usize;
+        let mut reduced = 0usize;
+        let mut unchanged_arity = 0usize;
+        let mut neutral_indices_other_traits_changed = 0usize;
+        let mut whole_genome_neutral = 0usize;
+        let samples = 2_000usize;
+        for _ in 0..samples {
+            let child = mutate(&parent, 8, 4, 1, &cfg, 0, &mut rng);
+            assert!(
+                child.indices.len() <= parent.indices.len(),
+                "improvement mode never grows arity"
+            );
+            if child.indices.len() < parent.indices.len() {
+                reduced += 1;
+            } else {
+                unchanged_arity += 1;
+            }
+            if child.indices != parent.indices {
+                changed += 1;
+            } else {
+                neutral += 1;
+            }
+            if child.indices == parent.indices {
+                let mut left = parent.clone();
+                let mut right = child.clone();
+                right.strategy_id = left.strategy_id.clone();
+                right.generation = left.generation;
+                reset_gene_metrics(&mut left);
+                reset_gene_metrics(&mut right);
+                let same_other = left == right;
+                if same_other {
+                    whole_genome_neutral += 1;
+                } else {
+                    neutral_indices_other_traits_changed += 1;
+                }
+            }
+        }
+        eprintln!(
+            "improvement-mode mutation: inherited={neutral} changed={changed} reduced_arity={reduced} same_arity={unchanged_arity} neutral_indices_other_traits_changed={neutral_indices_other_traits_changed} whole_genome_neutral={whole_genome_neutral} samples={samples}"
+        );
+        assert!(changed > 0);
+        assert!(neutral > 0);
+        assert_eq!(changed + neutral, samples);
+        assert_eq!(reduced + unchanged_arity, samples);
+        assert!(neutral_indices_other_traits_changed > 0);
+        assert!(whole_genome_neutral < neutral);
+    }
+
+    #[test]
+    fn random_newborn_always_satisfies_configured_min_structural_flags() {
+        let cfg = SmcSearchConfig::default();
+        let mut rng = StdRng::seed_from_u64(99);
+        for _ in 0..500 {
+            let gene = new_random_gene(6, 4, 0, &cfg, &mut rng);
+            assert!(
+                smc_structural_flag_count(&gene) >= cfg.min_flags,
+                "new_random_gene enforces min_flags on every newborn"
+            );
+        }
+    }
+
+    fn operator_traits_equal(left: &Gene, right: &Gene) -> bool {
+        if left.indices != right.indices
+            || left.weights != right.weights
+            || left.long_threshold != right.long_threshold
+            || left.short_threshold != right.short_threshold
+            || left.sl_pips != right.sl_pips
+            || left.tp_pips != right.tp_pips
+            || left.stop_vol_mult != right.stop_vol_mult
+        {
+            return false;
+        }
+        let flags = |gene: &Gene| {
+            [
+                gene.use_ob,
+                gene.use_fvg,
+                gene.use_liq_sweep,
+                gene.use_premium_discount,
+                gene.use_inducement,
+                gene.mtf_confirmation,
+                gene.use_bos,
+                gene.use_choch,
+                gene.use_eqh,
+                gene.use_eql,
+                gene.use_displacement,
+            ]
+        };
+        flags(left) == flags(right)
+    }
+
+    #[test]
+    fn duplicate_retry_forced_duplicate_sample_has_no_unchanged_genomes() {
+        let cfg = SmcSearchConfig::default();
+        let parent = audit_gene(vec![0]);
+        let mut seen = SeenSignatureMemory::current();
+        assert!(seen.insert_gene(&parent));
+        let mut rng = StdRng::seed_from_u64(77);
+        let mut unchanged_genome = 0usize;
+        let samples = 200usize;
+        for _ in 0..samples {
+            let replacement =
+                unique_candidate_or_retry(parent.clone(), &mut seen, 8, 4, 1, 20, &cfg, &mut rng);
+            if operator_traits_equal(&replacement, &parent) {
+                unchanged_genome += 1;
+            }
+        }
+        eprintln!(
+            "duplicate retry forced-duplicate sample: unchanged_genome={unchanged_genome} samples={samples}"
+        );
+        assert_eq!(
+            unchanged_genome, 0,
+            "forced duplicate retry sample produced no unchanged genomes; source branch draws wholesale newborns, this counter alone cannot distinguish a local mutation"
+        );
+    }
+
+    fn cancellation_parent_genes() -> (Gene, Gene) {
+        let mut a = Gene {
+            indices: vec![140, 202],
+            weights: vec![0.2, -0.4],
+            long_threshold: 0.2,
+            short_threshold: -0.2,
+            sl_pips: 20.0,
+            tp_pips: 40.0,
+            ..Gene::default()
+        };
+        a.normalize(323, 1);
+        let mut b = Gene {
+            indices: vec![97, 140],
+            weights: vec![0.4, -0.2],
+            long_threshold: 0.2,
+            short_threshold: -0.2,
+            sl_pips: 20.0,
+            tp_pips: 40.0,
+            ..Gene::default()
+        };
+        b.normalize(323, 1);
+        (a, b)
+    }
+
+    #[test]
+    fn finite_total_cancellation_is_replaced_not_injected_as_plus_one() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let (a, b) = cancellation_parent_genes();
+        let child = crossover(&a, &b, 1, &mut StdRng::seed_from_u64(1));
+        assert_eq!(child.indices, vec![140, 140]);
+        assert_eq!(child.weights, vec![0.2, -0.2]);
+        assert!(child.has_total_weight_cancellation(323));
+
+        // Reproduce mutate's exact first RNG draw type/shape. This seed selects
+        // a branch that rewrites no index or weight, so the pre-repair final
+        // normalize would have converted the canceled term to [140] weight +1.0.
+        let mut branch_rng = StdRng::seed_from_u64(0);
+        let branch: i32 = branch_rng.random_range(0..4);
+        assert!(
+            branch == 1 || branch == 3,
+            "expected a threshold/SMC branch with no index/weight rewrite, got {branch}"
+        );
+        let mut old_style = child.clone();
+        old_style.normalize(323, 1);
+        assert_eq!(old_style.indices, vec![140]);
+        assert_eq!(old_style.weights, vec![1.0]);
+        let cfg = SmcSearchConfig::default();
+        let mut rng = StdRng::seed_from_u64(0);
+        let replacement = mutate(&child, 323, 5, 1, &cfg, 1, &mut rng);
+        assert!(!replacement.has_total_weight_cancellation(323));
+        assert!(replacement.weights.iter().all(|weight| *weight != 0.0));
+        assert_ne!(replacement.indices, vec![140]);
+        assert_ne!(replacement.weights, vec![1.0]);
+
+        let mut second_rng = StdRng::seed_from_u64(0);
+        let repeated = mutate(&child, 323, 5, 1, &cfg, 1, &mut second_rng);
+        assert_eq!(replacement.indices, repeated.indices);
+        assert_eq!(replacement.weights, repeated.weights);
+        assert_eq!(replacement.long_threshold, repeated.long_threshold);
+        assert_eq!(replacement.short_threshold, repeated.short_threshold);
+        assert_eq!(replacement.sl_pips, repeated.sl_pips);
+        assert_eq!(replacement.tp_pips, repeated.tp_pips);
+
+        // Preserve signed noncanceling and partial-cancellation offspring.
+        let mut partial = Gene {
+            indices: vec![140, 140, 231],
+            weights: vec![0.2, -0.2, -0.8],
+            ..Gene::default()
+        };
+        partial.normalize(323, 1);
+        assert_eq!(partial.indices, vec![231]);
+        assert_eq!(partial.weights, vec![-0.8]);
+        let mut signed = Gene {
+            indices: vec![140],
+            weights: vec![-1.0],
+            ..Gene::default()
+        };
+        signed.normalize(323, 1);
+        assert_eq!(signed.indices, vec![140]);
+        assert_eq!(signed.weights, vec![-1.0]);
+
+        // Malformed-input repair is intentionally unchanged.
+        let mut malformed = Gene {
+            indices: vec![140],
+            weights: vec![f64::NAN],
+            ..Gene::default()
+        };
+        malformed.normalize(323, 1);
+        assert_eq!(malformed.weights, vec![1.0]);
+    }
+
+    #[test]
+    fn softmax_never_promotes_invalid_genome_above_finite_candidates() {
+        let weights = softmax_weights(&[2.0, f64::NEG_INFINITY, 1.0], &[0, 1, 2], 1.0);
+        let total: f64 = weights.iter().sum();
+        assert!((weights[0] - 1.0).abs() < 1e-12);
+        assert_eq!(weights[1], 0.0, "invalid candidate weight is zero");
+        assert!((weights[2] - (-1.0f64).exp()).abs() < 1e-12);
+        assert!(weights[1] / total < 1e-12);
+        assert!((weights[0] / total - 1.0 / (1.0 + (-1.0f64).exp())).abs() < 1e-12);
+        assert_eq!(
+            softmax_weights(&[f64::NEG_INFINITY, f64::NEG_INFINITY], &[0, 1], 1.0),
+            vec![1.0, 1.0],
+            "all-invalid remains an explicit uniform fallback"
+        );
+    }
+
+    /// The opt-in MonthlyUpsideV1 selector must route fitness through the
+    /// evaluator's completed-month return vector (neo-671 B9, docs §14.7), and
+    /// the default selector must keep the canonical dispatch untouched.
+    #[test]
+    fn monthly_upside_selector_routes_fitness_and_default_dispatch_is_unchanged() {
+        use crate::scoring::FitnessTable;
+
+        let metrics = vec![
+            [10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01],
+            [20.0, 1.2, 20_100.0, 0.05, 0.78, 2.1, 0.4, 0.2, 50.0, 0.6, 0.02],
+        ];
+        let months = vec![vec![0.02; 10], vec![0.04, 0.04, 0.04, 0.04, -0.13]];
+
+        // Default selector: the canonical growth-goal / growth / ga_fitness chain.
+        let mut genes = vec![Gene::default(), Gene::default()];
+        let default_cfg = crate::genetic::EvaluationConfig::default();
+        apply_metrics(&mut genes, &metrics, &default_cfg, 1.0, None);
+        assert_eq!(genes[0].fitness, crate::scoring::ga_fitness(&metrics[0]));
+        assert_eq!(genes[1].fitness, crate::scoring::ga_fitness(&metrics[1]));
+
+        // The selector routes to ga_fitness_monthly_upside_v1 with the vector.
+        let mut selected_cfg = crate::genetic::EvaluationConfig::default();
+        selected_cfg.fitness_table = FitnessTable::MonthlyUpsideV1;
+        apply_metrics(&mut genes, &metrics, &selected_cfg, 1.0, Some(&months));
+        assert_eq!(
+            genes[0].fitness,
+            crate::scoring::ga_fitness_monthly_upside_v1(&months[0], &metrics[0])
+        );
+        assert_eq!(
+            genes[1].fitness,
+            crate::scoring::ga_fitness_monthly_upside_v1(&months[1], &metrics[1])
+        );
+        assert_ne!(
+            genes[0].fitness,
+            crate::scoring::ga_fitness(&metrics[0]),
+            "the MonthlyUpsideV1 selector must not fall through to the canonical scorer"
+        );
+
+        // The dd-averse selector routes to the SAME monthly vector through its
+        // own scorer: identical when both candidates are under the drawdown
+        // thresholds, penalized when one is not.
+        let mut selected_cfg = crate::genetic::EvaluationConfig::default();
+        selected_cfg.fitness_table = FitnessTable::MonthlyUpsideDdAverseV1;
+        let clean = metrics.clone();
+        apply_metrics(&mut genes, &clean, &selected_cfg, 1.0, Some(&months));
+        assert_eq!(
+            genes[0].fitness,
+            crate::scoring::ga_fitness_monthly_upside_dd_averse_v1(&months[0], &clean[0])
+        );
+        let mut risky = clean.clone();
+        risky[0][3] = 0.30; // 30 % drawdown, far above the 10 % free band
+        apply_metrics(&mut genes, &risky, &selected_cfg, 1.0, Some(&months));
+        assert!(
+            genes[0].fitness < crate::scoring::ga_fitness_monthly_upside_v1(&months[0], &risky[0]),
+            "the dd-averse selector must penalize drawdown relative to B9"
+        );
+
+        // The dd-budget selector multiplies the profit term by the drawdown
+        // budget factor, so the same 30 % drawdown candidate turns negative.
+        let mut budget_cfg = crate::genetic::EvaluationConfig::default();
+        budget_cfg.fitness_table = FitnessTable::MonthlyUpsideDdBudgetV1;
+        apply_metrics(&mut genes, &risky, &budget_cfg, 1.0, Some(&months));
+        assert_eq!(
+            genes[0].fitness,
+            crate::scoring::ga_fitness_monthly_upside_dd_budget_v1(&months[0], &risky[0])
+        );
+        assert!(
+            genes[0].fitness < 0.0,
+            "a 30 % drawdown candidate must score negative under the 15 % budget"
+        );
+    }
+
 }

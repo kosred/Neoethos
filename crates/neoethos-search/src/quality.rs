@@ -7,6 +7,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
+#[path = "quality_monthly.rs"]
+mod monthly;
+pub use monthly::{MonthlyStrategyMetricsV1, monthly_closed_trade_metrics_v1};
+
 const TARGET_DOWNSIDE_SORTINO_SEMANTICS_V1: &str = "neoethos.target-downside-sortino.v1";
 const TARGET_DOWNSIDE_SORTINO_PRIMARY_SOURCE_V1: &str =
     "https://www.cmegroup.com/education/files/rr-sortino-a-sharper-ratio.pdf";
@@ -93,6 +97,20 @@ pub fn current_quality_runtime_overrides() -> QualityRuntimeOverrides {
     QUALITY_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
 }
 
+/// Recorded by the evaluator that closed a simulated position. This is
+/// diagnostic metadata, not broker execution evidence. A device's generic
+/// stop code remains `Stop`; it does not establish whether a trail was active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeExitReason {
+    Stop,
+    Target,
+    TrailingStop,
+    MaxHold,
+    DataGap,
+    SessionClose,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Trade {
     pub entry_time: i64,
@@ -100,6 +118,10 @@ pub struct Trade {
     pub pnl: f64,
     pub pnl_pct: Option<f64>,
     pub duration_hours: Option<f64>,
+    /// Absent in older logs or when the producer did not report a reason.
+    /// Never infer a missing cause from PnL or the duration of the position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_reason: Option<TradeExitReason>,
     /// Max Favorable Excursion — best unrealized profit reached during the trade ($).
     #[serde(default)]
     pub mfe: f64,
@@ -230,6 +252,14 @@ pub struct StrategyMetrics {
     pub avg_r_multiple: f64,
     #[serde(default)]
     pub mfe_capture_ratio: f64,
+    /// Completed-month fractional scorer inputs. None preserves historical
+    /// absence; Some([]) preserves the explicit unknown series emitted by V6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_returns: Option<Vec<f64>>,
+    /// Calendar-month closed-trade money observations over the evaluated span,
+    /// including idle and partial months. Never a broker or floating-equity claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_breakdown: Option<Vec<MonthlyStrategyMetricsV1>>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,7 +381,7 @@ impl StrategyQualityAnalyzer {
                 && (net - canonical_metrics[0]).abs() <= rounding_bound,
             "quality evaluation canonical PnL differs from its supplied ledger"
         );
-        Ok(self.analyze_strategy_inner(
+        let mut metrics = self.analyze_strategy_inner(
             strategy_id,
             trades,
             initial_balance,
@@ -361,7 +391,14 @@ impl StrategyQualityAnalyzer {
                 weekdays,
                 canonical_metrics,
             )),
-        ))
+        );
+        metrics.monthly_breakdown = Some(monthly_closed_trade_metrics_v1(
+            trades,
+            initial_balance,
+            evaluation_start_ms,
+            evaluation_end_ms,
+        )?);
+        Ok(metrics)
     }
 
     fn analyze_strategy_inner(
@@ -717,6 +754,10 @@ impl StrategyQualityAnalyzer {
             positive_months: monthly_metrics.positive,
             negative_months: monthly_metrics.negative,
             avg_monthly_return_pct,
+            // Filled by discovery's quality screen from the same replay's
+            // ledger monthly_returns_out; trade-only diagnostics stay empty.
+            monthly_returns: Some(Vec::new()),
+            monthly_breakdown: None,
             profit_per_trade: net_expectancy_per_trade,
             net_expectancy_stderr,
             net_expectancy_t_stat,
@@ -756,7 +797,7 @@ impl StrategyQualityAnalyzer {
 
 /// Inclusive UTC calendar dates; O(1) weeks plus at most six remainder days.
 /// Endpoint validation also bounds every later elapsed-time subtraction.
-fn evaluation_weekdays(start_ms: i64, end_ms: i64) -> anyhow::Result<u64> {
+pub(crate) fn evaluation_weekdays(start_ms: i64, end_ms: i64) -> anyhow::Result<u64> {
     anyhow::ensure!(
         start_ms >= 0 && end_ms > start_ms,
         "quality evaluation interval must have ordered nonnegative endpoints"
@@ -1193,6 +1234,8 @@ pub(crate) fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
         positive_months: 0,
         negative_months: 0,
         avg_monthly_return_pct: 0.0,
+        monthly_returns: Some(Vec::new()),
+        monthly_breakdown: None,
         profit_per_trade: 0.0,
         net_expectancy_stderr: 0.0,
         net_expectancy_t_stat: 0.0,
@@ -1286,8 +1329,30 @@ impl StrategyRanker {
 }
 
 #[cfg(test)]
+#[path = "quality_monthly_tests.rs"]
+mod monthly_tests;
+
+#[cfg(test)]
 mod overrides_tests {
     use super::*;
+
+    #[test]
+    fn trade_exit_reason_roundtrips_and_legacy_logs_keep_the_cause_unknown() {
+        let mut trade = Trade {
+            duration_hours: Some(7080.0),
+            pnl: 100.0,
+            ..Trade::default()
+        };
+        let legacy = serde_json::to_value(&trade).unwrap();
+        assert!(legacy.get("exit_reason").is_none());
+        let restored: Trade = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.exit_reason, None);
+        trade.exit_reason = Some(TradeExitReason::MaxHold);
+        let encoded = serde_json::to_value(&trade).unwrap();
+        assert_eq!(encoded["exit_reason"], "max_hold");
+        let restored: Trade = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.exit_reason, Some(TradeExitReason::MaxHold));
+    }
 
     fn quality_timestamp(year: i32, month: u32, day: u32) -> i64 {
         Utc.with_ymd_and_hms(year, month, day, 0, 0, 0)
@@ -1391,6 +1456,7 @@ mod overrides_tests {
             &days,
             &timestamps,
             &settings,
+            None,
         )
         .unwrap();
         assert_eq!(

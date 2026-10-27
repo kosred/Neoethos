@@ -165,6 +165,12 @@ opt-level = 0
 codegen-units = 16
 
 [patch.crates-io]
+# Backport upstream #7312 without changing the Vortex 0.67 wire/API family.
+# Nested patch slices must retain their parent chunk base and within-chunk offset.
+# https://github.com/vortex-data/vortex/commit/6c7eb338c17e3f938af15b43cf34c4e9e933fef6
+# Remove only after a compatible upstream release passes the nested-slice and
+# NeoEthos exact projection/receipt parity regressions.
+vortex-array = { path = "vendor/vortex-array-0.67.0" }
 lightgbm3 = { path = "vendor/lightgbm3" }
 lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
 # Burn's upstream umbrella manifest locks every optional backend, including

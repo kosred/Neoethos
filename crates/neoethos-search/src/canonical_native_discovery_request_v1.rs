@@ -716,7 +716,9 @@ fn validate_generation_zero_policy(
     config: &crate::DiscoveryConfig,
     contract: &CanonicalTrendbarResearchExecutionContractV3,
 ) -> Result<(), CanonicalNativeDiscoveryRequestErrorV1> {
-    let unsupported = if settings.risk.backtest_spread_pips_asian.is_some()
+    let unsupported = if config.runtime_overrides.weekly_cadence {
+        Some("rolling_weekly_cadence_v1_requires_cpu")
+    } else if settings.risk.backtest_spread_pips_asian.is_some()
         || settings.risk.backtest_spread_pips_overlap.is_some()
         || settings.risk.backtest_spread_pips_late_ny.is_some()
         || config.session_spread_pips.is_some()

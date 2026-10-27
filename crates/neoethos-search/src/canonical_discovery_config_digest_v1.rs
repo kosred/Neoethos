@@ -48,6 +48,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         max_rows,
         max_rows_by_timeframe,
         max_hours,
+        max_hold_bars: holding_horizon_bars,
         corr_threshold,
         min_trades_per_day,
         target_profile,
@@ -77,6 +78,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         sensitivity_spread_pips,
         sensitivity_commission_per_lot,
         adaptive_thresholds,
+        fitness_table: fitness_selector,
         mode,
         prop_firm_gate_params,
         risky_start_balance,
@@ -161,6 +163,14 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         "discovery_ledger_archive_top_n",
         *discovery_ledger_archive_top_n,
     )?;
+    // Preserve historical default identities while binding every active
+    // selector. Exhaustive destructuring above makes new omissions fail build.
+    if !fitness_selector.is_default() {
+        encoder.string("fitness_table", fitness_selector.name())?;
+    }
+    if *holding_horizon_bars != 0 {
+        encoder.usize("max_hold_bars", *holding_horizon_bars)?;
+    }
     Ok(encoder.finish())
 }
 
@@ -258,6 +268,11 @@ fn encode_runtime_overrides_v1(
         funnel_stage1_pct,
         stage1_window,
         min_history_years,
+        weekly_cadence,
+        risky_survival_only,
+        prefilter_direction_only_ranking,
+        prefilter_purge_prefixes,
+        label_cost_symmetric,
     } = runtime;
     encoder.record_start("runtime_overrides")?;
     encoder.usize("prefilter_top_k", *prefilter_top_k)?;
@@ -266,6 +281,32 @@ fn encode_runtime_overrides_v1(
     encoder.f64("funnel_stage1_pct", *funnel_stage1_pct)?;
     encoder.enumeration("stage1_window", stage1_window_wire_v1(*stage1_window))?;
     encoder.u32("min_history_years", *min_history_years)?;
+    // Legacy false encodes identically; only the explicit new policy adds bytes.
+    if *weekly_cadence {
+        encoder.boolean("rolling_weekly_cadence_v1", true)?;
+    }
+    if *risky_survival_only {
+        encoder.boolean("risky_survival_only_v2", true)?;
+    }
+    // Both new knobs encode ONLY when active, so the default configuration
+    // hashes exactly as it did before this feature existed and pre-knob
+    // artifacts stay comparable.
+    if *prefilter_direction_only_ranking {
+        encoder.boolean("prefilter_direction_only_ranking_v1", true)?;
+    }
+    if !prefilter_purge_prefixes.is_empty() {
+        encoder.record_start("prefilter_purge_prefixes_v1")?;
+        for (index, prefix) in prefilter_purge_prefixes.iter().enumerate() {
+            encoder.string(&index.to_string(), prefix)?;
+        }
+        encoder.record_end("prefilter_purge_prefixes_v1")?;
+    }
+    // Legacy false encodes identically; only the explicit opt-in adds bytes,
+    // so default runs keep the exact digest (and frame-cache key) they had
+    // before the knob existed.
+    if *label_cost_symmetric {
+        encoder.boolean("label_cost_symmetric_v1", true)?;
+    }
     encoder.record_end("runtime_overrides")
 }
 
@@ -540,6 +581,89 @@ const fn discovery_mode_wire_v1(mode: DiscoveryMode) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_fitness_selector_and_holding_horizon_have_distinct_config_identities() {
+        let original = DiscoveryConfig::default();
+        let baseline = canonical_discovery_config_digest_v1(&original).unwrap();
+        assert_eq!(
+            baseline,
+            [
+                41, 153, 192, 155, 135, 78, 190, 251, 128, 74, 131, 116, 45, 136, 196, 188, 70, 24,
+                4, 141, 115, 42, 187, 250, 100, 4, 162, 227, 108, 72, 101, 0
+            ],
+            "historical default identity must remain unchanged"
+        );
+        let mut identities = std::collections::HashSet::new();
+        for horizon in [0, 64, 128] {
+            for table in [
+                crate::scoring::FitnessTable::GaFitness,
+                crate::scoring::FitnessTable::MonthlyUpsideV1,
+            ] {
+                let mut config = original.clone();
+                config.max_hold_bars = horizon;
+                config.fitness_table = table;
+                let actual = canonical_discovery_config_digest_v1(&config).unwrap();
+                assert!(
+                    identities.insert(actual),
+                    "selector/horizon combinations must be distinct"
+                );
+                if horizon == 0 && table.is_default() {
+                    assert_eq!(actual, baseline);
+                } else {
+                    assert_ne!(actual, baseline, "unbound {horizon}/{table:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn risky_survival_opt_in_is_bound_without_changing_legacy_digest() {
+        let mut config = DiscoveryConfig::default();
+        let legacy = canonical_discovery_config_digest_v1(&config).unwrap();
+        config.runtime_overrides.risky_survival_only = true;
+        assert_ne!(
+            legacy,
+            canonical_discovery_config_digest_v1(&config).unwrap()
+        );
+        config.runtime_overrides.risky_survival_only = false;
+        assert_eq!(
+            legacy,
+            canonical_discovery_config_digest_v1(&config).unwrap()
+        );
+    }
+
+    #[test]
+    fn weekly_opt_in_changes_canonical_config_digest() {
+        let mut config = DiscoveryConfig::default();
+        let old = canonical_discovery_config_digest_v1(&config).unwrap();
+        assert!(
+            !serde_json::to_string(&config.runtime_overrides)
+                .unwrap()
+                .contains("weekly_cadence")
+        );
+        config.runtime_overrides.weekly_cadence = true;
+        assert_ne!(old, canonical_discovery_config_digest_v1(&config).unwrap());
+    }
+
+    #[test]
+    fn label_cost_symmetric_opt_in_changes_canonical_config_digest() {
+        let mut config = DiscoveryConfig::default();
+        let old = canonical_discovery_config_digest_v1(&config).unwrap();
+        // The legacy false encodes identically — the knob only adds digest
+        // bytes when the operator opts in, so default runs keep the exact
+        // digest (and therefore frame-cache key) they had before the knob
+        // existed.
+        assert!(
+            !serde_json::to_string(&config.runtime_overrides)
+                .unwrap()
+                .contains("label_cost_symmetric")
+        );
+        config.runtime_overrides.label_cost_symmetric = true;
+        assert_ne!(old, canonical_discovery_config_digest_v1(&config).unwrap());
+        // Turning it back off must restore the exact legacy digest.
+        config.runtime_overrides.label_cost_symmetric = false;
+        assert_eq!(old, canonical_discovery_config_digest_v1(&config).unwrap());
+    }
     use super::*;
 
     #[test]

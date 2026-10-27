@@ -39,6 +39,7 @@
 //! 5 templates × 10 variants = up to 50 starter genes.
 
 use super::strategy_gene::Gene;
+use neoethos_dataset_contracts::CANONICAL_TIMEFRAMES;
 use rand::Rng;
 
 /// Hand-crafted feature-role spec for one slot in a template.
@@ -292,16 +293,88 @@ const TEMPLATES: &[Template] = &[
 /// caller).
 const VARIANTS_PER_TEMPLATE: usize = 10;
 
-/// Find the feature index whose lowercased name contains both `tf` and
-/// `primary`. Returns `None` if no match exists.
-fn find_feature(feature_names: &[String], tf: &str, primary: &str) -> Option<usize> {
+thread_local! {
+    static SEARCH_BASE_TIMEFRAME: std::cell::RefCell<Option<(String, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct SearchBaseTimeframeGuard {
+    previous: Option<(String, bool)>,
+}
+
+impl Drop for SearchBaseTimeframeGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        SEARCH_BASE_TIMEFRAME.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Explicit provenance handoff from the feature owner: base timeframe and
+/// whether its columns were prefixed. No base timeframe is inferred from names.
+pub(crate) fn enter_search_base_timeframe(
+    base_timeframe: &str,
+    base_features_prefixed: bool,
+) -> SearchBaseTimeframeGuard {
+    let value = (base_timeframe.to_ascii_lowercase(), base_features_prefixed);
+    let previous = SEARCH_BASE_TIMEFRAME.with(|slot| slot.borrow_mut().replace(value));
+    SearchBaseTimeframeGuard { previous }
+}
+
+fn current_base_timeframe() -> Option<(String, bool)> {
+    SEARCH_BASE_TIMEFRAME.with(|slot| slot.borrow().clone())
+}
+
+fn has_known_timeframe_prefix(lower: &str) -> bool {
+    let first = lower.split('_').next().unwrap_or("");
+    CANONICAL_TIMEFRAMES
+        .iter()
+        .any(|timeframe| timeframe.eq_ignore_ascii_case(first))
+}
+
+fn token_sequence_present(name: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    let mut start = 0usize;
+    while let Some(found) = name[start..].find(needle) {
+        let index = start + found;
+        let end = index + needle.len();
+        let before_ok = index == 0 || bytes[index - 1] == b'_';
+        let after_ok = end == bytes.len() || bytes[end] == b'_';
+        if before_ok && after_ok {
+            return true;
+        }
+        start = index + 1;
+        if start >= name.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn timeframe_token_present(lower: &str, tf: &str) -> bool {
+    tf.is_empty() || lower.split('_').any(|segment| segment == tf)
+}
+
+fn find_feature(
+    feature_names: &[String],
+    tf: &str,
+    needle: &str,
+    token_boundary: bool,
+) -> Option<usize> {
     feature_names
         .iter()
         .enumerate()
         .find(|(_, name)| {
             let lower = name.to_lowercase();
-            let tf_ok = tf.is_empty() || lower.contains(tf);
-            tf_ok && lower.contains(primary)
+            let tf_ok = timeframe_token_present(&lower, tf);
+            let needle_ok = if token_boundary {
+                token_sequence_present(&lower, needle)
+            } else {
+                lower.contains(needle)
+            };
+            tf_ok && needle_ok
         })
         .map(|(idx, _)| idx)
 }
@@ -309,9 +382,39 @@ fn find_feature(feature_names: &[String], tf: &str, primary: &str) -> Option<usi
 /// Try `find_feature(tf, primary)` first; if that misses, fall back to
 /// `find_feature(tf, family)`; if that also misses, return `None` (the
 /// caller will skip this role rather than producing nonsense).
+fn find_base_feature(
+    feature_names: &[String],
+    needle: &str,
+    token_boundary: bool,
+) -> Option<usize> {
+    feature_names
+        .iter()
+        .enumerate()
+        .find(|(_, name)| {
+            let lower = name.to_lowercase();
+            if has_known_timeframe_prefix(&lower) {
+                return false;
+            }
+            if token_boundary {
+                token_sequence_present(&lower, needle)
+            } else {
+                lower.contains(needle)
+            }
+        })
+        .map(|(idx, _)| idx)
+}
+
 fn resolve_role(feature_names: &[String], role: &RoleSpec) -> Option<usize> {
-    find_feature(feature_names, role.tf, role.primary)
-        .or_else(|| find_feature(feature_names, role.tf, role.family))
+    let base = current_base_timeframe();
+    let base_unprefixed = base
+        .as_ref()
+        .is_some_and(|(base_tf, prefixed)| role.tf == base_tf && !prefixed);
+    if base_unprefixed {
+        return find_base_feature(feature_names, role.primary, true)
+            .or_else(|| find_base_feature(feature_names, role.family, false));
+    }
+    find_feature(feature_names, role.tf, role.primary, true)
+        .or_else(|| find_feature(feature_names, role.tf, role.family, false))
 }
 
 /// Build one Gene from a template + variant index. Variant rotations
@@ -364,12 +467,20 @@ fn build_variant(
     let long_threshold = template.long_threshold * scale;
     let short_threshold = template.short_threshold * scale;
 
-    // SL/TP rotation: alternate between conservative (1:2 RR) and
-    // moderate (1:2.5 RR) across variants.
+    // Use the SAME dataset-resolved geometry policy as new_random_gene.
+    // Hardcoded pip literals only described M5 and could place H4/H12 seeds
+    // wholly outside the current ATR-scaled stop band.
+    let bounds = super::evolution_math::current_gene_stop_bounds();
     let (sl_pips, tp_pips) = if variant % 2 == 0 {
-        (15.0, 30.0)
+        let sl = bounds.mid_pair().0;
+        let rr = 0.5 * (bounds.rr_min + bounds.rr_max);
+        (sl, (sl * rr).clamp(bounds.tp_min_pips, bounds.tp_max_pips))
     } else {
-        (20.0, 50.0)
+        let sl = bounds.sl_max_pips;
+        (
+            sl,
+            (sl * bounds.rr_max).clamp(bounds.tp_min_pips, bounds.tp_max_pips),
+        )
     };
 
     // SMC flag rotation: every 3rd variant flips a random flag so we
@@ -490,6 +601,51 @@ pub fn seed_professional_templates(
 }
 
 #[cfg(test)]
+pub(crate) fn multi_tf_test_feature_names() -> Vec<String> {
+    vec![
+        "ema_50",
+        "ema_21",
+        "ema_20",
+        "ema_200",
+        "ema_8",
+        "rsi",
+        "atr",
+        "macd",
+        "adx",
+        "cci",
+        "stoch",
+        "vwap",
+        "donchian",
+        "obv",
+        "bollinger_bands",
+        "d1_ema_50",
+        "d1_ema_20",
+        "d1_ema_200",
+        "d1_atr",
+        "h4_ema_21",
+        "h4_ema_50",
+        "h4_bbands",
+        "h4_macd",
+        "h4_donchian",
+        "h1_ema_50",
+        "h1_rsi",
+        "h1_macd",
+        "h1_obv",
+        "m15_rsi",
+        "m15_adx",
+        "m15_donchian",
+        "m5_vwap",
+        "m5_cci",
+        "m5_ema_8",
+        "m5_stoch",
+        "m5_atr",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rand::SeedableRng;
@@ -514,47 +670,7 @@ mod tests {
     fn full_multi_tf_feature_set_yields_templates() {
         // Construct a feature-name set that matches several template
         // roles across all 5 TFs.
-        let names: Vec<String> = vec![
-            "ema_50",
-            "ema_21",
-            "ema_20",
-            "ema_200",
-            "ema_8",
-            "rsi",
-            "atr",
-            "macd",
-            "adx",
-            "cci",
-            "stoch",
-            "vwap",
-            "donchian",
-            "obv",
-            "bollinger_bands",
-            "d1_ema_50",
-            "d1_ema_20",
-            "d1_ema_200",
-            "d1_atr",
-            "h4_ema_21",
-            "h4_ema_50",
-            "h4_bbands",
-            "h4_macd",
-            "h4_donchian",
-            "h1_ema_50",
-            "h1_rsi",
-            "h1_macd",
-            "h1_obv",
-            "m15_rsi",
-            "m15_adx",
-            "m15_donchian",
-            "m5_vwap",
-            "m5_cci",
-            "m5_ema_8",
-            "m5_stoch",
-            "m5_atr",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let names = multi_tf_test_feature_names();
         let n = names.len();
         let mut rng = StdRng::seed_from_u64(42);
         let seeds = seed_professional_templates(50, &names, n, &mut rng);
@@ -644,5 +760,83 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(template_feature_indices(&names).is_empty());
+    }
+
+    #[test]
+    fn feature_matching_uses_full_tf_and_keyword_tokens() {
+        let names = vec![
+            "h12_ema_50".to_string(),
+            "h1_rsi".to_string(),
+            "h1_ema_500".to_string(),
+            "h1_ema_50".to_string(),
+        ];
+        assert_eq!(find_feature(&names, "h1", "ema_50", true), Some(3));
+        assert_eq!(find_feature(&names, "h12", "ema_50", true), Some(0));
+        assert_eq!(find_feature(&names, "h1", "rsi", true), Some(1));
+        assert_eq!(find_feature(&names, "h1", "ema_500", true), Some(2));
+        assert_eq!(find_feature(&names, "h1", "ema_5", true), None);
+        assert_eq!(find_feature(&names, "h1", "ema_5", false), Some(2));
+    }
+
+    #[test]
+    fn explicit_unprefixed_base_provenance_resolves_base_roles_only() {
+        let _guard = enter_search_base_timeframe("M15", false);
+        let names = vec![
+            "adx".to_string(),
+            "h1_adx".to_string(),
+            "d1_atr".to_string(),
+            "m15_rsi".to_string(),
+        ];
+        let base_role = RoleSpec {
+            tf: "m15",
+            primary: "adx",
+            family: "adx",
+            weight: 0.2,
+        };
+        let higher_role = RoleSpec {
+            tf: "h1",
+            primary: "adx",
+            family: "adx",
+            weight: 0.2,
+        };
+        let absent_base_role = RoleSpec {
+            tf: "m15",
+            primary: "rsi",
+            family: "rsi",
+            weight: 0.2,
+        };
+        assert_eq!(resolve_role(&names, &base_role), Some(0));
+        assert_eq!(resolve_role(&names, &higher_role), Some(1));
+        assert_eq!(resolve_role(&names, &absent_base_role), None);
+    }
+
+    #[test]
+    fn actual_feature_frame_provenance_reaches_base_role_resolution() {
+        let frame = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+        let (base, prefixed) =
+            crate::genetic::search_engine::base_timeframe_context_from_features(&frame)
+                .expect("fixture frame has source provenance");
+        assert!(!base.is_empty());
+        let names = vec!["adx".to_string(), "h1_adx".to_string()];
+        let base_role = RoleSpec {
+            tf: Box::leak(base.to_ascii_lowercase().into_boxed_str()),
+            primary: "adx",
+            family: "adx",
+            weight: 0.2,
+        };
+        assert_eq!(
+            resolve_role(&names, &base_role),
+            None,
+            "without the explicit provenance guard unprefixed base is not assumed"
+        );
+        let _guard = crate::genetic::seed_templates::enter_search_base_timeframe(&base, prefixed);
+        assert_eq!(resolve_role(&names, &base_role), Some(0));
+        drop(_guard);
+        let _m15_guard = enter_search_base_timeframe("M15", false);
+        let template_names = vec!["rsi".to_string(), "h1_rsi".to_string()];
+        assert!(
+            template_feature_indices(&template_names).contains(&0),
+            "base role features are force-kept under explicit provenance"
+        );
     }
 }

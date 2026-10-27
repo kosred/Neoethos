@@ -50,6 +50,8 @@ fn cpu_discover_research_is_exact_receipt_bound_and_never_exports_a_live_portfol
         "try_from_settings_for_canonical_trendbar_research",
         "run_canonical_trendbar_research_discovery_with_holdout_and_progress",
         "completed_without_survivors",
+        "neoethos_data::QuantitativeFeatureSemantics::RollingValidityV5",
+        "expected.quantitative_semantics = recorded.quantitative_semantics",
         "write_json_atomic(&path, research)",
         "neoethos.canonical-cpu-research-streaming-index.v1",
         "artifact_class=ResearchOnly",
@@ -94,8 +96,9 @@ fn cpu_discover_research_is_exact_receipt_bound_and_never_exports_a_live_portfol
     }
 
     assert!(
-        research.contains("#[derive(Debug, Clone, Serialize)]")
-            && research.contains("pub struct CanonicalTrendbarResearchDiscoveryResultV3"),
+        research.contains("#[derive(Debug, Clone, Serialize, Deserialize)]")
+            && research.contains("pub struct CanonicalTrendbarResearchDiscoveryResultV3")
+            && research.contains("pub fn from_json_bytes(bytes: &[u8])"),
         "the complete research-only result envelope is not serializable"
     );
 }

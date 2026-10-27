@@ -880,6 +880,16 @@ pub fn compute_quant_feature_columns_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureCol
     )
 }
 
+/// Quant-v2 values with the rolling cumulative-delta validity correction shared
+/// by Quant-v4. Unlike the full v4 migration, v5 does not require an intraday
+/// session grid or change unrelated log, annualization, or session formulas.
+pub fn compute_quant_feature_columns_v5_f64(ohlcv: &Ohlcv) -> Result<Vec<FeatureColumnF64>> {
+    compute_quant_feature_columns_f64_with_cumulative_delta_dependency(
+        ohlcv,
+        CumulativeDeltaValidityDependency::RollingWindow,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CumulativeDeltaValidityDependency {
     Prefix,

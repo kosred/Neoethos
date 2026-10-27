@@ -178,6 +178,20 @@ impl FromStr for FeatureProfile {
     }
 }
 
+/// Quant recipes remain explicit so replay cannot silently change validity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantitativeFeatureSemantics {
+    #[default]
+    LegacyV2,
+    RollingValidityV5,
+}
+
+impl QuantitativeFeatureSemantics {
+    fn is_legacy(&self) -> bool {
+        *self == Self::LegacyV2
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureBuildOptions {
     pub profile: FeatureProfile,
@@ -197,6 +211,11 @@ pub struct FeatureBuildOptions {
     /// the legacy adaptive-prefix recipe; replay never invents a missing batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classic_ta_working_set: Option<super::hpc_ta::SweepBatch>,
+    #[serde(
+        default,
+        skip_serializing_if = "QuantitativeFeatureSemantics::is_legacy"
+    )]
+    pub quantitative_semantics: QuantitativeFeatureSemantics,
 }
 
 impl Default for FeatureBuildOptions {
@@ -208,6 +227,7 @@ impl Default for FeatureBuildOptions {
             normalization_training_rows: None,
             drop_columns_without_normalization_training_support: false,
             classic_ta_working_set: None,
+            quantitative_semantics: QuantitativeFeatureSemantics::LegacyV2,
         }
     }
 }
@@ -239,7 +259,7 @@ pub struct FeatureFrameView {
 /// and contiguous windows stay allocation-free; arbitrary row selections keep
 /// the exact source IDs instead of inventing a new contiguous range.
 #[derive(Debug, Clone)]
-enum FeatureFrameRowIds {
+pub(crate) enum FeatureFrameRowIds {
     Contiguous { origin: usize },
     Explicit(Arc<Vec<u64>>),
 }
@@ -475,6 +495,39 @@ impl FeatureFrame {
             provenance,
             Vec::new(),
             0,
+        )
+    }
+
+    /// Reconstruct a frame from exact persisted cache parts (research-only
+    /// feature-frame cache). Validates the same timestamps/plan/provenance/
+    /// backing invariants as every production constructor; carries no source
+    /// generation leases because the loading process still holds the dataset's
+    /// own verified leases for garbage-collection pinning.
+    pub(crate) fn from_cache_payload(
+        timestamps: Vec<i64>,
+        columns: Vec<FeatureColumnF64>,
+        plan: Arc<FeaturePlanV1>,
+        provenance: Arc<DatasetFeatureArtifactProvenanceV1>,
+        row_ids: FeatureFrameRowIds,
+        normalization_fitted_state: Option<
+            Arc<crate::core::normalization::SearchNormalizationFittedStateV1>,
+        >,
+        feature_build_options: Option<Arc<FeatureBuildOptions>>,
+    ) -> Result<Self> {
+        let names = columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        Self::build_with_authority(
+            timestamps,
+            names,
+            FeatureData::InMemory(columns),
+            plan,
+            provenance,
+            Arc::new(Vec::new()),
+            row_ids,
+            normalization_fitted_state,
+            feature_build_options,
         )
     }
 
@@ -968,6 +1021,13 @@ impl FeatureFrame {
         )
     }
 
+    /// Move this frame into shared backing before borrowed consumers create
+    /// clones or row windows. Only metadata is copied; feature values stay in
+    /// their original allocation, including an already-normalized RAM cube.
+    pub fn into_shared_view(self) -> Result<Self> {
+        Arc::new(self).shared_view()
+    }
+
     /// A whole-frame view with a genuinely shared in-memory backing. Unlike
     /// cloning an owned `InMemory(Vec<...>)`, this allocates no feature values.
     pub fn shared_view(self: &Arc<Self>) -> Result<Self> {
@@ -1429,7 +1489,12 @@ impl FeatureFrame {
 
     /// Resolve a base feature only from the recorded prefix recipe and exact
     /// source identity. No lowest-timeframe or name-substring guessing.
-    pub fn model_base_feature_name(&self, unprefixed: &str) -> Result<String> {
+    /// Resolve the recipe-canonical base spelling without requiring that the
+    /// literal spelling already exists in names. Callers that legitimately
+    /// accept normalized legacy spellings (for example SMC-OB) match this
+    /// candidate against their own normalized schema; ordinary model callers
+    /// keep using the existence-checked API below.
+    pub fn model_base_feature_name_candidate(&self, unprefixed: &str) -> Result<String> {
         let name = if let Some(options) = self
             .feature_build_options()
             .filter(|options| options.prefix_base_features)
@@ -1459,9 +1524,14 @@ impl FeatureFrame {
         } else {
             unprefixed.to_owned()
         };
+        Ok(name)
+    }
+
+    pub fn model_base_feature_name(&self, unprefixed: &str) -> Result<String> {
+        let name = self.model_base_feature_name_candidate(unprefixed)?;
         anyhow::ensure!(
             self.names.contains(&name),
-            "model base feature `{name}` is absent"
+            "model base feature name is absent"
         );
         Ok(name)
     }
@@ -2072,6 +2142,16 @@ mod fitted_model_view_tests {
         let options: FeatureBuildOptions = serde_json::from_slice(legacy).unwrap();
         assert_eq!(options, FeatureBuildOptions::default());
         assert_eq!(serde_json::to_vec(&options).unwrap(), legacy);
+        let current = FeatureBuildOptions {
+            quantitative_semantics: QuantitativeFeatureSemantics::RollingValidityV5,
+            ..options
+        };
+        let encoded = serde_json::to_vec(&current).unwrap();
+        assert_ne!(encoded, legacy);
+        assert_eq!(
+            serde_json::from_slice::<FeatureBuildOptions>(&encoded).unwrap(),
+            current
+        );
     }
 
     fn raw_frame(offset: f64) -> Arc<FeatureFrame> {
@@ -2257,6 +2337,54 @@ mod fitted_model_view_tests {
         );
         assert!(raw.shared_select_rows(&[2, 2]).is_err());
         assert!(raw.shared_select_rows(&[19, 20]).is_err());
+    }
+
+    #[test]
+    fn consumed_shared_backing_keeps_split_windows_on_one_cube() {
+        let source = Arc::try_unwrap(dense_test_frame()).unwrap();
+        let FeatureData::InMemory(columns) = &source.data else {
+            panic!("regression needs owned RAM columns")
+        };
+        let allocations: Vec<_> = columns
+            .iter()
+            .map(|column| (column.values.as_ptr(), column.validity.as_ptr()))
+            .collect();
+        let expected = source.project_columns(&[0, 1, 2], 0..17).unwrap();
+        let plan = source.plan_identity();
+        let provenance = source.provenance_identity();
+        let shared = source.into_shared_view().unwrap();
+        let FeatureData::View(view) = &shared.data else {
+            panic!("consumed source must become shared")
+        };
+        let FeatureData::InMemory(columns) = &view.parent.data else {
+            panic!("source values must retain their backing")
+        };
+        for (column, (values, validity)) in columns.iter().zip(allocations) {
+            assert_eq!(column.values.as_ptr(), values);
+            assert_eq!(column.validity.as_ptr(), validity);
+        }
+        // These are the three separate owned_range calls made by discovery.
+        for (start, end) in [(0, 10), (10, 13), (13, 17)] {
+            let window = shared.row_window(start, end).unwrap();
+            let FeatureData::View(window_view) = &window.data else {
+                panic!("split must remain a view")
+            };
+            let FeatureData::View(parent_view) = &window_view.parent.data else {
+                panic!("split must clone shared metadata, not the source cube")
+            };
+            assert!(Arc::ptr_eq(&parent_view.parent, &view.parent));
+            assert_eq!(window.plan_identity(), plan);
+            assert_eq!(window.provenance_identity(), provenance);
+            let actual = window.project_columns(&[0, 1, 2], 0..end - start).unwrap();
+            assert_eq!(actual.timestamps, expected.timestamps[start..end]);
+            assert_eq!(actual.row_ids, expected.row_ids[start..end]);
+            for (actual, expected) in actual.columns.iter().zip(&expected.columns) {
+                assert_eq!(actual.validity, expected.validity[start..end]);
+                for (actual, expected) in actual.values.iter().zip(&expected.values[start..end]) {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+            }
+        }
     }
 
     #[test]

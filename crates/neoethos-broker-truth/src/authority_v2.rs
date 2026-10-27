@@ -21,7 +21,9 @@ use crate::acquisition_v1::{
     BrokerTruthAcquisitionSemanticStatusV1, BrokerTruthReviewedSynchronizationBindingV1,
 };
 use crate::contracts::{EvidenceWindowV1, sha256_bytes, validate_sha256_hex};
-use crate::contracts_v2::BrokerFinancialTruthBundleManifestV2;
+use crate::contracts_v2::{
+    BrokerFinancialTruthBundleManifestV2, ReviewedQuoteReplayRuleIdentityV2,
+};
 use crate::semantic_v2::{
     BrokerFinancialTruthSemanticIngressErrorV2, UntrustedBrokerFinancialTruthIngressV2,
     inspect_untrusted_broker_financial_truth_bundle_v2,
@@ -175,6 +177,24 @@ impl ReviewedBrokerFinancialTruthEvidenceV2 {
         };
         evidence.validate()?;
         Ok(evidence)
+    }
+
+    /// Exact cTrader account id of the reviewed primary Bid/Ask
+    /// synchronization. Every reviewed synchronization is validated against
+    /// this same account; ordinal 0 is the exact primary quotes class.
+    pub fn account_id(&self) -> i64 {
+        self.reviewed_synchronizations[0].account_id()
+    }
+
+    /// Exact cTrader symbol id of the reviewed primary Bid/Ask synchronization.
+    pub fn symbol_id(&self) -> i64 {
+        self.reviewed_synchronizations[0].symbol_id()
+    }
+
+    /// Independently reviewed quote replay-rule identity of the primary
+    /// Bid/Ask synchronization.
+    pub fn reviewed_replay_rule_identity(&self) -> &ReviewedQuoteReplayRuleIdentityV2 {
+        self.reviewed_synchronizations[0].review_identity()
     }
 
     fn validate(&self) -> Result<(), BrokerFinancialTruthAuthorityErrorV2> {

@@ -387,12 +387,13 @@ fn evaluation_snapshot_census_and_all_f64_inputs_are_fail_closed() {
         .map(str::trim)
         .filter(|line| line.starts_with("pub ") && line.ends_with(','))
         .collect();
-    assert_eq!(field_lines.len(), 34);
+    assert_eq!(field_lines.len(), 35);
     assert_eq!(body.matches(": String,").count(), 2);
     assert_eq!(body.matches(": usize,").count(), 1);
     assert_eq!(body.matches(": bool,").count(), 3);
     assert_eq!(body.matches(": f64,").count(), 26);
     assert_eq!(body.matches(": Option<[f64; 3]>,").count(), 1);
+    assert_eq!(body.matches(": FitnessTable,").count(), 1);
     assert_eq!(body.matches("pub growth_goal:").count(), 1);
 
     let setters: &[fn(&mut EvaluationConfig, f64)] = &[
