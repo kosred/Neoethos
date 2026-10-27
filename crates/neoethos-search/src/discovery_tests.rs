@@ -2135,6 +2135,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
     let overrides = DiscoveryRuntimeOverrides {
         risky_survival_only: false,
         risky_account_experiment_v3: false,
+        risky_lot_constraints: None,
         weekly_cadence: false,
         prefilter_top_k: 0,
         prefilter_insample_frac: f64::NAN,
@@ -2157,6 +2158,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
     let too_small = DiscoveryRuntimeOverrides {
         risky_survival_only: false,
         risky_account_experiment_v3: false,
+        risky_lot_constraints: None,
         weekly_cadence: false,
         prefilter_top_k: 0,
         prefilter_insample_frac: 0.0,
@@ -2207,6 +2209,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
     config.runtime_overrides = DiscoveryRuntimeOverrides {
         risky_survival_only: false,
         risky_account_experiment_v3: false,
+        risky_lot_constraints: None,
         weekly_cadence: false,
         prefilter_top_k: 17,
         prefilter_insample_frac: 0.6,
@@ -4911,10 +4914,17 @@ fn risky_account_experiment_v3_is_bound_to_risky_settings_and_saved_replay() {
         .models
         .discovery_runtime
         .risky_account_experiment_v3 = true;
+    settings.models.discovery_runtime.risky_lot_constraints =
+        Some(neoethos_core::config::RiskyReplayLotConstraintsConfigV1 {
+            min_lots: 0.01,
+            max_lots: 1.0,
+            lot_step: 0.01,
+            source_artifact_sha256: "a".repeat(64),
+        });
     let config = DiscoveryConfig::from_settings(&settings);
     let policy = config.risky_account_experiment().unwrap().unwrap();
     let evaluation = config.evaluation_config(Some(1.1));
-    assert_eq!(evaluation.risky_account_experiment, Some(policy));
+    assert_eq!(evaluation.risky_account_experiment, Some(policy.clone()));
     assert_eq!(
         discovery_backtest_settings(&config, &profitable_gene("account_v3"), Some(1.1))
             .risky_account_experiment,
@@ -4935,6 +4945,8 @@ fn risky_account_experiment_v3_is_bound_to_risky_settings_and_saved_replay() {
     assert!(incompatible.risky_account_experiment().is_err());
     incompatible = config.clone();
     incompatible.runtime_overrides.risky_account_experiment_v3 = false;
+    assert!(incompatible.risky_account_experiment().is_err());
+    incompatible.runtime_overrides.risky_lot_constraints = None;
     assert!(
         ensure_research_config_matches_sealed_evaluation(
             &incompatible,

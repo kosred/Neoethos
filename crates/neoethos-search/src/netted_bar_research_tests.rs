@@ -344,6 +344,47 @@ fn broker_grid_never_rounds_up_to_force_a_trade_and_zero_risk_is_not_below_min()
 }
 
 #[test]
+fn bound_risky_grid_is_applied_reported_and_cannot_be_overridden() {
+    let mut run = prepared(&[100.0; 3], &[100.0; 3], &[100.0, 100.0, 97.0]);
+    run.settings.risky_account_experiment = Some(crate::eval::RiskyAccountExperimentV1 {
+        target_balance: 50_000.0,
+        lot_constraints: Some(
+            crate::QuoteReplayLotConstraintsV3::new(1.0, 10.0, 1.0, "a".repeat(64)).unwrap(),
+        ),
+    });
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0],
+        confidences: &[1.0; 3],
+        sl_pips: &[2.0; 3],
+        tp_pips: &[4.0; 3],
+        ml_multipliers: &[1.0; 3],
+    };
+    let out = run.evaluate(tape, None).unwrap();
+    // 1.5 requested lots -> 1 admitted lot; SL20 plus commission2.
+    near(out.closed_trades[0].pnl, -22.0);
+    near(out.ending_realized_balance, 978.0);
+    near(out.metrics.max_drawdown, 0.022);
+    assert_eq!(
+        out.lot_grid,
+        Some(BarReplayLotGridV1::new(1.0, 10.0, 1.0).unwrap())
+    );
+    assert!(
+        run.evaluate(tape, Some(BarReplayLotGridV1::new(0.5, 2.0, 0.25).unwrap()))
+            .is_err()
+    );
+    run.settings
+        .risky_account_experiment
+        .as_mut()
+        .unwrap()
+        .lot_constraints =
+        Some(crate::QuoteReplayLotConstraintsV3::new(2.0, 10.0, 1.0, "a".repeat(64)).unwrap());
+    let refused = run.evaluate(tape, None).unwrap();
+    assert_eq!(refused.below_min_entries, 1);
+    assert!(refused.closed_trades.is_empty());
+    near(refused.ending_realized_balance, 1000.0);
+}
+
+#[test]
 fn public_preparation_evaluates_exact_published_canonical_holdout_and_rejects_rebinding() {
     use crate::data_selection::CanonicalSearchInput;
     use crate::{CanonicalSearchEvaluatedWindowV1, CanonicalTrendbarResearchCostAssumptionsV2};

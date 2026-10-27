@@ -81,7 +81,7 @@ impl SnapshotSettingsDto {
                 .as_ref()
                 .map(|values| values.to_vec()),
             adaptive_rr: settings.adaptive_rr,
-            risky_account_experiment: settings.risky_account_experiment,
+            risky_account_experiment: settings.risky_account_experiment.clone(),
         }
     }
 
@@ -113,7 +113,7 @@ impl SnapshotSettingsDto {
             .map(|values| Arc::<[f64]>::from(values));
         settings.adaptive_vol_mult = 0.0;
         settings.adaptive_rr = self.adaptive_rr;
-        settings.risky_account_experiment = self.risky_account_experiment;
+        settings.risky_account_experiment = self.risky_account_experiment.clone();
         settings
     }
 }

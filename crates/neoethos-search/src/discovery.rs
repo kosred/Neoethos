@@ -122,6 +122,8 @@ pub struct DiscoveryRuntimeOverrides {
     pub risky_survival_only: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_account_experiment_v3: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risky_lot_constraints: Option<neoethos_core::config::RiskyReplayLotConstraintsConfigV1>,
     /// See the identically named field on
     /// `neoethos_core::config::DiscoveryRuntimeConfig` — that struct owns
     /// the decision rationale; this copy only carries the resolved value
@@ -172,6 +174,7 @@ impl Default for DiscoveryRuntimeOverrides {
             weekly_cadence: false,
             risky_survival_only: false,
             risky_account_experiment_v3: false,
+            risky_lot_constraints: None,
             prefilter_top_k: 240,
             prefilter_insample_frac: 1.0,
             prefilter_min_per_timeframe: 6,
@@ -196,6 +199,7 @@ impl DiscoveryRuntimeOverrides {
         let mut overrides = Self::default();
         overrides.risky_survival_only = cfg.risky_survival_only;
         overrides.risky_account_experiment_v3 = cfg.risky_account_experiment_v3;
+        overrides.risky_lot_constraints = cfg.risky_lot_constraints.clone();
         overrides.weekly_cadence = cfg.weekly_cadence;
         overrides.prefilter_top_k = cfg.prefilter_top_k;
         if cfg.prefilter_insample_frac.is_finite()
@@ -1795,6 +1799,11 @@ impl DiscoveryConfig {
     }
 
     fn risky_account_experiment(&self) -> Result<Option<crate::eval::RiskyAccountExperimentV1>> {
+        anyhow::ensure!(
+            self.runtime_overrides.risky_account_experiment_v3
+                || self.runtime_overrides.risky_lot_constraints.is_none(),
+            "explicit Risky lot constraints require risky_account_experiment_v3"
+        );
         if !self.runtime_overrides.risky_account_experiment_v3 {
             return Ok(None);
         }
@@ -1808,6 +1817,19 @@ impl DiscoveryConfig {
         );
         let policy = crate::eval::RiskyAccountExperimentV1 {
             target_balance: self.risky_target_balance,
+            lot_constraints: self
+                .runtime_overrides
+                .risky_lot_constraints
+                .as_ref()
+                .map(|raw| {
+                    crate::QuoteReplayLotConstraintsV3::new(
+                        raw.min_lots,
+                        raw.max_lots,
+                        raw.lot_step,
+                        raw.source_artifact_sha256.clone(),
+                    )
+                })
+                .transpose()?,
         };
         policy.validate(self.initial_balance)?;
         anyhow::ensure!(
@@ -2743,6 +2765,9 @@ pub struct DiscoveryRunProfile {
     pub prop_firm_min_pass_rate: f64,
     /// Sizing basis of the backtests the selection ran on.
     pub initial_balance: f64,
+    /// Reviewed quantity metadata recorded with its account sizing basis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risky_lot_constraints: Option<neoethos_core::config::RiskyReplayLotConstraintsConfigV1>,
     pub risk_per_trade_min: f64,
     pub risk_per_trade_max: f64,
     /// Resolved confidence normaliser used by the sizing formula. It belongs in
@@ -18563,6 +18588,7 @@ pub fn build_discovery_profile(
         weekly_cadence,
         risky_survival_only,
         risky_account_experiment_v3,
+        risky_lot_constraints,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
         label_cost_symmetric,
@@ -18570,6 +18596,7 @@ pub fn build_discovery_profile(
     DiscoveryRunProfile {
         risky_survival_only: *risky_survival_only,
         risky_account_experiment_v3: *risky_account_experiment_v3,
+        risky_lot_constraints: risky_lot_constraints.clone(),
         weekly_cadence: *weekly_cadence,
         prefilter_direction_only_ranking: *prefilter_direction_only_ranking,
         prefilter_purge_prefixes: prefilter_purge_prefixes.clone(),

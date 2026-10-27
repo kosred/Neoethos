@@ -1,5 +1,45 @@
 use super::*;
 
+#[test]
+fn quote_risk_adapter_refuses_to_drop_new_risky_account_stopping_policy() {
+    let mut evaluation = EvaluationConfig {
+        account_currency: "USD".into(),
+        initial_equity: 100.0,
+        risky_account_experiment: Some(crate::eval::RiskyAccountExperimentV1 {
+            target_balance: 50_000.0,
+            lot_constraints: None,
+        }),
+        ..Default::default()
+    };
+    let error = CanonicalSignalAccountRiskPolicyV3::from_evaluation(&evaluation).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to drop its bound policy")
+    );
+    evaluation.risky_account_experiment = None;
+    assert!(CanonicalSignalAccountRiskPolicyV3::from_evaluation(&evaluation).is_ok());
+}
+
+#[test]
+fn reviewed_quote_quantity_uses_shared_downward_grid_and_refuses_nonfinite_requests() {
+    let grid = QuoteReplayLotConstraintsV3::new(0.5, 2.0, 0.25, "a".repeat(64)).unwrap();
+    for (request, expected) in [
+        (0.49, None),
+        (0.99, Some(0.75)),
+        (3.0, Some(2.0)),
+        (f64::NAN, None),
+        (f64::INFINITY, None),
+        (-1.0, None),
+    ] {
+        assert_eq!(grid.normalize_down(request).ok(), expected);
+    }
+    let mut untrusted = serde_json::to_value(&grid).unwrap();
+    untrusted["source_artifact_sha256"] = "not-an-artifact".into();
+    let untrusted: QuoteReplayLotConstraintsV3 = serde_json::from_value(untrusted).unwrap();
+    assert!(untrusted.normalize_down(1.0).is_err());
+}
+
 struct Fixture {
     bars: Ohlcv,
     scope: CanonicalSearchArtifactScopeV2,

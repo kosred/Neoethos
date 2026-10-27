@@ -1412,6 +1412,17 @@ impl Default for SearchRuntimeConfig {
     }
 }
 
+/// Raw reviewed research inputs. Search validates their shape/source binding
+/// through its existing quote-replay quantity owner before using them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RiskyReplayLotConstraintsConfigV1 {
+    pub min_lots: f64,
+    pub max_lots: f64,
+    pub lot_step: f64,
+    pub source_artifact_sha256: String,
+}
+
 /// Discovery-pipeline runtime knobs — the config-driven replacement for the
 /// legacy `NEOETHOS_BOT_PREFILTER_TOP_K`, `NEOETHOS_BOT_PREFILTER_INSAMPLE`,
 /// `NEOETHOS_BOT_FUNNEL_STAGE1_PCT`, `NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW`,
@@ -1434,6 +1445,11 @@ pub struct DiscoveryRuntimeConfig {
     /// does not model broker margin/stop-out and is off for archived runs.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_account_experiment_v3: bool,
+    /// Optional reviewed quantity limits for new Risky CPU experiments.
+    /// The referenced artifact must supply these values; no broker defaults
+    /// or margin/stop-out authority is inferred from this configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risky_lot_constraints: Option<RiskyReplayLotConstraintsConfigV1>,
     /// Opt-in rolling five-UTC-weekday objective for new PropFirm CPU runs.
     /// Existing stricter frequency and financial floors remain active.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1601,6 +1617,7 @@ impl Default for DiscoveryRuntimeConfig {
             weekly_cadence: false,
             risky_survival_only: false,
             risky_account_experiment_v3: false,
+            risky_lot_constraints: None,
             prefilter_top_k: 240,
             // Discovery already receives only the training side of the outer
             // temporal split. Rank features on all of that admissible prefix;

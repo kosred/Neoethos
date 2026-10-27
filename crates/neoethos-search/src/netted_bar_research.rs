@@ -45,7 +45,7 @@ impl BarReplayLotGridV1 {
         })
     }
 
-    pub(super) fn normalize_down(self, requested: f64) -> Option<f64> {
+    pub(crate) fn normalize_down(self, requested: f64) -> Option<f64> {
         let capped = requested.min(self.max_lots);
         let value = (capped / self.lot_step).floor() * self.lot_step;
         (requested.is_finite()
@@ -222,6 +222,7 @@ impl PreparedNettedCanonicalBarResearchV1 {
         tape: NettedBarDecisionTapeV1<'_>,
         lot_grid: Option<BarReplayLotGridV1>,
     ) -> Result<NettedBarResearchResultV1> {
+        let lot_grid = self.settings.resolved_lot_grid(lot_grid)?;
         let n = self.close.len();
         ensure!(
             [

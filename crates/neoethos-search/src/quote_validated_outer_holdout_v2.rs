@@ -81,6 +81,11 @@ impl CanonicalSignalAccountRiskPolicyV3 {
     pub fn from_evaluation(
         evaluation: &EvaluationConfig,
     ) -> Result<Self, QuoteValidatedOuterHoldoutErrorV1> {
+        if evaluation.risky_account_experiment.is_some() {
+            return Err(binding_error(
+                "quote replay cannot yet preserve Risky account target/ruin stopping; refusing to drop its bound policy",
+            ));
+        }
         Self::new(
             AccountMoneyV1::new(&evaluation.account_currency, evaluation.initial_equity)
                 .map_err(|error| binding_error(error.to_string()))?,
@@ -612,45 +617,39 @@ pub struct QuoteReplayLotConstraintsV3 {
 }
 
 impl QuoteReplayLotConstraintsV3 {
+    pub(crate) fn checked_grid(
+        &self,
+    ) -> Result<crate::eval::BarReplayLotGridV1, QuoteValidatedOuterHoldoutErrorV1> {
+        validate_sha256("lot constraints source", &self.source_artifact_sha256)?;
+        crate::eval::BarReplayLotGridV1::new(self.min_lots, self.max_lots, self.lot_step)
+            .map_err(|error| binding_error(error.to_string()))
+    }
+
     pub fn new(
         min_lots: f64,
         max_lots: f64,
         lot_step: f64,
         source_artifact_sha256: String,
     ) -> Result<Self, QuoteValidatedOuterHoldoutErrorV1> {
-        if [min_lots, max_lots, lot_step]
-            .iter()
-            .any(|v| !v.is_finite() || *v <= 0.0)
-            || max_lots < min_lots
-            || lot_step > max_lots
-        {
-            return Err(binding_error("invalid explicit replay lot constraints"));
-        }
-        validate_sha256("lot constraints source", &source_artifact_sha256)?;
-        Ok(Self {
+        let constraints = Self {
             min_lots,
             max_lots,
             lot_step,
             source_artifact_sha256,
-        })
+        };
+        constraints.checked_grid()?;
+        Ok(constraints)
     }
 
     fn normalize_down(&self, requested: f64) -> Result<f64, QuoteValidatedOuterHoldoutErrorV1> {
         // Deserialized replay inputs are metadata, not a checked capability.
-        Self::new(
-            self.min_lots,
-            self.max_lots,
-            self.lot_step,
-            self.source_artifact_sha256.clone(),
-        )?;
-        let capped = requested.min(self.max_lots);
-        let lots = (capped / self.lot_step).floor() * self.lot_step;
-        if !lots.is_finite() || lots < self.min_lots || lots > capped {
-            return Err(binding_error(
-                "risk-sized entry cannot meet the explicit lot grid without increasing risk",
-            ));
-        }
-        Ok(lots)
+        self.checked_grid()?
+            .normalize_down(requested)
+            .ok_or_else(|| {
+                binding_error(
+                    "risk-sized entry cannot meet the explicit lot grid without increasing risk",
+                )
+            })
     }
 }
 

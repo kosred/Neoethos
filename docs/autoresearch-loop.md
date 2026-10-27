@@ -1914,6 +1914,20 @@ Work proceeds in this order:
    [cTrader dynamic leverage](https://help.ctrader.com/trading-with-ctrader/dynamic-leverage/)
    depends on broker exposure tiers. Reject an unfundable request visibly;
    do not assume unlimited credit or silently replace its risk policy.
+   The optional `models.discovery_runtime.risky_lot_constraints` now binds
+   `min_lots`, `max_lots`, `lot_step` and `source_artifact_sha256` to the new
+   Risky account policy, its settings/config identities and sealed replay.
+   Direct confidence and combined-lane CPU entries use the same existing
+   `BarReplayLotGridV1` after confidence/ML sizing and before opening exposure;
+   below-minimum requests are refused, and costs/P&L use admitted lots.
+   Combined replay reports the effective grid and counts below-min refusals;
+   a different supplied grid is rejected. None preserves archived behavior.
+   The source hash records declared provenance; it does not verify the source
+   artifact, chosen account/symbol, margin sufficiency or liquidation policy.
+   Do not encode changing free margin as a fictitious static `max_lots`.
+   Quote replay reuses the same rounding owner, but its account-risk adapter
+   refuses the new Risky stopping policy until quote target/ruin semantics are
+   implemented; silently dropping that policy would claim false equivalence.
    Reuse the broker's existing `fetch_broker_expected_margin_blocking` request
    owner in `neoethos-app/src/app_services/broker_api.rs` and the typed
    expected-margin response in `ctrader_account.rs`; the live margin-call

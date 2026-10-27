@@ -346,14 +346,18 @@ fn utc_hour_of_day(timestamp_ms: i64) -> u32 {
 /// Opt-in CPU Risky accounting. An exit consumes the position before later
 /// prices in its OHLC bar, and the experiment banks its first realized target.
 /// This does not provide broker margin, stop-out or quote-fill authority.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RiskyAccountExperimentV1 {
     pub target_balance: f64,
+    /// Optional explicit quantity constraint. Its source hash is metadata,
+    /// not historical broker margin or liquidation authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lot_constraints: Option<crate::QuoteReplayLotConstraintsV3>,
 }
 
 impl RiskyAccountExperimentV1 {
-    pub(crate) fn validate(self, initial_balance: f64) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self, initial_balance: f64) -> anyhow::Result<()> {
         anyhow::ensure!(
             initial_balance.is_finite()
                 && initial_balance > 0.0
@@ -361,6 +365,9 @@ impl RiskyAccountExperimentV1 {
                 && self.target_balance > initial_balance,
             "Risky account experiment requires a finite target above its positive initial balance"
         );
+        if let Some(constraints) = &self.lot_constraints {
+            constraints.checked_grid()?;
+        }
         Ok(())
     }
 }
@@ -777,6 +784,23 @@ pub fn current_backtest_runtime_overrides() -> BacktestRuntimeOverrides {
 }
 
 impl BacktestSettings {
+    pub(crate) fn resolved_lot_grid(
+        &self,
+        supplied: Option<BarReplayLotGridV1>,
+    ) -> anyhow::Result<Option<BarReplayLotGridV1>> {
+        let bound = self
+            .risky_account_experiment
+            .as_ref()
+            .and_then(|policy| policy.lot_constraints.as_ref())
+            .map(|constraints| constraints.checked_grid())
+            .transpose()?;
+        anyhow::ensure!(
+            bound.is_none() || supplied.is_none() || bound == supplied,
+            "supplied lot grid differs from the bound Risky quantity policy"
+        );
+        Ok(bound.or(supplied))
+    }
+
     pub fn initial_equity(&self) -> f64 {
         self.initial_equity_override
             .unwrap_or_else(|| current_backtest_runtime_overrides().initial_equity)
@@ -1143,11 +1167,14 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     let mut pos_tp_pips: f64 = settings.tp_pips;
 
     let initial_equity = settings.initial_equity();
-    if let Some(policy) = settings.risky_account_experiment {
+    if let Some(policy) = &settings.risky_account_experiment {
         policy
             .validate(initial_equity)
             .expect("invalid Risky account experiment");
     }
+    let lot_grid = settings
+        .resolved_lot_grid(netted.as_ref().and_then(|state| state.lot_grid))
+        .expect("invalid account lot constraints");
     let month_capacity = netted
         .as_ref()
         .map(|state| state.month_capacity)
@@ -1442,6 +1469,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 }
                 if settings
                     .risky_account_experiment
+                    .as_ref()
                     .is_some_and(|policy| equity <= 0.0 || equity >= policy.target_balance)
                 {
                     // The experiment banks the first realized target, or
@@ -1486,25 +1514,22 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 } else {
                     1.0
                 };
-                if let Some(state) = netted.as_deref_mut() {
-                    // ML shrinks the already confidence-sized risk ONCE. A
-                    // broker-quantity refusal must occur before lane occupancy.
-                    entry_lots *= size_multiplier;
-                    if entry_lots <= 0.0 {
-                        continue;
-                    }
-                    if let Some(grid) = state.lot_grid {
-                        match grid.normalize_down(entry_lots) {
-                            Some(lots) => entry_lots = lots,
-                            None => {
-                                state.below_min_entries += 1;
-                                continue;
-                            }
-                        }
-                    }
-                }
+                // Shrink risk once, then admit the same quantity through the
+                // shared grid for direct confidence and combined-lane replay.
+                entry_lots *= size_multiplier;
                 if entry_lots <= 0.0 {
                     continue;
+                }
+                if let Some(grid) = lot_grid {
+                    match grid.normalize_down(entry_lots) {
+                        Some(lots) => entry_lots = lots,
+                        None => {
+                            if let Some(state) = netted.as_deref_mut() {
+                                state.below_min_entries += 1;
+                            }
+                            continue;
+                        }
+                    }
                 }
                 in_pos = s;
                 // Bug #1 fix: half-spread applied at entry (entry_px offset), half at exit
@@ -1777,7 +1802,7 @@ pub(crate) fn validate_sizing_confidences(
         settings.pnl_conversion_fee_rate,
     )
     .map_err(anyhow::Error::msg)?;
-    if let Some(policy) = settings.risky_account_experiment {
+    if let Some(policy) = &settings.risky_account_experiment {
         policy.validate(settings.initial_equity())?;
     }
     anyhow::ensure!(

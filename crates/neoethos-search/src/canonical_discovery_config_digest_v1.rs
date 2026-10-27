@@ -271,6 +271,7 @@ fn encode_runtime_overrides_v1(
         weekly_cadence,
         risky_survival_only,
         risky_account_experiment_v3,
+        risky_lot_constraints,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
         label_cost_symmetric,
@@ -291,6 +292,14 @@ fn encode_runtime_overrides_v1(
     }
     if *risky_account_experiment_v3 {
         encoder.boolean("risky_account_experiment_v3", true)?;
+    }
+    if let Some(grid) = risky_lot_constraints {
+        encoder.record_start("risky_lot_constraints_v1")?;
+        encoder.f64("min_lots", grid.min_lots)?;
+        encoder.f64("max_lots", grid.max_lots)?;
+        encoder.f64("lot_step", grid.lot_step)?;
+        encoder.string("source_artifact_sha256", &grid.source_artifact_sha256)?;
+        encoder.record_end("risky_lot_constraints_v1")?;
     }
     // Both new knobs encode ONLY when active, so the default configuration
     // hashes exactly as it did before this feature existed and pre-knob
@@ -657,6 +666,36 @@ mod tests {
         );
         config.runtime_overrides.weekly_cadence = true;
         assert_ne!(old, canonical_discovery_config_digest_v1(&config).unwrap());
+    }
+
+    #[test]
+    fn risky_quantity_metadata_is_optional_and_each_dimension_changes_identity() {
+        let mut config = DiscoveryConfig::default();
+        let absent = canonical_discovery_config_digest_v1(&config).unwrap();
+        let mut identities = std::collections::HashSet::new();
+        for (min_lots, max_lots, lot_step, source) in [
+            (1.0, 10.0, 1.0, 'a'),
+            (2.0, 10.0, 1.0, 'a'),
+            (1.0, 11.0, 1.0, 'a'),
+            (1.0, 10.0, 0.5, 'a'),
+            (1.0, 10.0, 1.0, 'b'),
+        ] {
+            config.runtime_overrides.risky_lot_constraints =
+                Some(neoethos_core::config::RiskyReplayLotConstraintsConfigV1 {
+                    min_lots,
+                    max_lots,
+                    lot_step,
+                    source_artifact_sha256: source.to_string().repeat(64),
+                });
+            let identity = canonical_discovery_config_digest_v1(&config).unwrap();
+            assert_ne!(identity, absent);
+            assert!(identities.insert(identity));
+        }
+        config.runtime_overrides.risky_lot_constraints = None;
+        assert_eq!(
+            canonical_discovery_config_digest_v1(&config).unwrap(),
+            absent
+        );
     }
 
     #[test]

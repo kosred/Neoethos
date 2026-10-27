@@ -4,6 +4,7 @@ fn settings() -> BacktestSettings {
     BacktestSettings {
         risky_account_experiment: Some(RiskyAccountExperimentV1 {
             target_balance: 50_000.0,
+            lot_constraints: None,
         }),
         initial_equity_override: Some(100.0),
         sl_pips: 4.0,
@@ -210,6 +211,12 @@ fn risky_target_requires_realized_cash_after_costs() {
 #[test]
 fn risky_policy_validates_target_and_cannot_disappear_in_device_conversion() {
     let mut settings = settings();
+    settings
+        .risky_account_experiment
+        .as_mut()
+        .unwrap()
+        .lot_constraints =
+        Some(crate::QuoteReplayLotConstraintsV3::new(1.0, 10.0, 1.0, "a".repeat(64)).unwrap());
     let dto = crate::gpu_native::snapshot_fixture::SnapshotSettingsDto::from_settings(&settings);
     assert_eq!(
         dto.to_settings().risky_account_experiment,
@@ -226,5 +233,53 @@ fn risky_policy_validates_target_and_cannot_disappear_in_device_conversion() {
             .unwrap()
             .target_balance = target;
         assert!(validate_sizing_confidences(0, &[], &settings).is_err());
+    }
+}
+
+#[test]
+fn risky_explicit_lot_grid_applies_to_direct_confidence_and_ledger() {
+    // Pure accounting fixture, not captured broker quantities. Requested
+    // size is 75/13 lots; only the admitted quantity may drive costs/PnL/DD.
+    for (min, max, step, expected_trades, expected_loss) in [
+        (1.0, 10.0, 1.0, 1, 20.0),
+        (6.0, 10.0, 1.0, 0, 0.0),
+        (0.5, 3.0, 0.5, 1, 12.0),
+    ] {
+        let mut settings = settings();
+        settings
+            .risky_account_experiment
+            .as_mut()
+            .unwrap()
+            .lot_constraints =
+            Some(crate::QuoteReplayLotConstraintsV3::new(min, max, step, "a".repeat(64)).unwrap());
+        let (metrics, trades) = replay(
+            &[100.0; 3],
+            &[100.0, 100.0, 100.125],
+            &[100.0, 100.0, 97.5],
+            &[1, 0, 0],
+            &settings,
+        );
+        assert_eq!(trades.len(), expected_trades);
+        near(metrics[0], -expected_loss);
+        near(metrics[3], expected_loss / 100.0);
+    }
+}
+
+#[test]
+fn risky_lot_grid_is_optional_on_old_wire_and_rejects_unchecked_metadata() {
+    let legacy = r#"{"target_balance":50000.0}"#;
+    let policy: RiskyAccountExperimentV1 = serde_json::from_str(legacy).unwrap();
+    assert_eq!(serde_json::to_string(&policy).unwrap(), legacy);
+    for (min, max, step, source) in [
+        (0.0, 2.0, 1.0, "a".repeat(64)),
+        (2.0, 1.0, 1.0, "a".repeat(64)),
+        (1.0, 2.0, 0.0, "a".repeat(64)),
+        (1.0, 2.0, 1.0, "unbound".to_owned()),
+    ] {
+        let wire = serde_json::json!({"target_balance":50000.0,
+            "lot_constraints":{"min_lots":min,"max_lots":max,"lot_step":step,
+                "source_artifact_sha256":source}});
+        let untrusted: RiskyAccountExperimentV1 = serde_json::from_value(wire).unwrap();
+        assert!(untrusted.validate(100.0).is_err());
     }
 }

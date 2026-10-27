@@ -540,6 +540,13 @@ fn active_research_costs_worker() {
         };
         config.runtime_overrides.risky_survival_only = true;
         config.runtime_overrides.risky_account_experiment_v3 = true;
+        config.runtime_overrides.risky_lot_constraints =
+            Some(neoethos_core::config::RiskyReplayLotConstraintsConfigV1 {
+                min_lots: 0.01,
+                max_lots: 1.0,
+                lot_step: 0.01,
+                source_artifact_sha256: "a".repeat(64),
+            });
         let evaluation = config.evaluation_config(None);
         let search_settings = crate::genetic::search_engine::evaluation_backtest_settings(
             &evaluation,
@@ -548,6 +555,10 @@ fn active_research_costs_worker() {
         let replay_settings =
             PopulationTemplateResolver::new(&config, None).template(&Gene::default());
         assert!(search_settings.risky_account_experiment.is_some());
+        assert_eq!(
+            search_settings.resolved_lot_grid(None).unwrap(),
+            Some(crate::eval::BarReplayLotGridV1::new(0.01, 1.0, 0.01).unwrap())
+        );
         assert_eq!(
             search_settings.risky_account_experiment,
             replay_settings.risky_account_experiment

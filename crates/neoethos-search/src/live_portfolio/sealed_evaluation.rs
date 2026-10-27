@@ -85,6 +85,9 @@ mod tests {
         });
         evaluation.risky_account_experiment = Some(crate::eval::RiskyAccountExperimentV1 {
             target_balance: 50_000.0,
+            lot_constraints: Some(
+                crate::QuoteReplayLotConstraintsV3::new(0.01, 1.0, 0.01, "a".repeat(64)).unwrap(),
+            ),
         });
         let sealed = SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
         assert_eq!(
@@ -95,6 +98,10 @@ mod tests {
         tampered["risky_account_experiment"]["target_balance"] = 60_000.0.into();
         let tampered: SealedEvaluationPolicyV1 = serde_json::from_value(tampered).unwrap();
         assert!(tampered.to_evaluation().is_err());
+        let mut bad_quantity = serde_json::to_value(&sealed).unwrap();
+        bad_quantity["risky_account_experiment"]["lot_constraints"]["lot_step"] = 0.0.into();
+        let bad_quantity: SealedEvaluationPolicyV1 = serde_json::from_value(bad_quantity).unwrap();
+        assert!(bad_quantity.to_evaluation().is_err());
     }
 
     #[test]
@@ -484,7 +491,7 @@ impl SealedEvaluationPolicyV1 {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        if let Some(policy) = self.risky_account_experiment {
+        if let Some(policy) = &self.risky_account_experiment {
             policy.validate(self.initial_equity)?;
             anyhow::ensure!(
                 self.growth_objective

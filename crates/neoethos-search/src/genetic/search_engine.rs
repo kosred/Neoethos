@@ -892,7 +892,7 @@ pub fn signals_and_confidence_for_gene_full_with_smc_policy(
 /// an invalid sizing band must stop the search before NaN PnL can be sanitised
 /// into an apparently ordinary zero-profit candidate.
 pub(crate) fn evaluation_backtest_settings(config: &EvaluationConfig) -> Result<BacktestSettings> {
-    if let Some(policy) = config.risky_account_experiment {
+    if let Some(policy) = &config.risky_account_experiment {
         anyhow::ensure!(
             config.growth_objective,
             "Risky account experiment requires growth scoring"
@@ -994,7 +994,7 @@ pub(crate) fn evaluation_backtest_settings(config: &EvaluationConfig) -> Result<
     );
 
     Ok(BacktestSettings {
-        risky_account_experiment: config.risky_account_experiment,
+        risky_account_experiment: config.risky_account_experiment.clone(),
         initial_equity_override: Some(config.initial_equity),
         max_hold_bars: config.max_hold_bars,
         trailing_enabled: config.trailing_enabled,
