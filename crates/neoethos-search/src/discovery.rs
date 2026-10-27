@@ -3304,9 +3304,11 @@ pub fn faithful_oos_eval(
     portfolio_path: &std::path::Path,
     oos_start_ts_ms: i64,
 ) -> anyhow::Result<Vec<GeneOosResult>> {
-    neoethos_core::current_broker_financial_truth_capability_v1()
-        .require(neoethos_core::BrokerFinancialOperationV1::HistoricalEvaluation)
-        .map_err(anyhow::Error::new)?;
+    // Authority gate: the sealed canonical-trendbar research execution contract
+    // (installed by the research entry or by the under-contract wrapper below)
+    // OR the broker-financial-truth permit. Either way the gate is NOT removed:
+    // without an installed authority this refuses, exactly as before.
+    crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
     let _scope = crate::eval_telemetry::CallerScope::enter("faithful_oos");
     let artifact = crate::load_live_portfolio_json(portfolio_path)?;
     if artifact.genes.is_empty() {
@@ -3418,6 +3420,27 @@ pub fn faithful_oos_eval(
         });
     }
     Ok(out)
+}
+
+/// Faithful OOS evaluation under the SEALED canonical-trendbar research
+/// execution contract the original research was authorized with (the contract
+/// is stored inside the research artifact). This is the research-authority
+/// equivalent of `faithful_oos_eval`: it installs the contract for this call,
+/// runs the evaluation, and uninstalls when the returned scope drops. It does
+/// NOT touch the broker-financial-truth permit path, and without a valid
+/// contract the installation fails loudly.
+pub fn faithful_oos_eval_under_canonical_research_contract_v3(
+    config: &DiscoveryConfig,
+    data_dir: &std::path::Path,
+    portfolio_path: &std::path::Path,
+    oos_start_ts_ms: i64,
+    contract: &crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionContractV3,
+) -> anyhow::Result<Vec<GeneOosResult>> {
+    let _scope =
+        crate::canonical_trendbar_research::install_canonical_trendbar_research_execution_v3(
+            contract,
+        )?;
+    faithful_oos_eval(config, data_dir, portfolio_path, oos_start_ts_ms)
 }
 
 /// F-305 (2026-05-28): scale `min_trades_per_month` proportionally to

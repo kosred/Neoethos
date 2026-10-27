@@ -29,6 +29,9 @@ mod cubecl_eval;
 // gated: it is plain slice math, so it compiles + unit-tests on any build. The
 // device-execution glue that consumes it lives in `eval.rs` behind `gpu`.
 pub mod discovery;
+// Standalone export, kept away from the discovery re-export block so the
+// duplicate gate's baseline ranges for that block stay byte-stable.
+pub use discovery::faithful_oos_eval_under_canonical_research_contract_v3;
 pub mod discovery_ledger;
 mod prefilter_schema_v1;
 // `mod scheduler_assignment;` — DELETED 2026-05-25 (verbose-build pass):

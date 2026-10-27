@@ -1690,6 +1690,22 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
 /// risk-based confidence-scaled sizing + full costs) via the discovery backtest
 /// engine on the holdout window, features computed warm over the FULL series then
 /// sliced to [oos-from, end). Reports per-gene IS-vs-OOS + Walk-Forward Efficiency.
+// Load the canonical-trendbar research execution contract from a research
+// artifact (research.json, whose top-level execution_contract is used)
+// or from a standalone contract JSON file.
+fn load_canonical_research_contract(
+    path: &str,
+) -> Result<neoethos_search::CanonicalTrendbarResearchExecutionContractV3> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("research contract {path} is not readable"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("research contract {path} is not valid JSON"))?;
+    let contract_value = value.get("execution_contract").cloned().unwrap_or(value);
+    serde_json::from_value(contract_value).with_context(|| {
+        "research contract does not match the canonical execution contract schema"
+    })
+}
+
 fn cmd_forward_test(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
@@ -1704,12 +1720,37 @@ fn cmd_forward_test(args: &[String]) -> Result<()> {
     let oos_from = parse_flag(args, "--oos-from").unwrap_or_else(|| "2023-01-01".to_string());
     let oos_ms = parse_ymd_to_epoch_ms(&oos_from, "--oos-from")?;
 
-    let results = neoethos_search::faithful_oos_eval(
-        &config,
-        std::path::Path::new(&root),
-        std::path::Path::new(&portfolio),
-        oos_ms,
-    )?;
+    // Research-authority OOS: when the operator supplies the original research
+    // artifact (or its execution contract), the evaluation runs under the SAME
+    // sealed canonical-trendbar research execution contract that authorized the
+    // search - NOT under the (still unavailable) broker-financial-truth permit.
+    let results = if let Some(contract_path) = parse_flag(args, "--research-contract") {
+        let contract = load_canonical_research_contract(&contract_path)?;
+        let research_defaults = settings
+            .as_ref()
+            .map(|s| {
+                neoethos_search::DiscoveryConfig::try_from_settings_for_canonical_trendbar_research(
+                    s, &contract,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let research_config = research_defaults.apply_mode_overrides();
+        neoethos_search::faithful_oos_eval_under_canonical_research_contract_v3(
+            &research_config,
+            std::path::Path::new(&root),
+            std::path::Path::new(&portfolio),
+            oos_ms,
+            &contract,
+        )?
+    } else {
+        neoethos_search::faithful_oos_eval(
+            &config,
+            std::path::Path::new(&root),
+            std::path::Path::new(&portfolio),
+            oos_ms,
+        )?
+    };
 
     println!("FAITHFUL OOS forward-test (gene real SL/TP + risk sizing; holdout from {oos_from}):");
     println!(
@@ -6361,6 +6402,38 @@ mod tests {
                     "{bad} must be refused"
                 );
             }
+        }
+
+        #[test]
+        fn research_contract_loader_rejects_missing_and_invalid_files() {
+            use crate::load_canonical_research_contract as load_contract;
+            let dir = std::env::temp_dir().join("neoethos-contract-tests");
+            std::fs::create_dir_all(&dir).ok();
+            let missing = dir.join("missing.json");
+            let missing_err = load_contract(missing.to_str().unwrap())
+                .expect_err("missing file must be refused");
+            assert!(missing_err.to_string().contains("not readable"));
+
+            let bad_json = dir.join("bad.json");
+            std::fs::write(&bad_json, "{ not json").unwrap();
+            let bad_json_err = load_contract(bad_json.to_str().unwrap())
+                .expect_err("invalid JSON must be refused");
+            assert!(bad_json_err.to_string().contains("not valid JSON"));
+
+            let wrong_schema = dir.join("wrong-schema.json");
+            std::fs::write(&wrong_schema, "{}").unwrap();
+            let wrong_schema_err =
+                load_contract(wrong_schema.to_str().unwrap())
+                    .expect_err("a contract without the required fields must be refused");
+            assert!(wrong_schema_err.to_string().contains("does not match"));
+
+            let wrapped_wrong = dir.join("wrapped-wrong.json");
+            std::fs::write(&wrapped_wrong, "{\"execution_contract\": {}}").unwrap();
+            let wrapped_err = load_contract(wrapped_wrong.to_str().unwrap())
+                .expect_err("a wrapper with an empty contract must be refused");
+            assert!(wrapped_err.to_string().contains("does not match"));
+
+            std::fs::remove_dir_all(&dir).ok();
         }
     }
 }
