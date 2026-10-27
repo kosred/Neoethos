@@ -1922,8 +1922,19 @@ Work proceeds in this order:
    below-minimum requests are refused, and costs/P&L use admitted lots.
    Combined replay reports the effective grid and counts below-min refusals;
    a different supplied grid is rejected. None preserves archived behavior.
-   The source hash records declared provenance; it does not verify the source
-   artifact, chosen account/symbol, margin sufficiency or liquidation policy.
+   Standalone quantity-policy hashes record declared provenance. The shared
+   canonical screening producer and validator additionally compare that hash
+   with the exact broker-symbol bytes and their cost-envelope source. They
+   require min/max/step lots to equal the captured `minVolume`, `maxVolume`
+   and `stepVolume` divided by the captured `lotSize`. All four fields use
+   the same centi-unit dimension; no extra factor of 100 applies
+   ([cTrader symbol schema](https://help.ctrader.com/open-api/model-messages/#protooasymbol)).
+   Missing, malformed, inexact or inconsistent wire quantities are refused
+   when this policy is active. The existing parser also binds account/symbol
+   IDs to the acquisition plan. Absent quantity policy preserves old inputs.
+   These checks prove consistency of the supplied snapshot, not the chosen
+   Risky broker, capture freshness/server lineage, margin sufficiency or
+   liquidation authority. Those still require the actual account evidence.
    Do not encode changing free margin as a fictitious static `max_lots`.
    Quote replay reuses the same rounding owner, but its account-risk adapter
    refuses the new Risky stopping policy until quote target/ruin semantics are
