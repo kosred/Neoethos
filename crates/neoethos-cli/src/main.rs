@@ -1709,11 +1709,6 @@ fn load_canonical_research_contract(
 fn cmd_forward_test(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
-    let config = settings
-        .as_ref()
-        .map(neoethos_search::DiscoveryConfig::try_from_settings)
-        .transpose()?
-        .unwrap_or_default();
     let portfolio = parse_flag(args, "--portfolio").ok_or_else(|| {
         anyhow::anyhow!("forward-test requires --portfolio <live_portfolio.json>")
     })?;
@@ -1744,6 +1739,13 @@ fn cmd_forward_test(args: &[String]) -> Result<()> {
             &contract,
         )?
     } else {
+        // Legacy path: the broker-financial-truth gate applies (and currently
+        // refuses, by design) exactly as before.
+        let config = settings
+            .as_ref()
+            .map(neoethos_search::DiscoveryConfig::try_from_settings)
+            .transpose()?
+            .unwrap_or_default();
         neoethos_search::faithful_oos_eval(
             &config,
             std::path::Path::new(&root),
