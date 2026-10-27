@@ -50,6 +50,8 @@ pub struct SnapshotSettingsDto {
     pub high_quality_confidence: f64,
     pub adaptive_base_pips: Option<Vec<f64>>,
     pub adaptive_rr: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risky_account_experiment: Option<crate::eval::RiskyAccountExperimentV1>,
 }
 
 impl SnapshotSettingsDto {
@@ -79,6 +81,7 @@ impl SnapshotSettingsDto {
                 .as_ref()
                 .map(|values| values.to_vec()),
             adaptive_rr: settings.adaptive_rr,
+            risky_account_experiment: settings.risky_account_experiment,
         }
     }
 
@@ -110,6 +113,7 @@ impl SnapshotSettingsDto {
             .map(|values| Arc::<[f64]>::from(values));
         settings.adaptive_vol_mult = 0.0;
         settings.adaptive_rr = self.adaptive_rr;
+        settings.risky_account_experiment = self.risky_account_experiment;
         settings
     }
 }
@@ -432,6 +436,7 @@ mod tests {
             gene_smc_flags: vec![[0; 11]],
             smc_weights: [0.0; 11],
             settings: SnapshotSettingsDto {
+                risky_account_experiment: None,
                 max_hold_bars: 2,
                 min_hold_bars: 0,
                 max_trades_per_day: 5,

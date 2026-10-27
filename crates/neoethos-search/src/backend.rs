@@ -391,6 +391,9 @@ fn evaluate_population_core_with_backend_and_audit_inner(
     if weekly.is_some() {
         return Err("rolling weekly objective requires sealed CPU execution; native cadence observations are not implemented".into());
     }
+    if inputs.settings.risky_account_experiment.is_some() {
+        return Err("Risky account experiment v3 has no device accounting implementation".into());
+    }
     evidence
         .require_exact_cuda_device_ordinal_v1()
         .map_err(|error| error.to_string())?;

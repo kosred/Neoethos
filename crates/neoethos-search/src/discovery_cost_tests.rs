@@ -77,7 +77,7 @@ fn assert_same_evaluation_config(actual: &EvaluationConfig, expected: &Evaluatio
     // No `..`: adding an evaluation field requires extending this proof.
     compare_fields! {
         values: [symbol, account_currency, max_hold_bars, trailing_enabled,
-            kill_zones_enabled, session_spread_pips, growth_objective, growth_goal, weekly_objective,
+            kill_zones_enabled, session_spread_pips, growth_objective, growth_goal, risky_account_experiment, weekly_objective,
             fitness_table],
         floats: [initial_equity, trailing_atr_multiplier, trailing_be_trigger_r,
             trailing_min_lock_pips, pip_value, spread_pips, commission_per_trade,
@@ -527,6 +527,39 @@ fn active_research_costs_worker() {
         assert!(mismatch.pip_value.is_nan());
         assert!(mismatch.spread_pips.is_nan());
         assert!(mismatch.session_spread_pips.is_none());
+    }
+    #[cfg(not(any(feature = "gpu", feature = "gpu-cuda")))]
+    {
+        let mut config = DiscoveryConfig {
+            mode: DiscoveryMode::Risky,
+            initial_balance: 100.0,
+            risky_start_balance: 100.0,
+            evaluation_symbol: "EURUSD".into(),
+            evaluation_account_currency: "USD".into(),
+            ..DiscoveryConfig::default()
+        };
+        config.runtime_overrides.risky_survival_only = true;
+        config.runtime_overrides.risky_account_experiment_v3 = true;
+        let evaluation = config.evaluation_config(None);
+        let search_settings = crate::genetic::search_engine::evaluation_backtest_settings(
+            &evaluation,
+        )
+        .expect("sealed research monetary assumptions and the Risky controller are compatible");
+        let replay_settings =
+            PopulationTemplateResolver::new(&config, None).template(&Gene::default());
+        assert!(search_settings.risky_account_experiment.is_some());
+        assert_eq!(
+            search_settings.risky_account_experiment,
+            replay_settings.risky_account_experiment
+        );
+        let outcome = risky_goal_window_outcome(
+            &[],
+            &config,
+            1_735_689_600_000,
+            1_735_689_600_000 + 180 * 86_400_000,
+        )
+        .unwrap();
+        assert_eq!(outcome["policy"], "account_experiment_v3");
     }
     assert_eq!(contract.identity_sha256().unwrap(), identity);
 }

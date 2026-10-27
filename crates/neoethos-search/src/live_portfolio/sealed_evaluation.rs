@@ -47,6 +47,8 @@ pub(super) struct SealedEvaluationPolicyV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    risky_account_experiment: Option<crate::eval::RiskyAccountExperimentV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     weekly_objective: Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
     /// Current-equivalence binding for the weekly objective. Absent for
     /// non-weekly snapshots and for historical weekly snapshots created before
@@ -57,12 +59,44 @@ pub(super) struct SealedEvaluationPolicyV1 {
     /// 14.7). Absent for the canonical default and for historical snapshots;
     /// serialized only when a non-default table was selected, so legacy wire
     /// bytes and unknown-field refusal stay byte-identical.
-    #[serde(default, skip_serializing_if = "crate::scoring::FitnessTable::is_default")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::scoring::FitnessTable::is_default"
+    )]
     fitness_table: crate::scoring::FitnessTable,
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn risky_account_experiment_seals_target_and_preserves_absent_legacy_policy() {
+        let (mut evaluation, stops) = evaluation_and_stops();
+        let legacy = SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("risky_account_experiment")
+        );
+        evaluation.growth_objective = true;
+        evaluation.growth_goal = Some(crate::scoring::RiskyGrowthGoal {
+            start_balance: evaluation.initial_equity,
+            target_balance: 50_000.0,
+            horizon_days: 180.0,
+        });
+        evaluation.risky_account_experiment = Some(crate::eval::RiskyAccountExperimentV1 {
+            target_balance: 50_000.0,
+        });
+        let sealed = SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
+        assert_eq!(
+            sealed.to_evaluation().unwrap().risky_account_experiment,
+            evaluation.risky_account_experiment
+        );
+        let mut tampered = serde_json::to_value(&sealed).unwrap();
+        tampered["risky_account_experiment"]["target_balance"] = 60_000.0.into();
+        let tampered: SealedEvaluationPolicyV1 = serde_json::from_value(tampered).unwrap();
+        assert!(tampered.to_evaluation().is_err());
+    }
+
     #[test]
     fn sealed_evaluator_reuses_the_wire_owner_without_changing_legacy_order_or_unknown_field_refusal()
      {
@@ -450,6 +484,17 @@ impl SealedEvaluationPolicyV1 {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if let Some(policy) = self.risky_account_experiment {
+            policy.validate(self.initial_equity)?;
+            anyhow::ensure!(
+                self.growth_objective
+                    && self
+                        .growth_goal
+                        .is_some_and(|goal| goal.target_balance == policy.target_balance
+                            && goal.start_balance == self.initial_equity),
+                "sealed Risky account experiment differs from its scoring goal"
+            );
+        }
         self.adaptive_stops_v1.validate()?;
         self.validate_weekly_scoring_identity()?;
         if let Some(objective) = self.weekly_objective {

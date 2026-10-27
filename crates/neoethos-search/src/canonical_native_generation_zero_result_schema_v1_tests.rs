@@ -387,7 +387,13 @@ fn evaluation_snapshot_census_and_all_f64_inputs_are_fail_closed() {
         .map(str::trim)
         .filter(|line| line.starts_with("pub ") && line.ends_with(','))
         .collect();
-    assert_eq!(field_lines.len(), 35);
+    assert_eq!(
+        (
+            field_lines.len(),
+            body.matches("pub risky_account_experiment:").count()
+        ),
+        (36, 1)
+    );
     assert_eq!(body.matches(": String,").count(), 2);
     assert_eq!(body.matches(": usize,").count(), 1);
     assert_eq!(body.matches(": bool,").count(), 3);

@@ -288,6 +288,7 @@ fn hash_optional_session_spread(hasher: &mut ExactHasherV1, profile: Option<Sess
 
 fn hash_settings(hasher: &mut ExactHasherV1, settings: &BacktestSettings) {
     let BacktestSettings {
+        risky_account_experiment,
         initial_equity_override: _,
         sl_pips,
         tp_pips,
@@ -352,6 +353,12 @@ fn hash_settings(hasher: &mut ExactHasherV1, settings: &BacktestSettings) {
     }
     hasher.f64(*adaptive_vol_mult);
     hasher.f64(*adaptive_rr);
+    // None retains the historical settings identity. The opt-in CPU policy
+    // must never alias the full-window/whole-bar legacy experiment.
+    if let Some(policy) = risky_account_experiment {
+        hasher.u8(0xa1);
+        hasher.f64(policy.target_balance);
+    }
 }
 
 fn exact_view(

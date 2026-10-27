@@ -120,6 +120,8 @@ pub struct DiscoveryRuntimeOverrides {
     /// retains the exact archived research semantics.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_survival_only: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_account_experiment_v3: bool,
     /// See the identically named field on
     /// `neoethos_core::config::DiscoveryRuntimeConfig` — that struct owns
     /// the decision rationale; this copy only carries the resolved value
@@ -169,6 +171,7 @@ impl Default for DiscoveryRuntimeOverrides {
             // `neoethos_core::config::DiscoveryRuntimeConfig::default()`.
             weekly_cadence: false,
             risky_survival_only: false,
+            risky_account_experiment_v3: false,
             prefilter_top_k: 240,
             prefilter_insample_frac: 1.0,
             prefilter_min_per_timeframe: 6,
@@ -192,6 +195,7 @@ impl DiscoveryRuntimeOverrides {
         let cfg = &settings.models.discovery_runtime;
         let mut overrides = Self::default();
         overrides.risky_survival_only = cfg.risky_survival_only;
+        overrides.risky_account_experiment_v3 = cfg.risky_account_experiment_v3;
         overrides.weekly_cadence = cfg.weekly_cadence;
         overrides.prefilter_top_k = cfg.prefilter_top_k;
         if cfg.prefilter_insample_frac.is_finite()
@@ -1790,6 +1794,29 @@ impl DiscoveryConfig {
         Ok(Some(objective))
     }
 
+    fn risky_account_experiment(&self) -> Result<Option<crate::eval::RiskyAccountExperimentV1>> {
+        if !self.runtime_overrides.risky_account_experiment_v3 {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.mode == DiscoveryMode::Risky && self.runtime_overrides.risky_survival_only,
+            "Risky account experiment v3 requires Risky mode and risky_survival_only"
+        );
+        anyhow::ensure!(
+            !cfg!(any(feature = "gpu", feature = "gpu-cuda")),
+            "Risky account experiment v3 currently has CPU accounting only; device execution is unsupported"
+        );
+        let policy = crate::eval::RiskyAccountExperimentV1 {
+            target_balance: self.risky_target_balance,
+        };
+        policy.validate(self.initial_balance)?;
+        anyhow::ensure!(
+            self.risky_start_balance == self.initial_balance,
+            "Risky account experiment start balance must equal the actual initial balance"
+        );
+        Ok(Some(policy))
+    }
+
     pub(crate) fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
         let research_contract =
             crate::historical_evaluation_authority::active_research_contract_v1();
@@ -1838,6 +1865,9 @@ impl DiscoveryConfig {
         // inside the GA and after replay. PropFirm/Strict remain unchanged.
         cfg.growth_objective = matches!(self.mode, DiscoveryMode::Risky);
         cfg.fitness_table = self.fitness_table;
+        cfg.risky_account_experiment = self
+            .risky_account_experiment()
+            .expect("invalid Risky account experiment config");
         cfg.growth_goal = cfg
             .growth_objective
             .then_some(crate::scoring::RiskyGrowthGoal {
@@ -2623,6 +2653,8 @@ pub struct DiscoveryRunProfile {
     pub weekly_cadence: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_survival_only: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_account_experiment_v3: bool,
     /// Direction-only prefilter ranking was active for this run (opt-in).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub prefilter_direction_only_ranking: bool,
@@ -3112,6 +3144,7 @@ fn discovery_backtest_settings(
         risk_per_trade_max: config.risk_per_trade_max,
         high_quality_confidence: config.high_quality_confidence,
         initial_equity_override: Some(config.initial_balance),
+        risky_account_experiment: evaluation.risky_account_experiment,
         ..crate::eval::BacktestSettings::default()
     }
 }
@@ -6885,7 +6918,12 @@ fn risky_goal_window_outcome(
             start_ms,
             observed_end,
         )?;
-        outcome["policy"] = "survival_only_v2".into();
+        outcome["policy"] = if config.runtime_overrides.risky_account_experiment_v3 {
+            "account_experiment_v3"
+        } else {
+            "survival_only_v2"
+        }
+        .into();
         outcome["capital_floor"] = 0.0.into();
         outcome["capital_survived"] = (!floor_hit).into();
         outcome["lowest_marked_balance"] = lowest_marked_balance.into();
@@ -8804,6 +8842,10 @@ fn ensure_research_config_matches_sealed_evaluation(
     sealed: &EvaluationConfig,
 ) -> Result<()> {
     let rebuilt = config.evaluation_config_with_smc_gate(price_hint, final_gate);
+    anyhow::ensure!(
+        rebuilt.risky_account_experiment == sealed.risky_account_experiment,
+        "reconstructed Risky account experiment differs from the sealed Search policy"
+    );
     let mismatch = |field: &str, rebuilt: String, sealed: String| -> Result<()> {
         anyhow::bail!(
             "reconstructed discovery config field {field} = {rebuilt} differs from the sealed Search policy = {sealed}; refusing to price saved candidates under a configuration that is not the original run"
@@ -11020,6 +11062,7 @@ fn run_discovery_cycle_values_with_real_device_admission<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    config.risky_account_experiment()?;
     let strict_device_admission =
         crate::acquire_strict_discovery_device_admission_v1().map_err(anyhow::Error::new)?;
     run_discovery_cycle_values_with_progress(strict_device_admission, inputs, config, progress_fn)
@@ -18519,12 +18562,14 @@ pub fn build_discovery_profile(
         min_history_years,
         weekly_cadence,
         risky_survival_only,
+        risky_account_experiment_v3,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
         label_cost_symmetric,
     } = runtime_overrides;
     DiscoveryRunProfile {
         risky_survival_only: *risky_survival_only,
+        risky_account_experiment_v3: *risky_account_experiment_v3,
         weekly_cadence: *weekly_cadence,
         prefilter_direction_only_ranking: *prefilter_direction_only_ranking,
         prefilter_purge_prefixes: prefilter_purge_prefixes.clone(),

@@ -343,6 +343,32 @@ fn utc_hour_of_day(timestamp_ms: i64) -> u32 {
     hour as u32
 }
 
+/// Opt-in CPU Risky accounting. An exit consumes the position before later
+/// prices in its OHLC bar, and the experiment banks its first realized target.
+/// This does not provide broker margin, stop-out or quote-fill authority.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskyAccountExperimentV1 {
+    pub target_balance: f64,
+}
+
+impl RiskyAccountExperimentV1 {
+    pub(crate) fn validate(self, initial_balance: f64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            initial_balance.is_finite()
+                && initial_balance > 0.0
+                && self.target_balance.is_finite()
+                && self.target_balance > initial_balance,
+            "Risky account experiment requires a finite target above its positive initial balance"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "eval_risky_account_tests.rs"]
+mod risky_account_tests;
+
 #[derive(Debug, Clone)]
 pub struct BacktestSettings {
     /// Immutable account balance for this evaluation run. Standalone legacy
@@ -450,6 +476,9 @@ pub struct BacktestSettings {
     pub adaptive_base_pips: Option<std::sync::Arc<[f64]>>,
     pub adaptive_vol_mult: f64,
     pub adaptive_rr: f64,
+    /// Run-level account stopping/observation policy, separate from the
+    /// per-entry geometry above. Absent preserves historical CPU arithmetic.
+    pub risky_account_experiment: Option<RiskyAccountExperimentV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -606,6 +635,7 @@ impl Default for BacktestSettings {
             risk_per_trade_min: 0.005,
             risk_per_trade_max: 0.03,
             high_quality_confidence: 0.65,
+            risky_account_experiment: None,
             // Adaptive stops OFF by default (mult 0) → the scalar sl_pips/tp_pips path.
             adaptive_base_pips: None,
             adaptive_vol_mult: 0.0,
@@ -1113,6 +1143,11 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     let mut pos_tp_pips: f64 = settings.tp_pips;
 
     let initial_equity = settings.initial_equity();
+    if let Some(policy) = settings.risky_account_experiment {
+        policy
+            .validate(initial_equity)
+            .expect("invalid Risky account experiment");
+    }
     let month_capacity = netted
         .as_ref()
         .map(|state| state.month_capacity)
@@ -1120,7 +1155,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
 
     let mut equity = initial_equity;
     let mut peak_equity = initial_equity;
-    let mut max_dd = 0.0;
+    let mut max_dd = 0.0_f64;
     let mut trade_count = 0usize;
     let mut wins = 0usize;
     let mut gross_profit = 0.0;
@@ -1219,18 +1254,6 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
             day_trade_count = 0;
         }
 
-        if RECORD_TRADES && in_pos != 0 {
-            // Retain the existing bar-resolution excursion convention. This is
-            // not tick-resolved evidence about the ordering of intrabar prices.
-            let (favorable, adverse) = if in_pos == 1 {
-                (high[i] - entry_px, entry_px - low[i])
-            } else {
-                (entry_px - low[i], high[i] - entry_px)
-            };
-            mfe_money = mfe_money.max(favorable / pip * settings.pip_value_per_lot * pos_lots);
-            mae_money = mae_money.max(adverse / pip * settings.pip_value_per_lot * pos_lots);
-        }
-
         if in_pos != 0 {
             let gap_exit = use_timestamps
                 && settings.gap_threshold_ms > 0
@@ -1242,8 +1265,48 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
             let exit_px = if gap_exit {
                 Some((close[i], TradeExitReason::DataGap))
             } else {
-                let lo = low[i];
-                let hi = high[i];
+                protective_exit_price(
+                    in_pos,
+                    entry_px,
+                    pos_sl_pips,
+                    pos_tp_pips,
+                    &mut trail_px,
+                    high[i],
+                    low[i],
+                    close[i],
+                    i - entry_idx as usize,
+                    pip,
+                    settings,
+                )
+                .or_else(|| session_close.then_some((close[i], TradeExitReason::SessionClose)))
+            };
+            let new_accounting = settings.risky_account_experiment.is_some();
+            // Explicit OHLC path: stop first on a dual touch, otherwise the
+            // adverse excursion precedes a target. A closed position cannot
+            // observe later extremes. Gap fills retain their uncapped price.
+            let (lo, hi, adverse_first) = if new_accounting {
+                match exit_px {
+                    Some((px, TradeExitReason::Stop | TradeExitReason::TrailingStop)) => {
+                        (px, px, true)
+                    }
+                    Some((px, TradeExitReason::Target)) if in_pos == 1 => (low[i], px, true),
+                    Some((px, TradeExitReason::Target)) => (px, high[i], true),
+                    Some((px, TradeExitReason::DataGap)) => (px, px, true),
+                    _ => (low[i], high[i], false),
+                }
+            } else {
+                (low[i], high[i], false)
+            };
+            if RECORD_TRADES {
+                let (favorable, adverse) = if in_pos == 1 {
+                    (hi - entry_px, entry_px - lo)
+                } else {
+                    (entry_px - lo, hi - entry_px)
+                };
+                mfe_money = mfe_money.max(favorable / pip * settings.pip_value_per_lot * pos_lots);
+                mae_money = mae_money.max(adverse / pip * settings.pip_value_per_lot * pos_lots);
+            }
+            if !gap_exit || new_accounting {
                 // Float (unrealized) PnL drives intrabar DD/peak. Scale by the
                 // entry-captured `pos_lots` so the drawdown the GA sees matches
                 // the realized-PnL sizing (a 3%-risk trade floats 3× the DD of
@@ -1260,6 +1323,15 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                     } else {
                         (entry_px - lo) / pip * settings.pip_value_per_lot
                     };
+                if adverse_first {
+                    // Do not compare an earlier low to a later target peak.
+                    if peak_equity > 0.0 {
+                        max_dd =
+                            max_dd.max((peak_equity - (equity + worst_float_pnl)) / peak_equity);
+                    }
+                    day_low = day_low.min(equity + worst_float_pnl);
+                    finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
+                }
                 if (equity + best_float_pnl) > peak_equity {
                     peak_equity = equity + best_float_pnl;
                 }
@@ -1270,7 +1342,12 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                     // Preserve this bar's worst excursion (the canonical
                     // best-before-worst intrabar convention) but discard troughs
                     // that occurred before the new peak.
-                    day_low = equity + worst_float_pnl;
+                    day_low = equity
+                        + if adverse_first {
+                            best_float_pnl
+                        } else {
+                            worst_float_pnl
+                        };
                 } else if (equity + worst_float_pnl) < day_low {
                     day_low = equity + worst_float_pnl;
                 }
@@ -1280,25 +1357,10 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 } else {
                     0.0
                 };
-                if current_dd > max_dd {
+                if !adverse_first && current_dd > max_dd {
                     max_dd = current_dd;
                 }
-
-                protective_exit_price(
-                    in_pos,
-                    entry_px,
-                    pos_sl_pips,
-                    pos_tp_pips,
-                    &mut trail_px,
-                    hi,
-                    lo,
-                    close[i],
-                    i - entry_idx as usize,
-                    pip,
-                    settings,
-                )
-                .or_else(|| session_close.then_some((close[i], TradeExitReason::SessionClose)))
-            };
+            }
             if let Some((exit_px, exit_reason)) = exit_px {
                 let pnl = if in_pos == 1 {
                     (exit_px - entry_px) / pip * settings.pip_value_per_lot
@@ -1377,6 +1439,14 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 };
                 if current_dd > max_dd {
                     max_dd = current_dd;
+                }
+                if settings
+                    .risky_account_experiment
+                    .is_some_and(|policy| equity <= 0.0 || equity >= policy.target_balance)
+                {
+                    // The experiment banks the first realized target, or
+                    // terminates on realized exhaustion. No resets/deposits.
+                    break;
                 }
             }
         } else {
@@ -1707,6 +1777,9 @@ pub(crate) fn validate_sizing_confidences(
         settings.pnl_conversion_fee_rate,
     )
     .map_err(anyhow::Error::msg)?;
+    if let Some(policy) = settings.risky_account_experiment {
+        policy.validate(settings.initial_equity())?;
+    }
     anyhow::ensure!(
         settings.initial_equity().is_finite() && settings.initial_equity() > 0.0,
         "account-risk replay initial equity must be finite and positive"

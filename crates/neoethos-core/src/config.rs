@@ -1429,6 +1429,11 @@ pub struct DiscoveryRuntimeConfig {
     /// False preserves archived runs' 60% selection ceiling and EUR10 floor.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_survival_only: bool,
+    /// CPU research v3: observe exits before later candle extremes and bank
+    /// the first realized target. Requires Risky + risky_survival_only. This
+    /// does not model broker margin/stop-out and is off for archived runs.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_account_experiment_v3: bool,
     /// Opt-in rolling five-UTC-weekday objective for new PropFirm CPU runs.
     /// Existing stricter frequency and financial floors remain active.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1595,6 +1600,7 @@ impl Default for DiscoveryRuntimeConfig {
             // silently contradicted the shipped config.
             weekly_cadence: false,
             risky_survival_only: false,
+            risky_account_experiment_v3: false,
             prefilter_top_k: 240,
             // Discovery already receives only the training side of the outer
             // temporal split. Rank features on all of that admissible prefix;

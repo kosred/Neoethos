@@ -455,6 +455,7 @@ fn public_preparation_evaluates_exact_published_canonical_holdout_and_rejects_re
     // currency-conversion fee when quote and account currencies match.
     assert_eq!(contract.pnl_conversion_fee_rate(), 0.0);
     let evaluation = EvaluationConfig {
+        risky_account_experiment: None,
         symbol: "EURUSD".into(),
         account_currency: "USD".into(),
         initial_equity: 1_000.0,

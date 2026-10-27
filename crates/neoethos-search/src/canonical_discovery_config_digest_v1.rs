@@ -270,6 +270,7 @@ fn encode_runtime_overrides_v1(
         min_history_years,
         weekly_cadence,
         risky_survival_only,
+        risky_account_experiment_v3,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
         label_cost_symmetric,
@@ -287,6 +288,9 @@ fn encode_runtime_overrides_v1(
     }
     if *risky_survival_only {
         encoder.boolean("risky_survival_only_v2", true)?;
+    }
+    if *risky_account_experiment_v3 {
+        encoder.boolean("risky_account_experiment_v3", true)?;
     }
     // Both new knobs encode ONLY when active, so the default configuration
     // hashes exactly as it did before this feature existed and pre-knob
@@ -626,6 +630,16 @@ mod tests {
             canonical_discovery_config_digest_v1(&config).unwrap()
         );
         config.runtime_overrides.risky_survival_only = false;
+        assert_eq!(
+            legacy,
+            canonical_discovery_config_digest_v1(&config).unwrap()
+        );
+        config.runtime_overrides.risky_account_experiment_v3 = true;
+        assert_ne!(
+            legacy,
+            canonical_discovery_config_digest_v1(&config).unwrap()
+        );
+        config.runtime_overrides.risky_account_experiment_v3 = false;
         assert_eq!(
             legacy,
             canonical_discovery_config_digest_v1(&config).unwrap()

@@ -1843,3 +1843,110 @@ of starting the successful IS search again. Candidate selection is declared
 before OOS: two by actual IS growth pace and two by monthly consistency among
 positive, surviving IS candidates. Reused historical OOS remains exploratory;
 neither a positive aggregate nor one favorable window establishes the goal.
+
+### Risky account experiment: accounting and executable sizing (2026-10-27)
+
+The human's current scope is one 100-unit account reaching 50,000 within
+180 calendar days, without losing its capital and with a reasonably steady
+multiplication path. The human accepted **1:100 as the baseline**; 1:400 is a
+possible future broker scenario, not an available execution assumption. The
+actual broker and account currency still need binding. The old 9 October
+Spotware EUR reference is not authority for that choice.
+
+The author's [20-pip workbook](https://topmastertrader.com/20-pips-challange/)
+is preserved unchanged in the campaign's `sources` directory (SHA256
+`e05f5615e04aaa454652441046856d5e432e05c399c84f0fe61e4eab3c5bb473`).
+Its 20-to-52,404 table has hardcoded lots and roughly +30% wins / -23% losses.
+Changing its initial cell to 100 does not rescale those lots. The 206 checked
+numeric identities establish its arithmetic, not an entry signal, historical
+win rate, or broker-feasible execution. The published simulated 60% win rate
+in related challenge examples is an assumption and must not become an input
+claim about our genes.
+
+For a future reproducible baseline, freeze **continuous 3/13 risk sizing**:
+the desired gross win is 30% of current realized capital and the desired stop
+loss is 3/13 of it, with reward/risk 1.3. This is a declared prospective sizing
+controller, not a new profile added to the existing 36-profile matrix. Retain
+the author's discrete table as a separate reference. Neither version supplies
+an entry edge. Lot rounding, costs and margin can change or refuse the desired
+trade; record the actual fraction instead of silently calling it a 30% step.
+
+The gross reciprocal model requires 24 net upward steps from 100:
+`100 * 1.3^24 = 54,280.08`. Four net steps per month would give approximately
+100, 285.61, 815.73, 2,329.81, 6,654.17, 19,004.96, 54,280.08. This is an
+arithmetic benchmark, not a forecast. Smooth 500-fold multiplication over six
+equal periods requires about 181.727% per period. Trading costs break the
+reciprocal steps: one pip of round-trip costs against a gross 20-pip target
+consumes 1.5% of equity at this sizing. Under the explicitly assumed independent
+60% win rate, `ln(500)/E[log step]` is about 118, 165 or 276 trades for zero,
+one or two pips of costs. These are log-distance calculations, not expected
+first-passage times or success probabilities. Measure actual opportunity
+frequency, loss clustering, net returns and calendar inactivity from data.
+
+Work proceeds in this order:
+
+1. **Repair the existing CPU accounting owner first.** The independent native
+   fixture starts with 100, risks 3/13, exits its protective stop for -23.0769,
+   and must retain 76.9231. Its later candle low must not become a 115.3846 MAE
+   and a false capital-exhaustion verdict. Long, short, dual-touch, target,
+   costs and genuine gap losses need explicit evidence. An ordinary candle
+   assumes stop-first on dual touch; otherwise adverse excursion precedes a
+   target. This declared OHLC convention is not observed tick order.
+2. **Use one stopping contract.** The opt-in
+   `models.discovery_runtime.risky_account_experiment_v3: true` requires Risky
+   plus `risky_survival_only`. It uses the same CPU core for search and ledger,
+   banks the first realized net target and stops at realized capital exhaustion.
+   It binds the policy to configuration/settings hashes and sealed evaluation;
+   absent/false preserves archived arithmetic. Goal reports identify this as
+   `account_experiment_v3`. Device projection refuses unsupported semantics.
+   The experiment introduces no deposit, reset, withdrawal or recovery after
+   exhaustion. Genuine modeled gap losses remain uncapped and can be negative.
+   Gap handling here is the existing configured timestamp-gap close-fill
+   convention. The core does not walk opening quotes or bid/ask ticks; an
+   ordinary OHLC stop fill is still a research assumption, not guaranteed
+   execution through a price jump inside adjacent bars.
+3. **Bind physical admission before a financial baseline.** Reuse
+   `BarReplayLotGridV1`; direct confidence replay currently bypasses it. Bind
+   instrument units, account-currency pip value, min/step/max quantity, leverage
+   tiers, initial margin, free margin, stop-out, spread, commissions, swaps and
+   slippage. Example only: USD100, EURUSD1.10 and 0.15 lot require about USD165
+   initial margin at 1:100, versus USD41.25 at 1:400, before a cost buffer.
+   [cTrader dynamic leverage](https://help.ctrader.com/trading-with-ctrader/dynamic-leverage/)
+   depends on broker exposure tiers. Reject an unfundable request visibly;
+   do not assume unlimited credit or silently replace its risk policy.
+   Reuse the broker's existing `fetch_broker_expected_margin_blocking` request
+   owner in `neoethos-app/src/app_services/broker_api.rs` and the typed
+   expected-margin response in `ctrader_account.rs`; the live margin-call
+   observer already lives in `app_services/margin_call.rs`. These live readers
+   do not yet supply historical admission or liquidation to the research core.
+4. **Freeze the actual baseline before further search.** Pin source, binary,
+   data intervals, causal feature recipe, signal/fill timing, the controller,
+   costs, quantity/margin policy, target and 180-day deadline. Existing entries
+   use the previous bar's signal and the current bar's close. Adaptive genes
+   do not necessarily execute their printed scalar SL/TP labels, so a fixed
+   20-pip baseline needs explicit executed geometry and real quote comparison.
+   All four centered MinMax outputs stay excluded and old genes stay preserved.
+5. **Measure a signal edge separately from the controller.** Rank training
+   candidates by net log growth, actual time to target and the monthly path,
+   while retaining capital exhaustion, inactive months, worst month, losing
+   streaks, drawdown and trade count. Estimate win probability/payoff from
+   causal trades with costs; do not hardcode the challenge's assumed 60%.
+   A handful of trades in a year cannot establish the required cadence.
+6. **Freeze candidates before OOS.** Use predeclared IS rules, then replay
+   untouched candidate identities and sizing on chronological 180-day windows.
+   Show each start/end balance and duration, target hit time, survival, monthly
+   distribution, drawdown and trade count. Overlapping windows are dependent;
+   the already inspected historical tail remains exploratory. Freeze a new
+   prospective period for independent forward evidence. Do not tune the
+   declared matrix using its OOS outcomes.
+7. **Prove execution parity before money exposure.** Replay contemporaneous
+   quotes and demo execution against the frozen controller. The CPU repair is
+   not broker liquidation authority, a profitable strategy, or live readiness.
+
+The serial campaign retains its original start/deadline and resource limits.
+Its owned worker stopped on 27 October at 15:13:45 UTC when the guard detected
+other heavy work. No owned native child remained at the verified repair
+boundary. `STOP` now holds automatic execution while accounting is repaired;
+old logs, frozen checkpoints, profiles and executable are preserved. Do not
+restart a money-goal search merely because arithmetic regressions pass: the
+physical-admission step is still outstanding.

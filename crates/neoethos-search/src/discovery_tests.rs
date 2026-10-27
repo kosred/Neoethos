@@ -2134,6 +2134,7 @@ fn discovery_runtime_overrides_defaults_match_legacy_env_defaults() {
 fn discovery_runtime_overrides_clamp_invalid_values() {
     let overrides = DiscoveryRuntimeOverrides {
         risky_survival_only: false,
+        risky_account_experiment_v3: false,
         weekly_cadence: false,
         prefilter_top_k: 0,
         prefilter_insample_frac: f64::NAN,
@@ -2155,6 +2156,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
 
     let too_small = DiscoveryRuntimeOverrides {
         risky_survival_only: false,
+        risky_account_experiment_v3: false,
         weekly_cadence: false,
         prefilter_top_k: 0,
         prefilter_insample_frac: 0.0,
@@ -2204,6 +2206,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
     let mut config = DiscoveryConfig::default();
     config.runtime_overrides = DiscoveryRuntimeOverrides {
         risky_survival_only: false,
+        risky_account_experiment_v3: false,
         weekly_cadence: false,
         prefilter_top_k: 17,
         prefilter_insample_frac: 0.6,
@@ -4894,6 +4897,53 @@ fn risky_survival_policy_keeps_deep_drawdown_and_full_risk_without_prop_rules() 
     );
     let legacy = serde_json::to_value(DiscoveryRuntimeOverrides::default()).unwrap();
     assert!(legacy.get("risky_survival_only").is_none());
+}
+
+#[test]
+#[cfg(not(any(feature = "gpu", feature = "gpu-cuda")))]
+fn risky_account_experiment_v3_is_bound_to_risky_settings_and_saved_replay() {
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.initial_balance = 100.0;
+    settings.system.risky_start_balance_usd = 100.0;
+    settings.system.trading_mode = "risky".into();
+    settings.models.discovery_runtime.risky_survival_only = true;
+    settings
+        .models
+        .discovery_runtime
+        .risky_account_experiment_v3 = true;
+    let config = DiscoveryConfig::from_settings(&settings);
+    let policy = config.risky_account_experiment().unwrap().unwrap();
+    let evaluation = config.evaluation_config(Some(1.1));
+    assert_eq!(evaluation.risky_account_experiment, Some(policy));
+    assert_eq!(
+        discovery_backtest_settings(&config, &profitable_gene("account_v3"), Some(1.1))
+            .risky_account_experiment,
+        Some(policy)
+    );
+    // No broker/research monetary authority was installed by this test.
+    // Numerical builder propagation is checked in the existing isolated
+    // research-cost worker, so parallel tests cannot observe its authority.
+    assert!(crate::genetic::search_engine::evaluation_backtest_settings(&evaluation).is_err());
+    let mut incompatible = config.clone();
+    incompatible.runtime_overrides.risky_survival_only = false;
+    assert!(incompatible.risky_account_experiment().is_err());
+    incompatible = config.clone();
+    incompatible.mode = DiscoveryMode::PropFirm;
+    assert!(incompatible.risky_account_experiment().is_err());
+    incompatible = config.clone();
+    incompatible.risky_start_balance = 1000.0;
+    assert!(incompatible.risky_account_experiment().is_err());
+    incompatible = config.clone();
+    incompatible.runtime_overrides.risky_account_experiment_v3 = false;
+    assert!(
+        ensure_research_config_matches_sealed_evaluation(
+            &incompatible,
+            Some(1.1),
+            evaluation.smc_gate_threshold,
+            &evaluation
+        )
+        .is_err()
+    );
 }
 
 #[test]

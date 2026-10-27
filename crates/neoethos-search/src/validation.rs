@@ -2384,6 +2384,7 @@ mod tests {
 
     fn flat_settings() -> BacktestSettings {
         BacktestSettings {
+            risky_account_experiment: None,
             initial_equity_override: None,
             sl_pips: 1_000_000.0,
             tp_pips: 1_000_000.0,
