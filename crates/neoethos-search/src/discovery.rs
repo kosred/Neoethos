@@ -1652,9 +1652,28 @@ impl DiscoveryConfig {
                 0.60 // Frozen legacy research policy.
             };
             self.prop_firm_gate = None;
+            if self.runtime_overrides.risky_survival_only {
+                // Prop-firm delivery/shape preferences must not become Risky
+                // acceptance gates through the shared Settings constructor.
+                self.runtime_overrides.weekly_cadence = false;
+                self.min_trades_per_day = 0.0;
+                self.filtering.min_sharpe = -f64::MAX;
+                self.filtering.min_positive_months = 0;
+                self.filtering.min_trades_per_month = 0.0;
+                self.filtering.min_monthly_return_pct = 0.0;
+                self.filtering.opportunistic_enabled = false;
+                self.filtering.use_opportunistic_candidates = false;
+                self.target_profile.min_win_rate = 0.0;
+                self.target_profile.min_payoff_ratio = 0.0;
+                self.target_profile.max_in_market = 0.0;
+                self.target_profile.min_net_expectancy_per_trade = 0.0;
+                self.target_profile.min_expectancy_t_stat = 0.0;
+            }
             self.filtering.min_profit = 0.0;
             self.filtering.min_trades = 1.0;
-            self.filtering.min_sharpe = -5.0;
+            if !self.runtime_overrides.risky_survival_only {
+                self.filtering.min_sharpe = -5.0;
+            }
             self.filtering.min_win_rate = 0.0;
             self.filtering.min_profit_factor = 0.0;
             self.filtering.anomaly_guard = false;
@@ -6206,7 +6225,24 @@ fn evaluate_selection_calibration_cohort(
                 timestamps: &features.timestamps,
                 settings: &settings.settings_for_gene(gene),
             })?;
-            Ok(selection_calibration_trial(index, identity, summary))
+            if config.mode == DiscoveryMode::Risky && config.runtime_overrides.risky_survival_only {
+                let goals = native_risky_goal_windows(
+                    gene,
+                    &signals,
+                    &confidences,
+                    ohlcv,
+                    &features.timestamps,
+                    &settings,
+                )?;
+                Ok(selection_calibration_trial_for_goal(
+                    index,
+                    identity,
+                    summary,
+                    Some(goals),
+                ))
+            } else {
+                Ok(selection_calibration_trial(index, identity, summary))
+            }
         })?;
     crate::post_ga::check_cancel()?;
     Ok(SelectionCalibrationCohort {
@@ -6220,6 +6256,15 @@ fn selection_calibration_trial(
     candidate_archive_index: usize,
     strategy_identity: ValidationStrategyIdentityV2,
     summary: crate::validation::ForwardTestSummary,
+) -> crate::funnel_profile::SelectionCalibrationTrial {
+    selection_calibration_trial_for_goal(candidate_archive_index, strategy_identity, summary, None)
+}
+
+fn selection_calibration_trial_for_goal(
+    candidate_archive_index: usize,
+    strategy_identity: ValidationStrategyIdentityV2,
+    summary: crate::validation::ForwardTestSummary,
+    risky_goal_windows: Option<serde_json::Value>,
 ) -> crate::funnel_profile::SelectionCalibrationTrial {
     let invalid_slots = summary
         .metrics
@@ -6235,6 +6280,8 @@ fn selection_calibration_trial(
             "invalid calibration metrics: canonical slots {invalid_slots:?}; non-finite span_days={}",
             !summary.span_days.is_finite()
         ))
+    } else if let Some(goals) = risky_goal_windows.as_ref() {
+        risky_goal_calibration_rejection(goals)
     } else {
         crate::live_portfolio::LiveSizingEvidenceV1::validate_calibration_metrics(
             strategy_identity.strategy_id(),
@@ -6249,7 +6296,60 @@ fn selection_calibration_trial(
         summary: (!nonfinite).then_some(summary),
         profitable_for_selection: rejection_reason.is_none(),
         rejection_reason,
+        risky_goal_windows,
     }
+}
+
+fn risky_goal_calibration_rejection(goals: &serde_json::Value) -> Option<String> {
+    let windows = goals.get("windows").and_then(serde_json::Value::as_array);
+    let Some(windows) = windows.filter(|windows| !windows.is_empty()) else {
+        return Some("Risky calibration has no complete goal-horizon windows".into());
+    };
+    let ruined = windows
+        .iter()
+        .filter(|window| window["capital_survived"] != true)
+        .count();
+    if ruined > 0 {
+        return Some(format!(
+            "Risky capital exhausted in {ruined}/{} goal-horizon windows",
+            windows.len()
+        ));
+    }
+    if !windows
+        .iter()
+        .any(|window| window["target_reached"] == true)
+    {
+        return Some(format!(
+            "Risky target {} not reached within {} days in any calibration window",
+            goals["target_balance"], goals["window_days"]
+        ));
+    }
+    None
+}
+
+/// Account-risk robustness must preserve the same confidence-sized compounded
+/// strategy as Search. The fixed-lot timing diagnostic is a distinct policy.
+fn account_robustness_net(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    timestamps: &[i64],
+    signals: &[i8],
+    confidences: &[f64],
+    settings: &crate::eval::BacktestSettings,
+) -> Result<f64> {
+    Ok(simulate_trades_with_confidence_core(
+        close,
+        high,
+        low,
+        timestamps,
+        signals,
+        confidences,
+        settings,
+    )?
+    .iter()
+    .map(|trade| trade.pnl)
+    .sum())
 }
 
 fn selected_calibration_artifacts(
@@ -6296,10 +6396,17 @@ fn selected_calibration_artifacts(
             let summary = trial.summary.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("selected gene has no finite calibration summary")
             })?;
-            crate::live_portfolio::LiveSizingEvidenceV1::validate_calibration_metrics(
-                &gene.strategy_id,
-                &summary.metrics,
-            )?;
+            let checked = selection_calibration_trial_for_goal(
+                trial.candidate_archive_index,
+                trial.strategy_identity.clone(),
+                summary.clone(),
+                trial.risky_goal_windows.clone(),
+            );
+            anyhow::ensure!(
+                checked.profitable_for_selection,
+                "selected calibration no longer passes its mode policy: {:?}",
+                checked.rejection_reason
+            );
             ForwardTestValidationArtifactFile::new(
                 scope.clone(),
                 search_config_hash,
@@ -6468,10 +6575,14 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
                 confidences,
                 &settings,
             )?;
-            let prop_firm = compute_prop_firm_risk_summary(PropFirmRiskInput {
-                trades: &trades,
-                initial_balance: self.settings.config.initial_balance,
-                rules: prop_firm_rules,
+            let risk_only = self.settings.config.mode == DiscoveryMode::Risky
+                && self.settings.config.runtime_overrides.risky_survival_only;
+            let prop_firm = (!risk_only).then(|| {
+                compute_prop_firm_risk_summary(PropFirmRiskInput {
+                    trades: &trades,
+                    initial_balance: self.settings.config.initial_balance,
+                    rules: prop_firm_rules,
+                })
             });
             let monthly = crate::quality::monthly_closed_trade_metrics_v1(
                 &trades,
@@ -6480,7 +6591,7 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
                 *self.timestamps.last().context("empty OOS timestamps")?,
             )?;
             let goal_windows = self.goal_window_report(gene, signals, confidences)?;
-            strategies.push(serde_json::json!({
+            let mut strategy = serde_json::json!({
                 "strategy_id": gene.strategy_id,
                 "exact_gene_hash": crate::artifact_io::stable_json_hash(gene)?,
                 "forward_test": {
@@ -6498,10 +6609,14 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
                 "monthly_breakdown": monthly,
                 "logged_trades": trades,
                 "goal_windows": goal_windows,
-            }));
+            });
+            if risk_only {
+                strategy.as_object_mut().unwrap().remove("prop_firm_rules");
+            }
+            strategies.push(strategy);
         }
         let window = serde_json::to_value(self.holdout_scope.evaluated_window())?;
-        Ok(serde_json::json!({
+        let mut document = serde_json::json!({
             "schema": "neoethos.research-only.oos-evaluation.v1",
             "artifact_class": "ResearchOnly",
             "promotion_eligibility": "NotPromotionEligible",
@@ -6520,7 +6635,17 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
                 "evaluated_window": window,
             },
             "strategies": strategies,
-        }))
+        });
+        if self.settings.config.mode == DiscoveryMode::Risky
+            && self.settings.config.runtime_overrides.risky_survival_only
+        {
+            document
+                .as_object_mut()
+                .unwrap()
+                .remove("prop_firm_summary_scope");
+            document["evaluation_policy"] = "risky_goal_survival_v2".into();
+        }
+        Ok(document)
     }
 
     fn goal_window_report(
@@ -6530,16 +6655,18 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
         confidences: &[f64],
     ) -> Result<serde_json::Value> {
         let config = self.settings.config;
-        let risky = config.mode == DiscoveryMode::Risky;
+        if config.mode == DiscoveryMode::Risky {
+            return native_risky_goal_windows(
+                gene,
+                signals,
+                confidences,
+                self.ohlcv,
+                self.timestamps,
+                &self.settings,
+            );
+        }
         let mut overrides = config.derive_prop_firm_gate();
         overrides.n_windows = 12;
-        if risky {
-            anyhow::ensure!(
-                config.risky_horizon_days.is_finite() && config.risky_horizon_days >= 1.,
-                "invalid Risky horizon"
-            );
-            overrides.window_days = config.risky_horizon_days as usize;
-        }
         let windows = plan_prop_firm_windows(
             self.ohlcv,
             self.timestamps,
@@ -6547,19 +6674,18 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
             &self.settings,
             gene.stop_vol_mult > 0.,
         )?;
-        if !risky {
-            let (rate, count, failures) = compute_prop_firm_pass_rate(
-                gene,
-                signals,
-                confidences,
-                self.ohlcv,
-                self.timestamps,
-                config,
-                &overrides,
-                &self.settings,
-                &windows,
-            )?;
-            return Ok(serde_json::json!({
+        let (rate, count, failures) = compute_prop_firm_pass_rate(
+            gene,
+            signals,
+            confidences,
+            self.ohlcv,
+            self.timestamps,
+            config,
+            &overrides,
+            &self.settings,
+            &windows,
+        )?;
+        Ok(serde_json::json!({
                 "mode": "prop_firm", "window_days": overrides.window_days,
                 "rules": overrides.rules, "windows": count, "pass_rate": rate,
                 "passed": failures.passed, "daily_loss_breaches": failures.daily_loss_breaches,
@@ -6568,35 +6694,6 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
                 "min_trading_days_failures": failures.min_trading_days_failures,
                 "consistency_violations": failures.consistency_violations,
                 "warning": "Overlapping research windows; empirical pass fraction is not a future probability or broker execution evidence",
-            }));
-        }
-        let mut outcomes = Vec::with_capacity(windows.len());
-        for (start, end, base) in windows {
-            let mut settings = self.settings.settings_for_gene(gene);
-            if settings.adaptive_vol_mult > 0. {
-                settings.adaptive_base_pips = base;
-            }
-            let trades = simulate_trades_with_confidence_core(
-                &self.ohlcv.close[start..end],
-                &self.ohlcv.high[start..end],
-                &self.ohlcv.low[start..end],
-                &self.timestamps[start..end],
-                &signals[start..end],
-                &confidences[start..end],
-                &settings,
-            )?;
-            outcomes.push(risky_goal_window_outcome(
-                &trades,
-                config,
-                self.timestamps[start],
-                self.timestamps[end - 1],
-            )?);
-        }
-        Ok(serde_json::json!({
-            "mode": "risky", "initial_balance": config.initial_balance,
-            "target_balance": config.risky_target_balance, "window_days": overrides.window_days,
-            "sizing": "native confidence-sized compounding with original costs and lot limits",
-            "windows": outcomes, "warning": "Overlapping research windows; not independent future success probabilities",
         }))
     }
 
@@ -6633,6 +6730,79 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
             })
             .collect()
     }
+}
+
+/// Same native Risky evaluation for selection calibration and frozen OOS.
+/// The caller supplies the admitted time scope; this helper never selects or
+/// changes genes, settings, costs or the independent final-holdout boundary.
+fn native_risky_goal_windows(
+    gene: &Gene,
+    signals: &[i8],
+    confidences: &[f64],
+    ohlcv: &Ohlcv,
+    timestamps: &[i64],
+    resolver: &GeneEvalSettingsResolver<'_>,
+) -> Result<serde_json::Value> {
+    let config = resolver.config;
+    anyhow::ensure!(
+        config.mode == DiscoveryMode::Risky,
+        "Risky evaluator requires Risky mode"
+    );
+    anyhow::ensure!(
+        config.risky_horizon_days.is_finite() && config.risky_horizon_days >= 1.,
+        "invalid Risky horizon"
+    );
+    let rows = ohlcv.close.len();
+    anyhow::ensure!(
+        [
+            ohlcv.high.len(),
+            ohlcv.low.len(),
+            timestamps.len(),
+            signals.len(),
+            confidences.len()
+        ]
+        .iter()
+        .all(|length| *length == rows),
+        "Risky goal windows require aligned prices, timestamps, signals and confidence"
+    );
+    let mut window_plan = config.derive_prop_firm_gate();
+    window_plan.n_windows = 12;
+    window_plan.window_days = config.risky_horizon_days as usize;
+    let windows = plan_prop_firm_windows(
+        ohlcv,
+        timestamps,
+        &window_plan,
+        resolver,
+        gene.stop_vol_mult > 0.,
+    )?;
+    let mut outcomes = Vec::with_capacity(windows.len());
+    for (start, end, base) in windows {
+        let mut settings = resolver.settings_for_gene(gene);
+        if settings.adaptive_vol_mult > 0. {
+            settings.adaptive_base_pips = base;
+        }
+        let trades = simulate_trades_with_confidence_core(
+            &ohlcv.close[start..end],
+            &ohlcv.high[start..end],
+            &ohlcv.low[start..end],
+            &timestamps[start..end],
+            &signals[start..end],
+            &confidences[start..end],
+            &settings,
+        )?;
+        outcomes.push(risky_goal_window_outcome(
+            &trades,
+            config,
+            timestamps[start],
+            timestamps[end - 1],
+        )?);
+    }
+    Ok(serde_json::json!({
+        "mode": "risky", "initial_balance": config.initial_balance,
+        "target_balance": config.risky_target_balance, "window_days": window_plan.window_days,
+        "sizing": "native confidence-sized compounding with original costs and lot limits",
+        "windows": outcomes, "warning": "Overlapping research windows; not independent future success probabilities",
+    }))
 }
 
 /// Describe the native compounded path up to its first target or capital loss.
@@ -16043,10 +16213,17 @@ where
     }
     funnel.walkforward_selection_cohort = Some(wf_cohort);
     let profitable_calibration_genes = if let Some(calibration) = calibration_input {
+        let risky_goal_calibration =
+            config.mode == DiscoveryMode::Risky && config.runtime_overrides.risky_survival_only;
+        let calibration_policy = if risky_goal_calibration {
+            "Risky target/deadline and capital survival"
+        } else {
+            "profitable live sizing"
+        };
         progress_fn(DiscoveryProgress::StageAdvanced {
             stage: "holdout_forward_test",
             detail: format!(
-                "selection calibration for all {} internal-WF survivors before active portfolio capacity {}; final holdout remains reserved",
+                "{calibration_policy} selection calibration for all {} internal-WF survivors before active portfolio capacity {}; final holdout remains reserved",
                 candidate_census.walkforward_passed, config.portfolio_size,
             ),
         });
@@ -16085,13 +16262,18 @@ where
         if profitable.len() < cohort.trials.len() {
             funnel.add_reject_reason(
                 "passed_selection_calibration",
-                "calibration_sizing_gate_failed",
+                if risky_goal_calibration {
+                    "risky_goal_or_survival_calibration_failed"
+                } else {
+                    "calibration_sizing_gate_failed"
+                },
                 cohort.trials.len() - profitable.len(),
             );
         }
         tracing::info!(
             target: "neoethos_search::discovery",
             calibration_tested = cohort.trials.len(), calibration_profitable = profitable.len(),
+            calibration_policy,
             active_portfolio_capacity = config.portfolio_size,
             "completed the selection-used research cohort before active portfolio selection; this is not an untouched final test"
         );
@@ -16390,6 +16572,8 @@ where
             &ohlcv.low[w0..],
             &ohlcv.close[w0..],
         )?;
+        let account_risk_robustness =
+            config.mode == DiscoveryMode::Risky && config.runtime_overrides.risky_survival_only;
 
         let verdicts: Vec<(bool, String)> = portfolio
             .par_iter()
@@ -16398,11 +16582,42 @@ where
                 let settings = robust_resolver.settings_for_gene(gene);
                 let sig_full = &portfolio_signals[gi];
                 if sig_full.len() != n_all {
+                    anyhow::ensure!(
+                        !account_risk_robustness,
+                        "Risky account robustness signal length mismatch"
+                    );
                     return Ok((true, "skipped (signal length mismatch)".to_string()));
                 }
                 let sig_win = &sig_full[w0..];
-                let net_of = |sigs: &[i8]| -> f64 {
-                    simulate_trades_core(
+                let real_confidences = if account_risk_robustness {
+                    account_sizing_confidences(
+                        features,
+                        gene,
+                        &eval_cfg_rb,
+                        account_smc.as_ref().context("Risky robustness lost SMC")?,
+                        sig_full,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                let conf_win = if account_risk_robustness {
+                    &real_confidences[w0..]
+                } else {
+                    &[]
+                };
+                let net_of = |sigs: &[i8], confidence: &[f64]| -> Result<f64> {
+                    if account_risk_robustness {
+                        return account_robustness_net(
+                            &ohlcv.close[w0..],
+                            &ohlcv.high[w0..],
+                            &ohlcv.low[w0..],
+                            ts_win,
+                            sigs,
+                            confidence,
+                            &settings,
+                        );
+                    }
+                    Ok(simulate_trades_core(
                         &ohlcv.close[w0..],
                         &ohlcv.high[w0..],
                         &ohlcv.low[w0..],
@@ -16412,9 +16627,9 @@ where
                     )
                     .iter()
                     .map(|t| t.pnl)
-                    .sum()
+                    .sum())
                 };
-                let real_net = net_of(sig_win);
+                let real_net = net_of(sig_win, conf_win)?;
                 let signal_bars = sig_win.iter().filter(|s| **s != 0).count();
                 if real_net <= 0.0 || signal_bars < 30 {
                     // Too little recent evidence to test against — pass through;
@@ -16428,9 +16643,22 @@ where
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
                 let mut beats = 0usize;
                 let mut shuffled: Vec<i8> = sig_win.to_vec();
+                let mut paired = sig_win
+                    .iter()
+                    .copied()
+                    .zip(conf_win.iter().copied())
+                    .collect::<Vec<_>>();
                 for _ in 0..N_PERM {
-                    shuffled.shuffle(&mut rng);
-                    if net_of(&shuffled) >= real_net {
+                    let random_net = if account_risk_robustness {
+                        paired.shuffle(&mut rng);
+                        let (signals, confidence): (Vec<_>, Vec<_>) =
+                            paired.iter().copied().unzip();
+                        net_of(&signals, &confidence)?
+                    } else {
+                        shuffled.shuffle(&mut rng);
+                        net_of(&shuffled, &[])?
+                    };
+                    if random_net >= real_net {
                         beats += 1;
                     }
                 }
@@ -16451,9 +16679,29 @@ where
                     variant.short_threshold *= factor;
                     let sig_v = signals_for_gene_full(features, ohlcv, &variant, &eval_cfg_rb)?;
                     if sig_v.len() != n_all {
+                        anyhow::ensure!(
+                            !account_risk_robustness,
+                            "Risky plateau signal length mismatch"
+                        );
                         continue;
                     }
-                    let net_v = net_of(&sig_v[w0..]);
+                    let confidence = if account_risk_robustness {
+                        account_sizing_confidences(
+                            features,
+                            &variant,
+                            &eval_cfg_rb,
+                            account_smc.as_ref().context("Risky plateau lost SMC")?,
+                            &sig_v,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
+                    let confidence = if account_risk_robustness {
+                        &confidence[w0..]
+                    } else {
+                        &[]
+                    };
+                    let net_v = net_of(&sig_v[w0..], confidence)?;
                     if net_v < PLATEAU_MIN_RATIO * real_net {
                         return Ok((
                             false,

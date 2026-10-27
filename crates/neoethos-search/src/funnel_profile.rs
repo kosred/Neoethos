@@ -112,9 +112,12 @@ pub struct SelectionCalibrationTrial {
     /// Null means invalid/non-finite metrics, with the reason retained below.
     /// Ordinary losing but finite replays keep their complete measured summary.
     pub summary: Option<crate::validation::ForwardTestSummary>,
-    /// Passed the existing numerical sizing gate, not final validation.
+    /// Passed this mode's selection gate, not final validation. Legacy runs
+    /// use profitable sizing; Risky survival v2 requires its actual goal path.
     pub profitable_for_selection: bool,
     pub rejection_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risky_goal_windows: Option<serde_json::Value>,
 }
 
 /// Actual candidate coverage, separate from planned GA evaluation slots and

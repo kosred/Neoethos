@@ -1808,6 +1808,23 @@ survival or an extrapolated multi-year return as a six-month experiment.
 False retains archived behavior and its exact canonical configuration digest.
 PropFirm behavior remains governed by its own rules.
 
+The new policy also clears inherited PropFirm trade-frequency, monthly-return,
+weekly-cadence and trade-shape floors. Selection calibration evaluates native
+180-day Risky account paths: all sampled complete windows must retain capital,
+and at least one must reach the configured target. Each trial retains its
+window outcomes and monthly ledger, including failed goals. This is a
+selection criterion, not independent evidence or a future success probability.
+It replaces the generic whole-span positive-net/profit-factor/Kelly sizing
+gate only for this versioned Risky policy. Monthly steadiness remains visible
+for ranking and review rather than an invented PropFirm return threshold.
+
+Risky permutation and threshold-plateau diagnostics now use confidence-sized
+account compounding. Permutations keep signals paired with their entry sizing
+confidence; threshold variants recompute confidence. The legacy fixed-one-lot
+timing diagnostic remains unchanged for archived policy and PropFirm. Risky
+OOS reports under the new policy omit PropFirm rule verdicts. Common temporal
+integrity, cost accounting and overfitting checks retain their existing roles.
+
 The revised campaign declares confidence sizing across 0..100% of current
 capital and fixed-fraction IS comparisons at 5, 10, 20, 30, 50, 75 and 100%.
 These are searched sizing choices, not a universal low-risk ceiling. Native

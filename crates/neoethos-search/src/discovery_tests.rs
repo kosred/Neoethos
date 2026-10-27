@@ -3444,6 +3444,50 @@ fn research_only_oos_document_is_labelled_and_carries_one_entry_per_strategy() {
         goal.get("rules").is_none(),
         "Risky is not graded by prop rules"
     );
+    risky_config.runtime_overrides.risky_survival_only = true;
+    let risky_v2 = PreparedLockedHoldoutResearch::new(
+        &portfolio,
+        &features.names,
+        &features,
+        &ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &risky_config,
+        threshold,
+    )
+    .unwrap()
+    .research_only_oos_document(PropFirmRiskRules::default())
+    .unwrap();
+    assert_eq!(risky_v2["evaluation_policy"], "risky_goal_survival_v2");
+    assert!(risky_v2.get("prop_firm_summary_scope").is_none());
+    assert!(
+        risky_v2["strategies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|strategy| {
+                strategy.get("prop_firm_rules").is_none()
+                    && strategy["goal_windows"]["mode"] == "risky"
+            })
+    );
+    config.runtime_overrides.risky_survival_only = true;
+    let prop_with_risky_flag = PreparedLockedHoldoutResearch::new(
+        &portfolio,
+        &features.names,
+        &features,
+        &ohlcv,
+        &holdout_scope,
+        STRICT_VALIDATION_SEARCH_CONFIG_HASH,
+        &config,
+        threshold,
+    )
+    .unwrap()
+    .research_only_oos_document(PropFirmRiskRules::default())
+    .unwrap();
+    assert_eq!(
+        prop_with_risky_flag, document,
+        "Risky flag cannot change PropFirm reports"
+    );
 }
 
 #[test]
@@ -4906,6 +4950,47 @@ fn risky_survival_episode_uses_calendar_horizon_without_trimming_prop_firm() {
 }
 
 #[test]
+fn risky_survival_policy_clears_inherited_prop_delivery_and_shape_gates() {
+    let mut config = DiscoveryConfig::default();
+    config.runtime_overrides.risky_survival_only = true;
+    config.runtime_overrides.weekly_cadence = true;
+    config.filtering.min_positive_months = 12;
+    config.filtering.min_trades_per_month = 15.0;
+    config.filtering.min_monthly_return_pct = 0.04;
+    config.target_profile.min_win_rate = 0.65;
+    config.target_profile.min_payoff_ratio = 2.2;
+    config.target_profile.max_in_market = 0.2;
+    config.target_profile.min_net_expectancy_per_trade = 10.0;
+    config.target_profile.min_expectancy_t_stat = 3.0;
+    let prop = config.clone().apply_mode_overrides();
+    assert!(prop.prop_firm_gate.is_some());
+    assert!(prop.runtime_overrides.weekly_cadence);
+    assert_eq!(prop.target_profile.min_win_rate, 0.65);
+    assert_eq!(prop.filtering.min_monthly_return_pct, 0.04);
+    config.mode = DiscoveryMode::Risky;
+    let risky = config.apply_mode_overrides();
+    assert!(!risky.runtime_overrides.weekly_cadence);
+    assert_eq!(risky.min_trades_per_day, 0.0);
+    assert_eq!(risky.filtering.min_positive_months, 0);
+    assert_eq!(risky.filtering.min_trades_per_month, 0.0);
+    assert_eq!(risky.filtering.min_monthly_return_pct, 0.0);
+    assert_eq!(risky.filtering.min_sharpe, -f64::MAX);
+    assert_eq!(risky.target_profile.min_win_rate, 0.0);
+    assert_eq!(risky.target_profile.min_payoff_ratio, 0.0);
+    assert_eq!(risky.target_profile.max_in_market, 0.0);
+    assert_eq!(risky.target_profile.min_net_expectancy_per_trade, 0.0);
+    assert_eq!(risky.target_profile.min_expectancy_t_stat, 0.0);
+    let mut metrics = profitable_metrics("positive_without_prop_shape");
+    metrics.win_rate = 0.3;
+    metrics.payoff_ratio = 0.0;
+    metrics.in_market_pct = 0.9;
+    metrics.trades_per_month = 1.0;
+    metrics.max_drawdown_pct = 0.95;
+    assert!(classify_base_quality(&metrics, &risky.target_profile, &risky.filtering).is_ok());
+    assert!(classify_base_quality(&metrics, &prop.target_profile, &prop.filtering).is_err());
+}
+
+#[test]
 fn risky_survival_windows_refuse_ruin_but_keep_a_recovering_capital_path() {
     let start = 1_735_689_600_000;
     let mut config = DiscoveryConfig::default();
@@ -4935,6 +5020,42 @@ fn risky_survival_windows_refuse_ruin_but_keep_a_recovering_capital_path() {
     assert_eq!(outcome["max_closed_balance_drawdown"], 0.95);
     assert_eq!(outcome["balance_at_stop"], 50000.0);
     assert!(outcome["monthly_breakdown_until_stop"].is_array());
+    let goals = serde_json::json!({
+        "target_balance": 50000.0, "window_days": 180, "windows": [outcome]
+    });
+    assert!(risky_goal_calibration_rejection(&goals).is_none());
+    // A whole-period Kelly/net gate is not the goal-window decision: a
+    // strategy stops its capital experiment on reaching the declared target.
+    let identity =
+        ValidationStrategyIdentityV2::from_gene(&profitable_gene("goal_before_tail_loss")).unwrap();
+    let whole_span = crate::validation::ForwardTestSummary {
+        bars: 400,
+        span_days: 395.0,
+        metrics: BacktestMetrics::from_metric_array([
+            -10.0, -1.0, 90.0, 0.95, 0.3, 0.9, -1.0, 0.0, 10.0, 0.1, 0.0,
+        ]),
+    };
+    assert!(
+        !selection_calibration_trial(0, identity.clone(), whole_span.clone())
+            .profitable_for_selection
+    );
+    let goal_trial =
+        selection_calibration_trial_for_goal(0, identity, whole_span, Some(goals.clone()));
+    assert!(goal_trial.profitable_for_selection);
+    let encoded = serde_json::to_vec(&goal_trial).unwrap();
+    let decoded: crate::funnel_profile::SelectionCalibrationTrial =
+        serde_json::from_slice(&encoded).unwrap();
+    assert!(decoded.profitable_for_selection && decoded.risky_goal_windows.is_some());
+    let prop = compute_prop_firm_risk_summary(PropFirmRiskInput {
+        trades: &trades,
+        initial_balance: config.initial_balance,
+        rules: PropFirmRiskRules::default(),
+    });
+    assert!(prop.daily_loss_breach && prop.overall_drawdown_breach);
+    assert!(
+        !prop.all_rules_passed,
+        "Risky survival is not a prop challenge pass"
+    );
     // A trade that first loses the whole account cannot earn its later exit.
     trades[0].mae = 100.0;
     let ruined =
@@ -4942,6 +5063,13 @@ fn risky_survival_windows_refuse_ruin_but_keep_a_recovering_capital_path() {
     assert_eq!(ruined["target_reached"], false);
     assert_eq!(ruined["capital_survived"], false);
     assert_eq!(ruined["settled_trades_before_stop"], 0);
+    let mut mixed = goals.clone();
+    mixed["windows"].as_array_mut().unwrap().push(ruined);
+    assert!(
+        risky_goal_calibration_rejection(&mixed)
+            .unwrap()
+            .contains("capital exhausted")
+    );
     trades[0].mae = 5.0;
     trades[0].pnl = -100.0;
     let settled_ruin =
@@ -4955,6 +5083,115 @@ fn risky_survival_windows_refuse_ruin_but_keep_a_recovering_capital_path() {
     assert_eq!(legacy["floor_hit"], true);
     assert_eq!(legacy["target_reached"], false);
     assert!(legacy.get("policy").is_none());
+}
+
+#[test]
+fn prop_challenge_profit_is_not_a_risky_capital_goal() {
+    let start = 1_735_689_600_000;
+    let trades = (1..=4)
+        .map(|day| Trade {
+            entry_time: start + day * 86_400_000,
+            exit_time: Some(start + day * 86_400_000 + 60_000),
+            pnl: 20.0,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let rules = PropFirmRiskRules {
+        max_daily_loss_pct: 0.05,
+        max_overall_drawdown_pct: 0.10,
+        require_profit_target: true,
+        min_profit_target_pct: 0.08,
+        min_trading_days: 4,
+        ..Default::default()
+    };
+    let prop = compute_prop_firm_risk_summary(PropFirmRiskInput {
+        trades: &trades,
+        initial_balance: 1000.0,
+        rules,
+    });
+    assert!(prop.all_rules_passed);
+    let mut config = DiscoveryConfig::default();
+    config.mode = DiscoveryMode::Risky;
+    config.runtime_overrides.risky_survival_only = true;
+    config.initial_balance = 1000.0;
+    let risky =
+        risky_goal_window_outcome(&trades, &config, start, start + 180 * 86_400_000).unwrap();
+    assert_eq!(risky["capital_survived"], true);
+    assert_eq!(risky["target_reached"], false);
+    let goals =
+        serde_json::json!({"target_balance": 50000.0, "window_days": 180, "windows": [risky]});
+    let summary = crate::validation::ForwardTestSummary {
+        bars: 100,
+        span_days: 180.0,
+        metrics: BacktestMetrics::from_metric_array([
+            80.0, 1.0, 1080.0, 0.0, 1.0, 10.0, 20.0, 0.0, 4.0, 0.1, 0.01,
+        ]),
+    };
+    let identity =
+        ValidationStrategyIdentityV2::from_gene(&profitable_gene("different_goal")).unwrap();
+    let generic = selection_calibration_trial(0, identity.clone(), summary.clone());
+    assert!(
+        generic.profitable_for_selection,
+        "generic sizing accepts these finite positive metrics"
+    );
+    let goal_trial = selection_calibration_trial_for_goal(0, identity, summary, Some(goals));
+    assert!(!goal_trial.profitable_for_selection);
+    assert!(
+        goal_trial
+            .rejection_reason
+            .unwrap()
+            .contains("not reached within 180 days")
+    );
+    assert!(goal_trial.risky_goal_windows.is_some());
+    assert!(risky_goal_calibration_rejection(&serde_json::json!({"windows": []})).is_some());
+}
+
+#[test]
+fn risky_account_robustness_uses_compounded_entry_risk_and_requires_confidence() {
+    // Independent two-win oracle: 100 * 1.5 * 1.5 = 225. Fixed 1-lot
+    // timing earns only 2 * 4 = 8 under the same 4-pip brackets.
+    let close = [1.0; 5];
+    let high = [1.0, 1.0, 1.75, 1.0, 1.75];
+    let settings = crate::eval::BacktestSettings {
+        pip_value: 0.125,
+        pip_value_per_lot: 1.0,
+        sl_pips: 4.0,
+        tp_pips: 4.0,
+        initial_equity_override: Some(100.0),
+        risk_based_sizing: true,
+        risk_per_trade_min: 0.5,
+        risk_per_trade_max: 0.5,
+        spread_pips: 0.0,
+        commission_per_trade: 0.0,
+        swap_long_pips_per_day: 0.0,
+        pnl_conversion_fee_rate: 0.0,
+        kill_zones_enabled: false,
+        ..Default::default()
+    };
+    let signals = [1, 0, 1, 0, 0];
+    let timestamps = (0..5)
+        .map(|row| 1_735_689_600_000 + row * 60_000)
+        .collect::<Vec<_>>();
+    let net = account_robustness_net(
+        &close,
+        &high,
+        &close,
+        &timestamps,
+        &signals,
+        &[1.0; 5],
+        &settings,
+    )
+    .unwrap();
+    assert_eq!(net, 125.0);
+    let fixed_net = simulate_trades_core(&close, &high, &close, &timestamps, &signals, &settings)
+        .iter()
+        .map(|trade| trade.pnl)
+        .sum::<f64>();
+    assert_eq!(fixed_net, 8.0);
+    assert!(
+        account_robustness_net(&close, &high, &close, &timestamps, &signals, &[], &settings)
+            .is_err()
+    );
 }
 
 #[test]
