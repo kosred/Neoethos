@@ -2787,7 +2787,7 @@ fn cmd_discover_on_budgeted_pool(
                             emit_cpu_research_stage(&format!(
                                 "feature_frame_cache_hit cursor={cursor}"
                             ));
-                            return Ok(cached);
+                            return cached.into_shared_view();
                         }
                     }
                     let features =
@@ -2810,7 +2810,11 @@ fn cmd_discover_on_budgeted_pool(
                             "feature_frame_cache_stored bytes={bytes}"
                         ));
                     }
-                    Ok(features)
+                    // Discovery borrows this frame and creates separate IS,
+                    // calibration and OOS row windows. Move the resident cube
+                    // into shared backing once so those windows only copy
+                    // metadata rather than every in-memory feature column.
+                    features.into_shared_view()
                 },
                 |features| {
                     emit_cpu_research_stage("content_receipt_started");

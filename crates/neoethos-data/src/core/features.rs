@@ -1021,6 +1021,13 @@ impl FeatureFrame {
         )
     }
 
+    /// Move this frame into shared backing before borrowed consumers create
+    /// clones or row windows. Only metadata is copied; feature values stay in
+    /// their original allocation, including an already-normalized RAM cube.
+    pub fn into_shared_view(self) -> Result<Self> {
+        Arc::new(self).shared_view()
+    }
+
     /// A whole-frame view with a genuinely shared in-memory backing. Unlike
     /// cloning an owned `InMemory(Vec<...>)`, this allocates no feature values.
     pub fn shared_view(self: &Arc<Self>) -> Result<Self> {
@@ -2330,6 +2337,54 @@ mod fitted_model_view_tests {
         );
         assert!(raw.shared_select_rows(&[2, 2]).is_err());
         assert!(raw.shared_select_rows(&[19, 20]).is_err());
+    }
+
+    #[test]
+    fn consumed_shared_backing_keeps_split_windows_on_one_cube() {
+        let source = Arc::try_unwrap(dense_test_frame()).unwrap();
+        let FeatureData::InMemory(columns) = &source.data else {
+            panic!("regression needs owned RAM columns")
+        };
+        let allocations: Vec<_> = columns
+            .iter()
+            .map(|column| (column.values.as_ptr(), column.validity.as_ptr()))
+            .collect();
+        let expected = source.project_columns(&[0, 1, 2], 0..17).unwrap();
+        let plan = source.plan_identity();
+        let provenance = source.provenance_identity();
+        let shared = source.into_shared_view().unwrap();
+        let FeatureData::View(view) = &shared.data else {
+            panic!("consumed source must become shared")
+        };
+        let FeatureData::InMemory(columns) = &view.parent.data else {
+            panic!("source values must retain their backing")
+        };
+        for (column, (values, validity)) in columns.iter().zip(allocations) {
+            assert_eq!(column.values.as_ptr(), values);
+            assert_eq!(column.validity.as_ptr(), validity);
+        }
+        // These are the three separate owned_range calls made by discovery.
+        for (start, end) in [(0, 10), (10, 13), (13, 17)] {
+            let window = shared.row_window(start, end).unwrap();
+            let FeatureData::View(window_view) = &window.data else {
+                panic!("split must remain a view")
+            };
+            let FeatureData::View(parent_view) = &window_view.parent.data else {
+                panic!("split must clone shared metadata, not the source cube")
+            };
+            assert!(Arc::ptr_eq(&parent_view.parent, &view.parent));
+            assert_eq!(window.plan_identity(), plan);
+            assert_eq!(window.provenance_identity(), provenance);
+            let actual = window.project_columns(&[0, 1, 2], 0..end - start).unwrap();
+            assert_eq!(actual.timestamps, expected.timestamps[start..end]);
+            assert_eq!(actual.row_ids, expected.row_ids[start..end]);
+            for (actual, expected) in actual.columns.iter().zip(&expected.columns) {
+                assert_eq!(actual.validity, expected.validity[start..end]);
+                for (actual, expected) in actual.values.iter().zip(&expected.values[start..end]) {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+            }
+        }
     }
 
     #[test]

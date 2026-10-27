@@ -188,6 +188,7 @@ def run_job(plan,name,args,deadline):
     wait_resources(plan,deadline)
     if sha(plan['exe'])!=plan['exe_sha256']:raise RuntimeError('Pinned binary changed; refusing new launches')
     env=os.environ.copy();env['NEOETHOS_PINNED_FEATURE_BUDGET_HEADROOM_BYTES']=str(plan['feature_headroom_bytes'])
+    env['RUST_LOG']='info'
     # This campaign owns no shared-cache mutation or eviction policy.
     env.pop('NEOETHOS_FEATURE_FRAME_CACHE_DIR',None);env.pop('NEOETHOS_FEATURE_FRAME_CACHE_MAX_BYTES',None)
     logs=ROOT/'logs';logs.mkdir(exist_ok=True)
@@ -196,13 +197,20 @@ def run_job(plan,name,args,deadline):
         with (logs/(name+'.stdout.log')).open('wb') as stdout,(logs/(name+'.stderr.log')).open('wb') as stderr:
             p=subprocess.Popen([plan['exe']]+args,cwd=REPO,env=env,stdout=stdout,stderr=stderr,creationflags=subprocess.CREATE_NO_WINDOW|subprocess.BELOW_NORMAL_PRIORITY_CLASS)
             job.attach(p);emit('running',job=name,pid=p.pid)
-            end=min(deadline,time.time()+plan['max_job_hours']*3600);check=0
+            started=time.time();end=min(deadline,started+plan['max_job_hours']*3600);check=0
             while p.poll() is None:
-                if available()<plan['abort_free_gib'] or time.time()>end or (ROOT/'STOP').exists():
-                    p.kill();raise RuntimeError('Owned job aborted: memory/time/STOP guard')
-                if time.time()>check:
+                now=time.time();free=available()
+                reason=('free_memory' if free<plan['abort_free_gib'] else
+                    'deadline' if now>end else 'stop_requested' if (ROOT/'STOP').exists() else None)
+                if reason:
+                    emit('job_guard_triggered',job=name,pid=p.pid,reason=reason,
+                        free_gib=round(free,3),reserve_gib=plan['abort_free_gib'],elapsed_seconds=round(now-started,1))
+                    p.kill();p.wait()
+                    raise RuntimeError(f'Owned job aborted: {reason}; free={free:.3f}GiB; elapsed={now-started:.1f}s')
+                if now>check:
+                    emit('job_resources',job=name,pid=p.pid,free_gib=round(free,3),elapsed_seconds=round(now-started,1))
                     if competitors((p.pid,)):p.kill();raise RuntimeError('Other heavy work appeared; owned job stopped')
-                    check=time.time()+30
+                    check=now+30
                 time.sleep(2)
             emit('job_finished',job=name,exit_code=p.returncode)
             return p.returncode

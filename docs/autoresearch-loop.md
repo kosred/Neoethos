@@ -1787,3 +1787,12 @@ but genes using these outputs have contaminated historical evidence. Do not
 replace their feature indices with different columns or call a failed exact
 replay a financial OOS loss. A causal delayed replacement requires a new name
 and feature recipe plus prefix-invariance tests.
+
+The canonical CPU builder moves each completed or cached frame into shared
+backing before discovery borrows it. Otherwise `row_window` on an owned
+`InMemory` frame clones the entire cube separately for selection, calibration
+and holdout. Sharing preserves the exact cells, validity and provenance while
+removing those copies. The serial campaign records available RAM and elapsed
+time every 30 seconds and the specific reason when its owned-child guard stops
+a run. This repair changes storage ownership, not the pinned feature recipe or
+the financial settings.
