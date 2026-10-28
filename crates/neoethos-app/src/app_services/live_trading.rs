@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 mod candidate_models;
+mod holding_limit;
 
 use anyhow::{Context, Result, anyhow};
 use neoethos_data::Ohlcv;
@@ -1013,9 +1014,22 @@ async fn run(
 
     let bar_ms = tf_duration_ms(&base_tf)?;
     let warmup = req.warmup_bars;
+    let sealed_evaluation = live_trading_policy.sealed_evaluation_config()?;
+    // Only the opt-in Risky account contract gains this recipient. Archived
+    // absent-policy execution remains unchanged while that route is migrated.
+    let maximum_hold_bars = if sealed_evaluation.risky_account_experiment.is_some() {
+        sealed_evaluation.max_hold_bars
+    } else {
+        0
+    };
+    anyhow::ensure!(
+        maximum_hold_bars == 0 || warmup >= maximum_hold_bars,
+        "live holding limit {maximum_hold_bars} requires at least that many retained bars; configured warmup is {warmup}"
+    );
     let mut last_bar_ts: i64 = 0;
     // Track open position: (position_id, broker_volume_in_units)
     let mut open_position: Option<(i64, i64)> = None;
+    let mut position_entry_bar: Option<i64> = None;
     let mut bars_evaluated: u64 = 0;
 
     // ── Auto-cull: retire the strategy after N consecutive losing trades ───────
@@ -2070,6 +2084,7 @@ async fn run(
                     // so trailing doesn't try to amend a dead position.
                     if open_position.map(|(id, _)| id) == Some(position_id) {
                         open_position = None;
+                        position_entry_bar = None;
                     }
                     if opened_ids.is_empty() {
                         if let Ok(mut s) = status.lock() {
@@ -2218,10 +2233,35 @@ async fn run(
         }
 
         // Reconcile account identity and exact remaining volume BEFORE sending
-        // a weekend close. A successful response still cannot replace the next
+        // a timed/weekend close. A successful response cannot replace the next
         // broker/close-money reconciliation's proof of complete closure.
-        if kill_zones_enabled && reconciled_open_position && weekend_kill_zone(latest_ts).0 {
+        let weekend_close_due = kill_zones_enabled && weekend_kill_zone(latest_ts).0;
+        let holding_close_due = if reconciled_open_position {
+            match holding_limit::due(
+                maximum_hold_bars,
+                position_entry_bar,
+                base_snapshot.bars().iter().map(|bar| bar.timestamp_ms),
+            ) {
+                Ok(due) => due,
+                Err(error) => {
+                    tracing::error!(target: "neoethos_app::live_trading", %symbol, %error,
+                        "owned holding deadline could not be evidenced; preserving ownership and broker protection");
+                    if !weekend_close_due {
+                        continue;
+                    }
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if reconciled_open_position && (weekend_close_due || holding_close_due) {
             if let Some((pos_id, vol)) = open_position {
+                let close_reason = if holding_close_due {
+                    "maximum holding deadline"
+                } else {
+                    "weekend close"
+                };
                 let result = tokio::task::spawn_blocking(move || {
                     close_position_blocking(
                         pos_id,
@@ -2241,12 +2281,12 @@ async fn run(
                 };
                 tracing::info!(
                     target: "neoethos_app::live_trading",
-                    %symbol, position_id = pos_id, %close_report,
-                    "weekend close remains supervised until broker reconciliation proves it flat"
+                    %symbol, position_id = pos_id, reason = close_reason, %close_report,
+                    "managed close remains supervised until broker reconciliation proves it flat"
                 );
                 if let Ok(mut s) = status.lock() {
                     s.open_position_id = Some(pos_id);
-                    s.last_signal = Some(format!("weekend close: {close_report}"));
+                    s.last_signal = Some(format!("{close_reason}: {close_report}"));
                 }
                 // Do not amend protection or enter again using a snapshot
                 // taken before this close request.
@@ -2628,8 +2668,7 @@ async fn run(
         // consults the signal ONLY while FLAT. While a position is open the
         // signal is ignored entirely — exits happen exclusively via SL/TP
         // (broker-enforced live), the trail when `models.exit_policy` arms it,
-        // plus the weekend force-close; the
-        // production EvaluationConfig ships max_hold_bars = 0. The previous
+        // plus the sealed holding deadline and weekend force-close. The previous
         // live code closed + reopened on EVERY non-flat bar (paying the
         // spread per bar and resetting the trailing state) and closed on a
         // Flat signal — a trade profile no validated backtest ever had.
@@ -3652,6 +3691,7 @@ async fn run(
                         let broker_volume = opening.filled_volume_raw_centi_units();
                         opened_ids.insert(pos_id);
                         open_position = Some((pos_id, broker_volume));
+                        position_entry_bar = Some(latest_ts);
                         opened_entry_filled_volumes.insert(pos_id, broker_volume);
                         opened_volume_scales.insert(pos_id, volume_scale.clone());
                         // Preserve the exact reference for later recovery, but only

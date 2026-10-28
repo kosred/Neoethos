@@ -2022,6 +2022,18 @@ closures. This is a new human-requested configuration hypothesis, not an
 OOS-selected modification of the frozen 36-profile control matrix. No such
 financial baseline has run; physical account admission remains unbound.
 
+The live loop now has a holding-limit recipient for the opt-in Risky account
+contract. It retains the canonical bar observed when this engine receives an
+exact owned opening proof, then counts later retained closed bars. A zero limit
+remains disabled; unknown entry evidence or unordered history cannot invent a
+deadline. Startup requires enough retained bars for the declared limit. When
+due, the existing managed-close branch uses the reconciled account, symbol and
+remaining broker volume. A close reply never clears ownership: complete broker
+close-money reconciliation must do that before another entry. Partial/failed
+closes remain supervised. This is session-local bar-count enforcement, not a
+broker wall-clock execution guarantee or restart recovery. Legacy absent-policy
+execution stays unchanged; quote/margin/target admission remains separate.
+
 The challenge arithmetic also needs an explicit win/loss path. In the ideal
 continuous reciprocal model, 42 wins and 18 losses multiply 100 to 54,280.08
 over 60 trades; 36 wins and 24 losses give 2,329.81. Neither count is a measured
