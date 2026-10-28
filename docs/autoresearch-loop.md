@@ -1939,6 +1939,17 @@ Work proceeds in this order:
    Quote replay reuses the same rounding owner, but its account-risk adapter
    refuses the new Risky stopping policy until quote target/ruin semantics are
    implemented; silently dropping that policy would claim false equivalence.
+   The Risky account policy also refuses a closed-bar trailing ratchet when
+   the proposed long stop is at/above the observed close, or the short stop
+   is at/below it. The previous accepted protection remains in place. A
+   synthetic native regression previously credited +11.5384615385 from 100
+   at a stop the next bar never reached; the corrected replay waits for its
+   explicit timeout instead. Long/short, equality, valid ratchets and retained
+   prior stops are checked. Legacy absent-policy replay stays unchanged.
+   This close-price admission is still an OHLC research convention: it does
+   not establish synchronized Bid/Ask, broker minimum distances, amend
+   acceptance or opening-jump fills. Broker execution still needs its own
+   quote/account evidence.
    Reuse the broker's existing `fetch_broker_expected_margin_blocking` request
    owner in `neoethos-app/src/app_services/broker_api.rs` and the typed
    expected-margin response in `ctrader_account.rs`; the live margin-call
@@ -1975,3 +1986,21 @@ boundary. `STOP` now holds automatic execution while accounting is repaired;
 old logs, frozen checkpoints, profiles and executable are preserved. Do not
 restart a money-goal search merely because arithmetic regressions pass: the
 physical-admission step is still outstanding.
+
+On 28 October the human clarified that 100-to-50,000 is the aspiration, not
+the only useful outcome. The practical Risky requirement is to look for daily
+opportunities through complementary strategies, with positions normally
+closing within a few hours and executed targets around 5 to 25 pips. Daily
+coverage belongs to the combined account, not to every specialist separately;
+it is an opportunity/activity measure, not an instruction to force orders.
+Keep reporting net profit, inactive days, monthly outcomes, holding durations,
+execution refusals and capital survival even when the aspiration is missed.
+Do not call smaller gains achievement of the frozen 50,000 target.
+
+The earlier `eurusd-m15-weekly-20261027q-oos-noprop-cons-b9` configuration had
+trailing disabled and a 128-bar limit on M15 (32 hours). It is not a test of a
+few-hour trailing policy. A new prospective intraday comparison must declare
+its settings before IS, retain this old configuration as a control, and avoid
+using the already inspected tail to choose exits or a regime router. Scalar
+gene TP bounds are not executed-target bounds when adaptive multipliers are
+active. Confirm actual entry geometry before calling a profile "5–25 pips".

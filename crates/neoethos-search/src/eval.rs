@@ -1965,7 +1965,13 @@ fn protective_exit_price(
                 let locked = entry_px + settings.trailing_min_lock_pips * pip;
                 let candidate =
                     (hi - (settings.trailing_atr_multiplier * sl_pips * pip)).max(locked);
-                if *trail_px == 0.0 || candidate > *trail_px {
+                // A close-bar amend cannot install a sell stop at/above the
+                // observed market after a retracement. The Risky account
+                // experiment keeps its prior protection on that refusal;
+                // it must not invent a profitable next-bar fill there.
+                if (settings.risky_account_experiment.is_none() || candidate < close)
+                    && (*trail_px == 0.0 || candidate > *trail_px)
+                {
                     *trail_px = candidate;
                 }
             }
@@ -1989,7 +1995,9 @@ fn protective_exit_price(
                 let locked = entry_px - settings.trailing_min_lock_pips * pip;
                 let candidate =
                     (lo + (settings.trailing_atr_multiplier * sl_pips * pip)).min(locked);
-                if *trail_px == 0.0 || candidate < *trail_px {
+                if (settings.risky_account_experiment.is_none() || candidate > close)
+                    && (*trail_px == 0.0 || candidate < *trail_px)
+                {
                     *trail_px = candidate;
                 }
             }

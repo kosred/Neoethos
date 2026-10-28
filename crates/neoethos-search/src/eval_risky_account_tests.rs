@@ -75,6 +75,105 @@ fn near(actual: f64, expected: f64) {
     );
 }
 
+fn trailing_settings() -> BacktestSettings {
+    let mut policy = settings();
+    policy.trailing_enabled = true;
+    policy.trailing_be_trigger_r = 1.0;
+    policy.trailing_atr_multiplier = 1.0;
+    policy.trailing_min_lock_pips = 2.0;
+    policy.tp_pips = 80.0;
+    policy
+}
+
+#[test]
+fn risky_trailing_cannot_arm_beyond_the_observed_close() {
+    for side in [1, -1] {
+        for retracement in [0.125, 0.25] {
+            let mut policy = trailing_settings();
+            policy.max_hold_bars = 2;
+            let sign = side as f64;
+            let close = [100.0, 100.0, 100.0 + sign * retracement, 100.0];
+            let (high, low) = if side == 1 {
+                (
+                    [100.0, 100.0, 100.75, 100.125],
+                    [100.0, 100.0, 99.875, 99.875],
+                )
+            } else {
+                (
+                    [100.0, 100.0, 100.125, 100.125],
+                    [100.0, 100.0, 99.25, 99.875],
+                )
+            };
+            let (metrics, trades) = replay(&close, &high, &low, &[side, 0, 0, 0], &policy);
+            assert_eq!(trades.len(), 1);
+            // At the decision close the desired stop is already crossed (or
+            // equal to market). No executable next-bar amend was established.
+            // The final bar never trades at that desired +2-pip stop either.
+            // Only the explicit two-bar timeout at the entry price settles it;
+            // this replay does not liquidate an open trade merely at EOF.
+            near(trades[0].pnl, 0.0);
+            near(metrics[0], 0.0);
+            assert_ne!(trades[0].exit_reason, Some(TradeExitReason::TrailingStop));
+
+            let mut legacy = policy.clone();
+            legacy.risky_account_experiment = None;
+            let (old, _) = replay(&close, &high, &low, &[side, 0, 0, 0], &legacy);
+            near(old[0], 150.0 / 13.0);
+        }
+    }
+}
+
+#[test]
+fn risky_valid_closed_bar_trail_still_protects_the_next_bar() {
+    for side in [1, -1] {
+        let policy = trailing_settings();
+        let sign = side as f64;
+        let close = [100.0, 100.0, 100.0 + sign * 0.375, 100.0];
+        let (high, low) = if side == 1 {
+            (
+                [100.0, 100.0, 100.75, 100.375],
+                [100.0, 100.0, 99.875, 99.875],
+            )
+        } else {
+            (
+                [100.0, 100.0, 100.125, 100.125],
+                [100.0, 100.0, 99.25, 99.625],
+            )
+        };
+        let (metrics, trades) = replay(&close, &high, &low, &[side, 0, 0, 0], &policy);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].exit_reason, Some(TradeExitReason::TrailingStop));
+        // +2 pips with 100*(3/13)/4 lots, independently of the ratchet formula.
+        near(trades[0].pnl, 150.0 / 13.0);
+        near(metrics[0], 150.0 / 13.0);
+    }
+}
+
+#[test]
+fn risky_refused_ratchet_keeps_its_previous_accepted_stop() {
+    for side in [1, -1] {
+        let sign = side as f64;
+        let close = [0.0, 0.0, 0.375, 0.5, 0.25].map(|x| 100.0 + sign * x);
+        let upper = [0.0, 0.0, 0.75, 1.0, 0.375];
+        let lower = [0.0, 0.0, -0.125, 0.375, 0.125];
+        let (high, low) = if side == 1 {
+            (upper.map(|x| 100.0 + x), lower.map(|x| 100.0 + x))
+        } else {
+            (lower.map(|x| 100.0 - x), upper.map(|x| 100.0 - x))
+        };
+        let (metrics, trades) = replay(
+            &close,
+            &high,
+            &low,
+            &[side, 0, 0, 0, 0],
+            &trailing_settings(),
+        );
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].exit_reason, Some(TradeExitReason::TrailingStop));
+        near(metrics[0], 150.0 / 13.0);
+    }
+}
+
 #[test]
 fn risky_stop_excludes_after_exit_extremes_for_long_and_short() {
     for side in [1, -1] {
