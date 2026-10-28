@@ -1852,6 +1852,11 @@ impl Default for QualityRuntimeConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct StopTargetRuntimeConfig {
+    /// Fresh gene generation uses adaptive stops unless explicitly disabled.
+    /// `None` preserves the legacy enabled policy and its serialized wire.
+    /// Existing archived genes keep their recorded per-gene stop semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_stops_enabled: Option<bool>,
     /// Hard cap on how many bars the rolling expected-shortfall series will
     /// process. `0` (the default) means NO cap — every series gets the tail
     /// term, so scoring, walk-forward and live compute the same base stop.
@@ -1879,6 +1884,7 @@ pub struct StopTargetRuntimeConfig {
 impl Default for StopTargetRuntimeConfig {
     fn default() -> Self {
         Self {
+            adaptive_stops_enabled: None,
             tail_max_bars: 0,
             tail_step: 1,
         }

@@ -2004,3 +2004,30 @@ its settings before IS, retain this old configuration as a control, and avoid
 using the already inspected tail to choose exits or a regime router. Scalar
 gene TP bounds are not executed-target bounds when adaptive multipliers are
 active. Confirm actual entry geometry before calling a profile "5–25 pips".
+
+The previously missing switch is now an optional typed setting:
+`models.stop_target_runtime.adaptive_stops_enabled: false`. It disables
+adaptive multipliers for **fresh** gene generation; fixed-stop mutation then
+retains the configured absolute pip bounds. Omitted settings preserve the old
+enabled behavior and serialized Settings/runtime wire. Explicit false is bound
+to the startup runtime receipt and the archived resolved adaptive policy.
+Changing this switch never reinterprets a stored gene with a positive
+`stop_vol_mult`; archived candidates retain their own geometry.
+
+A prospective intraday comparison can therefore hold M15, a 16-bar time stop
+(four trading hours), fixed target bounds 5–25 pips and all entries/costs constant,
+then compare the declared trailing policy against trailing disabled. Actual
+wall-clock duration must still be reported across missing bars or market
+closures. This is a new human-requested configuration hypothesis, not an
+OOS-selected modification of the frozen 36-profile control matrix. No such
+financial baseline has run; physical account admission remains unbound.
+
+The challenge arithmetic also needs an explicit win/loss path. In the ideal
+continuous reciprocal model, 42 wins and 18 losses multiply 100 to 54,280.08
+over 60 trades; 36 wins and 24 losses give 2,329.81. Neither count is a measured
+win probability or a success forecast. The author's rounded table is separate.
+With the stored reference cost envelope, its static EUR conversion implies
+about 1.946412 pips of spread/slippage/commission before swaps. At a 5-pip
+gross target that cost is a much larger fraction of the move than at 25 pips;
+lot, margin and execution effects must be recomputed, rather than carrying
+the gross +30%/-23% ladder unchanged into a net profitability claim.
