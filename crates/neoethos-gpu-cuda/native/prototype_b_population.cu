@@ -1379,7 +1379,6 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
   double position_trail = 0.0;
   double position_fav = 0.0;
   double position_adv = 0.0;
-  int position_min_hold_bar = 0;
   int position_max_hold_bar = -1;
 
   const double pip = guarded_pip(settings.pip_value);
@@ -1500,14 +1499,27 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       } else {
         const double low = dataset.low[parent_bar];
         const double high = dataset.high[parent_bar];
+        const bool is_long_pos = position_event.direction == kDirectionLong;
+        double active_stop = position_event.stop_price;
+        if (settings.trailing_enabled != 0u && position_trail > 0.0 &&
+            ((is_long_pos && position_trail > active_stop) ||
+             (!is_long_pos && position_trail < active_stop))) {
+          active_stop = position_trail;
+        }
+        const double bracket_lower = is_long_pos ? active_stop : position_event.target_price;
+        const double bracket_upper = is_long_pos ? position_event.target_price : active_stop;
+        // Match the CPU's conservative OHLC convention without charging price
+        // movement beyond an already active protective exit to this position.
+        const double exposure_low = fmin(fmax(low, bracket_lower), bracket_upper);
+        const double exposure_high = fmin(fmax(high, bracket_lower), bracket_upper);
         double worst = 0.0;
         double best = 0.0;
-        if (position_event.direction == kDirectionLong) {
-          worst = (low - position_entry_price) / pip * settings.pip_value_per_lot;
-          best = (high - position_entry_price) / pip * settings.pip_value_per_lot;
+        if (is_long_pos) {
+          worst = (exposure_low - position_entry_price) / pip * settings.pip_value_per_lot;
+          best = (exposure_high - position_entry_price) / pip * settings.pip_value_per_lot;
         } else {
-          worst = (position_entry_price - high) / pip * settings.pip_value_per_lot;
-          best = (position_entry_price - low) / pip * settings.pip_value_per_lot;
+          worst = (position_entry_price - exposure_high) / pip * settings.pip_value_per_lot;
+          best = (position_entry_price - exposure_low) / pip * settings.pip_value_per_lot;
         }
         worst *= position_lots;
         best *= position_lots;
@@ -1538,36 +1550,29 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
         // bar's extreme move it. Letting a bar's own high move the stop its own
         // low is checked against is reward-hackable — the GA found it once and
         // produced never-lose genes.
-        const bool is_long_pos = position_event.direction == kDirectionLong;
-        double active_stop = position_event.stop_price;
-        if (position_trail > 0.0 && ((is_long_pos && position_trail > active_stop) ||
-                                     (!is_long_pos && position_trail < active_stop))) {
-          active_stop = position_trail;
-        }
         int exit_reason_now = kExitNone;
         double exit_price_now = 0.0;
-        if (bar >= position_min_hold_bar) {
-          if (is_long_pos ? (low <= active_stop) : (high >= active_stop)) {
-            exit_reason_now = kExitStop;
-            exit_price_now = active_stop;
-          } else if (is_long_pos ? (high >= position_event.target_price)
-                                 : (low <= position_event.target_price)) {
-            exit_reason_now = kExitTarget;
-            exit_price_now = position_event.target_price;
-          }
+        // Minimum hold is a preference, never permission to ignore protection.
+        if (is_long_pos ? (low <= active_stop) : (high >= active_stop)) {
+          exit_reason_now = kExitStop;
+          exit_price_now = active_stop;
+        } else if (is_long_pos ? (high >= position_event.target_price)
+                               : (low <= position_event.target_price)) {
+          exit_reason_now = kExitTarget;
+          exit_price_now = position_event.target_price;
         }
         if (exit_reason_now == kExitNone && position_max_hold_bar >= 0 &&
             bar >= position_max_hold_bar) {
           exit_reason_now = kExitMaxHold;
           exit_price_now = dataset.close[parent_bar];
         }
-        // Excursion accumulates on every open bar including this one, matching
-        // the CPU, which updates before testing for an exit.
+        // Excursion uses the same pre-existing bracket as drawdown. A newly
+        // ratcheted trail must not retroactively bound this bar.
         {
-          const double moved = is_long_pos ? (high - position_entry_price)
-                                           : (position_entry_price - low);
-          const double against = is_long_pos ? (position_entry_price - low)
-                                             : (high - position_entry_price);
+          const double moved = is_long_pos ? (exposure_high - position_entry_price)
+                                           : (position_entry_price - exposure_low);
+          const double against = is_long_pos ? (position_entry_price - exposure_low)
+                                             : (exposure_high - position_entry_price);
           if (moved > position_fav) {
             position_fav = moved;
           }
@@ -1585,8 +1590,10 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
             const double candidate =
                 is_long_pos ? fmax(high - give_back, position_entry_price + lock)
                             : fmin(low + give_back, position_entry_price - lock);
-            if (position_trail == 0.0 ||
-                (is_long_pos ? candidate > position_trail : candidate < position_trail)) {
+            if ((is_long_pos ? (candidate <= high && candidate <= dataset.close[parent_bar])
+                             : (candidate >= low && candidate >= dataset.close[parent_bar])) &&
+                (position_trail == 0.0 ||
+                 (is_long_pos ? candidate > position_trail : candidate < position_trail))) {
               position_trail = candidate;
             }
           }
@@ -1740,13 +1747,9 @@ __global__ void population_reduce_kernel(DeviceDataset dataset,
       position_fav = 0.0;
       position_adv = 0.0;
       {
-        const unsigned int min_hold = settings.min_hold_bars > 0u ? settings.min_hold_bars : 1u;
-        position_min_hold_bar = static_cast<int>(event.entry_bar) + static_cast<int>(min_hold);
         if (settings.max_hold_bars > 0u) {
-          const unsigned int hold = settings.max_hold_bars > settings.min_hold_bars
-                                        ? settings.max_hold_bars
-                                        : settings.min_hold_bars;
-          position_max_hold_bar = static_cast<int>(event.entry_bar) + static_cast<int>(hold);
+          position_max_hold_bar =
+              static_cast<int>(event.entry_bar) + static_cast<int>(settings.max_hold_bars);
         } else {
           position_max_hold_bar = -1;
         }

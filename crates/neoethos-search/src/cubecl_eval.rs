@@ -855,7 +855,7 @@ macro_rules! define_backtest_population_kernel {
             month_capacity: u32,
             initial_equity: $f,
             max_hold_bars: u32,
-            min_hold_bars: u32,
+            _min_hold_bars: u32,
             max_trades_per_day: u32,
             gap_threshold_ms: i32,
             use_timestamps: i32,
@@ -917,7 +917,6 @@ macro_rules! define_backtest_population_kernel {
                 let n_samples = n_samples as usize;
                 let month_capacity = month_capacity as usize;
                 let max_hold_bars = max_hold_bars as usize;
-                let min_hold_bars = min_hold_bars as usize;
                 let max_trades_per_day = max_trades_per_day as usize;
                 let signal_base = local_gene * n_samples;
                 let month_base = gene * month_capacity;
@@ -1194,23 +1193,61 @@ macro_rules! define_backtest_population_kernel {
                         let hi = high_pips[i];
                         let entry_px_v = entry_px.read();
 
+                        // Freeze the bracket from PRIOR bars before either
+                        // exposure accounting or this bar's trail ratchet.
+                        let sl_cell = RuntimeCell::<$f>::new(entry_px_v + sl_distance.read());
+                        let tp_cell = RuntimeCell::<$f>::new(entry_px_v - tp_distance.read());
+                        if in_pos_v2 == 1 {
+                            sl_cell.store(entry_px_v - sl_distance.read());
+                            tp_cell.store(entry_px_v + tp_distance.read());
+                        }
+                        if trailing_enabled != 0 && trail_px.read() > 0.0 {
+                            if in_pos_v2 == 1 {
+                                if trail_px.read() > sl_cell.read() {
+                                    sl_cell.store(trail_px.read());
+                                }
+                            } else if trail_px.read() < sl_cell.read() {
+                                sl_cell.store(trail_px.read());
+                            }
+                        }
+                        let lower = RuntimeCell::<$f>::new(tp_cell.read());
+                        let upper = RuntimeCell::<$f>::new(sl_cell.read());
+                        if in_pos_v2 == 1 {
+                            lower.store(sl_cell.read());
+                            upper.store(tp_cell.read());
+                        }
+                        let exposure_lo = RuntimeCell::<$f>::new(lo);
+                        let exposure_hi = RuntimeCell::<$f>::new(hi);
+                        if lo < lower.read() {
+                            exposure_lo.store(lower.read());
+                        } else if lo > upper.read() {
+                            exposure_lo.store(upper.read());
+                        }
+                        if hi < lower.read() {
+                            exposure_hi.store(lower.read());
+                        } else if hi > upper.read() {
+                            exposure_hi.store(upper.read());
+                        }
+
                         // Phase 2: float PnL scaled by pos_lots (eval.rs:865-880) so the
                         // equity-based DD tracks the sized position.
-                        // Device-parity-proven statement form: long worst-case
-                        // intrabar = low-entry, short = entry-high.
-                        let worst_base =
-                            RuntimeCell::<$f>::new((entry_px_v - hi) * pip_value_per_lot);
+                        // RuntimeCell statement form with the CPU's bounded
+                        // prices. Updated device parity is a separate check.
+                        let worst_base = RuntimeCell::<$f>::new(
+                            (entry_px_v - exposure_hi.read()) * pip_value_per_lot,
+                        );
                         if in_pos_v2 == 1 {
-                            worst_base.store((lo - entry_px_v) * pip_value_per_lot);
+                            worst_base.store((exposure_lo.read() - entry_px_v) * pip_value_per_lot);
                         }
                         let worst_float_pnl = worst_base.read() * pos_lots.read();
                         let eq = equity.read();
 
                         // #1375 workaround: long best-case intrabar = high-entry, short = entry-low.
-                        let best_base =
-                            RuntimeCell::<$f>::new((entry_px_v - lo) * pip_value_per_lot);
+                        let best_base = RuntimeCell::<$f>::new(
+                            (entry_px_v - exposure_lo.read()) * pip_value_per_lot,
+                        );
                         if in_pos_v2 == 1 {
-                            best_base.store((hi - entry_px_v) * pip_value_per_lot);
+                            best_base.store((exposure_hi.read() - entry_px_v) * pip_value_per_lot);
                         }
                         let best_float_pnl = best_base.read() * pos_lots.read();
                         if (eq + best_float_pnl) > peak_equity.read() {
@@ -1245,20 +1282,8 @@ macro_rules! define_backtest_population_kernel {
                         let pnl_cell = RuntimeCell::<$f>::new(0.0);
                         let exit_cell = RuntimeCell::<u32>::new(0);
                         let bars_held = i as i32 - entry_idx.read();
-                        let past_min_hold = min_hold_bars == 0 || bars_held >= min_hold_bars as i32;
-
-                        if past_min_hold && in_pos_v2 == 1 {
-                            let sl_cell = RuntimeCell::<$f>::new(entry_px_v - sl_distance.read());
-                            let tp = entry_px_v + tp_distance.read();
-                            // Apply only the trail from PRIOR bars (no intra-bar look-ahead — must
-                            // match the CPU eval: this bar's high can't move the stop its own low is
-                            // checked against). `trail_px == 0.0` is the unset sentinel.
-                            if trailing_enabled != 0
-                                && trail_px.read() > 0.0
-                                && trail_px.read() > sl_cell.read()
-                            {
-                                sl_cell.store(trail_px.read());
-                            }
+                        if in_pos_v2 == 1 {
+                            let tp = tp_cell.read();
                             let sl_v = sl_cell.read();
                             if lo <= sl_v {
                                 pnl_cell.store((sl_v - entry_px_v) * pip_value_per_lot);
@@ -1286,20 +1311,16 @@ macro_rules! define_backtest_population_kernel {
                                         candidate.store(raw);
                                     }
                                     let candidate_v = candidate.read();
-                                    if trail_px.read() == 0.0 || candidate_v > trail_px.read() {
+                                    if candidate_v <= hi
+                                        && candidate_v <= close_pips[i]
+                                        && (trail_px.read() == 0.0 || candidate_v > trail_px.read())
+                                    {
                                         trail_px.store(candidate_v);
                                     }
                                 }
                             }
-                        } else if past_min_hold {
-                            let sl_cell = RuntimeCell::<$f>::new(entry_px_v + sl_distance.read());
-                            let tp = entry_px_v - tp_distance.read();
-                            if trailing_enabled != 0
-                                && trail_px.read() > 0.0
-                                && trail_px.read() < sl_cell.read()
-                            {
-                                sl_cell.store(trail_px.read());
-                            }
+                        } else {
+                            let tp = tp_cell.read();
                             let sl_v = sl_cell.read();
                             if hi >= sl_v {
                                 pnl_cell.store((entry_px_v - sl_v) * pip_value_per_lot);
@@ -1321,7 +1342,10 @@ macro_rules! define_backtest_population_kernel {
                                         candidate.store(raw);
                                     }
                                     let candidate_v = candidate.read();
-                                    if trail_px.read() == 0.0 || candidate_v < trail_px.read() {
+                                    if candidate_v >= lo
+                                        && candidate_v >= close_pips[i]
+                                        && (trail_px.read() == 0.0 || candidate_v < trail_px.read())
+                                    {
                                         trail_px.store(candidate_v);
                                     }
                                 }
@@ -1329,7 +1353,6 @@ macro_rules! define_backtest_population_kernel {
                         }
 
                         if exit_cell.read() == 0
-                            && past_min_hold
                             && max_hold_bars > 0
                             && bars_held >= max_hold_bars as i32
                         {

@@ -74,6 +74,177 @@ fn assert_ledger(
 }
 
 #[test]
+fn protective_brackets_bound_the_reported_exposure() {
+    let times = [
+        timestamp(1, 12, 0),
+        timestamp(1, 12, 5),
+        timestamp(1, 12, 10),
+    ];
+    let days = [0; 3];
+    let settings = BacktestSettings {
+        initial_equity_override: Some(100.0),
+        ..settings()
+    };
+    for side in [1_i8, -1] {
+        for target in [false, true] {
+            let extreme_side = if target { side } else { -side };
+            let high = [100.0, 100.0, if extreme_side == 1 { 150.0 } else { 100.0 }];
+            let low = [100.0, 100.0, if extreme_side == -1 { 50.0 } else { 100.0 }];
+            let signals = [side, 0, 0];
+            let metrics = fast_evaluate_strategy_core(
+                &[100.0; 3],
+                &high,
+                &low,
+                &signals,
+                &[],
+                &days,
+                &days,
+                &times,
+                &settings,
+            );
+            let trades = assert_ledger(
+                &[100.0; 3],
+                &high,
+                &low,
+                &times,
+                &signals,
+                &settings,
+                &[if target { 10.0 } else { -2.0 }],
+            );
+            // Retain the conservative best-before-worst bar convention, but
+            // neither excursion can extend past a pre-existing exit barrier.
+            let expected_dd = if target { 10.0 / 110.0 } else { 2.0 / 100.0 };
+            for slot in [3, 10] {
+                assert!(
+                    (metrics[slot] - expected_dd).abs() < 1e-12,
+                    "side={side}, target={target}, slot={slot}, actual={}",
+                    metrics[slot]
+                );
+            }
+            assert_eq!(trades[0].mfe, if target { 10.0 } else { 0.0 });
+            assert_eq!(trades[0].mae, if target { 0.0 } else { 2.0 });
+        }
+    }
+}
+
+#[test]
+fn a_prior_trail_bounds_risk_when_the_following_bar_reverses() {
+    let times = (0..4)
+        .map(|i| timestamp(1, 12, 0) + i * 300_000)
+        .collect::<Vec<_>>();
+    let settings = BacktestSettings {
+        initial_equity_override: Some(100.0),
+        tp_pips: 50.0,
+        trailing_enabled: true,
+        trailing_min_lock_pips: 1.0,
+        ..settings()
+    };
+    for side in [1_i8, -1] {
+        let (close, high, low) = if side == 1 {
+            (
+                [100.0, 100.0, 103.0, 100.0],
+                [100.0, 100.0, 104.0, 103.0],
+                [100.0, 100.0, 100.0, 50.0],
+            )
+        } else {
+            (
+                [100.0, 100.0, 97.0, 100.0],
+                [100.0, 100.0, 100.0, 150.0],
+                [100.0, 100.0, 96.0, 97.0],
+            )
+        };
+        let signals = [side, 0, 0, 0];
+        let metrics = fast_evaluate_strategy_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &[],
+            &[0; 4],
+            &[0; 4],
+            &times,
+            &settings,
+        );
+        let trades = assert_ledger(&close, &high, &low, &times, &signals, &settings, &[2.0]);
+        for slot in [3, 10] {
+            assert!(
+                (metrics[slot] - 4.0 / 104.0).abs() < 1e-12,
+                "the prior +2 stop protects this bar; side={side}, slot={slot}, actual={}",
+                metrics[slot]
+            );
+        }
+        assert_eq!(trades[0].mfe, 4.0);
+        assert_eq!(trades[0].mae, 0.0);
+    }
+}
+
+#[test]
+fn an_unreached_profit_lock_cannot_manufacture_a_winning_trade() {
+    let times = (0..4)
+        .map(|i| timestamp(1, 12, 0) + i * 300_000)
+        .collect::<Vec<_>>();
+    let settings = BacktestSettings {
+        sl_pips: 1.0,
+        trailing_enabled: true,
+        trailing_be_trigger_r: 0.5,
+        trailing_min_lock_pips: 2.0,
+        ..settings()
+    };
+    for side in [1_i8, -1] {
+        let high = if side == 1 {
+            [100.0, 100.0, 101.0, 101.0]
+        } else {
+            [100.0, 100.0, 100.0, 101.0]
+        };
+        let low = if side == 1 {
+            [100.0, 100.0, 100.0, 99.0]
+        } else {
+            [100.0, 100.0, 99.0, 99.0]
+        };
+        let trades = assert_ledger(
+            &[100.0; 4],
+            &high,
+            &low,
+            &times,
+            &[side, 0, 0, 0],
+            &settings,
+            &[-1.0],
+        );
+        assert_eq!(trades[0].exit_time, Some(times[3]));
+    }
+}
+
+#[test]
+fn a_closed_bar_cannot_install_a_trail_beyond_its_current_price() {
+    let times = (0..4)
+        .map(|i| timestamp(1, 12, 0) + i * 300_000)
+        .collect::<Vec<_>>();
+    let settings = BacktestSettings {
+        trailing_enabled: true,
+        trailing_min_lock_pips: 1.0,
+        ..settings()
+    };
+    for side in [1_i8, -1] {
+        // The favorable extreme happened before the close. At the decision
+        // close (100), the proposed +2 lock can no longer be installed.
+        let (high, low) = if side == 1 {
+            ([100.0, 100.0, 104.0, 100.0], [100.0, 100.0, 100.0, 98.0])
+        } else {
+            ([100.0, 100.0, 100.0, 102.0], [100.0, 100.0, 96.0, 100.0])
+        };
+        assert_ledger(
+            &[100.0; 4],
+            &high,
+            &low,
+            &times,
+            &[side, 0, 0, 0],
+            &settings,
+            &[-2.0],
+        );
+    }
+}
+
+#[test]
 fn friday_close_is_priced_by_fitness_and_the_trade_ledger() {
     let times = [
         timestamp(4, 19, 50),

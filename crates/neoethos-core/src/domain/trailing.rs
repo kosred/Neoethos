@@ -67,7 +67,15 @@ impl TrailingPolicy {
             }
             _ => return None,
         };
-        if !candidate.is_finite() {
+        // The minimum lock can exceed the R trigger on a narrow stop. Never
+        // install a long stop above the observed high (or a short stop below
+        // the low): the locked profit has not been reached yet.
+        let reached = if direction == 1 {
+            candidate <= high
+        } else {
+            candidate >= low
+        };
+        if !candidate.is_finite() || !reached {
             return None;
         }
         let better = match (current, direction) {
@@ -83,6 +91,26 @@ impl TrailingPolicy {
 #[cfg(test)]
 mod tests {
     use super::TrailingPolicy;
+
+    #[test]
+    fn a_profit_lock_must_be_reached_before_it_can_arm() {
+        // Binary-exact prices: 1R is 0.125, but the lock requires 0.25.
+        let policy = TrailingPolicy::new(1.0, 1.0, 2.0, 0.125).unwrap();
+        for direction in [1_i8, -1] {
+            let entry = 1.25;
+            let original_stop = entry - f64::from(direction) * 0.125;
+            assert_eq!(
+                policy.next_stop_price(entry, original_stop, direction, 1.375, 1.125, None),
+                None,
+                "the R trigger alone cannot authorize an unreached lock ({direction})"
+            );
+            assert_eq!(
+                policy.next_stop_price(entry, original_stop, direction, 1.5, 1.0, None),
+                Some(entry + f64::from(direction) * 0.25),
+                "the lock arms when the actual excursion reaches it ({direction})"
+            );
+        }
+    }
 
     #[test]
     fn binary_exact_long_short_lock_and_ratchet_geometry() {

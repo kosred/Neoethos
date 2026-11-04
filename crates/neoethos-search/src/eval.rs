@@ -903,6 +903,33 @@ fn risk_based_pos_lots(
     }
 }
 
+/// Bracket protecting the current bar, using only the trail from prior bars.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn protective_exit_barriers(
+    side: i8,
+    entry_px: f64,
+    sl_pips: f64,
+    tp_pips: f64,
+    trail_px: f64,
+    pip: f64,
+    settings: &BacktestSettings,
+) -> (f64, f64) {
+    let (mut stop, target) = if side == 1 {
+        (entry_px - sl_pips * pip, entry_px + tp_pips * pip)
+    } else {
+        (entry_px + sl_pips * pip, entry_px - tp_pips * pip)
+    };
+    if settings.trailing_enabled && trail_px > 0.0 {
+        stop = if side == 1 {
+            stop.max(trail_px)
+        } else {
+            stop.min(trail_px)
+        };
+    }
+    (stop, target)
+}
+
 /// One protective-exit policy for CPU fitness and the detailed trade ledger.
 /// Existing protection is checked before this bar can ratchet the trail, and
 /// SL wins an ambiguous OHLC bar that crosses both SL and TP. A minimum hold
@@ -922,14 +949,9 @@ fn protective_exit_price(
     pip: f64,
     settings: &BacktestSettings,
 ) -> Option<f64> {
+    let (sl, tp) =
+        protective_exit_barriers(side, entry_px, sl_pips, tp_pips, *trail_px, pip, settings);
     if side == 1 {
-        let mut sl = entry_px - (sl_pips * pip);
-        let tp = entry_px + (tp_pips * pip);
-        // Only PRIOR bars may have moved the stop protecting this bar.
-        // Zero is the existing unset sentinel for both position directions.
-        if settings.trailing_enabled && *trail_px > 0.0 && *trail_px > sl {
-            sl = *trail_px;
-        }
         if lo <= sl {
             return Some(sl);
         }
@@ -942,17 +964,15 @@ fn protective_exit_price(
                 let locked = entry_px + settings.trailing_min_lock_pips * pip;
                 let candidate =
                     (hi - (settings.trailing_atr_multiplier * sl_pips * pip)).max(locked);
-                if *trail_px == 0.0 || candidate > *trail_px {
+                if candidate <= hi
+                    && candidate <= close
+                    && (*trail_px == 0.0 || candidate > *trail_px)
+                {
                     *trail_px = candidate;
                 }
             }
         }
     } else {
-        let mut sl = entry_px + (sl_pips * pip);
-        let tp = entry_px - (tp_pips * pip);
-        if settings.trailing_enabled && *trail_px > 0.0 && *trail_px < sl {
-            sl = *trail_px;
-        }
         if hi >= sl {
             return Some(sl);
         }
@@ -965,7 +985,10 @@ fn protective_exit_price(
                 let locked = entry_px - settings.trailing_min_lock_pips * pip;
                 let candidate =
                     (lo + (settings.trailing_atr_multiplier * sl_pips * pip)).min(locked);
-                if *trail_px == 0.0 || candidate < *trail_px {
+                if candidate >= lo
+                    && candidate >= close
+                    && (*trail_px == 0.0 || candidate < *trail_px)
+                {
                     *trail_px = candidate;
                 }
             }
@@ -1165,158 +1188,110 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
             day_trade_count = 0;
         }
 
-        if RECORD_TRADES && in_pos != 0 {
-            // Retain the existing bar-resolution excursion convention. This is
-            // not tick-resolved evidence about the ordering of intrabar prices.
-            let (favorable, adverse) = if in_pos == 1 {
-                (high[i] - entry_px, entry_px - low[i])
+        let gap_exit = in_pos != 0
+            && use_timestamps
+            && settings.gap_threshold_ms > 0
+            && timestamps[i] > timestamps[i - 1]
+            && timestamps[i] - timestamps[i - 1] >= settings.gap_threshold_ms;
+        let (exposure_low, exposure_high) = if in_pos != 0 && !gap_exit {
+            let (stop, target) = protective_exit_barriers(
+                in_pos,
+                entry_px,
+                pos_sl_pips,
+                pos_tp_pips,
+                trail_px,
+                pip,
+                settings,
+            );
+            let (lower, upper) = if in_pos == 1 {
+                (stop, target)
             } else {
-                (entry_px - low[i], high[i] - entry_px)
+                (target, stop)
+            };
+            // Conservative OHLC exposure, bounded by the bracket that already
+            // protected this bar. Raw extrema still decide the actual exit.
+            // Gaps retain their separate close-proxy fill policy below.
+            (low[i].max(lower).min(upper), high[i].max(lower).min(upper))
+        } else {
+            (low[i], high[i])
+        };
+
+        if RECORD_TRADES && in_pos != 0 {
+            let (favorable, adverse) = if in_pos == 1 {
+                (exposure_high - entry_px, entry_px - exposure_low)
+            } else {
+                (entry_px - exposure_low, exposure_high - entry_px)
             };
             mfe_money = mfe_money.max(favorable / pip * settings.pip_value_per_lot * pos_lots);
             mae_money = mae_money.max(adverse / pip * settings.pip_value_per_lot * pos_lots);
         }
 
-        // Gap detection: force-exit open position when market gap exceeds threshold
-        if in_pos != 0 && use_timestamps && settings.gap_threshold_ms > 0 {
-            let ts_prev = timestamps[i - 1];
-            let ts_curr = timestamps[i];
-            if ts_curr > ts_prev && (ts_curr - ts_prev) >= settings.gap_threshold_ms {
-                // Force exit at current close (proxy for gap open price).
-                // Risk-based sizing: scale the price-derived PnL and the
-                // commission+spread cost by the entry-captured `pos_lots`.
-                let pnl = if in_pos == 1 {
-                    (close[i] - entry_px) / pip * settings.pip_value_per_lot
-                } else {
-                    (entry_px - close[i]) / pip * settings.pip_value_per_lot
-                };
-                let price_gross = pnl * pos_lots - half_spread_cost * pos_lots;
-                let pnl =
-                    pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
-                // Preserve old cost/swap arithmetic when fee is zero, but carry
-                // the commission-free price gross separately for a nonzero fee.
-                let entry_ts_ms = if use_timestamps && entry_idx >= 0 {
-                    timestamps.get(entry_idx as usize).copied().unwrap_or(0)
-                } else {
-                    0
-                };
-                let exit_ts_ms = if use_timestamps {
-                    timestamps.get(i).copied().unwrap_or(0)
-                } else {
-                    0
-                };
-                let pnl = apply_carry_and_fee_scaled(
-                    pnl,
-                    price_gross,
-                    pos_lots,
-                    in_pos,
-                    entry_ts_ms,
-                    exit_ts_ms,
-                    settings,
-                );
-                if RECORD_TRADES {
-                    record_closed_cpu_trade(
-                        trades,
-                        entry_ts_ms,
-                        exit_ts_ms,
-                        pnl,
-                        initial_equity,
-                        pos_sl_pips * settings.pip_value_per_lot * pos_lots,
-                        mfe_money,
-                        mae_money,
-                    );
+        if in_pos != 0 {
+            let lo = low[i];
+            let hi = high[i];
+            if !gap_exit {
+                // Float (unrealized) PnL drives intrabar DD/peak. Scale by the
+                // entry-captured `pos_lots` so the drawdown the GA sees matches
+                // the realized-PnL sizing (a 3%-risk trade floats 3× the DD of
+                // a 1%-risk trade at the same price excursion).
+                let worst_float_pnl = pos_lots
+                    * if in_pos == 1 {
+                        (exposure_low - entry_px) / pip * settings.pip_value_per_lot
+                    } else {
+                        (entry_px - exposure_high) / pip * settings.pip_value_per_lot
+                    };
+                let best_float_pnl = pos_lots
+                    * if in_pos == 1 {
+                        (exposure_high - entry_px) / pip * settings.pip_value_per_lot
+                    } else {
+                        (entry_px - exposure_low) / pip * settings.pip_value_per_lot
+                    };
+                if (equity + best_float_pnl) > peak_equity {
+                    peak_equity = equity + best_float_pnl;
                 }
-                equity += pnl;
-                current_month_pnl += pnl;
-                trade_count += 1;
-                if pnl > 0.0 {
-                    wins += 1;
-                    gross_profit += pnl;
-                } else {
-                    gross_loss += pnl.abs();
-                }
-                in_pos = 0;
-                if equity > peak_equity {
-                    peak_equity = equity;
-                }
-                if equity > day_peak {
+                if (equity + best_float_pnl) > day_peak {
                     finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
-                    day_peak = equity;
-                    day_low = equity;
-                } else if equity < day_low {
-                    day_low = equity;
+                    day_peak = equity + best_float_pnl;
+                    // A new same-day peak starts a new causal drawdown segment.
+                    // Preserve this bar's worst excursion (the canonical
+                    // best-before-worst intrabar convention) but discard troughs
+                    // that occurred before the new peak.
+                    day_low = equity + worst_float_pnl;
+                } else if (equity + worst_float_pnl) < day_low {
+                    day_low = equity + worst_float_pnl;
                 }
+
                 let current_dd = if peak_equity > 0.0 {
-                    (peak_equity - equity) / peak_equity
+                    (peak_equity - (equity + worst_float_pnl)) / peak_equity
                 } else {
                     0.0
                 };
                 if current_dd > max_dd {
                     max_dd = current_dd;
                 }
-                // This close consumed the bar. The pre-gap signal must not
-                // reopen a position at the same close after forced liquidation.
-                continue;
-            }
-        }
-
-        if in_pos != 0 {
-            let lo = low[i];
-            let hi = high[i];
-            // Float (unrealized) PnL drives intrabar DD/peak. Scale by the
-            // entry-captured `pos_lots` so the drawdown the GA sees matches
-            // the realized-PnL sizing (a 3%-risk trade floats 3× the DD of
-            // a 1%-risk trade at the same price excursion).
-            let worst_float_pnl = pos_lots
-                * if in_pos == 1 {
-                    (lo - entry_px) / pip * settings.pip_value_per_lot
-                } else {
-                    (entry_px - hi) / pip * settings.pip_value_per_lot
-                };
-            let best_float_pnl = pos_lots
-                * if in_pos == 1 {
-                    (hi - entry_px) / pip * settings.pip_value_per_lot
-                } else {
-                    (entry_px - lo) / pip * settings.pip_value_per_lot
-                };
-            if (equity + best_float_pnl) > peak_equity {
-                peak_equity = equity + best_float_pnl;
-            }
-            if (equity + best_float_pnl) > day_peak {
-                finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
-                day_peak = equity + best_float_pnl;
-                // A new same-day peak starts a new causal drawdown segment.
-                // Preserve this bar's worst excursion (the canonical
-                // best-before-worst intrabar convention) but discard troughs
-                // that occurred before the new peak.
-                day_low = equity + worst_float_pnl;
-            } else if (equity + worst_float_pnl) < day_low {
-                day_low = equity + worst_float_pnl;
             }
 
-            let current_dd = if peak_equity > 0.0 {
-                (peak_equity - (equity + worst_float_pnl)) / peak_equity
+            // Gap, protective and session exits share one realized-PnL owner.
+            // Taking this branch consumes the bar, so a gap cannot also reopen.
+            let exit_px = if gap_exit {
+                Some(close[i])
             } else {
-                0.0
+                protective_exit_price(
+                    in_pos,
+                    entry_px,
+                    pos_sl_pips,
+                    pos_tp_pips,
+                    &mut trail_px,
+                    hi,
+                    lo,
+                    close[i],
+                    i - entry_idx as usize,
+                    pip,
+                    settings,
+                )
+                .or_else(|| session_close.then_some(close[i]))
             };
-            if current_dd > max_dd {
-                max_dd = current_dd;
-            }
 
-            let exit_px = protective_exit_price(
-                in_pos,
-                entry_px,
-                pos_sl_pips,
-                pos_tp_pips,
-                &mut trail_px,
-                hi,
-                lo,
-                close[i],
-                i - entry_idx as usize,
-                pip,
-                settings,
-            )
-            .or_else(|| session_close.then_some(close[i]));
             if let Some(exit_px) = exit_px {
                 let pnl = if in_pos == 1 {
                     (exit_px - entry_px) / pip * settings.pip_value_per_lot
