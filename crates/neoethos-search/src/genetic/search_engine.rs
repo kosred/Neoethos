@@ -3368,6 +3368,16 @@ impl EvaluatedGeneBehaviorKey {
     }
 }
 
+/// Compare measured objective fitness across generations, before novelty's
+/// generation-local normalization. Selection scores still rank parents and
+/// survivors, but a constant normalized maximum cannot prove convergence.
+fn generation_objective_score(scored: &[(f64, usize, Gene, [f64; 11])]) -> f64 {
+    scored
+        .iter()
+        .map(|(_, _, gene, _)| gene.fitness)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
 /// Keep the admitted archive AND the complete last evaluated population.
 /// A single profitable archive entry must not suppress all remaining evaluated
 /// candidates. Only compact genes/metrics cross this boundary; downstream
@@ -3949,7 +3959,7 @@ where
             super::migration::publish_elites(elites);
         }
 
-        let top_score = scored.first().map(|x| x.0).unwrap_or(f64::NEG_INFINITY);
+        let top_score = generation_objective_score(&scored);
         if top_score > best_score_seen + min_improvement {
             best_score_seen = top_score;
             stagnant_gens = 0;
@@ -5297,6 +5307,142 @@ mod evaluated_generation_handoff_tests {
         metrics[5] = 1.2;
         metrics[8] = 10.0;
         (net, index, gene, metrics)
+    }
+
+    #[test]
+    fn novelty_selection_scores_cannot_hide_objective_improvement() {
+        // With zero feature novelty, raw fitness [10, 20] and [20, 40]
+        // both normalize to selection scores [0, 0.8] at novelty_weight=0.2.
+        // The old first selection score therefore reported no improvement.
+        let mut progress = Vec::new();
+        for scale in [1.0, 2.0] {
+            let mut champion = candidate(0, 20.0 * scale);
+            champion.0 = 0.8;
+            champion.2.fitness = 20.0 * scale;
+            let mut other = candidate(0, 10.0 * scale);
+            other.2.weights[0] = -0.4;
+            other.0 = 0.0;
+            other.2.fitness = 10.0 * scale;
+            let ranked = vec![champion, other];
+            assert_eq!(ranked[0].0, 0.8, "relative selection maximum is unchanged");
+            progress.push(generation_objective_score(&ranked));
+        }
+        assert_eq!(progress, vec![20.0, 40.0]);
+        assert!(progress[1] > progress[0] + 1e-12);
+    }
+
+    #[test]
+    fn novelty_winner_does_not_replace_the_objective_champion() {
+        let mut novelty_winner = candidate(0, 3.0);
+        novelty_winner.0 = 0.9;
+        novelty_winner.2.fitness = 3.0;
+        let mut objective_champion = candidate(1, 10.0);
+        objective_champion.0 = 0.8;
+        objective_champion.2.fitness = 10.0;
+        let ranked = vec![novelty_winner, objective_champion];
+        assert_eq!(generation_objective_score(&ranked), 10.0);
+        assert_eq!(ranked[0].0, 0.9, "selection retains its novelty winner");
+        assert_eq!(ranked[0].2.indices, vec![0]);
+    }
+
+    #[test]
+    fn objective_progress_without_novelty_matches_ranked_fitness() {
+        for best in [-10.0, 0.0, 25.0] {
+            let mut champion = candidate(0, best);
+            champion.2.fitness = best;
+            let mut other = candidate(1, best - 1.0);
+            other.2.fitness = best - 1.0;
+            let ranked = vec![champion, other];
+            assert_eq!(generation_objective_score(&ranked), ranked[0].0);
+        }
+        assert_eq!(generation_objective_score(&[]), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn real_generation_loop_tracks_objective_progress_in_both_modes() -> Result<()> {
+        const CASE: &str = "NEOETHOS_TEST_OBJECTIVE_PROGRESS_CASE";
+        // Runtime overrides are process-wide and install-once. Separate test
+        // processes exercise both modes without changing another test's policy.
+        let Ok(case) = std::env::var(CASE) else {
+            let test_name = concat!(
+                "genetic::search_engine::evaluated_generation_handoff_tests::",
+                "real_generation_loop_tracks_objective_progress_in_both_modes"
+            );
+            for case in ["prop", "prop_novelty", "risky", "risky_novelty"] {
+                let output = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env(CASE, case)
+                    .output()?;
+                assert!(
+                    output.status.success(),
+                    "{case}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return Ok(());
+        };
+        let growth_objective = case.starts_with("risky");
+        super::super::runtime_overrides::install_genetic_search_runtime_overrides(
+            super::super::runtime_overrides::GeneticSearchRuntimeOverrides {
+                seed: Some(7),
+                novelty_weight: if case.ends_with("novelty") { 0.2 } else { 0.0 },
+                ..Default::default()
+            },
+        )
+        .expect("isolated test process must own its runtime policy");
+        // One feature makes every Jaccard novelty zero. The blended maximum
+        // stays 0.8 while the canonical fitness increases every generation.
+        let policy = ExactSearchSizingPolicyV1::new(false, 1)?;
+        let mut evaluation = 0;
+        let mut expected = Vec::new();
+        let mut progress = Vec::new();
+        evolve_search_with_generation_evaluator_v1(
+            &["feature_0".to_owned()],
+            30.0,
+            12,
+            3,
+            1,
+            None,
+            Some(EvaluationConfig {
+                growth_objective,
+                ..Default::default()
+            }),
+            &policy,
+            |genes, _| {
+                evaluation += 1;
+                let rows: Vec<_> = (0..genes.len())
+                    .map(|index| {
+                        let scale = (evaluation.min(3) * (index + 1)) as f64;
+                        let mut row = candidate(0, 10.0 * scale).3;
+                        row[4] = 0.55;
+                        row[8] = 20.0 * scale;
+                        row
+                    })
+                    .collect();
+                if evaluation <= 3 {
+                    let score = if growth_objective {
+                        crate::scoring::ga_fitness_growth
+                    } else {
+                        crate::scoring::ga_fitness
+                    };
+                    expected.push(rows.iter().map(score).fold(f64::NEG_INFINITY, f64::max));
+                }
+                Ok(rows)
+            },
+            |_, _, best, stagnant, _| progress.push((best, stagnant)),
+            || false,
+        )?;
+        assert_eq!(progress.len(), 3);
+        assert!(expected.windows(2).all(|pair| pair[1] > pair[0]));
+        assert_eq!(
+            progress,
+            expected
+                .into_iter()
+                .map(|best| (best, 0))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
     }
 
     #[test]
