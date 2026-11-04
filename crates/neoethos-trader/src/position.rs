@@ -132,7 +132,8 @@ impl Position {
     /// (`eval.rs:1581-1592` long, `:1608-1618` short):
     ///
     /// * arm when the favourable excursion from entry reaches
-    ///   `be_trigger_r × stop_distance`;
+    ///   `be_trigger_r × stop_distance` and the candidate lock price has actually
+    ///   been reached by that favourable excursion;
     /// * the candidate level is `extreme ∓ stop_multiplier × stop_distance`,
     ///   floored (long) / capped (short) at `entry ± min_lock_pips`;
     /// * keep it only if it is better than what is already locked in.
@@ -153,6 +154,16 @@ impl Position {
         else {
             return false;
         };
+        // This decision is made at the closed bar's current price. A stop
+        // beyond that price cannot preserve an earlier intrabar profit.
+        let placeable = if direction == 1 {
+            candidate <= bar.c
+        } else {
+            candidate >= bar.c
+        };
+        if !placeable {
+            return false;
+        }
         self.trail_px = Some(candidate);
         true
     }
@@ -525,6 +536,16 @@ mod trailing_tests {
         // A later, lower high must not give the trade its risk back.
         assert!(!p.ratchet_trail(&bar("EURUSD", 1.0025, 1.0015, 1.0020), &policy()));
         assert_eq!(p.trail_px, Some(best));
+    }
+
+    #[test]
+    fn a_retreat_before_the_decision_close_cannot_lock_an_old_extreme() {
+        let mut buy = long();
+        let mut sell = short();
+        assert!(!buy.ratchet_trail(&bar("EURUSD", 1.0040, 1.0000, 1.0000), &policy()));
+        assert!(!sell.ratchet_trail(&bar("EURUSD", 1.0000, 0.9960, 1.0000), &policy()));
+        assert_eq!(buy.trail_px, None);
+        assert_eq!(sell.trail_px, None);
     }
 
     #[test]

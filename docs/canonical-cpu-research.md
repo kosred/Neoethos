@@ -110,6 +110,35 @@ each batch's content receipt. Raw indicator values and strict GPU recipes retain
 their existing semantics. A discovery failure also preserves its full
 error chain in `failure.json` beside the original run inputs.
 
+Trading semantics version 2 bounds non-gap OHLC drawdown and trade excursions
+by the stop and target that protected the bar before it began. A prior trailing
+stop is included; a newly ratcheted stop only protects later bars. The existing
+conservative best-before-worst intrabar convention and stop-first exit precedence
+remain. This is a bar-resolution exposure bound, not a reconstruction of the
+intrabar path. Gap exits retain their separate close-proxy policy; executable
+Bid/Ask fills, slippage and broker loss-rule validation still require the reviewed
+quote route. Realized costs remain charged.
+
+For example, a 100-unit, one-lot numerical fixture with a two-unit stop and a
+later bar low of 50 closes at 98. Its drawdown is 2%, rather than charging the
+post-stop move as a 50% drawdown. Favorable excursion is likewise bounded by
+the target. This affects fitness risk terms and quality excursion summaries;
+it does not demonstrate the results of any historical strategy run.
+
+The shared Trader trailing geometry and the evaluator also require the proposed
+lock price to lie within the favorable excursion actually observed. Reaching a
+small R trigger cannot authorize locking two pips when price only moved one.
+Bar executors also refuse a new stop already beyond the decision close: an
+earlier intrabar extreme cannot be locked after price has retreated. The quote
+route still resolves threshold crossings using its executable quote stream.
+Minimum holding preferences never disable stop/target protection or extend the
+maximum holding deadline. Native CUDA and CubeCL mirror these source rules;
+CPU tests and host-compiled native arithmetic are distinct from actual-device
+verification. Old semantics-version-1 measurements must be rerun before comparison.
+The policy remains configurable through `models.exit_policy`; its default is
+still trailing disabled. Neither trailing nor a target setting establishes a
+positive net expectancy or a repeatable monthly return.
+
 The account snapshot and all five broker responses are hash-checked, checked
 against the exact acquisition account, and frozen beside the run. Configured
 account currency must match the observed deposit currency; mismatches are

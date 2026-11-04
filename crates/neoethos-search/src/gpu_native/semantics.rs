@@ -6,7 +6,7 @@
 
 use neoethos_core::utils::fnv1a64;
 
-pub const TRADING_SEMANTICS_VERSION: u32 = 1;
+pub const TRADING_SEMANTICS_VERSION: u32 = 2;
 pub const DISCOVERY_SEMANTICS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,37 +37,35 @@ impl TradingSemanticsDescriptor {
             same_bar_precedence: "canonical-stop-target-precedence-v1",
             fixed_stop_rule: "entry-captured-fixed-pips-v1",
             adaptive_stop_rule: "entry-captured-volatility-base-times-gene-multiplier-v1",
-            trailing_rule: "canonical-monotonic-trailing-v1",
+            trailing_rule: "reachable-monotonic-prior-bar-trailing-v2",
             break_even_rule: "canonical-r-multiple-trigger-v1",
             cost_rule: "spread-commission-swap-conversion-v1",
             sizing_rule: "confidence-scaled-equity-risk-band-v1",
-            equity_drawdown_rule: "trade-equity-peak-drawdown-v1",
+            equity_drawdown_rule: "barrier-bounded-conservative-equity-drawdown-v2",
             calendar_boundary_rule: "typed-month-day-prop-firm-boundaries-v1",
-            maximum_hold_rule: "configured-bars-forced-exit-v1",
+            maximum_hold_rule: "protective-exits-independent-of-minimum-hold-v2",
         }
     }
 
     pub fn canonical_bytes(self) -> Vec<u8> {
-        let mut out = Vec::new();
-        push_u32(&mut out, self.version);
-        for field in [
-            self.signal_threshold_rule,
-            self.smc_gate_rule,
-            self.entry_timing_rule,
-            self.same_bar_precedence,
-            self.fixed_stop_rule,
-            self.adaptive_stop_rule,
-            self.trailing_rule,
-            self.break_even_rule,
-            self.cost_rule,
-            self.sizing_rule,
-            self.equity_drawdown_rule,
-            self.calendar_boundary_rule,
-            self.maximum_hold_rule,
-        ] {
-            push_str(&mut out, field);
-        }
-        out
+        descriptor_bytes(
+            self.version,
+            &[
+                self.signal_threshold_rule,
+                self.smc_gate_rule,
+                self.entry_timing_rule,
+                self.same_bar_precedence,
+                self.fixed_stop_rule,
+                self.adaptive_stop_rule,
+                self.trailing_rule,
+                self.break_even_rule,
+                self.cost_rule,
+                self.sizing_rule,
+                self.equity_drawdown_rule,
+                self.calendar_boundary_rule,
+                self.maximum_hold_rule,
+            ],
+        )
     }
 
     pub fn hash(self) -> u64 {
@@ -110,24 +108,22 @@ impl DiscoverySemanticsDescriptor {
     }
 
     pub fn canonical_bytes(self) -> Vec<u8> {
-        let mut out = Vec::new();
-        push_u32(&mut out, self.version);
-        for field in [
-            self.fitness_formula,
-            self.rank_quantization,
-            self.tie_breaking,
-            self.candidate_identity,
-            self.filtering_policy,
-            self.validation_verdict_policy,
-            self.walkforward_policy,
-            self.cpcv_policy,
-            self.pbo_policy,
-            self.survivor_selection_policy,
-            self.portfolio_selection_policy,
-        ] {
-            push_str(&mut out, field);
-        }
-        out
+        descriptor_bytes(
+            self.version,
+            &[
+                self.fitness_formula,
+                self.rank_quantization,
+                self.tie_breaking,
+                self.candidate_identity,
+                self.filtering_policy,
+                self.validation_verdict_policy,
+                self.walkforward_policy,
+                self.cpcv_policy,
+                self.pbo_policy,
+                self.survivor_selection_policy,
+                self.portfolio_selection_policy,
+            ],
+        )
     }
 
     pub fn hash(self) -> u64 {
@@ -145,6 +141,15 @@ pub fn discovery_semantics_hash() -> u64 {
 
 pub fn semantics_hash_hex(hash: u64) -> String {
     format!("{hash:016x}")
+}
+
+fn descriptor_bytes(version: u32, fields: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u32(&mut out, version);
+    for field in fields {
+        push_str(&mut out, field);
+    }
+    out
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {

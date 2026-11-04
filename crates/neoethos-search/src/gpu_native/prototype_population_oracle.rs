@@ -1557,8 +1557,12 @@ fn floating_pnl(
     bar: usize,
     pip: f64,
 ) -> (f64, f64) {
-    let low = workload.dataset.low[bar];
-    let high = workload.dataset.high[bar];
+    // This reference refuses trailing state. Bound exposure independently by
+    // this event's fixed bracket, matching the supported canonical fill model.
+    let lower = position.event.stop_price.min(position.event.target_price);
+    let upper = position.event.stop_price.max(position.event.target_price);
+    let low = workload.dataset.low[bar].clamp(lower, upper);
+    let high = workload.dataset.high[bar].clamp(lower, upper);
     let (worst, best) = if position.event.direction == POPULATION_DIRECTION_LONG {
         (
             (low - position.entry_price) / pip * settings.pip_value_per_lot,
@@ -2025,8 +2029,12 @@ mod tests {
         assert_eq!(actual.metrics[2].values[0], 0.0);
         assert_eq!(actual.metrics[2].values[2], 100_000.0);
         assert_eq!(actual.metrics[2].values[8], 0.0);
-        assert!(actual.metrics[0].values[10] > 0.0);
-        assert!(actual.metrics[1].values[10] > actual.metrics[0].values[10]);
+        // The long's conservative peak/trough spans +5000 to -100. The
+        // short's 151 high is beyond its109 stop and cannot add a -5200
+        // excursion after closure; its cost-charged realized loss dominates.
+        for (index, expected_dd) in [(0, 5_100.0 / 105_000.0), (1, 1_221.0 / 100_000.0)] {
+            assert!((actual.metrics[index].values[10] - expected_dd).abs() < 1e-12);
+        }
     }
 
     #[test]
@@ -2125,6 +2133,46 @@ mod tests {
             "the independent oracle must retain the 100k -> 90k daily segment after the 110k peak, got {}",
             actual.metrics[0].values[10]
         );
+    }
+
+    #[test]
+    fn oracle_risk_uses_only_exposure_inside_the_existing_bracket() {
+        for side in [1_i8, -1] {
+            for target in [false, true] {
+                let mut workload = daily_drawdown_fixture();
+                workload.dataset.close.fill(100.0);
+                workload.dataset.high.fill(100.0);
+                workload.dataset.low.fill(100.0);
+                workload.dataset.indicators.fill(0.0);
+                workload.dataset.indicators[0] = f64::from(side);
+                workload.genes.stop_pips[0] = 2.0;
+                workload.genes.target_pips[0] = 10.0;
+                let extreme_side = if target { side } else { -side };
+                if extreme_side == 1 {
+                    workload.dataset.high[2] = 150.0;
+                } else {
+                    workload.dataset.low[2] = 50.0;
+                }
+                let actual = evaluate_population_oracle(&workload).unwrap();
+                let equity = actual.settings.initial_equity;
+                let expected_dd = if target {
+                    10.0 / (equity + 10.0)
+                } else {
+                    2.0 / equity
+                };
+                assert_eq!(
+                    actual.metrics[0].values[0],
+                    if target { 10.0 } else { -2.0 }
+                );
+                assert_eq!(actual.metrics[0].values[8], 1.0);
+                for slot in [3, 10] {
+                    assert!(
+                        (actual.metrics[0].values[slot] - expected_dd).abs() < 1e-12,
+                        "side={side}, target={target}, slot={slot}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
