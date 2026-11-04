@@ -634,6 +634,7 @@ const DISCOVERY_ADAPTIVE_GENERATION_ALGORITHM_V3: &str = concat!(
     "configured-survivor-immigrant-stagnation-rescue-mutation;",
     "signed-threshold-ladder;tp-sl-vol-distinct-bounds;",
     "smc-gate-progress-stagnation;ordered-templates;bounded-seen-retries;",
+    "stagnation=canonical-objective-fitness-before-novelty;",
     "full-resident-population;checkpoint-control-only;terminal-last-evaluated"
 );
 
@@ -647,7 +648,7 @@ fn adaptive_hip_generation_semantics_sha256_v3() -> [u8; 32] {
 }
 
 /// Explicitly versioned GPU algorithm and selected backend semantics. CUDA
-/// retains its original identity. HIP binds the same algorithm to AMD HIP,
+/// binds the objective-progress algorithm identity. HIP binds it to AMD HIP,
 /// hipCUB/rocPRIM and the distinct native protocol. The actual build digest is
 /// separately bound by the plan; neither hash attests to device execution.
 pub fn discovery_adaptive_generation_semantics_sha256_v3() -> [u8; 32] {
@@ -1315,9 +1316,9 @@ mod tests {
         assert_eq!(
             cuda_adaptive,
             [
-                0x8d, 0x0b, 0x1f, 0xab, 0xdc, 0xe6, 0x0d, 0x6d, 0xe6, 0xee, 0x21, 0xee, 0xb4, 0x0e,
-                0x45, 0x9a, 0x8f, 0xb6, 0x0e, 0x91, 0x6f, 0xb4, 0x07, 0x7f, 0x2b, 0xb0, 0xcc, 0xe1,
-                0xd2, 0xf0, 0xa8, 0x26,
+                0x95, 0xf7, 0x9f, 0x4f, 0xf0, 0x1d, 0xbb, 0x75, 0x62, 0xfb, 0x19, 0x34, 0x22, 0x12,
+                0x9b, 0xa4, 0xcf, 0x94, 0xce, 0xd0, 0x5b, 0x6a, 0x4a, 0x1b, 0xc0, 0x9f, 0x5d, 0x1d,
+                0x0b, 0x2d, 0x01, 0xdf,
             ]
         );
         let hip = sha256_v1(&[DISCOVERY_GENERATION_HIP_SEMANTICS_V1.as_bytes()]);

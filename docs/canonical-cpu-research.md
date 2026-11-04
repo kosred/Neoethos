@@ -102,6 +102,41 @@ fold remains part of the existing positive-fold denominator. Multiple reasons
 can apply to one candidate. Older profiles omit these diagnostics rather than
 inventing measurements. These selection diagnostics are not deployment artifacts.
 
+Internal WF replays already evolved genes; it does not rerun feature selection
+or the GA inside each fold. Its 70/30 window geometry chooses replay rows, not
+a new training/validation experiment. The feature prefilter defaults to the
+whole selection interval, normalization is fitted on that interval, and the
+full-selection quality screen runs before WF. Consequently these folds have
+already influenced candidate selection. Embargo separates replay boundaries;
+it does not remove that earlier selection exposure. A passing internal WF is
+a robustness screen within selection, not independent OOS evidence.
+
+Every internal-WF survivor is replayed on the separate selection-calibration
+interval before correlation and active portfolio capacity are applied. Its
+finite metrics and positive net profit, expectancy, profit factor and sizing
+fraction are required by the existing calibration gate. Inspect
+`funnel_profile.selection_calibration_cohort.trials` for each measured summary
+and rejection reason, including losing candidates. If no candidate survives,
+the portfolio is empty and the reserved final holdout is not evaluated. That
+outcome must not be described as a measured final-OOS failure.
+
+The trial-return matrix records the candidates admitted to the post-GA quality
+screen, before that screen's gates. It does not contain every genome evaluated
+during evolution, nor the earlier feature-selection alternatives. Its DSR
+uses the screen's offered count; its CSCV/PBO reranks the recorded, already
+evolved candidates. These statistics describe that recorded cohort, not the
+complete adaptive search. They cannot certify that the GA or repeated research
+attempts have avoided overfitting. Merely increasing the DSR trial count cannot
+reconstruct the omitted return paths or undo prior candidate selection.
+
+To attribute a regression, compare the same frozen data, costs, policy, seeds
+and budget with only the suspect mechanism changed. Record selection fitness,
+actual generations/evaluation slots, every rejection stage and calibration
+returns. A convergence fix must first change the false-stagnation behavior;
+better unseen returns require a separate market-data experiment. Keep final
+holdout results out of profile selection. The native convergence change also
+needs actual CUDA validation; CPU/source checks do not supply that evidence.
+
 CPU research uses the existing normalization projection to exclude columns with
 no valid cell in the in-sample normalization interval. Both base and aligned
 higher-timeframe columns use that same interval. Holdout values cannot rescue a

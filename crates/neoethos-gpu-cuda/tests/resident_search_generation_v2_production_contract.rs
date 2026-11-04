@@ -85,10 +85,22 @@ fn validate_slice2_scoring_archive_cub_scratch_query(source: &str) -> Result<(),
             "auto* rank_values = static_cast<std::uint64_t*>(nullptr);",
             1_usize,
         ),
-        ("neoethos_parallel_primitives_v1::DeviceReduce::Min(", 1_usize),
-        ("neoethos_parallel_primitives_v1::DeviceReduce::Max(", 1_usize),
-        ("neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(", 2_usize),
-        ("neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(", 1_usize),
+        (
+            "neoethos_parallel_primitives_v1::DeviceReduce::Min(",
+            1_usize,
+        ),
+        (
+            "neoethos_parallel_primitives_v1::DeviceReduce::Max(",
+            1_usize,
+        ),
+        (
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairs(",
+            2_usize,
+        ),
+        (
+            "neoethos_parallel_primitives_v1::DeviceRadixSort::SortPairsDescending(",
+            1_usize,
+        ),
         (
             "nullptr, candidate, rank_keys, rank_keys, rank_values, rank_values,\n      count, 0, 64, stream);",
             3_usize,
@@ -559,7 +571,13 @@ fn c_adaptive_policy_is_charged_and_rechecked_before_combined_allocation() {
             "&generation_import, generation_plan, adaptive_policy, &admission->generation",
         ],
     );
-    forbid_all(create, &["cudaMemGetInfo", "configure_resident_generation_adaptive_inputs_v3"]);
+    forbid_all(
+        create,
+        &[
+            "cudaMemGetInfo",
+            "configure_resident_generation_adaptive_inputs_v3",
+        ],
+    );
     for name in [
         "neoethos_gpu_cuda_population_query_resident_search_combined_v2(",
         "neoethos_gpu_cuda_population_query_resident_search_slice2_v3(",
@@ -567,7 +585,10 @@ fn c_adaptive_policy_is_charged_and_rechecked_before_combined_allocation() {
         "neoethos_gpu_cuda_population_create_resident_search_slice2_v3(",
     ] {
         let legacy = braced_item(&population_cuda, name);
-        require_all(legacy, &["opaque_session, generation_plan, nullptr, scoring_plan"]);
+        require_all(
+            legacy,
+            &["opaque_session, generation_plan, nullptr, scoring_plan"],
+        );
         forbid_all(legacy, &["cudaMemGetInfo", "cudaMalloc", "cudaHostAlloc"]);
     }
 }
@@ -596,43 +617,82 @@ fn c_canonical_base_chunks_preserve_full_population_and_one_global_scoring_sourc
     let symbol = "neoethos_gpu_cuda_population_upload_resident_base_scenarios_v3(";
     assert_eq!(header.matches(symbol).count(), 1);
     let upload = braced_item(&source, symbol);
-    require_in_order(upload, &[
-        "scenarios->count != planned_population", "retained_capacity > planned_population",
-        "session->resident_retained_evaluation_capacity_v3", "ordinal < scenarios->count",
-        "descriptor.base_candidate_id != ordinal", "descriptor.scenario_id != ordinal",
-        "descriptor.rng_counter != 0", "descriptor.window_offset != 0",
-        "descriptor.window_len !=", "descriptor.scenario_type != kScenarioBase",
-        "descriptor.spread_ticks != kNoTickOverride", "descriptor.slippage_ticks != 0",
-        "descriptor.commission_micros != kNoMicroOverride", "descriptor.perturbation_offset != 0",
-        "descriptor.perturbation_count != 0", "descriptor.reserved != 0",
-        "static_cast<std::size_t>(retained_capacity)",
-        "neoethos_gpu_cuda_population_upload_resident_scenarios_v2(",
-        "resident_canonical_base_scenarios_v3 = true",
-    ]);
+    require_in_order(
+        upload,
+        &[
+            "scenarios->count != planned_population",
+            "retained_capacity > planned_population",
+            "session->resident_retained_evaluation_capacity_v3",
+            "ordinal < scenarios->count",
+            "descriptor.base_candidate_id != ordinal",
+            "descriptor.scenario_id != ordinal",
+            "descriptor.rng_counter != 0",
+            "descriptor.window_offset != 0",
+            "descriptor.window_len !=",
+            "descriptor.scenario_type != kScenarioBase",
+            "descriptor.spread_ticks != kNoTickOverride",
+            "descriptor.slippage_ticks != 0",
+            "descriptor.commission_micros != kNoMicroOverride",
+            "descriptor.perturbation_offset != 0",
+            "descriptor.perturbation_count != 0",
+            "descriptor.reserved != 0",
+            "static_cast<std::size_t>(retained_capacity)",
+            "neoethos_gpu_cuda_population_upload_resident_scenarios_v2(",
+            "resident_canonical_base_scenarios_v3 = true",
+        ],
+    );
     let enqueue = braced_item(&source, "std::int32_t enqueue_population_evaluation_v1(");
-    require_in_order(enqueue, &[
-        "ensure_metrics_only_workspace_v1(session, scenario_count, month_capacity, bars)",
-        "begin_resident_generation_metrics_v3(", "population_gap_flags_kernel<<<",
-        "logical_offset < population", "remaining < capacity ? remaining : capacity",
-        "resident_base_scenario_ids_kernel_v3<<<", "active_scenarios.count =",
-        "population_reduce_kernel<<<active_blocks", "append_resident_generation_metrics_v3(",
-        "logical_offset += active_count", "session->resident_metrics_view_v3 = *resident_genes_v2",
-        "cudaEventRecord(session->event", "resident_metrics->scenario_count =",
-    ]);
+    require_in_order(
+        enqueue,
+        &[
+            "ensure_metrics_only_workspace_v1(session, scenario_count, month_capacity, bars)",
+            "begin_resident_generation_metrics_v3(",
+            "population_gap_flags_kernel<<<",
+            "logical_offset < population",
+            "remaining < capacity ? remaining : capacity",
+            "resident_base_scenario_ids_kernel_v3<<<",
+            "active_scenarios.count =",
+            "population_reduce_kernel<<<active_blocks",
+            "append_resident_generation_metrics_v3(",
+            "logical_offset += active_count",
+            "session->resident_metrics_view_v3 = *resident_genes_v2",
+            "cudaEventRecord(session->event",
+            "resident_metrics->scenario_count =",
+        ],
+    );
     let chunks = braced_item(enqueue, "for (std::uint64_t logical_offset = 0;");
-    forbid_all(chunks, &[
-        "cudaMalloc", "device_alloc", "cudaMemcpyHostToDevice", "cudaMemcpyDeviceToHost",
-        "cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize",
-        "upload_resident_scenarios", "score_and_rank", "bind_and_seal_resident_scoring",
-        "session->population =", "session->workspace_scenarios =",
-    ]);
-    let export = braced_item(&source, "neoethos_gpu_cuda_population_export_resident_scoring_source_v2(");
-    require_all(export, &[
-        "resident_metrics->scenario_count != static_cast<std::uint64_t>(session->workspace_scenarios)",
-        "export_resident_generation_metrics_v3(", "? retained_rows : session->metric_rows",
-        "? retained_scenario_ids :", "source->logical_population_count = expected_population",
-        "PopulationStrictExecutionStateV1::Poisoned",
-    ]);
+    forbid_all(
+        chunks,
+        &[
+            "cudaMalloc",
+            "device_alloc",
+            "cudaMemcpyHostToDevice",
+            "cudaMemcpyDeviceToHost",
+            "cudaStreamSynchronize",
+            "cudaDeviceSynchronize",
+            "cudaEventSynchronize",
+            "upload_resident_scenarios",
+            "score_and_rank",
+            "bind_and_seal_resident_scoring",
+            "session->population =",
+            "session->workspace_scenarios =",
+        ],
+    );
+    let export = braced_item(
+        &source,
+        "neoethos_gpu_cuda_population_export_resident_scoring_source_v2(",
+    );
+    require_all(
+        export,
+        &[
+            "resident_metrics->scenario_count != static_cast<std::uint64_t>(session->workspace_scenarios)",
+            "export_resident_generation_metrics_v3(",
+            "? retained_rows : session->metric_rows",
+            "? retained_scenario_ids :",
+            "source->logical_population_count = expected_population",
+            "PopulationStrictExecutionStateV1::Poisoned",
+        ],
+    );
 }
 
 #[test]
@@ -860,6 +920,18 @@ fn e_nonfinite_scoring_fault_precedes_rank_consumers_and_conditional_commit() {
         &generation_cuda,
         "std::int32_t enqueue_resident_generation_offspring_from_scored_rows_v2(",
     );
+    assert_eq!(
+        advance
+            .matches("enqueue_generation_scored_operators_v3(")
+            .count(),
+        1
+    );
+    let operators = braced_item(
+        &generation_cuda,
+        "std::int32_t enqueue_generation_scored_operators_v3(",
+    );
+    let expanded = format!("{advance}\n{operators}");
+    let advance = expanded.as_str();
     require_in_order(
         advance,
         &[

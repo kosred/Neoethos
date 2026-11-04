@@ -1034,6 +1034,19 @@ fn slice2_uses_a_private_typed_generation_split_without_per_generation_host_comp
         "enqueue_resident_generation_offspring_from_scored_rows_v2(",
         "\n}",
     );
+    assert_eq!(
+        split_enqueue
+            .matches("enqueue_generation_scored_operators_v3(")
+            .count(),
+        1
+    );
+    let operators = braced_definition(
+        &cuda,
+        "std::int32_t enqueue_generation_scored_operators_v3(",
+    )
+    .unwrap();
+    let expanded = format!("{split_enqueue}\n{operators}");
+    let split_enqueue = expanded.as_str();
     require_all(
         split_enqueue,
         &[
@@ -1106,6 +1119,19 @@ fn slice2_generation_finite_rows_seam_is_exact_and_eventless() {
     assert!(!public_v2.contains(symbol));
 
     let enqueue = section(&cuda, &format!("{symbol}("), "\n}");
+    assert_eq!(
+        enqueue
+            .matches("enqueue_generation_scored_operators_v3(")
+            .count(),
+        1
+    );
+    let operators = braced_definition(
+        &cuda,
+        "std::int32_t enqueue_generation_scored_operators_v3(",
+    )
+    .unwrap();
+    let expanded = format!("{enqueue}\n{operators}");
+    let enqueue = expanded.as_str();
     let compact_enqueue = compact_whitespace(enqueue);
     require_all(
         &compact_enqueue,
@@ -1524,4 +1550,180 @@ fn slice2_combined_publish_rejects_unrepresentable_next_tuple_before_generation_
         validate_slice2_publish_bounds_are_fail_closed(&mutation_before_failure_mutant).is_err(),
         "the contract must kill a mutant that bypasses the pre-mutation return"
     );
+}
+
+#[test]
+fn adaptive_progress_requires_the_sealed_objective_buffer_before_selection() {
+    let native = read_required("native/resident_generation_v1.cu");
+    let advance = braced_definition(
+        &native,
+        "std::int32_t enqueue_resident_generation_offspring_from_finite_rows_v2(",
+    )
+    .unwrap();
+    assert!(
+        compact_whitespace(advance)
+            .contains("finite_rows->device_seal, finite_rows->fitness_scores_device)")
+    );
+    let operators = braced_definition(
+        &native,
+        "std::int32_t enqueue_generation_scored_operators_v3(",
+    )
+    .unwrap();
+    let progress = operators
+        .find("update_adaptive_objective_progress_v3<<<")
+        .unwrap();
+    assert!(
+        progress
+            < operators
+                .find("launch_device_parent_selection_v1(")
+                .unwrap()
+    );
+    assert!(
+        operators[progress..].contains("objective_fitness, generation->logical_population_count")
+    );
+    assert!(operators.contains("generation->adaptive_enabled_v3 && objective_fitness == nullptr"));
+    for signature in [
+        "extern \"C\" std::int32_t enqueue_resident_rank_selection_offspring_v1(",
+        "std::int32_t enqueue_resident_generation_offspring_from_scored_rows_v2(",
+    ] {
+        let legacy = braced_definition(&native, signature).unwrap();
+        let rejection = legacy
+            .find("NEO_RESIDENT_STATUS_UNSUPPORTED_SELECTION_V1")
+            .unwrap();
+        assert!(
+            rejection
+                < legacy
+                    .find("launch_device_parent_selection_v1(")
+                    .or_else(|| legacy.find("enqueue_generation_scored_operators_v3("))
+                    .unwrap()
+        );
+    }
+    let progress = braced_definition(
+        &native,
+        "__global__ void update_adaptive_objective_progress_v3(",
+    )
+    .unwrap();
+    require_all(
+        progress,
+        &[
+            "objective_top = fmax(objective_top, objective_fitness[i]);",
+            "objective_top > state->best_score + minimum_improvement",
+            "state->best_score = objective_top;",
+        ],
+    );
+    let selection =
+        braced_definition(&native, "__global__ void update_adaptive_policy_v3(").unwrap();
+    assert!(!selection.contains("state->best_score"));
+    assert!(selection.contains("control->best_score_order_key = decision_keys[ranked[0]];"));
+    assert!(
+        read_required("src/resident_generation_v1.rs")
+            .contains("stagnation=canonical-objective-fitness-before-novelty;")
+    );
+}
+
+// Host execution of the production single-thread kernel body checks arithmetic
+// and selection separation. It does not establish CUDA compilation or execution.
+#[cfg(target_os = "linux")]
+#[test]
+fn native_adaptive_progress_kernel_tracks_improvement_hidden_by_novelty() {
+    let source = read_required("native/resident_generation_v1.cu");
+    let mut fixture = String::from(
+        "#include <bit>\n#include <cassert>\n#include <cmath>\n#include <cstdint>\n\
+         #define __host__\n#define __device__\n#define __global__\n\
+         using std::isfinite;\nstruct Dim { unsigned x; };\nDim blockIdx{}, threadIdx{};\n",
+    );
+    for (file, signature) in [
+        (
+            "native/neoethos_gpu_cuda.h",
+            "struct NeoPopulationMetricRow {",
+        ),
+        (
+            "native/resident_generation_v1_abi.cuh",
+            "struct NeoResidentGenerationPlanV1 {",
+        ),
+        (
+            "native/resident_generation_adaptive_v3_abi.cuh",
+            "struct NeoResidentAdaptivePolicyV3 {",
+        ),
+        (
+            "native/resident_generation_v2_abi.cuh",
+            "struct NeoResidentSearchDeviceControlV2 {",
+        ),
+    ] {
+        let header = read_required(file);
+        fixture.push_str(braced_definition(&header, signature).unwrap());
+        fixture.push_str(";\n");
+    }
+    fixture.push_str("using NeoResidentGenerationMetricRowV1 = NeoPopulationMetricRow;\n");
+    fixture.push_str(braced_definition(&source, "struct AdaptiveDeviceStateV3 {").unwrap());
+    fixture.push_str(";\n");
+    for signature in [
+        "__host__ __device__ double f64_from_bits_v1(",
+        "__device__ double clamp_f64_v1(",
+        "__device__ double adaptive_score_from_key_v3(",
+        "__global__ void update_adaptive_objective_progress_v3(",
+        "__global__ void update_adaptive_policy_v3(",
+    ] {
+        fixture.push_str(braced_definition(&source, signature).unwrap());
+        fixture.push('\n');
+    }
+    fixture.push_str(r#"
+std::uint64_t positive_key(double x) { return std::bit_cast<std::uint64_t>(x) ^ (1ull << 63); }
+int main() {
+  NeoResidentGenerationPlanV1 plan{}; plan.logical_population_count = 2;
+  NeoResidentAdaptivePolicyV3 policy{};
+  policy.minimum_improvement = 1e-12; policy.soft_stagnation_patience = 2;
+  policy.parent_policy = 3; policy.selection_temperature = 0.5;
+  policy.survivor_fraction = 0.25; policy.immigrant_fraction = 0.1;
+  AdaptiveDeviceStateV3 state{}; state.best_score = -INFINITY;
+  NeoResidentSearchDeviceControlV2 control{};
+  NeoResidentGenerationMetricRowV1 metrics[2]{};
+  metrics[0].values[8] = metrics[1].values[8] = 10;
+  std::uint64_t ranked[2] = {0, 1};
+  std::uint64_t keys[2] = {positive_key(0.9), positive_key(0.8)};
+  double objective[2] = {3.0, 10.0}, cdf[2]{};
+  std::uint32_t fault = 0;
+  for (unsigned generation = 0; generation < 2; ++generation) {
+    update_adaptive_objective_progress_v3(objective, 2, policy.minimum_improvement, &state, &fault);
+    update_adaptive_policy_v3(ranked, keys, metrics, &state, &control, cdf, plan, policy, generation, &fault);
+    assert(state.best_score == (generation == 0 ? 10.0 : 20.0));
+    assert(state.stagnant_generations == 0 && control.stagnant_generations == 0);
+    assert(control.best_score_order_key == keys[0]);
+    assert(cdf[0] == 1.0 && std::abs(cdf[1] - (1.0 + std::exp(-0.2))) < 1e-14);
+    objective[0] = 6.0; objective[1] = 20.0;
+  }
+  update_adaptive_objective_progress_v3(objective, 2, policy.minimum_improvement, &state, &fault);
+  update_adaptive_policy_v3(ranked, keys, metrics, &state, &control, cdf, plan, policy, 2, &fault);
+  assert(state.best_score == 20.0 && state.stagnant_generations == 1);
+  state.best_score = -INFINITY;
+  objective[0] = objective[1] = -INFINITY;
+  update_adaptive_objective_progress_v3(objective, 2, policy.minimum_improvement, &state, &fault);
+  update_adaptive_policy_v3(ranked, keys, metrics, &state, &control, cdf, plan, policy, 3, &fault);
+  assert(state.best_score == -INFINITY && state.stagnant_generations == 2);
+}
+"#);
+    let directory =
+        std::env::temp_dir().join(format!("neoethos-objective-kernel-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let cpp = directory.join("fixture.cpp");
+    let binary = directory.join("fixture");
+    fs::write(&cpp, fixture).unwrap();
+    let compiled = std::process::Command::new("c++")
+        .args(["-std=c++20", "-O0", "-o"])
+        .arg(&binary)
+        .arg(&cpp)
+        .output()
+        .expect("native host C++ compiler");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let result = std::process::Command::new(&binary).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    fs::remove_dir_all(directory).unwrap();
 }
