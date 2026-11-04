@@ -123,7 +123,7 @@ base64 = "0.22"
 # transitive tree, so cargo's dedup keeps the build small. Used by the
 # /diagnostics/bundle route to package log + config + sysinfo into a single
 # .zip that end users attach to support emails.
-zip = "7.2"
+zip = "9.0"
 # rustls is already pulled in transitively by reqwest / tungstenite.
 # Keep a direct edge so cTrader code can install the process-level
 # CryptoProvider before tungstenite builds a ClientConfig; without this,
