@@ -44,6 +44,107 @@ use vector_ta::utilities::data_loader::Candles;
 use vector_ta::utilities::enums::Kernel;
 use vector_ta::utilities::helpers::alloc_with_nan_prefix;
 
+#[test]
+fn raw_retrospective_pivots_rewrite_real_candle_history() {
+    use vector_ta::indicators::minmax::{MinmaxInput, MinmaxParams, minmax};
+    use vector_ta::indicators::zig_zag_channels::{
+        ZigZagChannelsInput, ZigZagChannelsParams, zig_zag_channels,
+    };
+
+    let bars = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+    type RawProducer<'a> = Box<dyn Fn(usize) -> Vec<Vec<f64>> + 'a>;
+    let producers: [(&str, RawProducer<'_>); 2] = [
+        (
+            "minmax",
+            Box::new(|rows| {
+                let output = minmax(&MinmaxInput::from_slices(
+                    &bars.high[..rows],
+                    &bars.low[..rows],
+                    MinmaxParams { order: Some(2) },
+                ))
+                .expect("real candle extrema");
+                vec![
+                    output.is_min,
+                    output.is_max,
+                    output.last_min,
+                    output.last_max,
+                ]
+            }),
+        ),
+        (
+            "zig_zag_channels",
+            Box::new(|rows| {
+                let output = zig_zag_channels(&ZigZagChannelsInput::from_slices(
+                    &bars.open[..rows],
+                    &bars.high[..rows],
+                    &bars.low[..rows],
+                    &bars.close[..rows],
+                    ZigZagChannelsParams {
+                        length: Some(5),
+                        extend: Some(true),
+                    },
+                ))
+                .expect("real candle channels");
+                vec![output.middle, output.upper, output.lower]
+            }),
+        ),
+    ];
+    for (id, produce) in producers {
+        let full = produce(bars.len());
+        assert!(
+            (20..bars.len()).any(|rows| {
+                produce(rows).iter().zip(&full).any(|(prefix, complete)| {
+                    prefix.iter().zip(complete).any(|(before, after)| {
+                        !(before.is_nan() && after.is_nan()) && before.to_bits() != after.to_bits()
+                    })
+                })
+            }),
+            "{id} no longer demonstrates retrospective values; review its production exclusion"
+        );
+    }
+}
+
+#[test]
+fn production_vocabulary_rejects_retrospective_pivot_features() {
+    use neoethos_data::core::all_indicators::{ALL_INDICATORS, PRODUCTION_INDICATOR_EXCLUSIONS};
+    use neoethos_data::core::feature_registry::feature_column_metadata;
+    use neoethos_data::core::hpc_ta::{
+        IndicatorComputePolicy, extended_sweep_plan, prepare_classic_ta_run_plan,
+    };
+
+    let plan = prepare_classic_ta_run_plan(8192, IndicatorComputePolicy::CpuOnly)
+        .expect("CPU production admission");
+    let (sweep, _) = extended_sweep_plan(usize::MAX);
+    for id in ["minmax", "zig_zag_channels"] {
+        assert!(
+            !ALL_INDICATORS.contains(&id),
+            "retrospective {id} is searchable"
+        );
+        assert!(
+            PRODUCTION_INDICATOR_EXCLUSIONS.iter().any(|item| {
+                item.id == id && !item.reason.is_empty() && !item.evidence.is_empty()
+            })
+        );
+        assert!(!plan.admission_report().admitted_indicator_ids.contains(&id));
+        assert!(!sweep.contains(&id));
+    }
+    for name in [
+        "minmax_is_min",
+        "minmax_is_max",
+        "minmax_last_min",
+        "minmax_last_max",
+        "zig_zag_channels",
+        "zig_zag_channels_middle",
+        "zig_zag_channels_upper",
+        "zig_zag_channels_lower",
+    ] {
+        assert!(
+            feature_column_metadata(name).is_none(),
+            "{name} still has production metadata"
+        );
+    }
+}
+
 /// The original open-source Pine v6 implementation updates its anchor with
 /// this recurrence on every bar of a bullish segment:
 ///
