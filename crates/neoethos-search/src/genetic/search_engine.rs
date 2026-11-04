@@ -5368,7 +5368,17 @@ mod evaluated_generation_handoff_tests {
                 "genetic::search_engine::evaluated_generation_handoff_tests::",
                 "real_generation_loop_tracks_objective_progress_in_both_modes"
             );
-            for case in ["prop", "prop_novelty", "risky", "risky_novelty"] {
+            for case in [
+                "prop",
+                "prop_novelty",
+                "risky",
+                "risky_novelty",
+                "risky_goal",
+                "risky_goal_novelty",
+                "prop_idle_novelty",
+                "risky_idle_novelty",
+                "risky_goal_idle_novelty",
+            ] {
                 let output = std::process::Command::new(std::env::current_exe()?)
                     .args(["--exact", test_name, "--nocapture"])
                     .env(CASE, case)
@@ -5383,6 +5393,14 @@ mod evaluated_generation_handoff_tests {
             return Ok(());
         };
         let growth_objective = case.starts_with("risky");
+        let no_trades = case.contains("idle");
+        let growth_goal = case
+            .contains("goal")
+            .then_some(crate::scoring::RiskyGrowthGoal {
+                start_balance: 100.0,
+                target_balance: 50_000.0,
+                horizon_days: 180.0,
+            });
         super::super::runtime_overrides::install_genetic_search_runtime_overrides(
             super::super::runtime_overrides::GeneticSearchRuntimeOverrides {
                 seed: Some(7),
@@ -5406,6 +5424,8 @@ mod evaluated_generation_handoff_tests {
             None,
             Some(EvaluationConfig {
                 growth_objective,
+                growth_goal,
+                initial_equity: 10_000.0,
                 ..Default::default()
             }),
             &policy,
@@ -5413,6 +5433,9 @@ mod evaluated_generation_handoff_tests {
                 evaluation += 1;
                 let rows: Vec<_> = (0..genes.len())
                     .map(|index| {
+                        if no_trades {
+                            return [0.0; 11];
+                        }
                         let scale = (evaluation.min(3) * (index + 1)) as f64;
                         let mut row = candidate(0, 10.0 * scale).3;
                         row[4] = 0.55;
@@ -5421,12 +5444,19 @@ mod evaluated_generation_handoff_tests {
                     })
                     .collect();
                 if evaluation <= 3 {
-                    let score = if growth_objective {
-                        crate::scoring::ga_fitness_growth
-                    } else {
-                        crate::scoring::ga_fitness
-                    };
-                    expected.push(rows.iter().map(score).fold(f64::NEG_INFINITY, f64::max));
+                    expected.push(
+                        rows.iter()
+                            .map(|row| {
+                                if let Some(goal) = growth_goal {
+                                    crate::scoring::ga_fitness_goal(row, 10_000.0, 30.0, goal)
+                                } else if growth_objective {
+                                    crate::scoring::ga_fitness_growth(row)
+                                } else {
+                                    crate::scoring::ga_fitness(row)
+                                }
+                            })
+                            .fold(f64::NEG_INFINITY, f64::max),
+                    );
                 }
                 Ok(rows)
             },
@@ -5434,12 +5464,17 @@ mod evaluated_generation_handoff_tests {
             || false,
         )?;
         assert_eq!(progress.len(), 3);
-        assert!(expected.windows(2).all(|pair| pair[1] > pair[0]));
+        if no_trades {
+            assert_eq!(expected, vec![-100.0; 3]);
+        } else {
+            assert!(expected.windows(2).all(|pair| pair[1] > pair[0]));
+        }
         assert_eq!(
             progress,
             expected
                 .into_iter()
-                .map(|best| (best, 0))
+                .enumerate()
+                .map(|(generation, best)| (best, if no_trades { generation } else { 0 }))
                 .collect::<Vec<_>>()
         );
         Ok(())
