@@ -102,6 +102,41 @@ fold remains part of the existing positive-fold denominator. Multiple reasons
 can apply to one candidate. Older profiles omit these diagnostics rather than
 inventing measurements. These selection diagnostics are not deployment artifacts.
 
+Raw features must also be available at their historical decision row. A
+train-only normalization fit cannot make a retrospective indicator causal.
+`minmax` reads later neighbours before marking an earlier extremum;
+`zig_zag_channels` fills earlier segments using later confirmed pivots and
+extends the last segment to the end of the supplied history. Both families are
+excluded from the production vocabulary and feature metadata, including
+parameter sweeps. Raw vector-ta APIs remain mathematical/chart APIs. The
+existing Classic FeaturePlan fingerprints the vocabulary source, so recorded
+features/models must be regenerated under the changed plan.
+
+The public data is in the separate
+[neoethos-data release](https://github.com/kosred/neoethos-data/releases/tag/snapshot-2026-08-09).
+Its unchanged `EURUSD.tar` has SHA-256
+`042aa66fde29e697bd30d93d85c4762076c06e292097e42680ed0067b06ca061`.
+On its first 8,192 M15 rows, actual CPU producers compared against natural
+prefixes of 2,048/4,096/6,553 rows reproduced 162/274/183 changed historical
+ZigZag values, plus retrospective extrema changes. These are raw-feature
+causality measurements within selection, not GA/OOS profitability results or
+proof that a particular historical winner used those columns. SMC, Quant,
+Session, Regime and Footprint were bitwise stable in this sample; remaining
+Classic short-window validity changes require separate investigation.
+
+The follow-up replay after exclusion emitted 1,776 Classic columns and compared
+21,538,159 valid paired cells. At 4,096 and 6,553 rows, both historical valid
+values and validity reasons matched the 8,192-row run. At 2,048 rows, two MSW
+outputs differed only by about 1e-14; no material numeric change remained at
+the probe's relative tolerance of 1e-10. Four `bandpass_200` outputs still had
+a length-dependent availability mismatch. Its derived HighPass period is
+2,667: the raw backend rejects 2,048/2,666-row inputs, but accepts 2,667 rows
+and marks values valid from row 2. Those accepted values match the longer
+history bitwise. This separate availability/length-contract problem remains
+open; the pivot exclusion does not repair it. The rare-event MFI output's
+remaining difference was only `ComputeFailure` versus `Warmup`, with no valid
+cell admitted on either side of the short-prefix comparison.
+
 CPU research uses the existing normalization projection to exclude columns with
 no valid cell in the in-sample normalization interval. Both base and aligned
 higher-timeframe columns use that same interval. Holdout values cannot rescue a

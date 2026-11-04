@@ -12,14 +12,29 @@ pub struct ProductionIndicatorExclusion {
     pub evidence: &'static str,
 }
 
-pub const PRODUCTION_INDICATOR_EXCLUSIONS: &[ProductionIndicatorExclusion] =
-    &[ProductionIndicatorExclusion {
+pub const PRODUCTION_INDICATOR_EXCLUSIONS: &[ProductionIndicatorExclusion] = &[
+    ProductionIndicatorExclusion {
         id: "exponential_trend",
         reason: "the published recurrence repeatedly multiplies its price-level anchor by a \
                  factor tending to two, exceeds finite f64 on valid long inputs, and cannot \
                  recover after the anchor becomes non-finite",
         evidence: "TradingView CDb3oR6A source v1 (2025-04-18); real EURUSD M5 Vortex row 7475",
-    }];
+    },
+    ProductionIndicatorExclusion {
+        id: "minmax",
+        reason: "symmetric extrema read later neighbours and write the result at the earlier \
+                 pivot row; the exported feature has no confirmation-availability delay",
+        evidence: "vector-ta minmax_scalar reads i+order; real EURUSD M15 prefix replay, \
+                   snapshot-2026-08-09 SHA256 042aa66fde29e697bd30d93d85c4762076c06e292097e42680ed0067b06ca061",
+    },
+    ProductionIndicatorExclusion {
+        id: "zig_zag_channels",
+        reason: "later confirmed pivots and the terminal close refill earlier channel segments, \
+                 so historical feature values are unavailable at their alleged decision row",
+        evidence: "vector-ta compute_run/fill_segment; unchanged real EURUSD M15 prefixes \
+                   2048/4096/6553 versus 8192 rows rewrite 162/274/183 earlier finite values",
+    },
+];
 
 pub const ALL_INDICATORS: &[&str] = &[
     "absolute_strength_index_oscillator",
@@ -207,7 +222,6 @@ pub const ALL_INDICATORS: &[&str] = &[
     "mfi",
     "midpoint",
     "midprice",
-    "minmax",
     "mod_god_mode",
     "mom",
     "momentum_ratio_oscillator",
@@ -360,7 +374,6 @@ pub const ALL_INDICATORS: &[&str] = &[
     "wma",
     "wto",
     "yang_zhang_volatility",
-    "zig_zag_channels",
     "zlema",
     "zscore",
 ];
