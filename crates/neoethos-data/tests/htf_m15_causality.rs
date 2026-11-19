@@ -77,3 +77,51 @@ fn current_h1_is_unavailable_before_first_confirmed_hour_close() {
     assert!(result[0].values.iter().all(|x| x.is_nan()));
     assert!(result[0].validity.iter().all(|v| *v == FeatureCellValidity::AlignmentMissing));
 }
+
+
+#[test]
+fn committed_real_ctrader_m1_fixture_never_exposes_h1_close_early() {
+    // Real EURUSD M1 rows, saved in the repository by its existing cTrader
+    // test-fixture producer. This checks the ACTUAL alignment primitive, not
+    // simulated trading profitability. 100 consecutive M1 bars span
+    // 2025-01-13 09:00..10:39 UTC: only 09:00..10:00 is a finished H1.
+    let raw: serde_json::Value =
+        serde_json::from_str(include_str!("../test_fixtures/eurusd_m1_100bars.json"))
+            .expect("committed cTrader fixture JSON");
+    let bars = raw["bars"].as_array().expect("bars array");
+    assert_eq!(bars.len(), 100);
+    let first = bars[0]["t"].as_i64().expect("M1 epoch milliseconds");
+    let bar_time = |i: usize| bars[i]["t"].as_i64().expect("M1 timestamp");
+    for i in 0..bars.len() {
+        assert_eq!(bar_time(i), first + i as i64 * MINUTE_MS);
+    }
+    assert_eq!(first, 1_736_758_800_000);
+    let h1_closed_value = bars[59]["c"].as_f64().expect("H1 closing value");
+    assert!((h1_closed_value - 1.08388).abs() < 1e-10);
+
+    // Only fully observed 15-minute bars; the last 10 M1 rows are ignored.
+    let m15_open = (0..6_usize).map(|i| bar_time(i * 15)).collect::<Vec<_>>();
+    let full = align_feature_columns_by_ms(
+        &m15_open, &[first], &[h1_column(vec![h1_closed_value])],
+        true, Some(2 * HOUR_MS), HOUR_MS,
+    ).expect("actual H1-to-M15 alignment over the real fixture");
+    assert_eq!(full[0].values.len(), 6);
+    for row in 0..4 {
+        assert_eq!(full[0].validity[row], FeatureCellValidity::AlignmentMissing);
+        assert!(full[0].values[row].is_nan());
+    }
+    for row in 4..6 {
+        assert_eq!(full[0].validity[row], FeatureCellValidity::Valid);
+        assert_eq!(full[0].values[row], h1_closed_value);
+    }
+
+    // The first 75 M1 rows can only complete the first five M15 bars.
+    // Appending the future 25 M1 rows must not rewrite the earlier H1 view.
+    let prefix_open = &m15_open[..5];
+    let prefix = align_feature_columns_by_ms(
+        prefix_open, &[first], &[h1_column(vec![h1_closed_value])],
+        true, Some(2 * HOUR_MS), HOUR_MS,
+    ).expect("prefix-only alignment");
+    assert_eq!(prefix[0].values, full[0].values[..5]);
+    assert_eq!(prefix[0].validity, full[0].validity[..5]);
+}
