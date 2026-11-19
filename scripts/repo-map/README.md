@@ -297,6 +297,25 @@ single caller edge for those two sites. Check individual calls with
 Rerun extraction after edits. The graph stays in the Git directory and the
 code-only command uses local parsing.
 
+To follow calls between crates, run the same extraction on `crates` and
+export a browsable tree. The two commands share the local graph.
+
+```powershell
+$workspaceMap = Join-Path (git rev-parse --absolute-git-dir) 'repo-map/graphify-crates'
+& $graphify extract crates --code-only --no-cluster --max-workers 2 --out $workspaceMap
+$graphFile = Join-Path $workspaceMap 'graphify-out/graph.json'
+$viewer = Join-Path $workspaceMap 'graphify-out/NeoEthos-crates.html'
+& $graphify tree --graph $graphFile --output $viewer --label 'NeoEthos crates' --top-k-edges 3
+```
+
+For example, Graphify marks the call from the joint specialist's `monthly`
+function to `monthly_closed_trade_metrics_v1` as inferred. The call appears in
+`crates/neoethos-trader/src/specialist_portfolio_joint.rs` and its definition is in
+`crates/neoethos-search/src/quality_monthly.rs`. This graph covers the selected
+`crates` directory. The standard HTML export loads D3 from `d3js.org` when
+opened. CLI queries work offline, and the Windows viewer generated on
+2026-11-19 embeds D3 7.9.0 for offline use.
+
 ## Completed Rust checkpoint
 
 Mapping branches (`codex/repo-map-*`) generate seven fresh static profiles for
