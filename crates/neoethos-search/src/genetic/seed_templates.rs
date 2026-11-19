@@ -476,8 +476,17 @@ pub fn seed_professional_templates(
     }
 
     let mut out: Vec<Gene> = Vec::with_capacity(count.min(TEMPLATES.len() * VARIANTS_PER_TEMPLATE));
-    for template in TEMPLATES.iter() {
-        for variant in 0..VARIANTS_PER_TEMPLATE {
+    // Cover every available strategy family before spending the next seed on
+    // another parameter variant of the same family. The old template-first
+    // ordering consumed the entire seed budget on trend_pullback whenever
+    // count <= VARIANTS_PER_TEMPLATE. Even with larger budgets, later families
+    // were invisible until earlier families had all ten variants.
+    //
+    // No new fitness preference is introduced here: template roles, variants,
+    // evaluator and promotion gates remain unchanged. This only makes the
+    // exploratory seed budget less sensitive to declaration order.
+    for variant in 0..VARIANTS_PER_TEMPLATE {
+        for template in TEMPLATES.iter() {
             if out.len() >= count {
                 return out;
             }
@@ -645,4 +654,62 @@ mod tests {
             .collect();
         assert!(template_feature_indices(&names).is_empty());
     }
+
+    #[test]
+    fn partial_seed_budget_covers_distinct_strategy_families_before_variants() {
+        // Every role can be resolved; the test is about admission order,
+        // not about a missing feature or a forced-random fallback.
+        let names: Vec<String> = TEMPLATES
+            .iter()
+            .flat_map(|template| {
+                template
+                    .roles
+                    .iter()
+                    .map(|role| format!("{}_{}", role.tf, role.primary))
+            })
+            .collect();
+
+        for requested in [1_usize, 2, 3, 4, 5, 6, 9, 10, 11, 17, 25, 49, 50] {
+            let mut rng = StdRng::seed_from_u64(20261119);
+            let seeds = seed_professional_templates(requested, &names, names.len(), &mut rng);
+            assert_eq!(seeds.len(), requested, "requested {requested}");
+            let covered: std::collections::HashSet<&str> = TEMPLATES
+                .iter()
+                .filter(|template| {
+                    seeds.iter().any(|gene| {
+                        gene.strategy_id
+                            .starts_with(&format!("seed_{}_v", template.name))
+                    })
+                })
+                .map(|template| template.name)
+                .collect();
+            assert_eq!(
+                covered.len(),
+                requested.min(TEMPLATES.len()),
+                "seed budget {requested} should cover families before variants"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_seed_budget_is_deterministic_for_fixed_rng_seed() {
+        let names: Vec<String> = TEMPLATES
+            .iter()
+            .flat_map(|template| {
+                template
+                    .roles
+                    .iter()
+                    .map(|role| format!("{}_{}", role.tf, role.primary))
+            })
+            .collect();
+        let mut a = StdRng::seed_from_u64(42);
+        let mut b = StdRng::seed_from_u64(42);
+        let first = seed_professional_templates(7, &names, names.len(), &mut a);
+        let replay = seed_professional_templates(7, &names, names.len(), &mut b);
+        assert_eq!(
+            first.iter().map(|g| &g.strategy_id).collect::<Vec<_>>(),
+            replay.iter().map(|g| &g.strategy_id).collect::<Vec<_>>()
+        );
+    }
+
 }
