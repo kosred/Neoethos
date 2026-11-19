@@ -1239,6 +1239,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "search-monthly-upside-objective"))]
     fn b9_monthly_upside_is_excluded_in_the_default_build_and_names_its_knob() {
         // The opt-in asymmetric monthly-upside objective (neo-671) must never
         // leak into a production build: with its feature OFF it is excluded
@@ -1269,6 +1270,26 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("search-monthly-upside-objective"), "{text}");
         assert!(text.contains("fitness_table"), "{text}");
+    }
+
+    #[test]
+    #[cfg(feature = "search-monthly-upside-objective")]
+    fn enabled_monthly_feature_reaches_the_search_selector() {
+        let caps = Capabilities::compiled();
+        let choice = ObjectiveChoice::new(
+            ObjectiveVariant::B9MonthlyUpside,
+            0,
+            RefusalLevels::permissive(),
+            &caps,
+            ScenarioKind::PropFirm,
+        )
+        .unwrap();
+        let mut config = DiscoveryConfig::default();
+        choice.apply(&mut config).unwrap();
+        assert_eq!(
+            config.fitness_table,
+            neoethos_search::scoring::FitnessTable::MonthlyUpsideV1
+        );
     }
 
     #[test]

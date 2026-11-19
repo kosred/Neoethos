@@ -610,7 +610,7 @@ pub enum CursorPolicy {
 }
 
 pub const POPULATION_LEVELS: &[usize] = &[512, 2048, 4096, 8192];
-pub const GENERATION_LEVELS: &[usize] = &[20, 50, 100, 200];
+pub const GENERATION_LEVELS: &[usize] = &[20, 50, 100, 200, 600];
 pub const GENE_WIDTH_LEVELS: &[usize] = &[4, 8, 12];
 pub const PREFILTER_WIDTH_LEVELS: &[usize] = &[120, 240, 480, 960];
 pub const PREFILTER_INSAMPLE_FRAC_LEVELS: &[f64] = &[0.60, 0.70, 0.80];
@@ -1228,6 +1228,17 @@ mod tests {
 
     fn caps() -> Capabilities {
         Capabilities::all_for_tests()
+    }
+
+    #[test]
+    fn six_hundred_generations_reach_the_config_without_reindexing_saved_levels() {
+        assert_eq!(&GENERATION_LEVELS[..4], &[20, 50, 100, 200]);
+        let mut levels = [0; FACTOR_COUNT];
+        levels[FactorId::Generations.index()] = 4;
+        let delta = SearchConfigDelta::new(levels, &caps()).expect("600-generation level");
+        let mut config = DiscoveryConfig::default();
+        delta.apply_structural(&mut config).unwrap();
+        assert_eq!(config.generations, 600);
     }
 
     #[test]

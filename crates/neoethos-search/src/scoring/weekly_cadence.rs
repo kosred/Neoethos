@@ -115,6 +115,7 @@ impl WeeklySearchLimitsV1 {
 /// this binding existed; they stay readable but are explicitly unbound and are
 /// refused as current equivalence/replay.
 pub const WEEKLY_SCORING_SEMANTICS_VERSION_V1: u16 = 2;
+pub const WEEKLY_GOAL_PROGRESS_SELECTION_SEMANTICS_V1: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,6 +127,17 @@ pub struct WeeklySearchObjectiveV1 {
     pub scoring_semantics_version: u16,
 }
 impl WeeklySearchObjectiveV1 {
+    /// Opt-in research selection that carries financial progress alongside
+    /// feasibility. Acceptance still uses the original risk/cadence limits.
+    pub fn with_goal_progress_selection(mut self) -> Self {
+        self.scoring_semantics_version = WEEKLY_GOAL_PROGRESS_SELECTION_SEMANTICS_V1;
+        self
+    }
+
+    pub fn uses_goal_progress_selection(&self) -> bool {
+        self.scoring_semantics_version == WEEKLY_GOAL_PROGRESS_SELECTION_SEMANTICS_V1
+    }
+
     /// New objectives must bind the current scoring semantics explicitly.
     pub fn current(cadence: WeeklyCadenceContractV1, limits: WeeklySearchLimitsV1) -> Self {
         Self {
@@ -137,6 +149,7 @@ impl WeeklySearchObjectiveV1 {
 
     pub fn is_current_scoring_semantics(&self) -> bool {
         self.scoring_semantics_version == WEEKLY_SCORING_SEMANTICS_VERSION_V1
+            || self.uses_goal_progress_selection()
     }
 
     /// Wire validation accepts the historical unbound form; current-equivalence
@@ -172,7 +185,7 @@ impl WeeklySearchObjectiveV1 {
         self.cadence.validate()?;
         self.limits.validate()?;
         anyhow::ensure!(
-            self.scoring_semantics_version <= WEEKLY_SCORING_SEMANTICS_VERSION_V1,
+            self.scoring_semantics_version <= WEEKLY_GOAL_PROGRESS_SELECTION_SEMANTICS_V1,
             "unsupported weekly scoring semantics version {}",
             self.scoring_semantics_version
         );
@@ -352,6 +365,8 @@ pub const WEEKLY_SELECTION_AXES_V1: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WeeklySelectionRankV1 {
     pub feasible: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub goal_progress_selection: bool,
     /// Intentional per-candidate invalid observation; never accepted.
     pub invalid: bool,
     pub front_rank: u32,
@@ -385,11 +400,20 @@ impl WeeklySelectionRankV1 {
             _ => {}
         }
         other
-            .front_rank
-            .cmp(&self.front_rank)
+            .goal_progress_selection
+            .cmp(&self.goal_progress_selection)
+            .reverse()
+            .then_with(|| other.front_rank.cmp(&self.front_rank))
             .then_with(|| self.crowding.total_cmp(&other.crowding))
-            .then_with(|| other.bounded_distance.total_cmp(&self.bounded_distance))
-            .then_with(|| self.fitness.total_cmp(&other.fitness))
+            .then_with(|| {
+                let financial = self.fitness.total_cmp(&other.fitness);
+                let constraint = other.bounded_distance.total_cmp(&self.bounded_distance);
+                if self.goal_progress_selection {
+                    financial.then(constraint)
+                } else {
+                    constraint.then(financial)
+                }
+            })
     }
 
     pub fn retention_cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -491,6 +515,7 @@ pub fn weekly_selection_ranks(
     let mut ranks = vec![
         WeeklySelectionRankV1 {
             feasible: false,
+            goal_progress_selection: objective.uses_goal_progress_selection(),
             invalid: false,
             front_rank: 0,
             crowding: 0.0,
@@ -518,6 +543,22 @@ pub fn weekly_selection_ranks(
         ranks[i].bounded_distance = axes.iter().map(|x| x / (1.0 + x)).sum();
         ranks[i].fitness = fitness[i];
     }
+    // Preserve the observed violation vector and its exact feasibility test.
+    // The opt-in policy changes the research coordinates: financial progress
+    // remains an objective even before a genome satisfies every constraint.
+    let selection_axes: Vec<_> = ranks
+        .iter()
+        .map(|rank| {
+            if rank.goal_progress_selection && !rank.invalid {
+                let mut coordinates = [0.0; WEEKLY_SELECTION_AXES_V1];
+                coordinates[0] = rank.bounded_distance;
+                coordinates[1] = -rank.fitness;
+                coordinates
+            } else {
+                rank.axes
+            }
+        })
+        .collect();
     let infeasible: Vec<usize> = (0..n).filter(|i| !feasible[*i]).collect();
     if infeasible.is_empty() {
         return Ok(ranks);
@@ -526,7 +567,9 @@ pub fn weekly_selection_ranks(
     let mut dominated_by = vec![0usize; n];
     for &candidate in &infeasible {
         for &other in &infeasible {
-            if other != candidate && weekly_dominates(&ranks[other].axes, &ranks[candidate].axes) {
+            if other != candidate
+                && weekly_dominates(&selection_axes[other], &selection_axes[candidate])
+            {
                 dominated_by[candidate] += 1;
             }
         }
@@ -556,18 +599,20 @@ pub fn weekly_selection_ranks(
             for axis in 0..WEEKLY_SELECTION_AXES_V1 {
                 let mut order = front.clone();
                 order.sort_by(|&a, &b| {
-                    ranks[a].axes[axis]
-                        .total_cmp(&ranks[b].axes[axis])
+                    selection_axes[a][axis]
+                        .total_cmp(&selection_axes[b][axis])
                         .then_with(|| a.cmp(&b))
                 });
-                let span = ranks[order[order.len() - 1]].axes[axis] - ranks[order[0]].axes[axis];
+                let span =
+                    selection_axes[order[order.len() - 1]][axis] - selection_axes[order[0]][axis];
                 if !(span > 0.0) {
                     continue;
                 }
                 crowding[positions[&order[0]]] += f64::INFINITY;
                 crowding[positions[&order[order.len() - 1]]] += f64::INFINITY;
                 for pos in 1..order.len() - 1 {
-                    let gap = ranks[order[pos + 1]].axes[axis] - ranks[order[pos - 1]].axes[axis];
+                    let gap =
+                        selection_axes[order[pos + 1]][axis] - selection_axes[order[pos - 1]][axis];
                     crowding[positions[&order[pos]]] += gap / span;
                 }
             }
@@ -581,7 +626,9 @@ pub fn weekly_selection_ranks(
         }
         for &index in &front {
             for &other in &infeasible {
-                if !removed[other] && weekly_dominates(&ranks[index].axes, &ranks[other].axes) {
+                if !removed[other]
+                    && weekly_dominates(&selection_axes[index], &selection_axes[other])
+                {
                     dominated_by[other] = dominated_by[other].saturating_sub(1);
                 }
             }
@@ -990,7 +1037,7 @@ mod tests {
         assert!(decoded.validate_current().is_err());
 
         let mut stale = current;
-        stale.scoring_semantics_version = WEEKLY_SCORING_SEMANTICS_VERSION_V1 + 1;
+        stale.scoring_semantics_version = WEEKLY_GOAL_PROGRESS_SELECTION_SEMANTICS_V1 + 1;
         assert!(stale.validate().is_err());
     }
     // Synthetic selection-only fixtures, not reports reconstructed from entry
@@ -1056,6 +1103,35 @@ mod tests {
         let fitness = vec![-1.0, -2.0, -3.0, -4.0, -5.0];
         let indices = [0, 1, 2, 3, 4];
         (objective, metrics, reports, fitness, indices)
+    }
+
+    #[test]
+    fn goal_progress_keeps_a_growth_path_without_relabeling_risk_violations() {
+        let objective = test_weekly_objective();
+        let observations = [
+            selection_metrics(1.0, 0.101, 0.02, 0.0, 500),
+            selection_metrics(10_000.0, 0.102, 0.02, 0.0, 500),
+        ];
+        let reports = [selection_report(1, 500), selection_report(1, 500)];
+        let goal_fitness = [0.001, 1.0];
+        let legacy =
+            weekly_selection_ranks(&objective, &observations, &reports, &goal_fitness).unwrap();
+        assert!(
+            legacy[0].front_rank < legacy[1].front_rank,
+            "the fixture exposes dominance by slightly smaller constraint shortfall"
+        );
+        let target = objective.with_goal_progress_selection();
+        let ranks =
+            weekly_selection_ranks(&target, &observations, &reports, &goal_fitness).unwrap();
+        assert_eq!(
+            ranks[0].front_rank, ranks[1].front_rank,
+            "better financial progress must remain a distinct research path"
+        );
+        assert!(
+            ranks.iter().all(|rank| !rank.feasible),
+            "a larger profit cannot waive the drawdown or cadence requirements"
+        );
+        assert_eq!(weekly_selection_order(&ranks)[0], 1);
     }
 
     #[test]

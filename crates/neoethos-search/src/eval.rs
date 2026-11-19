@@ -57,7 +57,8 @@ impl PopulationEvaluationV1 {
             self.metrics.len() == genes.len(),
             "evaluation observation count mismatch"
         );
-        if config.fitness_table == crate::scoring::fitness_table::FitnessTable::MonthlyUpsideV1 {
+        config.fitness_table.require_bound()?;
+        if config.fitness_table.requires_monthly_returns() {
             let months = self.monthly_returns.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("monthly objective requires same-execution monthly observations")
             })?;
@@ -2411,10 +2412,12 @@ pub(crate) fn validation_backtest_population_cpu(
 pub(crate) fn validation_backtest_population_cpu_with_monthly(
     inputs: PopulationEvalInputs<'_>,
 ) -> anyhow::Result<(Vec<[f64; 11]>, Vec<Vec<f64>>)> {
-    Ok(validation_backtest_population_observed_cpu::<false>(inputs, None)?
-        .into_iter()
-        .map(|(metrics, _trades, _report, monthly)| (metrics, monthly))
-        .unzip())
+    Ok(
+        validation_backtest_population_observed_cpu::<false>(inputs, None)?
+            .into_iter()
+            .map(|(metrics, _trades, _report, monthly)| (metrics, monthly))
+            .unzip(),
+    )
 }
 
 /// Same CPU population simulator with its actual account-risk ledger retained.
@@ -2564,16 +2567,16 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
             (metrics, trades, Vec::new(), Vec::new())
         } else {
             let (metrics, monthly) = fast_evaluate_strategy_core_with_monthly_returns(
-                    &gene_settings,
-                    close,
-                    high,
-                    low,
-                    &signals,
-                    &confidences,
-                    month_idx,
-                    day_idx,
-                    timestamps,
-                );
+                &gene_settings,
+                close,
+                high,
+                low,
+                &signals,
+                &confidences,
+                month_idx,
+                day_idx,
+                timestamps,
+            );
             (metrics, Vec::new(), Vec::new(), monthly)
         };
         let report = weekly

@@ -1424,25 +1424,40 @@ pub fn apply_metrics(
     monthly_returns: Option<&[Vec<f64>]>,
 ) {
     for (index, (gene, m)) in genes.iter_mut().zip(metrics.iter()).enumerate() {
-        gene.fitness =
-            if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideV1 {
-                // Opt-in B9 (docs section 14.7): the explicit selector wins over
-                // the legacy boolean chain and reads the evaluator's
-                // completed-month return vector. PopulationEvaluationV1::apply
-                // refuses missing/misaligned transport; a legitimately empty
-                // per-gene series still takes the scorer's -100.0 guard.
-                let months = monthly_returns
-                    .and_then(|series| series.get(index))
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                crate::scoring::ga_fitness_monthly_upside_v1(months, m)
-            } else if let Some(goal) = config.growth_goal {
-                crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
-            } else if config.growth_objective {
-                crate::scoring::ga_fitness_growth(m)
-            } else {
-                crate::scoring::ga_fitness(m)
-            };
+        gene.fitness = if let crate::scoring::FitnessTable::MonthlyGoalProgressV1(profile) =
+            config.fitness_table
+        {
+            let months = monthly_returns
+                .and_then(|series| series.get(index))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            crate::scoring::ga_fitness_monthly_goal_progress_v1(months, m, profile)
+        } else if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideV1 {
+            // Opt-in B9 (docs section 14.7): the explicit selector wins over
+            // the legacy boolean chain and reads the evaluator's
+            // completed-month return vector. PopulationEvaluationV1::apply
+            // refuses missing/misaligned transport; a legitimately empty
+            // per-gene series still takes the scorer's -100.0 guard.
+            let months = monthly_returns
+                .and_then(|series| series.get(index))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            crate::scoring::ga_fitness_monthly_upside_v1(months, m)
+        } else if config.fitness_table == crate::scoring::FitnessTable::ArchiveScore {
+            crate::scoring::archive_score(m)
+        } else if config.fitness_table == crate::scoring::FitnessTable::WindowScore {
+            crate::scoring::window_score(m)
+        } else if config.fitness_table == crate::scoring::FitnessTable::QualityScore {
+            crate::scoring::quality_score(m)
+        } else if config.fitness_table.require_bound().is_err() {
+            f64::NEG_INFINITY
+        } else if let Some(goal) = config.growth_goal {
+            crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
+        } else if config.growth_objective {
+            crate::scoring::ga_fitness_growth(m)
+        } else {
+            crate::scoring::ga_fitness(m)
+        };
         gene.sharpe_ratio = m[1];
         gene.max_drawdown = m[3];
         gene.win_rate = m[4];
@@ -2613,12 +2628,51 @@ mod generator_audit_tests {
     /// evaluator's completed-month return vector (neo-671 B9, docs §14.7), and
     /// the default selector must keep the canonical dispatch untouched.
     #[test]
+    fn named_tables_execute_their_selected_owner_instead_of_the_default_scorer() {
+        use crate::scoring::FitnessTable;
+        let observations = [
+            10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01,
+        ];
+        for (table, expected) in [
+            (
+                FitnessTable::ArchiveScore,
+                crate::scoring::archive_score(&observations),
+            ),
+            (
+                FitnessTable::WindowScore,
+                crate::scoring::window_score(&observations),
+            ),
+            (
+                FitnessTable::QualityScore,
+                crate::scoring::quality_score(&observations),
+            ),
+        ] {
+            let config = crate::genetic::EvaluationConfig {
+                fitness_table: table,
+                ..Default::default()
+            };
+            let mut genes = [Gene::default()];
+            apply_metrics(&mut genes, &[observations], &config, 30.0, None);
+            assert_eq!(
+                genes[0].fitness.to_bits(),
+                expected.to_bits(),
+                "{}",
+                table.name()
+            );
+        }
+    }
+
+    #[test]
     fn monthly_upside_selector_routes_fitness_and_default_dispatch_is_unchanged() {
         use crate::scoring::FitnessTable;
 
         let metrics = vec![
-            [10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01],
-            [20.0, 1.2, 20_100.0, 0.05, 0.78, 2.1, 0.4, 0.2, 50.0, 0.6, 0.02],
+            [
+                10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01,
+            ],
+            [
+                20.0, 1.2, 20_100.0, 0.05, 0.78, 2.1, 0.4, 0.2, 50.0, 0.6, 0.02,
+            ],
         ];
         let months = vec![vec![0.02; 10], vec![0.04, 0.04, 0.04, 0.04, -0.13]];
 

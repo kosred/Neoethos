@@ -156,7 +156,6 @@ pub struct DiscoveryRuntimeOverrides {
     /// Minimum historical-data window (years) discovery requires before it
     /// agrees to run; `0` skips the pre-flight check.
     pub min_history_years: u32,
-
 }
 
 impl Default for DiscoveryRuntimeOverrides {
@@ -1757,6 +1756,14 @@ impl DiscoveryConfig {
             )?,
             limits,
         );
+        let objective = if matches!(
+            self.fitness_table,
+            crate::scoring::FitnessTable::MonthlyGoalProgressV1(profile) if profile.uses_goal_progress_selection()
+        ) {
+            objective.with_goal_progress_selection()
+        } else {
+            objective
+        };
         objective.validate_current()?;
         Ok(Some(objective))
     }
@@ -11832,10 +11839,8 @@ pub fn run_prefilter_ranking_audit_v1(
     let features = selection.features();
     let ohlcv = selection.ohlcv();
     install_gene_stop_band_scale_for_dataset(&research_config, ohlcv);
-    let financial_geometry = resolve_prefilter_financial_geometry_v1(
-        &research_config,
-        ohlcv.close.last().copied(),
-    );
+    let financial_geometry =
+        resolve_prefilter_financial_geometry_v1(&research_config, ohlcv.close.last().copied());
     let available = features.names.len();
     let prefilter_top_k = resolve_prefilter_top_k(
         research_config.runtime_overrides.prefilter_top_k,
@@ -11853,7 +11858,9 @@ pub fn run_prefilter_ranking_audit_v1(
         insample_frac: research_config
             .runtime_overrides
             .resolved_prefilter_insample_frac(),
-        min_per_tf: research_config.runtime_overrides.prefilter_min_per_timeframe,
+        min_per_tf: research_config
+            .runtime_overrides
+            .prefilter_min_per_timeframe,
         max_hold_bars: financial_geometry.max_hold_bars,
         atr_period: 14,
         sl_atr_mult: financial_geometry.stop_atr_multiplier,
@@ -11890,16 +11897,18 @@ pub fn run_prefilter_ranking_audit_v1(
     let ranking_json = |ranking: &[(usize, String, f64, f64, u32, bool)]| {
         ranking
             .iter()
-            .map(|(index, name, score, instability, timeframe_group, purged)| {
-                serde_json::json!({
-                    "index": index,
-                    "name": name,
-                    "score": score,
-                    "instability": instability,
-                    "timeframe_group": timeframe_group,
-                    "purged": purged
-                })
-            })
+            .map(
+                |(index, name, score, instability, timeframe_group, purged)| {
+                    serde_json::json!({
+                        "index": index,
+                        "name": name,
+                        "score": score,
+                        "instability": instability,
+                        "timeframe_group": timeframe_group,
+                        "purged": purged
+                    })
+                },
+            )
             .collect::<Vec<_>>()
     };
     let report = serde_json::json!({
@@ -12240,8 +12249,7 @@ fn prefilter_features(
 ) -> Result<(FeatureFrame, PrefilterCensus)> {
     let mut inner_spec = spec.clone();
     inner_spec.audit_ranking = false;
-    let (frame, census, _ranking) =
-        prefilter_features_with_ranking(features, ohlcv, &inner_spec)?;
+    let (frame, census, _ranking) = prefilter_features_with_ranking(features, ohlcv, &inner_spec)?;
     Ok((frame, census))
 }
 
@@ -12252,7 +12260,11 @@ fn prefilter_features_with_ranking(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     spec: &PrefilterSpec,
-) -> Result<(FeatureFrame, PrefilterCensus, Vec<(usize, String, f64, f64, u32, bool)>)> {
+) -> Result<(
+    FeatureFrame,
+    PrefilterCensus,
+    Vec<(usize, String, f64, f64, u32, bool)>,
+)> {
     let n_rows = features.n_samples();
     let n_cols = features.n_features();
     if n_rows < 2 || n_cols <= spec.top_k {

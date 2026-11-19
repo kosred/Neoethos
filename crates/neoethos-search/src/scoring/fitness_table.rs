@@ -9,11 +9,11 @@
 //!
 //! `GaFitness` is the default and keeps the canonical three-way dispatch
 //! (growth goal -> growth -> `ga_fitness`) byte-for-byte. Only
-//! `MonthlyUpsideV1` is bound today: it routes fitness through
+//! The four named tables and `MonthlyUpsideV1` are bound. The latter routes through
 //! `crate::scoring::ga_fitness_monthly_upside_v1` using the evaluator's
-//! completed-month return vector. The remaining variants are declared so the
-//! autoresearch knobs can name them, but they do not change the GA until their
-//! own §14.7 follow-ups land.
+//! completed-month return vector. NetPerBarInMarket and ExpectancyTStat remain
+//! declared pending their own evaluation inputs and binding.
+use super::monthly_upside::MonthlyGoalProfileV1;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -34,6 +34,8 @@ pub enum FitnessTable {
     /// `crate::scoring::ga_fitness_monthly_upside_v1` in
     /// `genetic::evolution_math::apply_metrics`.
     MonthlyUpsideV1,
+    /// A validated goal and bounded weight preset, transported with the recipe.
+    MonthlyGoalProgressV1(MonthlyGoalProfileV1),
 }
 
 impl FitnessTable {
@@ -48,10 +50,12 @@ impl FitnessTable {
             Self::NetPerBarInMarket => "net_per_bar_in_market",
             Self::ExpectancyTStat => "expectancy_t_stat",
             Self::MonthlyUpsideV1 => "monthly_upside_v1",
+            Self::MonthlyGoalProgressV1(_) => "monthly_goal_progress_v1",
         }
     }
 
-    /// Parses a snake_case selector name. Unknown names fall back to the
+    /// Parses a parameter-free selector name. Goal profiles require their
+    /// explicit validated target and preset. Unknown names fall back to the
     /// canonical default rather than inventing a table.
     pub fn from_name(name: &str) -> Self {
         match name.trim().to_ascii_lowercase().as_str() {
@@ -70,6 +74,22 @@ impl FitnessTable {
     /// the field existed.
     pub fn is_default(&self) -> bool {
         *self == Self::GaFitness
+    }
+
+    pub fn requires_monthly_returns(self) -> bool {
+        matches!(self, Self::MonthlyUpsideV1 | Self::MonthlyGoalProgressV1(_))
+    }
+
+    pub fn require_bound(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !matches!(self, Self::NetPerBarInMarket | Self::ExpectancyTStat),
+            "fitness table {} has no implemented evaluator",
+            self.name()
+        );
+        if let Self::MonthlyGoalProgressV1(profile) = self {
+            profile.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -108,5 +128,23 @@ mod tests {
         let parsed: FitnessTable =
             serde_json::from_str(&json).expect("snake_case selector deserializes");
         assert_eq!(parsed, FitnessTable::MonthlyUpsideV1);
+    }
+
+    #[test]
+    fn parameterized_goal_table_preserves_the_preset_and_frozen_target_on_the_wire() {
+        let profile = MonthlyGoalProfileV1::new(20, 0.04).unwrap();
+        let table = FitnessTable::MonthlyGoalProgressV1(profile);
+        let json = serde_json::to_string(&table).unwrap();
+        assert_eq!(serde_json::from_str::<FitnessTable>(&json).unwrap(), table);
+        assert!(table.requires_monthly_returns());
+        table.require_bound().unwrap();
+        assert!(FitnessTable::ExpectancyTStat.require_bound().is_err());
+        assert!(FitnessTable::NetPerBarInMarket.require_bound().is_err());
+        assert!(
+            serde_json::from_str::<FitnessTable>(
+                r#"{"monthly_goal_progress_v1":{"preset":255,"monthly_target_ppm":40000}}"#
+            )
+            .is_err()
+        );
     }
 }

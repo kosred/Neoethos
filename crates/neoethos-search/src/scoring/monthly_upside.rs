@@ -60,6 +60,140 @@
 //! (docs/autoresearch-loop.md §14.7).
 
 use neoethos_core::utils::series::median_ignore_nan;
+use serde::{Deserialize, Serialize};
+
+/// A bounded research profile. The target is supplied by the frozen goal set;
+/// the preset chooses only growth, median-return and downside weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MonthlyGoalProfileV1 {
+    preset: u8,
+    monthly_target_ppm: u32,
+    goal_progress_selection: bool,
+}
+
+impl<'de> Deserialize<'de> for MonthlyGoalProfileV1 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            preset: u8,
+            monthly_target_ppm: u32,
+            goal_progress_selection: bool,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            preset: wire.preset,
+            monthly_target_ppm: wire.monthly_target_ppm,
+            goal_progress_selection: wire.goal_progress_selection,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+impl MonthlyGoalProfileV1 {
+    pub const PRESET_COUNT: u8 = 25;
+
+    pub fn new(preset: u8, monthly_target: f64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            monthly_target.is_finite() && monthly_target > 0.0 && monthly_target <= 1.0,
+            "monthly goal must be finite and inside (0, 1]"
+        );
+        let ppm = (monthly_target * 1_000_000.0).round();
+        anyhow::ensure!(
+            (monthly_target - ppm / 1_000_000.0).abs() <= 1e-12,
+            "monthly goal must be exactly representable in parts per million"
+        );
+        let value = Self {
+            preset,
+            monthly_target_ppm: ppm as u32,
+            goal_progress_selection: true,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.preset < Self::PRESET_COUNT,
+            "unknown monthly-goal preset"
+        );
+        anyhow::ensure!(
+            (1..=1_000_000).contains(&self.monthly_target_ppm),
+            "monthly-goal target is outside its admitted range"
+        );
+        Ok(())
+    }
+
+    pub fn preset(self) -> u8 {
+        self.preset
+    }
+    pub fn target_return(self) -> f64 {
+        f64::from(self.monthly_target_ppm) / 1_000_000.0
+    }
+    pub fn target_ppm(self) -> u32 {
+        self.monthly_target_ppm
+    }
+    pub fn uses_goal_progress_selection(self) -> bool {
+        self.goal_progress_selection
+    }
+    /// Paired control: hold the scorer/target fixed and change only selection.
+    pub fn with_legacy_selection_control(mut self) -> Self {
+        self.goal_progress_selection = false;
+        self
+    }
+
+    pub fn weights(self) -> anyhow::Result<[f64; 3]> {
+        self.validate()?;
+        // Fix the growth scale: positive rescalings of all three weights
+        // produce the same ordering and must not become separate search arms.
+        Ok([
+            1.0,
+            [0.0, 0.25, 0.5, 1.0, 2.0][usize::from(self.preset % 5)],
+            [0.125, 0.25, 0.5, 1.0, 2.0][usize::from(self.preset / 5)],
+        ])
+    }
+}
+
+/// Observed monthly log-growth pace and median return, normalized to the
+/// frozen monthly goal, minus the mean loss of the worst 10% of months.
+/// All positive returns retain a growth gradient. Win rate supplies no bonus.
+/// This is research guidance; the independent acceptance gates remain binding.
+pub fn ga_fitness_monthly_goal_progress_v1(
+    months: &[f64],
+    metrics: &[f64; 11],
+    profile: MonthlyGoalProfileV1,
+) -> f64 {
+    let Ok([growth_weight, median_weight, tail_weight]) = profile.weights() else {
+        return f64::NEG_INFINITY;
+    };
+    if metrics.iter().any(|value| !value.is_finite())
+        || months
+            .iter()
+            .any(|value| !value.is_finite() || *value <= -1.0)
+    {
+        return f64::NEG_INFINITY;
+    }
+    if metrics[8] < 1.0 || months.is_empty() {
+        return -100.0;
+    }
+    let goal = profile.target_return();
+    let growth =
+        months.iter().map(|value| value.ln_1p()).sum::<f64>() / months.len() as f64 / goal.ln_1p();
+    let median = median_ignore_nan(months) / goal;
+    let mut ordered = months.to_vec();
+    ordered.sort_by(f64::total_cmp);
+    let tail_count = ordered.len().div_ceil(10);
+    let tail_mean = ordered[..tail_count].iter().sum::<f64>() / tail_count as f64;
+    let downside = -tail_mean.min(0.0) / goal;
+    let score = growth_weight * growth + median_weight * median - tail_weight * downside;
+    if score.is_finite() {
+        score
+    } else {
+        f64::NEG_INFINITY
+    }
+}
 
 /// Median monthly return contribution: clipped to `[-10, +200]` percent.
 pub const MEDIAN_CLAMP_MIN_PCT: f64 = -10.0;
@@ -119,8 +253,8 @@ pub fn ga_fitness_monthly_upside_v1(monthly_returns: &[f64], metrics: &[f64; 11]
 
     // One-sided upside bonus: credit for how far the best month exceeded the
     // typical one, never negative, capped.
-    let upside_bonus = ((best_pct - median_pct).max(0.0) * UPSIDE_BONUS_WEIGHT)
-        .min(UPSIDE_BONUS_CAP_PCT);
+    let upside_bonus =
+        ((best_pct - median_pct).max(0.0) * UPSIDE_BONUS_WEIGHT).min(UPSIDE_BONUS_CAP_PCT);
 
     // Tail-loss penalty: non-zero ONLY when the worst month falls below
     // -TAIL_THRESHOLD_PCT, scaling with the depth below it.
@@ -153,26 +287,124 @@ mod tests {
     }
 
     #[test]
+    fn monthly_goal_progress_cannot_prefer_near_zero_profit_for_crossing_the_win_floor() {
+        let strong = [0.02; 12];
+        let near_zero = [0.0001; 12];
+        assert!(
+            ga_fitness_monthly_upside_v1(&near_zero, &metrics(0.51, 100.0))
+                > ga_fitness_monthly_upside_v1(&strong, &metrics(0.49, 100.0))
+        );
+        for preset in 0..MonthlyGoalProfileV1::PRESET_COUNT {
+            let profile = MonthlyGoalProfileV1::new(preset, 0.04).unwrap();
+            assert!(
+                ga_fitness_monthly_goal_progress_v1(&strong, &metrics(0.49, 100.0), profile)
+                    > ga_fitness_monthly_goal_progress_v1(
+                        &near_zero,
+                        &metrics(0.51, 100.0),
+                        profile
+                    ),
+                "preset {preset} must reward economic progress over the win-rate discontinuity"
+            );
+        }
+    }
+
+    #[test]
+    fn monthly_goal_profiles_must_change_a_return_downside_tradeoff() {
+        let steady = [0.01; 12];
+        let variable = [
+            0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, -0.04, -0.04, -0.04,
+        ];
+        let observations = metrics(0.6, 100.0);
+        let growth_profile = MonthlyGoalProfileV1::new(0, 0.04).unwrap();
+        let downside_profile = MonthlyGoalProfileV1::new(20, 0.04).unwrap();
+        assert!(
+            ga_fitness_monthly_goal_progress_v1(&variable, &observations, growth_profile)
+                > ga_fitness_monthly_goal_progress_v1(&steady, &observations, growth_profile)
+        );
+        assert!(
+            ga_fitness_monthly_goal_progress_v1(&steady, &observations, downside_profile)
+                > ga_fitness_monthly_goal_progress_v1(&variable, &observations, downside_profile)
+        );
+    }
+
+    #[test]
+    fn monthly_goal_profiles_reject_invalid_or_silently_rounded_targets() {
+        for target in [0.0, -0.04, f64::NAN, f64::INFINITY, 1.1, 0.0000001] {
+            assert!(MonthlyGoalProfileV1::new(0, target).is_err());
+        }
+        assert!(MonthlyGoalProfileV1::new(25, 0.04).is_err());
+        let profile = MonthlyGoalProfileV1::new(24, 0.04).unwrap();
+        assert_eq!(profile.target_ppm(), 40_000);
+        assert_eq!(profile.weights().unwrap(), [1.0, 2.0, 2.0]);
+        let serialized = serde_json::to_vec(&profile).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<MonthlyGoalProfileV1>(&serialized).unwrap(),
+            profile
+        );
+        assert!(
+            serde_json::from_str::<MonthlyGoalProfileV1>(
+                r#"{"preset":255,"monthly_target_ppm":40000,"goal_progress_selection":true}"#
+            )
+            .is_err()
+        );
+        let untrusted = MonthlyGoalProfileV1 {
+            preset: 255,
+            monthly_target_ppm: 40_000,
+            goal_progress_selection: true,
+        };
+        assert!(untrusted.validate().is_err());
+        assert_eq!(
+            ga_fitness_monthly_goal_progress_v1(&[0.02; 12], &metrics(0.6, 100.0), untrusted),
+            f64::NEG_INFINITY
+        );
+    }
+
+    #[test]
+    fn monthly_goal_progress_refuses_bankruptcy_and_nonfinite_months() {
+        let profile = MonthlyGoalProfileV1::new(0, 0.04).unwrap();
+        for months in [
+            vec![0.04, -1.0],
+            vec![0.04, -1.1],
+            vec![f64::NAN],
+            vec![f64::INFINITY],
+        ] {
+            assert_eq!(
+                ga_fitness_monthly_goal_progress_v1(&months, &metrics(0.6, 100.0), profile),
+                f64::NEG_INFINITY
+            );
+        }
+    }
+
+    #[test]
     fn zero_variance_scores_the_median_with_no_penalty() {
         // The whole point: a flat month series is not punished for its small
         // variance. base = 3.0, no bonus (best == median), no tail, no wr
         // bonus (wr 0.4 < floor).
         let months = [0.03; 10];
         let s = ga_fitness_monthly_upside_v1(&months, &metrics(0.40, 100.0));
-        assert!((s - 3.0).abs() < 1e-9, "flat +3%/month must score exactly 3.0, got {s}");
+        assert!(
+            (s - 3.0).abs() < 1e-9,
+            "flat +3%/month must score exactly 3.0, got {s}"
+        );
     }
 
     #[test]
     fn median_clamps_to_minus_ten_and_plus_two_hundred() {
         let huge = [5.0; 4]; // +500%/month → base clamps to +200, no bonus/tail
         let s = ga_fitness_monthly_upside_v1(&huge, &metrics(0.40, 100.0));
-        assert!((s - 200.0).abs() < 1e-9, "median clamp high bound broken: {s}");
+        assert!(
+            (s - 200.0).abs() < 1e-9,
+            "median clamp high bound broken: {s}"
+        );
 
         // -50%/month → base clamps to -10 AND the tail penalty applies:
         // (2.0 + -50.0) * 1.0 = -48.0 → -58.0 total.
         let awful = [-0.5; 4];
         let s = ga_fitness_monthly_upside_v1(&awful, &metrics(0.40, 100.0));
-        assert!((s - (-58.0)).abs() < 1e-9, "median clamp + tail broken: {s}");
+        assert!(
+            (s - (-58.0)).abs() < 1e-9,
+            "median clamp + tail broken: {s}"
+        );
     }
 
     #[test]
@@ -180,12 +412,18 @@ mod tests {
         // Worst month -1.9%: above the -2.0% threshold → zero tail penalty.
         let calm = [0.03, 0.03, 0.03, 0.03, -0.019];
         let s_calm = ga_fitness_monthly_upside_v1(&calm, &metrics(0.40, 100.0));
-        assert!((s_calm - 3.0).abs() < 1e-9, "worst -1.9% must cost nothing: {s_calm}");
+        assert!(
+            (s_calm - 3.0).abs() < 1e-9,
+            "worst -1.9% must cost nothing: {s_calm}"
+        );
 
         // Worst month -2.1%: penalty = (2.0 + -2.1) * 1.0 = -0.1.
         let clipped = [0.03, 0.03, 0.03, 0.03, -0.021];
         let s_clipped = ga_fitness_monthly_upside_v1(&clipped, &metrics(0.40, 100.0));
-        assert!((s_clipped - 2.9).abs() < 1e-9, "worst -2.1% must cost 0.1: {s_clipped}");
+        assert!(
+            (s_clipped - 2.9).abs() < 1e-9,
+            "worst -2.1% must cost 0.1: {s_clipped}"
+        );
     }
 
     #[test]
@@ -206,9 +444,15 @@ mod tests {
         let lumpy = [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.08];
         let s_flat = ga_fitness_monthly_upside_v1(&flat, &metrics(0.40, 100.0));
         let s_lumpy = ga_fitness_monthly_upside_v1(&lumpy, &metrics(0.40, 100.0));
-        assert!((s_flat - 2.0).abs() < 1e-9, "flat must score exactly the median: {s_flat}");
+        assert!(
+            (s_flat - 2.0).abs() < 1e-9,
+            "flat must score exactly the median: {s_flat}"
+        );
         // (8 - 2) * 0.25 = 1.5 → 3.5.
-        assert!((s_lumpy - 3.5).abs() < 1e-9, "upside bonus math broken: {s_lumpy}");
+        assert!(
+            (s_lumpy - 3.5).abs() < 1e-9,
+            "upside bonus math broken: {s_lumpy}"
+        );
     }
 
     #[test]
@@ -270,7 +514,10 @@ mod tests {
         );
         // Pins, so a silent constant drift cannot re-break the selection:
         // catastrophic = 4.0 + 0.0 - 11.0 + 5.0 = -2.0; sane = 2.0 + 0.0 + 5.0 = 7.0.
-        assert!((s_catastrophic - (-2.0)).abs() < 1e-9, "catastrophic pin: {s_catastrophic}");
+        assert!(
+            (s_catastrophic - (-2.0)).abs() < 1e-9,
+            "catastrophic pin: {s_catastrophic}"
+        );
         assert!((s_sane - 7.0).abs() < 1e-9, "sane pin: {s_sane}");
     }
 
@@ -291,7 +538,10 @@ mod tests {
         );
 
         // No monthly observations → -100.0.
-        assert_eq!(ga_fitness_monthly_upside_v1(&[], &metrics(0.60, 100.0)), -100.0);
+        assert_eq!(
+            ga_fitness_monthly_upside_v1(&[], &metrics(0.60, 100.0)),
+            -100.0
+        );
 
         // A corrupted month (non-finite) → -100.0, not a guessed median.
         let corrupted = [0.02, 0.02, f64::NAN, 0.02];

@@ -775,6 +775,15 @@ fn population_evaluation_passes_the_monthly_vector_into_the_selected_fitness() {
         crate::scoring::ga_fitness_monthly_upside_v1(&months, &m),
         "the observation must hand its monthly vector to the selected scorer"
     );
+    let profile = crate::scoring::MonthlyGoalProfileV1::new(0, 0.04).unwrap();
+    selected_cfg.fitness_table = crate::scoring::FitnessTable::MonthlyGoalProgressV1(profile);
+    observation
+        .apply(&mut selected_genes, &selected_cfg, 1.0)
+        .unwrap();
+    assert_eq!(
+        selected_genes[0].fitness,
+        crate::scoring::ga_fitness_monthly_goal_progress_v1(&months, &m, profile)
+    );
 
     // The metrics-only construction keeps the canonical default dispatch.
     let mut plain_genes = vec![crate::Gene::default()];
@@ -796,18 +805,25 @@ fn population_evaluation_passes_the_monthly_vector_into_the_selected_fitness() {
 #[test]
 fn monthly_selector_refuses_missing_or_misaligned_execution_observations() {
     let mut config = crate::genetic::EvaluationConfig::default();
-    config.fitness_table = crate::scoring::FitnessTable::MonthlyUpsideV1;
     let mut genes = [crate::Gene::default()];
     let metrics = vec![[1.0; 11]];
-    for monthly_returns in [None, Some(Vec::new())] {
-        let observation = PopulationEvaluationV1 {
-            metrics: metrics.clone(),
-            cadence: None,
-            monthly_returns,
-        };
-        let error = observation
-            .apply(&mut genes, &config, 30.0)
-            .expect_err("missing transport is not an unprofitable strategy");
-        assert!(error.to_string().contains("monthly"));
+    for selector in [
+        crate::scoring::FitnessTable::MonthlyUpsideV1,
+        crate::scoring::FitnessTable::MonthlyGoalProgressV1(
+            crate::scoring::MonthlyGoalProfileV1::new(0, 0.04).unwrap(),
+        ),
+    ] {
+        config.fitness_table = selector;
+        for monthly_returns in [None, Some(Vec::new())] {
+            let observation = PopulationEvaluationV1 {
+                metrics: metrics.clone(),
+                cadence: None,
+                monthly_returns,
+            };
+            let error = observation
+                .apply(&mut genes, &config, 30.0)
+                .expect_err("missing transport is not an unprofitable strategy");
+            assert!(error.to_string().contains("monthly"));
+        }
     }
 }

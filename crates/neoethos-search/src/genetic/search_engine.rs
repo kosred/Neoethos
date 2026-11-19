@@ -3564,6 +3564,13 @@ fn weekly_generation_selection(
         .find(|rank| !rank.invalid && rank.feasible)
     {
         2.0 + smooth(feasible.fitness)
+    } else if objective.uses_goal_progress_selection() {
+        sorted_ranks
+            .iter()
+            .filter(|rank| !rank.invalid)
+            .map(|rank| smooth(rank.fitness))
+            .max_by(f64::total_cmp)
+            .unwrap_or(f64::NEG_INFINITY)
     } else if let Some(best) = sorted_ranks
         .iter()
         .filter(|rank| !rank.invalid)

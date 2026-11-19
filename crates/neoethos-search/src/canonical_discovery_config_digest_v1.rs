@@ -168,6 +168,29 @@ pub(crate) fn canonical_discovery_config_digest_v1(
     if !fitness_selector.is_default() {
         encoder.string("fitness_table", fitness_selector.name())?;
     }
+    if matches!(
+        fitness_selector,
+        crate::scoring::FitnessTable::ArchiveScore
+            | crate::scoring::FitnessTable::WindowScore
+            | crate::scoring::FitnessTable::QualityScore
+    ) {
+        encoder.string("fitness_table.binding_revision", "named-owner-v1")?;
+    }
+    if let crate::scoring::FitnessTable::MonthlyGoalProgressV1(profile) = fitness_selector {
+        encoder.usize("fitness_table.goal_preset", usize::from(profile.preset()))?;
+        encoder.usize(
+            "fitness_table.monthly_target_ppm",
+            profile.target_ppm() as usize,
+        )?;
+        encoder.string(
+            "fitness_table.selection_policy",
+            if profile.uses_goal_progress_selection() {
+                "goal-progress-fronts-v1"
+            } else {
+                "legacy-constraint-fronts-v2"
+            },
+        )?;
+    }
     if *holding_horizon_bars != 0 {
         encoder.usize("max_hold_bars", *holding_horizon_bars)?;
     }
@@ -577,6 +600,30 @@ const fn discovery_mode_wire_v1(mode: DiscoveryMode) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn goal_weight_profile_and_target_cannot_share_a_config_identity() {
+        let mut config = DiscoveryConfig::default();
+        let mut identities = std::collections::HashSet::new();
+        for (preset, target, goal_selection) in [
+            (0, 0.04, true),
+            (1, 0.04, true),
+            (0, 0.05, true),
+            (0, 0.04, false),
+        ] {
+            let profile = crate::scoring::MonthlyGoalProfileV1::new(preset, target).unwrap();
+            config.fitness_table =
+                crate::scoring::FitnessTable::MonthlyGoalProgressV1(if goal_selection {
+                    profile
+                } else {
+                    profile.with_legacy_selection_control()
+                });
+            assert!(
+                identities.insert(canonical_discovery_config_digest_v1(&config).unwrap()),
+                "different goal recipes must not alias under the selector's shared name"
+            );
+        }
+    }
+
     #[test]
     fn active_fitness_selector_and_holding_horizon_have_distinct_config_identities() {
         let original = DiscoveryConfig::default();
