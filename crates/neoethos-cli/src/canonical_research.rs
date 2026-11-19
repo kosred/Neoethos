@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 25] = [
+const OPTIONAL: [&str; 27] = [
     "--higher",
     "--population",
     "--generations",
@@ -37,6 +37,8 @@ const OPTIONAL: [&str; 25] = [
     "--candidates",
     "--max-batches",
     "--cpu-threads",
+    "--training-percent",
+    "--screening-round-trip-pips",
     "--quote-replay-bundle",
     "--quote-replay-sha256",
     "--quote-replay-store",
@@ -613,7 +615,11 @@ fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String
         .into_iter()
         .chain(RESUME_FLAGS)
         .chain(NEW_SEARCH_FLAGS)
-        .chain(["--specialist-portfolio"])
+        .chain([
+            "--specialist-portfolio",
+            "--training-percent",
+            "--screening-round-trip-pips",
+        ])
     {
         if let Some(value) = args.0.get(flag) {
             push(discovery_args, flag, value);

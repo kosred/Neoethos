@@ -3019,6 +3019,7 @@ fn trim_recent_history(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    full_research_training: bool,
 ) -> Result<(FeatureFrame, Ohlcv, Option<usize>)> {
     let frame_rows = features.n_samples();
     let ohlcv_rows = ohlcv.close.len();
@@ -3058,7 +3059,10 @@ fn trim_recent_history(
     if row_cap > 0 && row_cap < available_rows {
         start_idx = available_rows - row_cap;
     }
-    if config.mode == DiscoveryMode::Risky && config.runtime_overrides.risky_survival_only {
+    if config.mode == DiscoveryMode::Risky
+        && config.runtime_overrides.risky_survival_only
+        && !full_research_training
+    {
         // Search an actual deadline-length episode rather than require a fast
         // compounder to survive many additional years after reaching its goal.
         let horizon_ms = config.risky_horizon_days * 86_400_000.0;
@@ -7256,7 +7260,7 @@ fn prepare_saved_candidate_replay<'a>(
     // context owns this guard; callers must not split the guard from the
     // materialized signals/similarity work.
     let result = research.discovery_result();
-    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let inputs = CanonicalDiscoveryRunInputs::with_research_holdout(input)?;
     let selection = inputs.selection();
     anyhow::ensure!(
         &result.selection_scope == selection.scope(),
@@ -9993,8 +9997,30 @@ pub const DEFAULT_OOS_HOLDOUT_FRACTION: f64 = 0.2;
 pub fn canonical_discovery_normalization_training_rows(
     row_count: usize,
 ) -> Result<std::ops::Range<usize>> {
-    anyhow::ensure!(row_count > 0, "canonical discovery input is empty");
     let split_at = ((row_count as f64) * (1.0 - DEFAULT_OOS_HOLDOUT_FRACTION)).floor() as usize;
+    checked_canonical_training_prefix(row_count, split_at)
+}
+
+pub fn canonical_research_training_rows_at_percent(
+    row_count: usize,
+    percent: usize,
+) -> Result<std::ops::Range<usize>> {
+    anyhow::ensure!(
+        (1..100).contains(&percent),
+        "training percent must be 1 through 99"
+    );
+    let rows = row_count
+        .checked_mul(percent)
+        .context("training row count overflow")?
+        / 100;
+    checked_canonical_training_prefix(row_count, rows)
+}
+
+fn checked_canonical_training_prefix(
+    row_count: usize,
+    split_at: usize,
+) -> Result<std::ops::Range<usize>> {
+    anyhow::ensure!(row_count > 0, "canonical discovery input is empty");
     anyhow::ensure!(split_at > 0, "in-sample selection window is empty");
     anyhow::ensure!(
         split_at < row_count,
@@ -10142,6 +10168,7 @@ struct CanonicalDiscoveryRunInputs<'a> {
     selection: ScopedDiscoveryInput<'a>,
     calibration: Option<ScopedDiscoveryInput<'a>>,
     holdout: Option<ScopedDiscoveryInput<'a>>,
+    full_research_training: bool,
 }
 
 impl<'a> CanonicalDiscoveryRunInputs<'a> {
@@ -10150,6 +10177,7 @@ impl<'a> CanonicalDiscoveryRunInputs<'a> {
             selection: ScopedDiscoveryInput::entire(input)?,
             calibration: None,
             holdout: None,
+            full_research_training: false,
         };
         validate_discovery_scope_pair(input, inputs.selection.scope(), None, None)?;
         Ok(inputs)
@@ -10159,6 +10187,25 @@ impl<'a> CanonicalDiscoveryRunInputs<'a> {
         let row_count = input.ohlcv().len();
         let training_rows = canonical_discovery_normalization_training_rows(row_count)?;
         Self::with_holdout_at(input, training_rows.end)
+    }
+
+    fn with_research_holdout(input: &'a CanonicalSearchRunInputV2<'_>) -> Result<Self> {
+        let Some(training) = input
+            .receipt()
+            .feature_build_options()
+            .and_then(|options| options.normalization_training_rows.as_ref())
+        else {
+            return Self::with_holdout(input);
+        };
+        anyhow::ensure!(
+            training.start == 0,
+            "CPU research training must be a chronological prefix"
+        );
+        let rows = input.ohlcv().len();
+        let mut scoped = Self::with_holdout_at(input, training.end)?;
+        scoped.full_research_training =
+            *training != canonical_discovery_normalization_training_rows(rows)?;
+        Ok(scoped)
     }
 
     fn with_holdout_at(input: &'a CanonicalSearchRunInputV2<'_>, split_at: usize) -> Result<Self> {
@@ -10197,6 +10244,7 @@ impl<'a> CanonicalDiscoveryRunInputs<'a> {
                 CanonicalSearchWindowRoleV1::Holdout,
                 final_start..row_count,
             )?),
+            full_research_training: false,
         };
         validate_discovery_scope_pair(
             input,
@@ -10834,7 +10882,7 @@ where
     if !result.portfolio.is_empty() {
         let mut research_config = config.clone();
         apply_research_contract_to_discovery_config(&mut research_config, contract);
-        let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+        let inputs = CanonicalDiscoveryRunInputs::with_research_holdout(input)?;
         let holdout = inputs
             .holdout()
             .expect("with_holdout always constructs a held-out evidence suffix");
@@ -10979,7 +11027,7 @@ pub fn with_canonical_research_finalist_v3<T>(
         .validate_against_input(input)?;
     let result = research.discovery_result();
     ensure_non_empty_portfolio(result, "resume frozen canonical research")?;
-    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let inputs = CanonicalDiscoveryRunInputs::with_research_holdout(input)?;
     let holdout = inputs.holdout().expect("three-way canonical holdout");
     anyhow::ensure!(
         &result.selection_scope == inputs.selection().scope()
@@ -11092,7 +11140,14 @@ where
 {
     #[cfg(feature = "gpu")]
     let _cubecl_population_residency = crate::cubecl_eval::cubecl_residency_scope();
-    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    let explicit_cpu_research = strict_device_admission.as_ref().is_some_and(
+        crate::SealedStrictDiscoveryDeviceAdmissionV1::is_explicit_canonical_cpu_research_v1,
+    );
+    let inputs = if explicit_cpu_research {
+        CanonicalDiscoveryRunInputs::with_research_holdout(input)?
+    } else {
+        CanonicalDiscoveryRunInputs::with_holdout(input)?
+    };
     let selection = inputs.selection();
     let holdout = inputs
         .holdout()
@@ -11102,9 +11157,6 @@ where
         .expect("with_holdout always constructs a separate selection calibration window");
     let n_rows = input.ohlcv().len();
     let is_end = selection.ohlcv().len();
-    let explicit_cpu_research = strict_device_admission.as_ref().is_some_and(
-        crate::SealedStrictDiscoveryDeviceAdmissionV1::is_explicit_canonical_cpu_research_v1,
-    );
     let gpu_manifest = crate::gpu_native::capability::GpuCapabilityManifest::stage1_baseline();
     let host_feature_preparation = gpu_manifest
         .capability(crate::gpu_native::capability::PipelineStage::FeaturePreparation)
@@ -11146,7 +11198,7 @@ where
         in_sample_rows = is_end,
         calibration_rows = calibration.ohlcv().len(),
         final_holdout_rows = holdout.ohlcv().len(),
-        holdout_fraction = DEFAULT_OOS_HOLDOUT_FRACTION,
+        held_back_fraction = (n_rows - is_end) as f64 / n_rows as f64,
         "discovery sees only the first {is_end} rows; calibration selects/sizes survivors, and the separate final tail remains reserved"
     );
 
@@ -11667,7 +11719,16 @@ where
     let n_input_rows = ohlcv.close.len();
     funnel.record_stage("data_loaded", n_input_rows, n_input_rows);
 
-    let (mut features, ohlcv, _) = trim_recent_history(features, ohlcv, config)?;
+    if inputs.full_research_training {
+        anyhow::ensure!(
+            row_cap_for_config(config) == 0
+                && config.runtime_overrides.resolved_funnel_stage1_pct() == 1.0
+                && config.runtime_overrides.resolved_prefilter_insample_frac() == 1.0,
+            "explicit CPU research training requires no row cap and full Stage 1 and prefilter windows"
+        );
+    }
+    let (mut features, ohlcv, _) =
+        trim_recent_history(features, ohlcv, config, inputs.full_research_training)?;
     let n_after_trim = ohlcv.close.len();
     funnel.record_stage("rows_after_trimming", n_input_rows, n_after_trim);
     funnel.record_stage("features_built", 0, features.n_features());
@@ -12596,8 +12657,8 @@ pub fn run_prefilter_ranking_audit_v1(
         )?;
     crate::historical_evaluation_authority::require_historical_evaluation_authority_v1()?;
 
-    // Same input split as the production cycle: first-80% selection window.
-    let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
+    // Use the same receipt-bound selection window as the CPU research cycle.
+    let inputs = CanonicalDiscoveryRunInputs::with_research_holdout(input)?;
     let selection = inputs.selection();
     let features = selection.features();
     let ohlcv = selection.ohlcv();

@@ -5003,7 +5003,7 @@ fn risky_survival_episode_uses_calendar_horizon_without_trimming_prop_firm() {
     config.mode = DiscoveryMode::Risky;
     config.risky_horizon_days = 20.0;
     config.runtime_overrides.risky_survival_only = true;
-    let (episode, prices, budget) = trim_recent_history(&features, &ohlcv, &config).unwrap();
+    let (episode, prices, budget) = trim_recent_history(&features, &ohlcv, &config, false).unwrap();
     assert_eq!(episode.n_samples(), 21);
     assert_eq!(budget, Some(21));
     assert_eq!(episode.timestamps, timestamps[timestamps.len() - 21..]);
@@ -5013,7 +5013,7 @@ fn risky_survival_episode_uses_calendar_horizon_without_trimming_prop_firm() {
     );
     config.mode = DiscoveryMode::PropFirm;
     assert_eq!(
-        trim_recent_history(&features, &ohlcv, &config)
+        trim_recent_history(&features, &ohlcv, &config, false)
             .unwrap()
             .0
             .n_samples(),
@@ -5022,7 +5022,7 @@ fn risky_survival_episode_uses_calendar_horizon_without_trimming_prop_firm() {
     config.mode = DiscoveryMode::Risky;
     config.runtime_overrides.risky_survival_only = false;
     assert_eq!(
-        trim_recent_history(&features, &ohlcv, &config)
+        trim_recent_history(&features, &ohlcv, &config, false)
             .unwrap()
             .0
             .n_samples(),

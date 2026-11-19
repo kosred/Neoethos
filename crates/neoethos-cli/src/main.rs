@@ -2061,6 +2061,8 @@ struct CanonicalCpuResearchInputs {
     cost_assumptions: std::path::PathBuf,
     broker_symbol_contract: std::path::PathBuf,
     settings_source: std::path::PathBuf,
+    training_percent: Option<usize>,
+    screening_round_trip_pips: Option<f64>,
 }
 
 fn canonical_cpu_research_evidence_status(
@@ -2086,6 +2088,8 @@ fn parse_canonical_cpu_research_inputs(
 ) -> Result<Option<CanonicalCpuResearchInputs>> {
     let requested = CANONICAL_CPU_RESEARCH_FLAGS
         .iter()
+        .copied()
+        .chain(["--training-percent", "--screening-round-trip-pips"])
         .any(|flag| args.iter().any(|arg| arg == flag));
     if !requested {
         return Ok(None);
@@ -2109,6 +2113,28 @@ fn parse_canonical_cpu_research_inputs(
         Ok(value.clone())
     };
 
+    let optional = |flag: &str| {
+        args.iter()
+            .any(|arg| arg == flag)
+            .then(|| value(flag))
+            .transpose()
+    };
+    let training_percent = optional("--training-percent")?
+        .map(|raw| raw.parse::<usize>())
+        .transpose()
+        .context("invalid --training-percent")?;
+    let screening_round_trip_pips = optional("--screening-round-trip-pips")?
+        .map(|raw| raw.parse::<f64>())
+        .transpose()
+        .context("invalid --screening-round-trip-pips")?;
+    anyhow::ensure!(
+        training_percent.is_none_or(|percent| (1..100).contains(&percent)),
+        "--training-percent must be 1 through 99"
+    );
+    anyhow::ensure!(
+        screening_round_trip_pips.is_none_or(|pips| pips.is_finite() && pips >= 0.0),
+        "--screening-round-trip-pips must be finite and nonnegative"
+    );
     Ok(Some(CanonicalCpuResearchInputs {
         authority_root: value("--research-authority-root")?.into(),
         plan_sha256: value("--research-plan-sha256")?,
@@ -2116,6 +2142,8 @@ fn parse_canonical_cpu_research_inputs(
         cost_assumptions: value("--research-cost-assumptions")?.into(),
         broker_symbol_contract: value("--research-broker-symbol-contract")?.into(),
         settings_source: value("--research-settings-source")?.into(),
+        training_percent,
+        screening_round_trip_pips,
     }))
 }
 
@@ -2271,6 +2299,13 @@ fn cmd_discover_on_budgeted_pool(
         anyhow::ensure!(
             new_search.is_none() || (quote_replay.is_none() && saved_research.is_none()),
             "new-search recorded input cannot be combined with finalist/quote continuation"
+        );
+        anyhow::ensure!(
+            quote_replay.is_none()
+                || canonical_cpu_research
+                    .as_ref()
+                    .is_none_or(|inputs| inputs.screening_round_trip_pips.is_none()),
+            "operator screening execution costs cannot be combined with broker quote replay"
         );
         if let Some(new_search) = &new_search {
             tracing::info!(
@@ -2727,9 +2762,16 @@ fn cmd_discover_on_budgeted_pool(
                 .map_err(anyhow::Error::msg)
                 .context("parse canonical CPU research base timeframe")?;
             let normalization_training_rows =
-                neoethos_search::canonical_discovery_normalization_training_rows(
-                    base_ohlcv.close.len(),
-                )?;
+                if let Some(percent) = research_inputs.training_percent {
+                    neoethos_search::discovery::canonical_research_training_rows_at_percent(
+                        base_ohlcv.close.len(),
+                        percent,
+                    )?
+                } else {
+                    neoethos_search::canonical_discovery_normalization_training_rows(
+                        base_ohlcv.close.len(),
+                    )?
+                };
             let feature_options = neoethos_data::FeatureBuildOptions {
                 higher_tfs: higher_list.clone(),
                 prefix_base_features: settings_ref.system.multi_resolution_prefix_base,
@@ -2940,6 +2982,7 @@ fn cmd_discover_on_budgeted_pool(
                         &research_inputs.broker_symbol_contract,
                         &research_inputs.settings_source,
                         receipt,
+                        research_inputs.screening_round_trip_pips,
                     )?;
                     let research_defaults = neoethos_search::DiscoveryConfig::try_from_settings_for_canonical_trendbar_research(
                         settings_ref,
@@ -3379,7 +3422,7 @@ fn cmd_discover_on_budgeted_pool(
                 } else {
                     format!("{out}.batch{cursor}.research.json")
                 };
-                neoethos_core::storage::json::write_json_atomic(&path, research)?;
+                neoethos_core::storage::json::write_json_atomic_compact(&path, research)?;
                 let batch_portfolios = research.discovery_result().portfolio.len();
                 let batch_candidates = research.discovery_result().candidates.len();
                 portfolio_count += batch_portfolios;

@@ -52,7 +52,7 @@ fn cpu_discover_research_is_exact_receipt_bound_and_never_exports_a_live_portfol
         "completed_without_survivors",
         "neoethos_data::QuantitativeFeatureSemantics::RollingValidityV5",
         "expected.quantitative_semantics = recorded.quantitative_semantics",
-        "write_json_atomic(&path, research)",
+        "write_json_atomic_compact(&path, research)",
         "neoethos.canonical-cpu-research-streaming-index.v1",
         "artifact_class=ResearchOnly",
         "promotion_eligibility=NotPromotionEligible",

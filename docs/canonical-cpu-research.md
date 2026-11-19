@@ -45,6 +45,28 @@ Every requested higher timeframe must exist directly in that same matrix.
 Settings, broker facts and cost assumptions are checked before feature work.
 An existing output directory is refused so previous runs remain recoverable.
 
+For a chronological 70% research split, add `--training-percent 70` and set
+`models.discovery_runtime.funnel_stage1_pct` and `prefilter_insample_frac`
+to `1.0`. Clear the global and timeframe-specific row caps. The feature
+receipt binds the training prefix for both normalization and the GA. With a
+non-default split the full prefix is searched, including in Risky mode. The
+rest is divided between selection calibration and the final holdout. Supply
+the same training percentage when reopening such a run.
+
+`--screening-round-trip-pips 0.4` uses an operator model of 0.4 pip per
+completed round trip for spread, slippage and commission together. The
+command retains the broker cost envelope and binds the operator assumption
+into the research contract. Signed overnight carry and applicable PnL
+conversion still use the broker inputs. Use the same flag when reopening
+the run. Broker quote replay requires the broker-derived execution model.
+
+For large searches, `--population` times `--generations` defines the available
+GA evaluation slots. The result's `whole_run_distinct_genomes` counts distinct
+evaluated genomes. The optional `models.search_runtime.archive_mode: active`
+also retains finite trading candidates with nonpositive training returns for
+later validation. The retained archive and `--candidates` each have their own
+cap. The candidate census records actual admission and every subsequent gate.
+
 The default exploratory budget is 64 candidates per generation, 16 generations,
 five indicators per gene, 16 finalist candidates and at most two streaming
 batches. Override these explicitly with `--population`, `--generations`,
