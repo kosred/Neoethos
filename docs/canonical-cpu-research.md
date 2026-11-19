@@ -763,6 +763,24 @@ cache hashes remained unchanged. These outcomes do not satisfy the profitable
 monthly-income objective; a prospective frozen policy and quote/account evidence
 are still required before any promotion claim.
 
+### Shared-account replay of walk-forward survivors
+
+Use `canonical-research --specialist-portfolio walkforward-joint-risky-v1`
+with the exact saved research file, its SHA-256, `--max-batches 1` and the
+original inputs and screening flags. The replay binds every passing
+walk-forward trial to its archived gene. It uses the stored calibration start
+dates and the final SMC threshold. The complete cohort generates signals from
+the same calibration feature frame with its original fixed stops and targets.
+
+Each start opens one account at the archived starting balance. Simultaneous
+positions share the marked equity, the sealed aggregate stop-risk budget,
+four available slots and the 30× research notional limit. The saved target
+and realized cash determine success by the calendar deadline. The report
+`research.json.walkforward-joint-risky.json` includes cohort membership,
+coverage, trades, monthly results and an equity trace for every window.
+The final holdout remains reserved. An incomplete window is labeled in the
+goal result.
+
 ### Continual specialist research V3
 
 `canonical-research --specialist-portfolio continual-v3` writes

@@ -641,6 +641,7 @@ pub(crate) enum SpecialistResearchMode {
     JointV2,
     ContinualV3,
     RiskyV4,
+    WalkforwardJointRiskyV1,
 }
 
 pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResearchMode>> {
@@ -653,10 +654,17 @@ pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResear
         "joint-v2" => SpecialistResearchMode::JointV2,
         "continual-v3" => SpecialistResearchMode::ContinualV3,
         "risky-v4" => SpecialistResearchMode::RiskyV4,
+        "walkforward-joint-risky-v1" => SpecialistResearchMode::WalkforwardJointRiskyV1,
         _ => anyhow::bail!(
-            "--specialist-portfolio expects true, joint-v2, continual-v3, or risky-v4"
+            "--specialist-portfolio expects true, joint-v2, continual-v3, risky-v4, or walkforward-joint-risky-v1"
         ),
     };
+    if mode == SpecialistResearchMode::WalkforwardJointRiskyV1 {
+        ensure!(
+            optional_inputs(args, &RESUME_FLAGS)?.len() == RESUME_FLAGS.len(),
+            "walkforward-joint-risky-v1 requires an exact saved research result"
+        );
+    }
     ensure!(
         !args.iter().any(|s| s.starts_with("--diagnose-")
             || s.starts_with("--quote-replay-")

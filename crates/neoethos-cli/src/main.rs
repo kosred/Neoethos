@@ -2858,6 +2858,9 @@ fn cmd_discover_on_budgeted_pool(
             let mut quote_evidence = Vec::new();
             let mut locked_finalists = Vec::new();
             let specialist_suffix = match specialist_mode {
+                Some(canonical_research::SpecialistResearchMode::WalkforwardJointRiskyV1) => {
+                    "walkforward-joint-risky"
+                }
                 Some(canonical_research::SpecialistResearchMode::RiskyV4) => "risky-specialists",
                 Some(canonical_research::SpecialistResearchMode::ContinualV3) => {
                     "continual-specialists"
@@ -3049,6 +3052,8 @@ fn cmd_discover_on_budgeted_pool(
                     }
                     let publish_specialists = |research: &neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3| -> Result<()> {
                         let document = match specialist_mode {
+                            Some(canonical_research::SpecialistResearchMode::WalkforwardJointRiskyV1) =>
+                                neoethos_trader::specialist_portfolio::evaluate_walkforward_joint_risky(&run_input, research)?,
                             Some(canonical_research::SpecialistResearchMode::RiskyV4) =>
                                 neoethos_trader::specialist_portfolio::evaluate_risky(&run_input, research)?,
                             Some(canonical_research::SpecialistResearchMode::ContinualV3) =>
@@ -3057,7 +3062,7 @@ fn cmd_discover_on_budgeted_pool(
                                 neoethos_trader::specialist_portfolio::evaluate_joint(&run_input, research)?,
                             _ => neoethos_trader::specialist_portfolio::evaluate(&run_input, research)?,
                         };
-                        neoethos_core::storage::json::write_json_atomic(&specialist_path, &document)?;
+                        neoethos_core::storage::json::write_json_atomic_compact(&specialist_path, &document)?;
                         println!("specialist_shared_account_report={}", specialist_path.display());
                         Ok(())
                     };

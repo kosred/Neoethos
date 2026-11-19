@@ -11,6 +11,10 @@ const POPULATION: usize = 16;
 const GENERATIONS: usize = 6;
 const MAX_EXPERTS_PER_STATE: usize = 4;
 
+#[path = "specialist_portfolio_walkforward.rs"]
+mod walkforward;
+pub use walkforward::evaluate_walkforward_joint_risky;
+
 #[path = "specialist_portfolio_continual.rs"]
 mod continual;
 pub use continual::evaluate as evaluate_continual;

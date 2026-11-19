@@ -20,6 +20,15 @@ pub struct JointBarAccountPolicyV1 {
 
 impl JointBarAccountPolicyV1 {
     pub fn validate(&self) -> Result<()> {
+        self.validate_fields()?;
+        ensure!(
+            self.max_target_pips <= 20.0,
+            "invalid shared-account admission policy (normal target <=20 pips)"
+        );
+        Ok(())
+    }
+
+    fn validate_fields(&self) -> Result<()> {
         ensure!(
             (1..=16).contains(&self.max_open_positions)
                 && self.max_entry_stop_risk_fraction.is_finite()
@@ -28,9 +37,8 @@ impl JointBarAccountPolicyV1 {
                 && self.max_gross_notional_multiple.is_finite()
                 && self.max_gross_notional_multiple > 0.0
                 && self.max_target_pips.is_finite()
-                && self.max_target_pips > 0.0
-                && self.max_target_pips <= 20.0,
-            "invalid shared-account admission policy (normal target <=20 pips)"
+                && self.max_target_pips > 0.0,
+            "invalid shared-account admission policy"
         );
         Ok(())
     }
@@ -184,6 +192,7 @@ impl PreparedNettedCanonicalBarResearchV1 {
         lot_grid: Option<BarReplayLotGridV1>,
         record_trace: bool,
     ) -> Result<JointBarAccountResultV1> {
+        policy.validate()?;
         self.evaluate_joint_inner(lanes, policy, lot_grid, record_trace, None)
     }
 
@@ -197,17 +206,22 @@ impl PreparedNettedCanonicalBarResearchV1 {
         record_trace: bool,
         goal: RiskyGrowthGoal,
     ) -> Result<JointBarAccountResultV1> {
-        goal.validate().map_err(anyhow::Error::msg)?;
-        ensure!(
-            goal.start_balance == self.settings.initial_equity(),
-            "Risky shared account must replay at its configured starting capital"
-        );
-        if let Some(experiment) = &self.settings.risky_account_experiment {
-            ensure!(
-                experiment.target_balance == goal.target_balance,
-                "Risky shared account target disagrees with sealed accounting policy"
-            );
-        }
+        policy.validate()?;
+        self.evaluate_joint_inner(lanes, policy, lot_grid, record_trace, Some(goal))
+    }
+
+    /// Replay a frozen research cohort under its already recorded fixed target
+    /// ceiling. The caller validates each gene and derives the ceiling from
+    /// that cohort. The ordinary specialist policy retains its 20-pip ceiling.
+    pub fn evaluate_joint_risky_archived_brackets(
+        &self,
+        lanes: &[JointBarLaneV1<'_>],
+        policy: JointBarAccountPolicyV1,
+        lot_grid: Option<BarReplayLotGridV1>,
+        record_trace: bool,
+        goal: RiskyGrowthGoal,
+    ) -> Result<JointBarAccountResultV1> {
+        policy.validate_fields()?;
         self.evaluate_joint_inner(lanes, policy, lot_grid, record_trace, Some(goal))
     }
 
@@ -219,7 +233,6 @@ impl PreparedNettedCanonicalBarResearchV1 {
         record_trace: bool,
         goal: Option<RiskyGrowthGoal>,
     ) -> Result<JointBarAccountResultV1> {
-        policy.validate()?;
         ensure!(
             lanes.len() <= 256,
             "bounded research supports at most 256 archived expert lanes"
@@ -265,6 +278,17 @@ impl PreparedNettedCanonicalBarResearchV1 {
         let initial = settings.initial_equity();
         let risky_goal = goal
             .map(|goal| -> Result<JointBarRiskyGoalOutcomeV1> {
+                goal.validate().map_err(anyhow::Error::msg)?;
+                ensure!(
+                    goal.start_balance == initial,
+                    "Risky shared account must replay at its configured starting capital"
+                );
+                if let Some(experiment) = &settings.risky_account_experiment {
+                    ensure!(
+                        experiment.target_balance == goal.target_balance,
+                        "Risky shared account target disagrees with sealed accounting policy"
+                    );
+                }
                 let duration = goal.horizon_days * 86_400_000.0;
                 ensure!(
                     duration.is_finite() && duration >= 1.0 && duration < i64::MAX as f64,
