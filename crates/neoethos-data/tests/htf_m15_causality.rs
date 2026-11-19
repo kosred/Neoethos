@@ -122,6 +122,13 @@ fn committed_real_ctrader_m1_fixture_never_exposes_h1_close_early() {
         prefix_open, &[first], &[h1_column(vec![h1_closed_value])],
         true, Some(2 * HOUR_MS), HOUR_MS,
     ).expect("prefix-only alignment");
-    assert_eq!(prefix[0].values, full[0].values[..5]);
-    assert_eq!(prefix[0].validity, full[0].validity[..5]);
+    assert_eq!(prefix[0].validity.as_slice(), &full[0].validity[..5]);
+    for row in 0..5 {
+        if prefix[0].validity[row] == FeatureCellValidity::Valid {
+            assert_eq!(prefix[0].values[row], full[0].values[row]);
+        } else {
+            assert!(prefix[0].values[row].is_nan());
+            assert!(full[0].values[row].is_nan());
+        }
+    }
 }
