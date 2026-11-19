@@ -257,6 +257,11 @@ def run_job(plan,name,args,deadline):
     env['RUST_LOG']='info'
     # This campaign owns no shared-cache mutation or eviction policy.
     env.pop('NEOETHOS_FEATURE_FRAME_CACHE_DIR',None);env.pop('NEOETHOS_FEATURE_FRAME_CACHE_MAX_BYTES',None)
+    if plan.get('feature_cache_root'):
+        cache=pathlib.Path(plan['feature_cache_root']).resolve()
+        assert cache.is_relative_to(ROOT.resolve()),'Comparison cache must stay inside its own campaign'
+        env['NEOETHOS_FEATURE_FRAME_CACHE_DIR']=str(cache)
+        env['NEOETHOS_FEATURE_FRAME_CACHE_MAX_BYTES']=str(plan['feature_cache_max_bytes'])
     logs=ROOT/'logs';logs.mkdir(exist_ok=True)
     job=Job(plan['job_limit_gib']);p=None
     try:

@@ -1754,6 +1754,7 @@ mod tests {
     fn sample_sealed_evaluation_policy() -> LiveTradingPolicyV1 {
         let mut policy = sample_live_trading_policy("fnv64:0123456789abcdef");
         let evaluation = crate::genetic::EvaluationConfig {
+            risky_limits_policy: None,
             risky_account_experiment: None,
             symbol: "EURUSD".to_owned(),
             account_currency: "USD".to_owned(),

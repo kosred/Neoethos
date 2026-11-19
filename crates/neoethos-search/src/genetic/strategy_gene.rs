@@ -945,6 +945,8 @@ pub struct EvaluationConfig {
     /// Run-bound v6 goal-pace objective; None retains explicitly legacy v5.
     pub growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risky_limits_policy: Option<neoethos_core::domain::risky_mode::RiskyLimitsPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risky_account_experiment: Option<crate::eval::RiskyAccountExperimentV1>,
     pub weekly_objective: Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
     /// Which named scoring table the GA maximises (docs/autoresearch-loop.md
@@ -1029,6 +1031,7 @@ impl Default for EvaluationConfig {
             smc_weight_displacement: smc.w_displacement,
             growth_objective: false,
             growth_goal: None,
+            risky_limits_policy: None,
             risky_account_experiment: None,
             weekly_objective: None,
             fitness_table: crate::scoring::FitnessTable::default(),
@@ -1037,6 +1040,21 @@ impl Default for EvaluationConfig {
 }
 
 impl EvaluationConfig {
+    pub fn validate_risky_limits_policy(&self) -> anyhow::Result<()> {
+        if let Some(policy) = self.risky_limits_policy {
+            anyhow::ensure!(
+                self.growth_objective && self.growth_goal.is_some(),
+                "Risky limits policy requires the Risky goal objective"
+            );
+            policy.validate_band(
+                self.risk_per_trade_min,
+                self.risk_per_trade_max,
+                self.high_quality_confidence,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn for_symbol(
         symbol: &str,
         account_currency: &str,

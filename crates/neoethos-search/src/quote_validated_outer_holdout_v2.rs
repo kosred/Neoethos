@@ -408,25 +408,17 @@ impl<'a> LockedCanonicalSignalPlanV3<'a> {
         // The archived enabled flag governs gene generation, not reinterpretation
         // of an already evolved gene. A too-short whole slice retains the same
         // explicit fixed-pip fallback; unavailable warm-up CELLS never enter.
-        let adaptive_base_pips = if portfolio.iter().any(|gene| gene.stop_vol_mult > 0.0) {
-            match crate::stop_target::adaptive_base_pips_series_with_settings(
+        let adaptive_base_pips = adaptive_stops_policy
+            .entry_base_pips(
+                portfolio.iter().any(|gene| gene.stop_vol_mult > 0.0),
                 &bars.high,
                 &bars.low,
                 &bars.close,
                 exit_policy.pip_size,
-                adaptive_stops_policy.settings(),
-            ) {
-                Ok(base) => Some(base),
-                Err(crate::stop_target::StopDistanceError::TooShort { .. }) => None,
-                Err(error) => {
-                    return Err(binding_error(format!(
-                        "locked adaptive stop recipe failed: {error}"
-                    )));
-                }
-            }
-        } else {
-            None
-        };
+            )
+            .map_err(|error| {
+                binding_error(format!("locked adaptive stop recipe failed: {error}"))
+            })?;
         let portfolio_identity_sha256 = portfolio_identity_sha256.to_owned();
         let scope_identity_sha256 = holdout_scope
             .identity_sha256()

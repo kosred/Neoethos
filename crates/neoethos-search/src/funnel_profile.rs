@@ -364,7 +364,9 @@ impl FunnelProfile {
         Ok(())
     }
 
-    pub(crate) const fn live_trading_policy_v1(
+    /// Read the recorded policy without granting mutation or promotion authority.
+    /// Archived research consumers must still validate their enclosing evidence.
+    pub const fn live_trading_policy_v1(
         &self,
     ) -> Option<&crate::live_portfolio::LiveTradingPolicyV1> {
         self.live_trading_policy_v1.as_ref()

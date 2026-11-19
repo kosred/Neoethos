@@ -21,8 +21,9 @@ pub type SmcRow = [i8; 11];
 #[path = "netted_bar_research.rs"]
 mod netted_bar_research;
 pub use netted_bar_research::{
-    BarReplayLotGridV1, NettedBarDecisionTapeV1, NettedBarResearchResultV1,
-    PreparedNettedCanonicalBarResearchV1, TerminalBarPositionV1,
+    BarReplayLotGridV1, JointBarAccountPolicyV1, JointBarAccountResultV1, JointBarLaneV1,
+    NettedBarDecisionTapeV1, NettedBarResearchResultV1, PreparedNettedCanonicalBarResearchV1,
+    TerminalBarPositionV1,
 };
 
 /// Metrics retain their canonical eleven-slot layout; cadence is an explicit
@@ -954,6 +955,36 @@ fn apply_carry_and_fee_scaled(
     )
 }
 
+/// One price/cost settlement for scalar and simultaneous research positions.
+#[allow(clippy::too_many_arguments)]
+fn closed_position_net_pnl(
+    direction: i8,
+    entry_price: f64,
+    exit_price: f64,
+    lots: f64,
+    exit_half_spread_cost: f64,
+    entry_time: i64,
+    exit_time: i64,
+    settings: &BacktestSettings,
+) -> f64 {
+    let pnl = if direction == 1 {
+        (exit_price - entry_price) / settings.pip_value * settings.pip_value_per_lot
+    } else {
+        (entry_price - exit_price) / settings.pip_value * settings.pip_value_per_lot
+    };
+    let price_gross = pnl * lots - exit_half_spread_cost * lots;
+    let after_costs = pnl * lots - (settings.commission_per_trade + exit_half_spread_cost) * lots;
+    apply_carry_and_fee_scaled(
+        after_costs,
+        price_gross,
+        lots,
+        direction,
+        entry_time,
+        exit_time,
+        settings,
+    )
+}
+
 /// Per-ENTRY `(sl_pips, tp_pips)` for the position opening at bar `i`. When the
 /// gene's `adaptive_vol_mult > 0` and a base vol-distance series is present, the
 /// stop scales with volatility at `i` (`sl = mult * base[i]`) while the target
@@ -1002,19 +1033,12 @@ fn risk_based_pos_lots(
     eff_sl_pips: f64,
     settings: &BacktestSettings,
 ) -> f64 {
-    let conf = conf.clamp(0.0, 1.0);
-    let risk_min = settings.risk_per_trade_min;
-    let risk_max = settings.risk_per_trade_max;
-    // Guard the confidence normaliser against a zero/negative/non-finite
-    // high_quality_confidence so we never divide by ~0.
-    let hq = settings.high_quality_confidence;
-    let conf_scale = if hq.is_finite() && hq > 0.0 {
-        (conf / hq).min(1.0)
-    } else {
-        // Degenerate config: treat any signal as max-quality.
-        1.0
-    };
-    let risk_pct = risk_min + (risk_max - risk_min) * conf_scale;
+    let risk_pct = neoethos_core::domain::risky_mode::confidence_scaled_risk_fraction(
+        settings.risk_per_trade_min,
+        settings.risk_per_trade_max,
+        settings.high_quality_confidence,
+        conf,
+    );
     // Size against the actual ENTRY stop, including legitimate sub-pip stops.
     // The lot cap below limits exposure; changing the risk denominator to a
     // fictitious one-pip stop makes the reported risk disagree with the trade.
@@ -1304,6 +1328,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                     i - entry_idx as usize,
                     pip,
                     settings,
+                    settings.risky_account_experiment.is_some(),
                 )
                 .or_else(|| session_close.then_some((close[i], TradeExitReason::SessionClose)))
             };
@@ -1312,15 +1337,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
             // adverse excursion precedes a target. A closed position cannot
             // observe later extremes. Gap fills retain their uncapped price.
             let (lo, hi, adverse_first) = if new_accounting {
-                match exit_px {
-                    Some((px, TradeExitReason::Stop | TradeExitReason::TrailingStop)) => {
-                        (px, px, true)
-                    }
-                    Some((px, TradeExitReason::Target)) if in_pos == 1 => (low[i], px, true),
-                    Some((px, TradeExitReason::Target)) => (px, high[i], true),
-                    Some((px, TradeExitReason::DataGap)) => (px, px, true),
-                    _ => (low[i], high[i], false),
-                }
+                observed_position_bar(in_pos, exit_px, low[i], high[i])
             } else {
                 (low[i], high[i], false)
             };
@@ -1389,19 +1406,11 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 }
             }
             if let Some((exit_px, exit_reason)) = exit_px {
-                let pnl = if in_pos == 1 {
-                    (exit_px - entry_px) / pip * settings.pip_value_per_lot
-                } else {
-                    (entry_px - exit_px) / pip * settings.pip_value_per_lot
-                };
                 // Risk-based sizing: the price-derived `pnl` (set in the
                 // shared protective-exit policy above) and the commission +
                 // half-spread cost both scale by the entry-captured
                 // `pos_lots`. (Half-spread was already paid at entry via the
                 // adjusted entry_px; this is the exit-side half + commission.)
-                let price_gross = pnl * pos_lots - half_spread_cost * pos_lots;
-                let pnl =
-                    pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
                 // Phase C.2: apply broker swap + conversion fee (size-aware).
                 let entry_ts_ms = if use_timestamps && entry_idx >= 0 {
                     timestamps.get(entry_idx as usize).copied().unwrap_or(0)
@@ -1413,14 +1422,24 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 } else {
                     0
                 };
-                let pnl = apply_carry_and_fee_scaled(
-                    pnl,
-                    price_gross,
-                    pos_lots,
+                // Retain the scalar path's historical tiny-pip guard.
+                let mut settlement_settings;
+                let priced_settings = if pip.to_bits() == settings.pip_value.to_bits() {
+                    settings
+                } else {
+                    settlement_settings = settings.clone();
+                    settlement_settings.pip_value = pip;
+                    &settlement_settings
+                };
+                let pnl = closed_position_net_pnl(
                     in_pos,
+                    entry_px,
+                    exit_px,
+                    pos_lots,
+                    half_spread_cost,
                     entry_ts_ms,
                     exit_ts_ms,
-                    settings,
+                    priced_settings,
                 );
                 if RECORD_TRADES {
                     record_closed_cpu_trade(
@@ -1942,6 +1961,7 @@ fn protective_exit_price(
     bars_held: usize,
     pip: f64,
     settings: &BacktestSettings,
+    strict_close_trail: bool,
 ) -> Option<(f64, TradeExitReason)> {
     let mut stop_reason = TradeExitReason::Stop;
     if side == 1 {
@@ -1969,7 +1989,7 @@ fn protective_exit_price(
                 // observed market after a retracement. The Risky account
                 // experiment keeps its prior protection on that refusal;
                 // it must not invent a profitable next-bar fill there.
-                if (settings.risky_account_experiment.is_none() || candidate < close)
+                if (!strict_close_trail || candidate < close)
                     && (*trail_px == 0.0 || candidate > *trail_px)
                 {
                     *trail_px = candidate;
@@ -1995,7 +2015,7 @@ fn protective_exit_price(
                 let locked = entry_px - settings.trailing_min_lock_pips * pip;
                 let candidate =
                     (lo + (settings.trailing_atr_multiplier * sl_pips * pip)).min(locked);
-                if (settings.risky_account_experiment.is_none() || candidate > close)
+                if (!strict_close_trail || candidate > close)
                     && (*trail_px == 0.0 || candidate < *trail_px)
                 {
                     *trail_px = candidate;
@@ -2006,6 +2026,24 @@ fn protective_exit_price(
     // Timeout is a close-of-bar exit, after the intrabar protective barriers.
     (settings.max_hold_bars > 0 && bars_held >= settings.max_hold_bars)
         .then_some((close, TradeExitReason::MaxHold))
+}
+
+/// A closed sleeve cannot observe extremes after its protective exit.
+fn observed_position_bar(
+    side: i8,
+    exit: Option<(f64, TradeExitReason)>,
+    low: f64,
+    high: f64,
+) -> (f64, f64, bool) {
+    match exit {
+        Some((
+            px,
+            TradeExitReason::Stop | TradeExitReason::TrailingStop | TradeExitReason::DataGap,
+        )) => (px, px, true),
+        Some((px, TradeExitReason::Target)) if side == 1 => (low, px, true),
+        Some((px, TradeExitReason::Target)) => (px, high, true),
+        _ => (low, high, false),
+    }
 }
 
 /// Configured weekend policy, not a universal assumption about FX sessions.

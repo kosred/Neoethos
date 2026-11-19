@@ -275,6 +275,28 @@ Regenerate after source changes; do not use an old map as evidence for new code.
 Reports live in Actions artifacts (30 days), not as generated files committed
 into the already large source tree. Download a checkpoint for longer retention.
 
+## Graphify on a Rust module
+
+For a quick view of a function and its neighbours, this checkout has a
+separate Python 3.12 environment under `.git/graphify-venv`. To reproduce it,
+install `graphifyy==0.9.112` in that environment. The executable is named
+`graphify`. [Graphify source and documentation](https://github.com/Graphify-Labs/graphify)
+
+```powershell
+$env:GRAPHIFY_BACKEND = 'none'
+$graphify = '.\.git\graphify-venv\Scripts\graphify.exe'
+$output = Join-Path (git rev-parse --absolute-git-dir) 'repo-map/graphify-genetic'
+& $graphify extract crates/neoethos-search/src/genetic --code-only --no-cluster --max-workers 2 --out $output
+& $graphify query 'seed_professional_templates' --seed 'seed_professional_templates' --depth 1 --graph (Join-Path $output 'graphify-out/graph.json')
+```
+
+The query finds the caller in `search_engine.rs`. That function calls the
+seed builder during initialization and diversity rescue. Graphify reports a
+single caller edge for those two sites. Check individual calls with
+`rg -n 'seed_professional_templates\(' crates/neoethos-search/src/genetic/search_engine.rs`.
+Rerun extraction after edits. The graph stays in the Git directory and the
+code-only command uses local parsing.
+
 ## Completed Rust checkpoint
 
 Mapping branches (`codex/repo-map-*`) generate seven fresh static profiles for

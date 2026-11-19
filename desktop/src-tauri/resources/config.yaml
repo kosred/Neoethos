@@ -24,7 +24,7 @@ system:
   watchlist: []
   account_currency: ''
   data_dir: data
-  trading_mode: prop_firm
+  trading_mode: risky
   risky_start_balance_usd: 100.0
   risky_target_balance_usd: 50000.0
   risky_horizon_days: 180
@@ -82,7 +82,7 @@ risk:
   risky_max_risk_per_trade: 0.3
   prop_firm_min_risk_per_trade: null
   prop_firm_max_risk_per_trade: 0.01
-  max_portfolio_risk: 0.04
+  max_portfolio_risk: 0.34
   daily_drawdown_limit: 0.04
   total_drawdown_limit: 0.07
   min_risk_reward: 2.0

@@ -587,16 +587,30 @@ pub fn seed_professional_templates(
     }
 
     let mut out: Vec<Gene> = Vec::with_capacity(count.min(TEMPLATES.len() * VARIANTS_PER_TEMPLATE));
-    for template in TEMPLATES.iter() {
-        for variant in 0..VARIANTS_PER_TEMPLATE {
+    let mut family_counts = [0_usize; TEMPLATES.len()];
+    // Spend the first seeds on distinct resolvable families before adding
+    // variants. Keep this ordering for both initial admission and rescue.
+    // The changed RNG draw order also changes SMC variants at full capacity;
+    // an unchanged family census does not mean an identical population.
+    'variants: for variant in 0..VARIANTS_PER_TEMPLATE {
+        for (family, template) in TEMPLATES.iter().enumerate() {
             if out.len() >= count {
-                return out;
+                break 'variants;
             }
             if let Some(gene) = build_variant(template, variant, feature_names, n_features, rng) {
                 out.push(gene);
+                family_counts[family] += 1;
             }
         }
     }
+    tracing::info!(
+        target: "neoethos_search::seed_templates",
+        requested = count,
+        emitted = out.len(),
+        seeded_families = family_counts.iter().filter(|&&n| n > 0).count(),
+        family_counts = ?TEMPLATES.iter().zip(family_counts).map(|(t, n)| (t.name, n)).collect::<Vec<_>>(),
+        "professional seed family admission before population filtering"
+    );
     out
 }
 
@@ -664,6 +678,65 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let seeds = seed_professional_templates(0, &names, names.len(), &mut rng);
         assert!(seeds.is_empty());
+    }
+
+    #[test]
+    fn partial_seed_budget_covers_distinct_strategy_families_before_variants() {
+        let names = multi_tf_test_feature_names();
+        for requested in [1_usize, 2, 3, 4, 5, 6, 9, 10, 11, 17, 20, 25, 49, 50, 51] {
+            let mut rng = StdRng::seed_from_u64(20261119);
+            let seeds = seed_professional_templates(requested, &names, names.len(), &mut rng);
+            assert_eq!(seeds.len(), requested.min(50), "requested {requested}");
+            let mut counts = [0_usize; 5];
+            for (position, gene) in seeds.iter().enumerate() {
+                let family = position % TEMPLATES.len();
+                let variant = position / TEMPLATES.len();
+                assert!(
+                    gene.strategy_id.starts_with(
+                        format!("seed_{}_v{variant}_", TEMPLATES[family].name).as_str()
+                    )
+                );
+                counts[family] += 1;
+            }
+            assert_eq!(
+                counts.iter().filter(|&&n| n > 0).count(),
+                requested.min(TEMPLATES.len())
+            );
+            assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1);
+        }
+    }
+
+    #[test]
+    fn seed_budget_replays_full_genomes_and_rng_state() {
+        let names = multi_tf_test_feature_names();
+        for requested in [7, 20, 50] {
+            let mut a = StdRng::seed_from_u64(42);
+            let mut b = StdRng::seed_from_u64(42);
+            let first = seed_professional_templates(requested, &names, names.len(), &mut a);
+            let replay = seed_professional_templates(requested, &names, names.len(), &mut b);
+            assert_eq!(first, replay, "fixed seed must replay every gene field");
+            assert_eq!(a.random::<u64>(), b.random::<u64>());
+        }
+    }
+
+    #[test]
+    fn seed_budget_round_robins_only_resolvable_families() {
+        // Only mean-reversion and counter-trend have two distinct roles here.
+        // Skipped families must not consume quota or prevent later families.
+        let names = vec!["h1_rsi".to_owned(), "m15_rsi".to_owned()];
+        let mut rng = StdRng::seed_from_u64(42);
+        let seeds = seed_professional_templates(25, &names, names.len(), &mut rng);
+        assert_eq!(seeds.len(), 20);
+        for (position, gene) in seeds.iter().enumerate() {
+            let family = ["mean_reversion", "counter_trend"][position % 2];
+            let variant = position / 2;
+            assert!(
+                gene.strategy_id
+                    .starts_with(format!("seed_{family}_v{variant}_").as_str())
+            );
+            assert_eq!(gene.indices, [0, 1]);
+        }
+        assert!(seed_professional_templates(25, &names, 1, &mut rng).is_empty());
     }
 
     #[test]

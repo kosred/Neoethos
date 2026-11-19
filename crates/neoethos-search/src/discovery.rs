@@ -649,6 +649,8 @@ pub struct DiscoveryConfig {
     /// the firm's daily rule makes it unpassable) and vice versa.
     pub risky_risk_band: Option<(f64, f64)>,
     pub prop_firm_risk_band: Option<(f64, f64)>,
+    /// Resolved only in Risky mode; absent retains the legacy risk contract.
+    pub risky_limits_policy: Option<neoethos_core::domain::risky_mode::RiskyLimitsPolicy>,
     /// Reject a gene if any regime-specific PnL drops below
     /// `-initial_balance * max_regime_loss_pct / 100`.
     pub max_regime_loss_pct: f64,
@@ -959,18 +961,19 @@ impl Default for DiscoveryConfig {
             cpcv_max_rows: 0,
             max_pbo: 0.5,
             filtering: crate::genetic::FilteringConfig::default(),
-            initial_balance: 100_000.0,
+            initial_balance: 100.0,
             // Keep the config-less fallback identical to
             // `DiscoveryConfig::from_settings(&Settings::default())`. A failed
-            // YAML load must not widen PropFirm risk from 1% to 3%.
+            // YAML load must not silently switch the primary Risky policy.
             risk_per_trade_min: 0.0,
-            risk_per_trade_max: 0.01,
+            risk_per_trade_max: 0.30,
             high_quality_confidence: DEFAULT_HIGH_QUALITY_CONFIDENCE,
             // Decision default (2026-08-09): the Risky 30% ceiling is operator
             // intent, so the config-less fallback carries the same band as
             // `from_settings` derives from `risk.risky_max_risk_per_trade`
             // (min inherits 0.0). Kept in lockstep (divergence test).
             risky_risk_band: Some((0.0, 0.30)),
+            risky_limits_policy: None,
             prop_firm_risk_band: Some((0.0, 0.01)),
             max_regime_loss_pct: 3.0,
             higher_timeframes: Vec::new(),
@@ -1000,9 +1003,9 @@ impl Default for DiscoveryConfig {
             // searched a different objective from the configured one and said
             // nothing about it.
             adaptive_thresholds: true,
-            // Env-absent default reproduces the retired
-            // resolve_discovery_mode() fallback (PropFirm).
-            mode: DiscoveryMode::PropFirm,
+            // Match SystemConfig's primary product, including config-load
+            // fallback paths. Explicit PropFirm profiles still select it.
+            mode: DiscoveryMode::Risky,
             prop_firm_gate_params: neoethos_core::config::PropFirmGateConfig::default(),
             // Risky-Mode goal defaults (mirror SystemConfig): 100 -> 50,000 in
             // 180 days. Ignored unless mode == Risky.
@@ -1336,6 +1339,10 @@ impl DiscoveryConfig {
         log_gate_states(settings);
 
         let risk_profile = resolve_discovery_risk_profile(settings);
+        let mode = resolve_discovery_mode(
+            &settings.system.trading_mode,
+            &model_settings.discovery_mode,
+        );
 
         Self {
             timeframe_label: settings.system.base_timeframe.clone(),
@@ -1431,7 +1438,14 @@ impl DiscoveryConfig {
             // raw YAML, not one careless click).
             max_pbo: 0.5,
             filtering,
-            initial_balance: settings.risk.initial_balance.max(1.0),
+            // Risky's reference capital is the actual replay capital. A
+            // PropFirm balance left in the shared settings must not turn the
+            // operator's 100 -> 50k experiment into a 10k -> 50k experiment.
+            initial_balance: if mode == DiscoveryMode::Risky {
+                settings.system.risky_start_balance_usd
+            } else {
+                settings.risk.initial_balance.max(1.0)
+            },
             // One resolver feeds both this execution config and the desktop
             // pre-flight. The UI therefore shows the same clamped, ordered
             // band that Generation 0 and every later validation stage receive.
@@ -1440,6 +1454,9 @@ impl DiscoveryConfig {
             high_quality_confidence: risk_profile.high_quality_confidence,
             risky_risk_band: risk_profile.risky_band_override,
             prop_firm_risk_band: risk_profile.prop_firm_band_override,
+            risky_limits_policy: settings
+                .risk
+                .limits_policy_for_mode(&settings.system.trading_mode),
             max_regime_loss_pct: 3.0,
             higher_timeframes: settings.system.higher_timeframes.clone(),
             runtime_overrides: DiscoveryRuntimeOverrides::from_settings(settings),
@@ -1492,10 +1509,7 @@ impl DiscoveryConfig {
                 round_trip.max(resolved_commission)
             },
             adaptive_thresholds: model_settings.discovery_runtime.adaptive_thresholds,
-            mode: resolve_discovery_mode(
-                &settings.system.trading_mode,
-                &model_settings.discovery_mode,
-            ),
+            mode,
             prop_firm_gate_params: model_settings.discovery_runtime.prop_firm_gate.clone(),
             risky_start_balance: settings.system.risky_start_balance_usd,
             risky_target_balance: settings.system.risky_target_balance_usd,
@@ -1536,6 +1550,11 @@ impl DiscoveryConfig {
     /// where the operator wants to lock in a specific value, but the
     /// happy-path call needs none of them.
     pub fn apply_mode_overrides(mut self) -> Self {
+        // A shared config can retain inactive Risky fields while PropFirm runs.
+        // Never carry Risky execution semantics into another mode.
+        if self.mode != DiscoveryMode::Risky {
+            self.risky_limits_policy = None;
+        }
         // MODE-SCOPED SIZING (2026-07-21). Risky and Prop-firm are two
         // different products sharing one engine: one compounds aggressively,
         // the other must survive a challenge whose daily-loss rule is a few
@@ -1654,7 +1673,9 @@ impl DiscoveryConfig {
             // (see `calculate_income_score`) prefers the fastest compounders.
             // Floors stay loose-but-sane so genuinely broken genes (negative
             // edge, never-trading) still drop out.
-            self.filtering.max_dd = if self.runtime_overrides.risky_survival_only {
+            self.filtering.max_dd = if self.runtime_overrides.risky_survival_only
+                || self.risky_limits_policy.is_some()
+            {
                 1.0 // Total loss is still refused by survived_the_backtest.
             } else {
                 0.60 // Frozen legacy research policy.
@@ -1897,6 +1918,9 @@ impl DiscoveryConfig {
                 target_balance: self.risky_target_balance,
                 horizon_days: self.risky_horizon_days,
             });
+        cfg.risky_limits_policy = self.risky_limits_policy;
+        cfg.validate_risky_limits_policy()
+            .expect("invalid Risky limits policy");
         if let Some(contract) = research_contract {
             // V3 seals a scalar cost envelope, not an ambient session curve.
             // Clear it even on identity mismatch so it cannot mask a refusal.
@@ -2774,6 +2798,9 @@ pub struct DiscoveryRunProfile {
     /// the run profile because changing it changes every confidence-sized trade.
     pub high_quality_confidence: f64,
     pub risky_risk_band: Option<(f64, f64)>,
+    /// Omission retains the legacy profile shape; opt-in runs name their policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risky_limits_policy: Option<neoethos_core::domain::risky_mode::RiskyLimitsPolicy>,
     pub prop_firm_risk_band: Option<(f64, f64)>,
     pub max_regime_loss_pct: f64,
     /// Robustness screens (Monte-Carlo / sensitivity) parameters.
@@ -6702,6 +6729,8 @@ impl<'a> PreparedLockedHoldoutResearch<'a> {
             "artifact_class": "ResearchOnly",
             "promotion_eligibility": "NotPromotionEligible",
             "authorization_issued": false,
+            "evaluation_scope": "individual_strategies",
+            "combined_portfolio_evaluated": false,
             "warning": "Numerical evaluation on the reserved final holdout using the run's screening cost assumptions and sealed signal policy. It is NOT broker-quote validated and is not admissible for promotion or live trading.",
             "search_config_hash": self.search_config_hash,
             "mode": format!("{:?}", self.settings.config.mode),
@@ -6905,6 +6934,10 @@ fn risky_goal_window_outcome(
     let mut target_days = None;
     let mut floor_hit = false;
     let mut settled = 0usize;
+    // Diagnostic only: crossing 80% neither stops nor accepts the account path.
+    let threshold_balance = 0.8 * config.risky_target_balance;
+    let mut threshold_reached = balance >= threshold_balance;
+    let mut threshold_days = threshold_reached.then_some(0.0);
     for trade in trades {
         lowest_marked_balance = lowest_marked_balance.min(balance - trade.mae);
         if survival_only && lowest_marked_balance <= 0.0 {
@@ -6916,6 +6949,12 @@ fn risky_goal_window_outcome(
         settled += 1;
         peak = peak.max(balance);
         dd = dd.max((peak - balance) / peak);
+        if !threshold_reached && balance >= threshold_balance {
+            threshold_reached = true;
+            threshold_days = trade
+                .exit_time
+                .map(|exit| (exit - start_ms) as f64 / 86_400_000.);
+        }
         if balance >= config.risky_target_balance {
             target_days = trade
                 .exit_time
@@ -6934,6 +6973,14 @@ fn risky_goal_window_outcome(
         "max_closed_balance_drawdown": dd, "trades_in_window": trades.len(),
     });
     if survival_only {
+        outcome["goal_progress_v1"] = serde_json::json!({
+            "threshold_fraction": 0.8,
+            "threshold_balance": threshold_balance,
+            "threshold_reached": threshold_reached,
+            "threshold_days": threshold_days,
+            "max_closed_balance": peak,
+            "max_fraction_of_target_balance": peak / config.risky_target_balance,
+        });
         let observed_end = target_days
             .and_then(|_| trades.get(settled.saturating_sub(1))?.exit_time)
             .unwrap_or(end_ms);
@@ -7177,18 +7224,37 @@ impl<'a> PreparedSavedCandidateReplay<'a> {
     }
 }
 
+fn begin_saved_research_replay(
+    input: &CanonicalSearchRunInputV2<'_>,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+) -> Result<crate::canonical_trendbar_research::CanonicalTrendbarResearchExecutionScopeV3> {
+    research.validate()?;
+    let contract = research.execution_contract();
+    contract.validate_against_input(input)?;
+    install_research_replay_execution_scope(contract)
+}
+
+/// Keep the receipt-bound conversion and execution context installed for
+/// downstream consumers that use the archived policy and the shared account.
+pub fn with_saved_research_execution<T>(
+    input: &CanonicalSearchRunInputV2<'_>,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _scope = begin_saved_research_replay(input, research)?;
+    run()
+}
+
 fn prepare_saved_candidate_replay<'a>(
     input: &'a CanonicalSearchRunInputV2<'_>,
     config: &DiscoveryConfig,
     research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
 ) -> Result<PreparedSavedCandidateReplay<'a>> {
-    research.validate()?;
+    let execution = begin_saved_research_replay(input, research)?;
     let contract = research.execution_contract();
-    contract.validate_against_input(input)?;
     // Keep the exact saved execution scope alive through the consumer. The
     // context owns this guard; callers must not split the guard from the
     // materialized signals/similarity work.
-    let execution = install_research_replay_execution_scope(contract)?;
     let result = research.discovery_result();
     let inputs = CanonicalDiscoveryRunInputs::with_holdout(input)?;
     let selection = inputs.selection();
@@ -7245,6 +7311,210 @@ fn prepare_saved_candidate_replay<'a>(
         evaluation,
         bypass,
     })
+}
+
+/// Four non-overlapping goal-length TRAINING episodes, including the exact
+/// latest episode used by survival-only GA discovery. Never crosses selection.
+fn risky_training_episode_ranges_v1(
+    timestamps: &[i64],
+    horizon_days: f64,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    anyhow::ensure!(
+        timestamps.len() >= 2 && timestamps.windows(2).all(|w| w[0] < w[1]),
+        "training episodes require strictly increasing timestamps"
+    );
+    let horizon = horizon_days * 86_400_000.;
+    anyhow::ensure!(
+        horizon.is_finite() && horizon >= 86_400_000. && horizon < i64::MAX as f64,
+        "invalid training episode horizon"
+    );
+    let horizon = horizon as i64;
+    let first = timestamps[0];
+    let last = timestamps[timestamps.len() - 1];
+    let span = last
+        .checked_sub(first)
+        .context("training episode span overflow")?;
+    anyhow::ensure!(
+        span / horizon >= 4,
+        "four training episodes need at least four goal horizons"
+    );
+    let spread = span - horizon;
+    let mut windows: Vec<std::ops::Range<usize>> = Vec::with_capacity(4);
+    for index in 0..4_i64 {
+        let end_ms = first + horizon + (i128::from(spread) * i128::from(index) / 3) as i64;
+        let start = timestamps.partition_point(|&ts| ts < end_ms - horizon);
+        let end = timestamps.partition_point(|&ts| ts <= end_ms);
+        anyhow::ensure!(
+            end.saturating_sub(start) >= 64,
+            "training episode has fewer than64 bars"
+        );
+        anyhow::ensure!(
+            windows.last().is_none_or(|prior| prior.end <= start),
+            "training episodes overlap"
+        );
+        windows.push(start..end);
+    }
+    Ok(windows)
+}
+
+fn risky_training_episode_utility_v1(
+    metrics: &[f64; 11],
+    initial: f64,
+    span: f64,
+    goal: crate::scoring::RiskyGrowthGoal,
+) -> Result<f64> {
+    anyhow::ensure!(
+        initial.is_finite() && initial > 0. && span.is_finite() && span > 0.,
+        "invalid training episode metrics"
+    );
+    goal.validate().map_err(anyhow::Error::msg)?;
+    let economic_rejection = neoethos_gpu_contracts::resident_search_scoring_v2::classify_resident_metrics_v2(metrics)
+        .map_err(|error| anyhow::anyhow!("invalid training episode producer metrics: {error:?}"))?;
+    if economic_rejection.is_some() {
+        return Ok(-1.);
+    }
+    if metrics[8] == 0. {
+        anyhow::ensure!(metrics[0] == 0., "inactive episode reports nonzero net");
+        return Ok(0.); // A specialist's inactivity is neutral, not a failed account.
+    }
+    if metrics[0] <= -initial || metrics[3] >= 1. {
+        return Ok(-1.);
+    }
+    let score = crate::scoring::ga_fitness_goal(metrics, initial, span, goal);
+    anyhow::ensure!(score.is_finite(), "nonfinite training goal utility");
+    Ok(score.clamp(-1., 1.))
+}
+
+/// Research-only repair experiment: select from the SAME frozen GA population
+/// using multiple earlier training episodes instead of the single lucky tail.
+/// Global selection-fitted normalization is permitted here because every row
+/// is explicitly training/selection data; none of these episodes is called OOS.
+/// The untouched outer replay is a separate command after the cohort is frozen.
+pub fn evaluate_saved_candidate_training_episodes_v1(
+    input: &CanonicalSearchRunInputV2<'_>,
+    config: &DiscoveryConfig,
+    research: &crate::CanonicalTrendbarResearchDiscoveryResultV3,
+) -> Result<serde_json::Value> {
+    let replay = prepare_saved_candidate_replay(input, config, research)?;
+    anyhow::ensure!(
+        replay.research_config.mode == DiscoveryMode::Risky
+            && replay.research_config.runtime_overrides.risky_survival_only
+            && replay
+                .research_config
+                .runtime_overrides
+                .risky_account_experiment_v3,
+        "training episode experiment requires Risky survival v3"
+    );
+    let goal = replay
+        .evaluation
+        .growth_goal
+        .context("training episodes lost the sealed goal")?;
+    let initial = replay.research_config.initial_balance;
+    let result = research.discovery_result();
+    let genes = &result.candidates;
+    anyhow::ensure!(
+        !genes.is_empty(),
+        "training episode experiment has no saved candidates"
+    );
+    let selection = replay.inputs.selection();
+    let windows =
+        risky_training_episode_ranges_v1(&replay.projected.timestamps, goal.horizon_days)?;
+    let mut observations = vec![Vec::with_capacity(4); genes.len()];
+    let mut utilities = vec![Vec::with_capacity(4); genes.len()];
+    let mut positive = vec![0usize; genes.len()];
+    let mut trading = vec![0usize; genes.len()];
+    let mut window_documents = Vec::new();
+    for (episode, range) in windows.iter().enumerate() {
+        if crate::genetic::search_engine::search_cancel_requested() {
+            anyhow::bail!("__DISCOVERY_CANCELLED__: training episode replay cancelled");
+        }
+        let features = replay.projected.row_window(range.start, range.end)?;
+        let bars = slice_ohlcv(selection.ohlcv(), range.start, range.end);
+        let timestamps = features.timestamps.as_slice();
+        let span = (timestamps[timestamps.len() - 1] - timestamps[0]) as f64 / 86_400_000.;
+        let (months, days) = month_day_indices(timestamps);
+        let resolver = GeneEvalSettingsResolver::for_slice(
+            &replay.research_config,
+            genes.iter(),
+            &bars.high,
+            &bars.low,
+            &bars.close,
+        )?;
+        let (signals, confidences) = locked_holdout_signals_and_confidences_with_policy(
+            genes,
+            &features,
+            &bars,
+            &replay.evaluation,
+            replay.bypass,
+        )?;
+        for (index, gene) in genes.iter().enumerate() {
+            let settings = resolver.settings_for_gene(gene);
+            let (metrics, trades) = evaluate_gene_with_ledger_v1(
+                &bars,
+                timestamps,
+                &months,
+                &days,
+                &signals[index],
+                &confidences[index],
+                &settings,
+            )?;
+            if episode == 3 {
+                anyhow::ensure!(
+                    trades.len() == gene.trades_count
+                        && (metrics[0] - gene.expectancy * gene.trades_count as f64).abs()
+                            <= 1e-7 * metrics[0].abs().max(1.),
+                    "latest training replay differs from saved candidate {}",
+                    gene.strategy_id
+                );
+            }
+            let utility = risky_training_episode_utility_v1(&metrics, initial, span, goal)?;
+            utilities[index].push(utility);
+            positive[index] += usize::from(metrics[0] > 0.);
+            trading[index] += usize::from(!trades.is_empty());
+            let monthly = crate::quality::monthly_closed_trade_metrics_v1(
+                &trades,
+                initial,
+                timestamps[0],
+                timestamps[timestamps.len() - 1],
+            )?;
+            observations[index].push(serde_json::json!({
+                "episode": episode, "utility": utility, "net_profit": metrics[0],
+                "max_drawdown": metrics[3], "trades": trades.len(),
+                "mean_recorded_R": if trades.is_empty() {0.} else {trades.iter().map(|t| t.r_multiple).sum::<f64>() / trades.len() as f64},
+                "monthly_breakdown": monthly,
+                "full_target_reached": initial + metrics[0] >= goal.target_balance,
+            }));
+        }
+        window_documents.push(serde_json::json!({"episode": episode,
+            "selection_start_row": range.start, "selection_end_row_exclusive": range.end,
+            "first_timestamp_ms": timestamps[0], "last_timestamp_ms": timestamps[timestamps.len()-1],
+            "bars": range.len(), "span_days": span}));
+    }
+    let candidates = genes
+        .iter()
+        .zip(observations)
+        .enumerate()
+        .map(|(index, (gene, episodes))| {
+            let mean = utilities[index].iter().sum::<f64>() / 4.;
+            Ok(
+                serde_json::json!({"candidate_index": index, "strategy_id": gene.strategy_id,
+            "exact_gene_hash": crate::artifact_io::stable_json_hash(gene)?,
+            "latest_episode_utility": utilities[index][3], "mean_episode_utility": mean,
+            "positive_episodes": positive[index], "trading_episodes": trading[index],
+            "episodes": episodes}),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(serde_json::json!({
+        "schema": "neoethos.research-only.training-episode-selection.v1",
+        "artifact_class": "ResearchOnly", "promotion_eligibility": "NotPromotionEligible",
+        "evaluation_scope": "individual_strategies", "combined_portfolio_evaluated": false,
+        "learning_scope": "post_GA_selection_of_frozen_population; genetic reproduction unchanged",
+        "normalization_scope": "frozen_global_selection_fit; training episodes are not independent OOS",
+        "aggregation": "mean_clipped_goal_pace_utility_v1; loss floor-1; target ceiling1; inactive0",
+        "selection_scope": result.selection_scope, "initial_balance": initial,
+        "goal": goal, "windows": window_documents, "candidates": candidates,
+    }))
 }
 
 pub fn diagnose_research_candidates_under_cost_variants_v3(
@@ -13544,12 +13814,12 @@ pub enum DiscoveryMode {
     /// MC-perturbation gates). Use only when looking for unicorn
     /// strategies that survive every consistency test in the codebase.
     Strict,
-    /// Self-tuning prop-firm passing mode. Default. Permissive filter
+    /// Self-tuning prop-firm passing mode. Permissive filter
     /// floors + FTMO window-pass scoring + ranking-based portfolio
     /// selection. Designed to deliver portfolios that can pass an
     /// actual prop-firm challenge in 60 days per phase.
     PropFirm,
-    /// Aggressive capital-multiplication mode (the user-facing "Risky"
+    /// Primary/default capital-multiplication mode (the user-facing "Risky"
     /// trading mode). High-risk-tolerant filter floors, a growth-tilted
     /// candidate ranking (fitness-dominated, NO drawdown tax) and NO
     /// prop-firm window-pass gate. Optimises for the fastest compounding of a
@@ -18485,6 +18755,7 @@ pub fn build_discovery_profile(
         // field can never be added to DiscoveryConfig without this destructure
         // noticing it.
         fitness_table: _profile_fitness_table @ _,
+        risky_limits_policy,
         // Bound like `fitness_table` (not yet recorded in the run profile —
         // section 14.8 stamp gap); a new field can never be added to
         // DiscoveryConfig without this destructure noticing it.
@@ -18694,6 +18965,7 @@ pub fn build_discovery_profile(
         risk_per_trade_max: *risk_per_trade_max,
         high_quality_confidence: *high_quality_confidence,
         risky_risk_band: *risky_risk_band,
+        risky_limits_policy: *risky_limits_policy,
         prop_firm_risk_band: *prop_firm_risk_band,
         max_regime_loss_pct: *max_regime_loss_pct,
         mc_runs: *mc_runs,

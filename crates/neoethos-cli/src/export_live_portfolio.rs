@@ -14,7 +14,7 @@
 //! canonical-research is deliberately research-only. Without this bridge the
 //! searched candidates could not be validated out of sample at all.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 #[derive(serde::Deserialize)]
 struct ResearchWrapper {

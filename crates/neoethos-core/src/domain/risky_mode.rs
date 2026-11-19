@@ -81,6 +81,56 @@
 
 use anyhow::{Result, bail};
 
+/// Explicit Risky-only risk semantics. Absence preserves frozen legacy runs.
+/// Broker constraints, solvency and strategy validation remain independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskyLimitsPolicy {
+    PerTradeOnlyV1,
+}
+
+impl RiskyLimitsPolicy {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PerTradeOnlyV1 => "per_trade_only_v1",
+        }
+    }
+
+    pub fn validate_band(self, min: f64, max: f64, high_quality: f64) -> Result<()> {
+        anyhow::ensure!(
+            min.is_finite()
+                && max.is_finite()
+                && min >= 0.0
+                && max > 0.0
+                && min <= max
+                && max <= 0.30
+                && high_quality.is_finite()
+                && high_quality > 0.0
+                && high_quality <= 1.0,
+            "Risky per_trade_only_v1 requires 0 <= min <= max <= 0.30, max > 0 and 0 < high_quality_confidence <= 1"
+        );
+        Ok(())
+    }
+}
+
+/// The existing Search confidence band, also used by live PerTradeOnlyV1.
+/// The fallback is retained for legacy callers; the new policy validates its
+/// normaliser before calling this function.
+pub fn confidence_scaled_risk_fraction(
+    min: f64,
+    max: f64,
+    high_quality: f64,
+    confidence: f64,
+) -> f64 {
+    let confidence = confidence.clamp(0.0, 1.0);
+    let scale = if high_quality.is_finite() && high_quality > 0.0 {
+        (confidence / high_quality).min(1.0)
+    } else {
+        1.0
+    };
+    min + (max - min) * scale
+}
+
 // ---------------------------------------------------------------------------
 // Defaults — operator-directive-derived (2026-05-17 framing).
 // Every constant is `pub const` so the live producer and the UI can render

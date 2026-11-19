@@ -78,133 +78,175 @@ fn combine_gene_signals_with_resolved_policy(
     smc_gate_disabled: bool,
     adaptive_policy: &neoethos_search::stop_target::ResolvedAdaptiveStopsPolicyV1,
 ) -> Result<NettedGeneSignals> {
-    let n = aligned_features.n_samples();
-    ensure!(
-        base_ohlcv.timestamp.as_deref() == Some(aligned_features.timestamps.as_slice())
-            && [
-                base_ohlcv.open.len(),
-                base_ohlcv.high.len(),
-                base_ohlcv.low.len(),
-                base_ohlcv.close.len()
-            ]
-            .iter()
-            .all(|length| *length == n),
-        "archived netted signals require exact matching feature/OHLC rows and timestamps"
-    );
-    ensure!(
-        evaluation.pip_value.is_finite() && evaluation.pip_value > 0.0,
-        "archived signal policy has no finite positive pip size"
-    );
-    adaptive_policy.validate()?;
-    ensure!(
-        genes.len() <= i32::MAX as usize,
-        "portfolio vote count exceeds its exact accumulator"
-    );
-    for gene in genes {
+    let votes = ArchivedGeneVotes::prepare(
+        genes,
+        aligned_features,
+        base_ohlcv,
+        evaluation,
+        smc_gate_disabled,
+        adaptive_policy,
+    )?;
+    votes.net(&(0..genes.len()).collect::<Vec<_>>())
+}
+
+/// Synthesize each expert once. Majority voting and specialist routing consume
+/// the same ready direction, confidence and sealed brackets for a signal row.
+pub(crate) struct ArchivedGeneVotes<'a> {
+    genes: &'a [Gene],
+    signals: Vec<Vec<i8>>,
+    confidences: Vec<Vec<f64>>,
+    adaptive_base: Option<Vec<f64>>,
+    reward_risk: f64,
+    rows: usize,
+}
+
+impl<'a> ArchivedGeneVotes<'a> {
+    pub(crate) fn prepare(
+        genes: &'a [Gene],
+        aligned_features: &FeatureFrame,
+        base_ohlcv: &Ohlcv,
+        evaluation: &EvaluationConfig,
+        smc_gate_disabled: bool,
+        adaptive_policy: &neoethos_search::stop_target::ResolvedAdaptiveStopsPolicyV1,
+    ) -> Result<Self> {
+        let n = aligned_features.n_samples();
         ensure!(
-            [gene.sl_pips, gene.tp_pips]
+            base_ohlcv.timestamp.as_deref() == Some(aligned_features.timestamps.as_slice())
+                && [
+                    base_ohlcv.open.len(),
+                    base_ohlcv.high.len(),
+                    base_ohlcv.low.len(),
+                    base_ohlcv.close.len()
+                ]
                 .iter()
-                .all(|value| value.is_finite() && *value > 0.0)
-                && gene.stop_vol_mult.is_finite()
-                && gene.stop_vol_mult >= 0.0
-                && gene.long_threshold.is_finite()
-                && gene.short_threshold.is_finite()
-                && gene.indices.len() == gene.weights.len()
-                && gene.weights.iter().all(|weight| weight.is_finite()),
-            "gene `{}` has invalid archived signal/bracket inputs",
-            gene.strategy_id
+                .all(|length| *length == n),
+            "archived netted signals require exact matching feature/OHLC rows and timestamps"
         );
-    }
-    let (signals, confidences) =
-        neoethos_search::discovery::locked_holdout_signals_and_confidences_with_policy(
-            genes,
-            aligned_features,
-            base_ohlcv,
-            evaluation,
-            smc_gate_disabled,
-        )
-        .context("synthesize archived SMC signal/confidence pairs")?;
-    // Search interprets an already-evolved positive multiplier as adaptive.
-    // The archived `enabled` flag governed gene generation, not whether replay
-    // may silently replace an existing gene's adaptive stops with fixed pips.
-    let adaptive_base = if genes.iter().any(|gene| gene.stop_vol_mult > 0.0) {
-        match neoethos_search::stop_target::adaptive_base_pips_series_with_settings(
-            &base_ohlcv.high,
-            &base_ohlcv.low,
-            &base_ohlcv.close,
-            evaluation.pip_value,
-            adaptive_policy.settings(),
-        ) {
-            Ok(base) => Some(base),
-            // Exact Search policy: a whole slice without an estimator window
-            // uses fixed pips. Missing cells in an available series do not.
-            Err(neoethos_search::stop_target::StopDistanceError::TooShort { .. }) => None,
-            Err(error) => return Err(error).context("archived adaptive stop base unavailable"),
-        }
-    } else {
-        None
-    };
-    let mut out = NettedGeneSignals {
-        directions: Vec::with_capacity(n),
-        confidences: Vec::with_capacity(n),
-        sl_pips: Vec::with_capacity(n),
-        tp_pips: Vec::with_capacity(n),
-    };
-    for row in 0..n {
-        let mut net = 0i32;
-        let mut sums = [[0.0_f64; 3]; 2];
-        let mut counts = [0usize; 2];
-        for (index, gene) in genes.iter().enumerate() {
-            let signal = signals[index][row];
-            let confidence = confidences[index][row];
+        ensure!(
+            evaluation.pip_value.is_finite() && evaluation.pip_value > 0.0,
+            "archived signal policy has no finite positive pip size"
+        );
+        adaptive_policy.validate()?;
+        ensure!(
+            genes.len() <= i32::MAX as usize,
+            "portfolio vote count exceeds its exact accumulator"
+        );
+        for gene in genes {
             ensure!(
-                (-1..=1).contains(&signal)
-                    && confidence.is_finite()
-                    && (0.0..=1.0).contains(&confidence),
-                "gene `{}` returned an invalid signal/confidence at row {row}",
+                [gene.sl_pips, gene.tp_pips]
+                    .iter()
+                    .all(|value| value.is_finite() && *value > 0.0)
+                    && gene.stop_vol_mult.is_finite()
+                    && gene.stop_vol_mult >= 0.0
+                    && gene.long_threshold.is_finite()
+                    && gene.short_threshold.is_finite()
+                    && gene.indices.len() == gene.weights.len()
+                    && gene.weights.iter().all(|weight| weight.is_finite()),
+                "gene `{}` has invalid archived signal/bracket inputs",
                 gene.strategy_id
             );
-            if signal == 0 {
-                continue;
-            }
-            let Some((stop, target)) = neoethos_search::stop_target::resolve_entry_stop_target_pips(
-                gene.sl_pips,
-                gene.tp_pips,
-                gene.stop_vol_mult,
-                adaptive_base
-                    .as_ref()
-                    .and_then(|base| base.get(row))
-                    .copied(),
-                adaptive_base.is_some(),
-                adaptive_policy.reward_risk_fallback(),
-            ) else {
-                continue;
-            };
-            net += i32::from(signal);
-            let side = usize::from(signal < 0);
-            counts[side] += 1;
-            sums[side][0] += confidence;
-            sums[side][1] += stop;
-            sums[side][2] += target;
-            ensure!(
-                sums[side].iter().all(|value| value.is_finite()),
-                "netted portfolio signal arithmetic overflow at row {row}"
-            );
         }
-        let direction = dir_from_net(net);
-        let values = if direction == Direction::Flat {
-            [0.0; 3]
-        } else {
-            let side = usize::from(direction == Direction::Short);
-            let count = counts[side] as f64;
-            sums[side].map(|value| value / count)
-        };
-        out.directions.push(direction);
-        out.confidences.push(values[0]);
-        out.sl_pips.push(values[1]);
-        out.tp_pips.push(values[2]);
+        let (signals, confidences) =
+            neoethos_search::discovery::locked_holdout_signals_and_confidences_with_policy(
+                genes,
+                aligned_features,
+                base_ohlcv,
+                evaluation,
+                smc_gate_disabled,
+            )
+            .context("synthesize archived SMC signal/confidence pairs")?;
+        // Search interprets an already-evolved positive multiplier as adaptive.
+        // The archived `enabled` flag governed gene generation, not whether replay
+        // may silently replace an existing gene's adaptive stops with fixed pips.
+        let adaptive_base = adaptive_policy
+            .entry_base_pips(
+                genes.iter().any(|gene| gene.stop_vol_mult > 0.0),
+                &base_ohlcv.high,
+                &base_ohlcv.low,
+                &base_ohlcv.close,
+                evaluation.pip_value,
+            )
+            .context("archived adaptive stop base unavailable")?;
+        Ok(Self {
+            genes,
+            signals,
+            confidences,
+            adaptive_base,
+            reward_risk: adaptive_policy.reward_risk_fallback(),
+            rows: n,
+        })
     }
-    Ok(out)
+
+    pub(crate) fn decision(&self, index: usize, row: usize) -> Result<Option<(i8, [f64; 3])>> {
+        let gene = &self.genes[index];
+        let signal = self.signals[index][row];
+        let confidence = self.confidences[index][row];
+        ensure!(
+            (-1..=1).contains(&signal)
+                && confidence.is_finite()
+                && (0.0..=1.0).contains(&confidence),
+            "gene `{}` returned an invalid signal/confidence at row {row}",
+            gene.strategy_id
+        );
+        if signal == 0 {
+            return Ok(None);
+        }
+        let brackets = neoethos_search::stop_target::resolve_entry_stop_target_pips(
+            gene.sl_pips,
+            gene.tp_pips,
+            gene.stop_vol_mult,
+            self.adaptive_base
+                .as_ref()
+                .and_then(|base| base.get(row))
+                .copied(),
+            self.adaptive_base.is_some(),
+            self.reward_risk,
+        );
+        Ok(brackets.map(|(stop, target)| (signal, [confidence, stop, target])))
+    }
+
+    pub(crate) fn net(&self, indices: &[usize]) -> Result<NettedGeneSignals> {
+        let n = self.rows;
+        let mut out = NettedGeneSignals {
+            directions: Vec::with_capacity(n),
+            confidences: Vec::with_capacity(n),
+            sl_pips: Vec::with_capacity(n),
+            tp_pips: Vec::with_capacity(n),
+        };
+        for row in 0..n {
+            let mut net = 0i32;
+            let mut sums = [[0.0_f64; 3]; 2];
+            let mut counts = [0usize; 2];
+            for &index in indices {
+                let Some((signal, [confidence, stop, target])) = self.decision(index, row)? else {
+                    continue;
+                };
+                net += i32::from(signal);
+                let side = usize::from(signal < 0);
+                counts[side] += 1;
+                sums[side][0] += confidence;
+                sums[side][1] += stop;
+                sums[side][2] += target;
+                ensure!(
+                    sums[side].iter().all(|value| value.is_finite()),
+                    "netted portfolio signal arithmetic overflow at row {row}"
+                );
+            }
+            let direction = dir_from_net(net);
+            let values = if direction == Direction::Flat {
+                [0.0; 3]
+            } else {
+                let side = usize::from(direction == Direction::Short);
+                let count = counts[side] as f64;
+                sums[side].map(|value| value / count)
+            };
+            out.directions.push(direction);
+            out.confidences.push(values[0]);
+            out.sl_pips.push(values[1]);
+            out.tp_pips.push(values[2]);
+        }
+        Ok(out)
+    }
 }
 
 /// Combine a portfolio's genes into ONE net per-bar direction. `aligned_features`
@@ -818,6 +860,9 @@ mod tests {
             growth_objective: false,
             growth_goal: None,
             fitness_table: Default::default(),
+            risky_account_experiment: None,
+            risky_limits_policy: None,
+            weekly_objective: None,
         };
         let adaptive = neoethos_search::stop_target::ResolvedAdaptiveStopsPolicyV1::checked_new(
             neoethos_search::stop_target::StopTargetSettings {

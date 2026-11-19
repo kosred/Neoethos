@@ -6,6 +6,10 @@ use crate::domain::prop_firm::{PropFirmConstraints, PropFirmPreset, PropFirmRunt
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Concurrent-risk seed for the operator's primary Risky product. Explicit
+/// PropFirm profiles seed their own preset's daily-stop ceiling instead.
+const RISKY_PORTFOLIO_RISK_CAP: f64 = 0.34;
+
 /// Serialize a `HashMap` in SORTED key order (audit M06/M07 follow-up).
 /// HashMap iteration order is randomized per process, so `Settings::save`
 /// reshuffled these config maps on every write — dirtying config.yaml in git
@@ -85,6 +89,10 @@ pub fn validate_news_calendar_source(raw: &str) -> Result<String, String> {
 
 /// System-level configuration
 ///
+/// Search/discovery and risk framing use `trading_mode`, whose default is
+/// `risky`. An explicit `models.discovery_mode = "strict"` overrides only
+/// the discovery side.
+///
 /// **Sealed against a second load path.** `remote = "Self"` makes the derive
 /// emit an *inherent* `SystemConfig::deserialize` instead of an
 /// `impl Deserialize for SystemConfig`, so this type cannot be reached by
@@ -132,10 +140,6 @@ pub struct SystemConfig {
     ///   - `"prop_firm"` → safety / stability: pass prop-firm challenges and
     ///     bank a steady monthly return. Drives `DiscoveryMode::PropFirm` (FTMO
     ///     window-pass gate) and the active `risk.preset` constraints.
-    ///
-    /// Search/discovery + risk framing orient around this one choice. An
-    /// explicit `models.discovery_mode = "strict"` is a power-user escape hatch
-    /// that overrides the discovery side only. Default `"prop_firm"`.
     pub trading_mode: String,
     /// Risky-Mode goal — capital multiplication. The operator sets where to
     /// start, where to reach, and by when; in Risky mode these PRESSURE the
@@ -238,7 +242,9 @@ impl Default for SystemConfig {
             // value.
             account_currency: String::new(),
             data_dir: PathBuf::from("data"),
-            trading_mode: "prop_firm".to_string(),
+            // Operator's primary product: 100 -> 50,000 in 180 days. An
+            // explicitly selected PropFirm profile still overrides this.
+            trading_mode: "risky".to_string(),
             risky_start_balance_usd: 100.0,
             risky_target_balance_usd: 50000.0,
             risky_horizon_days: 180,
@@ -381,6 +387,10 @@ pub struct RiskConfig {
     /// a field-level default would instead turn an absent key into `None`.
     pub risky_min_risk_per_trade: Option<f64>,
     pub risky_max_risk_per_trade: Option<f64>,
+    /// Opt-in Risky-only execution semantics. None preserves legacy archives;
+    /// PropFirm never resolves this policy, even in the same config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risky_limits_policy: Option<crate::domain::risky_mode::RiskyLimitsPolicy>,
     pub prop_firm_min_risk_per_trade: Option<f64>,
     pub prop_firm_max_risk_per_trade: Option<f64>,
     /// Portfolio-level cap on TOTAL concurrent risk across all running live
@@ -596,6 +606,7 @@ impl Default for RiskConfig {
             // surfaces P(ruin) so this stays a visible bet, not a hidden one.
             risky_min_risk_per_trade: None,
             risky_max_risk_per_trade: Some(0.30),
+            risky_limits_policy: None,
             prop_firm_min_risk_per_trade: None,
             // Operator decision (2026-08-10): a prop-firm entry may use at
             // most 1% risk. `None` would fall back to the shared 3% band.
@@ -613,7 +624,7 @@ impl Default for RiskConfig {
             // this per preset AND per trading_mode; the risky ladder gets
             // RISKY_PORTFOLIO_RISK_CAP instead, which is a tolerance for ruin
             // rather than a rulebook.
-            max_portfolio_risk: runtime.daily_dd_stop_trading_pct,
+            max_portfolio_risk: RISKY_PORTFOLIO_RISK_CAP,
             // Internal early stop sits 20% below the firm's published
             // daily-loss ceiling so a guard-rail trips before a real
             // breach. Operators override in YAML if their firm gives
@@ -682,6 +693,17 @@ impl Default for RiskConfig {
 pub type SessionSpreadPips = [f64; 3];
 
 impl RiskConfig {
+    pub fn limits_policy_for_mode(
+        &self,
+        mode: &str,
+    ) -> Option<crate::domain::risky_mode::RiskyLimitsPolicy> {
+        if mode.eq_ignore_ascii_case("risky") || mode.eq_ignore_ascii_case("growth") {
+            self.risky_limits_policy
+        } else {
+            None
+        }
+    }
+
     /// Resolve the operator's session-spread curve.
     ///
     /// - `Ok(None)` — none of the three keys is set. The evaluator charges the
@@ -3072,7 +3094,8 @@ pub use load_seal::{ConfigOverride, ConfigProvenance, ConfigSource, Settings};
 /// open by design, and why `ModelsConfig` is still unsealed.
 mod load_seal {
     use super::{
-        AppRuntimeConfig, ModelsConfig, NewsConfig, RiskConfig, SystemConfig, user_config_path,
+        AppRuntimeConfig, ModelsConfig, NewsConfig, RISKY_PORTFOLIO_RISK_CAP, RiskConfig,
+        SystemConfig, user_config_path,
     };
     use crate::domain::prop_firm::{PropFirmConstraints, PropFirmPreset, PropFirmRuntimeDefaults};
     use serde::{Deserialize, Deserializer, Serialize};
@@ -3847,13 +3870,6 @@ mod load_seal {
         max_trades_per_day: usize,
         max_portfolio_risk: f64,
     }
-
-    /// The concurrent-risk ceiling for the RISKY ladder, where the point is to
-    /// multiply a small balance and `risky_max_risk_per_trade` is already 0.30.
-    /// It is deliberately not derived from a daily-drawdown stop: risky mode has
-    /// no challenge to fail, so the binding constraint is the operator's
-    /// tolerance for ruin, not a firm's rulebook.
-    const RISKY_PORTFOLIO_RISK_CAP: f64 = 0.34;
 
     impl PresetSeeds {
         /// `risky_ladder` comes from `system.trading_mode`, NOT from the preset.

@@ -50,6 +50,582 @@ fn near(actual: f64, expected: f64) {
     );
 }
 
+fn joint_policy() -> JointBarAccountPolicyV1 {
+    JointBarAccountPolicyV1 {
+        max_open_positions: 4,
+        max_entry_stop_risk_fraction: 0.02,
+        max_gross_notional_multiple: 30.0,
+        max_target_pips: 20.0,
+    }
+}
+
+fn joint_single(
+    run: &PreparedNettedCanonicalBarResearchV1,
+    tape: NettedBarDecisionTapeV1<'_>,
+) -> JointBarAccountResultV1 {
+    run.evaluate_joint(
+        &[JointBarLaneV1 {
+            expert_id: "a",
+            tape,
+        }],
+        joint_policy(),
+        None,
+        true,
+    )
+    .unwrap()
+}
+
+fn goal_fixture(high: &[f64], low: &[f64]) -> PreparedNettedCanonicalBarResearchV1 {
+    let mut run = prepared(&vec![100.; high.len()], high, low);
+    // Real 180-day deadlines, independently chosen sparse numerical fixtures.
+    let start = run.timestamps[0];
+    run.timestamps = [0, 60, 120, 180, 181]
+        .iter()
+        .take(high.len())
+        .map(|d| start + d * 86_400_000)
+        .collect();
+    run
+}
+
+fn goal_single(run: &PreparedNettedCanonicalBarResearchV1) -> JointBarAccountResultV1 {
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1; 5],
+        confidences: &[1.; 5],
+        sl_pips: &[2.; 5],
+        tp_pips: &[4.; 5],
+        ml_multipliers: &[1.; 5],
+    };
+    run.evaluate_joint_risky(
+        &[JointBarLaneV1 {
+            expert_id: "a",
+            tape,
+        }],
+        joint_policy(),
+        None,
+        true,
+        crate::scoring::RiskyGrowthGoal {
+            start_balance: 1000.,
+            target_balance: 1030.,
+            horizon_days: 180.,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn risky_joint_banks_only_realized_target_and_ignores_later_losses() {
+    let run = goal_fixture(
+        &[100., 100., 104., 100., 100.],
+        &[100., 100., 100., 98., 98.],
+    );
+    let out = goal_single(&run);
+    // Admission budget20 =>1lot; TP40 less commission2 =>38 settled profit.
+    near(out.valuation.ending_realized_balance, 1038.);
+    assert_eq!(out.closed_trades.len(), 1);
+    assert!(out.terminal_open.is_empty());
+    let goal = out.risky_goal.unwrap();
+    assert_eq!(goal.status, "target_banked");
+    assert_eq!(goal.banked_target_timestamp_ms, Some(run.timestamps[2]));
+    assert!(goal.full_horizon_available);
+}
+
+#[test]
+fn risky_joint_deadline_does_not_credit_a_later_target_or_force_close() {
+    let run = goal_fixture(&[100., 100., 100., 100., 104.], &[100.; 5]);
+    let out = goal_single(&run);
+    near(out.valuation.ending_realized_balance, 1000.);
+    near(out.valuation.ending_modeled_net_equity, 998.);
+    assert_eq!(out.terminal_open.len(), 1);
+    assert!(out.closed_trades.is_empty());
+    assert_eq!(out.valuation.last_processed_timestamp_ms, run.timestamps[3]);
+    assert_eq!(
+        out.risky_goal.unwrap().status,
+        "deadline_elapsed_without_banked_target"
+    );
+}
+
+#[test]
+fn risky_joint_cash_crossing_with_an_open_losing_sleeve_is_not_success() {
+    let run = goal_fixture(
+        &[100., 100., 104., 100., 100.],
+        &[100., 100., 100., 98., 100.],
+    );
+    let tape = |tp| NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0, 0, 0],
+        confidences: &[1.; 5],
+        sl_pips: &[2.; 5],
+        tp_pips: tp,
+        ml_multipliers: &[0.5; 5],
+    };
+    let out = run
+        .evaluate_joint_risky(
+            &[
+                JointBarLaneV1 {
+                    expert_id: "a",
+                    tape: tape(&[4.; 5]),
+                },
+                JointBarLaneV1 {
+                    expert_id: "b",
+                    tape: tape(&[8.; 5]),
+                },
+            ],
+            joint_policy(),
+            None,
+            true,
+            crate::scoring::RiskyGrowthGoal {
+                start_balance: 1000.,
+                target_balance: 1010.,
+                horizon_days: 180.,
+            },
+        )
+        .unwrap();
+    // Two .5lot sleeves: A settles +19, then B settles -11 =>1008.
+    near(out.valuation.ending_realized_balance, 1008.);
+    let goal = out.risky_goal.unwrap();
+    assert_eq!(
+        goal.first_realized_crossing_timestamp_ms,
+        Some(run.timestamps[2])
+    );
+    assert_eq!(goal.banked_target_timestamp_ms, None);
+    assert_eq!(goal.status, "deadline_elapsed_without_banked_target");
+}
+
+#[test]
+fn risky_joint_requires_actual_start_capital_and_complete_horizon_to_grade_failure() {
+    let run = goal_fixture(&[100.; 3], &[100.; 3]);
+    let mut goal = crate::scoring::RiskyGrowthGoal {
+        start_balance: 1000.,
+        target_balance: 50000.,
+        horizon_days: 180.,
+    };
+    let out = run
+        .evaluate_joint_risky(&[], joint_policy(), None, true, goal)
+        .unwrap();
+    assert_eq!(out.risky_goal.unwrap().status, "incomplete_history");
+    goal.start_balance = 100.;
+    assert!(
+        run.evaluate_joint_risky(&[], joint_policy(), None, true, goal)
+            .is_err()
+    );
+}
+
+#[test]
+fn allocation_update_keeps_open_protection_and_sizes_new_expert_from_the_same_account() {
+    let run = prepared(&[100.; 5], &[100., 100., 104., 100., 108.], &[100.; 5]);
+    let older = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0, 0, 0],
+        confidences: &[1.; 5],
+        sl_pips: &[2.; 5],
+        tp_pips: &[8., 1., 1., 1., 1.],
+        ml_multipliers: &[0.5, 0., 0., 0., 0.],
+    };
+    let newer = NettedBarDecisionTapeV1 {
+        signals: &[0, 0, 1, 0, 0],
+        confidences: &[1.; 5],
+        sl_pips: &[2.; 5],
+        tp_pips: &[4.; 5],
+        ml_multipliers: &[0., 0., 1., 1., 1.],
+    };
+    let out = run
+        .evaluate_joint(
+            &[
+                JointBarLaneV1 {
+                    expert_id: "older",
+                    tape: older,
+                },
+                JointBarLaneV1 {
+                    expert_id: "newer",
+                    tape: newer,
+                },
+            ],
+            joint_policy(),
+            None,
+            true,
+        )
+        .unwrap();
+    // Old sleeve: .75 lots, 15 initial stop-risk. At the new entry its pending
+    // commission leaves998.5 equity; remaining budget998.5*.02-15=4.97.
+    // New lots=.2485. Old target remains8 even when its allocation becomes0.
+    let old = out
+        .closed_trades
+        .iter()
+        .find(|t| t.expert_id == "older")
+        .unwrap();
+    let new = out
+        .closed_trades
+        .iter()
+        .find(|t| t.expert_id == "newer")
+        .unwrap();
+    near(old.terms.target_pips, 8.0);
+    near(old.trade.pnl, 58.5);
+    near(new.terms.lots, 0.2485);
+    near(new.trade.pnl, 9.443);
+    near(out.valuation.ending_realized_balance, 1067.943);
+    assert_eq!(out.admission.max_simultaneous_positions, 2);
+    assert_eq!(old.trade.exit_time, Some(run.timestamps[4]));
+    assert_eq!(new.trade.entry_time, run.timestamps[3]);
+}
+
+#[test]
+fn simultaneous_experts_share_cash_budget_and_keep_independent_brackets() {
+    let run = prepared(&[100.; 4], &[100., 100., 104., 108.], &[100.; 4]);
+    let first = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0, 0],
+        confidences: &[1.; 4],
+        sl_pips: &[2.; 4],
+        tp_pips: &[4.; 4],
+        ml_multipliers: &[1.; 4],
+    };
+    let second = NettedBarDecisionTapeV1 {
+        sl_pips: &[4.; 4],
+        tp_pips: &[8.; 4],
+        ..first
+    };
+    let lanes = [
+        JointBarLaneV1 {
+            expert_id: "a",
+            tape: first,
+        },
+        JointBarLaneV1 {
+            expert_id: "b",
+            tape: second,
+        },
+    ];
+    let out = run
+        .evaluate_joint(&lanes, joint_policy(), None, true)
+        .unwrap();
+    // Each requests 3% of the SAME 1000. Combined 60 risk is scaled to 20:
+    // .5 lots at SL2 and .25 at SL4. They close on different bars.
+    assert_eq!(out.admission.max_simultaneous_positions, 2);
+    assert_eq!(out.closed_trades.len(), 2);
+    near(out.closed_trades[0].terms.lots, 0.5);
+    near(out.closed_trades[1].terms.lots, 0.25);
+    near(out.closed_trades[0].trade.pnl, 19.0);
+    near(out.closed_trades[1].trade.pnl, 19.5);
+    near(out.valuation.ending_realized_balance, 1038.5);
+    near(out.admission.max_admitted_stop_risk_fraction, 0.02);
+    assert_eq!(
+        out.closed_trades[0].trade.exit_time,
+        Some(run.timestamps[2])
+    );
+    assert_eq!(
+        out.closed_trades[1].trade.exit_time,
+        Some(run.timestamps[3])
+    );
+    let reverse = [
+        JointBarLaneV1 {
+            expert_id: "b",
+            tape: second,
+        },
+        JointBarLaneV1 {
+            expert_id: "a",
+            tape: first,
+        },
+    ];
+    let reversed = run
+        .evaluate_joint(&reverse, joint_policy(), None, true)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(out).unwrap(),
+        serde_json::to_value(reversed).unwrap()
+    );
+}
+
+#[test]
+fn joint_target_cap_rejects_actual_entry_distance_without_clamping() {
+    let run = prepared(&[100.; 4], &[100.; 4], &[100.; 4]);
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 1, 1, 0],
+        confidences: &[1.; 4],
+        sl_pips: &[2.; 4],
+        tp_pips: &[70., 20.0001, 20., 0.],
+        ml_multipliers: &[1.; 4],
+    };
+    let out = run
+        .evaluate_joint(
+            &[JointBarLaneV1 {
+                expert_id: "normal",
+                tape,
+            }],
+            joint_policy(),
+            None,
+            false,
+        )
+        .unwrap();
+    assert_eq!(out.admission.entries("oversized_target"), 2);
+    assert_eq!(out.admission.entries("accepted"), 1);
+    near(out.terminal_open[0].terms.target_pips, 20.0);
+    assert_eq!(out.terminal_open[0].entry_timestamp_ms, run.timestamps[3]);
+    assert!(
+        JointBarAccountPolicyV1 {
+            max_target_pips: 25.,
+            ..joint_policy()
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
+fn joint_opposite_positions_keep_marks_separate_without_crediting_unrealized_cash() {
+    let run = prepared(
+        &[100., 100., 101.],
+        &[100., 100., 101.],
+        &[100., 100., 101.],
+    );
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0],
+        confidences: &[1.; 3],
+        sl_pips: &[10.; 3],
+        tp_pips: &[20.; 3],
+        ml_multipliers: &[1.; 3],
+    };
+    let opposite = NettedBarDecisionTapeV1 {
+        signals: &[-1, 0, 0],
+        ..tape
+    };
+    let out = run
+        .evaluate_joint(
+            &[
+                JointBarLaneV1 {
+                    expert_id: "long",
+                    tape,
+                },
+                JointBarLaneV1 {
+                    expert_id: "short",
+                    tape: opposite,
+                },
+            ],
+            joint_policy(),
+            None,
+            false,
+        )
+        .unwrap();
+    // .1 lots each. Opposite price marks cancel; .2+.2 pending commission.
+    assert_eq!(out.terminal_open.len(), 2);
+    assert!(out.closed_trades.is_empty());
+    near(out.valuation.ending_realized_balance, 1000.0);
+    near(out.valuation.ending_modeled_net_equity, 999.6);
+    near(out.terminal_open[0].gross_unrealized_account, 1.0);
+    near(out.terminal_open[1].gross_unrealized_account, -1.0);
+}
+
+#[test]
+fn joint_lot_grid_rounds_down_and_rejected_entries_do_not_occupy_slots() {
+    let mut run = prepared(&[100.; 4], &[100., 100., 100., 104.], &[100.; 4]);
+    run.settings.risk_per_trade_min = 0.02;
+    run.settings.risk_per_trade_max = 0.02;
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 1, 0, 0],
+        confidences: &[1.; 4],
+        sl_pips: &[2.; 4],
+        tp_pips: &[4.; 4],
+        ml_multipliers: &[0.25, 0.99, 0., 0.],
+    };
+    let out = run
+        .evaluate_joint(
+            &[JointBarLaneV1 {
+                expert_id: "a",
+                tape,
+            }],
+            joint_policy(),
+            Some(BarReplayLotGridV1::new(0.5, 100., 0.5).unwrap()),
+            false,
+        )
+        .unwrap();
+    assert_eq!(out.admission.entries("below_min_lots"), 1);
+    assert_eq!(out.admission.entries("accepted"), 1);
+    near(out.closed_trades[0].terms.lots, 0.5);
+    near(out.closed_trades[0].trade.pnl, 19.0);
+    assert_eq!(out.closed_trades[0].trade.entry_time, run.timestamps[2]);
+}
+
+#[test]
+fn joint_single_lane_reuses_legacy_price_cost_and_compounding_arithmetic() {
+    let mut run = prepared(&[100.; 5], &[100., 100., 104., 100., 104.], &[100.; 5]);
+    run.settings.spread_pips = 0.2;
+    run.settings.swap_long_pips_per_day = -0.3;
+    run.settings.pnl_conversion_fee_rate = 0.005;
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 1, 0, 0],
+        confidences: &[0.5; 5],
+        sl_pips: &[2.; 5],
+        tp_pips: &[3.; 5],
+        ml_multipliers: &[0.5; 5],
+    };
+    let legacy = run.evaluate(tape, None).unwrap();
+    let joint = run
+        .evaluate_joint(
+            &[JointBarLaneV1 {
+                expert_id: "a",
+                tape,
+            }],
+            joint_policy(),
+            None,
+            false,
+        )
+        .unwrap();
+    near(
+        joint.valuation.ending_realized_balance,
+        legacy.ending_realized_balance,
+    );
+    assert_eq!(joint.closed_trades.len(), 2);
+    for (a, b) in joint.closed_trades.iter().zip(&legacy.closed_trades) {
+        near(a.trade.pnl, b.pnl);
+        near(a.trade.r_multiple, b.r_multiple);
+    }
+}
+
+#[test]
+fn joint_protection_starts_after_entry_and_prefixes_are_causal() {
+    let run = prepared(
+        &[100.; 4],
+        &[100., 110., 104., 100.],
+        &[100., 90., 100., 100.],
+    );
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0, 0],
+        confidences: &[1.; 4],
+        sl_pips: &[2.; 4],
+        tp_pips: &[4.; 4],
+        ml_multipliers: &[1.; 4],
+    };
+    let out = joint_single(&run, tape);
+    assert_eq!(
+        out.closed_trades[0].trade.exit_time,
+        Some(run.timestamps[2])
+    );
+    near(out.closed_trades[0].trade.pnl, 38.0);
+    let changed = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, -1, -1],
+        ..tape
+    };
+    let later = run
+        .evaluate_joint(
+            &[JointBarLaneV1 {
+                expert_id: "a",
+                tape: changed,
+            }],
+            joint_policy(),
+            None,
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&out.equity_trace[..2]).unwrap(),
+        serde_json::to_value(&later.equity_trace[..2]).unwrap()
+    );
+    let bad = NettedBarDecisionTapeV1 {
+        ml_multipliers: &[f64::NAN; 4],
+        ..tape
+    };
+    assert!(
+        run.evaluate_joint(
+            &[JointBarLaneV1 {
+                expert_id: "a",
+                tape: bad
+            }],
+            joint_policy(),
+            None,
+            false
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn joint_entry_cost_exhaustion_stops_before_later_profit_can_hide_it() {
+    let mut run = prepared(&[100.; 4], &[100., 100., 104., 104.], &[100.; 4]);
+    run.settings.commission_per_trade = 5000.0;
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0, 0],
+        confidences: &[1.; 4],
+        sl_pips: &[2.; 4],
+        tp_pips: &[4.; 4],
+        ml_multipliers: &[1.; 4],
+    };
+    let out = joint_single(&run, tape);
+    assert!(out.valuation.drawdown.capital_bound_breached);
+    assert_eq!(out.valuation.last_processed_timestamp_ms, run.timestamps[1]);
+    assert!(out.closed_trades.is_empty());
+    assert_eq!(out.terminal_open.len(), 1);
+    near(out.valuation.ending_realized_balance, 1000.0);
+    near(out.valuation.ending_modeled_net_equity, -4000.0);
+}
+
+#[test]
+fn joint_trailing_cannot_install_a_stop_already_crossed_at_close() {
+    let mut run = prepared(
+        &[100.; 4],
+        &[100., 100., 104., 101.],
+        &[100., 100., 100., 99.],
+    );
+    run.settings.trailing_enabled = true;
+    run.settings.trailing_be_trigger_r = 0.1;
+    run.settings.trailing_atr_multiplier = 0.5;
+    run.settings.trailing_min_lock_pips = 0.0;
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0, 0],
+        confidences: &[1.; 4],
+        sl_pips: &[2.; 4],
+        tp_pips: &[20.; 4],
+        ml_multipliers: &[1.; 4],
+    };
+    let out = run
+        .evaluate_joint(
+            &[JointBarLaneV1 {
+                expert_id: "a",
+                tape,
+            }],
+            joint_policy(),
+            None,
+            false,
+        )
+        .unwrap();
+    assert!(
+        out.closed_trades.is_empty(),
+        "cannot invent a later profitable exit at refused stop103"
+    );
+    assert_eq!(out.terminal_open.len(), 1);
+}
+
+#[test]
+fn joint_gross_notional_limit_scales_the_whole_entry_batch() {
+    let run = prepared(&[100.; 2], &[100.; 2], &[100.; 2]);
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 0],
+        confidences: &[1.; 2],
+        sl_pips: &[2.; 2],
+        tp_pips: &[4.; 2],
+        ml_multipliers: &[1.; 2],
+    };
+    let policy = JointBarAccountPolicyV1 {
+        max_gross_notional_multiple: 0.5,
+        ..joint_policy()
+    };
+    let out = run
+        .evaluate_joint(
+            &[
+                JointBarLaneV1 {
+                    expert_id: "a",
+                    tape,
+                },
+                JointBarLaneV1 {
+                    expert_id: "b",
+                    tape,
+                },
+            ],
+            policy,
+            None,
+            false,
+        )
+        .unwrap();
+    near(out.terminal_open[0].terms.lots, 0.25);
+    near(out.terminal_open[1].terms.lots, 0.25);
+    near(out.admission.max_admitted_gross_notional_multiple, 0.5);
+    near(out.admission.max_admitted_stop_risk_fraction, 0.01);
+}
+
 #[test]
 fn varying_brackets_confidence_and_ml_once_compound_hand_calculated_account_pnl() {
     let run = prepared(
@@ -496,6 +1072,7 @@ fn public_preparation_evaluates_exact_published_canonical_holdout_and_rejects_re
     // currency-conversion fee when quote and account currencies match.
     assert_eq!(contract.pnl_conversion_fee_rate(), 0.0);
     let evaluation = EvaluationConfig {
+        risky_limits_policy: None,
         risky_account_experiment: None,
         symbol: "EURUSD".into(),
         account_currency: "USD".into(),
@@ -581,6 +1158,54 @@ fn public_preparation_evaluates_exact_published_canonical_holdout_and_rejects_re
     assert_eq!(out.account_currency, "USD");
     assert!(out.terminal_open.is_none());
     assert!(!out.promotion_eligible);
+
+    // The existing fitting adapter must use the same cost-charged lifecycle,
+    // keep its declared scope identity, and refuse the final-holdout role.
+    assert!(
+        PreparedNettedCanonicalBarResearchV1::from_training_scope(
+            &run,
+            &scope,
+            &contract,
+            &evaluation,
+        )
+        .is_err()
+    );
+    for role in [
+        CanonicalSearchWindowRoleV1::InSample,
+        CanonicalSearchWindowRoleV1::SelectionValidation,
+    ] {
+        let fitting_scope =
+            CanonicalSearchArtifactScopeV2::from_run_input_range(role, &run, 20..28).unwrap();
+        let fitting = PreparedNettedCanonicalBarResearchV1::from_training_scope(
+            &run,
+            &fitting_scope,
+            &contract,
+            &evaluation,
+        )
+        .expect("explicit non-final scope");
+        let fitting_out = fitting.evaluate(tape, None).unwrap();
+        assert_eq!(fitting_out.metrics, out.metrics);
+        near(fitting_out.ending_realized_balance, 1000.0 + expected);
+        assert_eq!(
+            fitting_out.scope_identity_sha256,
+            fitting_scope.identity_sha256().unwrap()
+        );
+        assert_ne!(fitting_out.scope_identity_sha256, out.scope_identity_sha256);
+        assert_eq!(
+            fitting_out.cost_contract_identity_sha256,
+            out.cost_contract_identity_sha256
+        );
+        assert!(!fitting_out.promotion_eligible);
+        assert!(
+            PreparedNettedCanonicalBarResearchV1::from_input(
+                &run,
+                &fitting_scope,
+                &contract,
+                &evaluation,
+            )
+            .is_err()
+        );
+    }
 
     let wrong_role = CanonicalSearchArtifactScopeV2::from_run_input_range(
         CanonicalSearchWindowRoleV1::InSample,

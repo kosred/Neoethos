@@ -606,9 +606,6 @@ mod tests {
             4096,
         )
         .unwrap_err();
-        assert!(
-            error.to_string().contains("CubeCL CUDA runtime"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("CubeCL CUDA runtime"), "{error}");
     }
 }

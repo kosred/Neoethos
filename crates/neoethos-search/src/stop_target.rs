@@ -334,6 +334,29 @@ impl ResolvedAdaptiveStopsPolicyV1 {
     pub fn settings(&self) -> &StopTargetSettings {
         &self.settings
     }
+
+    /// Build the archived entry series when at least one gene needs it.
+    /// Only a too-short whole slice retains the legacy fixed-pip path; missing
+    /// cells and other producer errors must never silently change geometry.
+    pub fn entry_base_pips(
+        &self,
+        needed: bool,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        pip_size: f64,
+    ) -> Result<Option<Vec<f64>>, StopDistanceError> {
+        self.validate()?;
+        if !needed {
+            return Ok(None);
+        }
+        match adaptive_base_pips_series_with_settings(high, low, close, pip_size, &self.settings) {
+            Ok(base) => Ok(Some(base)),
+            Err(StopDistanceError::TooShort { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -1650,6 +1673,56 @@ pub fn adaptive_stops_rr() -> f64 {
 #[cfg(test)]
 mod adaptive_stop_tests {
     use super::*;
+
+    #[test]
+    fn archived_entry_series_preserves_warmup_and_refuses_non_length_errors() {
+        let settings = StopTargetSettings {
+            vol_estimator: "parkinson".into(),
+            ..Default::default()
+        };
+        let policy = ResolvedAdaptiveStopsPolicyV1::checked_new(settings, false, 2.0).unwrap();
+        assert!(
+            policy
+                .entry_base_pips(false, &[], &[], &[], f64::NAN)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            policy
+                .entry_base_pips(true, &[1.01; 3], &[0.99; 3], &[1.; 3], 0.0001)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            policy
+                .entry_base_pips(true, &[1.01; 3], &[0.99; 3], &[1.; 3], f64::NAN)
+                .is_err()
+        );
+        assert!(
+            policy
+                .entry_base_pips(true, &[1.01; 3], &[0.99; 2], &[1.; 3], 0.0001)
+                .is_err()
+        );
+        let expected = adaptive_base_pips_series_with_settings(
+            &[1.01; 200],
+            &[0.99; 200],
+            &[1.; 200],
+            0.0001,
+            policy.settings(),
+        )
+        .unwrap();
+        let actual = policy
+            .entry_base_pips(true, &[1.01; 200], &[0.99; 200], &[1.; 200], 0.0001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.len(), 200);
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
 
     #[test]
     fn shared_entry_geometry_preserves_fixed_disabled_warmup_and_exact_multiplication_order() {

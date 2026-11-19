@@ -1696,14 +1696,13 @@ fn cmd_trader_replay(args: &[String]) -> Result<()> {
 fn load_canonical_research_contract(
     path: &str,
 ) -> Result<neoethos_search::CanonicalTrendbarResearchExecutionContractV3> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("research contract {path} is not readable"))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("research contract {path} is not readable"))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("research contract {path} is not valid JSON"))?;
     let contract_value = value.get("execution_contract").cloned().unwrap_or(value);
-    serde_json::from_value(contract_value).with_context(|| {
-        "research contract does not match the canonical execution contract schema"
-    })
+    serde_json::from_value(contract_value)
+        .with_context(|| "research contract does not match the canonical execution contract schema")
 }
 
 fn cmd_forward_test(args: &[String]) -> Result<()> {
@@ -2255,6 +2254,12 @@ fn cmd_discover_on_budgeted_pool(
     let result = (|| -> Result<(String, String, usize, usize)> {
         let settings = resolve_cli_settings(args)?;
         let canonical_cpu_research = parse_canonical_cpu_research_inputs(args)?;
+        let specialist_mode = canonical_research::specialist_mode(args)?;
+        let specialists = specialist_mode.is_some();
+        anyhow::ensure!(
+            !specialists || canonical_cpu_research.is_some(),
+            "specialist portfolio requires canonical research inputs"
+        );
         let mut quote_replay = canonical_research::QuoteReplayInputs::load(args)?;
         let mut saved_research = canonical_research::SavedResearchInputs::load(args)?;
         let new_search = canonical_research::NewSearchInputs::load(args)?;
@@ -2282,12 +2287,37 @@ fn cmd_discover_on_budgeted_pool(
         let diagnose_weekdays_out = parse_flag(args, "--diagnose-candidate-weekdays-out");
         let diagnose_exit_out = parse_flag(args, "--diagnose-exit-policy-out");
         let diagnose_oos_out = parse_flag(args, "--diagnose-candidate-oos-out");
+        let diagnose_training_out = parse_flag(args, "--diagnose-training-episodes-out");
         let diagnose_weekday_selectors = parse_flag(args, "--diagnose-candidate-selectors");
         // Research-only offline prefilter-ranking audit (no GA): ranks the full
         // pre-prefilter vocabulary under the default correlation ranking AND
         // the direction-only ranking and persists both tables, then
         // short-circuits before Search via PrefilterRankingAuditCompleteV1.
         let prefilter_audit_out = parse_flag(args, "--prefilter-ranking-audit-out");
+        if let Some(out) = diagnose_training_out.as_deref() {
+            anyhow::ensure!(
+                canonical_cpu_research.is_some()
+                    && saved_research.is_some()
+                    && new_search.is_none()
+                    && quote_replay.is_none(),
+                "training episodes require saved canonical CPU research"
+            );
+            anyhow::ensure!(
+                diagnose_cost_out.is_none()
+                    && diagnose_signals_out.is_none()
+                    && diagnose_weekdays_out.is_none()
+                    && diagnose_exit_out.is_none()
+                    && diagnose_oos_out.is_none()
+                    && diagnose_weekday_selectors.is_none()
+                    && prefilter_audit_out.is_none()
+                    && parse_flag(args, "--diagnose-cost-variants").is_none(),
+                "training episodes cannot be combined with other diagnostics"
+            );
+            anyhow::ensure!(
+                !std::path::Path::new(out).exists(),
+                "training episode output must be new"
+            );
+        }
         if prefilter_audit_out.is_some() {
             anyhow::ensure!(
                 canonical_cpu_research.is_some(),
@@ -2785,6 +2815,20 @@ fn cmd_discover_on_budgeted_pool(
             }
             let mut quote_evidence = Vec::new();
             let mut locked_finalists = Vec::new();
+            let specialist_suffix = match specialist_mode {
+                Some(canonical_research::SpecialistResearchMode::RiskyV4) => "risky-specialists",
+                Some(canonical_research::SpecialistResearchMode::ContinualV3) => {
+                    "continual-specialists"
+                }
+                Some(canonical_research::SpecialistResearchMode::JointV2) => "joint-specialists",
+                _ => "specialists",
+            };
+            let specialist_path =
+                std::path::PathBuf::from(format!("{out}.{specialist_suffix}.json"));
+            anyhow::ensure!(
+                !specialists || (stream_max_batches == 1 && !specialist_path.exists()),
+                "specialist portfolio requires one batch and a new result path"
+            );
             anyhow::ensure!(
                 (quote_replay.is_none() && saved_research.is_none()) || stream_max_batches == 1,
                 "a saved continuation requires --stream-max-batches 1"
@@ -2960,6 +3004,20 @@ fn cmd_discover_on_budgeted_pool(
                              PrefilterRankingAuditCompleteV1"
                         );
                     }
+                    let publish_specialists = |research: &neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3| -> Result<()> {
+                        let document = match specialist_mode {
+                            Some(canonical_research::SpecialistResearchMode::RiskyV4) =>
+                                neoethos_trader::specialist_portfolio::evaluate_risky(&run_input, research)?,
+                            Some(canonical_research::SpecialistResearchMode::ContinualV3) =>
+                                neoethos_trader::specialist_portfolio::evaluate_continual(&run_input, research)?,
+                            Some(canonical_research::SpecialistResearchMode::JointV2) =>
+                                neoethos_trader::specialist_portfolio::evaluate_joint(&run_input, research)?,
+                            _ => neoethos_trader::specialist_portfolio::evaluate(&run_input, research)?,
+                        };
+                        neoethos_core::storage::json::write_json_atomic(&specialist_path, &document)?;
+                        println!("specialist_shared_account_report={}", specialist_path.display());
+                        Ok(())
+                    };
                     if let Some(saved) = saved_research.as_mut() {
                         let research = saved
                             .research
@@ -2971,6 +3029,21 @@ fn cmd_discover_on_budgeted_pool(
                             "saved research contract differs from the reopened sources and settings"
                         );
                         let result_ref = research.discovery_result();
+                        if specialists {
+                            publish_specialists(&research)?;
+                            return Ok(research);
+                        }
+                        if let Some(out) = diagnose_training_out.as_deref() {
+                            let document = neoethos_search::discovery::evaluate_saved_candidate_training_episodes_v1(
+                                &run_input, &research_config, &research,
+                            )?;
+                            neoethos_core::storage::json::write_json_atomic(
+                                std::path::Path::new(out),
+                                &document,
+                            )?;
+                            emit_cpu_research_stage("saved_candidate_training_episodes_written");
+                            return Ok(research);
+                        }
                         if let Some(oos_out) = diagnose_oos_out.as_deref() {
                             let path = std::path::Path::new(oos_out);
                             anyhow::ensure!(
@@ -3198,13 +3271,17 @@ fn cmd_discover_on_budgeted_pool(
                             emit_cpu_research_progress,
                         );
                     }
-                    neoethos_search::run_canonical_trendbar_research_discovery_with_holdout_and_progress(
+                    let research = neoethos_search::run_canonical_trendbar_research_discovery_with_holdout_and_progress(
                         &run_input,
                         &research_config,
                         &contract,
                         neoethos_search::PropFirmRiskRules::default(),
                         emit_cpu_research_progress,
-                    )
+                    )?;
+                    if specialists {
+                        publish_specialists(&research)?;
+                    }
+                    Ok(research)
                 },
             ) {
                 Ok(outcome) => outcome,
@@ -6412,8 +6489,8 @@ mod tests {
             let dir = std::env::temp_dir().join("neoethos-contract-tests");
             std::fs::create_dir_all(&dir).ok();
             let missing = dir.join("missing.json");
-            let missing_err = load_contract(missing.to_str().unwrap())
-                .expect_err("missing file must be refused");
+            let missing_err =
+                load_contract(missing.to_str().unwrap()).expect_err("missing file must be refused");
             assert!(missing_err.to_string().contains("not readable"));
 
             let bad_json = dir.join("bad.json");
@@ -6424,9 +6501,8 @@ mod tests {
 
             let wrong_schema = dir.join("wrong-schema.json");
             std::fs::write(&wrong_schema, "{}").unwrap();
-            let wrong_schema_err =
-                load_contract(wrong_schema.to_str().unwrap())
-                    .expect_err("a contract without the required fields must be refused");
+            let wrong_schema_err = load_contract(wrong_schema.to_str().unwrap())
+                .expect_err("a contract without the required fields must be refused");
             assert!(wrong_schema_err.to_string().contains("does not match"));
 
             let wrapped_wrong = dir.join("wrapped-wrong.json");

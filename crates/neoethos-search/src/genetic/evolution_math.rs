@@ -1424,39 +1424,37 @@ pub fn apply_metrics(
     monthly_returns: Option<&[Vec<f64>]>,
 ) {
     for (index, (gene, m)) in genes.iter_mut().zip(metrics.iter()).enumerate() {
-        gene.fitness =
-            if matches!(
-                config.fitness_table,
-                crate::scoring::FitnessTable::MonthlyUpsideV1
-                    | crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1
-                    | crate::scoring::FitnessTable::MonthlyUpsideDdBudgetV1
-            ) {
-                // Opt-in B9 / B9-dd-averse (docs section 14.7): the explicit
-                // selector wins over the legacy boolean chain and reads the
-                // evaluator's completed-month return vector.
-                // PopulationEvaluationV1::apply refuses missing/misaligned
-                // transport; a legitimately empty per-gene series still takes
-                // the scorer's -100.0 guard.
-                let months = monthly_returns
-                    .and_then(|series| series.get(index))
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1 {
-                    crate::scoring::ga_fitness_monthly_upside_dd_averse_v1(months, m)
-                } else if config.fitness_table
-                    == crate::scoring::FitnessTable::MonthlyUpsideDdBudgetV1
-                {
-                    crate::scoring::ga_fitness_monthly_upside_dd_budget_v1(months, m)
-                } else {
-                    crate::scoring::ga_fitness_monthly_upside_v1(months, m)
-                }
-            } else if let Some(goal) = config.growth_goal {
-                crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
-            } else if config.growth_objective {
-                crate::scoring::ga_fitness_growth(m)
+        gene.fitness = if matches!(
+            config.fitness_table,
+            crate::scoring::FitnessTable::MonthlyUpsideV1
+                | crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1
+                | crate::scoring::FitnessTable::MonthlyUpsideDdBudgetV1
+        ) {
+            // Opt-in B9 / B9-dd-averse (docs section 14.7): the explicit
+            // selector wins over the legacy boolean chain and reads the
+            // evaluator's completed-month return vector.
+            // PopulationEvaluationV1::apply refuses missing/misaligned
+            // transport; a legitimately empty per-gene series still takes
+            // the scorer's -100.0 guard.
+            let months = monthly_returns
+                .and_then(|series| series.get(index))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideDdAverseV1 {
+                crate::scoring::ga_fitness_monthly_upside_dd_averse_v1(months, m)
+            } else if config.fitness_table == crate::scoring::FitnessTable::MonthlyUpsideDdBudgetV1
+            {
+                crate::scoring::ga_fitness_monthly_upside_dd_budget_v1(months, m)
             } else {
-                crate::scoring::ga_fitness(m)
-            };
+                crate::scoring::ga_fitness_monthly_upside_v1(months, m)
+            }
+        } else if let Some(goal) = config.growth_goal {
+            crate::scoring::ga_fitness_goal(m, config.initial_equity, evaluation_span_days, goal)
+        } else if config.growth_objective {
+            crate::scoring::ga_fitness_growth(m)
+        } else {
+            crate::scoring::ga_fitness(m)
+        };
         gene.sharpe_ratio = m[1];
         gene.max_drawdown = m[3];
         gene.win_rate = m[4];
@@ -1639,6 +1637,21 @@ mod tests {
     fn rank_weights_follow_candidate_order() {
         let weights = rank_weights(&[10, 20, 30, 40]);
         assert_eq!(weights, vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn rank_selector_allocates_the_exact_linear_probability_mass() {
+        // Equal-width midpoint cells give an independent count of the inverse
+        // CDF's probability mass, rather than comparing against another sampler.
+        for count in [1usize, 2, 7, 64] {
+            let cells: usize = (1..=count).sum();
+            let mut observed = vec![0usize; count];
+            for cell in 0..cells {
+                observed[rank_offset_for_target(count, cell as f64 + 0.5)] += 1;
+            }
+            assert_eq!(observed, (1..=count).rev().collect::<Vec<_>>());
+            assert_eq!(observed.iter().sum::<usize>(), cells);
+        }
     }
 
     #[test]
@@ -2631,8 +2644,12 @@ mod generator_audit_tests {
         use crate::scoring::FitnessTable;
 
         let metrics = vec![
-            [10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01],
-            [20.0, 1.2, 20_100.0, 0.05, 0.78, 2.1, 0.4, 0.2, 50.0, 0.6, 0.02],
+            [
+                10.0, 1.5, 10_100.0, 0.02, 0.60, 1.8, 0.5, 0.5, 100.0, 0.7, 0.01,
+            ],
+            [
+                20.0, 1.2, 20_100.0, 0.05, 0.78, 2.1, 0.4, 0.2, 50.0, 0.6, 0.02,
+            ],
         ];
         let months = vec![vec![0.02; 10], vec![0.04, 0.04, 0.04, 0.04, -0.13]];
 
@@ -2694,5 +2711,4 @@ mod generator_audit_tests {
             "a 30 % drawdown candidate must score negative under the 15 % budget"
         );
     }
-
 }

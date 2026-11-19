@@ -9,8 +9,8 @@
 //! built frame, and a cache hit must reproduce that receipt bit for bit.
 
 use anyhow::{Context, Result, ensure};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::path::Path;
 
 /// On a cache miss: seal the receipt next to the stored frame entry. On a
@@ -32,8 +32,9 @@ where
         let bytes = std::fs::read(&sidecar).with_context(|| {
             format!("cached feature frame `{key}` has no sealed receipt sidecar; clear the cache directory `{}` and rerun", cache_dir.display())
         })?;
-        let stored: T = serde_json::from_slice(&bytes)
-            .with_context(|| format!("cached feature frame `{key}` receipt sidecar is malformed"))?;
+        let stored: T = serde_json::from_slice(&bytes).with_context(|| {
+            format!("cached feature frame `{key}` receipt sidecar is malformed")
+        })?;
         ensure!(
             stored == *receipt,
             "cached feature frame `{key}` failed receipt verification: the rebuilt frame does not match the sealed receipt; clear the cache directory `{}` and rerun",
@@ -78,9 +79,15 @@ mod tests {
     #[test]
     fn miss_seals_then_hit_with_same_receipt_passes() {
         let dir = fresh_dir("seal");
-        let probe = SealProbe { a: 7, b: "x".to_owned() };
+        let probe = SealProbe {
+            a: 7,
+            b: "x".to_owned(),
+        };
         verify_or_seal_receipt_sidecar(&dir, "k1", false, &probe).expect("seal");
-        assert!(dir.join("k1").join("receipt.json").is_file(), "sidecar written");
+        assert!(
+            dir.join("k1").join("receipt.json").is_file(),
+            "sidecar written"
+        );
         verify_or_seal_receipt_sidecar(&dir, "k1", true, &probe).expect("verify");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -88,8 +95,14 @@ mod tests {
     #[test]
     fn hit_with_different_receipt_fails() {
         let dir = fresh_dir("mismatch");
-        let sealed = SealProbe { a: 7, b: "x".to_owned() };
-        let rebuilt = SealProbe { a: 8, b: "x".to_owned() };
+        let sealed = SealProbe {
+            a: 7,
+            b: "x".to_owned(),
+        };
+        let rebuilt = SealProbe {
+            a: 8,
+            b: "x".to_owned(),
+        };
         verify_or_seal_receipt_sidecar(&dir, "k1", false, &sealed).expect("seal");
         let error = verify_or_seal_receipt_sidecar(&dir, "k1", true, &rebuilt).unwrap_err();
         assert!(
@@ -102,7 +115,10 @@ mod tests {
     #[test]
     fn hit_without_sidecar_fails() {
         let dir = fresh_dir("missing");
-        let probe = SealProbe { a: 7, b: "x".to_owned() };
+        let probe = SealProbe {
+            a: 7,
+            b: "x".to_owned(),
+        };
         let error = verify_or_seal_receipt_sidecar(&dir, "k1", true, &probe).unwrap_err();
         assert!(
             error.to_string().contains("no sealed receipt sidecar"),

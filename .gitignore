@@ -12,6 +12,10 @@
 /catboost_info/
 /target/
 target/
+/target-dd/
+/target-ex/
+# Machine-local diagnostic scratch; source and receipts remain on disk.
+/.work/
 /target-codex-*/
 /.worktrees/
 /rust_core/

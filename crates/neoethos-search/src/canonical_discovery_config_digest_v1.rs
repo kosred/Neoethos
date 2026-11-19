@@ -69,6 +69,7 @@ pub(crate) fn canonical_discovery_config_digest_v1(
         high_quality_confidence,
         risky_risk_band,
         prop_firm_risk_band,
+        risky_limits_policy,
         max_regime_loss_pct,
         higher_timeframes,
         runtime_overrides,
@@ -170,6 +171,9 @@ pub(crate) fn canonical_discovery_config_digest_v1(
     }
     if *holding_horizon_bars != 0 {
         encoder.usize("max_hold_bars", *holding_horizon_bars)?;
+    }
+    if let Some(policy) = risky_limits_policy {
+        encoder.string("risky_limits_policy", policy.name())?;
     }
     Ok(encoder.finish())
 }
@@ -598,13 +602,27 @@ mod tests {
     fn active_fitness_selector_and_holding_horizon_have_distinct_config_identities() {
         let original = DiscoveryConfig::default();
         let baseline = canonical_discovery_config_digest_v1(&original).unwrap();
+        // Preserve the OLD explicit PropFirm recipe's identity. The operator
+        // intentionally changed the primary default to Risky; those two
+        // policies must now have different identities, not share a receipt.
+        let historical = canonical_discovery_config_digest_v1(&DiscoveryConfig {
+            mode: DiscoveryMode::PropFirm,
+            initial_balance: 100_000.0,
+            risk_per_trade_max: 0.01,
+            ..DiscoveryConfig::default()
+        })
+        .unwrap();
         assert_eq!(
-            baseline,
+            historical,
             [
                 41, 153, 192, 155, 135, 78, 190, 251, 128, 74, 131, 116, 45, 136, 196, 188, 70, 24,
                 4, 141, 115, 42, 187, 250, 100, 4, 162, 227, 108, 72, 101, 0
             ],
             "historical default identity must remain unchanged"
+        );
+        assert_ne!(
+            baseline, historical,
+            "Risky must not reuse the old PropFirm identity"
         );
         let mut identities = std::collections::HashSet::new();
         for horizon in [0, 64, 128] {

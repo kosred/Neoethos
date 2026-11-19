@@ -1007,6 +1007,7 @@ fn prop_firm_gate_config_overrides_populate_discovery_config() {
     // (carried on DiscoveryConfig.prop_firm_gate_params) instead of the retired
     // NEOETHOS_BOT_DISCOVERY_PROP_FIRM_* env vars. No env, no lock needed.
     let cfg = DiscoveryConfig {
+        mode: DiscoveryMode::PropFirm,
         prop_firm_gate_params: neoethos_core::config::PropFirmGateConfig {
             pass_rate: 0.42,
             n_windows: 17,
@@ -1019,7 +1020,7 @@ fn prop_firm_gate_config_overrides_populate_discovery_config() {
     .apply_mode_overrides();
     let pf = cfg
         .prop_firm_gate
-        .expect("default mode is PropFirm — gate must be auto-enabled");
+        .expect("explicit PropFirm mode must auto-enable its gate");
     assert_eq!(pf.n_windows, 17);
     assert_eq!(pf.window_days, 21);
     assert!((pf.pass_rate - 0.42).abs() < 1e-9);
@@ -1028,13 +1029,15 @@ fn prop_firm_gate_config_overrides_populate_discovery_config() {
 }
 
 #[test]
-fn prop_firm_gate_auto_enables_with_default_config() {
-    // The whole point: a default config (zero overrides) still produces a
-    // smart, ready-to-run prop-firm config — the FTMO baseline. No env vars
-    // involved any more; the gate params come from
-    // models.discovery_runtime.prop_firm_gate (all defaults here).
-    let cfg = DiscoveryConfig::default().apply_mode_overrides();
-    let pf = cfg.prop_firm_gate.expect("default = PropFirm mode");
+fn prop_firm_gate_auto_enables_when_prop_firm_is_selected() {
+    // An explicit PropFirm selection retains the baseline without overrides
+    // to models.discovery_runtime.prop_firm_gate.
+    let cfg = DiscoveryConfig {
+        mode: DiscoveryMode::PropFirm,
+        ..Default::default()
+    }
+    .apply_mode_overrides();
+    let pf = cfg.prop_firm_gate.expect("explicit PropFirm selection");
     // FTMO baseline: 5%/10%/10%/5 days, 60-day window
     assert_eq!(pf.window_days, 60);
     assert_eq!(pf.n_windows, 0); // sentinel — auto-tuned at runtime
@@ -3369,6 +3372,7 @@ fn candidate_cost_variant_diagnostic_matches_the_production_frequency_definition
 #[test]
 fn research_only_oos_document_is_labelled_and_carries_one_entry_per_strategy() {
     let mut config = DiscoveryConfig::default();
+    config.mode = DiscoveryMode::PropFirm;
     config.runtime_overrides.prefilter_top_k = 0;
     let portfolio = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
     let (_, _, holdout_scope, features, ohlcv) = sample_split_search_values();
@@ -3394,6 +3398,8 @@ fn research_only_oos_document_is_labelled_and_carries_one_entry_per_strategy() {
     assert_eq!(document["artifact_class"], "ResearchOnly");
     assert_eq!(document["promotion_eligibility"], "NotPromotionEligible");
     assert_eq!(document["authorization_issued"], false);
+    assert_eq!(document["evaluation_scope"], "individual_strategies");
+    assert_eq!(document["combined_portfolio_evaluated"], false);
     assert!(
         document["warning"]
             .as_str()
@@ -4020,6 +4026,19 @@ fn discovery_run_profile_leaves_engine_identity_empty_without_a_run_receipt() {
 }
 
 #[test]
+fn discovery_run_profile_records_opt_in_risky_limits_without_changing_legacy_shape() {
+    let mut config = DiscoveryConfig::default();
+    let result = populated_discovery_result(0, 0, 0, 0);
+    let legacy = serde_json::to_value(build_discovery_profile(&config, &result)).unwrap();
+    assert!(legacy.get("risky_limits_policy").is_none());
+    config.mode = DiscoveryMode::Risky;
+    config.risky_limits_policy =
+        Some(neoethos_core::domain::risky_mode::RiskyLimitsPolicy::PerTradeOnlyV1);
+    let current = serde_json::to_value(build_discovery_profile(&config, &result)).unwrap();
+    assert_eq!(current["risky_limits_policy"], "per_trade_only_v1");
+}
+
+#[test]
 fn discovery_run_profile_persists_the_full_run_scoped_execution_receipt_v2() {
     let mut result = populated_discovery_result(0, 0, 0, 0);
     result.funnel_profile = Some(crate::funnel_profile::FunnelProfile::new("EURUSD", "M1"));
@@ -4216,11 +4235,8 @@ fn propfirm_mode_scales_min_trades_per_month_for_d1() {
     // End-to-end: PropFirm mode + D1 should produce a clearly-lower
     // min_trades_per_month than the operator's raw config value.
     //
-    // Note: env-var test lock not needed here — we read the mode
-    // via `resolve_discovery_mode()` which is process-global, but
-    // the default with no env is PropFirm anyway. Tests that mutate
-    // NEOETHOS_BOT_DISCOVERY_MODE must use ENV_VAR_TEST_LOCK; we don't.
     let mut cfg = DiscoveryConfig::default();
+    cfg.mode = DiscoveryMode::PropFirm;
     cfg.evaluation_symbol = "EURUSD".to_string();
     cfg.evaluation_account_currency = "USD".to_string();
     cfg.evaluation_spread_pips = 1.0;
@@ -4230,7 +4246,7 @@ fn propfirm_mode_scales_min_trades_per_month_for_d1() {
     cfg.filtering.opportunistic_min_trades_per_month = 10.0;
 
     let cfg = cfg.apply_mode_overrides();
-    // PropFirm mode is the default; D1 scale = 0.13 → 15 × 0.13 = 1.95
+    // Explicit PropFirm selection: D1 scale = 0.13 → 15 × 0.13 = 1.95
     // (clamped to ≥ 0.5).
     assert!(
         cfg.filtering.min_trades_per_month < 5.0,
@@ -4491,9 +4507,10 @@ fn portfolio_correlation_gate_rejects_undefined_inputs_and_threshold_equality() 
 #[test]
 fn operator_risk_band_reaches_the_discovery_backtest() {
     let mut settings = neoethos_core::Settings::default();
+    settings.system.trading_mode = "prop_firm".into();
     settings.risk.min_risk_per_trade = 0.05;
     settings.risk.max_risk_per_trade = 0.30;
-    // The default product is PropFirm, whose explicit mode band correctly wins
+    // This explicit PropFirm fixture's mode band correctly wins
     // over the shared fallback. Change that operator-facing band as well so
     // this test exercises the resolved policy that actually runs.
     settings.risk.prop_firm_min_risk_per_trade = Some(0.05);
@@ -4792,6 +4809,7 @@ fn gene_eval_settings_resolver_installs_the_scored_stop_regime() {
 fn risk_band_is_clamped_and_ordered() {
     // A min above max would otherwise size every trade at the floor.
     let mut settings = neoethos_core::Settings::default();
+    settings.system.trading_mode = "prop_firm".into();
     settings.risk.min_risk_per_trade = 0.40;
     settings.risk.max_risk_per_trade = 0.10;
     settings.risk.prop_firm_min_risk_per_trade = None;
@@ -4806,6 +4824,7 @@ fn risk_band_is_clamped_and_ordered() {
 
     // Absurd values are bounded to [0, 100%].
     let mut settings = neoethos_core::Settings::default();
+    settings.system.trading_mode = "prop_firm".into();
     settings.risk.min_risk_per_trade = -1.0;
     settings.risk.max_risk_per_trade = 12.0;
     settings.risk.prop_firm_min_risk_per_trade = None;
@@ -4814,11 +4833,10 @@ fn risk_band_is_clamped_and_ordered() {
     assert_eq!(config.risk_per_trade_min, 0.0);
     assert_eq!(config.risk_per_trade_max, 1.0);
 
-    // A config-load failure must keep the shipped PropFirm band, not widen it
-    // to the generic BacktestSettings 3% ceiling.
+    // A config-load failure must keep the primary Risky mode and its band.
     let d = DiscoveryConfig::default();
     assert!((d.risk_per_trade_min - 0.0).abs() < 1e-12);
-    assert!((d.risk_per_trade_max - 0.01).abs() < 1e-12);
+    assert!((d.risk_per_trade_max - 0.30).abs() < 1e-12);
     let from_settings = DiscoveryConfig::from_settings(&neoethos_core::Settings::default());
     assert!((d.risk_per_trade_min - from_settings.risk_per_trade_min).abs() < 1e-12);
     assert!((d.risk_per_trade_max - from_settings.risk_per_trade_max).abs() < 1e-12);
@@ -4926,7 +4944,8 @@ fn risky_account_experiment_v3_is_bound_to_risky_settings_and_saved_replay() {
     let evaluation = config.evaluation_config(Some(1.1));
     assert_eq!(evaluation.risky_account_experiment, Some(policy.clone()));
     assert_eq!(
-        discovery_backtest_settings(&config, &profitable_gene("account_v3"), Some(1.1))
+        PopulationTemplateResolver::new(&config, Some(1.1))
+            .template(&profitable_gene("account_v3"))
             .risky_account_experiment,
         Some(policy)
     );
@@ -5014,6 +5033,7 @@ fn risky_survival_episode_uses_calendar_horizon_without_trimming_prop_firm() {
 #[test]
 fn risky_survival_policy_clears_inherited_prop_delivery_and_shape_gates() {
     let mut config = DiscoveryConfig::default();
+    config.mode = DiscoveryMode::PropFirm;
     config.runtime_overrides.risky_survival_only = true;
     config.runtime_overrides.weekly_cadence = true;
     config.filtering.min_positive_months = 12;
@@ -5145,6 +5165,93 @@ fn risky_survival_windows_refuse_ruin_but_keep_a_recovering_capital_path() {
     assert_eq!(legacy["floor_hit"], true);
     assert_eq!(legacy["target_reached"], false);
     assert!(legacy.get("policy").is_none());
+    assert!(legacy.get("goal_progress_v1").is_none());
+}
+
+#[test]
+fn risky_goal_progress_reports_80_percent_without_accepting_a_partial_goal() {
+    let start = 1_735_689_600_000;
+    let day = 86_400_000;
+    let mut config = DiscoveryConfig::default();
+    config.mode = DiscoveryMode::Risky;
+    config.initial_balance = 100.0;
+    config.risky_target_balance = 50000.0;
+    config.runtime_overrides.risky_survival_only = true;
+    // These are realized account amounts, not a rescaling of independent genes.
+    for (label, steps, partial, full, survived, peak) in [
+        ("below", vec![(39899.0, 0.0)], false, false, true, 39999.0),
+        (
+            "exactly_80",
+            vec![(39900.0, 0.0)],
+            true,
+            false,
+            true,
+            40000.0,
+        ),
+        ("full", vec![(49900.0, 0.0)], true, true, true, 50000.0),
+        (
+            "partial_then_ruin",
+            vec![(39900.0, 0.0), (-40000.0, 0.0)],
+            true,
+            false,
+            false,
+            40000.0,
+        ),
+        (
+            "ruin_before_exit",
+            vec![(49900.0, 100.0)],
+            false,
+            false,
+            false,
+            100.0,
+        ),
+        (
+            "full_banks_before_later_loss",
+            vec![(49900.0, 0.0), (-50000.0, 0.0)],
+            true,
+            true,
+            true,
+            50000.0,
+        ),
+    ] {
+        let trades = steps
+            .into_iter()
+            .enumerate()
+            .map(|(index, (pnl, mae))| Trade {
+                entry_time: start + index as i64 * day,
+                exit_time: Some(start + (index as i64 + 1) * day),
+                pnl,
+                mae,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let outcome =
+            risky_goal_window_outcome(&trades, &config, start, start + 180 * day).expect(label);
+        let progress = &outcome["goal_progress_v1"];
+        assert_eq!(progress["threshold_fraction"], 0.8, "{label}");
+        assert_eq!(progress["threshold_balance"], 40000.0, "{label}");
+        assert_eq!(progress["threshold_reached"], partial, "{label}");
+        assert_eq!(progress["max_closed_balance"], peak, "{label}");
+        assert_eq!(
+            progress["threshold_days"],
+            if partial {
+                serde_json::json!(1.0)
+            } else {
+                serde_json::Value::Null
+            },
+            "{label}"
+        );
+        assert_eq!(outcome["target_reached"], full, "{label}");
+        assert_eq!(outcome["capital_survived"], survived, "{label}");
+        let goals = serde_json::json!({
+            "target_balance": 50000.0, "window_days": 180, "windows": [outcome]
+        });
+        assert_eq!(
+            risky_goal_calibration_rejection(&goals).is_none(),
+            full && survived,
+            "{label}"
+        );
+    }
 }
 
 #[test]
@@ -5637,6 +5744,37 @@ fn the_target_profile_separates_win_rate_from_payoff() {
 /// This test lives in neoethos-search because search depends on core and can
 /// therefore see both sides. That is exactly why the two drifted: neither
 /// crate could check it alone.
+#[test]
+fn primary_risky_mode_uses_its_own_start_target_and_deadline() {
+    let mut settings = neoethos_core::Settings::default();
+    assert_eq!(settings.system.trading_mode, "risky");
+    let fallback = DiscoveryConfig::default();
+    assert_eq!(fallback.mode, DiscoveryMode::Risky);
+    assert_eq!(fallback.initial_balance, 100.);
+    assert!(fallback.apply_mode_overrides().prop_firm_gate.is_none());
+    settings.system.account_currency = "EUR".into();
+    settings.risk.initial_balance = 10_000.;
+    let risky = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(risky.mode, DiscoveryMode::Risky);
+    assert_eq!(risky.initial_balance, 100.);
+    assert_eq!(risky.risky_target_balance, 50_000.);
+    assert_eq!(risky.risky_horizon_days, 180.);
+    let evaluation = risky.evaluation_config(Some(1.1));
+    assert_eq!(evaluation.initial_equity, 100.);
+    assert_eq!(evaluation.account_currency, "EUR");
+    assert_eq!(evaluation.growth_goal.unwrap().target_balance, 50_000.);
+    settings.system.trading_mode = "prop_firm".into();
+    let prop = DiscoveryConfig::from_settings(&settings);
+    assert_eq!(prop.initial_balance, 10_000.);
+    assert!(!prop.evaluation_config(Some(1.1)).growth_objective);
+    settings.system.trading_mode = "risky".into();
+    settings.models.discovery_mode = "strict".into();
+    assert_eq!(
+        DiscoveryConfig::from_settings(&settings).initial_balance,
+        10_000.
+    );
+}
+
 #[test]
 fn display_mode_matches_the_engine_mode() {
     // (trading_mode, discovery_mode) -> the mode string the report must print.
@@ -6935,6 +7073,12 @@ fn every_env_knob_is_classified_and_recorded_in_the_run_profile() {
         (
             "NEOETHOS_TEST_WALKFORWARD_PRE_CANCEL_CHILD",
             DiagnosticOnly("cfg(test) marker for an isolated walkforward cancellation subprocess"),
+        ),
+        (
+            "NEOETHOS_TEST_FIXED_INTRADAY_CHILD",
+            DiagnosticOnly(
+                "cfg(test) recursion marker for fixed-target generation consumer subprocess; absent from production code",
+            ),
         ),
         (
             "NEOETHOS_BOT_SEARCH_VRAM_LOG",
@@ -8753,4 +8897,65 @@ fn gene_artifact_metrics_reject_nonfinite_scalars_and_weights() {
     let mut bad_stop = Gene::default();
     bad_stop.stop_vol_mult = f64::NEG_INFINITY;
     assert!(!gene_artifact_metrics_finite_v1(&bad_stop));
+}
+
+#[test]
+fn risky_training_episodes_cover_distinct_past_windows_and_exact_latest_tail() -> Result<()> {
+    let day = 86_400_000_i64;
+    let timestamps = (0..=1800).map(|i| i * day).collect::<Vec<_>>();
+    let windows = risky_training_episode_ranges_v1(&timestamps, 180.)?;
+    assert_eq!(windows, vec![0..181, 540..721, 1080..1261, 1620..1801]);
+    let latest_cutoff = timestamps[timestamps.len() - 1] - 180 * day;
+    assert_eq!(
+        windows[3].start,
+        timestamps.partition_point(|&t| t < latest_cutoff)
+    );
+    assert!(windows.windows(2).all(|w| w[0].end <= w[1].start));
+    assert!(risky_training_episode_ranges_v1(&timestamps[..600], 180.).is_err());
+    assert!(risky_training_episode_ranges_v1(&timestamps, f64::NAN).is_err());
+    let mut unordered = timestamps;
+    unordered[400] = unordered[399];
+    assert!(risky_training_episode_ranges_v1(&unordered, 180.).is_err());
+    Ok(())
+}
+
+#[test]
+fn risky_training_episode_utility_keeps_inactivity_neutral_and_refuses_corruption() -> Result<()> {
+    let goal = crate::scoring::RiskyGrowthGoal {
+        start_balance: 100.,
+        target_balance: 50000.,
+        horizon_days: 180.,
+    };
+    let mut metrics = [0.; 11];
+    assert_eq!(
+        risky_training_episode_utility_v1(&metrics, 100., 180., goal)?,
+        0.
+    );
+    metrics[8] = 20.;
+    metrics[0] = 49900.;
+    metrics[3] = 0.2;
+    assert_eq!(
+        risky_training_episode_utility_v1(&metrics, 100., 180., goal)?,
+        1.
+    );
+    metrics[0] = -99.999;
+    metrics[3] = 0.999999;
+    assert_eq!(
+        risky_training_episode_utility_v1(&metrics, 100., 180., goal)?,
+        -1.
+    );
+    metrics[0] = -100.;
+    metrics[1] = f64::NEG_INFINITY;
+    metrics[3] = 1.;
+    assert_eq!(
+        risky_training_episode_utility_v1(&metrics, 100., 180., goal)?,
+        -1.
+    );
+    metrics[6] = f64::NAN;
+    assert!(risky_training_episode_utility_v1(&metrics, 100., 180., goal).is_err());
+    // One spectacular episode cannot compensate three total losses; an inactive
+    // specialist is not required to show positive performance in every episode.
+    assert!(([1., -1., -1., -1.].iter().sum::<f64>() / 4.) < 0.2);
+    assert_eq!([1., 0., 0., 0.].iter().sum::<f64>() / 4., 0.25);
+    Ok(())
 }

@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 23] = [
+const OPTIONAL: [&str; 25] = [
     "--higher",
     "--population",
     "--generations",
@@ -50,6 +50,8 @@ const OPTIONAL: [&str; 23] = [
     "--diagnose-candidate-selectors",
     "--diagnose-exit-policy-out",
     "--diagnose-candidate-oos-out",
+    "--diagnose-training-episodes-out",
+    "--specialist-portfolio",
     "--new-search-research",
     "--new-search-research-sha256",
     "--prefilter-ranking-audit-out",
@@ -197,13 +199,15 @@ impl SavedResearchInputs {
         // zero-portfolio archives: it never resumes a frozen finalist and never
         // needs a portfolio to exist. Every other continuation still requires
         // one, because it would otherwise restart a finalist replay over nothing.
-        let research_only_diagnostic = args.iter().any(|arg| {
-            arg == "--diagnose-candidate-costs-out"
-                || arg == "--diagnose-candidate-signals-out"
-                || arg == "--diagnose-candidate-weekdays-out"
-                || arg == "--diagnose-exit-policy-out"
-                || arg == "--diagnose-candidate-oos-out"
-        });
+        let research_only_diagnostic = specialist_requested(args)?
+            || args.iter().any(|arg| {
+                arg == "--diagnose-candidate-costs-out"
+                    || arg == "--diagnose-candidate-signals-out"
+                    || arg == "--diagnose-candidate-weekdays-out"
+                    || arg == "--diagnose-exit-policy-out"
+                    || arg == "--diagnose-candidate-oos-out"
+                    || arg == "--diagnose-training-episodes-out"
+            });
         if !research_only_diagnostic {
             neoethos_search::ensure_non_empty_portfolio(
                 research.discovery_result(),
@@ -390,6 +394,27 @@ impl Arguments {
             ensure!(
                 resume_flags == 0 && quote_flags == 0,
                 "--fitness-table is a fresh-search selector and cannot be combined with a saved continuation or quote replay"
+            );
+        }
+        if parsed.0.contains_key("--diagnose-training-episodes-out") {
+            ensure!(
+                resume_flags != 0 && new_search_flags == 0 && quote_flags == 0,
+                "training episodes require an exact saved research and cannot run fresh search or quote replay"
+            );
+            ensure!(
+                [
+                    "--diagnose-candidate-costs-out",
+                    "--diagnose-cost-variants",
+                    "--diagnose-candidate-signals-out",
+                    "--diagnose-candidate-weekdays-out",
+                    "--diagnose-exit-policy-out",
+                    "--diagnose-candidate-oos-out",
+                    "--diagnose-candidate-selectors",
+                    "--prefilter-ranking-audit-out",
+                ]
+                .iter()
+                .all(|flag| !parsed.0.contains_key(*flag)),
+                "training episodes cannot be combined with other diagnostics"
             );
         }
         let diagnose_flags = ["--diagnose-candidate-costs-out", "--diagnose-cost-variants"]
@@ -588,6 +613,7 @@ fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String
         .into_iter()
         .chain(RESUME_FLAGS)
         .chain(NEW_SEARCH_FLAGS)
+        .chain(["--specialist-portfolio"])
     {
         if let Some(value) = args.0.get(flag) {
             push(discovery_args, flag, value);
@@ -599,6 +625,44 @@ fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String
     }
 }
 
+pub(crate) fn specialist_requested(args: &[String]) -> Result<bool> {
+    Ok(specialist_mode(args)?.is_some())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpecialistResearchMode {
+    RoutedV1,
+    JointV2,
+    ContinualV3,
+    RiskyV4,
+}
+
+pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResearchMode>> {
+    let flags = optional_inputs(args, &["--specialist-portfolio"])?;
+    let Some(value) = flags.get("--specialist-portfolio") else {
+        return Ok(None);
+    };
+    let mode = match *value {
+        "true" => SpecialistResearchMode::RoutedV1,
+        "joint-v2" => SpecialistResearchMode::JointV2,
+        "continual-v3" => SpecialistResearchMode::ContinualV3,
+        "risky-v4" => SpecialistResearchMode::RiskyV4,
+        _ => anyhow::bail!(
+            "--specialist-portfolio expects true, joint-v2, continual-v3, or risky-v4"
+        ),
+    };
+    ensure!(
+        !args.iter().any(|s| s.starts_with("--diagnose-")
+            || s.starts_with("--quote-replay-")
+            || matches!(
+                s.as_str(),
+                "--prefilter-ranking-audit-out" | "--research-oos-eval-out" | "--research-oos-eval"
+            )),
+        "specialist portfolio requires a dedicated research run"
+    );
+    Ok(Some(mode))
+}
+
 fn forward_optional_diagnostic_flags(args: &Arguments, discovery_args: &mut Vec<String>) {
     for flag in [
         "--diagnose-candidate-costs-out",
@@ -608,6 +672,7 @@ fn forward_optional_diagnostic_flags(args: &Arguments, discovery_args: &mut Vec<
         "--diagnose-candidate-selectors",
         "--diagnose-exit-policy-out",
         "--diagnose-candidate-oos-out",
+        "--diagnose-training-episodes-out",
         "--prefilter-ranking-audit-out",
     ] {
         if let Some(value) = args.0.get(flag) {
@@ -827,6 +892,41 @@ fn push(args: &mut Vec<String>, flag: &str, value: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn specialist_research_is_explicit_and_excludes_other_replay_modes() {
+        assert!(!super::specialist_requested(&[]).unwrap());
+        let request = vec!["--specialist-portfolio".into(), "true".into()];
+        assert!(super::specialist_requested(&request).unwrap());
+        assert_eq!(
+            super::specialist_mode(&["--specialist-portfolio".into(), "joint-v2".into()]).unwrap(),
+            Some(super::SpecialistResearchMode::JointV2)
+        );
+        assert_eq!(
+            super::specialist_mode(&["--specialist-portfolio".into(), "continual-v3".into()])
+                .unwrap(),
+            Some(super::SpecialistResearchMode::ContinualV3)
+        );
+        for value in ["false", "1", "yes"] {
+            assert!(
+                super::specialist_requested(&["--specialist-portfolio".into(), value.into()])
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            super::specialist_mode(&["--specialist-portfolio".into(), "risky-v4".into()]).unwrap(),
+            Some(super::SpecialistResearchMode::RiskyV4)
+        );
+        for flag in [
+            "--diagnose-candidate-oos-out",
+            "--quote-replay-research",
+            "--research-oos-eval",
+            "--prefilter-ranking-audit-out",
+        ] {
+            let mut mixed = request.clone();
+            mixed.extend([flag.into(), "path".into()]);
+            assert!(super::specialist_requested(&mixed).is_err(), "{flag}");
+        }
+    }
     use super::*;
 
     fn valid_arguments() -> Vec<String> {
@@ -1061,6 +1161,33 @@ mod tests {
             &"c".repeat(64),
         );
         assert!(Arguments::parse(&with_new_search).is_err());
+    }
+
+    #[test]
+    fn training_episode_diagnostic_requires_saved_context_and_excludes_other_diagnostics() {
+        let mut raw = valid_arguments();
+        push(
+            &mut raw,
+            "--diagnose-training-episodes-out",
+            "C:/out/training.json",
+        );
+        assert!(Arguments::parse(&raw).is_err());
+        push(&mut raw, "--resume-research", "saved.json");
+        push(&mut raw, "--resume-research-sha256", "explicit");
+        push(&mut raw, "--max-batches", "1");
+        let parsed = Arguments::parse(&raw).unwrap();
+        let mut forwarded = Vec::new();
+        forward_optional_diagnostic_flags(&parsed, &mut forwarded);
+        assert_eq!(
+            forwarded,
+            vec!["--diagnose-training-episodes-out", "C:/out/training.json"]
+        );
+        push(
+            &mut raw,
+            "--diagnose-candidate-signals-out",
+            "C:/out/signals.json",
+        );
+        assert!(Arguments::parse(&raw).is_err());
     }
 
     fn valid_arguments_with_flag(flag: &str, value: &str) -> Vec<String> {

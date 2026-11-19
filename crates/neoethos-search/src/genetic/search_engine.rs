@@ -3847,6 +3847,24 @@ where
     Ok(result)
 }
 
+fn ordinary_generation_progress_v1(
+    scored: &[(f64, usize, Gene, [f64; 11])],
+    novelty_active: bool,
+) -> f64 {
+    if novelty_active {
+        // Selection scores are normalized afresh in every generation. Their
+        // maxima cannot measure improvement across generations, and their top
+        // novelty winner need not be the best financial genome.
+        scored
+            .iter()
+            .map(|(_, _, gene, _)| gene.fitness)
+            .filter(|fitness| fitness.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max)
+    } else {
+        scored.first().map(|row| row.0).unwrap_or(f64::NEG_INFINITY)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evolve_search_with_generation_evaluator_v1<F, E, M>(
     feature_names: &[String],
@@ -4349,7 +4367,7 @@ where
         let progress_score = weekly_selection
             .as_ref()
             .map(|selection| selection.progress)
-            .unwrap_or(top_score);
+            .unwrap_or_else(|| ordinary_generation_progress_v1(&scored, novelty_weight > 0.0));
         if progress_score > best_score_seen + min_improvement {
             best_score_seen = progress_score;
             stagnant_gens = 0;
@@ -5782,6 +5800,72 @@ mod exact_search_sizing_policy_tests {
 
 #[cfg(test)]
 mod evaluated_generation_handoff_tests {
+    #[test]
+    fn novelty_normalization_cannot_hide_financial_progress_or_invent_it() {
+        let population = |best_financial: f64| {
+            vec![
+                (
+                    1.0,
+                    0,
+                    Gene {
+                        fitness: best_financial - 10.0,
+                        ..Default::default()
+                    },
+                    [0.0; 11],
+                ),
+                (
+                    0.8,
+                    1,
+                    Gene {
+                        fitness: best_financial,
+                        ..Default::default()
+                    },
+                    [0.0; 11],
+                ),
+                (
+                    0.7,
+                    2,
+                    Gene {
+                        fitness: f64::NEG_INFINITY,
+                        ..Default::default()
+                    },
+                    [0.0; 11],
+                ),
+            ]
+        };
+        // Min-max fitness/novelty blending can give every generation the same
+        // winning selection score, even when the best financial genome changes.
+        let mut best = f64::NEG_INFINITY;
+        let mut stagnant = 0;
+        for financial in [-4.0, 3.0, 9.0] {
+            let scored = population(financial);
+            assert_eq!(ordinary_generation_progress_v1(&scored, false), 1.0);
+            let progress = ordinary_generation_progress_v1(&scored, true);
+            assert_eq!(progress, financial);
+            if progress > best + 1e-12 {
+                best = progress;
+                stagnant = 0;
+            } else {
+                stagnant += 1;
+            }
+        }
+        assert_eq!(stagnant, 0, "financial improvement must reset stagnation");
+        let mut flat = population(9.0);
+        flat[0].0 = 0.99;
+        flat[1].0 = 0.98;
+        assert_eq!(
+            ordinary_generation_progress_v1(&flat, true),
+            best,
+            "a different novelty ranking is not improved financial performance"
+        );
+        flat[0].2.fitness = f64::NAN;
+        assert_eq!(ordinary_generation_progress_v1(&flat, true), best);
+        assert_eq!(
+            ordinary_generation_progress_v1(&[], true),
+            f64::NEG_INFINITY
+        );
+    }
+
     #[test]
     fn weekly_cached_generation_producer_preserves_exact_legacy_metrics() -> Result<()> {
         use crate::exact_resident_dataset_authority_v1::ExactResidentDatasetViewRequestV1;

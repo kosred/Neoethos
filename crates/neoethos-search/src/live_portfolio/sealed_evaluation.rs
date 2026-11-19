@@ -47,6 +47,8 @@ pub(super) struct SealedEvaluationPolicyV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    risky_limits_policy: Option<neoethos_core::domain::risky_mode::RiskyLimitsPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     risky_account_experiment: Option<crate::eval::RiskyAccountExperimentV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     weekly_objective: Option<crate::scoring::weekly_cadence::WeeklySearchObjectiveV1>,
@@ -491,6 +493,17 @@ impl SealedEvaluationPolicyV1 {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if let Some(policy) = self.risky_limits_policy {
+            anyhow::ensure!(
+                self.growth_objective && self.growth_goal.is_some(),
+                "sealed Risky limits policy requires the Risky goal objective"
+            );
+            policy.validate_band(
+                self.risk_per_trade_min,
+                self.risk_per_trade_max,
+                self.high_quality_confidence,
+            )?;
+        }
         if let Some(policy) = &self.risky_account_experiment {
             policy.validate(self.initial_equity)?;
             anyhow::ensure!(
