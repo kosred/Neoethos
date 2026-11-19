@@ -676,10 +676,10 @@ mod tests {
             let covered: std::collections::HashSet<&str> = TEMPLATES
                 .iter()
                 .filter(|template| {
-                    seeds.iter().any(|gene| {
-                        gene.strategy_id
-                            .starts_with(&format!("seed_{}_v", template.name))
-                    })
+                    let prefix = format!("seed_{}_v", template.name);
+                    seeds
+                        .iter()
+                        .any(|gene| gene.strategy_id.starts_with(prefix.as_str()))
                 })
                 .map(|template| template.name)
                 .collect();
