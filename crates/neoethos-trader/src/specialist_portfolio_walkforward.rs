@@ -344,6 +344,20 @@ pub fn evaluate_weekly_joint_risky_forward(
             return Ok(report);
         }
         let (policy, evaluation, goal) = frozen_risky_recipe(research)?;
+        let training = &source.selection_scope;
+        let training_goals = {
+            let tapes =
+                DirectTapes::prepare(input, research, training, &trials, policy, &evaluation)?;
+            joint_goal_windows(
+                &tapes,
+                &trials,
+                input,
+                research,
+                training,
+                &evaluation,
+                goal,
+            )?
+        };
         let tapes = DirectTapes::prepare(input, research, holdout, &trials, policy, &evaluation)?;
         let times = &tapes.times;
         let account = PreparedNettedCanonicalBarResearchV1::from_input(
@@ -362,12 +376,13 @@ pub fn evaluate_weekly_joint_risky_forward(
         let weekly =
             forward_weekly_admissions(&continuous, &trials, times[0], times[times.len() - 1])?;
         let goals =
-            forward_goal_windows(&tapes, &trials, input, research, holdout, &evaluation, goal)?;
+            joint_goal_windows(&tapes, &trials, input, research, holdout, &evaluation, goal)?;
         report["combined_portfolio_evaluated"] = json!(true);
         report["status"] = json!("evaluated");
         report["goal"] = json!(goal);
         report["weekly_admissions"] = weekly;
         report["continuous_shared_account"] = ledger(continuous, times)?;
+        report["training_goal_windows"] = json!(training_goals);
         report["goal_windows"] = json!(goals);
         Ok(report)
     })
@@ -422,7 +437,7 @@ fn forward_weekly_admissions(
     }))
 }
 
-fn forward_goal_windows(
+fn joint_goal_windows(
     tapes: &DirectTapes,
     trials: &[FrozenTrial<'_>],
     input: &CanonicalSearchRunInputV2<'_>,
@@ -432,6 +447,14 @@ fn forward_goal_windows(
     goal: RiskyGrowthGoal,
 ) -> Result<Vec<Value>> {
     let first_row = usize::try_from(scope.evaluated_window().row_start())?;
+    let role = scope.evaluated_window().role();
+    let prepare = match role {
+        CanonicalSearchWindowRoleV1::Holdout => PreparedNettedCanonicalBarResearchV1::from_input,
+        CanonicalSearchWindowRoleV1::InSample => {
+            PreparedNettedCanonicalBarResearchV1::from_training_scope
+        }
+        _ => anyhow::bail!("shared goal windows require training or holdout input"),
+    };
     let times = &tapes.times;
     let target_ceiling = maximum_target(trials);
     let duration = (goal.horizon_days * 86_400_000.0) as i64;
@@ -441,18 +464,18 @@ fn forward_goal_windows(
         let deadline = times[start]
             .checked_add(duration)
             .context("goal deadline overflow")?;
-        let next = times.partition_point(|&stamp| stamp <= deadline);
-        if next == times.len() {
+        if times.last().is_none_or(|&stamp| stamp < deadline) {
             break;
         }
-        // The first following bar witnesses coverage. It cannot be traded by the earlier account.
-        let end = next + 1;
+        let next = times.partition_point(|&stamp| stamp <= deadline);
+        // A following bar can witness coverage without being traded by the earlier account.
+        let end = (next + 1).min(times.len());
         let window_scope = CanonicalSearchArtifactScopeV2::from_run_input_range(
-            CanonicalSearchWindowRoleV1::Holdout,
+            role,
             input,
             first_row + start..first_row + end,
         )?;
-        let account = PreparedNettedCanonicalBarResearchV1::from_input(
+        let account = prepare(
             input,
             &window_scope,
             research.execution_contract(),

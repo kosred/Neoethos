@@ -1471,6 +1471,10 @@ pub struct DiscoveryRuntimeConfig {
     /// period of the Risky candidate screening window.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_minimum_weekly_entries: bool,
+    /// Measure Risky weekly entries without rejecting candidates for cadence.
+    /// Used with the exact continuous Risky account policy for paired research.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_weekly_entries_report_only: bool,
     /// Optional reviewed quantity limits for new Risky CPU experiments.
     /// The referenced artifact must supply these values; no broker defaults
     /// or margin/stop-out authority is inferred from this configuration.
@@ -1644,6 +1648,7 @@ impl Default for DiscoveryRuntimeConfig {
             risky_survival_only: false,
             risky_account_experiment_v3: false,
             risky_minimum_weekly_entries: false,
+            risky_weekly_entries_report_only: false,
             risky_lot_constraints: None,
             prefilter_top_k: 240,
             // Discovery already receives only the training side of the outer

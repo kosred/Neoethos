@@ -124,6 +124,8 @@ pub struct DiscoveryRuntimeOverrides {
     pub risky_account_experiment_v3: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_minimum_weekly_entries: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_weekly_entries_report_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risky_lot_constraints: Option<neoethos_core::config::RiskyReplayLotConstraintsConfigV1>,
     /// See the identically named field on
@@ -177,6 +179,7 @@ impl Default for DiscoveryRuntimeOverrides {
             risky_survival_only: false,
             risky_account_experiment_v3: false,
             risky_minimum_weekly_entries: false,
+            risky_weekly_entries_report_only: false,
             risky_lot_constraints: None,
             prefilter_top_k: 240,
             prefilter_insample_frac: 1.0,
@@ -203,6 +206,7 @@ impl DiscoveryRuntimeOverrides {
         overrides.risky_survival_only = cfg.risky_survival_only;
         overrides.risky_account_experiment_v3 = cfg.risky_account_experiment_v3;
         overrides.risky_minimum_weekly_entries = cfg.risky_minimum_weekly_entries;
+        overrides.risky_weekly_entries_report_only = cfg.risky_weekly_entries_report_only;
         overrides.risky_lot_constraints = cfg.risky_lot_constraints.clone();
         overrides.weekly_cadence = cfg.weekly_cadence;
         overrides.prefilter_top_k = cfg.prefilter_top_k;
@@ -1598,6 +1602,7 @@ impl DiscoveryConfig {
         let mode = self.mode;
         if mode != DiscoveryMode::Risky {
             self.runtime_overrides.risky_minimum_weekly_entries = false;
+            self.runtime_overrides.risky_weekly_entries_report_only = false;
         }
 
         if matches!(mode, DiscoveryMode::PropFirm) {
@@ -1831,6 +1836,10 @@ impl DiscoveryConfig {
         let continuous_exact_stop_risk = self.mode == DiscoveryMode::Risky
             && self.runtime_overrides.risky_minimum_weekly_entries
             && risk_band == (0.30, 0.30);
+        anyhow::ensure!(
+            !self.runtime_overrides.risky_weekly_entries_report_only || continuous_exact_stop_risk,
+            "report-only Risky weekly cadence requires the exact continuous 30% policy"
+        );
         anyhow::ensure!(
             self.runtime_overrides.risky_account_experiment_v3
                 || self.runtime_overrides.risky_lot_constraints.is_none(),
@@ -2754,6 +2763,9 @@ pub struct DiscoveryRunProfile {
     pub validation_evidence_hashes: DiscoveryPerKindEvidenceHashes,
     pub validation_evidence_complete: bool,
     pub validation_evidence_missing_kinds: Vec<String>,
+    /// Weekly Risky cadence was measured as validation evidence only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_weekly_entries_report_only: bool,
     /// Resolved determinism policy under which the genetic search ran.
     /// `Deterministic { seed }` means the run is reproducible; the two
     /// non-deterministic variants surface in the persisted profile so
@@ -14912,8 +14924,11 @@ where
     // decision. Run the base quality screen whenever candidates exist; logging
     // controls only whether trade details are retained.
     let weekly_objective = config.weekly_objective_for_window(&features.timestamps)?;
-    let require_risky_complete_weeks = config.mode == DiscoveryMode::Risky
+    let assess_risky_complete_weeks = config.mode == DiscoveryMode::Risky
         && config.runtime_overrides.risky_minimum_weekly_entries;
+    let require_risky_complete_weeks =
+        assess_risky_complete_weeks && !config.runtime_overrides.risky_weekly_entries_report_only;
+    let enforce_weekly_cadence = require_risky_complete_weeks || weekly_objective.is_some();
     if !filtered.is_empty() {
         let candidate_deep_robustness = !matches!(config.mode, DiscoveryMode::Risky);
         progress_fn(DiscoveryProgress::StageAdvanced {
@@ -14952,7 +14967,7 @@ where
         let quality_end_ms = features.timestamps.last().copied().ok_or_else(|| {
             anyhow::anyhow!("quality replay requires an evaluation end timestamp")
         })?;
-        if require_risky_complete_weeks {
+        if assess_risky_complete_weeks {
             let complete_weeks = crate::scoring::weekly_cadence::complete_week_entry_counts_v1(
                 quality_start_ms,
                 quality_end_ms,
@@ -14967,7 +14982,8 @@ where
                 complete_weeks,
                 quality_start_ms,
                 quality_end_ms,
-                "Risky candidate screening requires one admitted entry per complete week"
+                enforced = require_risky_complete_weeks,
+                "Risky candidate screening measures one admitted entry per complete week"
             );
         }
         let (quality_months, quality_days) = month_day_indices(&features.timestamps);
@@ -15806,7 +15822,7 @@ where
                             &features.timestamps,
                             &screen_resolver.settings_for_gene(&gene),
                             Some(&mut monthly_returns),
-                            require_risky_complete_weeks.then_some(&mut admitted_entries),
+                            assess_risky_complete_weeks.then_some(&mut admitted_entries),
                         )?;
                     completed_quality_replays.fetch_add(1, AtomicOrdering::Relaxed);
                     let mut metrics = analyzer.analyze_strategy_with_evaluation(
@@ -15856,7 +15872,7 @@ where
                         trades_outside_grid,
                     };
 
-                    let failed_weekly_cadence = if require_risky_complete_weeks {
+                    let failed_weekly_cadence = if assess_risky_complete_weeks {
                         crate::scoring::weekly_cadence::complete_week_entry_counts_v1(
                             quality_start_ms,
                             quality_end_ms,
@@ -15875,7 +15891,9 @@ where
                     };
                     if failed_weekly_cadence {
                         rejected_weekly_cadence.fetch_add(1, AtomicOrdering::Relaxed);
-                        return Ok((None, trial_row));
+                        if enforce_weekly_cadence {
+                            return Ok((None, trial_row));
+                        }
                     }
                     let verdict =
                         classify_base_quality(&metrics, &config.target_profile, &config.filtering);
@@ -16132,7 +16150,7 @@ where
             mc_floor: rejected_mc_floor.load(AtomicOrdering::Relaxed),
             mc_near_miss: mc_near_miss.load(AtomicOrdering::Relaxed),
             sensitivity: rejected_sensitivity.load(AtomicOrdering::Relaxed),
-            weekly_cadence: (require_risky_complete_weeks || weekly_objective.is_some())
+            weekly_cadence: enforce_weekly_cadence
                 .then(|| rejected_weekly_cadence.load(AtomicOrdering::Relaxed)),
         };
         // Arithmetic self-check: the ten criteria must partition the
@@ -16156,6 +16174,7 @@ where
         tracing::info!(
             target: "neoethos_search::funnel",
             rejected_base_quality = quality_rejects.base_quality,
+            observed_weekly_cadence_misses = rejected_weekly_cadence.load(AtomicOrdering::Relaxed),
             rejected_weekly_cadence = quality_rejects.weekly_cadence.unwrap_or(0),
             rejected_regime = quality_rejects.regime,
             rejected_monte_carlo = quality_rejects.mc_floor,
@@ -16925,7 +16944,7 @@ where
     ) = if portfolio.is_empty()
         && calibration_input.is_none()
         && !best_effort_fallback.is_empty()
-        && !require_risky_complete_weeks
+        && !assess_risky_complete_weeks
     {
         fallback_mode = true;
         let fallback_reason = funnel
@@ -19030,6 +19049,7 @@ pub fn build_discovery_profile(
         risky_survival_only,
         risky_account_experiment_v3,
         risky_minimum_weekly_entries,
+        risky_weekly_entries_report_only,
         risky_lot_constraints,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
@@ -19039,6 +19059,7 @@ pub fn build_discovery_profile(
         risky_survival_only: *risky_survival_only,
         risky_account_experiment_v3: *risky_account_experiment_v3,
         risky_minimum_weekly_entries: *risky_minimum_weekly_entries,
+        risky_weekly_entries_report_only: *risky_weekly_entries_report_only,
         risky_lot_constraints: risky_lot_constraints.clone(),
         weekly_cadence: *weekly_cadence,
         prefilter_direction_only_ranking: *prefilter_direction_only_ranking,

@@ -792,9 +792,17 @@ disable the V3 early-banking simulator during search, and set both
 Before walk-forward selection, a candidate must open at least one position
 in every complete seven-day interval of the search prefix.
 
+For a paired research run, keep the exact Risky recipe and set
+`models.discovery_runtime.risky_weekly_entries_report_only: true`.
+Discovery measures the same weekly entries and continues screening candidates
+with inactive weeks. Compare the archived genes before interpreting any
+difference in the final cohort.
+
 The shared forward report uses the frozen walk-forward survivors. It reports
 actual weekly admissions per strategy, a continuous account, and sequential
-fully covered 180-day goal windows. Each accepted position risks 30% of the
+fully covered 180-day goal windows. `training_goal_windows` uses that same
+cohort within the search prefix. The forward windows start in the reserved
+suffix. Each accepted position risks 30% of the
 then-current modeled equity at its stop. The account admits up to three
 positions within a shared 90% stop-risk budget. This research model uses
 fractional lots and omits a gross-notional limit. The report distinguishes
