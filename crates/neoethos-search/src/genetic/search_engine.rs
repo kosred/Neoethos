@@ -56,6 +56,7 @@ type GeneArrays = (Vec<i32>, Vec<i32>, Vec<f64>, Vec<f64>, Vec<f64>);
 pub(crate) struct ExactSearchSizingPolicyV1 {
     migration_enabled_for_run: bool,
     term_cap: usize,
+    explicit_cpu_research: bool,
 }
 
 impl ExactSearchSizingPolicyV1 {
@@ -66,6 +67,7 @@ impl ExactSearchSizingPolicyV1 {
         Ok(Self {
             migration_enabled_for_run,
             term_cap,
+            explicit_cpu_research: false,
         })
     }
 
@@ -77,7 +79,12 @@ impl ExactSearchSizingPolicyV1 {
         if receipt.migration_enabled_for_run() {
             bail!("receipt-governed exact search requires migration disabled for the whole run");
         }
-        Self::new(false, receipt.term_cap())
+        let mut policy = Self::new(false, receipt.term_cap())?;
+        policy.explicit_cpu_research = matches!(
+            receipt.route(),
+            crate::population_auto_sizing_receipt_v1::PopulationAutoSizingRouteV1::CpuExplicitResearch { .. }
+        );
+        Ok(policy)
     }
 
     #[cfg(feature = "gpu-cuda")]
@@ -4065,7 +4072,39 @@ where
     let archive_min_net = genetic_runtime_overrides.archive_scoring.min_net;
     let archive_min_pf = genetic_runtime_overrides.archive_scoring.min_pf;
     let archive_min_sharpe = genetic_runtime_overrides.archive_scoring.min_sharpe;
-    let archive_cap = genetic_runtime_overrides.effective_archive_cap(population, generations);
+    let archive_cap = match genetic_runtime_overrides.cpu_research_archive_cap {
+        None => genetic_runtime_overrides.effective_archive_cap(population, generations),
+        Some(capacity) => {
+            anyhow::ensure!(
+                sizing_policy.explicit_cpu_research && eval_cfg.weekly_objective.is_none(),
+                "expanded archive requires the explicit CPU research route and scalar archive"
+            );
+            anyhow::ensure!(
+                (population..=1_000_000).contains(&capacity)
+                    && population
+                        .checked_mul(generations)
+                        .is_some_and(|slots| slots >= capacity),
+                "CPU research archive capacity exceeds the supported generation or archive budget"
+            );
+            let terms = sizing_policy.term_cap
+                * (std::mem::size_of::<usize>() + std::mem::size_of::<f64>());
+            let observation_bytes = std::mem::size_of::<(Gene, [f64; 11], usize)>() + terms + 128;
+            // Include the archive indexes, distinct seen keys and ownership
+            // overlap while assembling and repricing the final candidate union.
+            let estimated_bytes = (capacity as u64) * (observation_bytes as u64) * 6;
+            let available_bytes = neoethos_core::allocation_headroom_bytes();
+            anyhow::ensure!(
+                estimated_bytes <= available_bytes / 2,
+                "CPU research archive requires {estimated_bytes} bytes with {available_bytes} bytes of live allocation headroom"
+            );
+            tracing::info!(
+                target: "neoethos_search::funnel",
+                capacity, estimated_bytes, available_bytes,
+                "Expanded CPU research archive admitted"
+            );
+            capacity
+        }
+    };
     let mut profitable_archive = if eval_cfg.weekly_objective.is_some() {
         BoundedProfitableArchive::for_weekly_vector_objective(archive_cap)
     } else {

@@ -331,6 +331,10 @@ where
     );
     let runtime = snapshot.genetic_search();
     ensure!(
+        runtime.cpu_research_archive_cap.is_none(),
+        "expanded archive requires the explicit CPU research route"
+    );
+    ensure!(
         snapshot.seen_memory().file_path.is_none(),
         "native adaptive Search does not yet preserve configured seen-signature append-file persistence"
     );

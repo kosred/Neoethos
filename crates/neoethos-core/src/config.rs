@@ -1637,6 +1637,9 @@ pub struct DiscoveryRuntimeConfig {
     /// device-side label still applies the legacy tilt); use the CPU route.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub label_cost_symmetric: bool,
+    /// Explicit capacity for receipt-bound CPU research, admitted against host RAM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_research_archive_cap: Option<usize>,
 }
 
 impl Default for DiscoveryRuntimeConfig {
@@ -1660,6 +1663,7 @@ impl Default for DiscoveryRuntimeConfig {
             prefilter_direction_only_ranking: false,
             prefilter_purge_prefixes: Vec::new(),
             label_cost_symmetric: false,
+            cpu_research_archive_cap: None,
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
             min_history_years: 0,

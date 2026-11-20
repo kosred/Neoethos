@@ -798,6 +798,13 @@ Discovery measures the same weekly entries and continues screening candidates
 with inactive weeks. Compare the archived genes before interpreting any
 difference in the final cohort.
 
+For receipt-bound CPU runs requiring a larger scalar archive, set
+`models.discovery_runtime.cpu_research_archive_cap` explicitly, up to 1,000,000.
+The engine checks the generation budget and live allocation headroom before
+admitting the archive. Set `--candidates` to the intended validation budget.
+The generation census records the distinct genomes and the number repriced
+under the final policy.
+
 The shared forward report uses the frozen walk-forward survivors. It reports
 actual weekly admissions per strategy, a continuous account, and sequential
 fully covered 180-day goal windows. `training_goal_windows` uses that same
