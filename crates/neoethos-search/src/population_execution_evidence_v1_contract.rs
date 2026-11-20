@@ -9,11 +9,11 @@ use crate::population_execution_evidence_v1::{
 };
 use neoethos_data::{FeatureCellValidity, FeatureColumnF64, FeatureFrame, Ohlcv};
 
-fn parent(rows: usize) -> (CanonicalSearchArtifactScopeV2, FeatureFrame, Ohlcv) {
+pub(crate) fn parent(rows: usize) -> (CanonicalSearchArtifactScopeV2, FeatureFrame, Ohlcv) {
     parent_with_changed_feature(rows, None)
 }
 
-fn explicit_cpu_research_admission(
+pub(crate) fn explicit_cpu_research_admission(
     features: &FeatureFrame,
 ) -> crate::SealedStrictDiscoveryDeviceAdmissionV1 {
     let anchor = features.provenance().bindings()[0]
@@ -564,4 +564,117 @@ fn process_global_observation_and_unsealed_success_routes_are_absent() {
         "population_execution_run_receipt_v2: population_execution_run_receipt_v2.cloned()"
     ));
     assert!(!discovery.contains("pub population_engine_run_receipt:"));
+}
+
+#[test]
+fn weekly_backend_uses_the_existing_sealed_cpu_route_and_keeps_all_metric_bits() {
+    use crate::eval::PopulationEvalInputs;
+    use crate::genetic::search_engine::EvalDataCache;
+    use crate::scoring::weekly_cadence::*;
+    let (scope, features, ohlcv) = parent(14_400);
+    let run = begin_exact_population_execution_run_v1(
+        explicit_cpu_research_admission(&features),
+        &scope,
+        &features,
+        &ohlcv,
+    )
+    .unwrap();
+    let cache = EvalDataCache::build(&features, &ohlcv).unwrap();
+    let settings = BacktestSettings {
+        pip_value: 0.0001,
+        pip_value_per_lot: 10.0,
+        spread_pips: 1.0,
+        commission_per_trade: 7.0,
+        swap_long_pips_per_day: -0.5,
+        swap_short_pips_per_day: 0.2,
+        pnl_conversion_fee_rate: 0.001,
+        initial_equity_override: Some(10_000.0),
+        risk_based_sizing: true,
+        risk_per_trade_min: 0.005,
+        risk_per_trade_max: 0.01,
+        trailing_enabled: false,
+        kill_zones_enabled: false,
+        max_hold_bars: 10,
+        ..BacktestSettings::default()
+    };
+    let evidence = run
+        .seal_evaluation(&settings, ExactResidentDatasetViewRequestV1::Full)
+        .unwrap();
+    let inputs = || PopulationEvalInputs {
+        close: &ohlcv.close,
+        high: &ohlcv.high,
+        low: &ohlcv.low,
+        indicators: cache.indicators.view(),
+        gene_offsets: &[0, 1, 2],
+        gene_indices: &[0, 1],
+        gene_weights: &[1.0, 1.0],
+        long_thr: &[1.0, 1.0],
+        short_thr: &[-1.0, -1.0],
+        month_idx: &cache.months,
+        day_idx: &cache.days,
+        timestamps: &features.timestamps,
+        sl_pips: &[10.0, 10.0],
+        tp_pips: &[20.0, 20.0],
+        stop_vol_mult: &[],
+        smc_data: &cache.smc_data,
+        gene_smc_flags: &[[0; 11]; 2],
+        gate_threshold: 0.0,
+        weights: &[0.0; 11],
+        settings: &settings,
+    };
+    let backend = crate::backend::current_evaluation_backend();
+    let legacy = crate::backend::evaluate_population_core_with_backend_and_evidence(
+        inputs(),
+        backend,
+        &evidence,
+    )
+    .unwrap();
+    let mut objective = test_weekly_objective();
+    objective.limits.per_trade_risk_band =
+        (settings.risk_per_trade_min, settings.risk_per_trade_max);
+    objective.cadence = WeeklyCadenceContractV1::new(
+        features.timestamps[0],
+        *features.timestamps.last().unwrap(),
+        21.0,
+    )
+    .unwrap();
+    let observed = crate::backend::evaluate_population_observed_with_evidence(
+        inputs(),
+        backend,
+        &evidence,
+        Some(&objective),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy
+            .iter()
+            .map(|m| m.map(f64::to_bits))
+            .collect::<Vec<_>>(),
+        observed
+            .metrics
+            .iter()
+            .map(|m| m.map(f64::to_bits))
+            .collect::<Vec<_>>()
+    );
+    let reports = observed.cadence.unwrap();
+    assert_eq!(reports.len(), 2);
+    for (m, r) in observed.metrics.iter().zip(&reports) {
+        assert!(m[8] > 1.0);
+        assert_eq!(m[8], r.trades as f64);
+        assert!(r.trading_days >= 5);
+    }
+    objective.cadence.evaluation_start_ms += 1;
+    assert!(
+        crate::backend::evaluate_population_observed_with_evidence(
+            inputs(),
+            backend,
+            &evidence,
+            Some(&objective)
+        )
+        .unwrap_err()
+        .contains("interval differs")
+    );
+    drop(evidence);
+    let completed = run.finish().unwrap();
+    assert_eq!(completed.engines(), &[PopulationEvalEngine::Cpu]);
 }

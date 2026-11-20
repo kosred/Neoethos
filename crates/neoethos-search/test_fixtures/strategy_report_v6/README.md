@@ -7,6 +7,19 @@ review the two printed temporary output paths, then install the reviewed files.
 The generator never writes here. Normal tests require the checked-in pair and
 compare it byte-for-byte with the current actual Search writers.
 
+The October 2026 refresh persists the existing funnel signal-policy field for
+frozen research continuation. Review confirmed that only that field and the
+research evidence identity changed; the compact portfolio bytes stayed identical.
+
+The 2026-10-25 refresh archives the per-month money series: every research.json
+quality entry now carries the completed-month fractional return vector
+(`monthly_returns`) the canonical CPU ledger evaluator emits — the same series
+the opt-in MonthlyUpsideV1 selector (B9) consumes. Review confirmed the only
+research.json changes are those monthly_returns additions on the three quality
+entries, the funnel stage rename introduced by the measured GA census commit
+(which had left the checked-in pair stale on this branch) and the derived
+evidence identity hash; the compact portfolio bytes stayed identical.
+
 The pair uses the existing external `embedded-ctrader-fixture-unverified`
 two-column receipt with 80/10/10 scopes, typed selection evidence constructors,
 the real research-result constructor and the real compact V6 portfolio writer.
@@ -38,3 +51,11 @@ promotion and live authorization flags remain unavailable.
 This fixture does not exercise the App's private cost-sidecar publisher, the
 complete discovery job, HTTP/UI rendering, independent final evaluation, or
 broker execution.
+
+`legacy_quality_without_monthly_returns.json` contains the three unchanged
+quality objects from commit `a5a5d74e`'s `e6b6fa678b01daed3427bcef6c132d27c31d1662a4c4dcc3b02f2f74902b24aa.research.json`.
+The compatibility test checks that decoding them adds neither `monthly_returns`
+nor `monthly_breakdown`. Explicit empty/new monthly arrays also keep their wire
+values. This is quality-payload compatibility, not a claim that every historical
+envelope is readable: the old synthetic envelope has a separate null numeric
+trade-duration field that strict decoding already refuses.

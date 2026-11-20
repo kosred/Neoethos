@@ -835,11 +835,11 @@ mod tests {
         let portfolio = research.join("actual.research.live_portfolio.json");
         let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../neoethos-search/test_fixtures/strategy_report_v6/a2d3ef812dd8b341f863f7a57df3f71172a94c95269fe51c49ece25e3623d327.research.live_portfolio.json"
+            "/../neoethos-search/test_fixtures/strategy_report_v6/d2c6a8f8e68b52c49d81b409734b8acc2250c9875d4aa04e56c41b43f65f2588.research.live_portfolio.json"
         ));
         std::fs::write(&portfolio, bytes).unwrap();
         std::fs::write(research.join("actual.research.json"), include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"),
-            "/../neoethos-search/test_fixtures/strategy_report_v6/a2d3ef812dd8b341f863f7a57df3f71172a94c95269fe51c49ece25e3623d327.research.json"))).unwrap();
+            "/../neoethos-search/test_fixtures/strategy_report_v6/d2c6a8f8e68b52c49d81b409734b8acc2250c9875d4aa04e56c41b43f65f2588.research.json"))).unwrap();
         std::fs::write(research.join("actual.research.costs.json"), b"{}").unwrap();
         let invalid = research.join("invalid.live_portfolio.json");
         std::fs::write(&invalid, br#"{"payload":[{},{}],"candidates":[{},{}]}"#).unwrap();

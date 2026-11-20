@@ -41,6 +41,9 @@ impl PrototypeADatasetUpload {
     }
 
     fn validate(&self) -> Result<(), PrototypeAUploadError> {
+        if self.settings.risky_account_experiment.is_some() {
+            return Err(PrototypeAUploadError::UnsupportedRiskyAccountExperiment);
+        }
         let bars = self.bars();
         if bars == 0 {
             return Err(PrototypeAUploadError::EmptyDataset);
@@ -256,6 +259,7 @@ impl PrototypeARebatchPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrototypeAUploadError {
+    UnsupportedRiskyAccountExperiment,
     EmptyDataset,
     ZeroFeatureCount,
     EmptyGeneBatch,
@@ -282,6 +286,10 @@ pub enum PrototypeAUploadError {
 impl fmt::Display for PrototypeAUploadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedRiskyAccountExperiment => write!(
+                f,
+                "Prototype A does not support Risky account experiment v3"
+            ),
             Self::EmptyDataset => write!(f, "Prototype A dataset upload is empty"),
             Self::ZeroFeatureCount => {
                 write!(f, "Prototype A dataset upload has no features")
@@ -460,6 +468,7 @@ mod tests {
 
     fn settings() -> SnapshotSettingsDto {
         SnapshotSettingsDto {
+            risky_account_experiment: None,
             session_spread_profile: None,
             max_hold_bars: 12,
             min_hold_bars: 0,

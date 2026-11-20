@@ -33,8 +33,15 @@ struct RuntimeSnapshotV1 {
 }
 
 impl RuntimeSnapshotV1 {
-    const fn expected_adaptive_invariants_v1() -> (bool, f64) {
-        (true, 2.0)
+    fn expected_adaptive_policy_v1(settings: &neoethos_core::Settings) -> (bool, f64) {
+        (
+            settings
+                .models
+                .stop_target_runtime
+                .adaptive_stops_enabled
+                .unwrap_or(true),
+            2.0,
+        )
     }
 
     fn expected(
@@ -42,7 +49,8 @@ impl RuntimeSnapshotV1 {
     ) -> Result<Self, CanonicalNativeDiscoveryRequestErrorV1> {
         let backend = crate::EvaluationBackend::from_settings_and_process_env(settings)
             .map_err(|error| runtime_error(&format!("resolve evaluation backend: {error}")))?;
-        let (adaptive_stops_enabled, adaptive_stops_rr) = Self::expected_adaptive_invariants_v1();
+        let (adaptive_stops_enabled, adaptive_stops_rr) =
+            Self::expected_adaptive_policy_v1(settings);
         Ok(Self {
             evaluation_backend: backend_tag(backend),
             indicator_compute_policy: if backend.device == crate::DevicePreference::Gpu {
@@ -401,8 +409,9 @@ mod adaptive_invariant_tests {
     use super::*;
 
     #[test]
-    fn expected_adaptive_invariants_are_literal_and_current_drift_cannot_self_validate() {
-        let (enabled, rr) = RuntimeSnapshotV1::expected_adaptive_invariants_v1();
+    fn expected_adaptive_policy_is_bound_to_settings_and_rejects_runtime_drift() {
+        let (enabled, rr) =
+            RuntimeSnapshotV1::expected_adaptive_policy_v1(&neoethos_core::Settings::default());
         assert!(enabled);
         assert_eq!(rr.to_bits(), 2.0_f64.to_bits());
 
@@ -419,5 +428,15 @@ mod adaptive_invariant_tests {
         let mut changed_rr = expected.clone();
         changed_rr.adaptive_stops_rr = 2.5;
         assert!(validate_snapshot(&expected, &changed_rr).is_err());
+
+        settings.models.stop_target_runtime.adaptive_stops_enabled = Some(false);
+        let fixed = RuntimeSnapshotV1::expected(&settings).unwrap();
+        assert!(!fixed.adaptive_stops_enabled);
+        assert_ne!(
+            fixed.identity_sha256().unwrap(),
+            expected.identity_sha256().unwrap()
+        );
+        assert!(validate_snapshot(&fixed, &expected).is_err());
+        assert!(validate_snapshot(&expected, &fixed).is_err());
     }
 }

@@ -10,6 +10,10 @@ use crate::{
     CanonicalTrendbarResearchExecutionContractV3, EvaluationConfig,
 };
 
+#[path = "netted_bar_portfolio.rs"]
+mod portfolio;
+pub use portfolio::{JointBarAccountPolicyV1, JointBarAccountResultV1, JointBarLaneV1};
+
 /// All decision fields belong to the same just-closed signal row. The next
 /// bar's close is the existing CPU screening fill convention, not a live quote.
 #[derive(Clone, Copy, Debug)]
@@ -45,7 +49,7 @@ impl BarReplayLotGridV1 {
         })
     }
 
-    pub(super) fn normalize_down(self, requested: f64) -> Option<f64> {
+    pub(crate) fn normalize_down(self, requested: f64) -> Option<f64> {
         let capped = requested.min(self.max_lots);
         let value = (capped / self.lot_step).floor() * self.lot_step;
         (requested.is_finite()
@@ -129,12 +133,43 @@ impl PreparedNettedCanonicalBarResearchV1 {
         contract: &CanonicalTrendbarResearchExecutionContractV3,
         evaluation: &EvaluationConfig,
     ) -> Result<Self> {
+        ensure!(
+            scope.evaluated_window().role() == CanonicalSearchWindowRoleV1::Holdout,
+            "netted bar research requires the exact input's locked holdout scope"
+        );
+        Self::from_verified_scope(input, scope, contract, evaluation)
+    }
+
+    /// Use the identical account lifecycle for fitting and calibration, with an
+    /// explicit non-final scope. Final evaluation retains its own entry point.
+    pub fn from_training_scope(
+        input: &CanonicalSearchRunInputV2<'_>,
+        scope: &CanonicalSearchArtifactScopeV2,
+        contract: &CanonicalTrendbarResearchExecutionContractV3,
+        evaluation: &EvaluationConfig,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(
+                scope.evaluated_window().role(),
+                CanonicalSearchWindowRoleV1::InSample
+                    | CanonicalSearchWindowRoleV1::SelectionValidation
+            ),
+            "portfolio fitting requires a training or calibration scope"
+        );
+        Self::from_verified_scope(input, scope, contract, evaluation)
+    }
+
+    fn from_verified_scope(
+        input: &CanonicalSearchRunInputV2<'_>,
+        scope: &CanonicalSearchArtifactScopeV2,
+        contract: &CanonicalTrendbarResearchExecutionContractV3,
+        evaluation: &EvaluationConfig,
+    ) -> Result<Self> {
         scope.validate()?;
         contract.validate_against_input(input)?;
         ensure!(
-            scope.receipt() == input.receipt()
-                && scope.evaluated_window().role() == CanonicalSearchWindowRoleV1::Holdout,
-            "netted bar research requires the exact input's locked holdout scope"
+            scope.receipt() == input.receipt(),
+            "netted bar research scope differs from the canonical input"
         );
         let timestamps = input
             .ohlcv()
@@ -149,7 +184,7 @@ impl PreparedNettedCanonicalBarResearchV1 {
             .map_err(|_| anyhow::anyhow!("holdout end is absent from the canonical input"))?
             + 1;
         let actual = CanonicalSearchArtifactScopeV2::from_run_input_range(
-            CanonicalSearchWindowRoleV1::Holdout,
+            scope.evaluated_window().role(),
             input,
             start..end,
         )?;
@@ -222,44 +257,8 @@ impl PreparedNettedCanonicalBarResearchV1 {
         tape: NettedBarDecisionTapeV1<'_>,
         lot_grid: Option<BarReplayLotGridV1>,
     ) -> Result<NettedBarResearchResultV1> {
-        let n = self.close.len();
-        ensure!(
-            [
-                tape.signals.len(),
-                tape.confidences.len(),
-                tape.sl_pips.len(),
-                tape.tp_pips.len(),
-                tape.ml_multipliers.len()
-            ]
-            .iter()
-            .all(|length| *length == n),
-            "netted decision tape must exactly match held-out rows"
-        );
-        super::validate_sizing_confidences(n, tape.confidences, &self.settings)?;
-        for row in 0..n {
-            ensure!(
-                (-1..=1).contains(&tape.signals[row])
-                    && tape.ml_multipliers[row].is_finite()
-                    && (0.0..=1.0).contains(&tape.ml_multipliers[row])
-                    && [tape.sl_pips[row], tape.tp_pips[row]]
-                        .iter()
-                        .all(|v| v.is_finite() && *v >= 0.0)
-                    && (tape.signals[row] == 0
-                        || (tape.sl_pips[row] > 0.0 && tape.tp_pips[row] > 0.0)),
-                "invalid netted direction/brackets/ML multiplier at row {row}"
-            );
-            ensure!(
-                [
-                    tape.sl_pips[row] * self.settings.pip_value_per_lot,
-                    tape.tp_pips[row] * self.settings.pip_value_per_lot,
-                    tape.sl_pips[row] * self.settings.pip_value,
-                    tape.tp_pips[row] * self.settings.pip_value,
-                ]
-                .iter()
-                .all(|value| value.is_finite()),
-                "netted bracket/account risk arithmetic overflow at row {row}"
-            );
-        }
+        let lot_grid = self.settings.resolved_lot_grid(lot_grid)?;
+        self.validate_tape(tape)?;
         let mut state = NettedBarCoreState {
             tape,
             lot_grid,
@@ -286,6 +285,8 @@ impl PreparedNettedCanonicalBarResearchV1 {
             &self.settings,
             &mut trades,
             Some(&mut state),
+            None,
+            None,
         );
         ensure!(
             !state.nonfinite_metrics
@@ -328,6 +329,48 @@ impl PreparedNettedCanonicalBarResearchV1 {
             below_min_entries: state.below_min_entries,
             lot_grid,
         })
+    }
+
+    fn validate_tape(&self, tape: NettedBarDecisionTapeV1<'_>) -> Result<()> {
+        let n = self.close.len();
+        ensure!(
+            [
+                tape.signals.len(),
+                tape.confidences.len(),
+                tape.sl_pips.len(),
+                tape.tp_pips.len(),
+                tape.ml_multipliers.len()
+            ]
+            .iter()
+            .all(|length| *length == n),
+            "netted decision tape must exactly match held-out rows"
+        );
+        super::validate_sizing_confidences(n, tape.confidences, &self.settings)?;
+        for row in 0..n {
+            ensure!(
+                (-1..=1).contains(&tape.signals[row])
+                    && tape.ml_multipliers[row].is_finite()
+                    && (0.0..=1.0).contains(&tape.ml_multipliers[row])
+                    && [tape.sl_pips[row], tape.tp_pips[row]]
+                        .iter()
+                        .all(|v| v.is_finite() && *v >= 0.0)
+                    && (tape.signals[row] == 0
+                        || (tape.sl_pips[row] > 0.0 && tape.tp_pips[row] > 0.0)),
+                "invalid netted direction/brackets/ML multiplier at row {row}"
+            );
+            ensure!(
+                [
+                    tape.sl_pips[row] * self.settings.pip_value_per_lot,
+                    tape.tp_pips[row] * self.settings.pip_value_per_lot,
+                    tape.sl_pips[row] * self.settings.pip_value,
+                    tape.tp_pips[row] * self.settings.pip_value,
+                ]
+                .iter()
+                .all(|value| value.is_finite()),
+                "netted bracket/account risk arithmetic overflow at row {row}"
+            );
+        }
+        Ok(())
     }
 }
 

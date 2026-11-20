@@ -1,0 +1,28 @@
+{
+  "date": "2022-07-01",
+  "instrument": "EURUSD",
+  "venue": "dukascopy",
+  "venue_role": "labeled research reference only; NOT the execution venue (execution truth = cTrader demo); never mixed into the sealed cost model",
+  "status": "ok",
+  "source": "dukascopy-downloader 1.1.0 (jetta.dukascopy.com)",
+  "attempts": 1,
+  "error": null,
+  "detail": null,
+  "requests": {
+    "planned": 24,
+    "fetched": 24,
+    "cached": 0,
+    "failed": 0
+  },
+  "download_seconds": 21.8,
+  "bytes_measured": 1439733,
+  "bytes_wire_bi5": 0,
+  "spread_stats_method": "spread_pips=(ask-bid)/0.0001; p99=linear-interpolation quantile; share_of_day=time-weighted: ms-span of ticks with spread<=1.0 pip divided by ms-span from first to last tick of the UTC day",
+  "tick_count": 115505,
+  "mean_spread_pips": 0.3644543526254333,
+  "median_spread_pips": 0.30000000000196536,
+  "p99_spread_pips": 0.700000000000145,
+  "share_of_day_spread_le_1pip": 0.9974601830784697,
+  "ticks_with_ask_lt_bid": 0,
+  "file": "C:\\Users\\konst\\AppData\\Local\\neoethos\\dukascopy-ref\\2022-07-01\\EURUSD_ticks.csv"
+}

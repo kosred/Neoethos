@@ -332,6 +332,7 @@ fn build_snapshot_dto(
             high_quality_confidence: 0.65,
             adaptive_base_pips: None,
             adaptive_rr: 2.0,
+            risky_account_experiment: None,
         },
     }
 }
