@@ -1810,10 +1810,22 @@ pub fn prepare_validation_population(
     let (sl_pips, tp_pips) = validation_stop_target_arrays(genes);
     let gene_smc_flags: Vec<_> = genes.iter().map(gene_smc_row).collect();
     let smc_weights = evaluation_smc_weights(config);
-    // Use the caller's settings verbatim, but FORCE fixed-1-lot sizing so the
-    // metrics[0] sign matches the serial `simulate_trades_core` reference.
+    // Legacy cost and robustness scenarios compare the fixed-1-lot reference.
+    // The exact Risky policy binds account sizing to every modeled entry, so
+    // its cost scenarios must preserve that same risk on the same account.
     let mut settings = settings_template.clone();
-    settings.risk_based_sizing = false;
+    if settings
+        .risky_account_experiment
+        .as_ref()
+        .is_some_and(|policy| policy.continuous_exact_stop_risk)
+    {
+        anyhow::ensure!(
+            settings.risk_based_sizing,
+            "exact Risky validation requires account-risk sizing"
+        );
+    } else {
+        settings.risk_based_sizing = false;
+    }
     let stop_vol_mults = resolve_adaptive_stops(
         genes,
         &ohlcv.high,
