@@ -1185,8 +1185,15 @@ fn compute_production_feature_columns(
             }
         },
         ProductionFeatureProducerId::Quantitative => match feature_math_authority {
-            MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy => {
-                compute_quant_feature_columns_f64(ohlcv)
+            MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(semantics) => {
+                match semantics {
+                    QuantitativeFeatureSemantics::LegacyV2 => {
+                        compute_quant_feature_columns_f64(ohlcv)
+                    }
+                    QuantitativeFeatureSemantics::RollingValidityV5 => {
+                        compute_quant_feature_columns_v5_f64(ohlcv)
+                    }
+                }
             }
             #[cfg(feature = "gpu-cuda")]
             MultiTimeframeFeatureMathAuthorityV3::ResidentGpuExactParityCpuReferenceV3 => {
@@ -1208,8 +1215,14 @@ fn production_feature_manifest_row(
     feature_math_authority: MultiTimeframeFeatureMathAuthorityV3,
     producer: ProductionFeatureProducerId,
 ) -> Result<&'static ProductionFeatureProducerManifestRowV1> {
-    #[cfg(not(feature = "gpu-cuda"))]
-    let _ = feature_math_authority;
+    if feature_math_authority
+        == MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(
+            QuantitativeFeatureSemantics::RollingValidityV5,
+        )
+        && producer == ProductionFeatureProducerId::Quantitative
+    {
+        return Ok(quantitative_feature_producer_manifest_v5()?);
+    }
     #[cfg(feature = "gpu-cuda")]
     if feature_math_authority
         == MultiTimeframeFeatureMathAuthorityV3::ResidentGpuExactParityCpuReferenceV3
@@ -1353,7 +1366,9 @@ pub fn compute_hpc_feature_frame_sized(
         profile,
         budget_rows,
         &classic_run_plan,
-        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(
+            QuantitativeFeatureSemantics::LegacyV2,
+        ),
         &FeatureBuildControl::default(),
     )
 }
@@ -1648,7 +1663,7 @@ pub fn prepare_multitimeframe_features_batch_with_options_and_control(
         base_tf,
         opts,
         None,
-        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(opts.quantitative_semantics),
         batch,
         control,
         None,
@@ -1675,7 +1690,9 @@ pub fn compute_hpc_feature_frame_batch(
         profile,
         budget_rows,
         &classic_run_plan,
-        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(
+            QuantitativeFeatureSemantics::LegacyV2,
+        ),
         &FeatureBuildControl::default(),
     )
 }
@@ -2884,7 +2901,7 @@ impl MultiTimeframeFeatureSink {
 /// have to key on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MultiTimeframeFeatureMathAuthorityV3 {
-    CurrentProcessPolicy,
+    CurrentProcessPolicy(QuantitativeFeatureSemantics),
     #[cfg(feature = "gpu-cuda")]
     ResidentGpuExactParityCpuReferenceV3,
 }
@@ -2929,7 +2946,7 @@ pub fn prepare_multitimeframe_features_raw_with_options_and_control(
         base_tf,
         opts,
         None,
-        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(opts.quantitative_semantics),
         None,
         control,
         Some(false),
@@ -2978,7 +2995,7 @@ pub fn prepare_multitimeframe_features_with_fitted_normalization_and_control(
         base_tf,
         opts,
         None,
-        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(opts.quantitative_semantics),
         None,
         control,
         Some(true),
@@ -2999,7 +3016,7 @@ pub fn prepare_multitimeframe_features_with_control(
         base_tf,
         opts,
         None,
-        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(opts.quantitative_semantics),
         None,
         control,
         None,
@@ -3074,7 +3091,7 @@ pub fn prepare_multitimeframe_features_before_batch_with_options(
         base_tf,
         opts,
         Some(end_exclusive_ms),
-        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(opts.quantitative_semantics),
         batch,
         &FeatureBuildControl::default(),
         None,
@@ -3093,7 +3110,7 @@ fn prepare_multitimeframe_features_with_optional_cutoff(
         base_tf,
         opts,
         end_exclusive_ms,
-        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(opts.quantitative_semantics),
         None,
         &FeatureBuildControl::default(),
         None,
@@ -3189,7 +3206,7 @@ fn prepare_multitimeframe_features_with_feature_math_authority_v3(
     // feature allocations behind. Every frame below borrows this exact plan;
     // falling available RAM during the build cannot narrow later timeframes.
     let classic_run_plan = match feature_math_authority {
-        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy => {
+        MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(_) => {
             crate::core::hpc_ta::prepare_classic_ta_run_plan_with_working_set(
                 budget_rows,
                 control.resolved_indicator_compute_policy(),
@@ -4712,6 +4729,7 @@ mod cube_assembly_tests {
             higher_tfs: vec!["M5".into()],
             normalization_training_rows: Some(0..80),
             drop_columns_without_normalization_training_support: true,
+            quantitative_semantics: QuantitativeFeatureSemantics::RollingValidityV5,
             ..Default::default()
         };
         let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
@@ -4734,6 +4752,17 @@ mod cube_assembly_tests {
         let recorded = training
             .feature_build_options()
             .expect("exact producer recipe");
+        assert_eq!(
+            training
+                .plan()
+                .nodes()
+                .iter()
+                .filter(|node| node.id().starts_with("producer:quantitative:"))
+                .map(|node| node.semantic_version())
+                .collect::<Vec<_>>(),
+            vec![5, 5],
+            "both direct timeframes must seal the corrected Quant authority"
+        );
         assert_eq!(
             recorded.classic_ta_working_set.as_ref(),
             Some(batch.as_ref())
@@ -4843,7 +4872,9 @@ mod cube_assembly_tests {
         );
         let source = ds.canonical_frame("M1")?;
         let fallback_error = compute_production_feature_columns(
-            MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy,
+            MultiTimeframeFeatureMathAuthorityV3::CurrentProcessPolicy(
+                QuantitativeFeatureSemantics::LegacyV2,
+            ),
             ProductionFeatureProducerId::ClassicVectorTa,
             &source,
             source.len(),

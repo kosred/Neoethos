@@ -196,7 +196,10 @@ pub fn enforce_min_structural_smc_flags(
     rng: &mut impl Rng,
 ) {
     let need = cfg.min_flags.min(10);
-    if need == 0 {
+    if need == 0 || smc_structural_flag_count(gene) >= need {
+        // Min structural flags are already satisfied: do not redraw or force
+        // MTF confirmation. That field was sampled from cfg.p_mtf by
+        // randomize_smc_flags and is not a structural flag.
         return;
     }
     while smc_structural_flag_count(gene) < need {
@@ -213,12 +216,9 @@ pub fn enforce_min_structural_smc_flags(
             _ => gene.use_displacement = true,
         }
     }
-    if !gene.mtf_confirmation && rng.random_bool(cfg.p_mtf.max(0.5)) {
-        gene.mtf_confirmation = true;
-    }
 }
 
-pub fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig) {
+pub fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig, rng: &mut impl Rng) {
     if genes.is_empty() {
         return;
     }
@@ -233,7 +233,6 @@ pub fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig) {
     if active >= target {
         return;
     }
-    let mut rng = rand::rng();
     for gene in genes.iter_mut() {
         if active >= target {
             break;
@@ -241,7 +240,7 @@ pub fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig) {
         if smc_structural_flag_count(gene) > 0 {
             continue;
         }
-        enforce_min_structural_smc_flags(gene, cfg, &mut rng);
+        enforce_min_structural_smc_flags(gene, cfg, rng);
         active += 1;
     }
 }
@@ -563,9 +562,39 @@ fn resolve_smc_columns(names: &[String]) -> [Option<usize>; SMC_FLAG_COUNT] {
     out
 }
 
-fn detect_smc_columns(names: &[String]) -> SmcColumns {
-    let bound = resolve_smc_columns(names);
-    record_binding(names, &bound);
+fn find_exact_column_in_frame(frame: &FeatureFrame, candidates: &[&str]) -> Option<usize> {
+    for candidate in candidates {
+        let Ok(resolved) = frame.model_base_feature_name_candidate(candidate) else {
+            continue;
+        };
+        let want = normalize_feature_name(&resolved);
+        if let Some(index) = frame
+            .names
+            .iter()
+            .position(|raw| normalize_feature_name(raw) == want)
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Frame-aware resolution. The canonical base identity comes from the frame's
+/// recorded prefix recipe, so a prefixed base column (for example M15_smc_ob)
+/// binds by its exact producer name. Higher-timeframe columns and ambiguous
+/// provenance cannot impersonate the base; they resolve to None and retain the
+/// existing crude-bar fallback.
+pub(crate) fn resolve_smc_columns_in_frame(
+    frame: &FeatureFrame,
+) -> [Option<usize>; SMC_FLAG_COUNT] {
+    let mut out = [None; SMC_FLAG_COUNT];
+    for (index, spec) in SMC_ALIAS_SPECS.iter().enumerate() {
+        out[index] = find_exact_column_in_frame(frame, spec.candidates);
+    }
+    out
+}
+
+fn smc_columns_from_bound(bound: [Option<usize>; SMC_FLAG_COUNT]) -> SmcColumns {
     SmcColumns {
         ob: bound[SMC_IDX_OB],
         fvg: bound[SMC_IDX_FVG],
@@ -579,6 +608,18 @@ fn detect_smc_columns(names: &[String]) -> SmcColumns {
         eql: bound[SMC_IDX_EQL],
         displacement: bound[SMC_IDX_DISPLACEMENT],
     }
+}
+
+fn detect_smc_columns_in_frame(frame: &FeatureFrame) -> SmcColumns {
+    let bound = resolve_smc_columns_in_frame(frame);
+    record_binding(&frame.names, &bound);
+    smc_columns_from_bound(bound)
+}
+
+fn detect_smc_columns(names: &[String]) -> SmcColumns {
+    let bound = resolve_smc_columns(names);
+    record_binding(names, &bound);
+    smc_columns_from_bound(bound)
 }
 
 pub fn derive_smc_arrays(ohlcv: &Ohlcv) -> SmcSignalTuple {
@@ -1042,7 +1083,7 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
         ohlcv.open.len() == n && ohlcv.high.len() == n && ohlcv.low.len() == n,
         "SMC OHLC column length mismatch"
     );
-    let cols = detect_smc_columns(&frame.names);
+    let cols = detect_smc_columns_in_frame(frame);
     let all_bound = [
         cols.ob,
         cols.fvg,
@@ -1127,10 +1168,15 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
     apply_dir_col(&mut liq, cols.liq)?;
     apply_dir_col(&mut trend, cols.trend)?;
     apply_dir_col(&mut premium, cols.premium)?;
-    if cols
-        .premium
-        .is_some_and(|col| normalize_feature_name(&frame.names[col]) == "smc_pd_array")
-    {
+    let premium_is_pd_array = cols.premium.is_some_and(|col| {
+        frame
+            .model_base_feature_name_candidate("smc_pd_array")
+            .map(|resolved| {
+                normalize_feature_name(&frame.names[col]) == normalize_feature_name(&resolved)
+            })
+            .unwrap_or(false)
+    });
+    if premium_is_pd_array {
         premium.iter_mut().for_each(|value| *value = -*value);
     }
     // Inducement is a presence gate for either direction. EQH is the short
@@ -1157,4 +1203,300 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> anyhow::Result<S
         eql,
         displacement,
     ))
+}
+
+#[cfg(test)]
+mod prefixed_binding_tests {
+    use super::*;
+    use neoethos_data::test_fixtures::ctrader_sample_ohlcv;
+
+    const CANONICAL_ALIASES: [&str; 11] = [
+        "smc_ob",
+        "smc_fvg",
+        "smc_liq_sweep",
+        "smc_trend_bias",
+        "smc_pd_array",
+        "smc_inducement",
+        "smc_bos",
+        "smc_mss",
+        "smc_eqh",
+        "smc_eql",
+        "smc_displacement",
+    ];
+
+    fn smc_frame(prefixed: bool, higher_only: bool, legacy_spelling: bool) -> FeatureFrame {
+        use neoethos_data::{FeatureBuildOptions, FeatureCellValidity, FeatureColumnF64};
+        let ohlcv = ctrader_sample_ohlcv();
+        let timestamps = ohlcv.timestamp.clone().expect("fixture timestamps");
+        let n = timestamps.len();
+        let names: Vec<String> = CANONICAL_ALIASES
+            .iter()
+            .map(|alias| {
+                let spelling = if legacy_spelling {
+                    alias.to_ascii_uppercase().replace('_', "-")
+                } else {
+                    (*alias).to_string()
+                };
+                if higher_only {
+                    format!("H1_{spelling}")
+                } else if prefixed {
+                    format!("M1_{spelling}")
+                } else {
+                    spelling
+                }
+            })
+            .collect();
+        let columns: Vec<FeatureColumnF64> = names
+            .iter()
+            .enumerate()
+            .map(|(column, name)| {
+                let values: Vec<f64> = (0..n)
+                    .map(|row| {
+                        if CANONICAL_ALIASES[column] == "smc_pd_array" {
+                            1.0
+                        } else {
+                            match row % 3 {
+                                0 => -1.0,
+                                1 => 1.0,
+                                _ => 0.0,
+                            }
+                        }
+                    })
+                    .collect();
+                let validity: Vec<FeatureCellValidity> = (0..n)
+                    .map(|row| {
+                        if row % 11 == 0 {
+                            FeatureCellValidity::MissingInput
+                        } else {
+                            FeatureCellValidity::Valid
+                        }
+                    })
+                    .collect();
+                FeatureColumnF64::new(name.clone(), values, validity).unwrap()
+            })
+            .collect();
+        let options = FeatureBuildOptions {
+            prefix_base_features: prefixed,
+            higher_tfs: if higher_only {
+                vec!["H1".to_string()]
+            } else {
+                Vec::new()
+            },
+            ..FeatureBuildOptions::default()
+        };
+        neoethos_data::test_fixtures::ctrader_test_feature_frame_from_columns_with_options(
+            timestamps, columns, options,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prefixed_base_smc_columns_bind_by_canonical_identity_and_match_arrays() {
+        let ohlcv = ctrader_sample_ohlcv();
+        let plain = smc_frame(false, false, false);
+        let prefixed = smc_frame(true, false, false);
+        let plain_binding = resolve_smc_columns(&plain.names);
+        let prefixed_name_only = resolve_smc_columns(&prefixed.names);
+        let prefixed_binding = resolve_smc_columns_in_frame(&prefixed);
+        for flag in 0..SMC_FLAG_COUNT {
+            assert!(
+                plain_binding[flag].is_some(),
+                "unprefixed flag {flag} unbound"
+            );
+            assert!(
+                prefixed_name_only[flag].is_none(),
+                "name-only resolver must not guess prefixed flag {flag}"
+            );
+            assert!(
+                prefixed_binding[flag].is_some(),
+                "prefixed flag {flag} did not bind by canonical identity"
+            );
+        }
+        let plain_arrays = build_smc_arrays(&plain, &ohlcv).unwrap();
+        let prefixed_arrays = build_smc_arrays(&prefixed, &ohlcv).unwrap();
+        let plain_tuple = [
+            plain_arrays.0,
+            plain_arrays.1,
+            plain_arrays.2,
+            plain_arrays.3,
+            plain_arrays.4,
+            plain_arrays.5,
+            plain_arrays.6,
+            plain_arrays.7,
+            plain_arrays.8,
+            plain_arrays.9,
+            plain_arrays.10,
+        ];
+        let prefixed_tuple = [
+            prefixed_arrays.0,
+            prefixed_arrays.1,
+            prefixed_arrays.2,
+            prefixed_arrays.3,
+            prefixed_arrays.4,
+            prefixed_arrays.5,
+            prefixed_arrays.6,
+            prefixed_arrays.7,
+            prefixed_arrays.8,
+            prefixed_arrays.9,
+            prefixed_arrays.10,
+        ];
+        for (flag, (plain, prefixed)) in plain_tuple.iter().zip(prefixed_tuple.iter()).enumerate() {
+            assert_eq!(plain, prefixed, "flag {flag} arrays diverged");
+        }
+        // smc_pd_array raw +1 must invert in BOTH spellings.
+        assert!(plain_tuple[4].iter().any(|value| *value == -1));
+        assert_eq!(plain_tuple[4], prefixed_tuple[4]);
+
+        // Legacy normalised spellings must still bind on the ACTUAL frame path.
+        let legacy_plain = smc_frame(false, false, true);
+        let legacy_prefixed = smc_frame(true, false, true);
+        assert!(
+            resolve_smc_columns_in_frame(&legacy_plain)
+                .iter()
+                .all(Option::is_some)
+        );
+        assert!(
+            resolve_smc_columns_in_frame(&legacy_prefixed)
+                .iter()
+                .all(Option::is_some)
+        );
+        let legacy_plain_arrays = build_smc_arrays(&legacy_plain, &ohlcv).unwrap();
+        let legacy_prefixed_arrays = build_smc_arrays(&legacy_prefixed, &ohlcv).unwrap();
+        assert_eq!(legacy_plain_arrays.0, plain_tuple[0]);
+        assert_eq!(legacy_plain_arrays.4, plain_tuple[4]);
+        assert_eq!(legacy_prefixed_arrays.0, prefixed_tuple[0]);
+        assert_eq!(legacy_prefixed_arrays.4, prefixed_tuple[4]);
+
+        let higher_only = smc_frame(true, true, false);
+        assert!(
+            resolve_smc_columns_in_frame(&higher_only)
+                .iter()
+                .all(Option::is_none),
+            "higher-timeframe names cannot impersonate the prefixed base"
+        );
+    }
+}
+
+#[cfg(test)]
+mod operator_ratio_tests {
+    use super::*;
+    use crate::genetic::smc_indicators::smc_structural_flag_count;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn population_smc_ratio_is_seeded_and_reaches_the_target() {
+        let cfg = SmcSearchConfig {
+            force_ratio: 0.30,
+            min_flags: 1,
+            ..SmcSearchConfig::default()
+        };
+        let blank = vec![Gene::default(); 32];
+        let mut first = blank.clone();
+        let mut second = blank.clone();
+        let mut other = blank.clone();
+        enforce_population_smc_ratio(&mut first, &cfg, &mut StdRng::seed_from_u64(42));
+        enforce_population_smc_ratio(&mut second, &cfg, &mut StdRng::seed_from_u64(42));
+        enforce_population_smc_ratio(&mut other, &cfg, &mut StdRng::seed_from_u64(43));
+        let flags = |genes: &[Gene]| -> Vec<Vec<bool>> {
+            genes
+                .iter()
+                .map(|gene| {
+                    vec![
+                        gene.use_ob,
+                        gene.use_fvg,
+                        gene.use_liq_sweep,
+                        gene.use_premium_discount,
+                        gene.use_inducement,
+                        gene.mtf_confirmation,
+                        gene.use_bos,
+                        gene.use_choch,
+                        gene.use_eqh,
+                        gene.use_eql,
+                        gene.use_displacement,
+                    ]
+                })
+                .collect()
+        };
+        assert_eq!(
+            flags(&first),
+            flags(&second),
+            "same seed reproduces WHICH flags are forced"
+        );
+        assert_ne!(
+            flags(&first),
+            flags(&other),
+            "seeded placement is not one fixed pattern"
+        );
+        let active = first
+            .iter()
+            .filter(|gene| smc_structural_flag_count(gene) > 0)
+            .count();
+        assert!(active >= ((32.0 * cfg.force_ratio).ceil() as usize));
+    }
+
+    #[test]
+    fn smc_repair_actual_genes_can_collide_and_collision_is_counted() {
+        let cfg = SmcSearchConfig {
+            force_ratio: 1.0,
+            min_flags: 10,
+            p_mtf: 1.0,
+            ..SmcSearchConfig::default()
+        };
+        let mut first = Gene::default();
+        first.mtf_confirmation = true;
+        let mut second = Gene::default();
+        second.mtf_confirmation = true;
+        second.use_ob = true;
+        second.use_fvg = true;
+        second.use_liq_sweep = true;
+        second.use_premium_discount = true;
+        second.use_inducement = true;
+        second.use_bos = true;
+        second.use_choch = true;
+        second.use_eqh = true;
+        second.use_eql = true;
+        second.use_displacement = true;
+        let mut genes = vec![first, second];
+        enforce_population_smc_ratio(&mut genes, &cfg, &mut StdRng::seed_from_u64(5));
+        let mut seen = crate::genetic::evolution_math::SeenSignatureMemory::current();
+        let registered_first = seen.insert_gene(&genes[0]);
+        let registered_second = seen.insert_gene(&genes[1]);
+        let collisions = usize::from(!registered_first) + usize::from(!registered_second);
+        assert_eq!(
+            collisions, 1,
+            "SMC repair can merge formerly distinct offspring; count the actual repeat"
+        );
+    }
+
+    #[test]
+    fn structural_minimum_does_not_redraw_or_force_mtf_probability() {
+        let cfg = SmcSearchConfig {
+            min_flags: 1,
+            p_mtf: 0.0,
+            ..SmcSearchConfig::default()
+        };
+        let mut gene = Gene {
+            use_ob: true,
+            mtf_confirmation: false,
+            ..Gene::default()
+        };
+        enforce_min_structural_smc_flags(&mut gene, &cfg, &mut StdRng::seed_from_u64(7));
+        assert!(!gene.mtf_confirmation, "p_mtf=0 must not be forced to 0.5");
+
+        let mut zero_flags = Gene::default();
+        enforce_min_structural_smc_flags(
+            &mut zero_flags,
+            &SmcSearchConfig {
+                min_flags: 10,
+                p_mtf: 0.0,
+                ..SmcSearchConfig::default()
+            },
+            &mut StdRng::seed_from_u64(8),
+        );
+        assert!(smc_structural_flag_count(&zero_flags) >= 10);
+        assert!(
+            !zero_flags.mtf_confirmation,
+            "structural repair must not enable MTF"
+        );
+    }
 }

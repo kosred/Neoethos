@@ -391,6 +391,7 @@ pub(crate) fn seal_cpu_research_contract_for_input(
     broker_symbol_contract_path: &Path,
     settings_source_path: &Path,
     receipt: neoethos_search::CanonicalSearchInputReceiptV2,
+    screening_round_trip_pips: Option<f64>,
 ) -> Result<neoethos_search::CanonicalTrendbarResearchExecutionContractV3> {
     let plan_receipt = CanonicalTrendbarPlanReceiptV1::from_sha256(plan_sha256.to_owned())?;
     let matrix_receipt = CanonicalTrendbarMatrixReceiptV1::from_sha256(matrix_sha256.to_owned())?;
@@ -431,20 +432,38 @@ pub(crate) fn seal_cpu_research_contract_for_input(
         "broker symbol contract changed while the CPU research contract was sealed"
     );
 
-    let assumption_source_sha256 = format!("{:x}", Sha256::digest(&cost_assumption_bytes));
+    let broker_assumptions_sha256 = format!("{:x}", Sha256::digest(&cost_assumption_bytes));
+    let (source_id, source_hash, spread, slippage, commission) =
+        if let Some(pips) = screening_round_trip_pips {
+            ensure!(
+                pips.is_finite() && pips >= 0.0,
+                "invalid research execution cost"
+            );
+            let source_id = "neoethos.operator-fixed-round-trip-screening.v1";
+            let binding = serde_json::to_vec(&(source_id, &broker_assumptions_sha256, pips))?;
+            let source_hash = format!("{:x}", Sha256::digest(&binding));
+            (source_id, source_hash, pips, 0.0, 0.0)
+        } else {
+            (
+                costs.assumption_source_id.as_str(),
+                broker_assumptions_sha256,
+                costs.full_spread_pips_assumption,
+                costs.slippage_pips_per_fill_assumption,
+                costs.commission_account_per_lot_per_fill_assumption,
+            )
+        };
     let contract = neoethos_search::CanonicalTrendbarResearchExecutionContractV3::new(
         receipt.clone(),
         neoethos_search::CanonicalTrendbarResearchCostAssumptionsV2 {
             symbol: &costs.symbol,
             account_currency: &costs.account_currency,
-            assumption_source_id: &costs.assumption_source_id,
-            assumption_source_sha256: &assumption_source_sha256,
+            assumption_source_id: source_id,
+            assumption_source_sha256: &source_hash,
             pip_size: costs.pip_size,
             pip_value_per_lot,
-            full_spread_pips_assumption: costs.full_spread_pips_assumption,
-            slippage_pips_per_fill_assumption: costs.slippage_pips_per_fill_assumption,
-            commission_account_per_lot_per_fill_assumption: costs
-                .commission_account_per_lot_per_fill_assumption,
+            full_spread_pips_assumption: spread,
+            slippage_pips_per_fill_assumption: slippage,
+            commission_account_per_lot_per_fill_assumption: commission,
             swap_long_pips_per_day: costs.swap_long_pips_per_day,
             swap_short_pips_per_day: costs.swap_short_pips_per_day,
             pnl_conversion_fee_rate: costs.pnl_conversion_fee_rate,

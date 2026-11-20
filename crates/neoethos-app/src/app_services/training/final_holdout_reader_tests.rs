@@ -130,6 +130,7 @@ fn synthetic_report(context: &VerifiedContext, usage: &FinalHoldoutUse, net: f64
                 (context.timestamp_end_ms - context.timestamp_start_ms) as f64 / 3_600_000.0,
             ),
             mfe: net.max(0.0),
+            exit_reason: None,
             mae: net.min(0.0),
             r_multiple: net / 10.0,
         }],

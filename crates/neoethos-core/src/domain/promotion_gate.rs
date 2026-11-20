@@ -390,6 +390,39 @@ mod tests {
     }
 
     #[test]
+    fn member_metric_aggregation_does_not_measure_joint_account_drawdown() {
+        // Characterization of an intentional limitation, NOT a passing
+        // end-to-end portfolio simulator. Independent sleeves have alternate
+        // losses: -6%,+10% and +10%,-6% (repeated). Neither is a Prop-Firm
+        // pass if daily loss is capped at 5%, but 50:50 rebalanced sleeves
+        // have +2% on every corresponding day and no drawdown.
+        let mut a = strong();
+        let mut b = strong();
+        a.max_drawdown_pct = 6.0;
+        b.max_drawdown_pct = 6.0;
+        let member_aggregate = aggregate_portfolio(&[a, b]).unwrap();
+        assert_eq!(member_aggregate.max_drawdown_pct, 6.0);
+
+        let a_net_daily = [-0.06, 0.10, -0.06, 0.10];
+        let b_net_daily = [0.10, -0.06, 0.10, -0.06];
+        let mut equity = 1.0_f64;
+        let mut peak = 1.0_f64;
+        let mut joint_max_dd = 0.0_f64;
+        for (&ret_a, &ret_b) in a_net_daily.iter().zip(b_net_daily.iter()) {
+            let joint_day_return = 0.5 * ret_a + 0.5 * ret_b;
+            equity *= 1.0 + joint_day_return;
+            peak = peak.max(equity);
+            joint_max_dd = joint_max_dd.max((peak - equity) / peak);
+        }
+        assert!((equity - 1.02_f64.powi(4)).abs() < 1e-12);
+        assert_eq!(joint_max_dd, 0.0);
+        assert_ne!(member_aggregate.max_drawdown_pct, joint_max_dd * 100.0);
+        // Production implication: a portfolio-level objective must use an
+        // explicitly synchronized, capital-aware common-account replay.
+        // A mean-Sharpe / worst-member-DD aggregate cannot replace it.
+    }
+
+    #[test]
     fn non_finite_metrics_fail_every_field_loudly() {
         // Audit B07: NaN, +inf and -inf must be rejected as broken evidence,
         // never compared against thresholds. +inf profit factor used to PASS.

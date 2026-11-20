@@ -1361,7 +1361,28 @@ export type StrategyEntry = {
   discoveredAtMs: number | null;
 };
 export type MonthRow = { month: string; balance: number; returnPct: number; trades: number };
-export type StrategyReport = StrategyEntry & { monthly: MonthRow[]; yearly: MonthRow[] };
+export type MonthlyAccountRow = {
+  month_utc: string;
+  is_partial: boolean;
+  starting_balance: number;
+  ending_balance: number;
+  net_profit: number;
+  return_pct: number | null;
+  closed_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  gross_profit: number;
+  gross_loss: number;
+  win_rate: number | null;
+  profit_factor: number | null;
+  max_closed_balance_drawdown_money: number;
+  max_closed_balance_drawdown_pct: number | null;
+};
+export type StrategyReport = StrategyEntry & {
+  monthly: MonthRow[];
+  yearly: MonthRow[];
+  monthlyAccount: MonthlyAccountRow[];
+};
 export const strategyList = () => apiGet<{ count: number; strategies: StrategyEntry[]; unavailable: string[] }>("/strategy/list");
 export const strategyReport = (dir: string, base: string, strategyId: string, exactGeneHash: string) =>
   apiGet<StrategyReport>(`/strategy/report?dir=${encodeURIComponent(dir)}&base=${encodeURIComponent(base)}&strategy_id=${encodeURIComponent(strategyId)}&exact_gene_hash=${encodeURIComponent(exactGeneHash)}`);

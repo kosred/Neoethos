@@ -260,23 +260,32 @@ export default function StrategyReport() {
               <div className="ticker" style={{ flexWrap: "wrap" }}>
                 {rep.yearly.map((y) => <span className="tick" key={y.month}>{y.month}: <b>{normalizedUnits(y.balance)}</b></span>)}
               </div>
-              <h2>Monthly journal</h2>
+            </>
+          )}
+          <h2>Monthly account journal · unsealed IS</h2>
+          <p className="muted small">Original account units{rep.recordedEvaluation ? ` (${rep.recordedEvaluation.accountCurrency})` : ""}, after recorded costs. Every month in the selected research interval is shown. Partial marks incomplete calendar coverage; drawdown measures closed-trade balance within that month. Undefined ratios show —.</p>
+          <div style={{ overflowX: "auto" }}>
               <table className="tbl">
-                <thead><tr><th>Month</th><th>Return%</th><th>Balance</th><th>Trades</th></tr></thead>
+                <thead><tr><th>Month (UTC)</th><th>Net PnL</th><th>Return %</th><th>Opening</th><th>Closing</th><th>Trades</th><th>Win %</th><th>PF</th><th>Closed DD</th><th>Closed DD %</th></tr></thead>
                 <tbody>
-                  {rep.monthly.slice(-24).reverse().map((m) => (
-                    <tr key={m.month}>
-                      <td>{m.month}</td>
-                      <td className={m.returnPct >= 0 ? "buy" : "sell"}>{m.returnPct >= 0 ? "+" : ""}{m.returnPct.toFixed(1)}</td>
-                      <td className="mono">{normalizedUnits(m.balance)}</td>
-                      <td>{m.trades}</td>
+                  {rep.monthlyAccount.map((m) => (
+                    <tr key={m.month_utc}>
+                      <td>{m.month_utc}{m.is_partial && <span className="muted small"> · partial</span>}</td>
+                      <td className={m.net_profit >= 0 ? "buy" : "sell"}>{m.net_profit.toFixed(2)}</td>
+                      <td>{m.return_pct?.toFixed(2) ?? "—"}</td>
+                      <td className="mono">{m.starting_balance.toFixed(2)}</td>
+                      <td className="mono">{m.ending_balance.toFixed(2)}</td>
+                      <td>{m.closed_trades}</td>
+                      <td>{m.win_rate == null ? "—" : (m.win_rate * 100).toFixed(1)}</td>
+                      <td title={`Gross profit ${m.gross_profit.toFixed(2)} / gross loss ${m.gross_loss.toFixed(2)}`}>{m.profit_factor?.toFixed(2) ?? "—"}</td>
+                      <td>{m.max_closed_balance_drawdown_money.toFixed(2)}</td>
+                      <td>{m.max_closed_balance_drawdown_pct?.toFixed(2) ?? "—"}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-              <p className="muted small">Showing last 24 months of {rep.monthly.length}.</p>
-            </>
-          )}
+          </div>
+          <p className="muted small">Showing all {rep.monthlyAccount.length} months. OOS and demo/live performance require their own execution records.</p>
         </>
       )}
     </div>

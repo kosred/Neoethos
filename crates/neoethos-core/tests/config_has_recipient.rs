@@ -444,7 +444,15 @@ fn parse_config_model(src: &str) -> ConfigModel {
         {
             continue;
         }
-        let ty = base_type(ty.trim_end().trim_end_matches(','));
+        let expression = ty.trim_end().trim_end_matches(',');
+        let base = base_type(expression);
+        // Optional config structs are still reachable deserializable knobs.
+        // Treat the container exactly like its installed child, rather than
+        // declaring Risky's checked lot-grid fields unreachable.
+        let ty = match (base.as_str(), expression.split_once('<')) {
+            ("Option", Some((_, inner))) => base_type(inner.trim_end_matches('>')),
+            _ => base,
+        };
         model
             .structs
             .entry(owner)
@@ -2108,6 +2116,17 @@ fn no_ui_control_is_backed_by_a_no_recipient_field() {
 #[cfg(test)]
 mod scanner {
     use super::*;
+
+    #[test]
+    fn optional_nested_config_is_reachable_and_retains_all_fields() {
+        let model = parse_config_model(
+            "#[derive(Deserialize)]\npub struct Settings {\n pub grid: Option<LotGrid>,\n}\n\
+             #[derive(Deserialize)]\npub struct LotGrid {\n pub minimum: f64,\n}\n",
+        );
+        assert!(model.reachable.contains("LotGrid"));
+        assert!(model.installs["grid"].contains("LotGrid"));
+        assert!(model.declares("LotGrid", "minimum"));
+    }
 
     fn tiny_model() -> ConfigModel {
         // `ExitPolicyConfig` and `RiskConfig` share `trailing_min_lock_pips` on

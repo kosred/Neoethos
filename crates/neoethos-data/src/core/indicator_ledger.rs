@@ -116,6 +116,26 @@ pub const EXPECTED_NON_PRODUCING: &[(&str, &str)] = &[
 /// identifies one declared output of a multi-output indicator.
 pub const PRODUCTION_OUTPUT_EXCLUSIONS: &[(&str, Option<&str>, &str)] = &[
     (
+        "minmax",
+        Some("is_min"),
+        "centered pivot reads low[i + order] but writes at i; no confirmation delay exists in the production adapter",
+    ),
+    (
+        "minmax",
+        Some("is_max"),
+        "centered pivot reads high[i + order] but writes at i; no confirmation delay exists in the production adapter",
+    ),
+    (
+        "minmax",
+        Some("last_min"),
+        "forward-filled centered low pivot inherits future-bar dependence from is_min; a new causal feature must be versioned",
+    ),
+    (
+        "minmax",
+        Some("last_max"),
+        "forward-filled centered high pivot inherits future-bar dependence from is_max; a new causal feature must be versioned",
+    ),
+    (
         "adjustable_ma_alternating_extremities",
         Some("smoothed_close"),
         "formula copies `ma` into `smoothed_close` with copy_from_slice, so the two outputs are structurally identical",
@@ -937,6 +957,33 @@ mod tests {
             output_ids_for("adaptive_bounds_rsi").contains(&Some("regime")),
             "excluding the auxiliary RSI must preserve the indicator's distinct regime output"
         );
+    }
+
+    #[test]
+    fn centered_minmax_future_bar_changes_past_pivot_and_is_not_admitted() {
+        use vector_ta::indicators::minmax::{MinmaxInput, MinmaxParams, minmax_with_kernel};
+        use vector_ta::utilities::enums::Kernel;
+        let high = [1., 2., 3., 4., 10., 4., 3., 2., 1., 2., 3., 4.];
+        let low = high.map(|value| value - 1.);
+        let compute = |h: &[f64]| {
+            minmax_with_kernel(
+                &MinmaxInput::from_slices(h, &low, MinmaxParams { order: Some(3) }),
+                Kernel::Scalar,
+            )
+            .unwrap()
+        };
+        let original = compute(&high);
+        let mut future_changed = high;
+        future_changed[7] = 11.;
+        let revised = compute(&future_changed);
+        assert_eq!(original.is_max[4], 10.);
+        assert!(
+            revised.is_max[4].is_nan(),
+            "a future-only change rewrites the historical pivot"
+        );
+        assert_eq!(&high[..=4], &future_changed[..=4]);
+        assert!(output_ids_for("minmax").is_empty());
+        assert_eq!(planned_output_count("minmax"), 0);
     }
 
     #[test]

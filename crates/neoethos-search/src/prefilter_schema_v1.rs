@@ -77,6 +77,18 @@ pub(crate) fn timeframe_group_v1(name: &str) -> Option<&str> {
     Some(head)
 }
 
+/// Strip an optional leading timeframe head (`H1_`, `H4_`, `M15_`, `MN1_`, …)
+/// from a column name so family-prefix matching is timeframe-agnostic:
+/// `H1_atr_7` → `atr_7`, `smc_ob` → `smc_ob`.
+pub(crate) fn strip_timeframe_prefix_v1(name: &str) -> &str {
+    if timeframe_group_v1(name).is_some() {
+        name.split_once('_')
+            .map_or(name, |(_head, rest)| rest)
+    } else {
+        name
+    }
+}
+
 pub(crate) fn seal_prefilter_column_classification_v1(
     ordered_feature_names: &[String],
 ) -> Option<SealedPrefilterColumnClassificationV1> {
@@ -171,5 +183,20 @@ mod tests {
         assert_eq!(sealed.template_force_keep_flags().len(), names.len());
         assert_ne!(sealed.ordered_feature_schema_sha256(), [0; 32]);
         assert_ne!(sealed.column_classification_content_sha256(), [0; 32]);
+    }
+
+    #[test]
+    fn strip_timeframe_prefix_strips_only_real_timeframe_heads() {
+        assert_eq!(strip_timeframe_prefix_v1("H1_atr_7"), "atr_7");
+        assert_eq!(strip_timeframe_prefix_v1("M15_mass_21"), "mass_21");
+        assert_eq!(strip_timeframe_prefix_v1("MN1_foo"), "foo");
+        assert_eq!(strip_timeframe_prefix_v1("smc_ob"), "smc_ob");
+        assert_eq!(
+            strip_timeframe_prefix_v1("garman_klass_volatility_7"),
+            "garman_klass_volatility_7"
+        );
+        assert_eq!(strip_timeframe_prefix_v1("atr"), "atr");
+        // Lowercase heads are not canonical timeframe groups and stay intact.
+        assert_eq!(strip_timeframe_prefix_v1("h4_macd"), "h4_macd");
     }
 }

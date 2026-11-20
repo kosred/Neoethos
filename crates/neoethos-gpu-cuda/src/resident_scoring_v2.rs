@@ -8,7 +8,7 @@ use std::ptr::NonNull;
 use thiserror::Error;
 
 pub(crate) const RESIDENT_SCORING_SEMANTICS_PROPFIRM_V2: &str = concat!(
-    "neoethos.resident-scoring.v2;objective=prop-firm-v4;",
+    "neoethos.resident-scoring.v2;objective=prop-firm-v4;rev=sample-confidence-v7;",
     "checked-eleven-metrics;finite-or-authenticated-economic-objective;raw-objective;",
     "positive-zero-canonical;cuda-build-and-math-bound;no-host-decision"
 );

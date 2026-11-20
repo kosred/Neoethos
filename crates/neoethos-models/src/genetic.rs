@@ -682,9 +682,9 @@ impl GeneticStrategyExpert {
         if gene
             .weights
             .iter()
-            .any(|weight| !weight.is_finite() || *weight <= 0.0)
+            .any(|weight| !weight.is_finite() || *weight == 0.0)
         {
-            bail!("{context} contains a gene with non-finite or non-positive weights");
+            bail!("{context} contains a gene with non-finite or zero weights");
         }
         if !gene.long_threshold.is_finite() || !gene.short_threshold.is_finite() {
             bail!("{context} contains a gene with non-finite thresholds");
@@ -1333,6 +1333,58 @@ mod tests {
         assert!(err.to_string().contains("no portfolio"));
 
         let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn genetic_persisted_signed_negative_weight_roundtrips_while_zero_and_nonfinite_still_fail()
+    -> Result<()> {
+        let include = |weight: f64| {
+            let mut gene = sample_gene();
+            gene.weights = vec![weight];
+            let best_fitness = gene.fitness;
+            GeneticArtifact {
+                portfolio: vec![gene],
+                feature_columns: vec!["f1".to_string()],
+                runtime_metadata: Some(sample_runtime_metadata(vec!["f1".to_string()])),
+                best_fitness,
+                ..GeneticArtifact::default()
+            }
+        };
+        let negative_path = temp_model_dir("genetic_negative_weight");
+        std::fs::create_dir_all(&negative_path)?;
+        let negative = include(-0.2);
+        std::fs::write(
+            GeneticStrategyExpert::artifact_path(&negative_path),
+            serde_json::to_vec_pretty(&negative)?,
+        )?;
+        let mut expert = GeneticStrategyExpert::default();
+        expert.load(&negative_path)?;
+        assert_eq!(expert.portfolio[0].weights, vec![-0.2]);
+        let _ = std::fs::remove_dir_all(&negative_path);
+
+        let zero_path = temp_model_dir("genetic_zero_weight");
+        std::fs::create_dir_all(&zero_path)?;
+        let zero = include(0.0);
+        std::fs::write(
+            GeneticStrategyExpert::artifact_path(&zero_path),
+            serde_json::to_vec_pretty(&zero)?,
+        )?;
+        let mut expert = GeneticStrategyExpert::default();
+        let error = expert
+            .load(&zero_path)
+            .expect_err("zero weight must stay rejected");
+        assert!(error.to_string().contains("zero weights"), "{error}");
+        let _ = std::fs::remove_dir_all(&zero_path);
+
+        let mut nonfinite_gene = sample_gene();
+        nonfinite_gene.weights = vec![f64::NAN];
+        let error = GeneticStrategyExpert::validate_gene(&nonfinite_gene, 1, "test")
+            .expect_err("non-finite weight must stay rejected");
+        assert!(
+            error.to_string().contains("non-finite or zero weights"),
+            "{error}"
+        );
         Ok(())
     }
 

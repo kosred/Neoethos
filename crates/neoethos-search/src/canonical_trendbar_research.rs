@@ -521,7 +521,7 @@ impl CanonicalTrendbarResearchExecutionContractV3 {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalTrendbarResearchDiscoveryResultV3 {
     schema_version: u16,
@@ -533,6 +533,15 @@ pub struct CanonicalTrendbarResearchDiscoveryResultV3 {
 }
 
 impl CanonicalTrendbarResearchDiscoveryResultV3 {
+    /// Reopen research evidence, not a trading or broker capability. Consumers
+    /// must additionally bind it to the freshly reopened canonical input.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        let result: Self =
+            serde_json::from_slice(bytes).context("decode saved canonical research")?;
+        result.validate()?;
+        Ok(result)
+    }
+
     pub(crate) fn new(
         execution_contract: CanonicalTrendbarResearchExecutionContractV3,
         discovery_result: DiscoveryResult,
@@ -670,12 +679,22 @@ fn result_identity_sha256(
 ) -> Result<String> {
     contract.validate()?;
     result.validate_evaluated_scopes()?;
-    let mut bytes = Vec::new();
-    push_string(&mut bytes, &contract.identity_sha256()?);
-    let result_bytes =
-        serde_json::to_vec(result).context("serialize complete research discovery result")?;
-    push_bytes(&mut bytes, &result_bytes);
-    Ok(domain_sha256(RESULT_IDENTITY_DOMAIN_V3, &bytes))
+    let result_len = crate::artifact_io::compact_json_byte_len(result)?;
+    let mut prefix = Vec::new();
+    push_string(&mut prefix, &contract.identity_sha256()?);
+    prefix.extend_from_slice(&result_len.to_be_bytes());
+    let body_len = (prefix.len() as u64)
+        .checked_add(result_len)
+        .context("research result hash length overflow")?;
+    let mut hasher = Sha256::new();
+    hasher.update(RESULT_IDENTITY_DOMAIN_V3);
+    hasher.update(body_len.to_be_bytes());
+    hasher.update(prefix);
+    let mut writer = std::io::BufWriter::new(hasher);
+    serde_json::to_writer(&mut writer, result)
+        .context("hash complete research discovery result")?;
+    let hasher = writer.into_inner().map_err(|error| error.into_error())?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn validate_identity_text(label: &str, value: &str) -> Result<()> {

@@ -1560,6 +1560,8 @@ fn embargoed_walkforward_backtest_core(
                     slice_days,
                     slice_ts,
                     &window_settings,
+                    None,
+                    None,
                 )?;
 
                 // Map metrics [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count, consistency, max_daily_dd]
@@ -2383,6 +2385,7 @@ mod tests {
 
     fn flat_settings() -> BacktestSettings {
         BacktestSettings {
+            risky_account_experiment: None,
             initial_equity_override: None,
             sl_pips: 1_000_000.0,
             tp_pips: 1_000_000.0,
@@ -3119,6 +3122,7 @@ mod risk_diagnostics_split_tests {
             pnl,
             pnl_pct: Some(pnl / 100_000.0),
             duration_hours: Some(1.0),
+            exit_reason: None,
             mfe: pnl.max(0.0),
             mae: (-pnl).max(0.0),
             r_multiple: pnl / 200.0,
@@ -3304,6 +3308,8 @@ mod window_evaluation_tests {
                         &days[start..end],
                         &timestamps[start..end],
                         &policy,
+                        None,
+                        None,
                     )?;
                     metrics.push(row);
                     trades.push(ledger);
@@ -3618,6 +3624,7 @@ mod window_evaluation_tests {
                 pnl: -250.0,
                 pnl_pct: Some(-0.0025),
                 duration_hours: Some(6.0),
+                exit_reason: None,
                 mfe: 40.0,
                 mae: 250.0,
                 r_multiple: -1.25,
@@ -3628,6 +3635,7 @@ mod window_evaluation_tests {
                 pnl: 600.0,
                 pnl_pct: Some(0.006),
                 duration_hours: Some(6.0),
+                exit_reason: None,
                 mfe: 700.0,
                 mae: 30.0,
                 r_multiple: 3.0,

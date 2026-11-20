@@ -23,6 +23,61 @@ thing faster.** Do not spend card-hours scaling population before A+B land.
 
 ---
 
+## Status reconciliation — 2026-10-19 (verified, supersedes the verdict above)
+
+The verdict above is kept as the 2026-08-09 audit record. Re-checked against
+commit `e503f8cd` and the real 2026-10-18 EURUSD M5/H1/H4 run
+(`%LOCALAPPDATA%\neoethos\experiments\eurusd-m5-h1-h4-20261018`):
+
+- **The GA objective is no longer `g_trade x trades` when a growth goal is
+  bound.** Canonical Risky research ran `scoring_version=6`: realized balance
+  pace toward the configured reference ratio (`start=100`, `target=50,000`,
+  `horizon=180d`) — see `eurusd-m5-inputs-20261018/research.log:155`, the
+  authority `crates/neoethos-gpu-contracts/src/resident_search_scoring_v2.rs`
+  (`score_risky_ga_fitness_goal_v6`), wired by
+  `crates/neoethos-search/src/genetic/search_engine.rs:3388-3412` and
+  `crates/neoethos-search/src/genetic/evolution_math.rs:1363-1368`. The v5
+  `g_trade x trades` objective remains the fallback when no goal is bound
+  (`crates/neoethos-search/src/scoring/named.rs:155`).
+- **B (payoff-explicit ranking) landed in substance.** Risky finalist ranking
+  uses the same goal-pace score when a goal is bound
+  (`crates/neoethos-search/src/discovery.rs:13459-13502`), not the
+  volume-tie-broken income score. The non-goal branch is unchanged.
+- **A is still open.** `models.prop_search_min_payoff_ratio` defaults to
+  `0.0` (`crates/neoethos-core/src/config.rs:2475`) and the run used `0.0`;
+  the gate exists and is wired (`crates/neoethos-search/src/discovery.rs:3440`)
+  but is off. Payoff ratio is still not an explicit term of the v6 goal pace.
+- **D is superseded for canonical CPU research, not for reviewed quotes.** That
+  run charged broker-evidenced screening costs: full spread 1.5 pips + 0.5
+  slippage per fill, 4.5 account-currency commission per lot per fill, swap
+  -2.445/-0.105 pips/day, zero conversion fee (`screening-costs.json` and
+  `research.json` -> `execution_contract.screening_costs`; swap is charged at
+  `crates/neoethos-search/src/eval.rs:741-747` and `:804-810`). A flat 2.0-pip,
+  zero-swap, 72%-commission model no longer describes this path. These remain
+  screening assumptions; a reviewed finalist quote bundle is still required for
+  financial validation.
+- **E (activity floors) no longer blocks by default.**
+  `prop_search_val_min_trades_per_day`/`_per_month` default to `0`/`0.0`
+  (`crates/neoethos-core/src/config.rs:2466-2467`) and the run used zeros.
+- **Two feature-validity defects that poisoned this run are repaired.** In the
+  exact run frame (791,263 M5 rows, training rows `0..633,010`), the legacy
+  `quant_cum_delta_zscore` had 1,389 valid cells and the archived
+  `dual_ulcer_index_threshold` had 95; after the Quant-v5 CPU semantic and the
+  Classic-v9 dual-ulcer clamp, the same frame measures 619,565 and 633,002
+  valid/finite cells. Feature-validity measurements, not profitability evidence.
+- **Still open from this document:** the Slice 6 data-integrity gate has no
+  source implementation; the 2014-2016 corrupt-bar re-import was not verified
+  here; and the config split persists — the operator store
+  (`%LOCALAPPDATA%\neoethos\config.yaml:316`) runs
+  `models.discovery_mode: prop_firm` while the repo `config.yaml:116` runs
+  `risky`, so an app-launched run and a CLI run can still search different
+  things.
+
+Rows **A-E** in the table below remain the 2026-08-09 proposal record; use this
+block for current state.
+
+---
+
 ## What already landed (honesty fixes — no philosophy change)
 
 These make the search *measure what it claims*; they do not change what

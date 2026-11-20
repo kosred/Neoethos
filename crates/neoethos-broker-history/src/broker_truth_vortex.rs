@@ -1056,6 +1056,16 @@ fn broker_evidence_rows_array_v2(
     .into_array())
 }
 
+/// Public encoder entry for the exact fixed 13-field Vortex evidence dtype
+/// that reviewed_sync_ingress_v2 decodes. Shared by the production encoder and
+/// the acquisition-side reviewed-input generator so producer and ingress keep
+/// one schema owner; the private V2 encoder remains the single implementation.
+pub fn encode_broker_evidence_rows_v2(
+    rows: &[CapturedBrokerEvidenceRowV2],
+) -> Result<vortex_array::ArrayRef> {
+    broker_evidence_rows_array_v2(rows)
+}
+
 fn raw_deal_pages_array_v2(
     capture: &ValidatedCloseDealReconciliationV2,
 ) -> Result<vortex_array::ArrayRef> {
