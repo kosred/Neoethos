@@ -122,6 +122,8 @@ pub struct DiscoveryRuntimeOverrides {
     pub risky_survival_only: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_account_experiment_v3: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_minimum_weekly_entries: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risky_lot_constraints: Option<neoethos_core::config::RiskyReplayLotConstraintsConfigV1>,
     /// See the identically named field on
@@ -174,6 +176,7 @@ impl Default for DiscoveryRuntimeOverrides {
             weekly_cadence: false,
             risky_survival_only: false,
             risky_account_experiment_v3: false,
+            risky_minimum_weekly_entries: false,
             risky_lot_constraints: None,
             prefilter_top_k: 240,
             prefilter_insample_frac: 1.0,
@@ -199,6 +202,7 @@ impl DiscoveryRuntimeOverrides {
         let mut overrides = Self::default();
         overrides.risky_survival_only = cfg.risky_survival_only;
         overrides.risky_account_experiment_v3 = cfg.risky_account_experiment_v3;
+        overrides.risky_minimum_weekly_entries = cfg.risky_minimum_weekly_entries;
         overrides.risky_lot_constraints = cfg.risky_lot_constraints.clone();
         overrides.weekly_cadence = cfg.weekly_cadence;
         overrides.prefilter_top_k = cfg.prefilter_top_k;
@@ -1592,6 +1596,9 @@ impl DiscoveryConfig {
         // *rule parameters* are still derived inside `derive_prop_firm_gate`
         // — that env read is the Stage B tail.)
         let mode = self.mode;
+        if mode != DiscoveryMode::Risky {
+            self.runtime_overrides.risky_minimum_weekly_entries = false;
+        }
 
         if matches!(mode, DiscoveryMode::PropFirm) {
             // Permissive filter floor — the GA's output is judged by the
@@ -1820,16 +1827,22 @@ impl DiscoveryConfig {
     }
 
     fn risky_account_experiment(&self) -> Result<Option<crate::eval::RiskyAccountExperimentV1>> {
+        let risk_band = (self.risk_per_trade_min, self.risk_per_trade_max);
+        let continuous_exact_stop_risk = self.mode == DiscoveryMode::Risky
+            && self.runtime_overrides.risky_minimum_weekly_entries
+            && risk_band == (0.30, 0.30);
         anyhow::ensure!(
             self.runtime_overrides.risky_account_experiment_v3
                 || self.runtime_overrides.risky_lot_constraints.is_none(),
             "explicit Risky lot constraints require risky_account_experiment_v3"
         );
-        if !self.runtime_overrides.risky_account_experiment_v3 {
+        if !self.runtime_overrides.risky_account_experiment_v3 && !continuous_exact_stop_risk {
             return Ok(None);
         }
         anyhow::ensure!(
-            self.mode == DiscoveryMode::Risky && self.runtime_overrides.risky_survival_only,
+            !self.runtime_overrides.risky_account_experiment_v3
+                || (self.mode == DiscoveryMode::Risky
+                    && self.runtime_overrides.risky_survival_only),
             "Risky account experiment v3 requires Risky mode and risky_survival_only"
         );
         anyhow::ensure!(
@@ -1838,6 +1851,7 @@ impl DiscoveryConfig {
         );
         let policy = crate::eval::RiskyAccountExperimentV1 {
             target_balance: self.risky_target_balance,
+            continuous_exact_stop_risk,
             lot_constraints: self
                 .runtime_overrides
                 .risky_lot_constraints
@@ -1852,7 +1866,7 @@ impl DiscoveryConfig {
                 })
                 .transpose()?,
         };
-        policy.validate(self.initial_balance)?;
+        policy.validate(self.initial_balance, risk_band)?;
         anyhow::ensure!(
             self.risky_start_balance == self.initial_balance,
             "Risky account experiment start balance must equal the actual initial balance"
@@ -2398,6 +2412,25 @@ impl DiscoveryResult {
         let first = segments.first().expect("segments checked non-empty");
         let last = segments.last().expect("segments checked non-empty");
         let selected = self.selection_scope.evaluated_window();
+        if let Some(options) = self
+            .search_input_receipt
+            .feature_build_options()
+            .filter(|options| options.research_full_forward)
+        {
+            let training = options
+                .normalization_training_rows
+                .as_ref()
+                .context("full forward research result lacks its exact training prefix")?;
+            anyhow::ensure!(
+                training.start == 0
+                    && selected.role() == CanonicalSearchWindowRoleV1::InSample
+                    && selected.row_end().checked_sub(first.row_start())
+                        == Some(u64::try_from(training.end)?)
+                    && self.calibration_scope.is_none()
+                    && self.holdout_scope.is_some(),
+                "full forward research requires the exact sealed prefix and undivided holdout suffix"
+            );
+        }
 
         match (selected.role(), self.holdout_scope.as_ref()) {
             (CanonicalSearchWindowRoleV1::DiscoveryInput, None) => {
@@ -2701,6 +2734,8 @@ pub struct DiscoveryRunProfile {
     pub risky_survival_only: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_account_experiment_v3: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_minimum_weekly_entries: bool,
     /// Direction-only prefilter ranking was active for this run (opt-in).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub prefilter_direction_only_ranking: bool,
@@ -7087,6 +7122,7 @@ fn evaluate_gene_with_ledger_v1(
         timestamps,
         settings,
         None,
+        None,
     )
 }
 
@@ -10190,11 +10226,14 @@ impl<'a> CanonicalDiscoveryRunInputs<'a> {
     }
 
     fn with_research_holdout(input: &'a CanonicalSearchRunInputV2<'_>) -> Result<Self> {
-        let Some(training) = input
-            .receipt()
-            .feature_build_options()
-            .and_then(|options| options.normalization_training_rows.as_ref())
-        else {
+        let Some(options) = input.receipt().feature_build_options() else {
+            return Self::with_holdout(input);
+        };
+        let Some(training) = options.normalization_training_rows.as_ref() else {
+            anyhow::ensure!(
+                !options.research_full_forward,
+                "full forward research requires an exact training prefix in the sealed recipe"
+            );
             return Self::with_holdout(input);
         };
         anyhow::ensure!(
@@ -10202,30 +10241,36 @@ impl<'a> CanonicalDiscoveryRunInputs<'a> {
             "CPU research training must be a chronological prefix"
         );
         let rows = input.ohlcv().len();
-        let mut scoped = Self::with_holdout_at(input, training.end)?;
-        scoped.full_research_training =
-            *training != canonical_discovery_normalization_training_rows(rows)?;
+        let mut scoped = if options.research_full_forward {
+            checked_canonical_training_prefix(rows, training.end)?;
+            Self::with_holdout_boundaries(input, training.end, None)?
+        } else {
+            Self::with_holdout_at(input, training.end)?
+        };
+        scoped.full_research_training = options.research_full_forward
+            || *training != canonical_discovery_normalization_training_rows(rows)?;
         Ok(scoped)
     }
 
     fn with_holdout_at(input: &'a CanonicalSearchRunInputV2<'_>, split_at: usize) -> Result<Self> {
         let row_count = input.ohlcv().len();
-        anyhow::ensure!(row_count > 0, "canonical discovery input is empty");
-        anyhow::ensure!(split_at > 0, "in-sample selection window is empty");
-        anyhow::ensure!(
-            split_at < row_count,
-            "holdout suffix is empty or split {split_at} exceeds {row_count} parent rows"
-        );
-        anyhow::ensure!(
-            split_at >= 64,
-            "in-sample selection must contain at least 64 rows; got {split_at}"
-        );
+        let training = checked_canonical_training_prefix(row_count, split_at)?;
         let final_start = split_at
-            .checked_add((row_count - split_at) / 2)
+            .checked_add((row_count - training.end) / 2)
             .ok_or_else(|| anyhow::anyhow!("final holdout boundary overflow"))?;
+        Self::with_holdout_boundaries(input, training.end, Some(final_start))
+    }
+
+    fn with_holdout_boundaries(
+        input: &'a CanonicalSearchRunInputV2<'_>,
+        split_at: usize,
+        calibration_end: Option<usize>,
+    ) -> Result<Self> {
+        let row_count = input.ohlcv().len();
+        let final_start = calibration_end.unwrap_or(split_at);
         anyhow::ensure!(
-            final_start > split_at && final_start < row_count,
-            "selection calibration and final holdout must each contain actual rows"
+            final_start < row_count && calibration_end.is_none_or(|end| end > split_at),
+            "requested calibration and final holdout windows must each contain actual rows"
         );
 
         let inputs = Self {
@@ -10234,11 +10279,15 @@ impl<'a> CanonicalDiscoveryRunInputs<'a> {
                 CanonicalSearchWindowRoleV1::InSample,
                 0..split_at,
             )?,
-            calibration: Some(ScopedDiscoveryInput::owned_range(
-                input,
-                CanonicalSearchWindowRoleV1::SelectionValidation,
-                split_at..final_start,
-            )?),
+            calibration: calibration_end
+                .map(|end| {
+                    ScopedDiscoveryInput::owned_range(
+                        input,
+                        CanonicalSearchWindowRoleV1::SelectionValidation,
+                        split_at..end,
+                    )
+                })
+                .transpose()?,
             holdout: Some(ScopedDiscoveryInput::owned_range(
                 input,
                 CanonicalSearchWindowRoleV1::Holdout,
@@ -10285,11 +10334,15 @@ fn validate_discovery_scope_pair(
     let full = full_scope.evaluated_window();
     let selected = selection.evaluated_window();
     validate_normalization_training_scope(input.receipt(), selected)?;
+    let full_forward = input
+        .receipt()
+        .feature_build_options()
+        .is_some_and(|options| options.research_full_forward);
 
     let Some(holdout) = holdout else {
         anyhow::ensure!(
-            calibration.is_none(),
-            "calibration requires a separate final holdout"
+            calibration.is_none() && !full_forward,
+            "calibration and full forward research require a separate final holdout"
         );
         anyhow::ensure!(
             selected.role() == CanonicalSearchWindowRoleV1::DiscoveryInput,
@@ -10324,19 +10377,27 @@ fn validate_discovery_scope_pair(
             && held_out.timestamp_end_ms() == full.timestamp_end_ms(),
         "holdout split evidence must end at the exact canonical input boundary"
     );
-    let calibration = calibration.ok_or_else(|| {
-        anyhow::anyhow!("a new split run requires calibration separate from final holdout")
-    })?;
-    calibration
-        .validate_against_receipt(input.receipt())
-        .map_err(anyhow::Error::new)?;
-    let calibrated = calibration.evaluated_window();
     anyhow::ensure!(
-        calibrated.role() == CanonicalSearchWindowRoleV1::SelectionValidation
-            && selected.row_end() == calibrated.row_start()
-            && calibrated.row_end() == held_out.row_start(),
-        "selection, calibration and final holdout must be contiguous without a gap or overlap"
+        calibration.is_none() == full_forward,
+        "split run calibration must match the sealed full forward policy"
     );
+    if let Some(calibration) = calibration {
+        calibration
+            .validate_against_receipt(input.receipt())
+            .map_err(anyhow::Error::new)?;
+        let calibrated = calibration.evaluated_window();
+        anyhow::ensure!(
+            calibrated.role() == CanonicalSearchWindowRoleV1::SelectionValidation
+                && selected.row_end() == calibrated.row_start()
+                && calibrated.row_end() == held_out.row_start(),
+            "selection, calibration and final holdout must be contiguous without a gap or overlap"
+        );
+    } else {
+        anyhow::ensure!(
+            selected.row_end() == held_out.row_start(),
+            "full forward must begin immediately after the exact selection prefix"
+        );
+    }
 
     let split_at = selected
         .row_end()
@@ -10359,16 +10420,19 @@ fn validate_discovery_scope_pair(
         usize::try_from(held_out.row_start() - full.row_start())?..input.ohlcv().len(),
     )
     .map_err(anyhow::Error::new)?;
+    let expected_calibration = if calibration.is_some() {
+        Some(CanonicalSearchArtifactScopeV2::from_run_input_range(
+            CanonicalSearchWindowRoleV1::SelectionValidation,
+            input,
+            split_at..usize::try_from(held_out.row_start() - full.row_start())?,
+        )?)
+    } else {
+        None
+    };
     anyhow::ensure!(
         selection == &expected_selection
             && holdout == &expected_holdout
-            && calibration
-                == &CanonicalSearchArtifactScopeV2::from_run_input_range(
-                    CanonicalSearchWindowRoleV1::SelectionValidation,
-                    input,
-                    split_at..usize::try_from(held_out.row_start() - full.row_start())?
-                )
-                .map_err(anyhow::Error::new)?,
+            && calibration == expected_calibration.as_ref(),
         "selection, calibration and final holdout scopes do not exactly match the parent rows/timestamps"
     );
     Ok(())
@@ -11152,9 +11216,12 @@ where
     let holdout = inputs
         .holdout()
         .expect("with_holdout always constructs a held-out evidence suffix");
-    let calibration = inputs
-        .calibration()
-        .expect("with_holdout always constructs a separate selection calibration window");
+    let calibration = inputs.calibration();
+    anyhow::ensure!(
+        calibration.is_some()
+            || (quote_validated_outer_holdout.is_none() && prelocked_quote_replay.is_none()),
+        "full forward research cannot run the calibration-dependent quote continuation"
+    );
     let n_rows = input.ohlcv().len();
     let is_end = selection.ohlcv().len();
     let gpu_manifest = crate::gpu_native::capability::GpuCapabilityManifest::stage1_baseline();
@@ -11196,10 +11263,10 @@ where
         target: "neoethos_search::discovery",
         total_rows = n_rows,
         in_sample_rows = is_end,
-        calibration_rows = calibration.ohlcv().len(),
+        calibration_rows = calibration.map_or(0, |window| window.ohlcv().len()),
         final_holdout_rows = holdout.ohlcv().len(),
         held_back_fraction = (n_rows - is_end) as f64 / n_rows as f64,
-        "discovery sees only the first {is_end} rows; calibration selects/sizes survivors, and the separate final tail remains reserved"
+        "discovery sees only the first {is_end} rows; the final tail remains reserved"
     );
 
     let mut result = if let Some(strict_device_admission) = strict_device_admission {
@@ -11221,6 +11288,9 @@ where
     if result.portfolio.is_empty() {
         return Ok((result, None));
     }
+    let Some(calibration) = calibration else {
+        return Ok((result, None));
+    };
 
     progress_fn(DiscoveryProgress::StageAdvanced {
         stage: "holdout_forward_test",
@@ -14841,9 +14911,9 @@ where
     // ran, so turning logging off could also turn off the positive-expectancy
     // decision. Run the base quality screen whenever candidates exist; logging
     // controls only whether trade details are retained.
-    let weekly_gate = config
-        .weekly_objective_for_window(&features.timestamps)?
-        .map(|objective| (objective, std::sync::atomic::AtomicUsize::new(0)));
+    let weekly_objective = config.weekly_objective_for_window(&features.timestamps)?;
+    let require_risky_complete_weeks = config.mode == DiscoveryMode::Risky
+        && config.runtime_overrides.risky_minimum_weekly_entries;
     if !filtered.is_empty() {
         let candidate_deep_robustness = !matches!(config.mode, DiscoveryMode::Risky);
         progress_fn(DiscoveryProgress::StageAdvanced {
@@ -14882,7 +14952,26 @@ where
         let quality_end_ms = features.timestamps.last().copied().ok_or_else(|| {
             anyhow::anyhow!("quality replay requires an evaluation end timestamp")
         })?;
+        if require_risky_complete_weeks {
+            let complete_weeks = crate::scoring::weekly_cadence::complete_week_entry_counts_v1(
+                quality_start_ms,
+                quality_end_ms,
+                std::iter::empty(),
+            )?
+            .len();
+            anyhow::ensure!(
+                complete_weeks > 0,
+                "Risky cadence needs a complete training week"
+            );
+            tracing::info!(
+                complete_weeks,
+                quality_start_ms,
+                quality_end_ms,
+                "Risky candidate screening requires one admitted entry per complete week"
+            );
+        }
         let (quality_months, quality_days) = month_day_indices(&features.timestamps);
+        let rejected_weekly_cadence = std::sync::atomic::AtomicUsize::default();
 
         // AREA 2 / Stage A (2026-06-09): deterministic per-combo seed for the
         // Monte-Carlo perturbation RNG. Derived ONLY from combo-stable material
@@ -15704,6 +15793,7 @@ where
                         &sig,
                     )?;
                     let mut monthly_returns = Vec::new();
+                    let mut admitted_entries = Vec::new();
                     let (account_metrics, trades) =
                         crate::eval::evaluate_strategy_with_confidence_and_ledger_core(
                             &ohlcv.close,
@@ -15716,6 +15806,7 @@ where
                             &features.timestamps,
                             &screen_resolver.settings_for_gene(&gene),
                             Some(&mut monthly_returns),
+                            require_risky_complete_weeks.then_some(&mut admitted_entries),
                         )?;
                     completed_quality_replays.fetch_add(1, AtomicOrdering::Relaxed);
                     let mut metrics = analyzer.analyze_strategy_with_evaluation(
@@ -15765,17 +15856,26 @@ where
                         trades_outside_grid,
                     };
 
-                    if let Some((objective, rejected)) = &weekly_gate {
+                    let failed_weekly_cadence = if require_risky_complete_weeks {
+                        crate::scoring::weekly_cadence::complete_week_entry_counts_v1(
+                            quality_start_ms,
+                            quality_end_ms,
+                            admitted_entries,
+                        )?
+                        .contains(&0)
+                    } else if let Some(objective) = &weekly_objective {
                         let entries = trades.iter().map(|t| t.entry_time).collect::<Vec<_>>();
-                        let cadence =
-                            crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
-                                &objective.cadence,
-                                &entries,
-                            )?;
-                        if !cadence.feasible() {
-                            rejected.fetch_add(1, AtomicOrdering::Relaxed);
-                            return Ok((None, trial_row));
-                        }
+                        !crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(
+                            &objective.cadence,
+                            &entries,
+                        )?
+                        .feasible()
+                    } else {
+                        false
+                    };
+                    if failed_weekly_cadence {
+                        rejected_weekly_cadence.fetch_add(1, AtomicOrdering::Relaxed);
+                        return Ok((None, trial_row));
                     }
                     let verdict =
                         classify_base_quality(&metrics, &config.target_profile, &config.filtering);
@@ -16032,9 +16132,8 @@ where
             mc_floor: rejected_mc_floor.load(AtomicOrdering::Relaxed),
             mc_near_miss: mc_near_miss.load(AtomicOrdering::Relaxed),
             sensitivity: rejected_sensitivity.load(AtomicOrdering::Relaxed),
-            weekly_cadence: weekly_gate
-                .as_ref()
-                .map(|(_, counter)| counter.load(AtomicOrdering::Relaxed)),
+            weekly_cadence: (require_risky_complete_weeks || weekly_objective.is_some())
+                .then(|| rejected_weekly_cadence.load(AtomicOrdering::Relaxed)),
         };
         // Arithmetic self-check: the ten criteria must partition the
         // base-quality rejects exactly. If they ever disagree the breakdown is
@@ -16057,6 +16156,7 @@ where
         tracing::info!(
             target: "neoethos_search::funnel",
             rejected_base_quality = quality_rejects.base_quality,
+            rejected_weekly_cadence = quality_rejects.weekly_cadence.unwrap_or(0),
             rejected_regime = quality_rejects.regime,
             rejected_monte_carlo = quality_rejects.mc_floor,
             monte_carlo_near_miss = quality_rejects.mc_near_miss,
@@ -16272,7 +16372,11 @@ where
     if quality_rejects.total() > 0 {
         for (reason, count) in [
             (
-                "rolling_five_weekday_cadence",
+                if require_risky_complete_weeks {
+                    "risky_complete_week_cadence"
+                } else {
+                    "rolling_five_weekday_cadence"
+                },
                 quality_rejects.weekly_cadence.unwrap_or(0),
             ),
             ("total.base_quality", quality_rejects.base_quality),
@@ -16818,7 +16922,11 @@ where
         mut canonical_backtest_artifacts,
         mut walkforward_validation_artifacts,
         _,
-    ) = if portfolio.is_empty() && calibration_input.is_none() && !best_effort_fallback.is_empty() {
+    ) = if portfolio.is_empty()
+        && calibration_input.is_none()
+        && !best_effort_fallback.is_empty()
+        && !require_risky_complete_weeks
+    {
         fallback_mode = true;
         let fallback_reason = funnel
             .stages
@@ -16899,6 +17007,7 @@ where
                     &quality_days,
                     &features.timestamps,
                     &fallback_resolver.settings_for_gene(&gene),
+                    None,
                     None,
                 )?;
             // Best-effort fallback rows predate the per-month archive producer;
@@ -18920,6 +19029,7 @@ pub fn build_discovery_profile(
         weekly_cadence,
         risky_survival_only,
         risky_account_experiment_v3,
+        risky_minimum_weekly_entries,
         risky_lot_constraints,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
@@ -18928,6 +19038,7 @@ pub fn build_discovery_profile(
     DiscoveryRunProfile {
         risky_survival_only: *risky_survival_only,
         risky_account_experiment_v3: *risky_account_experiment_v3,
+        risky_minimum_weekly_entries: *risky_minimum_weekly_entries,
         risky_lot_constraints: risky_lot_constraints.clone(),
         weekly_cadence: *weekly_cadence,
         prefilter_direction_only_ranking: *prefilter_direction_only_ranking,
@@ -19944,6 +20055,7 @@ mod candidate_validation_order_tests {
                     &days,
                     &features.timestamps,
                     &resolver.settings_for_gene(gene),
+                    None,
                     None,
                 )?;
             let mut measured = quality_analyzer_for_config(&config)

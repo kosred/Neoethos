@@ -13,7 +13,7 @@ const MAX_EXPERTS_PER_STATE: usize = 4;
 
 #[path = "specialist_portfolio_walkforward.rs"]
 mod walkforward;
-pub use walkforward::evaluate_walkforward_joint_risky;
+pub use walkforward::{evaluate_walkforward_joint_risky, evaluate_weekly_joint_risky_forward};
 
 #[path = "specialist_portfolio_continual.rs"]
 mod continual;

@@ -44,6 +44,30 @@ impl JointBarAccountPolicyV1 {
     }
 }
 
+/// The published policy keeps the same capped fields for ordinary replays.
+/// A null gross-notional cap identifies the explicit fixed-stop-risk model.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct JointBarAppliedPolicyV1 {
+    pub max_open_positions: usize,
+    pub max_entry_stop_risk_fraction: f64,
+    pub max_gross_notional_multiple: Option<f64>,
+    pub max_target_pips: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_stop_risk_per_entry: Option<f64>,
+}
+
+impl From<JointBarAccountPolicyV1> for JointBarAppliedPolicyV1 {
+    fn from(policy: JointBarAccountPolicyV1) -> Self {
+        Self {
+            max_open_positions: policy.max_open_positions,
+            max_entry_stop_risk_fraction: policy.max_entry_stop_risk_fraction,
+            max_gross_notional_multiple: Some(policy.max_gross_notional_multiple),
+            max_target_pips: policy.max_target_pips,
+            exact_stop_risk_per_entry: None,
+        }
+    }
+}
+
 pub struct JointBarLaneV1<'a> {
     pub expert_id: &'a str,
     /// ml_multipliers are the expert's allocated fraction, applied once.
@@ -73,6 +97,8 @@ pub struct JointBarMarkV1 {
     #[serde(flatten)]
     pub terms: JointBarPositionTermsV1,
     pub entry_timestamp_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_equity_at_entry: Option<f64>,
     pub modeled_entry_price: f64,
     pub gross_unrealized_account: f64,
     /// Hypothetical close mark including pending modeled fees and carry;
@@ -95,7 +121,7 @@ pub struct JointBarAccountResultV1 {
     pub scope_identity_sha256: String,
     pub cost_contract_identity_sha256: String,
     pub account_currency: String,
-    pub policy: JointBarAccountPolicyV1,
+    pub policy: JointBarAppliedPolicyV1,
     #[serde(flatten)]
     pub valuation: JointBarValuationV1,
     pub admission: JointBarAdmissionStatsV1,
@@ -217,18 +243,46 @@ impl PreparedNettedCanonicalBarResearchV1 {
         &self,
         lanes: &[JointBarLaneV1<'_>],
         policy: JointBarAccountPolicyV1,
-        lot_grid: Option<BarReplayLotGridV1>,
-        record_trace: bool,
         goal: RiskyGrowthGoal,
     ) -> Result<JointBarAccountResultV1> {
         policy.validate_fields()?;
-        self.evaluate_joint_inner(lanes, policy, lot_grid, record_trace, Some(goal))
+        self.evaluate_joint_inner(lanes, policy, None, true, Some(goal))
+    }
+
+    /// Admit whole 30% initial stop-risk orders against one shared 90% budget.
+    /// This research model uses fractional lots and no gross-notional cap.
+    /// A missing goal keeps the same account through the full supplied period.
+    pub fn evaluate_joint_exact_risky(
+        &self,
+        lanes: &[JointBarLaneV1<'_>],
+        max_target_pips: f64,
+        record_trace: bool,
+        goal: Option<RiskyGrowthGoal>,
+    ) -> Result<JointBarAccountResultV1> {
+        const EXACT_STOP_RISK: f64 = 0.30;
+        ensure!(
+            self.settings.risk_per_trade_min == EXACT_STOP_RISK
+                && self.settings.risk_per_trade_max == EXACT_STOP_RISK,
+            "exact Risky replay requires the sealed fixed 30% risk band"
+        );
+        ensure!(
+            max_target_pips.is_finite() && max_target_pips > 0.0,
+            "exact Risky replay requires a finite positive target ceiling"
+        );
+        let policy = JointBarAppliedPolicyV1 {
+            max_open_positions: 3,
+            max_entry_stop_risk_fraction: 0.90,
+            max_gross_notional_multiple: None,
+            max_target_pips,
+            exact_stop_risk_per_entry: Some(EXACT_STOP_RISK),
+        };
+        self.evaluate_joint_inner(lanes, policy, None, record_trace, goal)
     }
 
     fn evaluate_joint_inner(
         &self,
         lanes: &[JointBarLaneV1<'_>],
-        policy: JointBarAccountPolicyV1,
+        policy: impl Into<JointBarAppliedPolicyV1>,
         lot_grid: Option<BarReplayLotGridV1>,
         record_trace: bool,
         goal: Option<RiskyGrowthGoal>,
@@ -237,6 +291,7 @@ impl PreparedNettedCanonicalBarResearchV1 {
             lanes.len() <= 256,
             "bounded research supports at most 256 archived expert lanes"
         );
+        let policy = policy.into();
         let settings = &self.settings;
         ensure!(
             settings.risk_based_sizing
@@ -247,6 +302,10 @@ impl PreparedNettedCanonicalBarResearchV1 {
             "shared account requires checked risk sizing and account pip economics"
         );
         let grid = settings.resolved_lot_grid(lot_grid)?;
+        ensure!(
+            policy.exact_stop_risk_per_entry.is_none() || grid.is_none(),
+            "exact Risky replay requires fractional lots without a lot grid"
+        );
         let mut order: Vec<_> = (0..lanes.len()).collect();
         order.sort_by_key(|&i| lanes[i].expert_id);
         for (rank, &i) in order.iter().enumerate() {
@@ -256,6 +315,15 @@ impl PreparedNettedCanonicalBarResearchV1 {
                 "expert identities must be nonempty and unique"
             );
             self.validate_tape(lanes[i].tape)?;
+            ensure!(
+                policy.exact_stop_risk_per_entry.is_none()
+                    || lanes[i]
+                        .tape
+                        .ml_multipliers
+                        .iter()
+                        .all(|&multiplier| multiplier == 0.0 || multiplier == 1.0),
+                "exact Risky lanes may veto entries but may not resize them"
+            );
         }
         // Validate economics even for a cash portfolio with no lanes.
         super::super::validate_sizing_confidences(
@@ -312,7 +380,11 @@ impl PreparedNettedCanonicalBarResearchV1 {
                 .partition_point(|&t| t <= g.deadline_timestamp_ms)
         });
         let mut out = JointBarAccountResultV1 {
-            execution_basis: "canonical_cpu_joint_ohlc_v1; prior_row_signal_next_close_fill; independent_hedged_sleeves; scalar_costs; shared_realized_cash; pending_cost_net_marks; not_broker_margin_or_challenge_simulation",
+            execution_basis: if policy.exact_stop_risk_per_entry.is_some() {
+                "canonical_cpu_joint_ohlc_exact_risky_v1; prior_row_signal_next_close_fill; fractional_lots; scalar_costs; shared_realized_cash; pending_cost_net_marks; not_broker_margin_or_challenge_simulation"
+            } else {
+                "canonical_cpu_joint_ohlc_v1; prior_row_signal_next_close_fill; independent_hedged_sleeves; scalar_costs; shared_realized_cash; pending_cost_net_marks; not_broker_margin_or_challenge_simulation"
+            },
             promotion_eligible: false,
             scope_identity_sha256: self.scope_identity_sha256.clone(),
             cost_contract_identity_sha256: self.cost_contract_identity_sha256.clone(),
@@ -511,37 +583,51 @@ impl PreparedNettedCanonicalBarResearchV1 {
                         out.admission.record("capacity");
                         continue;
                     }
-                    let lots = super::super::risk_based_pos_lots(
-                        tape.confidences[signal],
-                        marked,
-                        tape.sl_pips[signal],
-                        settings,
-                    ) * tape.ml_multipliers[signal];
+                    let lots = if let Some(risk_fraction) = policy.exact_stop_risk_per_entry {
+                        let lots = (marked * risk_fraction) / (tape.sl_pips[signal] * ppv);
+                        ensure!(
+                            lots.is_finite() && lots > 0.0,
+                            "exact Risky position size cannot be represented"
+                        );
+                        lots
+                    } else {
+                        super::super::risk_based_pos_lots(
+                            tape.confidences[signal],
+                            marked,
+                            tape.sl_pips[signal],
+                            settings,
+                        ) * tape.ml_multipliers[signal]
+                    };
                     if lots > 0.0 {
                         requests.push((i, lots));
                     }
                 }
             }
-            let requested_risk: f64 = requests
-                .iter()
-                .map(|(i, l)| l * lanes[*i].tape.sl_pips[row - 1] * ppv)
-                .sum();
-            let requested_notional: f64 = requests.iter().map(|(_, l)| l * notional_per_lot).sum();
-            let ratio = |available: f64, requested: f64| {
-                if requested > 0.0 {
-                    (available.max(0.0) / requested).min(1.0)
-                } else {
-                    1.0
-                }
-            };
-            let scale = ratio(
-                marked * policy.max_entry_stop_risk_fraction - reserved_risk,
-                requested_risk,
-            )
-            .min(ratio(
-                marked * policy.max_gross_notional_multiple - reserved_lots * notional_per_lot,
-                requested_notional,
-            ));
+            let scale = policy
+                .max_gross_notional_multiple
+                .map_or(1.0, |notional_cap| {
+                    let requested_risk: f64 = requests
+                        .iter()
+                        .map(|(i, l)| l * lanes[*i].tape.sl_pips[row - 1] * ppv)
+                        .sum();
+                    let requested_notional =
+                        requests.iter().map(|(_, l)| l * notional_per_lot).sum();
+                    let ratio = |available: f64, requested: f64| {
+                        if requested > 0.0 {
+                            (available.max(0.0) / requested).min(1.0)
+                        } else {
+                            1.0
+                        }
+                    };
+                    ratio(
+                        marked * policy.max_entry_stop_risk_fraction - reserved_risk,
+                        requested_risk,
+                    )
+                    .min(ratio(
+                        marked * notional_cap - reserved_lots * notional_per_lot,
+                        requested_notional,
+                    ))
+                });
             for (i, requested) in requests {
                 let mut lots = requested * scale;
                 if lots <= 0.0 {
@@ -556,19 +642,30 @@ impl PreparedNettedCanonicalBarResearchV1 {
                     lots = normalized;
                 }
                 let tape = lanes[i].tape;
+                let stop = tape.sl_pips[row - 1];
+                let order_risk = stop * ppv * lots;
+                // Allow rounding at the boundary where three 30% positions
+                // fit exactly into the 90% allowance on the same entry bar.
+                if policy.exact_stop_risk_per_entry.is_some()
+                    && reserved_risk + order_risk
+                        > marked * (policy.max_entry_stop_risk_fraction + 8.0 * f64::EPSILON)
+                {
+                    out.admission.record("aggregate_stop_risk_budget");
+                    continue;
+                }
                 let p = Position {
                     direction: tape.signals[row - 1],
                     entry: row,
                     price: self.close[row] + f64::from(tape.signals[row - 1]) * spread * 0.5 * pip,
                     lots,
-                    stop: tape.sl_pips[row - 1],
+                    stop,
                     target: tape.tp_pips[row - 1],
                     trail: 0.0,
                     mfe: 0.0,
                     mae: 0.0,
                     entry_equity: marked,
                 };
-                reserved_risk += p.stop * ppv * p.lots;
+                reserved_risk += order_risk;
                 reserved_lots += lots;
                 positions[i] = Some(p);
                 out.admission.record("accepted");
@@ -629,6 +726,9 @@ impl PreparedNettedCanonicalBarResearchV1 {
                             expert_id: lanes[i].expert_id.to_owned(),
                             terms: p.report_terms(),
                             entry_timestamp_ms: self.timestamps[p.entry],
+                            account_equity_at_entry: policy
+                                .exact_stop_risk_per_entry
+                                .map(|_| p.entry_equity),
                             modeled_entry_price: p.price,
                             gross_unrealized_account: f64::from(p.direction)
                                 * (self.close[row] - p.price)

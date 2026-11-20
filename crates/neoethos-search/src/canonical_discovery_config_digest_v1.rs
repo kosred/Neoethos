@@ -275,6 +275,7 @@ fn encode_runtime_overrides_v1(
         weekly_cadence,
         risky_survival_only,
         risky_account_experiment_v3,
+        risky_minimum_weekly_entries,
         risky_lot_constraints,
         prefilter_direction_only_ranking,
         prefilter_purge_prefixes,
@@ -296,6 +297,9 @@ fn encode_runtime_overrides_v1(
     }
     if *risky_account_experiment_v3 {
         encoder.boolean("risky_account_experiment_v3", true)?;
+    }
+    if *risky_minimum_weekly_entries {
+        encoder.boolean("risky_complete_week_entries_v1", true)?;
     }
     if let Some(grid) = risky_lot_constraints {
         encoder.record_start("risky_lot_constraints_v1")?;

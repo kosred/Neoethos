@@ -800,6 +800,7 @@ fn all_one_multipliers_and_fixed_brackets_match_legacy_core_bit_for_bit() {
             &run.timestamps,
             &run.settings,
             None,
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -924,6 +925,7 @@ fn bound_risky_grid_is_applied_reported_and_cannot_be_overridden() {
     let mut run = prepared(&[100.0; 3], &[100.0; 3], &[100.0, 100.0, 97.0]);
     run.settings.risky_account_experiment = Some(crate::eval::RiskyAccountExperimentV1 {
         target_balance: 50_000.0,
+        continuous_exact_stop_risk: false,
         lot_constraints: Some(
             crate::QuoteReplayLotConstraintsV3::new(1.0, 10.0, 1.0, "a".repeat(64)).unwrap(),
         ),

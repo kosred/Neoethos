@@ -258,6 +258,35 @@ impl WeeklyRollingCadenceReportV1 {
         self.violating_windows == 0 && self.trading_days >= 5
     }
 }
+
+/// Count admissions in consecutive complete seven-day periods starting at the
+/// first observed timestamp. An entry on a period boundary belongs to the next
+/// period. Entries in the incomplete final period do not cover an earlier week.
+pub fn complete_week_entry_counts_v1(
+    start_ms: i64,
+    coverage_last_ms: i64,
+    entries: impl IntoIterator<Item = i64>,
+) -> anyhow::Result<Vec<usize>> {
+    const WEEK_MS: i64 = 7 * 86_400_000;
+    anyhow::ensure!(
+        start_ms >= 0 && coverage_last_ms >= start_ms,
+        "weekly entry coverage requires ordered nonnegative bounds"
+    );
+    let complete_weeks = usize::try_from((coverage_last_ms - start_ms) / WEEK_MS)?;
+    let mut counts = vec![0; complete_weeks];
+    for stamp in entries {
+        anyhow::ensure!(
+            (start_ms..=coverage_last_ms).contains(&stamp),
+            "entry timestamp outside weekly coverage bounds"
+        );
+        let index = usize::try_from((stamp - start_ms) / WEEK_MS)?;
+        if let Some(count) = counts.get_mut(index) {
+            *count += 1;
+        }
+    }
+    Ok(counts)
+}
+
 pub fn evaluate_rolling_weekly_cadence(
     contract: &WeeklyCadenceContractV1,
     entries: &[i64],

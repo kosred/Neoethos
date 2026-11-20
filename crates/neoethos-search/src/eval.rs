@@ -351,6 +351,10 @@ fn utc_hour_of_day(timestamp_ms: i64) -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct RiskyAccountExperimentV1 {
     pub target_balance: f64,
+    /// Weekly fixed-risk research uses fractional lots at 30% and continues
+    /// through the target, stopping only on account exhaustion or history end.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continuous_exact_stop_risk: bool,
     /// Optional explicit quantity constraint. Its source hash is metadata,
     /// not historical broker margin or liquidation authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -358,13 +362,22 @@ pub struct RiskyAccountExperimentV1 {
 }
 
 impl RiskyAccountExperimentV1 {
-    pub(crate) fn validate(&self, initial_balance: f64) -> anyhow::Result<()> {
+    pub(crate) fn validate(
+        &self,
+        initial_balance: f64,
+        risk_band: (f64, f64),
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             initial_balance.is_finite()
                 && initial_balance > 0.0
                 && self.target_balance.is_finite()
                 && self.target_balance > initial_balance,
             "Risky account experiment requires a finite target above its positive initial balance"
+        );
+        anyhow::ensure!(
+            !self.continuous_exact_stop_risk
+                || (risk_band == (0.30, 0.30) && self.lot_constraints.is_none()),
+            "continuous exact Risky replay requires a fixed 30% risk band and no lot grid"
         );
         if let Some(constraints) = &self.lot_constraints {
             constraints.checked_grid()?;
@@ -789,6 +802,14 @@ impl BacktestSettings {
         &self,
         supplied: Option<BarReplayLotGridV1>,
     ) -> anyhow::Result<Option<BarReplayLotGridV1>> {
+        anyhow::ensure!(
+            supplied.is_none()
+                || !self
+                    .risky_account_experiment
+                    .as_ref()
+                    .is_some_and(|policy| { policy.continuous_exact_stop_risk }),
+            "continuous exact Risky replay cannot use a supplied lot grid"
+        );
         let bound = self
             .risky_account_experiment
             .as_ref()
@@ -1022,7 +1043,7 @@ fn entry_sl_tp_pips(settings: &BacktestSettings, i: usize) -> Option<(f64, f64)>
 ///   pos_lots = if equity > 0 {
 ///                  (risk_pct * equity) / (eff_sl * pip_value_per_lot)
 ///              } else { 0.0 }
-///   pos_lots = pos_lots.clamp(0.0, 100.0)         // sane leverage backstop
+///   pos_lots = pos_lots.clamp(0.0, 100.0)         // legacy leverage backstop
 ///
 /// Net effect: a full-SL loss ≈ `risk_pct × equity`, a TP win ≈
 /// `risk_pct × equity × (tp/sl)`.
@@ -1058,7 +1079,15 @@ fn risk_based_pos_lots(
         0.0
     };
     if pos_lots.is_finite() {
-        pos_lots.clamp(0.0, 100.0)
+        if settings
+            .risky_account_experiment
+            .as_ref()
+            .is_some_and(|policy| policy.continuous_exact_stop_risk)
+        {
+            pos_lots.max(0.0)
+        } else {
+            pos_lots.clamp(0.0, 100.0)
+        }
     } else {
         0.0
     }
@@ -1132,6 +1161,11 @@ pub(crate) fn fast_evaluate_strategy_core_with_monthly_returns(
     (metrics, monthly)
 }
 
+enum EntryTimestampObservation<'a> {
+    Settled(&'a mut Vec<i64>),
+    Admitted(&'a mut Vec<i64>),
+}
+
 /// The CPU fitness and detailed ledger share the same position lifecycle.
 /// `RECORD_TRADES = false` removes ledger/excursion recording at compile time;
 /// population search does not allocate a trade history for each candidate.
@@ -1148,7 +1182,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     settings: &BacktestSettings,
     trades: &mut Vec<Trade>,
     mut netted: Option<&mut netted_bar_research::NettedBarCoreState<'_>>,
-    mut entry_timestamps: Option<&mut Vec<i64>>,
+    mut entry_timestamps: Option<EntryTimestampObservation<'_>>,
     monthly_returns_out: Option<&mut Vec<f64>>,
 ) -> [f64; 11] {
     // Reports itself on first call — see `eval_telemetry`.
@@ -1180,7 +1214,12 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     // per-bar confidence slice is supplied. Otherwise `pos_lots` stays
     // 1.0 for every trade — exact legacy fixed-1-lot behaviour, which
     // keeps existing callers (and the `&[]` callers below) unchanged.
-    let use_risk_sizing = settings.risk_based_sizing && !confidences.is_empty();
+    let continuous_exact_stop_risk = settings
+        .risky_account_experiment
+        .as_ref()
+        .is_some_and(|policy| policy.continuous_exact_stop_risk);
+    let use_risk_sizing =
+        settings.risk_based_sizing && (!confidences.is_empty() || continuous_exact_stop_risk);
     // Captured at each entry; constant for the life of an open position.
     let mut pos_lots: f64 = 1.0;
     // Per-entry SL/TP in pips (adaptive-per-entry when enabled, else the scalar
@@ -1193,9 +1232,16 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     let initial_equity = settings.initial_equity();
     if let Some(policy) = &settings.risky_account_experiment {
         policy
-            .validate(initial_equity)
+            .validate(
+                initial_equity,
+                (settings.risk_per_trade_min, settings.risk_per_trade_max),
+            )
             .expect("invalid Risky account experiment");
     }
+    assert!(
+        !continuous_exact_stop_risk || use_risk_sizing,
+        "continuous exact Risky replay requires account-risk sizing"
+    );
     let lot_grid = settings
         .resolved_lot_grid(netted.as_ref().and_then(|state| state.lot_grid))
         .expect("invalid account lot constraints");
@@ -1457,7 +1503,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 equity += pnl;
                 current_month_pnl += pnl;
                 trade_count += 1;
-                if let Some(entries) = entry_timestamps.as_deref_mut() {
+                if let Some(EntryTimestampObservation::Settled(entries)) = &mut entry_timestamps {
                     entries.push(timestamps[entry_idx as usize]);
                 }
                 if pnl > 0.0 {
@@ -1489,10 +1535,14 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 if settings
                     .risky_account_experiment
                     .as_ref()
-                    .is_some_and(|policy| equity <= 0.0 || equity >= policy.target_balance)
+                    .is_some_and(|policy| {
+                        equity <= 0.0
+                            || (!policy.continuous_exact_stop_risk
+                                && equity >= policy.target_balance)
+                    })
                 {
-                    // The experiment banks the first realized target, or
-                    // terminates on realized exhaustion. No resets/deposits.
+                    // Legacy accounts bank the first realized target. Visible
+                    // exhaustion terminates either policy without a reset.
                     break;
                 }
             }
@@ -1527,6 +1577,10 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 if size_multiplier == 0.0 {
                     continue;
                 }
+                assert!(
+                    !continuous_exact_stop_risk || size_multiplier == 1.0,
+                    "continuous exact Risky replay may veto a position but cannot resize it"
+                );
                 let mut entry_lots = if use_risk_sizing {
                     let conf = confidences.get(i - 1).copied().unwrap_or(1.0);
                     risk_based_pos_lots(conf, equity, entry_sl, settings)
@@ -1554,6 +1608,9 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 // Bug #1 fix: half-spread applied at entry (entry_px offset), half at exit
                 entry_px = close[i] + (s as f64) * half_spread_px;
                 entry_idx = i as i64;
+                if let Some(EntryTimestampObservation::Admitted(entries)) = &mut entry_timestamps {
+                    entries.push(timestamps[i]);
+                }
                 trail_px = 0.0;
                 mfe_money = 0.0;
                 mae_money = 0.0;
@@ -1822,7 +1879,10 @@ pub(crate) fn validate_sizing_confidences(
     )
     .map_err(anyhow::Error::msg)?;
     if let Some(policy) = &settings.risky_account_experiment {
-        policy.validate(settings.initial_equity())?;
+        policy.validate(
+            settings.initial_equity(),
+            (settings.risk_per_trade_min, settings.risk_per_trade_max),
+        )?;
     }
     anyhow::ensure!(
         settings.initial_equity().is_finite() && settings.initial_equity() > 0.0,
@@ -1865,6 +1925,8 @@ pub(crate) fn validate_sizing_confidences(
 /// return vector (month P&L over month-start equity) — the same series the
 /// opt-in MonthlyUpsideV1 selector (B9) consumes; pass `None` when the
 /// consumer has no monthly series.
+/// `admitted_entries_out` optionally records entry times for every admitted
+/// position, including positions still open at the replay boundary.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
     close: &[f64],
@@ -1877,6 +1939,7 @@ pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
     timestamps: &[i64],
     settings: &BacktestSettings,
     monthly_returns_out: Option<&mut Vec<f64>>,
+    admitted_entries_out: Option<&mut Vec<i64>>,
 ) -> anyhow::Result<([f64; 11], Vec<Trade>)> {
     let bars = close.len();
     if high.len() != bars
@@ -1904,7 +1967,7 @@ pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
         settings,
         &mut trades,
         None,
-        None,
+        admitted_entries_out.map(EntryTimestampObservation::Admitted),
         monthly_returns_out,
     );
     Ok((metrics, trades))
@@ -1938,6 +2001,7 @@ pub(crate) fn simulate_trades_with_confidence_core(
         &days,
         timestamps,
         settings,
+        None,
         None,
     )
     .map(|(_, trades)| trades)
@@ -2695,7 +2759,7 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
                 &gene_settings,
                 &mut trades,
                 None,
-                Some(&mut entries),
+                Some(EntryTimestampObservation::Settled(&mut entries)),
                 Some(&mut monthly),
             );
             (metrics, trades, entries, monthly)
@@ -2710,6 +2774,7 @@ pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: b
                 day_idx,
                 timestamps,
                 &gene_settings,
+                None,
                 None,
             )?;
             (metrics, trades, Vec::new(), Vec::new())
@@ -3814,6 +3879,7 @@ mod overrides_tests {
                         &days,
                         &times,
                         &settings,
+                        None,
                         None,
                     )
                     .unwrap();

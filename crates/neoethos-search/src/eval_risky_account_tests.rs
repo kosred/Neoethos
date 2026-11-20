@@ -4,6 +4,7 @@ fn settings() -> BacktestSettings {
     BacktestSettings {
         risky_account_experiment: Some(RiskyAccountExperimentV1 {
             target_balance: 50_000.0,
+            continuous_exact_stop_risk: false,
             lot_constraints: None,
         }),
         initial_equity_override: Some(100.0),
@@ -47,6 +48,7 @@ fn replay(
         &calendar,
         &timestamps,
         settings,
+        None,
         None,
     )
     .unwrap();

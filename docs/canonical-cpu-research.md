@@ -781,6 +781,25 @@ coverage, trades, monthly results and an equity trace for every window.
 The final holdout remains reserved. An incomplete window is labeled in the
 goal result.
 
+### Weekly Risky search with the full forward suffix
+
+Use `--training-percent 70 --research-full-forward true` to seal a 70% search
+prefix and reserve the entire remaining 30% for forward replay. Add
+`--specialist-portfolio weekly-joint-risky-forward-v1` with the Risky settings
+that explicitly enable `models.discovery_runtime.risky_minimum_weekly_entries`,
+disable the V3 early-banking simulator during search, and set both
+`risk.risky_min_risk_per_trade` and `risk.risky_max_risk_per_trade` to 0.30.
+Before walk-forward selection, a candidate must open at least one position
+in every complete seven-day interval of the search prefix.
+
+The shared forward report uses the frozen walk-forward survivors. It reports
+actual weekly admissions per strategy, a continuous account, and sequential
+fully covered 180-day goal windows. Each accepted position risks 30% of the
+then-current modeled equity at its stop. The account admits up to three
+positions within a shared 90% stop-risk budget. This research model uses
+fractional lots and omits a gross-notional limit. The report distinguishes
+an empty frozen cohort from a completed forward replay.
+
 ### Continual specialist research V3
 
 `canonical-research --specialist-portfolio continual-v3` writes

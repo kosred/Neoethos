@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 27] = [
+const OPTIONAL: [&str; 28] = [
     "--higher",
     "--population",
     "--generations",
@@ -38,6 +38,7 @@ const OPTIONAL: [&str; 27] = [
     "--max-batches",
     "--cpu-threads",
     "--training-percent",
+    "--research-full-forward",
     "--screening-round-trip-pips",
     "--quote-replay-bundle",
     "--quote-replay-sha256",
@@ -618,6 +619,7 @@ fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String
         .chain([
             "--specialist-portfolio",
             "--training-percent",
+            "--research-full-forward",
             "--screening-round-trip-pips",
         ])
     {
@@ -642,6 +644,7 @@ pub(crate) enum SpecialistResearchMode {
     ContinualV3,
     RiskyV4,
     WalkforwardJointRiskyV1,
+    WeeklyJointRiskyForwardV1,
 }
 
 pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResearchMode>> {
@@ -655,8 +658,9 @@ pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResear
         "continual-v3" => SpecialistResearchMode::ContinualV3,
         "risky-v4" => SpecialistResearchMode::RiskyV4,
         "walkforward-joint-risky-v1" => SpecialistResearchMode::WalkforwardJointRiskyV1,
+        "weekly-joint-risky-forward-v1" => SpecialistResearchMode::WeeklyJointRiskyForwardV1,
         _ => anyhow::bail!(
-            "--specialist-portfolio expects true, joint-v2, continual-v3, risky-v4, or walkforward-joint-risky-v1"
+            "--specialist-portfolio expects true, joint-v2, continual-v3, risky-v4, walkforward-joint-risky-v1, or weekly-joint-risky-forward-v1"
         ),
     };
     if mode == SpecialistResearchMode::WalkforwardJointRiskyV1 {

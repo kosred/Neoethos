@@ -1467,6 +1467,10 @@ pub struct DiscoveryRuntimeConfig {
     /// does not model broker margin/stop-out and is off for archived runs.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub risky_account_experiment_v3: bool,
+    /// Require at least one admitted entry in every complete seven-day
+    /// period of the Risky candidate screening window.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_minimum_weekly_entries: bool,
     /// Optional reviewed quantity limits for new Risky CPU experiments.
     /// The referenced artifact must supply these values; no broker defaults
     /// or margin/stop-out authority is inferred from this configuration.
@@ -1639,6 +1643,7 @@ impl Default for DiscoveryRuntimeConfig {
             weekly_cadence: false,
             risky_survival_only: false,
             risky_account_experiment_v3: false,
+            risky_minimum_weekly_entries: false,
             risky_lot_constraints: None,
             prefilter_top_k: 240,
             // Discovery already receives only the training side of the outer

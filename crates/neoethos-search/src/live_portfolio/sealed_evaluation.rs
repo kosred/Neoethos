@@ -87,6 +87,7 @@ mod tests {
         });
         evaluation.risky_account_experiment = Some(crate::eval::RiskyAccountExperimentV1 {
             target_balance: 50_000.0,
+            continuous_exact_stop_risk: false,
             lot_constraints: Some(
                 crate::QuoteReplayLotConstraintsV3::new(0.01, 1.0, 0.01, "a".repeat(64)).unwrap(),
             ),
@@ -505,7 +506,10 @@ impl SealedEvaluationPolicyV1 {
             )?;
         }
         if let Some(policy) = &self.risky_account_experiment {
-            policy.validate(self.initial_equity)?;
+            policy.validate(
+                self.initial_equity,
+                (self.risk_per_trade_min, self.risk_per_trade_max),
+            )?;
             anyhow::ensure!(
                 self.growth_objective
                     && self

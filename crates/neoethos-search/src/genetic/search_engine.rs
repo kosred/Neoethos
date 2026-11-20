@@ -897,7 +897,10 @@ pub(crate) fn evaluation_backtest_settings(config: &EvaluationConfig) -> Result<
             config.growth_objective,
             "Risky account experiment requires growth scoring"
         );
-        policy.validate(config.initial_equity)?;
+        policy.validate(
+            config.initial_equity,
+            (config.risk_per_trade_min, config.risk_per_trade_max),
+        )?;
         anyhow::ensure!(
             config
                 .growth_goal

@@ -365,6 +365,9 @@ fn hash_settings(hasher: &mut ExactHasherV1, settings: &BacktestSettings) {
             hasher.u8(0xa2);
             hasher.bytes(&serde_json::to_vec(constraints).expect("finite checked lot policy"));
         }
+        if policy.continuous_exact_stop_risk {
+            hasher.u8(0xa3);
+        }
     }
 }
 
@@ -819,6 +822,7 @@ mod account_equity_binding_tests {
             initial_equity_override: Some(100.0),
             risky_account_experiment: Some(crate::eval::RiskyAccountExperimentV1 {
                 target_balance: 50_000.0,
+                continuous_exact_stop_risk: false,
                 lot_constraints: None,
             }),
             ..Default::default()

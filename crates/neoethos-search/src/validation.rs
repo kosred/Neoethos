@@ -1561,6 +1561,7 @@ fn embargoed_walkforward_backtest_core(
                     slice_ts,
                     &window_settings,
                     None,
+                    None,
                 )?;
 
                 // Map metrics [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count, consistency, max_daily_dd]
@@ -3307,6 +3308,7 @@ mod window_evaluation_tests {
                         &days[start..end],
                         &timestamps[start..end],
                         &policy,
+                        None,
                         None,
                     )?;
                     metrics.push(row);

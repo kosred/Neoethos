@@ -7,6 +7,7 @@ fn quote_risk_adapter_refuses_to_drop_new_risky_account_stopping_policy() {
         initial_equity: 100.0,
         risky_account_experiment: Some(crate::eval::RiskyAccountExperimentV1 {
             target_balance: 50_000.0,
+            continuous_exact_stop_risk: false,
             lot_constraints: None,
         }),
         ..Default::default()

@@ -2062,6 +2062,7 @@ struct CanonicalCpuResearchInputs {
     broker_symbol_contract: std::path::PathBuf,
     settings_source: std::path::PathBuf,
     training_percent: Option<usize>,
+    full_forward: bool,
     screening_round_trip_pips: Option<f64>,
 }
 
@@ -2089,7 +2090,11 @@ fn parse_canonical_cpu_research_inputs(
     let requested = CANONICAL_CPU_RESEARCH_FLAGS
         .iter()
         .copied()
-        .chain(["--training-percent", "--screening-round-trip-pips"])
+        .chain([
+            "--training-percent",
+            "--research-full-forward",
+            "--screening-round-trip-pips",
+        ])
         .any(|flag| args.iter().any(|arg| arg == flag));
     if !requested {
         return Ok(None);
@@ -2123,6 +2128,15 @@ fn parse_canonical_cpu_research_inputs(
         .map(|raw| raw.parse::<usize>())
         .transpose()
         .context("invalid --training-percent")?;
+    let full_forward = optional("--research-full-forward")?
+        .map(|raw| raw.parse::<bool>())
+        .transpose()
+        .context("--research-full-forward must be true or false")?
+        .unwrap_or(false);
+    anyhow::ensure!(
+        !full_forward || training_percent.is_some(),
+        "--research-full-forward true requires explicit --training-percent"
+    );
     let screening_round_trip_pips = optional("--screening-round-trip-pips")?
         .map(|raw| raw.parse::<f64>())
         .transpose()
@@ -2143,6 +2157,7 @@ fn parse_canonical_cpu_research_inputs(
         broker_symbol_contract: value("--research-broker-symbol-contract")?.into(),
         settings_source: value("--research-settings-source")?.into(),
         training_percent,
+        full_forward,
         screening_round_trip_pips,
     }))
 }
@@ -2288,6 +2303,31 @@ fn cmd_discover_on_budgeted_pool(
             !specialists || canonical_cpu_research.is_some(),
             "specialist portfolio requires canonical research inputs"
         );
+        if specialist_mode
+            == Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1)
+        {
+            let inputs = canonical_cpu_research
+                .as_ref()
+                .context("missing research inputs")?;
+            let settings = settings
+                .as_ref()
+                .context("missing Risky research settings")?;
+            anyhow::ensure!(
+                inputs.full_forward
+                    && settings.system.trading_mode.eq_ignore_ascii_case("risky")
+                    && settings
+                        .models
+                        .discovery_runtime
+                        .risky_minimum_weekly_entries
+                    && !settings
+                        .models
+                        .discovery_runtime
+                        .risky_account_experiment_v3
+                    && settings.risk.risky_min_risk_per_trade == Some(0.30)
+                    && settings.risk.risky_max_risk_per_trade == Some(0.30),
+                "weekly joint Risky forward requires a full reserved suffix, the Risky weekly screen, a fixed 30% band and continuous candidate training"
+            );
+        }
         let mut quote_replay = canonical_research::QuoteReplayInputs::load(args)?;
         let mut saved_research = canonical_research::SavedResearchInputs::load(args)?;
         let new_search = canonical_research::NewSearchInputs::load(args)?;
@@ -2776,6 +2816,7 @@ fn cmd_discover_on_budgeted_pool(
                 higher_tfs: higher_list.clone(),
                 prefix_base_features: settings_ref.system.multi_resolution_prefix_base,
                 normalization_training_rows: Some(normalization_training_rows),
+                research_full_forward: research_inputs.full_forward,
                 // Sparse event outputs can have no finite training cell. Use
                 // the existing train-only projection; the options, retained
                 // names and fitted state are sealed into this batch's receipt.
@@ -2858,6 +2899,9 @@ fn cmd_discover_on_budgeted_pool(
             let mut quote_evidence = Vec::new();
             let mut locked_finalists = Vec::new();
             let specialist_suffix = match specialist_mode {
+                Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1) => {
+                    "weekly-joint-risky-forward"
+                }
                 Some(canonical_research::SpecialistResearchMode::WalkforwardJointRiskyV1) => {
                     "walkforward-joint-risky"
                 }
@@ -3052,6 +3096,8 @@ fn cmd_discover_on_budgeted_pool(
                     }
                     let publish_specialists = |research: &neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3| -> Result<()> {
                         let document = match specialist_mode {
+                            Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1) =>
+                                neoethos_trader::specialist_portfolio::evaluate_weekly_joint_risky_forward(&run_input, research)?,
                             Some(canonical_research::SpecialistResearchMode::WalkforwardJointRiskyV1) =>
                                 neoethos_trader::specialist_portfolio::evaluate_walkforward_joint_risky(&run_input, research)?,
                             Some(canonical_research::SpecialistResearchMode::RiskyV4) =>
@@ -5916,6 +5962,9 @@ fn print_help() {
     );
     println!(
         "  canonical-research --authority-root <dir> --data-root <dir> --plan-sha256 <sha> --matrix-sha256 <sha> --broker-symbol-contract <json> --broker-account-snapshot <account-snapshot.json> --settings-source <yaml> --symbol EURUSD --base-timeframe H4 --out-dir <new-dir> [--higher D1] [--population 64] [--generations 16] [--max-batches 2] [--research-oos-eval <json>]"
+    );
+    println!(
+        "    chronological scopes: --training-percent <percent> [--research-full-forward true]"
     );
     println!(
         "    saved quote replay: --quote-replay-bundle <json> --quote-replay-sha256 <sha> --quote-replay-store <dir> --max-batches 1"

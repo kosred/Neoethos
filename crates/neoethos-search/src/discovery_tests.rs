@@ -660,6 +660,7 @@ fn run_finalization_milestone_fixture(
                 &features.timestamps,
                 &resolver.settings_for_gene(gene),
                 None,
+                None,
             )
             .expect("milestone fixture measured candidate metrics")
             .0
@@ -2138,6 +2139,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
     let overrides = DiscoveryRuntimeOverrides {
         risky_survival_only: false,
         risky_account_experiment_v3: false,
+        risky_minimum_weekly_entries: false,
         risky_lot_constraints: None,
         weekly_cadence: false,
         prefilter_top_k: 0,
@@ -2161,6 +2163,7 @@ fn discovery_runtime_overrides_clamp_invalid_values() {
     let too_small = DiscoveryRuntimeOverrides {
         risky_survival_only: false,
         risky_account_experiment_v3: false,
+        risky_minimum_weekly_entries: false,
         risky_lot_constraints: None,
         weekly_cadence: false,
         prefilter_top_k: 0,
@@ -2212,6 +2215,7 @@ fn discovery_profile_exports_runtime_override_resolution() {
     config.runtime_overrides = DiscoveryRuntimeOverrides {
         risky_survival_only: false,
         risky_account_experiment_v3: false,
+        risky_minimum_weekly_entries: false,
         risky_lot_constraints: None,
         weekly_cadence: false,
         prefilter_top_k: 17,
@@ -7614,6 +7618,7 @@ fn quality_metrics_payload_archives_the_two_month_fractional_return_vector() {
         &timestamps,
         &settings,
         Some(&mut monthly),
+        None,
     )
     .expect("synthetic two-month replay");
     assert_eq!(trades.len(), 2, "one trade per completed month: {trades:?}");
@@ -8166,6 +8171,7 @@ fn prefilter_force_keep_and_seed_templates_preserve_unprefixed_base_and_higher_r
             drop_columns_without_normalization_training_support: false,
             classic_ta_working_set: None,
             quantitative_semantics: neoethos_data::QuantitativeFeatureSemantics::LegacyV2,
+            research_full_forward: false,
         },
     );
     let spec = PrefilterSpec {

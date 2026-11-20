@@ -216,6 +216,10 @@ pub struct FeatureBuildOptions {
         skip_serializing_if = "QuantitativeFeatureSemantics::is_legacy"
     )]
     pub quantitative_semantics: QuantitativeFeatureSemantics,
+    /// Explicit CPU research reserves the entire suffix for final forward.
+    /// Omit false so prior recipes retain their serialized identities.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub research_full_forward: bool,
 }
 
 impl Default for FeatureBuildOptions {
@@ -228,6 +232,7 @@ impl Default for FeatureBuildOptions {
             drop_columns_without_normalization_training_support: false,
             classic_ta_working_set: None,
             quantitative_semantics: QuantitativeFeatureSemantics::LegacyV2,
+            research_full_forward: false,
         }
     }
 }
