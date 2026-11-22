@@ -449,6 +449,7 @@ fn explicit_rounded_joint_replay_can_use_the_frozen_fractional_recipe() {
         target_balance: 50_000.0,
         continuous_exact_stop_risk: true,
         lot_constraints: None,
+        fixed_leverage: None,
     });
     let tape = NettedBarDecisionTapeV1 {
         signals: &[1, 0, 0],
@@ -471,6 +472,7 @@ fn explicit_rounded_joint_replay_can_use_the_frozen_fractional_recipe() {
         fit_to_buying_power: false,
         max_open_positions: 3,
         price_stops: None,
+        price_action_risk_ceiling: None,
     };
     let grid = BarReplayLotGridV1::new(1., 10., 1.).unwrap();
     let rounded_sizing = JointBarRiskyOrderSizingV1 {
@@ -498,6 +500,72 @@ fn explicit_rounded_joint_replay_can_use_the_frozen_fractional_recipe() {
         run.evaluate_joint_risky_full_size(&lanes, 20., false, None, rounded_sizing)
             .is_err()
     );
+}
+
+#[test]
+fn sealed_fixed_margin_agrees_between_scalar_and_shared_risky_replay() {
+    let mut run = prepared(&[100.; 3], &[100., 100., 104.], &[100.; 3]);
+    run.settings.initial_equity_override = Some(100.);
+    run.settings.risk_per_trade_min = 0.30;
+    run.settings.risk_per_trade_max = 0.30;
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0],
+        confidences: &[1.; 3],
+        sl_pips: &[2.; 3],
+        tp_pips: &[4.; 3],
+        ml_multipliers: &[1.; 3],
+    };
+    let lanes = [JointBarLaneV1 {
+        expert_id: "one",
+        tape,
+    }];
+    for (ratio, expected_lots) in [(30, 0.03), (100, 0.10), (400, 0.40)] {
+        let leverage = JointBarFixedNotionalLeverageV1 {
+            maximum: std::num::NonZeroU32::new(ratio).unwrap(),
+            account_notional_per_lot: 100_000.0,
+        };
+        let grid = BarReplayLotGridV1::new(0.01, 100., 0.01).unwrap();
+        run.settings.risky_account_experiment = Some(crate::eval::RiskyAccountExperimentV1 {
+            target_balance: 50_000.,
+            continuous_exact_stop_risk: false,
+            lot_constraints: Some(
+                crate::QuoteReplayLotConstraintsV3::new(0.01, 100., 0.01, "d".repeat(64)).unwrap(),
+            ),
+            fixed_leverage: Some(leverage),
+        });
+        let sizing = JointBarRiskyOrderSizingV1 {
+            leverage: Some(leverage),
+            confidence_risk_floor: None,
+            lot_grid: Some(grid),
+            fit_to_buying_power: true,
+            max_open_positions: 1,
+            price_stops: None,
+            price_action_risk_ceiling: None,
+        };
+        let scalar = run.evaluate(tape, None).unwrap();
+        let shared = run
+            .evaluate_joint_risky_full_size(&lanes, 20., false, None, sizing)
+            .unwrap();
+        near(shared.closed_trades[0].terms.lots, expected_lots);
+        near(scalar.closed_trades[0].pnl, 38. * expected_lots);
+        near(
+            shared.closed_trades[0].trade.pnl,
+            scalar.closed_trades[0].pnl,
+        );
+        assert!(
+            run.evaluate_joint_risky_full_size(
+                &lanes,
+                20.,
+                false,
+                None,
+                JointBarRiskyOrderSizingV1 {
+                    fit_to_buying_power: false,
+                    ..sizing
+                },
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -989,6 +1057,7 @@ fn bound_risky_grid_is_applied_reported_and_cannot_be_overridden() {
         lot_constraints: Some(
             crate::QuoteReplayLotConstraintsV3::new(1.0, 10.0, 1.0, "a".repeat(64)).unwrap(),
         ),
+        fixed_leverage: None,
     });
     let tape = NettedBarDecisionTapeV1 {
         signals: &[1, 0, 0],

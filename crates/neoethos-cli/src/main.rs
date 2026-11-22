@@ -2313,17 +2313,16 @@ fn cmd_discover_on_budgeted_pool(
             let settings = settings
                 .as_ref()
                 .context("missing Risky research settings")?;
+            let runtime = &settings.models.discovery_runtime;
+            let fixed_broker_profile = runtime
+                .risky_lot_constraints
+                .as_ref()
+                .is_some_and(|limits| limits.fixed_leverage.is_some());
             anyhow::ensure!(
                 inputs.full_forward
                     && settings.system.trading_mode.eq_ignore_ascii_case("risky")
-                    && settings
-                        .models
-                        .discovery_runtime
-                        .risky_minimum_weekly_entries
-                    && !settings
-                        .models
-                        .discovery_runtime
-                        .risky_account_experiment_v3
+                    && runtime.risky_minimum_weekly_entries
+                    && runtime.risky_account_experiment_v3 == fixed_broker_profile
                     && settings.risk.risky_min_risk_per_trade == Some(0.30)
                     && settings.risk.risky_max_risk_per_trade == Some(0.30),
                 "weekly joint Risky forward requires a full reserved suffix, the Risky weekly screen, a fixed 30% band and continuous candidate training"
@@ -3098,7 +3097,7 @@ fn cmd_discover_on_budgeted_pool(
                     }
                     let publish_specialists = |research: &neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3| -> Result<()> {
                         let document = match specialist_mode {
-                            Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1 { max_leverage, compare_adaptive, compare_lots }) => {
+                            Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1 { max_leverage, compare_adaptive, compare_lots, compare_price_risk }) => {
                                 let leverage = if let Some(maximum) = max_leverage {
                                     anyhow::ensure!(
                                         contract.symbol().get(..3) == Some(contract.account_currency()),
@@ -3116,7 +3115,7 @@ fn cmd_discover_on_budgeted_pool(
                                     stop_bounds.sl_min_pips,
                                     stop_bounds.sl_max_pips,
                                 ]);
-                                let broker_lots = if compare_lots {
+                                let broker_lots = if compare_lots || compare_price_risk {
                                     anyhow::ensure!(base_timeframe == neoethos_data::CanonicalTimeframe::M15,
                                         "the lot comparison's price action arm requires M15 source candles");
                                     let [min, max, step] = broker_cost_facts.lot_limits()?;
@@ -3124,6 +3123,7 @@ fn cmd_discover_on_budgeted_pool(
                                         grid: neoethos_search::eval::BarReplayLotGridV1::new(min, max, step)?,
                                         symbol_contract_sha256: broker_cost_facts.source_sha256(),
                                         price_action_stop_bounds_pips: [stop_bounds.sl_min_pips, stop_bounds.sl_max_pips],
+                                        price_action_risk_comparison: compare_price_risk,
                                     })
                                 } else { None };
                                 neoethos_trader::specialist_portfolio::evaluate_weekly_joint_risky_forward(

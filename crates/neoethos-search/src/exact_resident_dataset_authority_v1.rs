@@ -368,6 +368,11 @@ fn hash_settings(hasher: &mut ExactHasherV1, settings: &BacktestSettings) {
         if policy.continuous_exact_stop_risk {
             hasher.u8(0xa3);
         }
+        if let Some(leverage) = policy.fixed_leverage {
+            hasher.u8(0xa4);
+            hasher.u64(u64::from(leverage.maximum.get()));
+            hasher.f64(leverage.account_notional_per_lot);
+        }
     }
 }
 
@@ -824,6 +829,7 @@ mod account_equity_binding_tests {
                 target_balance: 50_000.0,
                 continuous_exact_stop_risk: false,
                 lot_constraints: None,
+                fixed_leverage: None,
             }),
             ..Default::default()
         };

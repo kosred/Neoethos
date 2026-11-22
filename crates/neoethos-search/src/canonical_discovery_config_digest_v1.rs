@@ -311,6 +311,15 @@ fn encode_runtime_overrides_v1(
         encoder.f64("max_lots", grid.max_lots)?;
         encoder.f64("lot_step", grid.lot_step)?;
         encoder.string("source_artifact_sha256", &grid.source_artifact_sha256)?;
+        if let Some(leverage) = grid.fixed_leverage {
+            encoder.record_start("fixed_leverage_v1")?;
+            encoder.u32("maximum", leverage.maximum.get())?;
+            encoder.f64(
+                "account_notional_per_lot",
+                leverage.account_notional_per_lot,
+            )?;
+            encoder.record_end("fixed_leverage_v1")?;
+        }
         encoder.record_end("risky_lot_constraints_v1")?;
     }
     // Both new knobs encode ONLY when active, so the default configuration
@@ -712,6 +721,7 @@ mod tests {
                     max_lots,
                     lot_step,
                     source_artifact_sha256: source.to_string().repeat(64),
+                    fixed_leverage: None,
                 });
             let identity = canonical_discovery_config_digest_v1(&config).unwrap();
             assert_ne!(identity, absent);

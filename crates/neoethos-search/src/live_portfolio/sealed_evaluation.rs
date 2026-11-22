@@ -91,6 +91,7 @@ mod tests {
             lot_constraints: Some(
                 crate::QuoteReplayLotConstraintsV3::new(0.01, 1.0, 0.01, "a".repeat(64)).unwrap(),
             ),
+            fixed_leverage: None,
         });
         let sealed = SealedEvaluationPolicyV1::from_evaluation(&evaluation, false, &stops).unwrap();
         assert_eq!(

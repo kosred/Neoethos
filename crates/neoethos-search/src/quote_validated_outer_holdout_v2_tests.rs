@@ -9,6 +9,7 @@ fn quote_risk_adapter_refuses_to_drop_new_risky_account_stopping_policy() {
             target_balance: 50_000.0,
             continuous_exact_stop_risk: false,
             lot_constraints: None,
+            fixed_leverage: None,
         }),
         ..Default::default()
     };

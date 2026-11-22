@@ -360,9 +360,15 @@ pub struct RiskyAccountExperimentV1 {
     /// not historical broker margin or liquidation authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lot_constraints: Option<crate::QuoteReplayLotConstraintsV3>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_leverage: Option<neoethos_core::config::RiskyFixedNotionalLeverageV1>,
 }
 
 impl RiskyAccountExperimentV1 {
+    pub(crate) fn continuous_risk_sizing(&self) -> bool {
+        self.continuous_exact_stop_risk || self.fixed_leverage.is_some()
+    }
+
     pub(crate) fn validate(
         &self,
         initial_balance: f64,
@@ -377,9 +383,20 @@ impl RiskyAccountExperimentV1 {
         );
         anyhow::ensure!(
             !self.continuous_exact_stop_risk
-                || (risk_band == (0.30, 0.30) && self.lot_constraints.is_none()),
+                || (risk_band == (0.30, 0.30)
+                    && self.lot_constraints.is_none()
+                    && self.fixed_leverage.is_none()),
             "continuous exact Risky replay requires a fixed 30% risk band and no lot grid"
         );
+        if let Some(leverage) = self.fixed_leverage {
+            anyhow::ensure!(
+                risk_band == (0.30, 0.30)
+                    && self.lot_constraints.is_some()
+                    && leverage.account_notional_per_lot.is_finite()
+                    && leverage.account_notional_per_lot > 0.0,
+                "fixed-leverage Risky replay requires a lot grid, a 30% risk ceiling and positive account notional per lot"
+            );
+        }
         if let Some(constraints) = &self.lot_constraints {
             constraints.checked_grid()?;
         }
@@ -1085,7 +1102,7 @@ fn risk_based_pos_lots(
         if settings
             .risky_account_experiment
             .as_ref()
-            .is_some_and(|policy| policy.continuous_exact_stop_risk)
+            .is_some_and(RiskyAccountExperimentV1::continuous_risk_sizing)
         {
             pos_lots.max(0.0)
         } else {
@@ -1217,12 +1234,12 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     // per-bar confidence slice is supplied. Otherwise `pos_lots` stays
     // 1.0 for every trade — exact legacy fixed-1-lot behaviour, which
     // keeps existing callers (and the `&[]` callers below) unchanged.
-    let continuous_exact_stop_risk = settings
-        .risky_account_experiment
-        .as_ref()
-        .is_some_and(|policy| policy.continuous_exact_stop_risk);
+    let account_policy = settings.risky_account_experiment.as_ref();
+    let continuous_risk_sizing =
+        account_policy.is_some_and(RiskyAccountExperimentV1::continuous_risk_sizing);
+    let fixed_leverage = account_policy.and_then(|policy| policy.fixed_leverage);
     let use_risk_sizing =
-        settings.risk_based_sizing && (!confidences.is_empty() || continuous_exact_stop_risk);
+        settings.risk_based_sizing && (!confidences.is_empty() || continuous_risk_sizing);
     // Captured at each entry; constant for the life of an open position.
     let mut pos_lots: f64 = 1.0;
     // Per-entry SL/TP in pips (adaptive-per-entry when enabled, else the scalar
@@ -1233,7 +1250,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     let mut pos_tp_pips: f64 = settings.tp_pips;
 
     let initial_equity = settings.initial_equity();
-    if let Some(policy) = &settings.risky_account_experiment {
+    if let Some(policy) = account_policy {
         policy
             .validate(
                 initial_equity,
@@ -1242,8 +1259,8 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
             .expect("invalid Risky account experiment");
     }
     assert!(
-        !continuous_exact_stop_risk || use_risk_sizing,
-        "continuous exact Risky replay requires account-risk sizing"
+        !continuous_risk_sizing || use_risk_sizing,
+        "continuous Risky replay requires account-risk sizing"
     );
     let lot_grid = settings
         .resolved_lot_grid(netted.as_ref().and_then(|state| state.lot_grid), false)
@@ -1540,8 +1557,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                     .as_ref()
                     .is_some_and(|policy| {
                         equity <= 0.0
-                            || (!policy.continuous_exact_stop_risk
-                                && equity >= policy.target_balance)
+                            || (!policy.continuous_risk_sizing() && equity >= policy.target_balance)
                     })
                 {
                     // Legacy accounts bank the first realized target. Visible
@@ -1581,8 +1597,8 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                     continue;
                 }
                 assert!(
-                    !continuous_exact_stop_risk || size_multiplier == 1.0,
-                    "continuous exact Risky replay may veto a position but cannot resize it"
+                    !continuous_risk_sizing || size_multiplier == 1.0,
+                    "continuous Risky replay may veto a position but cannot rescale its risk signal"
                 );
                 let mut entry_lots = if use_risk_sizing {
                     let conf = confidences.get(i - 1).copied().unwrap_or(1.0);
@@ -1596,6 +1612,14 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 if entry_lots <= 0.0 {
                     continue;
                 }
+                if let Some(policy) = fixed_leverage {
+                    entry_lots = entry_lots.min(netted_bar_research::remaining_fixed_margin_lots(
+                        equity,
+                        f64::from(policy.maximum.get()),
+                        policy.account_notional_per_lot,
+                        0.0,
+                    ));
+                }
                 if let Some(grid) = lot_grid {
                     match grid.normalize_down(entry_lots) {
                         Some(lots) => entry_lots = lots,
@@ -1605,6 +1629,13 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                             }
                             continue;
                         }
+                    }
+                }
+                if let Some(policy) = fixed_leverage {
+                    if entry_lots * policy.account_notional_per_lot
+                        > equity * f64::from(policy.maximum.get())
+                    {
+                        continue;
                     }
                 }
                 in_pos = s;

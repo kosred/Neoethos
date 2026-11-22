@@ -852,6 +852,25 @@ fill must leave the stop inside the configured pip bounds and the target is
 admission outcomes. These are historical OHLC runs with a fixed leverage
 assumption and the original scalar costs.
 
+To use the same modeled broker limits during fresh Risky discovery and the
+shared backtest/forward, enable `risky_account_experiment_v3` with
+`risky_survival_only` and bind `models.discovery_runtime.risky_lot_constraints`
+to the exact symbol artifact. Within the lot constraints, set
+`fixed_leverage.maximum` to the scenario's positive leverage ratio and
+`fixed_leverage.account_notional_per_lot` to the broker's base units per lot.
+The research account currency must match the FX base currency. Search and
+replay retain the 30% pre-cost stop-risk ceiling, reduce volume to available
+modeled margin and round down to the checked lot grid. The weekly shared
+replay reads the profile from the saved search. One-candidate screening
+budgets a flat account while the combined replay also reserves existing
+exposure. The fixed ratio models opening capacity.
+
+Use `--shared-account-price-action-risk-comparison true` with
+`--specialist-portfolio weekly-joint-risky-forward-v1` to test the same
+structural signal at 30%, 10% and 5% risk ceilings with a 20-pip target, and
+at a 5% ceiling with a 12-pip target. It accepts the fixed profile sealed by
+fresh discovery or the fixed-leverage override of an exact legacy replay.
+
 ### Continual specialist research V3
 
 `canonical-research --specialist-portfolio continual-v3` writes

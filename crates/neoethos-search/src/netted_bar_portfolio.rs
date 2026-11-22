@@ -1,12 +1,15 @@
 //! Simultaneous expert sleeves on the existing canonical OHLC research owner.
 //! A shared ledger is deliberate; this does not attest broker hedging, margin,
 //! quotes, challenge rules, or promotion. V1 single-position receipts stay V1.
-use super::{BarReplayLotGridV1, NettedBarDecisionTapeV1, PreparedNettedCanonicalBarResearchV1};
+use super::{
+    BarReplayLotGridV1, NettedBarDecisionTapeV1, PreparedNettedCanonicalBarResearchV1,
+    remaining_fixed_margin_lots,
+};
 use crate::quality::{Trade, TradeExitReason};
 use crate::scoring::RiskyGrowthGoal;
 use anyhow::{Context, Result, ensure};
+pub use neoethos_core::config::RiskyFixedNotionalLeverageV1 as JointBarFixedNotionalLeverageV1;
 use serde::{Deserialize, Serialize};
-use std::num::NonZeroU32;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,13 +83,6 @@ impl From<JointBarAccountPolicyV1> for JointBarAppliedPolicyV1 {
     }
 }
 
-/// Fixed gross exposure model for an FX account denominated in the base currency.
-#[derive(Clone, Copy, Debug)]
-pub struct JointBarFixedNotionalLeverageV1 {
-    pub maximum: NonZeroU32,
-    pub account_notional_per_lot: f64,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct JointBarRiskyOrderSizingV1<'a> {
     pub leverage: Option<JointBarFixedNotionalLeverageV1>,
@@ -95,6 +91,7 @@ pub struct JointBarRiskyOrderSizingV1<'a> {
     pub fit_to_buying_power: bool,
     pub max_open_positions: usize,
     pub price_stops: Option<JointBarPriceStopLevelsV1<'a>>,
+    pub price_action_risk_ceiling: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -362,6 +359,16 @@ impl PreparedNettedCanonicalBarResearchV1 {
                 "structural stops require a single aligned lane and valid pip bounds"
             );
         }
+        let rounded_risk_ceiling = order_sizing
+            .price_action_risk_ceiling
+            .unwrap_or(EXACT_STOP_RISK);
+        ensure!(
+            order_sizing.price_action_risk_ceiling.is_none()
+                || (order_sizing.price_stops.is_some()
+                    && rounded_risk_ceiling > 0.0
+                    && rounded_risk_ceiling <= EXACT_STOP_RISK),
+            "a lower risk ceiling requires an explicit price-action replay"
+        );
         let fixed_account_notional_per_lot = leverage.map(|limit| limit.account_notional_per_lot);
         ensure!(
             fixed_account_notional_per_lot.is_none_or(|value| value.is_finite() && value > 0.0),
@@ -390,7 +397,7 @@ impl PreparedNettedCanonicalBarResearchV1 {
             exact_stop_risk_per_entry: (confidence_stop_risk_band.is_none() && lot_grid.is_none())
                 .then_some(EXACT_STOP_RISK),
             confidence_stop_risk_band,
-            rounded_order_stop_risk_ceiling: lot_grid.map(|_| EXACT_STOP_RISK),
+            rounded_order_stop_risk_ceiling: lot_grid.map(|_| rounded_risk_ceiling),
             fit_to_buying_power: lot_grid.map(|_| order_sizing.fit_to_buying_power),
         };
         self.evaluate_joint_inner(
@@ -425,6 +432,20 @@ impl PreparedNettedCanonicalBarResearchV1 {
             "bounded research supports at most 256 archived expert lanes"
         );
         let settings = &self.settings;
+        if let Some(bound) = settings
+            .risky_account_experiment
+            .as_ref()
+            .and_then(|account| account.fixed_leverage)
+        {
+            ensure!(
+                rounded_risky
+                    && policy.fit_to_buying_power == Some(true)
+                    && fixed_leverage == Some(f64::from(bound.maximum.get()))
+                    && policy.fixed_account_notional_per_lot
+                        == Some(bound.account_notional_per_lot),
+                "shared replay must use the fixed margin and order sizing sealed during search"
+            );
+        }
         ensure!(
             settings.risk_based_sizing
                 && settings.pip_value.is_finite()
@@ -780,9 +801,12 @@ impl PreparedNettedCanonicalBarResearchV1 {
                                     let risk_capacity = (stop_risk_limit - requested_stop_risk)
                                         .max(0.0)
                                         / (stop * ppv);
-                                    let margin_capacity = (marked * limit / notional_per_lot
-                                        - requested_lots)
-                                        .max(0.0);
+                                    let margin_capacity = remaining_fixed_margin_lots(
+                                        marked,
+                                        limit,
+                                        notional_per_lot,
+                                        requested_lots,
+                                    );
                                     let resized = lots.min(risk_capacity).min(margin_capacity);
                                     fit_adjusted = resized < lots;
                                     lots = resized;

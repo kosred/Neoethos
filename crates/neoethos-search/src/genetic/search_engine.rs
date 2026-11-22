@@ -1824,11 +1824,11 @@ pub fn prepare_validation_population(
     if settings
         .risky_account_experiment
         .as_ref()
-        .is_some_and(|policy| policy.continuous_exact_stop_risk)
+        .is_some_and(crate::eval::RiskyAccountExperimentV1::continuous_risk_sizing)
     {
         anyhow::ensure!(
             settings.risk_based_sizing,
-            "exact Risky validation requires account-risk sizing"
+            "continuous Risky validation requires account-risk sizing"
         );
     } else {
         settings.risk_based_sizing = false;

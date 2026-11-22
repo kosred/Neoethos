@@ -64,6 +64,15 @@ impl BarReplayLotGridV1 {
     }
 }
 
+pub(super) fn remaining_fixed_margin_lots(
+    equity: f64,
+    leverage: f64,
+    notional_per_lot: f64,
+    committed_lots: f64,
+) -> f64 {
+    (equity * leverage / notional_per_lot - committed_lots).max(0.0)
+}
+
 /// An open modeled position is NOT a completed trade. Gross mark and pending
 /// commission remain separate; no exit quote, swap settlement or liquidation is
 /// invented. `marked_equity_before_pending_costs` is not broker account equity.

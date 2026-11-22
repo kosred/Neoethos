@@ -150,6 +150,13 @@ impl BrokerSymbolCostFactsV1 {
                 "Risky lot constraints value differs from exact broker volume/lotSize"
             );
         }
+        if let Some(leverage) = grid.fixed_leverage {
+            ensure!(
+                costs.symbol.get(..3) == Some(costs.account_currency.as_str())
+                    && leverage.account_notional_per_lot == self.base_units_per_lot(),
+                "fixed-leverage Risky research requires the broker's lot size and an FX base-currency account"
+            );
+        }
         Ok(())
     }
 }

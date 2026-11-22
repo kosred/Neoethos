@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 31] = [
+const OPTIONAL: [&str; 32] = [
     "--higher",
     "--population",
     "--generations",
@@ -58,6 +58,7 @@ const OPTIONAL: [&str; 31] = [
     "--shared-account-max-leverage",
     "--shared-account-adaptive-comparison",
     "--shared-account-lot-comparison",
+    "--shared-account-price-action-risk-comparison",
     "--new-search-research",
     "--new-search-research-sha256",
     "--prefilter-ranking-audit-out",
@@ -624,6 +625,7 @@ fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String
             "--shared-account-max-leverage",
             "--shared-account-adaptive-comparison",
             "--shared-account-lot-comparison",
+            "--shared-account-price-action-risk-comparison",
             "--training-percent",
             "--research-full-forward",
             "--screening-round-trip-pips",
@@ -654,6 +656,7 @@ pub(crate) enum SpecialistResearchMode {
         max_leverage: Option<std::num::NonZeroU32>,
         compare_adaptive: bool,
         compare_lots: bool,
+        compare_price_risk: bool,
     },
 }
 
@@ -675,6 +678,7 @@ pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResear
     };
     let compare_adaptive = comparison_enabled("--shared-account-adaptive-comparison")?;
     let compare_lots = comparison_enabled("--shared-account-lot-comparison")?;
+    let compare_price_risk = comparison_enabled("--shared-account-price-action-risk-comparison")?;
     ensure!(
         !compare_adaptive || max_leverage.is_some(),
         "--shared-account-adaptive-comparison true requires --shared-account-max-leverage"
@@ -682,6 +686,14 @@ pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResear
     ensure!(
         !compare_lots || (max_leverage.is_some() && !compare_adaptive),
         "--shared-account-lot-comparison true requires fixed leverage and a dedicated replay"
+    );
+    ensure!(
+        !compare_price_risk
+            || (!compare_adaptive
+                && !compare_lots
+                && flags.get("--specialist-portfolio").copied()
+                    == Some("weekly-joint-risky-forward-v1")),
+        "price-action risk comparison requires a dedicated weekly-joint-risky-forward-v1 replay"
     );
     if max_leverage.is_some() {
         ensure!(
@@ -703,6 +715,7 @@ pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResear
             max_leverage,
             compare_adaptive,
             compare_lots,
+            compare_price_risk,
         },
         _ => anyhow::bail!(
             "--specialist-portfolio expects true, joint-v2, continual-v3, risky-v4, walkforward-joint-risky-v1, or weekly-joint-risky-forward-v1"

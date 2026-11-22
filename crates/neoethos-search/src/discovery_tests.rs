@@ -4945,6 +4945,7 @@ fn risky_account_experiment_v3_is_bound_to_risky_settings_and_saved_replay() {
             max_lots: 1.0,
             lot_step: 0.01,
             source_artifact_sha256: "a".repeat(64),
+            fixed_leverage: None,
         });
     let config = DiscoveryConfig::from_settings(&settings);
     let policy = config.risky_account_experiment().unwrap().unwrap();

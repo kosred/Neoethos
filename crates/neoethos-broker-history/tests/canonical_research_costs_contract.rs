@@ -71,6 +71,7 @@ impl Fixture {
             max_lots: 100.0,
             lot_step: 0.01,
             source_artifact_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            fixed_leverage: None,
         })
     }
 

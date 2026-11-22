@@ -1443,6 +1443,16 @@ pub struct RiskyReplayLotConstraintsConfigV1 {
     pub max_lots: f64,
     pub lot_step: f64,
     pub source_artifact_sha256: String,
+    /// Optional fixed-leverage assumption for FX with a base-currency account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_leverage: Option<RiskyFixedNotionalLeverageV1>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RiskyFixedNotionalLeverageV1 {
+    pub maximum: std::num::NonZeroU32,
+    pub account_notional_per_lot: f64,
 }
 
 /// Discovery-pipeline runtime knobs — the config-driven replacement for the

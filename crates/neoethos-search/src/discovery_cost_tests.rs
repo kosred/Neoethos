@@ -546,6 +546,7 @@ fn active_research_costs_worker() {
                 max_lots: 1.0,
                 lot_step: 0.01,
                 source_artifact_sha256: "a".repeat(64),
+                fixed_leverage: None,
             });
         let evaluation = config.evaluation_config(None);
         let search_settings = crate::genetic::search_engine::evaluation_backtest_settings(

@@ -1833,16 +1833,20 @@ impl DiscoveryConfig {
 
     fn risky_account_experiment(&self) -> Result<Option<crate::eval::RiskyAccountExperimentV1>> {
         let risk_band = (self.risk_per_trade_min, self.risk_per_trade_max);
+        let constraints = self.runtime_overrides.risky_lot_constraints.as_ref();
+        let fixed_leverage = constraints.and_then(|limits| limits.fixed_leverage);
         let continuous_exact_stop_risk = self.mode == DiscoveryMode::Risky
             && self.runtime_overrides.risky_minimum_weekly_entries
-            && risk_band == (0.30, 0.30);
+            && risk_band == (0.30, 0.30)
+            && fixed_leverage.is_none();
         anyhow::ensure!(
-            !self.runtime_overrides.risky_weekly_entries_report_only || continuous_exact_stop_risk,
-            "report-only Risky weekly cadence requires the exact continuous 30% policy"
+            !self.runtime_overrides.risky_weekly_entries_report_only
+                || continuous_exact_stop_risk
+                || fixed_leverage.is_some(),
+            "report-only Risky weekly cadence requires a continuous 30% policy"
         );
         anyhow::ensure!(
-            self.runtime_overrides.risky_account_experiment_v3
-                || self.runtime_overrides.risky_lot_constraints.is_none(),
+            self.runtime_overrides.risky_account_experiment_v3 || constraints.is_none(),
             "explicit Risky lot constraints require risky_account_experiment_v3"
         );
         if !self.runtime_overrides.risky_account_experiment_v3 && !continuous_exact_stop_risk {
@@ -1858,13 +1862,16 @@ impl DiscoveryConfig {
             !cfg!(any(feature = "gpu", feature = "gpu-cuda")),
             "Risky account experiment v3 currently has CPU accounting only; device execution is unsupported"
         );
+        anyhow::ensure!(
+            fixed_leverage.is_none()
+                || self.evaluation_symbol.get(..3)
+                    == Some(self.evaluation_account_currency.as_str()),
+            "fixed-leverage Risky research requires an FX base-currency account"
+        );
         let policy = crate::eval::RiskyAccountExperimentV1 {
             target_balance: self.risky_target_balance,
             continuous_exact_stop_risk,
-            lot_constraints: self
-                .runtime_overrides
-                .risky_lot_constraints
-                .as_ref()
+            lot_constraints: constraints
                 .map(|raw| {
                     crate::QuoteReplayLotConstraintsV3::new(
                         raw.min_lots,
@@ -1874,6 +1881,7 @@ impl DiscoveryConfig {
                     )
                 })
                 .transpose()?,
+            fixed_leverage,
         };
         policy.validate(self.initial_balance, risk_band)?;
         anyhow::ensure!(

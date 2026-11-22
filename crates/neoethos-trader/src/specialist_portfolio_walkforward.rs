@@ -362,6 +362,9 @@ enum WeeklyRiskyScenario {
     BrokerGridFitMargin,
     BrokerGridSingle,
     PriceAction,
+    PriceActionRiskTen,
+    PriceActionRiskFive,
+    PriceActionRiskFiveTargetTwelve,
 }
 
 impl WeeklyRiskyScenario {
@@ -380,20 +383,49 @@ impl WeeklyRiskyScenario {
         Self::PriceAction,
     ];
 
+    const PRICE_ACTION_RISK: [Self; 4] = [
+        Self::PriceAction,
+        Self::PriceActionRiskTen,
+        Self::PriceActionRiskFive,
+        Self::PriceActionRiskFiveTargetTwelve,
+    ];
+
+    fn uses_price_action(self) -> bool {
+        Self::PRICE_ACTION_RISK.contains(&self)
+    }
+
+    fn price_action_target(self) -> f64 {
+        if self == Self::PriceActionRiskFiveTargetTwelve {
+            12.0
+        } else {
+            PRICE_ACTION_TARGET_PIPS
+        }
+    }
+
+    fn tapes<'a>(
+        self,
+        frozen: Option<&'a DirectTapes>,
+        price: Option<&'a mut DirectTapes>,
+    ) -> Result<&'a DirectTapes> {
+        if self.uses_price_action() {
+            let price = price.context("missing price action tape")?;
+            price.tapes[0].targets.fill(self.price_action_target());
+            Ok(price)
+        } else {
+            frozen.context("missing frozen specialist tapes")
+        }
+    }
+
     fn order_sizing<'a>(
         self,
         leverage: Option<JointBarFixedNotionalLeverageV1>,
-        broker_lots: Option<&BrokerLotComparisonV1>,
+        lot_grid: Option<BarReplayLotGridV1>,
+        price_stop_bounds: Option<[f64; 2]>,
         tapes: &'a DirectTapes,
     ) -> JointBarRiskyOrderSizingV1<'a> {
-        let single_position = matches!(self, Self::BrokerGridSingle | Self::PriceAction);
-        let fit_to_buying_power = matches!(
-            self,
-            Self::BrokerGridFitMargin | Self::BrokerGridSingle | Self::PriceAction
-        );
-        let lot_grid = broker_lots
-            .filter(|_| self != Self::Fixed)
-            .map(|config| config.grid);
+        let single_position = self == Self::BrokerGridSingle || self.uses_price_action();
+        let fit_to_buying_power = single_position || self == Self::BrokerGridFitMargin;
+        let lot_grid = lot_grid.filter(|_| self != Self::Fixed);
         JointBarRiskyOrderSizingV1 {
             leverage,
             confidence_risk_floor: (self == Self::AdaptiveRisk).then_some(
@@ -402,21 +434,26 @@ impl WeeklyRiskyScenario {
             lot_grid,
             fit_to_buying_power,
             max_open_positions: if single_position { 1 } else { 3 },
-            price_stops: broker_lots.and_then(|config| {
+            price_stops: price_stop_bounds.and_then(|distance_bounds_pips| {
                 tapes.price_stop_levels.as_deref().map(|signal_row_levels| {
                     JointBarPriceStopLevelsV1 {
                         signal_row_levels,
-                        distance_bounds_pips: config.price_action_stop_bounds_pips,
+                        distance_bounds_pips,
                     }
                 })
             }),
+            price_action_risk_ceiling: match self {
+                Self::PriceActionRiskTen => Some(0.10),
+                Self::PriceActionRiskFive | Self::PriceActionRiskFiveTargetTwelve => Some(0.05),
+                _ => None,
+            },
         }
     }
 
     fn target_ceiling(self, trials: &[FrozenTrial<'_>]) -> f64 {
         let target = maximum_target(trials);
-        if self == Self::PriceAction {
-            PRICE_ACTION_TARGET_PIPS
+        if self.uses_price_action() {
+            self.price_action_target()
         } else if self == Self::AdaptiveTp {
             target * ATR_SCALE[1]
         } else {
@@ -429,6 +466,7 @@ pub struct BrokerLotComparisonV1 {
     pub grid: BarReplayLotGridV1,
     pub symbol_contract_sha256: String,
     pub price_action_stop_bounds_pips: [f64; 2],
+    pub price_action_risk_comparison: bool,
 }
 
 const PRICE_ACTION_ID: &str = "h1-trend-m15-pullback-v1";
@@ -623,8 +661,10 @@ pub fn evaluate_weekly_joint_risky_forward(
     adaptive_stop_bounds: Option<[f64; 2]>,
     broker_lots: Option<&BrokerLotComparisonV1>,
 ) -> Result<Value> {
+    let price_risk = broker_lots.is_some_and(|options| options.price_action_risk_comparison);
     ensure!(
-        broker_lots.is_none() || (leverage.is_some() && adaptive_stop_bounds.is_none()),
+        broker_lots.is_none()
+            || (adaptive_stop_bounds.is_none() && (price_risk || leverage.is_some())),
         "lot comparison requires fixed leverage and its own replay mode"
     );
     neoethos_search::discovery::with_saved_research_execution(input, research, || {
@@ -656,11 +696,48 @@ pub fn evaluate_weekly_joint_risky_forward(
             "members": trials.iter().map(|trial| &trial.member).collect::<Vec<_>>(),
             "combined_portfolio_evaluated": false,
         });
-        if trials.is_empty() {
+        if trials.is_empty() && !price_risk {
             report["status"] = json!("no_frozen_walkforward_survivors");
             return Ok(report);
         }
         let (policy, evaluation, goal) = frozen_risky_recipe(research)?;
+        let bound_policy = evaluation.risky_account_experiment.as_ref();
+        let bound_leverage = bound_policy.and_then(|policy| policy.fixed_leverage);
+        let mut lot_grid = broker_lots.map(|options| options.grid);
+        if bound_leverage.is_some() {
+            ensure!(
+                leverage.is_none()
+                    && adaptive_stop_bounds.is_none()
+                    && (broker_lots.is_none() || price_risk),
+                "the shared account must use the fixed broker profile sealed during search"
+            );
+            let bound_lots = bound_policy
+                .and_then(|policy| policy.lot_constraints.as_ref())
+                .context("sealed fixed leverage has no lot grid")?;
+            let grid = bound_lots.checked_grid()?;
+            if let Some(options) = broker_lots {
+                ensure!(
+                    options.grid == grid
+                        && options.symbol_contract_sha256 == bound_lots.source_artifact_sha256(),
+                    "comparison symbol differs from the broker profile sealed during search"
+                );
+            }
+            lot_grid = Some(grid);
+            report["schema"] = json!("neoethos.weekly-joint-risky-forward.broker-profile.v1");
+            report["broker_volume_source"] = json!({
+                "symbol_contract_sha256": bound_lots.source_artifact_sha256(),
+                "lot_grid": grid,
+                "fixed_leverage": bound_leverage,
+            });
+        } else if price_risk {
+            report["schema"] = json!("neoethos.weekly-joint-risky-forward.price-action-risk.v1");
+        }
+        let leverage = bound_leverage.or(leverage);
+        ensure!(
+            !price_risk || leverage.is_some(),
+            "price-action risk comparison requires a fixed leverage assumption"
+        );
+        let price_stop_bounds = broker_lots.map(|options| options.price_action_stop_bounds_pips);
         let training = &source.selection_scope;
         let expert_ids: Vec<_> = trials
             .iter()
@@ -673,35 +750,45 @@ pub fn evaluate_weekly_joint_risky_forward(
         let adaptive = adaptive_stop_bounds
             .map(|bounds| AdaptiveWeeklyBrackets::from_input(input, bounds))
             .transpose()?;
-        let modes: &[WeeklyRiskyScenario] = if broker_lots.is_some() {
-            &WeeklyRiskyScenario::EXECUTION
+        let mut modes = if price_risk {
+            WeeklyRiskyScenario::PRICE_ACTION_RISK.to_vec()
+        } else if broker_lots.is_some() {
+            WeeklyRiskyScenario::EXECUTION.to_vec()
         } else if adaptive.is_some() {
-            &WeeklyRiskyScenario::ALL
+            WeeklyRiskyScenario::ALL.to_vec()
         } else {
-            &WeeklyRiskyScenario::ALL[..1]
+            vec![WeeklyRiskyScenario::Fixed]
+        };
+        if bound_leverage.is_some() && !trials.is_empty() {
+            if price_risk {
+                modes.insert(0, WeeklyRiskyScenario::BrokerGridFitMargin);
+            } else {
+                modes[0] = WeeklyRiskyScenario::BrokerGridFitMargin;
+            }
+        }
+        let run_frozen = modes.iter().any(|mode| !mode.uses_price_action());
+        let prepare_frozen = |scope| {
+            run_frozen
+                .then(|| DirectTapes::prepare(input, research, scope, &trials, policy, &evaluation))
+                .transpose()
         };
         let mut results = Vec::with_capacity(modes.len());
         {
-            let mut frozen_tapes =
-                DirectTapes::prepare(input, research, training, &trials, policy, &evaluation)?;
-            let price_tapes = price_action
+            let mut frozen_tapes = prepare_frozen(training)?;
+            let mut price_tapes = price_action
                 .as_ref()
                 .map(|price| price.for_scope(input, training, evaluation.pip_value))
                 .transpose()?;
-            for &scenario in modes {
+            for &scenario in &modes {
                 tracing::info!(?scenario, "shared Risky training scenario started");
-                if let Some(brackets) = &adaptive {
-                    brackets.apply(&mut frozen_tapes, &trials, training, scenario)?;
+                if let (Some(brackets), Some(frozen)) = (&adaptive, &mut frozen_tapes) {
+                    brackets.apply(frozen, &trials, training, scenario)?;
                 }
-                let (tapes, ids) = if scenario == WeeklyRiskyScenario::PriceAction {
-                    (
-                        price_tapes
-                            .as_ref()
-                            .context("missing price action training tape")?,
-                        price_ids.as_slice(),
-                    )
+                let tapes = scenario.tapes(frozen_tapes.as_ref(), price_tapes.as_mut())?;
+                let ids = if scenario.uses_price_action() {
+                    price_ids.as_slice()
                 } else {
-                    (&frozen_tapes, expert_ids.as_slice())
+                    expert_ids.as_slice()
                 };
                 let training_goals = joint_goal_windows(
                     tapes,
@@ -712,14 +799,13 @@ pub fn evaluate_weekly_joint_risky_forward(
                     &evaluation,
                     goal,
                     scenario.target_ceiling(&trials),
-                    scenario.order_sizing(leverage, broker_lots, tapes),
+                    scenario.order_sizing(leverage, lot_grid, price_stop_bounds, tapes),
                 )?;
                 results.push((scenario, json!({"training_goal_windows": training_goals})));
             }
         }
-        let mut frozen_tapes =
-            DirectTapes::prepare(input, research, holdout, &trials, policy, &evaluation)?;
-        let price_tapes = price_action
+        let mut frozen_tapes = prepare_frozen(holdout)?;
+        let mut price_tapes = price_action
             .as_ref()
             .map(|price| price.for_scope(input, holdout, evaluation.pip_value))
             .transpose()?;
@@ -731,21 +817,17 @@ pub fn evaluate_weekly_joint_risky_forward(
         )?;
         for (scenario, outcome) in &mut results {
             tracing::info!(?scenario, "shared Risky forward scenario started");
-            if let Some(brackets) = &adaptive {
-                brackets.apply(&mut frozen_tapes, &trials, holdout, *scenario)?;
+            if let (Some(brackets), Some(frozen)) = (&adaptive, &mut frozen_tapes) {
+                brackets.apply(frozen, &trials, holdout, *scenario)?;
             }
-            let (tapes, ids) = if *scenario == WeeklyRiskyScenario::PriceAction {
-                (
-                    price_tapes
-                        .as_ref()
-                        .context("missing price action forward tape")?,
-                    price_ids.as_slice(),
-                )
+            let tapes = scenario.tapes(frozen_tapes.as_ref(), price_tapes.as_mut())?;
+            let ids = if scenario.uses_price_action() {
+                price_ids.as_slice()
             } else {
-                (&frozen_tapes, expert_ids.as_slice())
+                expert_ids.as_slice()
             };
             let times = &tapes.times;
-            let order_sizing = scenario.order_sizing(leverage, broker_lots, tapes);
+            let order_sizing = scenario.order_sizing(leverage, lot_grid, price_stop_bounds, tapes);
             let target_ceiling = scenario.target_ceiling(&trials);
             let continuous = account.evaluate_joint_risky_full_size(
                 &tapes.lanes(ids, 0..times.len()),
@@ -769,14 +851,16 @@ pub fn evaluate_weekly_joint_risky_forward(
                 order_sizing,
             )?);
         }
-        report["combined_portfolio_evaluated"] = json!(true);
+        report["combined_portfolio_evaluated"] = json!(run_frozen);
         report["status"] = json!("evaluated");
         report["goal"] = json!(goal);
         if let Some(config) = broker_lots {
-            report["broker_volume_source"] = json!({
-                "symbol_contract_sha256": config.symbol_contract_sha256,
-                "lot_grid": config.grid,
-            });
+            if bound_leverage.is_none() {
+                report["broker_volume_source"] = json!({
+                    "symbol_contract_sha256": config.symbol_contract_sha256,
+                    "lot_grid": config.grid,
+                });
+            }
             report["price_action_recipe"] = json!({
                 "strategy_id": PRICE_ACTION_ID,
                 "trend": "two consecutive complete H1 ranges with higher highs and lows or lower highs and lows, known before the pullback starts",
@@ -785,6 +869,11 @@ pub fn evaluate_weekly_joint_risky_forward(
                 "stop_distance_bounds_pips": config.price_action_stop_bounds_pips,
                 "target_pips": PRICE_ACTION_TARGET_PIPS,
             });
+            if price_risk {
+                report["price_action_recipe"]["short_target_pips"] = json!(
+                    WeeklyRiskyScenario::PriceActionRiskFiveTargetTwelve.price_action_target()
+                );
+            }
         }
         if let Some(brackets) = adaptive {
             report["confidence_full_risk_threshold"] = json!(evaluation.high_quality_confidence);

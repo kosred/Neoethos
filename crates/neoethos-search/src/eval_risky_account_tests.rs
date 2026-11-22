@@ -6,6 +6,7 @@ fn settings() -> BacktestSettings {
             target_balance: 50_000.0,
             continuous_exact_stop_risk: false,
             lot_constraints: None,
+            fixed_leverage: None,
         }),
         initial_equity_override: Some(100.0),
         sl_pips: 4.0,

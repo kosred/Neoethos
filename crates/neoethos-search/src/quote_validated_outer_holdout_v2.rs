@@ -609,12 +609,16 @@ pub struct QuoteReplayLotConstraintsV3 {
 }
 
 impl QuoteReplayLotConstraintsV3 {
-    pub(crate) fn checked_grid(
+    pub fn checked_grid(
         &self,
     ) -> Result<crate::eval::BarReplayLotGridV1, QuoteValidatedOuterHoldoutErrorV1> {
         validate_sha256("lot constraints source", &self.source_artifact_sha256)?;
         crate::eval::BarReplayLotGridV1::new(self.min_lots, self.max_lots, self.lot_step)
             .map_err(|error| binding_error(error.to_string()))
+    }
+
+    pub fn source_artifact_sha256(&self) -> &str {
+        &self.source_artifact_sha256
     }
 
     pub fn new(
