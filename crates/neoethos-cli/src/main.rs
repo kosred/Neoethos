@@ -3018,7 +3018,7 @@ fn cmd_discover_on_budgeted_pool(
                             "feature_frame_cache_receipt_sealed"
                         });
                     }
-                    let (contract, base_units_per_lot) =
+                    let (contract, broker_cost_facts) =
                         canonical_full_run::seal_cpu_research_contract_for_input(
                             settings_ref,
                             &research_inputs.authority_root,
@@ -3098,7 +3098,7 @@ fn cmd_discover_on_budgeted_pool(
                     }
                     let publish_specialists = |research: &neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3| -> Result<()> {
                         let document = match specialist_mode {
-                            Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1 { max_leverage, compare_adaptive }) => {
+                            Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1 { max_leverage, compare_adaptive, compare_lots }) => {
                                 let leverage = if let Some(maximum) = max_leverage {
                                     anyhow::ensure!(
                                         contract.symbol().get(..3) == Some(contract.account_currency()),
@@ -3106,7 +3106,7 @@ fn cmd_discover_on_budgeted_pool(
                                     );
                                     Some(neoethos_search::eval::JointBarFixedNotionalLeverageV1 {
                                         maximum,
-                                        account_notional_per_lot: base_units_per_lot,
+                                        account_notional_per_lot: broker_cost_facts.base_units_per_lot(),
                                     })
                                 } else {
                                     None
@@ -3116,7 +3116,19 @@ fn cmd_discover_on_budgeted_pool(
                                     stop_bounds.sl_min_pips,
                                     stop_bounds.sl_max_pips,
                                 ]);
-                                neoethos_trader::specialist_portfolio::evaluate_weekly_joint_risky_forward(&run_input, research, leverage, adaptive_stop_bounds)?
+                                let broker_lots = if compare_lots {
+                                    anyhow::ensure!(base_timeframe == neoethos_data::CanonicalTimeframe::M15,
+                                        "the lot comparison's price action arm requires M15 source candles");
+                                    let [min, max, step] = broker_cost_facts.lot_limits()?;
+                                    Some(neoethos_trader::specialist_portfolio::BrokerLotComparisonV1 {
+                                        grid: neoethos_search::eval::BarReplayLotGridV1::new(min, max, step)?,
+                                        symbol_contract_sha256: broker_cost_facts.source_sha256(),
+                                        price_action_stop_bounds_pips: [stop_bounds.sl_min_pips, stop_bounds.sl_max_pips],
+                                    })
+                                } else { None };
+                                neoethos_trader::specialist_portfolio::evaluate_weekly_joint_risky_forward(
+                                    &run_input, research, leverage, adaptive_stop_bounds, broker_lots.as_ref(),
+                                )?
                             }
                             Some(canonical_research::SpecialistResearchMode::WalkforwardJointRiskyV1) =>
                                 neoethos_trader::specialist_portfolio::evaluate_walkforward_joint_risky(&run_input, research)?,

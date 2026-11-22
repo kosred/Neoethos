@@ -96,25 +96,16 @@ pub struct BrokerSymbolCostFactsV1 {
 }
 
 impl BrokerSymbolCostFactsV1 {
-    fn validate_risky_lot_constraints(
-        &self,
-        costs: &ScreeningCostEnvelopeWireV2,
-        settings: &neoethos_core::Settings,
-    ) -> Result<()> {
-        let Some(grid) = &settings.models.discovery_runtime.risky_lot_constraints else {
-            return Ok(());
-        };
-        ensure_canonical_sha256(&grid.source_artifact_sha256, "Risky lot constraints")?;
-        let actual_source = format!("{:x}", self.source_sha256);
-        let cost_source = costs
-            .source_components
-            .iter()
-            .find(|component| component.role == "broker_symbol_contract")
-            .context("Risky lot constraints omit broker symbol source")?;
-        ensure!(
-            grid.source_artifact_sha256 == actual_source && cost_source.sha256 == actual_source,
-            "Risky lot constraints source does not match the exact broker symbol bytes"
-        );
+    pub fn base_units_per_lot(&self) -> f64 {
+        self.lot_size_cents as f64 / 100.0
+    }
+
+    pub fn source_sha256(&self) -> String {
+        format!("{:x}", self.source_sha256)
+    }
+
+    /// Read min, max, and step in lots from the verified broker symbol bytes.
+    pub fn lot_limits(&self) -> Result<[f64; 3]> {
         let mut wire = [0_i64; 3];
         for (index, name) in ["minVolume", "maxVolume", "stepVolume"].iter().enumerate() {
             wire[index] = self.quantity_volume_cents[index]
@@ -128,13 +119,32 @@ impl BrokerSymbolCostFactsV1 {
             wire[0] <= wire[1] && wire[2] <= wire[1],
             "broker lot constraints min/step exceed maximum volume"
         );
-        // Both quantities and lotSize are centi-units. Compare their ratio
-        // directly; this is input verification, not another rounding owner.
-        for (index, configured) in [grid.min_lots, grid.max_lots, grid.lot_step]
+        Ok(wire.map(|volume| volume as f64 / self.lot_size_cents as f64))
+    }
+
+    fn validate_risky_lot_constraints(
+        &self,
+        costs: &ScreeningCostEnvelopeWireV2,
+        settings: &neoethos_core::Settings,
+    ) -> Result<()> {
+        let Some(grid) = &settings.models.discovery_runtime.risky_lot_constraints else {
+            return Ok(());
+        };
+        ensure_canonical_sha256(&grid.source_artifact_sha256, "Risky lot constraints")?;
+        let actual_source = self.source_sha256();
+        let cost_source = costs
+            .source_components
             .iter()
-            .enumerate()
+            .find(|component| component.role == "broker_symbol_contract")
+            .context("Risky lot constraints omit broker symbol source")?;
+        ensure!(
+            grid.source_artifact_sha256 == actual_source && cost_source.sha256 == actual_source,
+            "Risky lot constraints source does not match the exact broker symbol bytes"
+        );
+        for (configured, expected) in [grid.min_lots, grid.max_lots, grid.lot_step]
+            .into_iter()
+            .zip(self.lot_limits()?)
         {
-            let expected = wire[index] as f64 / self.lot_size_cents as f64;
             ensure!(
                 configured.is_finite() && configured.to_bits() == expected.to_bits(),
                 "Risky lot constraints value differs from exact broker volume/lotSize"

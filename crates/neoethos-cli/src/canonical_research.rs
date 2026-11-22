@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 30] = [
+const OPTIONAL: [&str; 31] = [
     "--higher",
     "--population",
     "--generations",
@@ -57,6 +57,7 @@ const OPTIONAL: [&str; 30] = [
     "--specialist-portfolio",
     "--shared-account-max-leverage",
     "--shared-account-adaptive-comparison",
+    "--shared-account-lot-comparison",
     "--new-search-research",
     "--new-search-research-sha256",
     "--prefilter-ranking-audit-out",
@@ -622,6 +623,7 @@ fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String
             "--specialist-portfolio",
             "--shared-account-max-leverage",
             "--shared-account-adaptive-comparison",
+            "--shared-account-lot-comparison",
             "--training-percent",
             "--research-full-forward",
             "--screening-round-trip-pips",
@@ -651,6 +653,7 @@ pub(crate) enum SpecialistResearchMode {
     WeeklyJointRiskyForwardV1 {
         max_leverage: Option<std::num::NonZeroU32>,
         compare_adaptive: bool,
+        compare_lots: bool,
     },
 }
 
@@ -662,16 +665,23 @@ pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResear
         .map(|value| value.parse())
         .transpose()
         .context("--shared-account-max-leverage requires a positive integer")?;
-    let adaptive_flag = "--shared-account-adaptive-comparison";
-    let compare_adaptive = optional_inputs(args, &[adaptive_flag])?
-        .get(adaptive_flag)
-        .map(|value| value.parse::<bool>())
-        .transpose()
-        .context("--shared-account-adaptive-comparison requires true or false")?
-        .unwrap_or(false);
+    let comparison_enabled = |flag: &str| -> Result<bool> {
+        Ok(optional_inputs(args, &[flag])?
+            .get(flag)
+            .map(|value| value.parse::<bool>())
+            .transpose()
+            .with_context(|| format!("{flag} requires true or false"))?
+            .unwrap_or(false))
+    };
+    let compare_adaptive = comparison_enabled("--shared-account-adaptive-comparison")?;
+    let compare_lots = comparison_enabled("--shared-account-lot-comparison")?;
     ensure!(
         !compare_adaptive || max_leverage.is_some(),
         "--shared-account-adaptive-comparison true requires --shared-account-max-leverage"
+    );
+    ensure!(
+        !compare_lots || (max_leverage.is_some() && !compare_adaptive),
+        "--shared-account-lot-comparison true requires fixed leverage and a dedicated replay"
     );
     if max_leverage.is_some() {
         ensure!(
@@ -692,6 +702,7 @@ pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResear
         "weekly-joint-risky-forward-v1" => SpecialistResearchMode::WeeklyJointRiskyForwardV1 {
             max_leverage,
             compare_adaptive,
+            compare_lots,
         },
         _ => anyhow::bail!(
             "--specialist-portfolio expects true, joint-v2, continual-v3, risky-v4, walkforward-joint-risky-v1, or weekly-joint-risky-forward-v1"

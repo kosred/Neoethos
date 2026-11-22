@@ -14,7 +14,7 @@ use crate::{
 mod portfolio;
 pub use portfolio::{
     JointBarAccountPolicyV1, JointBarAccountResultV1, JointBarFixedNotionalLeverageV1,
-    JointBarLaneV1, JointBarRiskyOrderSizingV1,
+    JointBarLaneV1, JointBarPriceStopLevelsV1, JointBarRiskyOrderSizingV1,
 };
 
 /// All decision fields belong to the same just-closed signal row. The next
@@ -260,7 +260,7 @@ impl PreparedNettedCanonicalBarResearchV1 {
         tape: NettedBarDecisionTapeV1<'_>,
         lot_grid: Option<BarReplayLotGridV1>,
     ) -> Result<NettedBarResearchResultV1> {
-        let lot_grid = self.settings.resolved_lot_grid(lot_grid)?;
+        let lot_grid = self.settings.resolved_lot_grid(lot_grid, false)?;
         self.validate_tape(tape)?;
         let mut state = NettedBarCoreState {
             tape,

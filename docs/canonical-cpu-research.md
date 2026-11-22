@@ -837,6 +837,21 @@ absolute stop bounds still apply. The first 96 source bars use neutral scaling.
 The comparison report contains a separate ledger and weekly cadence for each
 scenario. Each scenario uses the same fixed gross leverage admission rule.
 
+Use `--shared-account-lot-comparison true` with fixed leverage and an exact
+M15 saved result to compare execution and one price-action baseline. The
+control repeats the frozen fractional-lot replay. The lot-grid account rounds
+orders down within the verified symbol's min, max and step. A second lot-grid
+account also reduces a request to fit the remaining fixed margin and aggregate
+stop-risk budget, rounding down again as needed. A third uses that same sizing
+with one position at a time. For the last account, the price-action tape uses
+two complete consecutive H1 ranges available before the M15 pullback. A
+countertrend M15 candle followed by a close beyond its range in the trend
+direction supplies a signal. The stop is the pair's price extreme. The modeled
+fill must leave the stop inside the configured pip bounds and the target is
+20 pips. The report includes the lot contract hash, requested sizes and actual
+admission outcomes. These are historical OHLC runs with a fixed leverage
+assumption and the original scalar costs.
+
 ### Continual specialist research V3
 
 `canonical-research --specialist-portfolio continual-v3` writes

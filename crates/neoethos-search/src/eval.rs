@@ -22,9 +22,9 @@ pub type SmcRow = [i8; 11];
 mod netted_bar_research;
 pub use netted_bar_research::{
     BarReplayLotGridV1, JointBarAccountPolicyV1, JointBarAccountResultV1,
-    JointBarFixedNotionalLeverageV1, JointBarLaneV1, JointBarRiskyOrderSizingV1,
-    NettedBarDecisionTapeV1, NettedBarResearchResultV1, PreparedNettedCanonicalBarResearchV1,
-    TerminalBarPositionV1,
+    JointBarFixedNotionalLeverageV1, JointBarLaneV1, JointBarPriceStopLevelsV1,
+    JointBarRiskyOrderSizingV1, NettedBarDecisionTapeV1, NettedBarResearchResultV1,
+    PreparedNettedCanonicalBarResearchV1, TerminalBarPositionV1,
 };
 
 /// Metrics retain their canonical eleven-slot layout; cadence is an explicit
@@ -802,9 +802,11 @@ impl BacktestSettings {
     pub(crate) fn resolved_lot_grid(
         &self,
         supplied: Option<BarReplayLotGridV1>,
+        use_rounded_risky_order_policy: bool,
     ) -> anyhow::Result<Option<BarReplayLotGridV1>> {
         anyhow::ensure!(
-            supplied.is_none()
+            use_rounded_risky_order_policy
+                || supplied.is_none()
                 || !self
                     .risky_account_experiment
                     .as_ref()
@@ -1244,7 +1246,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
         "continuous exact Risky replay requires account-risk sizing"
     );
     let lot_grid = settings
-        .resolved_lot_grid(netted.as_ref().and_then(|state| state.lot_grid))
+        .resolved_lot_grid(netted.as_ref().and_then(|state| state.lot_grid), false)
         .expect("invalid account lot constraints");
     let month_capacity = netted
         .as_ref()

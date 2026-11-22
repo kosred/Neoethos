@@ -556,7 +556,7 @@ fn active_research_costs_worker() {
             PopulationTemplateResolver::new(&config, None).template(&Gene::default());
         assert!(search_settings.risky_account_experiment.is_some());
         assert_eq!(
-            search_settings.resolved_lot_grid(None).unwrap(),
+            search_settings.resolved_lot_grid(None, false).unwrap(),
             Some(crate::eval::BarReplayLotGridV1::new(0.01, 1.0, 0.01).unwrap())
         );
         assert_eq!(

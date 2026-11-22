@@ -21,7 +21,9 @@ mod joint;
 pub use joint::evaluate as evaluate_joint;
 pub use joint::evaluate_continual;
 pub use joint::evaluate_risky;
-pub use joint::{evaluate_walkforward_joint_risky, evaluate_weekly_joint_risky_forward};
+pub use joint::{
+    BrokerLotComparisonV1, evaluate_walkforward_joint_risky, evaluate_weekly_joint_risky_forward,
+};
 
 const STATES: [&str; 4] = [
     "hourly_up",

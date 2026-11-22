@@ -381,6 +381,6 @@ fn risky_lot_grid_is_optional_on_old_wire_and_rejects_unchecked_metadata() {
             "lot_constraints":{"min_lots":min,"max_lots":max,"lot_step":step,
                 "source_artifact_sha256":source}});
         let untrusted: RiskyAccountExperimentV1 = serde_json::from_value(wire).unwrap();
-        assert!(untrusted.validate(100.0).is_err());
+        assert!(untrusted.validate(100.0, (0.30, 0.30)).is_err());
     }
 }

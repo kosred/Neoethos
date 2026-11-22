@@ -377,8 +377,8 @@ pub fn build_cost_assumptions(args: &[String], settings: &neoethos_core::Setting
 /// ordinary adaptive CPU vocabulary that the caller has already materialized.
 /// Both routes require the same exact acquisition plan, matrix, broker symbol,
 /// settings bytes, and D1-derived cost envelope. The returned contract remains
-/// `ResearchOnly` and `NotPromotionEligible`. Also return the verified base
-/// units per lot for the optional fixed-leverage replay.
+/// `ResearchOnly` and `NotPromotionEligible`. Also return the verified symbol
+/// facts used for base notional and optional volume constraints.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn seal_cpu_research_contract_for_input(
     settings: &neoethos_core::Settings,
@@ -395,7 +395,7 @@ pub(crate) fn seal_cpu_research_contract_for_input(
     screening_round_trip_pips: Option<f64>,
 ) -> Result<(
     neoethos_search::CanonicalTrendbarResearchExecutionContractV3,
-    f64,
+    neoethos_broker_history::canonical_research_costs::BrokerSymbolCostFactsV1,
 )> {
     let plan_receipt = CanonicalTrendbarPlanReceiptV1::from_sha256(plan_sha256.to_owned())?;
     let matrix_receipt = CanonicalTrendbarMatrixReceiptV1::from_sha256(matrix_sha256.to_owned())?;
@@ -474,7 +474,7 @@ pub(crate) fn seal_cpu_research_contract_for_input(
         },
     )?;
     contract.validate_against_receipt(&receipt)?;
-    Ok((contract, costs.pip_value_quote_per_lot / costs.pip_size))
+    Ok((contract, broker_cost_facts))
 }
 
 pub(crate) fn ensure_cpu_research_output_target(

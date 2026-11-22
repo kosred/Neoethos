@@ -441,6 +441,66 @@ fn joint_lot_grid_rounds_down_and_rejected_entries_do_not_occupy_slots() {
 }
 
 #[test]
+fn explicit_rounded_joint_replay_can_use_the_frozen_fractional_recipe() {
+    let mut run = prepared(&[100.; 3], &[100., 100., 104.], &[100.; 3]);
+    run.settings.risk_per_trade_min = 0.30;
+    run.settings.risk_per_trade_max = 0.30;
+    run.settings.risky_account_experiment = Some(crate::eval::RiskyAccountExperimentV1 {
+        target_balance: 50_000.0,
+        continuous_exact_stop_risk: true,
+        lot_constraints: None,
+    });
+    let tape = NettedBarDecisionTapeV1 {
+        signals: &[1, 0, 0],
+        confidences: &[1.; 3],
+        sl_pips: &[9.5; 3],
+        tp_pips: &[4.; 3],
+        ml_multipliers: &[1.; 3],
+    };
+    let lanes = [JointBarLaneV1 {
+        expert_id: "archived",
+        tape,
+    }];
+    let exact_sizing = JointBarRiskyOrderSizingV1 {
+        leverage: Some(JointBarFixedNotionalLeverageV1 {
+            maximum: std::num::NonZeroU32::new(400).unwrap(),
+            account_notional_per_lot: 100_000.0,
+        }),
+        confidence_risk_floor: None,
+        lot_grid: None,
+        fit_to_buying_power: false,
+        max_open_positions: 3,
+        price_stops: None,
+    };
+    let grid = BarReplayLotGridV1::new(1., 10., 1.).unwrap();
+    let rounded_sizing = JointBarRiskyOrderSizingV1 {
+        lot_grid: Some(grid),
+        ..exact_sizing
+    };
+
+    let exact = run
+        .evaluate_joint_risky_full_size(&lanes, 20., false, None, exact_sizing)
+        .unwrap();
+    let rounded = run
+        .evaluate_joint_risky_full_size(&lanes, 20., false, None, rounded_sizing)
+        .unwrap();
+    near(exact.closed_trades[0].terms.lots, 300.0 / 95.0);
+    near(rounded.closed_trades[0].terms.lots, 3.);
+    assert_eq!(exact.lot_grid, None);
+    assert_eq!(rounded.lot_grid, Some(grid));
+    assert!(run.evaluate(tape, Some(grid)).is_err());
+
+    let policy = run.settings.risky_account_experiment.as_mut().unwrap();
+    policy.continuous_exact_stop_risk = false;
+    policy.lot_constraints =
+        Some(crate::QuoteReplayLotConstraintsV3::new(0.5, 10., 0.5, "a".repeat(64)).unwrap());
+    assert!(
+        run.evaluate_joint_risky_full_size(&lanes, 20., false, None, rounded_sizing)
+            .is_err()
+    );
+}
+
+#[test]
 fn joint_single_lane_reuses_legacy_price_cost_and_compounding_arithmetic() {
     let mut run = prepared(&[100.; 5], &[100., 100., 104., 100., 104.], &[100.; 5]);
     run.settings.spread_pips = 0.2;
