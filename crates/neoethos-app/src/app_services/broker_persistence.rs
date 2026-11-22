@@ -160,7 +160,7 @@ fn load_from_filesystem() -> BrokerSettingsState {
 fn load_from_path(path: &std::path::Path) -> BrokerSettingsState {
     match neoethos_core::broker_config::load_from_disk(path) {
         Ok(Some(s)) => {
-            tracing::info!(
+            tracing::debug!(
                 path = %path.display(),
                 schema_version = %s.schema_version,
                 "loaded broker credentials from disk"

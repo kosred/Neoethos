@@ -287,11 +287,11 @@ impl PreparedNettedCanonicalBarResearchV1 {
         record_trace: bool,
         goal: Option<RiskyGrowthGoal>,
     ) -> Result<JointBarAccountResultV1> {
+        let policy = policy.into();
         ensure!(
-            lanes.len() <= 256,
+            policy.exact_stop_risk_per_entry.is_some() || lanes.len() <= 256,
             "bounded research supports at most 256 archived expert lanes"
         );
-        let policy = policy.into();
         let settings = &self.settings;
         ensure!(
             settings.risk_based_sizing

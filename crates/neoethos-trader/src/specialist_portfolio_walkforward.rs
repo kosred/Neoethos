@@ -3,6 +3,7 @@ use super::*;
 use neoethos_search::data_selection::CanonicalSearchArtifactScopeRefV1;
 use neoethos_search::scoring::weekly_cadence::complete_week_entry_counts_v1;
 use std::collections::BTreeMap;
+use std::mem::size_of;
 use std::ops::Range;
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -25,6 +26,7 @@ struct FrozenTrial<'a> {
 
 fn frozen_walkforward_trials(
     research: &CanonicalTrendbarResearchDiscoveryResultV3,
+    lane_limit: Option<usize>,
 ) -> Result<Vec<FrozenTrial<'_>>> {
     let source = research.discovery_result();
     let funnel = source
@@ -47,10 +49,12 @@ fn frozen_walkforward_trials(
     if survivors.is_empty() {
         return Ok(Vec::new());
     }
-    ensure!(
-        survivors.len() <= 256,
-        "joint replay supports at most 256 frozen lanes"
-    );
+    if let Some(limit) = lane_limit {
+        ensure!(
+            survivors.len() <= limit,
+            "joint replay supports at most {limit} frozen lanes"
+        );
+    }
     let calibrated = match (
         source.calibration_scope()?,
         &funnel.selection_calibration_cohort,
@@ -148,6 +152,29 @@ impl DirectTapes {
         let window = scope.evaluated_window();
         let start = usize::try_from(window.row_start())?;
         let end = usize::try_from(window.row_end())?;
+        if trials.len() > 256 {
+            // Vote synthesis holds one signal and one confidence per row. The
+            // routed tapes add a signal, confidence, stop and target per row.
+            let cell_bytes = 2 * size_of::<i8>() + 4 * size_of::<f64>();
+            let rows = end.checked_sub(start).context("invalid frozen window")?;
+            let estimated_bytes = rows
+                .checked_mul(trials.len())
+                .and_then(|cells| cells.checked_mul(cell_bytes))
+                .context("frozen replay tape size overflow")?;
+            let tape_budget = neoethos_core::allocation_headroom_bytes() / 2;
+            ensure!(
+                estimated_bytes as u64 <= tape_budget,
+                "{} frozen lanes require {estimated_bytes} bytes of vote and decision tapes, above the {tape_budget}-byte budget",
+                trials.len()
+            );
+            tracing::info!(
+                lanes = trials.len(),
+                rows,
+                estimated_bytes,
+                tape_budget,
+                "expanded frozen cohort admitted for shared-account replay"
+            );
+        }
         let bars = neoethos_data::slice_ohlcv(input.ohlcv(), start, end, None);
         let features = project_features_to_effective(
             &input.features().row_window(start, end)?,
@@ -208,7 +235,7 @@ pub fn evaluate_walkforward_joint_risky(
         let calibration = source
             .calibration_scope()?
             .context("missing saved calibration")?;
-        let trials = frozen_walkforward_trials(research)?;
+        let trials = frozen_walkforward_trials(research, Some(256))?;
         ensure!(
             !trials.is_empty(),
             "joint replay requires a nonempty frozen cohort"
@@ -327,7 +354,7 @@ pub fn evaluate_weekly_joint_risky_forward(
         let holdout = source
             .holdout_scope()?
             .context("missing locked forward scope")?;
-        let trials = frozen_walkforward_trials(research)?;
+        let trials = frozen_walkforward_trials(research, None)?;
         let mut report = json!({
             "schema": "neoethos.weekly-joint-risky-forward.v1",
             "backend": "canonical_cpu",
