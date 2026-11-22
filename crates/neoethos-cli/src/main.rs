@@ -2303,9 +2303,10 @@ fn cmd_discover_on_budgeted_pool(
             !specialists || canonical_cpu_research.is_some(),
             "specialist portfolio requires canonical research inputs"
         );
-        if specialist_mode
-            == Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1)
-        {
+        if matches!(
+            specialist_mode,
+            Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1 { .. })
+        ) {
             let inputs = canonical_cpu_research
                 .as_ref()
                 .context("missing research inputs")?;
@@ -2899,9 +2900,9 @@ fn cmd_discover_on_budgeted_pool(
             let mut quote_evidence = Vec::new();
             let mut locked_finalists = Vec::new();
             let specialist_suffix = match specialist_mode {
-                Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1) => {
-                    "weekly-joint-risky-forward"
-                }
+                Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1 {
+                    ..
+                }) => "weekly-joint-risky-forward",
                 Some(canonical_research::SpecialistResearchMode::WalkforwardJointRiskyV1) => {
                     "walkforward-joint-risky"
                 }
@@ -3017,20 +3018,21 @@ fn cmd_discover_on_budgeted_pool(
                             "feature_frame_cache_receipt_sealed"
                         });
                     }
-                    let contract = canonical_full_run::seal_cpu_research_contract_for_input(
-                        settings_ref,
-                        &research_inputs.authority_root,
-                        std::path::Path::new(&root),
-                        &research_inputs.plan_sha256,
-                        &research_inputs.matrix_sha256,
-                        &symbol,
-                        base_timeframe,
-                        &research_inputs.cost_assumptions,
-                        &research_inputs.broker_symbol_contract,
-                        &research_inputs.settings_source,
-                        receipt,
-                        research_inputs.screening_round_trip_pips,
-                    )?;
+                    let (contract, base_units_per_lot) =
+                        canonical_full_run::seal_cpu_research_contract_for_input(
+                            settings_ref,
+                            &research_inputs.authority_root,
+                            std::path::Path::new(&root),
+                            &research_inputs.plan_sha256,
+                            &research_inputs.matrix_sha256,
+                            &symbol,
+                            base_timeframe,
+                            &research_inputs.cost_assumptions,
+                            &research_inputs.broker_symbol_contract,
+                            &research_inputs.settings_source,
+                            receipt,
+                            research_inputs.screening_round_trip_pips,
+                        )?;
                     let research_defaults = neoethos_search::DiscoveryConfig::try_from_settings_for_canonical_trendbar_research(
                         settings_ref,
                         &contract,
@@ -3096,8 +3098,26 @@ fn cmd_discover_on_budgeted_pool(
                     }
                     let publish_specialists = |research: &neoethos_search::CanonicalTrendbarResearchDiscoveryResultV3| -> Result<()> {
                         let document = match specialist_mode {
-                            Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1) =>
-                                neoethos_trader::specialist_portfolio::evaluate_weekly_joint_risky_forward(&run_input, research)?,
+                            Some(canonical_research::SpecialistResearchMode::WeeklyJointRiskyForwardV1 { max_leverage, compare_adaptive }) => {
+                                let leverage = if let Some(maximum) = max_leverage {
+                                    anyhow::ensure!(
+                                        contract.symbol().get(..3) == Some(contract.account_currency()),
+                                        "fixed leverage replay requires an account denominated in the FX base currency"
+                                    );
+                                    Some(neoethos_search::eval::JointBarFixedNotionalLeverageV1 {
+                                        maximum,
+                                        account_notional_per_lot: base_units_per_lot,
+                                    })
+                                } else {
+                                    None
+                                };
+                                let stop_bounds = &settings_ref.models.gene_stop_bounds;
+                                let adaptive_stop_bounds = compare_adaptive.then_some([
+                                    stop_bounds.sl_min_pips,
+                                    stop_bounds.sl_max_pips,
+                                ]);
+                                neoethos_trader::specialist_portfolio::evaluate_weekly_joint_risky_forward(&run_input, research, leverage, adaptive_stop_bounds)?
+                            }
                             Some(canonical_research::SpecialistResearchMode::WalkforwardJointRiskyV1) =>
                                 neoethos_trader::specialist_portfolio::evaluate_walkforward_joint_risky(&run_input, research)?,
                             Some(canonical_research::SpecialistResearchMode::RiskyV4) =>

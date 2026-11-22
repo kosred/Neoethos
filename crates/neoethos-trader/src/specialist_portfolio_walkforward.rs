@@ -1,6 +1,7 @@
 //! Frozen Risky walk-forward survivors replayed concurrently on one account.
 use super::*;
 use neoethos_search::data_selection::CanonicalSearchArtifactScopeRefV1;
+use neoethos_search::eval::{JointBarFixedNotionalLeverageV1, JointBarRiskyOrderSizingV1};
 use neoethos_search::scoring::weekly_cadence::complete_week_entry_counts_v1;
 use std::collections::BTreeMap;
 use std::mem::size_of;
@@ -341,9 +342,128 @@ fn maximum_target(trials: &[FrozenTrial<'_>]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+const FAST_ATR: usize = 14;
+const SLOW_ATR: usize = 96;
+const ATR_SCALE: [f64; 2] = [0.5, 2.0];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WeeklyRiskyScenario {
+    Fixed,
+    AdaptiveRisk,
+    AdaptiveTp,
+    AdaptiveSl,
+}
+
+impl WeeklyRiskyScenario {
+    const ALL: [Self; 4] = [
+        Self::Fixed,
+        Self::AdaptiveRisk,
+        Self::AdaptiveTp,
+        Self::AdaptiveSl,
+    ];
+
+    fn order_sizing(
+        self,
+        leverage: Option<JointBarFixedNotionalLeverageV1>,
+    ) -> JointBarRiskyOrderSizingV1 {
+        JointBarRiskyOrderSizingV1 {
+            leverage,
+            confidence_risk_floor: (self == Self::AdaptiveRisk).then_some(
+                neoethos_core::domain::risky_mode::RISKY_MODE_DEFAULT_RISK_PER_TRADE_FRACTION,
+            ),
+        }
+    }
+
+    fn target_ceiling(self, trials: &[FrozenTrial<'_>]) -> f64 {
+        let target = maximum_target(trials);
+        if self == Self::AdaptiveTp {
+            target * ATR_SCALE[1]
+        } else {
+            target
+        }
+    }
+}
+
+struct AdaptiveWeeklyBrackets {
+    multipliers: Vec<f64>,
+    stop_bounds: [f64; 2],
+}
+
+impl AdaptiveWeeklyBrackets {
+    fn from_input(input: &CanonicalSearchRunInputV2<'_>, stop_bounds: [f64; 2]) -> Result<Self> {
+        ensure!(
+            stop_bounds.iter().all(|x| x.is_finite() && *x > 0.0)
+                && stop_bounds[0] <= stop_bounds[1],
+            "adaptive SL comparison requires ordered positive bounds"
+        );
+        let bars = input.ohlcv();
+        let fast =
+            neoethos_search::stop_target::compute_atr(&bars.high, &bars.low, &bars.close, FAST_ATR);
+        let slow =
+            neoethos_search::stop_target::compute_atr(&bars.high, &bars.low, &bars.close, SLOW_ATR);
+        let multipliers = fast
+            .into_iter()
+            .zip(slow)
+            .enumerate()
+            .map(|(row, (fast, slow))| {
+                if row < SLOW_ATR {
+                    return Ok(1.0);
+                }
+                ensure!(
+                    fast.is_finite() && fast > 0.0 && slow.is_finite() && slow > 0.0,
+                    "invalid ATR scale on completed bar {row}"
+                );
+                Ok((fast / slow).clamp(ATR_SCALE[0], ATR_SCALE[1]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            multipliers,
+            stop_bounds,
+        })
+    }
+
+    fn apply(
+        &self,
+        tapes: &mut DirectTapes,
+        trades: &[FrozenTrial<'_>],
+        scope: &CanonicalSearchArtifactScopeV2,
+        scenario: WeeklyRiskyScenario,
+    ) -> Result<()> {
+        let window = scope.evaluated_window();
+        let range = usize::try_from(window.row_start())?..usize::try_from(window.row_end())?;
+        let multipliers = self
+            .multipliers
+            .get(range)
+            .context("ATR scale does not cover the replay scope")?;
+        // Reuse the prepared tapes across scenarios. Restore the other leg from
+        // the frozen gene so each arm changes one bracket on the signal row.
+        for (tape, trial) in tapes.tapes.iter_mut().zip(trades) {
+            for (row, &scale) in multipliers.iter().enumerate() {
+                if tape.signals[row] == 0 {
+                    continue;
+                }
+                tape.targets[row] = trial.gene.tp_pips;
+                tape.stops[row] = trial.gene.sl_pips;
+                match scenario {
+                    WeeklyRiskyScenario::AdaptiveTp => tape.targets[row] *= scale,
+                    WeeklyRiskyScenario::AdaptiveSl => {
+                        tape.stops[row] = (tape.stops[row] * scale)
+                            .clamp(self.stop_bounds[0], self.stop_bounds[1]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn evaluate_weekly_joint_risky_forward(
     input: &CanonicalSearchRunInputV2<'_>,
     research: &CanonicalTrendbarResearchDiscoveryResultV3,
+    leverage: Option<JointBarFixedNotionalLeverageV1>,
+    adaptive_stop_bounds: Option<[f64; 2]>,
 ) -> Result<Value> {
     neoethos_search::discovery::with_saved_research_execution(input, research, || {
         let source = research.discovery_result();
@@ -356,7 +476,13 @@ pub fn evaluate_weekly_joint_risky_forward(
             .context("missing locked forward scope")?;
         let trials = frozen_walkforward_trials(research, None)?;
         let mut report = json!({
-            "schema": "neoethos.weekly-joint-risky-forward.v1",
+            "schema": if adaptive_stop_bounds.is_some() {
+                "neoethos.weekly-joint-risky-forward.adaptive-comparison.v1"
+            } else if leverage.is_some() {
+                "neoethos.weekly-joint-risky-forward.leverage.v1"
+            } else {
+                "neoethos.weekly-joint-risky-forward.v1"
+            },
             "backend": "canonical_cpu",
             "promotion_eligible": false,
             "source_evidence_sha256": research.evidence_identity_sha256(),
@@ -372,45 +498,105 @@ pub fn evaluate_weekly_joint_risky_forward(
         }
         let (policy, evaluation, goal) = frozen_risky_recipe(research)?;
         let training = &source.selection_scope;
-        let training_goals = {
-            let tapes =
-                DirectTapes::prepare(input, research, training, &trials, policy, &evaluation)?;
-            joint_goal_windows(
-                &tapes,
-                &trials,
-                input,
-                research,
-                training,
-                &evaluation,
-                goal,
-            )?
+        let adaptive = adaptive_stop_bounds
+            .map(|bounds| AdaptiveWeeklyBrackets::from_input(input, bounds))
+            .transpose()?;
+        let modes: &[WeeklyRiskyScenario] = if adaptive.is_some() {
+            &WeeklyRiskyScenario::ALL
+        } else {
+            &WeeklyRiskyScenario::ALL[..1]
         };
-        let tapes = DirectTapes::prepare(input, research, holdout, &trials, policy, &evaluation)?;
-        let times = &tapes.times;
+        let mut results = Vec::with_capacity(modes.len());
+        {
+            let mut tapes =
+                DirectTapes::prepare(input, research, training, &trials, policy, &evaluation)?;
+            for &scenario in modes {
+                tracing::info!(?scenario, "shared Risky training scenario started");
+                if let Some(brackets) = &adaptive {
+                    brackets.apply(&mut tapes, &trials, training, scenario)?;
+                }
+                let training_goals = joint_goal_windows(
+                    &tapes,
+                    &trials,
+                    input,
+                    research,
+                    training,
+                    &evaluation,
+                    goal,
+                    leverage,
+                    scenario,
+                )?;
+                results.push((scenario, json!({"training_goal_windows": training_goals})));
+            }
+        }
+        let mut tapes =
+            DirectTapes::prepare(input, research, holdout, &trials, policy, &evaluation)?;
         let account = PreparedNettedCanonicalBarResearchV1::from_input(
             input,
             holdout,
             research.execution_contract(),
             &evaluation,
         )?;
-        let target_ceiling = maximum_target(&trials);
-        let continuous = account.evaluate_joint_exact_risky(
-            &tapes.lanes(&trials, 0..times.len()),
-            target_ceiling,
-            true,
-            None,
-        )?;
-        let weekly =
-            forward_weekly_admissions(&continuous, &trials, times[0], times[times.len() - 1])?;
-        let goals =
-            joint_goal_windows(&tapes, &trials, input, research, holdout, &evaluation, goal)?;
+        for (scenario, outcome) in &mut results {
+            tracing::info!(?scenario, "shared Risky forward scenario started");
+            if let Some(brackets) = &adaptive {
+                brackets.apply(&mut tapes, &trials, holdout, *scenario)?;
+            }
+            let times = &tapes.times;
+            let continuous = account.evaluate_joint_risky_full_size(
+                &tapes.lanes(&trials, 0..times.len()),
+                scenario.target_ceiling(&trials),
+                true,
+                None,
+                scenario.order_sizing(leverage),
+            )?;
+            outcome["weekly_admissions"] =
+                forward_weekly_admissions(&continuous, &trials, times[0], times[times.len() - 1])?;
+            outcome["continuous_shared_account"] = ledger(continuous, times)?;
+            outcome["goal_windows"] = json!(joint_goal_windows(
+                &tapes,
+                &trials,
+                input,
+                research,
+                holdout,
+                &evaluation,
+                goal,
+                leverage,
+                *scenario,
+            )?);
+        }
         report["combined_portfolio_evaluated"] = json!(true);
         report["status"] = json!("evaluated");
         report["goal"] = json!(goal);
-        report["weekly_admissions"] = weekly;
-        report["continuous_shared_account"] = ledger(continuous, times)?;
-        report["training_goal_windows"] = json!(training_goals);
-        report["goal_windows"] = json!(goals);
+        if let Some(brackets) = adaptive {
+            report["confidence_full_risk_threshold"] = json!(evaluation.high_quality_confidence);
+            report["adaptive_brackets"] = json!({
+                "source": "causal_ema_true_range_ratio_on_signal_bar",
+                "fast_period": FAST_ATR, "slow_period": SLOW_ATR,
+                "scale_bounds": ATR_SCALE, "warmup_rows_at_fixed_brackets": SLOW_ATR,
+                "stop_bounds_pips": brackets.stop_bounds,
+            });
+            report["scenarios"] = json!(
+                results
+                    .into_iter()
+                    .map(|(scenario, mut outcome)| {
+                        outcome["scenario"] = json!(scenario);
+                        outcome
+                    })
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            let (_, outcome) = results
+                .pop()
+                .context("fixed Risky replay result is absent")?;
+            let Value::Object(mut fields) = outcome else {
+                anyhow::bail!("invalid Risky replay report");
+            };
+            report
+                .as_object_mut()
+                .context("invalid joint replay document")?
+                .append(&mut fields);
+        }
         Ok(report)
     })
 }
@@ -464,6 +650,7 @@ fn forward_weekly_admissions(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn joint_goal_windows(
     tapes: &DirectTapes,
     trials: &[FrozenTrial<'_>],
@@ -472,6 +659,8 @@ fn joint_goal_windows(
     scope: &CanonicalSearchArtifactScopeV2,
     evaluation: &EvaluationConfig,
     goal: RiskyGrowthGoal,
+    leverage: Option<JointBarFixedNotionalLeverageV1>,
+    scenario: WeeklyRiskyScenario,
 ) -> Result<Vec<Value>> {
     let first_row = usize::try_from(scope.evaluated_window().row_start())?;
     let role = scope.evaluated_window().role();
@@ -483,7 +672,7 @@ fn joint_goal_windows(
         _ => anyhow::bail!("shared goal windows require training or holdout input"),
     };
     let times = &tapes.times;
-    let target_ceiling = maximum_target(trials);
+    let target_ceiling = scenario.target_ceiling(trials);
     let duration = (goal.horizon_days * 86_400_000.0) as i64;
     let mut start = 0;
     let mut windows = Vec::new();
@@ -508,11 +697,12 @@ fn joint_goal_windows(
             research.execution_contract(),
             evaluation,
         )?;
-        let result = account.evaluate_joint_exact_risky(
+        let result = account.evaluate_joint_risky_full_size(
             &tapes.lanes(trials, start..end),
             target_ceiling,
             true,
             Some(goal),
+            scenario.order_sizing(leverage),
         )?;
         windows.push(json!({
             "window": windows.len() + 1,

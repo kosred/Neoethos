@@ -21,7 +21,8 @@ pub type SmcRow = [i8; 11];
 #[path = "netted_bar_research.rs"]
 mod netted_bar_research;
 pub use netted_bar_research::{
-    BarReplayLotGridV1, JointBarAccountPolicyV1, JointBarAccountResultV1, JointBarLaneV1,
+    BarReplayLotGridV1, JointBarAccountPolicyV1, JointBarAccountResultV1,
+    JointBarFixedNotionalLeverageV1, JointBarLaneV1, JointBarRiskyOrderSizingV1,
     NettedBarDecisionTapeV1, NettedBarResearchResultV1, PreparedNettedCanonicalBarResearchV1,
     TerminalBarPositionV1,
 };

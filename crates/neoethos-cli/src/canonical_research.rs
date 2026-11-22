@@ -29,7 +29,7 @@ const REQUIRED: [&str; 10] = [
     "--base-timeframe",
     "--out-dir",
 ];
-const OPTIONAL: [&str; 28] = [
+const OPTIONAL: [&str; 30] = [
     "--higher",
     "--population",
     "--generations",
@@ -55,6 +55,8 @@ const OPTIONAL: [&str; 28] = [
     "--diagnose-candidate-oos-out",
     "--diagnose-training-episodes-out",
     "--specialist-portfolio",
+    "--shared-account-max-leverage",
+    "--shared-account-adaptive-comparison",
     "--new-search-research",
     "--new-search-research-sha256",
     "--prefilter-ranking-audit-out",
@@ -618,6 +620,8 @@ fn forward_optional_mode_flags(args: &Arguments, discovery_args: &mut Vec<String
         .chain(NEW_SEARCH_FLAGS)
         .chain([
             "--specialist-portfolio",
+            "--shared-account-max-leverage",
+            "--shared-account-adaptive-comparison",
             "--training-percent",
             "--research-full-forward",
             "--screening-round-trip-pips",
@@ -644,11 +648,38 @@ pub(crate) enum SpecialistResearchMode {
     ContinualV3,
     RiskyV4,
     WalkforwardJointRiskyV1,
-    WeeklyJointRiskyForwardV1,
+    WeeklyJointRiskyForwardV1 {
+        max_leverage: Option<std::num::NonZeroU32>,
+        compare_adaptive: bool,
+    },
 }
 
 pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResearchMode>> {
     let flags = optional_inputs(args, &["--specialist-portfolio"])?;
+    let leverage_flag = "--shared-account-max-leverage";
+    let max_leverage = optional_inputs(args, &[leverage_flag])?
+        .get(leverage_flag)
+        .map(|value| value.parse())
+        .transpose()
+        .context("--shared-account-max-leverage requires a positive integer")?;
+    let adaptive_flag = "--shared-account-adaptive-comparison";
+    let compare_adaptive = optional_inputs(args, &[adaptive_flag])?
+        .get(adaptive_flag)
+        .map(|value| value.parse::<bool>())
+        .transpose()
+        .context("--shared-account-adaptive-comparison requires true or false")?
+        .unwrap_or(false);
+    ensure!(
+        !compare_adaptive || max_leverage.is_some(),
+        "--shared-account-adaptive-comparison true requires --shared-account-max-leverage"
+    );
+    if max_leverage.is_some() {
+        ensure!(
+            flags.get("--specialist-portfolio").copied() == Some("weekly-joint-risky-forward-v1")
+                && optional_inputs(args, &RESUME_FLAGS)?.len() == RESUME_FLAGS.len(),
+            "--shared-account-max-leverage requires weekly-joint-risky-forward-v1 and an exact saved research result"
+        );
+    }
     let Some(value) = flags.get("--specialist-portfolio") else {
         return Ok(None);
     };
@@ -658,7 +689,10 @@ pub(crate) fn specialist_mode(args: &[String]) -> Result<Option<SpecialistResear
         "continual-v3" => SpecialistResearchMode::ContinualV3,
         "risky-v4" => SpecialistResearchMode::RiskyV4,
         "walkforward-joint-risky-v1" => SpecialistResearchMode::WalkforwardJointRiskyV1,
-        "weekly-joint-risky-forward-v1" => SpecialistResearchMode::WeeklyJointRiskyForwardV1,
+        "weekly-joint-risky-forward-v1" => SpecialistResearchMode::WeeklyJointRiskyForwardV1 {
+            max_leverage,
+            compare_adaptive,
+        },
         _ => anyhow::bail!(
             "--specialist-portfolio expects true, joint-v2, continual-v3, risky-v4, walkforward-joint-risky-v1, or weekly-joint-risky-forward-v1"
         ),

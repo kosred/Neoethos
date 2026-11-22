@@ -12,7 +12,10 @@ use crate::{
 
 #[path = "netted_bar_portfolio.rs"]
 mod portfolio;
-pub use portfolio::{JointBarAccountPolicyV1, JointBarAccountResultV1, JointBarLaneV1};
+pub use portfolio::{
+    JointBarAccountPolicyV1, JointBarAccountResultV1, JointBarFixedNotionalLeverageV1,
+    JointBarLaneV1, JointBarRiskyOrderSizingV1,
+};
 
 /// All decision fields belong to the same just-closed signal row. The next
 /// bar's close is the existing CPU screening fill convention, not a live quote.

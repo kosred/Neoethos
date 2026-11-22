@@ -815,6 +815,28 @@ positions within a shared 90% stop-risk budget. This research model uses
 fractional lots and omits a gross-notional limit. The report distinguishes
 an empty frozen cohort from a completed forward replay.
 
+For a frozen comparison with leverage, add `--shared-account-max-leverage 400`
+to the exact saved replay in a new output directory. The account currency must
+match the FX base currency. The replay uses the verified lot size from the
+existing symbol contract and checks total gross exposure against 400 times
+pre-entry marked equity. A request that exceeds the limit is refused and the
+next candidate can use the slot. Both periods use this rule, the same fractional
+lots and the same fixed 30% initial stop risk. The report records refusals and
+peak admitted leverage under `neoethos.weekly-joint-risky-forward.leverage.v1`.
+This is a research admission model with a fixed leverage limit. Broker-specific
+liquidation and volume tiers require separate evidence.
+
+Add `--shared-account-adaptive-comparison true` to evaluate four separate
+accounts over the same dates with the same frozen entry signals. The fixed
+account retains 30% initial stop risk and archived brackets. The adaptive-risk
+account uses the existing confidence sizing rule with the Risky default 10%
+floor and 30% ceiling. The adaptive-TP and adaptive-SL accounts each alter one
+distance at entry using the ratio of 14- and 96-bar EMA true ranges on the
+completed signal bar, limited to 0.5–2.0. In the SL scenario the configured
+absolute stop bounds still apply. The first 96 source bars use neutral scaling.
+The comparison report contains a separate ledger and weekly cadence for each
+scenario. Each scenario uses the same fixed gross leverage admission rule.
+
 ### Continual specialist research V3
 
 `canonical-research --specialist-portfolio continual-v3` writes

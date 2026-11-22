@@ -901,7 +901,8 @@ fn compute_ema(values: &[f64], period: usize) -> Vec<f64> {
     out
 }
 
-fn compute_atr(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<f64> {
+/// Causal EMA of true range in price units, for aligned OHLC slices.
+pub fn compute_atr(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<f64> {
     let n = close.len();
     let mut tr = vec![0.0; n];
     for i in 1..n {
