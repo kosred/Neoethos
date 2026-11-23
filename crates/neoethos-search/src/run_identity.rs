@@ -26,22 +26,94 @@ const SEARCH_ALGORITHM_SEMANTICS_V1: &str = "neoethos.search.algorithm.is-calibr
 /// Include corrected execution/stop/admission arithmetic in every config key.
 /// Computed once, not once per candidate. This separates existing cached scores
 /// and checkpoints even when the user's knobs and dataset are unchanged.
-fn cpu_execution_source_sha256() -> &'static str {
+fn source_bundle_sha256(domain: &[u8], sources: &[&[u8]]) -> String {
     use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    for source in sources {
+        hash.update((source.len() as u64).to_le_bytes());
+        hash.update(source);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn cpu_execution_source_sha256_from(sources: &[&[u8]]) -> String {
+    source_bundle_sha256(b"neoethos.cpu-execution-source.v1\0", sources)
+}
+
+fn cpu_execution_source_sha256() -> &'static str {
     static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     IDENTITY.get_or_init(|| {
-        let mut hash = Sha256::new();
-        hash.update(b"neoethos.cpu-execution-source.v1\0");
-        for source in [
+        cpu_execution_source_sha256_from(&[
             include_bytes!("eval.rs").as_slice(),
             include_bytes!("stop_target.rs").as_slice(),
             include_bytes!("run_identity.rs").as_slice(),
-        ] {
-            hash.update((source.len() as u64).to_le_bytes());
-            hash.update(source);
-        }
-        format!("{:x}", hash.finalize())
+            include_bytes!("genetic/evolution_math.rs").as_slice(),
+            include_bytes!("genetic/smc_indicators.rs").as_slice(),
+            include_bytes!("genetic/strategy_gene.rs").as_slice(),
+            include_bytes!("genetic/seed_templates.rs").as_slice(),
+        ])
     })
+}
+
+/// Independent source identity for the weekly scoring semantics and the
+/// feasibility-first archive ordering that consumes it. The global
+/// `cpu_execution_source_sha256` also hashes this file, so this introduction
+/// changes every resolved-config stamp even for non-weekly runs: historical
+/// JSON remains readable, but old current-equivalence self-hash checks refuse.
+/// The separate weekly domain isolates FUTURE weekly scoring edits from
+/// non-weekly stamps without pretending the introduction was hash-neutral.
+fn weekly_scoring_source_sha256_from(sources: &[&[u8]]) -> String {
+    source_bundle_sha256(b"neoethos.weekly-scoring-source.v1\0", sources)
+}
+
+fn weekly_scoring_source_sha256() -> &'static str {
+    static IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        weekly_scoring_source_sha256_from(&[
+            include_bytes!("scoring/weekly_cadence.rs").as_slice(),
+            include_bytes!("genetic/profitable_archive.rs").as_slice(),
+            include_bytes!("genetic/search_engine.rs").as_slice(),
+        ])
+    })
+}
+
+/// Static current-equivalence binding for a weekly objective. It records the
+/// scoring-semantics version and the compiled source hash of the weekly fitness
+/// and archive-ordering owners, so equal cadence/limits cannot masquerade as the
+/// same search across a scoring revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeeklyScoringIdentityV1 {
+    pub semantics_version: u16,
+    pub source_sha256: String,
+}
+
+impl WeeklyScoringIdentityV1 {
+    pub fn current() -> Self {
+        Self {
+            semantics_version: crate::scoring::weekly_cadence::WEEKLY_SCORING_SEMANTICS_VERSION_V1,
+            source_sha256: weekly_scoring_source_sha256().to_owned(),
+        }
+    }
+
+    /// Equality against the compiled source, not acceptance of a caller token.
+    pub fn validate_current(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.semantics_version
+                == crate::scoring::weekly_cadence::WEEKLY_SCORING_SEMANTICS_VERSION_V1,
+            "weekly scoring semantics version {} is not current {}",
+            self.semantics_version,
+            crate::scoring::weekly_cadence::WEEKLY_SCORING_SEMANTICS_VERSION_V1
+        );
+        anyhow::ensure!(
+            self.source_sha256 == weekly_scoring_source_sha256(),
+            "weekly scoring source hash is stale: recorded {} but current compiled identity is {}",
+            self.source_sha256,
+            weekly_scoring_source_sha256()
+        );
+        Ok(())
+    }
 }
 
 fn deserialize_required_option<'de, D, T>(
@@ -902,6 +974,10 @@ pub struct PopulationAutoSelectionSemanticsV1 {
     stage1_identity_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekly_search_limits: Option<crate::scoring::weekly_cadence::WeeklySearchLimitsV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weekly_scoring_identity: Option<WeeklyScoringIdentityV1>,
 }
 
 /// Strict persisted authority for the selection-changing population decision.
@@ -923,9 +999,37 @@ pub struct PopulationAutoSearchAuthorityV1 {
     /// from the unchanged resolved-config stamp schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     growth_goal: Option<crate::scoring::RiskyGrowthGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekly_search_limits: Option<crate::scoring::weekly_cadence::WeeklySearchLimitsV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekly_scoring_identity: Option<WeeklyScoringIdentityV1>,
 }
 
 impl PopulationAutoSearchAuthorityV1 {
+    pub fn weekly_search_limits(
+        &self,
+    ) -> Option<crate::scoring::weekly_cadence::WeeklySearchLimitsV1> {
+        self.weekly_search_limits
+    }
+
+    pub fn weekly_scoring_identity(&self) -> Option<&WeeklyScoringIdentityV1> {
+        self.weekly_scoring_identity.as_ref()
+    }
+
+    /// Limits plus the source-bound scoring identity; None means the authority
+    /// is legacy/unbound and must not be treated as current equivalence.
+    pub fn weekly_search_binding(
+        &self,
+    ) -> Option<(
+        crate::scoring::weekly_cadence::WeeklySearchLimitsV1,
+        WeeklyScoringIdentityV1,
+    )> {
+        Some((
+            self.weekly_search_limits?,
+            self.weekly_scoring_identity.clone()?,
+        ))
+    }
+
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
     }
@@ -966,6 +1070,8 @@ impl PopulationAutoSearchAuthorityV1 {
             stage1_row_end: stage1.row_end(),
             stage1_identity_sha256: stage1.identity_sha256().to_owned(),
             growth_goal: self.growth_goal,
+            weekly_search_limits: self.weekly_search_limits,
+            weekly_scoring_identity: self.weekly_scoring_identity.clone(),
         })
     }
 
@@ -992,6 +1098,30 @@ impl PopulationAutoSearchAuthorityV1 {
         self.population_auto_sizing_receipt
             .validate()
             .map_err(anyhow::Error::new)?;
+        match (
+            self.weekly_search_limits,
+            self.weekly_scoring_identity.as_ref(),
+        ) {
+            (Some(limits), Some(identity)) => {
+                limits.validate()?;
+                identity.validate_current()?;
+                anyhow::ensure!(
+                    self.resolved_config_stamp.mode == "prop_firm",
+                    "weekly search authority requires PropFirm mode"
+                );
+                anyhow::ensure!(
+                    limits.initial_equity == self.resolved_config_stamp.initial_balance,
+                    "weekly limits disagree with simulation equity"
+                );
+            }
+            (Some(_), None) => anyhow::bail!(
+                "weekly search authority is unbound: legacy weekly limits have no scoring identity; inspectable but not admissible as current equivalence"
+            ),
+            (None, Some(_)) => {
+                anyhow::bail!("weekly scoring identity is present without weekly limits")
+            }
+            (None, None) => {}
+        }
         let stamp = &self.resolved_config_stamp;
         let receipt = &self.population_auto_sizing_receipt;
         if let Some(goal) = self.growth_goal {
@@ -1086,12 +1216,16 @@ pub fn build_population_auto_search_authority_v1(
         pip_value_per_lot,
         normalize_features,
     )?;
+    let weekly_limits = config.weekly_search_limits()?;
+    let weekly_scoring_identity = weekly_limits.map(|_| WeeklyScoringIdentityV1::current());
     let mut authority = PopulationAutoSearchAuthorityV1 {
         schema_version: POPULATION_AUTO_SEARCH_AUTHORITY_SCHEMA_VERSION_V1,
         resolved_config_stamp,
         population_auto_sizing_receipt: receipt.clone(),
         search_config_hash: String::new(),
         growth_goal,
+        weekly_search_limits: weekly_limits,
+        weekly_scoring_identity,
     };
     authority.search_config_hash = authority.computed_search_config_hash_v1()?;
     authority.validate()?;
@@ -1672,6 +1806,140 @@ mod tests {
                     .contains("self-hash mismatch")
             );
         }
+    }
+
+    #[test]
+    fn weekly_selection_authority_binds_limits_and_legacy_omits_them() {
+        let (config, receipt) = cpu_selection_authority_fixture();
+        let legacy =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("weekly_search_limits")
+        );
+        let mut config = DiscoveryConfig {
+            mode: crate::discovery::DiscoveryMode::PropFirm,
+            ..config
+        }
+        .apply_mode_overrides();
+        let baseline =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        config.runtime_overrides.weekly_cadence = true;
+        let weekly =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        assert_ne!(baseline.search_config_hash(), weekly.search_config_hash());
+        assert!(weekly.weekly_search_limits().is_some());
+        let bytes = serde_json::to_vec(&weekly).unwrap();
+        let mut decoded: PopulationAutoSearchAuthorityV1 = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+        decoded.weekly_search_limits.as_mut().unwrap().max_drawdown *= 0.5;
+        assert!(decoded.validate().is_err());
+    }
+
+    #[test]
+    fn weekly_scoring_identity_binds_compiled_source_and_refuses_stale_or_unbound_authority() {
+        let (config, receipt) = cpu_selection_authority_fixture();
+        let mut config = DiscoveryConfig {
+            mode: crate::discovery::DiscoveryMode::PropFirm,
+            ..config
+        }
+        .apply_mode_overrides();
+        config.runtime_overrides.weekly_cadence = true;
+        let authority =
+            build_population_auto_search_authority_v1(&config, &receipt, 10.0, false).unwrap();
+        let identity = authority
+            .weekly_scoring_identity()
+            .expect("weekly authority must carry the compiled scoring identity")
+            .clone();
+        assert_eq!(identity, WeeklyScoringIdentityV1::current());
+        assert_eq!(
+            identity.semantics_version,
+            crate::scoring::weekly_cadence::WEEKLY_SCORING_SEMANTICS_VERSION_V1
+        );
+        assert_eq!(identity.source_sha256, weekly_scoring_source_sha256());
+
+        let mut stale_version = authority.clone();
+        stale_version
+            .weekly_scoring_identity
+            .as_mut()
+            .unwrap()
+            .semantics_version += 1;
+        assert!(stale_version.validate().is_err());
+        let mut stale_source = authority.clone();
+        stale_source
+            .weekly_scoring_identity
+            .as_mut()
+            .unwrap()
+            .source_sha256 = "00".repeat(32);
+        assert!(stale_source.validate().is_err());
+
+        let mut no_identity = authority.clone();
+        no_identity.weekly_scoring_identity = None;
+        assert!(
+            no_identity.computed_search_config_hash_v1().unwrap() != authority.search_config_hash()
+        );
+
+        let mut value = serde_json::to_value(&authority).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("weekly_scoring_identity");
+        let legacy: PopulationAutoSearchAuthorityV1 = serde_json::from_value(value).unwrap();
+        assert!(legacy.weekly_search_limits().is_some());
+        assert!(legacy.weekly_scoring_identity().is_none());
+        let error = legacy.validate().unwrap_err().to_string();
+        assert!(error.contains("unbound"), "{error}");
+
+        let (plain_config, plain_receipt) = cpu_selection_authority_fixture();
+        let plain =
+            build_population_auto_search_authority_v1(&plain_config, &plain_receipt, 10.0, false)
+                .unwrap();
+        assert!(plain.weekly_scoring_identity().is_none());
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("weekly_scoring_identity")
+        );
+        plain.validate().unwrap();
+    }
+
+    #[test]
+    fn global_execution_identity_includes_run_identity_itself() {
+        let mutated = cpu_execution_source_sha256_from(&[b"eval", b"stop", b"identity-v2"]);
+        assert_ne!(
+            cpu_execution_source_sha256_from(&[b"eval", b"stop", b"identity-v1"]),
+            mutated
+        );
+        assert_eq!(
+            cpu_execution_source_sha256(),
+            cpu_execution_source_sha256_from(&[
+                include_bytes!("eval.rs").as_slice(),
+                include_bytes!("stop_target.rs").as_slice(),
+                include_bytes!("run_identity.rs").as_slice(),
+                include_bytes!("genetic/evolution_math.rs").as_slice(),
+                include_bytes!("genetic/smc_indicators.rs").as_slice(),
+                include_bytes!("genetic/strategy_gene.rs").as_slice(),
+                include_bytes!("genetic/seed_templates.rs").as_slice(),
+            ])
+        );
+    }
+
+    #[test]
+    fn weekly_scoring_source_hash_is_content_sensitive() {
+        let first = weekly_scoring_source_sha256_from(&[b"weekly", b"archive"]);
+        assert_eq!(
+            first,
+            weekly_scoring_source_sha256_from(&[b"weekly", b"archive"])
+        );
+        assert_ne!(
+            first,
+            weekly_scoring_source_sha256_from(&[b"weekly", b"archive-v2"])
+        );
+        assert_eq!(
+            weekly_scoring_source_sha256(),
+            WeeklyScoringIdentityV1::current().source_sha256
+        );
     }
 
     fn cpu_selection_authority_fixture() -> (

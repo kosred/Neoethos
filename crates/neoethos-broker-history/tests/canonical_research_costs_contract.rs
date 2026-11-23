@@ -55,6 +55,45 @@ fn plan(account_id: i64) -> Result<CanonicalTrendbarAcquisitionPlanV1> {
 }
 
 impl Fixture {
+    fn quantity_contract(
+        &mut self,
+    ) -> Result<neoethos_core::config::RiskyReplayLotConstraintsConfigV1> {
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&self.broker_path)?)?;
+        let symbol = &mut document["payload"]["symbol"][0];
+        symbol["minVolume"] = 100_000.into();
+        symbol["maxVolume"] = 1_000_000_000_i64.into();
+        symbol["stepVolume"] = 100_000.into();
+        let bytes = serde_json::to_vec(&document)?;
+        fs::write(&self.broker_path, &bytes)?;
+        Ok(neoethos_core::config::RiskyReplayLotConstraintsConfigV1 {
+            min_lots: 0.01,
+            max_lots: 100.0,
+            lot_step: 0.01,
+            source_artifact_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            fixed_leverage: None,
+        })
+    }
+
+    fn write_quantity_settings(
+        &mut self,
+        grid: &neoethos_core::config::RiskyReplayLotConstraintsConfigV1,
+    ) -> Result<()> {
+        let base = String::from_utf8(SETTINGS_BYTES.to_vec())?
+            .replace(
+                "account_currency: USD\n",
+                "account_currency: USD\n  trading_mode: risky\n",
+            )
+            .replace("risk:\n", "risk:\n  initial_balance: 100\n");
+        let source = format!(
+            "{base}models:\n  discovery_runtime:\n    risky_survival_only: true\n    risky_account_experiment_v3: true\n    risky_lot_constraints:\n      min_lots: {}\n      max_lots: {}\n      lot_step: {}\n      source_artifact_sha256: '{}'\n",
+            grid.min_lots, grid.max_lots, grid.lot_step, grid.source_artifact_sha256
+        );
+        fs::write(&self.settings_path, source)?;
+        self.settings = Settings::from_yaml(&self.settings_path)?;
+        Ok(())
+    }
+
     fn new() -> Result<Self> {
         let directory = tempfile::tempdir()?;
         let data_root = directory.path().join("data");
@@ -160,6 +199,129 @@ impl Fixture {
             &self.settings_path,
         )
     }
+}
+
+#[test]
+fn risky_lot_limits_must_match_the_exact_broker_contract() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let captured = fixture.quantity_contract()?;
+    for (min, max, step) in [(0.02, 100.0, 0.01), (0.01, 99.0, 0.01), (0.01, 100.0, 0.02)] {
+        let mut changed = captured.clone();
+        changed.min_lots = min;
+        changed.max_lots = max;
+        changed.lot_step = step;
+        fixture.write_quantity_settings(&changed)?;
+        let error = fixture.build(CanonicalTimeframe::D1).expect_err(
+            "a valid source hash cannot authorize quantity values absent from that source",
+        );
+        assert!(error.to_string().contains("lot constraints"), "{error:#}");
+    }
+    Ok(())
+}
+
+#[test]
+fn risky_quantity_source_must_be_actual_and_uses_the_reported_lot_size() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let mut grid = fixture.quantity_contract()?;
+    fixture.write_quantity_settings(&grid)?;
+    let costs = fixture.build(CanonicalTimeframe::D1)?;
+    assert_eq!(
+        costs
+            .source_components
+            .iter()
+            .find(|part| part.role == "broker_symbol_contract")
+            .unwrap()
+            .sha256,
+        grid.source_artifact_sha256
+    );
+    grid.source_artifact_sha256 = "0".repeat(64);
+    fixture.write_quantity_settings(&grid)?;
+    let error = fixture.build(CanonicalTimeframe::D1).unwrap_err();
+    assert!(error.to_string().contains("lot constraints source"));
+
+    // A broker-defined 10,000-unit lot must not become a conventional 100,000.
+    let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&fixture.broker_path)?)?;
+    document["payload"]["symbol"][0]["lotSize"] = 1_000_000.into();
+    let bytes = serde_json::to_vec(&document)?;
+    fs::write(&fixture.broker_path, &bytes)?;
+    grid.min_lots = 0.1;
+    grid.max_lots = 1000.0;
+    grid.lot_step = 0.1;
+    grid.source_artifact_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    fixture.write_quantity_settings(&grid)?;
+    assert_eq!(
+        fixture
+            .build(CanonicalTimeframe::D1)?
+            .pip_value_quote_per_lot,
+        1.0
+    );
+    Ok(())
+}
+
+#[test]
+fn risky_quantity_missing_invalid_or_inexact_wire_fields_are_refused_even_after_rehash()
+-> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let mut grid = fixture.quantity_contract()?;
+    let base: serde_json::Value = serde_json::from_slice(&fs::read(&fixture.broker_path)?)?;
+    for (field, value) in [
+        ("minVolume", serde_json::Value::Null),
+        ("stepVolume", serde_json::json!(0)),
+        ("maxVolume", serde_json::json!(-1)),
+        ("minVolume", serde_json::json!(1.5)),
+        ("maxVolume", serde_json::json!(9_000_000_000_000_001_i64)),
+        ("stepVolume", serde_json::json!(2_000_000_000_i64)),
+        ("minVolume", serde_json::json!(2_000_000_000_i64)),
+    ] {
+        let mut document = base.clone();
+        document["payload"]["symbol"][0][field] = value;
+        let bytes = serde_json::to_vec(&document)?;
+        fs::write(&fixture.broker_path, &bytes)?;
+        grid.source_artifact_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        fixture.write_quantity_settings(&grid)?;
+        let error = fixture.build(CanonicalTimeframe::D1).unwrap_err();
+        assert!(
+            error.to_string().contains("lot constraints"),
+            "{field}: {error:#}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn risky_quantity_consumers_cannot_mix_facts_from_another_cost_envelope() -> Result<()> {
+    use neoethos_broker_history::canonical_research_costs::{
+        validate_broker_symbol_contract, validate_costs,
+    };
+    let mut fixture = Fixture::new()?;
+    let mut grid = fixture.quantity_contract()?;
+    fixture.write_quantity_settings(&grid)?;
+    let original = fixture.build(CanonicalTimeframe::D1)?;
+    let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&fixture.broker_path)?)?;
+    document["payload"]["symbol"][0]["digits"] = 5.into();
+    let changed = serde_json::to_vec(&document)?;
+    fs::write(&fixture.broker_path, &changed)?;
+    grid.source_artifact_sha256 = format!("{:x}", Sha256::digest(&changed));
+    fixture.write_quantity_settings(&grid)?;
+    let replacement = fixture.build(CanonicalTimeframe::D1)?;
+    let plan = fixture.store.open_plan(&fixture.plan)?;
+    let matrix = fixture
+        .store
+        .open_matrix(&fixture.data_root, &fixture.plan, &fixture.matrix)?;
+    let replacement_facts =
+        validate_broker_symbol_contract(&changed, &replacement, "EURUSD", &plan)?;
+    let error = validate_costs(
+        &original,
+        "EURUSD",
+        &fixture.settings,
+        &plan,
+        &matrix,
+        &fixture.data_root,
+        replacement_facts,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("lot constraints source"));
+    Ok(())
 }
 
 #[test]

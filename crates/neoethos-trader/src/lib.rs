@@ -60,6 +60,7 @@ mod quote_signal_replay;
 mod replay;
 pub mod risk;
 pub mod signal;
+pub mod specialist_portfolio;
 
 // Curated surface so front-ends can `use neoethos_trader::*` ergonomically.
 pub use blend_signal::{

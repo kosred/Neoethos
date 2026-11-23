@@ -94,6 +94,7 @@ use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE,
     CTRADER_OA_ACCOUNTS_TOKEN_INVALIDATED_EVENT_PAYLOAD_TYPE,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_CLIENT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE, CTRADER_OA_MARGIN_CALL_TRIGGER_EVENT_PAYLOAD_TYPE,
     CTRADER_OA_MARGIN_CALL_UPDATE_EVENT_PAYLOAD_TYPE, CTRADER_OA_MARGIN_CHANGED_EVENT_PAYLOAD_TYPE,
@@ -986,9 +987,15 @@ fn handshake_response_matches(
         response.payload_type == expected_type,
         "spot handshake response type differs from the requested operation"
     );
+    // ProtoOAApplicationAuthRes has no required body fields. An omitted
+    // payload deserializes as Null, just like an explicit null acknowledgement.
+    // Account authentication and subscription still require the account object.
+    let empty_application_ack = expected_type == CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE
+        && expected_account.is_none()
+        && response.payload.is_null();
     anyhow::ensure!(
-        response.payload.is_object(),
-        "spot handshake response payload is not an object"
+        response.payload.is_object() || empty_application_ack,
+        "spot handshake response payload is not an object (payload_type={expected_type})"
     );
     if let Some(account) = expected_account {
         anyhow::ensure!(
@@ -1183,6 +1190,57 @@ mod tests {
             }
         }"#;
         assert!(parse_spot_event_loose(payload, 42, &symbols).is_none());
+    }
+
+    #[test]
+    fn empty_application_acknowledgement_preserves_handshake_identity_checks() {
+        // ProtoOAApplicationAuthRes has no required body fields. These are
+        // wire fixtures, not responses produced by our request builders.
+        for wire in [
+            r#"{"clientMsgId":"app","payloadType":2101}"#,
+            r#"{"clientMsgId":"app","payloadType":2101,"payload":null}"#,
+            r#"{"clientMsgId":"app","payloadType":2101,"payload":{}}"#,
+        ] {
+            let acknowledgement = parse_open_api_envelope(wire).unwrap();
+            assert!(
+                handshake_response_matches(&acknowledgement, "app", 2101, None).unwrap(),
+                "empty application acknowledgement rejected: {wire}"
+            );
+            assert!(
+                !handshake_response_matches(&acknowledgement, "another-request", 2101, None)
+                    .unwrap()
+            );
+            assert!(handshake_response_matches(&acknowledgement, "app", 2103, None).is_err());
+            assert!(handshake_response_matches(&acknowledgement, "app", 2101, Some(42)).is_err());
+        }
+        for payload in [
+            serde_json::json!([]),
+            serde_json::json!(""),
+            serde_json::json!(false),
+            serde_json::json!(0),
+        ] {
+            let acknowledgement = parse_open_api_envelope(
+                &serde_json::json!({
+                    "clientMsgId": "app", "payloadType": 2101, "payload": payload
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(handshake_response_matches(&acknowledgement, "app", 2101, None).is_err());
+        }
+        // Account authentication and spot subscription still require an
+        // object carrying the exact account; an empty ACK cannot authorize it.
+        for response_type in [2103, 2128] {
+            let acknowledgement = parse_open_api_envelope(
+                &serde_json::json!({"clientMsgId": "account", "payloadType": response_type})
+                    .to_string(),
+            )
+            .unwrap();
+            assert!(
+                handshake_response_matches(&acknowledgement, "account", response_type, Some(42))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

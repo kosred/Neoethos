@@ -118,3 +118,22 @@ fn source_surface_is_move_only_run_scoped_and_never_opens_the_global_gate() {
         BrokerFinancialTruthAuthoritySourceClassV2::ResearchOnly
     );
 }
+
+#[test]
+fn reviewed_evidence_exposes_the_primary_account_symbol_and_replay_rule_identity() {
+    // The reviewed evidence carries exactly one primary Bid/Ask
+    // synchronization (account 42, symbol 7) plus its independently reviewed
+    // quote replay-rule identity. The reviewed-bundle consumers read these
+    // through public getters to build the exact replay binding.
+    let evidence = reviewed_fixture();
+    assert_eq!(evidence.account_id(), 42);
+    assert_eq!(evidence.symbol_id(), 7);
+    let expected_identity =
+        ReviewedQuoteReplayRuleIdentityV2::new("77".repeat(32), "88".repeat(32), "99".repeat(32))
+            .expect("review identity fixture");
+    assert_eq!(
+        evidence.reviewed_replay_rule_identity(),
+        &expected_identity,
+        "the getter must return the exact reviewed primary replay-rule identity"
+    );
+}

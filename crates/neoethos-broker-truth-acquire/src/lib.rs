@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 mod acquisition_orchestration_v1;
 mod bounded_reviewed_finalist_acquisition_v2;
 mod finalist_quote_replay_acquisition_v1;
+mod reviewed_input_generation_v1;
 
 pub use acquisition_orchestration_v1::{
     BrokerTruthAcquisitionOrchestrationErrorCodeV1, BrokerTruthAcquisitionOrchestrationErrorV1,
@@ -61,6 +62,10 @@ pub use finalist_quote_replay_acquisition_v1::{
     FinalistQuoteReplayAcquisitionRequestV1, FinalistQuoteReplayArtifactClassV1,
     FinalistQuoteReplayRestartPolicyV1, MAX_FINALIST_QUOTE_REPLAY_WINDOW_MS_V1,
     StoredFinalistQuoteReplayV1, StoredQuotePositionEconomicsV1, acquire_finalist_quote_replay_v1,
+};
+pub use reviewed_input_generation_v1::{
+    AGENT_REVIEWER_IDENTITY_V1, AGENT_REVIEWER_NONCE_FILE_V1, GeneratedReviewedInputArtifactV1,
+    GeneratedReviewedInputsV1, ReviewedInputGenerationArgsV1, generate_reviewed_inputs_v1,
 };
 
 const ACQUISITION_SCHEMA_VERSION_V1: u16 = 1;

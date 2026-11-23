@@ -344,8 +344,10 @@ impl DualUlcerIndexStream {
         }
 
         let denom = self.period as f64;
-        let long_ulcer = self.long_sq_sum.sqrt() / denom;
-        let short_ulcer = self.short_sq_sum.sqrt() / denom;
+        // Same clamp as the batch lanes: a rounded-negative rolling square sum
+        // must not turn into NaN and poison this stream's cumulative threshold.
+        let long_ulcer = self.long_sq_sum.max(0.0).sqrt() / denom;
+        let short_ulcer = self.short_sq_sum.max(0.0).sqrt() / denom;
         let diff = (long_ulcer - short_ulcer).abs();
         let threshold = if self.auto_threshold {
             self.diff_sum += diff;
@@ -523,8 +525,11 @@ fn compute_dual_ulcer_index_row(
         }
 
         let denom = period as f64;
-        let long_ulcer = long_sq_sum.sqrt() / denom;
-        let short_ulcer = short_sq_sum.sqrt() / denom;
+        // A rolling square sum can round a few ulps below zero; sqrt() would
+        // then return NaN and the NaN would poison the cumulative threshold for
+        // every later row. Clamp the impossible negative before the root.
+        let long_ulcer = long_sq_sum.max(0.0).sqrt() / denom;
+        let short_ulcer = short_sq_sum.max(0.0).sqrt() / denom;
         let diff = (long_ulcer - short_ulcer).abs();
         let threshold = if auto_threshold {
             diff_sum += diff;
@@ -640,8 +645,11 @@ fn compute_dual_ulcer_index_selected_row(
         }
 
         let denom = period as f64;
-        let long_ulcer = long_sq_sum.sqrt() / denom;
-        let short_ulcer = short_sq_sum.sqrt() / denom;
+        // A rolling square sum can round a few ulps below zero; sqrt() would
+        // then return NaN and the NaN would poison the cumulative threshold for
+        // every later row. Clamp the impossible negative before the root.
+        let long_ulcer = long_sq_sum.max(0.0).sqrt() / denom;
+        let short_ulcer = short_sq_sum.max(0.0).sqrt() / denom;
         let diff = (long_ulcer - short_ulcer).abs();
         let threshold = if auto_threshold {
             diff_sum += diff;

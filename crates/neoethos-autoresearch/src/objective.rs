@@ -88,9 +88,12 @@ pub enum ObjectiveVariant {
     B7Significance,
     /// Portfolio-level objective.
     B8Portfolio,
+    /// Asymmetric monthly-upside GA fitness: median monthly return with a
+    /// one-sided upside bonus and a tail-loss-only penalty (neo-671).
+    B9MonthlyUpside,
 }
 
-pub const VARIANT_COUNT: usize = 9;
+pub const VARIANT_COUNT: usize = 10;
 
 /// How a variant reaches the search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +367,29 @@ pub const VARIANTS: [VariantSpec; VARIANT_COUNT] = [
              gene. Diversification is a real, non-redistributive effect on path statistics, and the \
              live artifact is a portfolio anyway.",
     },
+    VariantSpec {
+        id: ObjectiveVariant::B9MonthlyUpside,
+        label: "B9_monthly_upside",
+        changes: ObjectiveDimension::EvaluationUnit,
+        scenario: Some(ScenarioKind::PropFirm),
+        expression: Expression::Overrides,
+        // The scorer (`scoring::ga_fitness_monthly_upside_v1`) ships with the
+        // search; the knob the GA needs to bind it (a fitness-table selector)
+        // does not yet — see docs/autoresearch-loop.md §14.7. Like B0/B7, the
+        // variant is therefore excluded and named in the space report until the
+        // selector lands; the feature stays OFF in the shipped build.
+        requires: &[RequiredKnob::MonthlyUpsideObjective],
+        exact_form_requires: None,
+        writes: &["fitness_table"],
+        params: 1,
+        max_draws_per_session: None,
+        why_not_a_reparameterisation: "the reward is ASYMMETRIC in the monthly unit: the median monthly return is \
+             maximised (with a capped, one-sided upside bonus) and ONLY a worst month below -2% is \
+             penalised. It is not a monotone transform of the per-month or per-trade mean — the \
+             neo-671 reward-shape experiment measured mean/Sharpe rewards selecting exit rungs with \
+             worst months of -13% to -129% while the asymmetric reward selected rungs with sane \
+             worst months of -1.7%/-2.1%.",
+    },
 ];
 
 impl ObjectiveVariant {
@@ -377,6 +403,7 @@ impl ObjectiveVariant {
         ObjectiveVariant::B6MonthlyConsistency,
         ObjectiveVariant::B7Significance,
         ObjectiveVariant::B8Portfolio,
+        ObjectiveVariant::B9MonthlyUpside,
     ];
 
     /// The declared set, as a slice. Same order as [`ObjectiveVariant::ALL`].
@@ -833,6 +860,12 @@ impl ObjectiveChoice {
                     cfg.score_portfolio_after_pruning = true;
                 }
             }
+            ObjectiveVariant::B9MonthlyUpside => {
+                #[cfg(feature = "search-monthly-upside-objective")]
+                {
+                    cfg.fitness_table = neoethos_search::scoring::FitnessTable::MonthlyUpsideV1;
+                }
+            }
             // ModeNative: the mode's own objective already IS this variant.
             // Nothing is written, and the report says so beside the coverage
             // count rather than leaving "the default ran" to look like a
@@ -1203,6 +1236,60 @@ mod tests {
                 .all(|d| d.field() != "target_profile.min_net_expectancy_per_trade")
         );
         assert!(FROZEN_FIELDS.contains(&"target_profile.min_net_expectancy_per_trade"));
+    }
+
+    #[test]
+    fn b9_monthly_upside_is_excluded_in_the_default_build_and_names_its_knob() {
+        // The opt-in asymmetric monthly-upside objective (neo-671) must never
+        // leak into a production build: with its feature OFF it is excluded
+        // from the drawable space in BOTH scenarios and the report names the
+        // missing symbol, feature and doc section.
+        let caps = Capabilities::compiled();
+        for scenario in SCENARIOS {
+            assert!(
+                !ObjectiveVariant::B9MonthlyUpside.drawable(&caps, scenario),
+                "B9 must not be drawable without its feature under {scenario:?}"
+            );
+        }
+        let reason = ObjectiveVariant::B9MonthlyUpside
+            .exclusion_reason(&caps, ScenarioKind::PropFirm)
+            .expect("excluded variants must name the reason");
+        assert_eq!(
+            reason,
+            VariantExclusion::MissingKnob(RequiredKnob::MonthlyUpsideObjective)
+        );
+        let err = ObjectiveChoice::new(
+            ObjectiveVariant::B9MonthlyUpside,
+            0,
+            RefusalLevels::permissive(),
+            &caps,
+            ScenarioKind::PropFirm,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("search-monthly-upside-objective"), "{text}");
+        assert!(text.contains("fitness_table"), "{text}");
+    }
+
+    #[test]
+    fn b9_monthly_upside_is_drawable_only_under_prop_firm_when_the_knob_exists() {
+        // With every capability compiled in (test-only), B9 serves the
+        // PropFirm scenario — the scenario whose GA the median-monthly
+        // objective replaces — and is excluded from Risky sessions by
+        // scenario, not by a missing knob.
+        let caps = Capabilities::all_for_tests();
+        assert!(ObjectiveVariant::B9MonthlyUpside.drawable(&caps, ScenarioKind::PropFirm));
+        assert!(!ObjectiveVariant::B9MonthlyUpside.drawable(&caps, ScenarioKind::Risky));
+        let reason = ObjectiveVariant::B9MonthlyUpside
+            .exclusion_reason(&caps, ScenarioKind::Risky)
+            .unwrap();
+        assert_eq!(
+            reason,
+            VariantExclusion::WrongScenario {
+                requires: ScenarioKind::PropFirm,
+                session: ScenarioKind::Risky,
+            }
+        );
     }
 
     #[test]

@@ -288,6 +288,7 @@ fn hash_optional_session_spread(hasher: &mut ExactHasherV1, profile: Option<Sess
 
 fn hash_settings(hasher: &mut ExactHasherV1, settings: &BacktestSettings) {
     let BacktestSettings {
+        risky_account_experiment,
         initial_equity_override: _,
         sl_pips,
         tp_pips,
@@ -352,6 +353,27 @@ fn hash_settings(hasher: &mut ExactHasherV1, settings: &BacktestSettings) {
     }
     hasher.f64(*adaptive_vol_mult);
     hasher.f64(*adaptive_rr);
+    // None retains the historical settings identity. The opt-in CPU policy
+    // must never alias the full-window/whole-bar legacy experiment.
+    if let Some(policy) = risky_account_experiment {
+        hasher.u8(0xa1);
+        hasher.f64(policy.target_balance);
+        if let Some(constraints) = &policy.lot_constraints {
+            constraints
+                .checked_grid()
+                .expect("invalid bound lot constraints");
+            hasher.u8(0xa2);
+            hasher.bytes(&serde_json::to_vec(constraints).expect("finite checked lot policy"));
+        }
+        if policy.continuous_exact_stop_risk {
+            hasher.u8(0xa3);
+        }
+        if let Some(leverage) = policy.fixed_leverage {
+            hasher.u8(0xa4);
+            hasher.u64(u64::from(leverage.maximum.get()));
+            hasher.f64(leverage.account_notional_per_lot);
+        }
+    }
 }
 
 fn exact_view(
@@ -797,6 +819,52 @@ mod account_equity_binding_tests {
         let mut hasher = ExactHasherV1::new(EVALUATION_HASH_DOMAIN_V1);
         hash_settings(&mut hasher, settings);
         hasher.finish()
+    }
+
+    #[test]
+    fn risky_quantity_bounds_step_and_source_are_bound_without_changing_absent_policy() {
+        let mut settings = BacktestSettings {
+            initial_equity_override: Some(100.0),
+            risky_account_experiment: Some(crate::eval::RiskyAccountExperimentV1 {
+                target_balance: 50_000.0,
+                continuous_exact_stop_risk: false,
+                lot_constraints: None,
+                fixed_leverage: None,
+            }),
+            ..Default::default()
+        };
+        let unquantized = policy_hash(&settings);
+        let mut hashes = std::collections::HashSet::new();
+        for (min, max, step, source) in [
+            (1.0, 10.0, 1.0, 'a'),
+            (2.0, 10.0, 1.0, 'a'),
+            (1.0, 11.0, 1.0, 'a'),
+            (1.0, 10.0, 0.5, 'a'),
+            (1.0, 10.0, 1.0, 'b'),
+        ] {
+            settings
+                .risky_account_experiment
+                .as_mut()
+                .unwrap()
+                .lot_constraints = Some(
+                crate::QuoteReplayLotConstraintsV3::new(
+                    min,
+                    max,
+                    step,
+                    source.to_string().repeat(64),
+                )
+                .unwrap(),
+            );
+            let hash = policy_hash(&settings);
+            assert_ne!(hash, unquantized);
+            assert!(hashes.insert(hash));
+        }
+        settings
+            .risky_account_experiment
+            .as_mut()
+            .unwrap()
+            .lot_constraints = None;
+        assert_eq!(policy_hash(&settings), unquantized);
     }
 
     #[test]

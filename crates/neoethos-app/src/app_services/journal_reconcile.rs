@@ -12,9 +12,11 @@
 //! (config unreadable) is silently skipped.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use crate::app_services::ctrader_account::{CTraderAccountRuntimeSnapshot, CTraderDealSnapshot};
+use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::journal_store::{self, ClosedTrade, EquitySample};
 
 /// Resolve the data dir from the live `config.yaml`; `None` (skip) on
@@ -54,22 +56,6 @@ fn position_open_times(runtime: &CTraderAccountRuntimeSnapshot) -> HashMap<i64, 
         }
     }
     opened
-}
-
-/// The cTrader broker environment currently selected on disk, as the string the
-/// journal stores (`"Demo"` / `"Live"`).
-///
-/// 2026-08-09: this is the fact the demo forward-test gate needs and could not
-/// previously read off a journal row. It is deliberately taken here, on the
-/// reconcile path, because this is the moment the fill is turned into a record —
-/// the environment that was live when the deal executed is the environment the
-/// account-refresh that produced this snapshot ran against.
-fn current_environment_label() -> String {
-    crate::app_services::broker_persistence::load_broker_settings()
-        .ctrader
-        .environment
-        .as_str()
-        .to_string()
 }
 
 fn closed_trade_from_deal(
@@ -146,19 +132,37 @@ pub fn reconcile_best_effort(
     if let Err(error) = neoethos_core::current_broker_financial_truth_capability_v1()
         .require(neoethos_core::BrokerFinancialOperationV1::LiveRiskAndPnl)
     {
-        tracing::error!(
-            target: "neoethos_app::journal_reconcile",
-            error = %error,
-            "live journal reconciliation disabled before local state access"
-        );
+        static RECONCILIATION_UNAVAILABLE: Once = Once::new();
+        // V1 describes the release capability. Account refreshes cannot change it.
+        RECONCILIATION_UNAVAILABLE.call_once(|| {
+            tracing::warn!(
+                target: "neoethos_app::journal_reconcile",
+                error = %error,
+                "live journal reconciliation is unavailable until broker evidence is verified"
+            );
+        });
         return;
     }
-    let Some(dir) = data_dir() else {
-        return;
-    };
+    let runtime = runtime.clone();
+    let names = names.clone();
+    tokio::task::spawn_blocking(move || {
+        let Some(dir) = data_dir() else {
+            return;
+        };
+        reconcile_closed_deals(&runtime, &names, &dir);
+    });
+}
 
+fn reconcile_closed_deals(
+    runtime: &CTraderAccountRuntimeSnapshot,
+    names: &HashMap<i64, String>,
+    dir: &Path,
+) {
     let account_id = runtime.reconcile.account_id.to_string();
-    let environment = current_environment_label();
+    let environment = match runtime.environment {
+        CTraderEnvironment::Demo => "Demo",
+        CTraderEnvironment::Live => "Live",
+    };
     let mut recorded_any = false;
     let opened_at = position_open_times(runtime);
 
@@ -188,8 +192,7 @@ pub fn reconcile_best_effort(
             );
             continue;
         }
-        let Some(trade) =
-            closed_trade_from_deal(deal, names, &account_id, &environment, &opened_at)
+        let Some(trade) = closed_trade_from_deal(deal, names, &account_id, environment, &opened_at)
         else {
             // The only remaining refusal: the broker symbol catalog has not
             // populated yet. Recording is idempotent on `position_id` and the
@@ -198,7 +201,7 @@ pub fn reconcile_best_effort(
             deferred_cold_catalog += 1;
             continue;
         };
-        match journal_store::record_closed_trade(&dir, &trade) {
+        match journal_store::record_closed_trade(dir, &trade) {
             Ok(true) => {
                 recorded += 1;
                 recorded_any = true;
@@ -241,7 +244,7 @@ pub fn reconcile_best_effort(
         let balance = runtime.trader.balance;
         let equity = runtime.trader.balance + runtime.unrealized_pnl;
         journal_store::append_equity_sample_best_effort(
-            &dir,
+            dir,
             &EquitySample {
                 ts_ms: journal_store::now_unix_ms(),
                 balance,
@@ -249,7 +252,7 @@ pub fn reconcile_best_effort(
                 // trader balance plus ProtoOAGetPositionUnrealizedPnLRes net rows.
                 equity,
                 account_id: Some(account_id.clone()),
-                environment: Some(environment.clone()),
+                environment: Some(environment.to_string()),
             },
         );
     }

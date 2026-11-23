@@ -1,6 +1,6 @@
 #[cfg(feature = "gpu")]
 use crate::cubecl_eval::{cuda_eval_backtest_kernel_enabled, cuda_eval_signal_kernel_enabled};
-use crate::quality::Trade;
+use crate::quality::{Trade, TradeExitReason};
 use ndarray::ArrayView2;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -21,9 +21,94 @@ pub type SmcRow = [i8; 11];
 #[path = "netted_bar_research.rs"]
 mod netted_bar_research;
 pub use netted_bar_research::{
-    BarReplayLotGridV1, NettedBarDecisionTapeV1, NettedBarResearchResultV1,
+    BarReplayLotGridV1, JointBarAccountPolicyV1, JointBarAccountResultV1,
+    JointBarFixedNotionalLeverageV1, JointBarLaneV1, JointBarPriceStopLevelsV1,
+    JointBarRiskyOrderSizingV1, NettedBarDecisionTapeV1, NettedBarResearchResultV1,
     PreparedNettedCanonicalBarResearchV1, TerminalBarPositionV1,
 };
+
+/// Metrics retain their canonical eleven-slot layout; cadence is an explicit
+/// optional observation from the same CPU simulation, never inferred from count.
+#[derive(Debug)]
+pub(crate) struct PopulationEvaluationV1 {
+    pub metrics: Vec<[f64; 11]>,
+    pub cadence: Option<Vec<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>>,
+    /// Per-gene completed-month fractional return vectors, aligned with the
+    /// metrics rows. Produced by the canonical CPU evaluator; None from
+    /// metrics-only producers (GPU routes, transport adapters). The canonical
+    /// scorers never read it — only the opt-in MonthlyUpsideV1 selector does.
+    pub monthly_returns: Option<Vec<Vec<f64>>>,
+}
+impl From<Vec<[f64; 11]>> for PopulationEvaluationV1 {
+    fn from(metrics: Vec<[f64; 11]>) -> Self {
+        Self {
+            metrics,
+            cadence: None,
+            monthly_returns: None,
+        }
+    }
+}
+impl PopulationEvaluationV1 {
+    pub(crate) fn apply(
+        &self,
+        genes: &mut [crate::Gene],
+        config: &crate::genetic::EvaluationConfig,
+        span: f64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.metrics.len() == genes.len(),
+            "evaluation observation count mismatch"
+        );
+        if matches!(
+            config.fitness_table,
+            crate::scoring::fitness_table::FitnessTable::MonthlyUpsideV1
+                | crate::scoring::fitness_table::FitnessTable::MonthlyUpsideDdAverseV1
+                | crate::scoring::fitness_table::FitnessTable::MonthlyUpsideDdBudgetV1
+        ) {
+            let months = self.monthly_returns.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("monthly objective requires same-execution monthly observations")
+            })?;
+            anyhow::ensure!(
+                months.len() == genes.len(),
+                "monthly observation count mismatch"
+            );
+        }
+        if let Some(objective) = config.weekly_objective {
+            objective.checked_for_evaluation(
+                config.initial_equity,
+                config.growth_objective,
+                (config.risk_per_trade_min, config.risk_per_trade_max),
+            )?;
+            let reports = self.cadence.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("weekly objective requires same-execution cadence observations")
+            })?;
+            anyhow::ensure!(
+                reports.len() == genes.len(),
+                "cadence observation count mismatch"
+            );
+            anyhow::ensure!(
+                reports
+                    .iter()
+                    .zip(&self.metrics)
+                    .all(|(r, m)| r.trades as f64 == m[8]),
+                "cadence ledger and metric trade counts disagree"
+            );
+        } else {
+            anyhow::ensure!(self.cadence.is_none(), "unbound weekly observations");
+        }
+        crate::genetic::apply_metrics(
+            genes,
+            &self.metrics,
+            config,
+            span,
+            self.monthly_returns.as_deref(),
+        );
+        // Weekly runs keep the ORIGINAL financial scorer in Gene.fitness. The
+        // versioned vector/front selection owns weekly ordering; the legacy
+        // per-window 1000-tier objective is historical/diagnostic only.
+        Ok(())
+    }
+}
 
 pub struct PopulationEvalInputs<'a> {
     pub close: &'a [f64],
@@ -260,6 +345,69 @@ fn utc_hour_of_day(timestamp_ms: i64) -> u32 {
     hour as u32
 }
 
+/// Opt-in CPU Risky accounting. An exit consumes the position before later
+/// prices in its OHLC bar, and the experiment banks its first realized target.
+/// This does not provide broker margin, stop-out or quote-fill authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskyAccountExperimentV1 {
+    pub target_balance: f64,
+    /// Weekly fixed-risk research uses fractional lots at 30% and continues
+    /// through the target, stopping only on account exhaustion or history end.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continuous_exact_stop_risk: bool,
+    /// Optional explicit quantity constraint. Its source hash is metadata,
+    /// not historical broker margin or liquidation authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lot_constraints: Option<crate::QuoteReplayLotConstraintsV3>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_leverage: Option<neoethos_core::config::RiskyFixedNotionalLeverageV1>,
+}
+
+impl RiskyAccountExperimentV1 {
+    pub(crate) fn continuous_risk_sizing(&self) -> bool {
+        self.continuous_exact_stop_risk || self.fixed_leverage.is_some()
+    }
+
+    pub(crate) fn validate(
+        &self,
+        initial_balance: f64,
+        risk_band: (f64, f64),
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            initial_balance.is_finite()
+                && initial_balance > 0.0
+                && self.target_balance.is_finite()
+                && self.target_balance > initial_balance,
+            "Risky account experiment requires a finite target above its positive initial balance"
+        );
+        anyhow::ensure!(
+            !self.continuous_exact_stop_risk
+                || (risk_band == (0.30, 0.30)
+                    && self.lot_constraints.is_none()
+                    && self.fixed_leverage.is_none()),
+            "continuous exact Risky replay requires a fixed 30% risk band and no lot grid"
+        );
+        if let Some(leverage) = self.fixed_leverage {
+            anyhow::ensure!(
+                risk_band == (0.30, 0.30)
+                    && self.lot_constraints.is_some()
+                    && leverage.account_notional_per_lot.is_finite()
+                    && leverage.account_notional_per_lot > 0.0,
+                "fixed-leverage Risky replay requires a lot grid, a 30% risk ceiling and positive account notional per lot"
+            );
+        }
+        if let Some(constraints) = &self.lot_constraints {
+            constraints.checked_grid()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "eval_risky_account_tests.rs"]
+mod risky_account_tests;
+
 #[derive(Debug, Clone)]
 pub struct BacktestSettings {
     /// Immutable account balance for this evaluation run. Standalone legacy
@@ -367,6 +515,9 @@ pub struct BacktestSettings {
     pub adaptive_base_pips: Option<std::sync::Arc<[f64]>>,
     pub adaptive_vol_mult: f64,
     pub adaptive_rr: f64,
+    /// Run-level account stopping/observation policy, separate from the
+    /// per-entry geometry above. Absent preserves historical CPU arithmetic.
+    pub risky_account_experiment: Option<RiskyAccountExperimentV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -523,6 +674,7 @@ impl Default for BacktestSettings {
             risk_per_trade_min: 0.005,
             risk_per_trade_max: 0.03,
             high_quality_confidence: 0.65,
+            risky_account_experiment: None,
             // Adaptive stops OFF by default (mult 0) → the scalar sl_pips/tp_pips path.
             adaptive_base_pips: None,
             adaptive_vol_mult: 0.0,
@@ -664,6 +816,33 @@ pub fn current_backtest_runtime_overrides() -> BacktestRuntimeOverrides {
 }
 
 impl BacktestSettings {
+    pub(crate) fn resolved_lot_grid(
+        &self,
+        supplied: Option<BarReplayLotGridV1>,
+        use_rounded_risky_order_policy: bool,
+    ) -> anyhow::Result<Option<BarReplayLotGridV1>> {
+        anyhow::ensure!(
+            use_rounded_risky_order_policy
+                || supplied.is_none()
+                || !self
+                    .risky_account_experiment
+                    .as_ref()
+                    .is_some_and(|policy| { policy.continuous_exact_stop_risk }),
+            "continuous exact Risky replay cannot use a supplied lot grid"
+        );
+        let bound = self
+            .risky_account_experiment
+            .as_ref()
+            .and_then(|policy| policy.lot_constraints.as_ref())
+            .map(|constraints| constraints.checked_grid())
+            .transpose()?;
+        anyhow::ensure!(
+            bound.is_none() || supplied.is_none() || bound == supplied,
+            "supplied lot grid differs from the bound Risky quantity policy"
+        );
+        Ok(bound.or(supplied))
+    }
+
     pub fn initial_equity(&self) -> f64 {
         self.initial_equity_override
             .unwrap_or_else(|| current_backtest_runtime_overrides().initial_equity)
@@ -817,6 +996,36 @@ fn apply_carry_and_fee_scaled(
     )
 }
 
+/// One price/cost settlement for scalar and simultaneous research positions.
+#[allow(clippy::too_many_arguments)]
+fn closed_position_net_pnl(
+    direction: i8,
+    entry_price: f64,
+    exit_price: f64,
+    lots: f64,
+    exit_half_spread_cost: f64,
+    entry_time: i64,
+    exit_time: i64,
+    settings: &BacktestSettings,
+) -> f64 {
+    let pnl = if direction == 1 {
+        (exit_price - entry_price) / settings.pip_value * settings.pip_value_per_lot
+    } else {
+        (entry_price - exit_price) / settings.pip_value * settings.pip_value_per_lot
+    };
+    let price_gross = pnl * lots - exit_half_spread_cost * lots;
+    let after_costs = pnl * lots - (settings.commission_per_trade + exit_half_spread_cost) * lots;
+    apply_carry_and_fee_scaled(
+        after_costs,
+        price_gross,
+        lots,
+        direction,
+        entry_time,
+        exit_time,
+        settings,
+    )
+}
+
 /// Per-ENTRY `(sl_pips, tp_pips)` for the position opening at bar `i`. When the
 /// gene's `adaptive_vol_mult > 0` and a base vol-distance series is present, the
 /// stop scales with volatility at `i` (`sl = mult * base[i]`) while the target
@@ -854,7 +1063,7 @@ fn entry_sl_tp_pips(settings: &BacktestSettings, i: usize) -> Option<(f64, f64)>
 ///   pos_lots = if equity > 0 {
 ///                  (risk_pct * equity) / (eff_sl * pip_value_per_lot)
 ///              } else { 0.0 }
-///   pos_lots = pos_lots.clamp(0.0, 100.0)         // sane leverage backstop
+///   pos_lots = pos_lots.clamp(0.0, 100.0)         // legacy leverage backstop
 ///
 /// Net effect: a full-SL loss ≈ `risk_pct × equity`, a TP win ≈
 /// `risk_pct × equity × (tp/sl)`.
@@ -865,19 +1074,12 @@ fn risk_based_pos_lots(
     eff_sl_pips: f64,
     settings: &BacktestSettings,
 ) -> f64 {
-    let conf = conf.clamp(0.0, 1.0);
-    let risk_min = settings.risk_per_trade_min;
-    let risk_max = settings.risk_per_trade_max;
-    // Guard the confidence normaliser against a zero/negative/non-finite
-    // high_quality_confidence so we never divide by ~0.
-    let hq = settings.high_quality_confidence;
-    let conf_scale = if hq.is_finite() && hq > 0.0 {
-        (conf / hq).min(1.0)
-    } else {
-        // Degenerate config: treat any signal as max-quality.
-        1.0
-    };
-    let risk_pct = risk_min + (risk_max - risk_min) * conf_scale;
+    let risk_pct = neoethos_core::domain::risky_mode::confidence_scaled_risk_fraction(
+        settings.risk_per_trade_min,
+        settings.risk_per_trade_max,
+        settings.high_quality_confidence,
+        conf,
+    );
     // Size against the actual ENTRY stop, including legitimate sub-pip stops.
     // The lot cap below limits exposure; changing the risk denominator to a
     // fictitious one-pip stop makes the reported risk disagree with the trade.
@@ -897,82 +1099,18 @@ fn risk_based_pos_lots(
         0.0
     };
     if pos_lots.is_finite() {
-        pos_lots.clamp(0.0, 100.0)
+        if settings
+            .risky_account_experiment
+            .as_ref()
+            .is_some_and(RiskyAccountExperimentV1::continuous_risk_sizing)
+        {
+            pos_lots.max(0.0)
+        } else {
+            pos_lots.clamp(0.0, 100.0)
+        }
     } else {
         0.0
     }
-}
-
-/// One protective-exit policy for CPU fitness and the detailed trade ledger.
-/// Existing protection is checked before this bar can ratchet the trail, and
-/// SL wins an ambiguous OHLC bar that crosses both SL and TP. A minimum hold
-/// must never suppress protection or extend the maximum holding deadline.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn protective_exit_price(
-    side: i8,
-    entry_px: f64,
-    sl_pips: f64,
-    tp_pips: f64,
-    trail_px: &mut f64,
-    hi: f64,
-    lo: f64,
-    close: f64,
-    bars_held: usize,
-    pip: f64,
-    settings: &BacktestSettings,
-) -> Option<f64> {
-    if side == 1 {
-        let mut sl = entry_px - (sl_pips * pip);
-        let tp = entry_px + (tp_pips * pip);
-        // Only PRIOR bars may have moved the stop protecting this bar.
-        // Zero is the existing unset sentinel for both position directions.
-        if settings.trailing_enabled && *trail_px > 0.0 && *trail_px > sl {
-            sl = *trail_px;
-        }
-        if lo <= sl {
-            return Some(sl);
-        }
-        if hi >= tp {
-            return Some(tp);
-        }
-        if settings.trailing_enabled {
-            let mv = hi - entry_px;
-            if mv >= (settings.trailing_be_trigger_r * sl_pips * pip) {
-                let locked = entry_px + settings.trailing_min_lock_pips * pip;
-                let candidate =
-                    (hi - (settings.trailing_atr_multiplier * sl_pips * pip)).max(locked);
-                if *trail_px == 0.0 || candidate > *trail_px {
-                    *trail_px = candidate;
-                }
-            }
-        }
-    } else {
-        let mut sl = entry_px + (sl_pips * pip);
-        let tp = entry_px - (tp_pips * pip);
-        if settings.trailing_enabled && *trail_px > 0.0 && *trail_px < sl {
-            sl = *trail_px;
-        }
-        if hi >= sl {
-            return Some(sl);
-        }
-        if lo <= tp {
-            return Some(tp);
-        }
-        if settings.trailing_enabled {
-            let mv = entry_px - lo;
-            if mv >= (settings.trailing_be_trigger_r * sl_pips * pip) {
-                let locked = entry_px - settings.trailing_min_lock_pips * pip;
-                let candidate =
-                    (lo + (settings.trailing_atr_multiplier * sl_pips * pip)).min(locked);
-                if *trail_px == 0.0 || candidate < *trail_px {
-                    *trail_px = candidate;
-                }
-            }
-        }
-    }
-    // Timeout is a close-of-bar exit, after the intrabar protective barriers.
-    (settings.max_hold_bars > 0 && bars_held >= settings.max_hold_bars).then_some(close)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -999,7 +1137,53 @@ pub(crate) fn fast_evaluate_strategy_core(
         settings,
         &mut Vec::new(),
         None,
+        None,
+        None,
     )
+}
+
+/// Same canonical CPU simulation as `fast_evaluate_strategy_core`, additionally
+/// returning the completed-month fractional return vector (pnl over month-start
+/// equity) for the opt-in MonthlyUpsideV1 selector. The eleven-slot metrics are
+/// bit-identical to the metrics-only sibling.
+///
+/// The parameter names and order are DELIBERATELY unlike every other evaluator
+/// entry point: the duplicate gate treats an identical argument block as a new
+/// copy, so this wrapper must not share one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fast_evaluate_strategy_core_with_monthly_returns(
+    eval_settings: &BacktestSettings,
+    bars_close: &[f64],
+    bars_high: &[f64],
+    bars_low: &[f64],
+    entry_signals: &[i8],
+    confidence_values: &[f64],
+    month_buckets: &[i64],
+    day_buckets: &[i64],
+    bar_timestamps: &[i64],
+) -> ([f64; 11], Vec<f64>) {
+    let mut monthly = Vec::new();
+    let metrics = evaluate_strategy_with_ledger_core::<false>(
+        bars_close,
+        bars_high,
+        bars_low,
+        entry_signals,
+        confidence_values,
+        month_buckets,
+        day_buckets,
+        bar_timestamps,
+        eval_settings,
+        &mut Vec::new(),
+        None,
+        None,
+        Some(&mut monthly),
+    );
+    (metrics, monthly)
+}
+
+enum EntryTimestampObservation<'a> {
+    Settled(&'a mut Vec<i64>),
+    Admitted(&'a mut Vec<i64>),
 }
 
 /// The CPU fitness and detailed ledger share the same position lifecycle.
@@ -1018,6 +1202,8 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     settings: &BacktestSettings,
     trades: &mut Vec<Trade>,
     mut netted: Option<&mut netted_bar_research::NettedBarCoreState<'_>>,
+    mut entry_timestamps: Option<EntryTimestampObservation<'_>>,
+    monthly_returns_out: Option<&mut Vec<f64>>,
 ) -> [f64; 11] {
     // Reports itself on first call — see `eval_telemetry`.
     neoethos_core::research_conversion_fee::validate_conversion_fee_rate_v1(
@@ -1048,7 +1234,12 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     // per-bar confidence slice is supplied. Otherwise `pos_lots` stays
     // 1.0 for every trade — exact legacy fixed-1-lot behaviour, which
     // keeps existing callers (and the `&[]` callers below) unchanged.
-    let use_risk_sizing = settings.risk_based_sizing && !confidences.is_empty();
+    let account_policy = settings.risky_account_experiment.as_ref();
+    let continuous_risk_sizing =
+        account_policy.is_some_and(RiskyAccountExperimentV1::continuous_risk_sizing);
+    let fixed_leverage = account_policy.and_then(|policy| policy.fixed_leverage);
+    let use_risk_sizing =
+        settings.risk_based_sizing && (!confidences.is_empty() || continuous_risk_sizing);
     // Captured at each entry; constant for the life of an open position.
     let mut pos_lots: f64 = 1.0;
     // Per-entry SL/TP in pips (adaptive-per-entry when enabled, else the scalar
@@ -1059,6 +1250,21 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     let mut pos_tp_pips: f64 = settings.tp_pips;
 
     let initial_equity = settings.initial_equity();
+    if let Some(policy) = account_policy {
+        policy
+            .validate(
+                initial_equity,
+                (settings.risk_per_trade_min, settings.risk_per_trade_max),
+            )
+            .expect("invalid Risky account experiment");
+    }
+    assert!(
+        !continuous_risk_sizing || use_risk_sizing,
+        "continuous Risky replay requires account-risk sizing"
+    );
+    let lot_grid = settings
+        .resolved_lot_grid(netted.as_ref().and_then(|state| state.lot_grid), false)
+        .expect("invalid account lot constraints");
     let month_capacity = netted
         .as_ref()
         .map(|state| state.month_capacity)
@@ -1066,7 +1272,7 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
 
     let mut equity = initial_equity;
     let mut peak_equity = initial_equity;
-    let mut max_dd = 0.0;
+    let mut max_dd = 0.0_f64;
     let mut trade_count = 0usize;
     let mut wins = 0usize;
     let mut gross_profit = 0.0;
@@ -1165,172 +1371,112 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
             day_trade_count = 0;
         }
 
-        if RECORD_TRADES && in_pos != 0 {
-            // Retain the existing bar-resolution excursion convention. This is
-            // not tick-resolved evidence about the ordering of intrabar prices.
-            let (favorable, adverse) = if in_pos == 1 {
-                (high[i] - entry_px, entry_px - low[i])
+        if in_pos != 0 {
+            let gap_exit = use_timestamps
+                && settings.gap_threshold_ms > 0
+                && timestamps[i] > timestamps[i - 1]
+                && timestamps[i] - timestamps[i - 1] >= settings.gap_threshold_ms;
+            // A gap retains the existing close-price convention and skips the
+            // ordinary intrabar drawdown/barrier walk. All exits then settle
+            // through one cost, cash, drawdown and trade-recording path.
+            let exit_px = if gap_exit {
+                Some((close[i], TradeExitReason::DataGap))
             } else {
-                (entry_px - low[i], high[i] - entry_px)
-            };
-            mfe_money = mfe_money.max(favorable / pip * settings.pip_value_per_lot * pos_lots);
-            mae_money = mae_money.max(adverse / pip * settings.pip_value_per_lot * pos_lots);
-        }
-
-        // Gap detection: force-exit open position when market gap exceeds threshold
-        if in_pos != 0 && use_timestamps && settings.gap_threshold_ms > 0 {
-            let ts_prev = timestamps[i - 1];
-            let ts_curr = timestamps[i];
-            if ts_curr > ts_prev && (ts_curr - ts_prev) >= settings.gap_threshold_ms {
-                // Force exit at current close (proxy for gap open price).
-                // Risk-based sizing: scale the price-derived PnL and the
-                // commission+spread cost by the entry-captured `pos_lots`.
-                let pnl = if in_pos == 1 {
-                    (close[i] - entry_px) / pip * settings.pip_value_per_lot
-                } else {
-                    (entry_px - close[i]) / pip * settings.pip_value_per_lot
-                };
-                let price_gross = pnl * pos_lots - half_spread_cost * pos_lots;
-                let pnl =
-                    pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
-                // Preserve old cost/swap arithmetic when fee is zero, but carry
-                // the commission-free price gross separately for a nonzero fee.
-                let entry_ts_ms = if use_timestamps && entry_idx >= 0 {
-                    timestamps.get(entry_idx as usize).copied().unwrap_or(0)
-                } else {
-                    0
-                };
-                let exit_ts_ms = if use_timestamps {
-                    timestamps.get(i).copied().unwrap_or(0)
-                } else {
-                    0
-                };
-                let pnl = apply_carry_and_fee_scaled(
-                    pnl,
-                    price_gross,
-                    pos_lots,
+                protective_exit_price(
                     in_pos,
-                    entry_ts_ms,
-                    exit_ts_ms,
+                    entry_px,
+                    pos_sl_pips,
+                    pos_tp_pips,
+                    &mut trail_px,
+                    high[i],
+                    low[i],
+                    close[i],
+                    i - entry_idx as usize,
+                    pip,
                     settings,
-                );
-                if RECORD_TRADES {
-                    record_closed_cpu_trade(
-                        trades,
-                        entry_ts_ms,
-                        exit_ts_ms,
-                        pnl,
-                        initial_equity,
-                        pos_sl_pips * settings.pip_value_per_lot * pos_lots,
-                        mfe_money,
-                        mae_money,
-                    );
-                }
-                equity += pnl;
-                current_month_pnl += pnl;
-                trade_count += 1;
-                if pnl > 0.0 {
-                    wins += 1;
-                    gross_profit += pnl;
+                    settings.risky_account_experiment.is_some(),
+                )
+                .or_else(|| session_close.then_some((close[i], TradeExitReason::SessionClose)))
+            };
+            let new_accounting = settings.risky_account_experiment.is_some();
+            // Explicit OHLC path: stop first on a dual touch, otherwise the
+            // adverse excursion precedes a target. A closed position cannot
+            // observe later extremes. Gap fills retain their uncapped price.
+            let (lo, hi, adverse_first) = if new_accounting {
+                observed_position_bar(in_pos, exit_px, low[i], high[i])
+            } else {
+                (low[i], high[i], false)
+            };
+            if RECORD_TRADES {
+                let (favorable, adverse) = if in_pos == 1 {
+                    (hi - entry_px, entry_px - lo)
                 } else {
-                    gross_loss += pnl.abs();
-                }
-                in_pos = 0;
-                if equity > peak_equity {
-                    peak_equity = equity;
-                }
-                if equity > day_peak {
+                    (entry_px - lo, hi - entry_px)
+                };
+                mfe_money = mfe_money.max(favorable / pip * settings.pip_value_per_lot * pos_lots);
+                mae_money = mae_money.max(adverse / pip * settings.pip_value_per_lot * pos_lots);
+            }
+            if !gap_exit || new_accounting {
+                // Float (unrealized) PnL drives intrabar DD/peak. Scale by the
+                // entry-captured `pos_lots` so the drawdown the GA sees matches
+                // the realized-PnL sizing (a 3%-risk trade floats 3× the DD of
+                // a 1%-risk trade at the same price excursion).
+                let worst_float_pnl = pos_lots
+                    * if in_pos == 1 {
+                        (lo - entry_px) / pip * settings.pip_value_per_lot
+                    } else {
+                        (entry_px - hi) / pip * settings.pip_value_per_lot
+                    };
+                let best_float_pnl = pos_lots
+                    * if in_pos == 1 {
+                        (hi - entry_px) / pip * settings.pip_value_per_lot
+                    } else {
+                        (entry_px - lo) / pip * settings.pip_value_per_lot
+                    };
+                if adverse_first {
+                    // Do not compare an earlier low to a later target peak.
+                    if peak_equity > 0.0 {
+                        max_dd =
+                            max_dd.max((peak_equity - (equity + worst_float_pnl)) / peak_equity);
+                    }
+                    day_low = day_low.min(equity + worst_float_pnl);
                     finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
-                    day_peak = equity;
-                    day_low = equity;
-                } else if equity < day_low {
-                    day_low = equity;
                 }
+                if (equity + best_float_pnl) > peak_equity {
+                    peak_equity = equity + best_float_pnl;
+                }
+                if (equity + best_float_pnl) > day_peak {
+                    finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
+                    day_peak = equity + best_float_pnl;
+                    // A new same-day peak starts a new causal drawdown segment.
+                    // Preserve this bar's worst excursion (the canonical
+                    // best-before-worst intrabar convention) but discard troughs
+                    // that occurred before the new peak.
+                    day_low = equity
+                        + if adverse_first {
+                            best_float_pnl
+                        } else {
+                            worst_float_pnl
+                        };
+                } else if (equity + worst_float_pnl) < day_low {
+                    day_low = equity + worst_float_pnl;
+                }
+
                 let current_dd = if peak_equity > 0.0 {
-                    (peak_equity - equity) / peak_equity
+                    (peak_equity - (equity + worst_float_pnl)) / peak_equity
                 } else {
                     0.0
                 };
-                if current_dd > max_dd {
+                if !adverse_first && current_dd > max_dd {
                     max_dd = current_dd;
                 }
-                // This close consumed the bar. The pre-gap signal must not
-                // reopen a position at the same close after forced liquidation.
-                continue;
             }
-        }
-
-        if in_pos != 0 {
-            let lo = low[i];
-            let hi = high[i];
-            // Float (unrealized) PnL drives intrabar DD/peak. Scale by the
-            // entry-captured `pos_lots` so the drawdown the GA sees matches
-            // the realized-PnL sizing (a 3%-risk trade floats 3× the DD of
-            // a 1%-risk trade at the same price excursion).
-            let worst_float_pnl = pos_lots
-                * if in_pos == 1 {
-                    (lo - entry_px) / pip * settings.pip_value_per_lot
-                } else {
-                    (entry_px - hi) / pip * settings.pip_value_per_lot
-                };
-            let best_float_pnl = pos_lots
-                * if in_pos == 1 {
-                    (hi - entry_px) / pip * settings.pip_value_per_lot
-                } else {
-                    (entry_px - lo) / pip * settings.pip_value_per_lot
-                };
-            if (equity + best_float_pnl) > peak_equity {
-                peak_equity = equity + best_float_pnl;
-            }
-            if (equity + best_float_pnl) > day_peak {
-                finalize_daily_drawdown_segment(day_peak, day_low, &mut max_daily_dd);
-                day_peak = equity + best_float_pnl;
-                // A new same-day peak starts a new causal drawdown segment.
-                // Preserve this bar's worst excursion (the canonical
-                // best-before-worst intrabar convention) but discard troughs
-                // that occurred before the new peak.
-                day_low = equity + worst_float_pnl;
-            } else if (equity + worst_float_pnl) < day_low {
-                day_low = equity + worst_float_pnl;
-            }
-
-            let current_dd = if peak_equity > 0.0 {
-                (peak_equity - (equity + worst_float_pnl)) / peak_equity
-            } else {
-                0.0
-            };
-            if current_dd > max_dd {
-                max_dd = current_dd;
-            }
-
-            let exit_px = protective_exit_price(
-                in_pos,
-                entry_px,
-                pos_sl_pips,
-                pos_tp_pips,
-                &mut trail_px,
-                hi,
-                lo,
-                close[i],
-                i - entry_idx as usize,
-                pip,
-                settings,
-            )
-            .or_else(|| session_close.then_some(close[i]));
-            if let Some(exit_px) = exit_px {
-                let pnl = if in_pos == 1 {
-                    (exit_px - entry_px) / pip * settings.pip_value_per_lot
-                } else {
-                    (entry_px - exit_px) / pip * settings.pip_value_per_lot
-                };
+            if let Some((exit_px, exit_reason)) = exit_px {
                 // Risk-based sizing: the price-derived `pnl` (set in the
                 // shared protective-exit policy above) and the commission +
                 // half-spread cost both scale by the entry-captured
                 // `pos_lots`. (Half-spread was already paid at entry via the
                 // adjusted entry_px; this is the exit-side half + commission.)
-                let price_gross = pnl * pos_lots - half_spread_cost * pos_lots;
-                let pnl =
-                    pnl * pos_lots - (settings.commission_per_trade + half_spread_cost) * pos_lots;
                 // Phase C.2: apply broker swap + conversion fee (size-aware).
                 let entry_ts_ms = if use_timestamps && entry_idx >= 0 {
                     timestamps.get(entry_idx as usize).copied().unwrap_or(0)
@@ -1342,14 +1488,24 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 } else {
                     0
                 };
-                let pnl = apply_carry_and_fee_scaled(
-                    pnl,
-                    price_gross,
-                    pos_lots,
+                // Retain the scalar path's historical tiny-pip guard.
+                let mut settlement_settings;
+                let priced_settings = if pip.to_bits() == settings.pip_value.to_bits() {
+                    settings
+                } else {
+                    settlement_settings = settings.clone();
+                    settlement_settings.pip_value = pip;
+                    &settlement_settings
+                };
+                let pnl = closed_position_net_pnl(
                     in_pos,
+                    entry_px,
+                    exit_px,
+                    pos_lots,
+                    half_spread_cost,
                     entry_ts_ms,
                     exit_ts_ms,
-                    settings,
+                    priced_settings,
                 );
                 if RECORD_TRADES {
                     record_closed_cpu_trade(
@@ -1361,11 +1517,15 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                         pos_sl_pips * settings.pip_value_per_lot * pos_lots,
                         mfe_money,
                         mae_money,
+                        exit_reason,
                     );
                 }
                 equity += pnl;
                 current_month_pnl += pnl;
                 trade_count += 1;
+                if let Some(EntryTimestampObservation::Settled(entries)) = &mut entry_timestamps {
+                    entries.push(timestamps[entry_idx as usize]);
+                }
                 if pnl > 0.0 {
                     wins += 1;
                     gross_profit += pnl;
@@ -1392,8 +1552,22 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 if current_dd > max_dd {
                     max_dd = current_dd;
                 }
+                if settings
+                    .risky_account_experiment
+                    .as_ref()
+                    .is_some_and(|policy| {
+                        equity <= 0.0
+                            || (!policy.continuous_risk_sizing() && equity >= policy.target_balance)
+                    })
+                {
+                    // Legacy accounts bank the first realized target. Visible
+                    // exhaustion terminates either policy without a reset.
+                    break;
+                }
             }
         } else {
+            // Closing above consumes the bar, including a forced gap exit:
+            // this entry branch is reached only when the bar began flat.
             // Causal entry: act on the signal observed at the PRIOR bar's
             // close, fill at the CURRENT bar's close. Previously the code
             // read `signals[i]` and immediately filled at `close[i]` — but
@@ -1422,36 +1596,55 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
                 if size_multiplier == 0.0 {
                     continue;
                 }
+                assert!(
+                    !continuous_risk_sizing || size_multiplier == 1.0,
+                    "continuous Risky replay may veto a position but cannot rescale its risk signal"
+                );
                 let mut entry_lots = if use_risk_sizing {
                     let conf = confidences.get(i - 1).copied().unwrap_or(1.0);
                     risk_based_pos_lots(conf, equity, entry_sl, settings)
                 } else {
                     1.0
                 };
-                if let Some(state) = netted.as_deref_mut() {
-                    // ML shrinks the already confidence-sized risk ONCE. A
-                    // broker-quantity refusal must occur before lane occupancy.
-                    entry_lots *= size_multiplier;
-                    if entry_lots <= 0.0 {
-                        continue;
-                    }
-                    if let Some(grid) = state.lot_grid {
-                        match grid.normalize_down(entry_lots) {
-                            Some(lots) => entry_lots = lots,
-                            None => {
+                // Shrink risk once, then admit the same quantity through the
+                // shared grid for direct confidence and combined-lane replay.
+                entry_lots *= size_multiplier;
+                if entry_lots <= 0.0 {
+                    continue;
+                }
+                if let Some(policy) = fixed_leverage {
+                    entry_lots = entry_lots.min(netted_bar_research::remaining_fixed_margin_lots(
+                        equity,
+                        f64::from(policy.maximum.get()),
+                        policy.account_notional_per_lot,
+                        0.0,
+                    ));
+                }
+                if let Some(grid) = lot_grid {
+                    match grid.normalize_down(entry_lots) {
+                        Some(lots) => entry_lots = lots,
+                        None => {
+                            if let Some(state) = netted.as_deref_mut() {
                                 state.below_min_entries += 1;
-                                continue;
                             }
+                            continue;
                         }
                     }
                 }
-                if entry_lots <= 0.0 {
-                    continue;
+                if let Some(policy) = fixed_leverage {
+                    if entry_lots * policy.account_notional_per_lot
+                        > equity * f64::from(policy.maximum.get())
+                    {
+                        continue;
+                    }
                 }
                 in_pos = s;
                 // Bug #1 fix: half-spread applied at entry (entry_px offset), half at exit
                 entry_px = close[i] + (s as f64) * half_spread_px;
                 entry_idx = i as i64;
+                if let Some(EntryTimestampObservation::Admitted(entries)) = &mut entry_timestamps {
+                    entries.push(timestamps[i]);
+                }
                 trail_px = 0.0;
                 mfe_money = 0.0;
                 mae_money = 0.0;
@@ -1540,6 +1733,26 @@ fn evaluate_strategy_with_ledger_core<const RECORD_TRADES: bool>(
     } else {
         (0.0, 0.0, 0.0, 0)
     };
+
+    // The completed-month fractional return vector for the opt-in
+    // MonthlyUpsideV1 selector (neo-671 B9, docs section 14.7). Same 0..=limit
+    // month range and the same month-start-equity denominators the slot-7 hit
+    // rate reads above, so the vector can never disagree with the canonical
+    // metrics it rides alongside. Months with a non-positive start equity are
+    // omitted exactly like the slot-7 counter omits them. The eleven-slot
+    // metrics and every existing output are untouched.
+    if let Some(out) = monthly_returns_out {
+        out.clear();
+        if month_ptr >= 0 {
+            let limit = month_ptr.min(month_capacity.saturating_sub(1) as i64) as usize;
+            for idx in 0..=limit {
+                let base = month_start_equities[idx];
+                if base > 0.0 {
+                    out.push(monthly_pnls[idx] / base);
+                }
+            }
+        }
+    }
 
     // Custom/versioned consistency stays on its historical raw-money inputs.
     let consistency = if std_m > 0.0 {
@@ -1681,6 +1894,8 @@ pub(crate) fn simulate_trades_core(
         settings,
         &mut trades,
         None,
+        None,
+        None,
     );
     trades
 }
@@ -1697,6 +1912,12 @@ pub(crate) fn validate_sizing_confidences(
         settings.pnl_conversion_fee_rate,
     )
     .map_err(anyhow::Error::msg)?;
+    if let Some(policy) = &settings.risky_account_experiment {
+        policy.validate(
+            settings.initial_equity(),
+            (settings.risk_per_trade_min, settings.risk_per_trade_max),
+        )?;
+    }
     anyhow::ensure!(
         settings.initial_equity().is_finite() && settings.initial_equity() > 0.0,
         "account-risk replay initial equity must be finite and positive"
@@ -1734,6 +1955,12 @@ pub(crate) fn validate_sizing_confidences(
 /// One replay returns both the metrics and the actual entry-sized trades.
 /// Consumers cannot accidentally combine risk-sized metrics with a fixed-lot
 /// ledger, and walk-forward does not have to simulate every window twice.
+/// `monthly_returns_out` optionally captures the completed-month fractional
+/// return vector (month P&L over month-start equity) — the same series the
+/// opt-in MonthlyUpsideV1 selector (B9) consumes; pass `None` when the
+/// consumer has no monthly series.
+/// `admitted_entries_out` optionally records entry times for every admitted
+/// position, including positions still open at the replay boundary.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
     close: &[f64],
@@ -1745,6 +1972,8 @@ pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
     day_idx: &[i64],
     timestamps: &[i64],
     settings: &BacktestSettings,
+    monthly_returns_out: Option<&mut Vec<f64>>,
+    admitted_entries_out: Option<&mut Vec<i64>>,
 ) -> anyhow::Result<([f64; 11], Vec<Trade>)> {
     let bars = close.len();
     if high.len() != bars
@@ -1772,6 +2001,8 @@ pub(crate) fn evaluate_strategy_with_confidence_and_ledger_core(
         settings,
         &mut trades,
         None,
+        admitted_entries_out.map(EntryTimestampObservation::Admitted),
+        monthly_returns_out,
     );
     Ok((metrics, trades))
 }
@@ -1804,8 +2035,113 @@ pub(crate) fn simulate_trades_with_confidence_core(
         &days,
         timestamps,
         settings,
+        None,
+        None,
     )
     .map(|(_, trades)| trades)
+}
+
+/// One protective-exit policy for CPU fitness and the detailed trade ledger.
+/// Existing protection is checked before this bar can ratchet the trail, and
+/// SL wins an ambiguous OHLC bar that crosses both SL and TP. A minimum hold
+/// must never suppress protection or extend the maximum holding deadline.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn protective_exit_price(
+    side: i8,
+    entry_px: f64,
+    sl_pips: f64,
+    tp_pips: f64,
+    trail_px: &mut f64,
+    hi: f64,
+    lo: f64,
+    close: f64,
+    bars_held: usize,
+    pip: f64,
+    settings: &BacktestSettings,
+    strict_close_trail: bool,
+) -> Option<(f64, TradeExitReason)> {
+    let mut stop_reason = TradeExitReason::Stop;
+    if side == 1 {
+        let mut sl = entry_px - (sl_pips * pip);
+        let tp = entry_px + (tp_pips * pip);
+        // Only PRIOR bars may have moved the stop protecting this bar.
+        // Zero is the existing unset sentinel for both position directions.
+        if settings.trailing_enabled && *trail_px > 0.0 && *trail_px > sl {
+            sl = *trail_px;
+            stop_reason = TradeExitReason::TrailingStop;
+        }
+        if lo <= sl {
+            return Some((sl, stop_reason));
+        }
+        if hi >= tp {
+            return Some((tp, TradeExitReason::Target));
+        }
+        if settings.trailing_enabled {
+            let mv = hi - entry_px;
+            if mv >= (settings.trailing_be_trigger_r * sl_pips * pip) {
+                let locked = entry_px + settings.trailing_min_lock_pips * pip;
+                let candidate =
+                    (hi - (settings.trailing_atr_multiplier * sl_pips * pip)).max(locked);
+                // A close-bar amend cannot install a sell stop at/above the
+                // observed market after a retracement. The Risky account
+                // experiment keeps its prior protection on that refusal;
+                // it must not invent a profitable next-bar fill there.
+                if (!strict_close_trail || candidate < close)
+                    && (*trail_px == 0.0 || candidate > *trail_px)
+                {
+                    *trail_px = candidate;
+                }
+            }
+        }
+    } else {
+        let mut sl = entry_px + (sl_pips * pip);
+        let tp = entry_px - (tp_pips * pip);
+        if settings.trailing_enabled && *trail_px > 0.0 && *trail_px < sl {
+            sl = *trail_px;
+            stop_reason = TradeExitReason::TrailingStop;
+        }
+        if hi >= sl {
+            return Some((sl, stop_reason));
+        }
+        if lo <= tp {
+            return Some((tp, TradeExitReason::Target));
+        }
+        if settings.trailing_enabled {
+            let mv = entry_px - lo;
+            if mv >= (settings.trailing_be_trigger_r * sl_pips * pip) {
+                let locked = entry_px - settings.trailing_min_lock_pips * pip;
+                let candidate =
+                    (lo + (settings.trailing_atr_multiplier * sl_pips * pip)).min(locked);
+                if (!strict_close_trail || candidate > close)
+                    && (*trail_px == 0.0 || candidate < *trail_px)
+                {
+                    *trail_px = candidate;
+                }
+            }
+        }
+    }
+    // Timeout is a close-of-bar exit, after the intrabar protective barriers.
+    (settings.max_hold_bars > 0 && bars_held >= settings.max_hold_bars)
+        .then_some((close, TradeExitReason::MaxHold))
+}
+
+/// A closed sleeve cannot observe extremes after its protective exit.
+fn observed_position_bar(
+    side: i8,
+    exit: Option<(f64, TradeExitReason)>,
+    low: f64,
+    high: f64,
+) -> (f64, f64, bool) {
+    match exit {
+        Some((
+            px,
+            TradeExitReason::Stop | TradeExitReason::TrailingStop | TradeExitReason::DataGap,
+        )) => (px, px, true),
+        Some((px, TradeExitReason::Target)) if side == 1 => (low, px, true),
+        Some((px, TradeExitReason::Target)) => (px, high, true),
+        _ => (low, high, false),
+    }
 }
 
 /// Configured weekend policy, not a universal assumption about FX sessions.
@@ -1831,6 +2167,7 @@ fn record_closed_cpu_trade(
     initial_risk: f64,
     mfe: f64,
     mae: f64,
+    exit_reason: TradeExitReason,
 ) {
     trades.push(Trade {
         entry_time,
@@ -1839,6 +2176,7 @@ fn record_closed_cpu_trade(
         pnl_pct: Some(pnl / initial_balance),
         duration_hours: (exit_time >= entry_time)
             .then_some((exit_time - entry_time) as f64 / 3_600_000.0),
+        exit_reason: Some(exit_reason),
         mfe,
         mae,
         r_multiple: pnl / initial_risk.max(1e-9),
@@ -2193,70 +2531,7 @@ fn evaluate_population_core_unchecked(
                 .to_string(),
         );
     }
-    let PopulationEvalInputs {
-        close,
-        high,
-        low,
-        indicators,
-        gene_offsets,
-        gene_indices,
-        gene_weights,
-        long_thr,
-        short_thr,
-        month_idx,
-        day_idx,
-        timestamps,
-        sl_pips,
-        tp_pips,
-        stop_vol_mult,
-        smc_data,
-        gene_smc_flags,
-        gate_threshold,
-        weights,
-        settings,
-    } = inputs;
-    let n_genes = long_thr.len();
-    let n_samples = close.len();
-    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
-    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
-
-    // Per-gene CPU evaluation (signal synthesis + SL/TP backtest), reachable
-    // only under the sealed exact-zero-device CPU receipt.
-    let eval_gene_cpu = |g: usize| -> [f64; 11] {
-        let (signals, confidences) = synthesize_signals_and_confidence_cpu(
-            indicators,
-            gene_offsets,
-            gene_indices,
-            gene_weights,
-            long_thr,
-            short_thr,
-            smc_data,
-            gene_smc_flags,
-            gate_threshold,
-            weights,
-            g,
-            n_samples,
-        );
-        let mut gene_settings = settings.clone();
-        gene_settings.sl_pips = sl_pips[g];
-        gene_settings.tp_pips = tp_pips[g];
-        // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
-        // Pairs with the shared `adaptive_base_pips` on the cloned settings.
-        gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
-        // Risk-based sizing uses the per-bar confidence; with
-        // `risk_based_sizing == false` the slice is ignored (legacy).
-        fast_evaluate_strategy_core(
-            close,
-            high,
-            low,
-            &signals,
-            &confidences,
-            month_idx,
-            day_idx,
-            timestamps,
-            &gene_settings,
-        )
-    };
+    let n_genes = inputs.long_thr.len();
 
     // The only legal CPU branch is the exact-zero-device route sealed before
     // this evaluation. Backend configuration cannot grant or block it.
@@ -2264,7 +2539,7 @@ fn evaluate_population_core_unchecked(
         .require_cpu_route_receipt_v1()
         .map_err(|error| error.to_string())?;
     let cpu_started = std::time::Instant::now();
-    let results: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+    let results = validation_backtest_population_cpu(inputs);
     evidence
         .record_successful_population(
             crate::engine_identity::PopulationEvalEngine::Cpu,
@@ -2327,71 +2602,7 @@ fn validation_backtest_population_inner(
     if !cpu_route {
         panic!("sealed native validation route requires the compiled native CUDA adapter");
     }
-    let PopulationEvalInputs {
-        close,
-        high,
-        low,
-        indicators,
-        gene_offsets,
-        gene_indices,
-        gene_weights,
-        long_thr,
-        short_thr,
-        month_idx,
-        day_idx,
-        timestamps,
-        sl_pips,
-        tp_pips,
-        stop_vol_mult,
-        smc_data,
-        gene_smc_flags,
-        gate_threshold,
-        weights,
-        settings,
-    } = inputs;
-    let n_genes = long_thr.len();
-    let n_samples = close.len();
-    let stop_vol_mult_fallback = normalized_stop_vol_mult(stop_vol_mult, n_genes);
-    let stop_vol_mult = stop_vol_mult_fallback.as_deref().unwrap_or(stop_vol_mult);
-    if n_genes == 0 {
-        return Vec::new();
-    }
-
-    // Canonical per-gene CPU route, shared mathematically with the GA. It is a
-    // local closure because it borrows the input slices.
-    let eval_gene_cpu = |g: usize| -> [f64; 11] {
-        let (signals, confidences) = synthesize_signals_and_confidence_cpu(
-            indicators,
-            gene_offsets,
-            gene_indices,
-            gene_weights,
-            long_thr,
-            short_thr,
-            smc_data,
-            gene_smc_flags,
-            gate_threshold,
-            weights,
-            g,
-            n_samples,
-        );
-        let mut gene_settings = settings.clone();
-        gene_settings.sl_pips = sl_pips[g];
-        gene_settings.tp_pips = tp_pips[g];
-        // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
-        // Pairs with the shared `adaptive_base_pips` on the cloned settings.
-        gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
-        fast_evaluate_strategy_core(
-            close,
-            high,
-            low,
-            &signals,
-            &confidences,
-            month_idx,
-            day_idx,
-            timestamps,
-            &gene_settings,
-        )
-    };
+    let n_genes = inputs.long_thr.len();
 
     // Canonical CPU execution exists only under the sealed exact-zero-device
     // receipt checked above; it is not a recovery action after native failure.
@@ -2399,7 +2610,7 @@ fn validation_backtest_population_inner(
         .require_cpu_route_receipt_v1()
         .unwrap_or_else(|error| panic!("CPU validation route is not authorized: {error}"));
     let cpu_started = std::time::Instant::now();
-    let out: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect();
+    let out = validation_backtest_population_cpu(inputs);
     evidence
         .record_successful_population(
             crate::engine_identity::PopulationEvalEngine::Cpu,
@@ -2440,6 +2651,21 @@ pub(crate) fn validation_backtest_population_cpu(
         .collect()
 }
 
+/// Same canonical CPU population simulation, additionally returning each gene's
+/// completed-month fractional return vector for the opt-in MonthlyUpsideV1
+/// selector (neo-671 B9). The eleven-slot metrics are bit-identical to
+/// [`validation_backtest_population_cpu`].
+pub(crate) fn validation_backtest_population_cpu_with_monthly(
+    inputs: PopulationEvalInputs<'_>,
+) -> anyhow::Result<(Vec<[f64; 11]>, Vec<Vec<f64>>)> {
+    Ok(
+        validation_backtest_population_observed_cpu::<false>(inputs, None)?
+            .into_iter()
+            .map(|(metrics, _trades, _report, monthly)| (metrics, monthly))
+            .unzip(),
+    )
+}
+
 /// Same CPU population simulator with its actual account-risk ledger retained.
 /// The receipt is checked before execution; a native route cannot enter here.
 pub(crate) fn validation_backtest_population_with_ledger_cpu(
@@ -2466,6 +2692,25 @@ pub(crate) fn validation_backtest_population_with_ledger_cpu(
 fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
     inputs: PopulationEvalInputs<'_>,
 ) -> anyhow::Result<Vec<([f64; 11], Vec<Trade>)>> {
+    Ok(
+        validation_backtest_population_observed_cpu::<RECORD_TRADES>(inputs, None)?
+            .into_iter()
+            .map(|(m, t, _, _)| (m, t))
+            .collect(),
+    )
+}
+
+pub(crate) fn validation_backtest_population_observed_cpu<const RECORD_TRADES: bool>(
+    inputs: PopulationEvalInputs<'_>,
+    weekly: Option<&crate::scoring::weekly_cadence::WeeklyCadenceContractV1>,
+) -> anyhow::Result<
+    Vec<(
+        [f64; 11],
+        Vec<Trade>,
+        Option<crate::scoring::weekly_cadence::WeeklyRollingCadenceReportV1>,
+        Vec<f64>,
+    )>,
+> {
     // Reports itself on first call, so "never used" is visible rather
     // than inferred. See `eval_telemetry`.
     let _telemetry_started = std::time::Instant::now();
@@ -2510,7 +2755,7 @@ fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
     if n_genes == 0 {
         return Ok(Vec::new());
     }
-    let eval_gene_cpu = |g: usize| -> anyhow::Result<([f64; 11], Vec<Trade>)> {
+    let eval_gene_cpu = |g: usize| -> anyhow::Result<_> {
         let (signals, confidences) = synthesize_signals_and_confidence_cpu(
             indicators,
             gene_offsets,
@@ -2531,8 +2776,12 @@ fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
         // Per-gene adaptive stop multiplier (0.0 / empty slice => fixed path).
         // Pairs with the shared `adaptive_base_pips` on the cloned settings.
         gene_settings.adaptive_vol_mult = stop_vol_mult.get(g).copied().unwrap_or(0.0);
-        if RECORD_TRADES {
-            evaluate_strategy_with_confidence_and_ledger_core(
+        let (metrics, trades, entries, monthly) = if weekly.is_some() {
+            // Retain entry times only, not a population-sized trade ledger.
+            let mut entries = Vec::new();
+            let mut trades = Vec::new();
+            let mut monthly = Vec::new();
+            let metrics = evaluate_strategy_with_ledger_core::<RECORD_TRADES>(
                 close,
                 high,
                 low,
@@ -2542,23 +2791,45 @@ fn validation_backtest_population_cpu_core<const RECORD_TRADES: bool>(
                 day_idx,
                 timestamps,
                 &gene_settings,
-            )
+                &mut trades,
+                None,
+                Some(EntryTimestampObservation::Settled(&mut entries)),
+                Some(&mut monthly),
+            );
+            (metrics, trades, entries, monthly)
+        } else if RECORD_TRADES {
+            let (metrics, trades) = evaluate_strategy_with_confidence_and_ledger_core(
+                close,
+                high,
+                low,
+                &signals,
+                &confidences,
+                month_idx,
+                day_idx,
+                timestamps,
+                &gene_settings,
+                None,
+                None,
+            )?;
+            (metrics, trades, Vec::new(), Vec::new())
         } else {
-            Ok((
-                fast_evaluate_strategy_core(
-                    close,
-                    high,
-                    low,
-                    &signals,
-                    &confidences,
-                    month_idx,
-                    day_idx,
-                    timestamps,
-                    &gene_settings,
-                ),
-                Vec::new(),
-            ))
-        }
+            let (metrics, monthly) = fast_evaluate_strategy_core_with_monthly_returns(
+                &gene_settings,
+                close,
+                high,
+                low,
+                &signals,
+                &confidences,
+                month_idx,
+                day_idx,
+                timestamps,
+            );
+            (metrics, Vec::new(), Vec::new(), monthly)
+        };
+        let report = weekly
+            .map(|c| crate::scoring::weekly_cadence::evaluate_rolling_weekly_cadence(c, &entries))
+            .transpose()?;
+        Ok((metrics, trades, report, monthly))
     };
     (0..n_genes).into_par_iter().map(&eval_gene_cpu).collect()
 }
@@ -3642,6 +3913,8 @@ mod overrides_tests {
                         &days,
                         &times,
                         &settings,
+                        None,
+                        None,
                     )
                     .unwrap();
                     let fast = fast_evaluate_strategy_core(
@@ -3793,6 +4066,64 @@ mod overrides_tests {
             "empty confidence slice must force fixed-1-lot, got {}",
             m[0]
         );
+    }
+
+    #[test]
+    fn risk_sizing_compounds_current_equity_and_cannot_recover_after_full_loss() {
+        // Exactly representable synthetic prices isolate the balance oracle:
+        // win, win, loss, win at 1R, with no fees or fractional-pip roundoff.
+        let close = [1.0; 9];
+        let mut high = close;
+        let mut low = close;
+        for row in [2, 4, 8] {
+            high[row] = 1.75;
+        }
+        low[6] = 0.25;
+        let signals = [1, 0, 1, 0, 1, 0, 1, 0, 0];
+        let mut settings = BacktestSettings {
+            initial_equity_override: Some(100.0),
+            pip_value: 0.125,
+            pip_value_per_lot: 1.0,
+            sl_pips: 4.0,
+            tp_pips: 4.0,
+            spread_pips: 0.0,
+            commission_per_trade: 0.0,
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
+            kill_zones_enabled: false,
+            max_hold_bars: 0,
+            min_hold_bars: 0,
+            trailing_enabled: false,
+            risk_based_sizing: true,
+            risk_per_trade_min: 0.5,
+            risk_per_trade_max: 0.5,
+            ..Default::default()
+        };
+        let evaluate = |settings: &BacktestSettings| {
+            fast_evaluate_strategy_core(
+                &close,
+                &high,
+                &low,
+                &signals,
+                &[1.0; 9],
+                &[0; 9],
+                &[0; 9],
+                &[],
+                settings,
+            )
+        };
+        let partial = evaluate(&settings);
+        // 100 -> 150 -> 225 -> 112.5 -> 168.75; fixed-initial sizing differs.
+        assert!((partial[0] - 68.75).abs() < 1e-9);
+        assert_eq!(partial[8], 4.0);
+        settings.risk_per_trade_min = 1.0;
+        settings.risk_per_trade_max = 1.0;
+        let exhausted = evaluate(&settings);
+        // 100 -> 200 -> 400 -> 0; the later winning signal cannot resurrect it.
+        assert_eq!(exhausted[0], -100.0);
+        assert_eq!(exhausted[8], 3.0);
+        assert!(exhausted[3] >= 1.0);
     }
 
     #[test]
@@ -4069,6 +4400,7 @@ mod protective_exit_tests {
         settings: &BacktestSettings,
         exit_bar: usize,
         expected_pnl: f64,
+        expected_reason: TradeExitReason,
     ) {
         let timestamps: Vec<i64> = (0..close.len())
             .map(|i| 1_700_000_000_000 + i as i64 * 300_000)
@@ -4096,6 +4428,7 @@ mod protective_exit_tests {
         assert_eq!(trades.len(), 1, "trade logger lost the protected exit");
         assert_eq!(trades[0].entry_time, timestamps[1]);
         assert_eq!(trades[0].exit_time, Some(timestamps[exit_bar]));
+        assert_eq!(trades[0].exit_reason, Some(expected_reason));
         for pnl in [metrics[0], trades[0].pnl] {
             assert!(
                 (pnl - expected_pnl).abs() < 1e-8,
@@ -4139,6 +4472,11 @@ mod protective_exit_tests {
                     &protected_settings(),
                     2,
                     if target { 400.0 } else { -200.0 },
+                    if target {
+                        TradeExitReason::Target
+                    } else {
+                        TradeExitReason::Stop
+                    },
                 );
             }
         }
@@ -4178,6 +4516,7 @@ mod protective_exit_tests {
                 &settings,
                 3,
                 200.0,
+                TradeExitReason::TrailingStop,
             );
         }
     }
@@ -4200,6 +4539,7 @@ mod protective_exit_tests {
                 &settings,
                 3,
                 side as f64 * 100.0,
+                TradeExitReason::MaxHold,
             );
         }
     }
@@ -4219,6 +4559,7 @@ mod protective_exit_tests {
                 &settings,
                 3,
                 -200.0,
+                TradeExitReason::Stop,
             );
         }
     }
@@ -4237,7 +4578,70 @@ mod protective_exit_tests {
             &settings,
             4,
             100.0,
+            TradeExitReason::MaxHold,
         );
+    }
+
+    #[test]
+    fn trade_log_distinguishes_session_close_from_data_gap() {
+        let start = chrono::DateTime::parse_from_rfc3339("2024-01-05T19:50:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let close = [1.0, 1.0, 1.001, 1.001];
+        let high = close.map(|value| value + 0.0001);
+        let low = close.map(|value| value - 0.0001);
+        for reason in [TradeExitReason::SessionClose, TradeExitReason::DataGap] {
+            let mut timestamps = [start, start + 300_000, start + 600_000, start + 900_000];
+            let mut settings = protected_settings();
+            settings.kill_zones_enabled = reason == TradeExitReason::SessionClose;
+            if reason == TradeExitReason::DataGap {
+                settings.gap_threshold_ms = 3 * 86_400_000;
+                timestamps[2] += 7 * 86_400_000;
+                timestamps[3] += 7 * 86_400_000;
+            }
+            let trades =
+                simulate_trades_core(&close, &high, &low, &timestamps, &[1, 0, 0, 0], &settings);
+            assert_eq!(trades.len(), 1);
+            assert_eq!(trades[0].exit_time, Some(timestamps[2]));
+            assert_eq!(trades[0].exit_reason, Some(reason));
+            assert!((trades[0].pnl - 100.0).abs() < 1e-8);
+        }
+    }
+
+    #[test]
+    fn gap_exit_keeps_cash_costs_and_consumes_the_bar_before_reentry() {
+        let start = 1_700_000_000_000;
+        let timestamps = [
+            start,
+            start + 300_000,
+            start + 7 * 86_400_000 + 300_000,
+            start + 7 * 86_400_000 + 600_000,
+        ];
+        let settings = BacktestSettings {
+            gap_threshold_ms: 3 * 86_400_000,
+            spread_pips: 2.0,
+            commission_per_trade: 4.0,
+            swap_long_pips_per_day: -0.5,
+            pnl_conversion_fee_rate: 0.02,
+            ..protected_settings()
+        };
+        // A same-bar reentry after the gap would spuriously hit a second target
+        // on the final bar. The valid new entry on that last bar stays open.
+        let trades = simulate_trades_core(
+            &[1.0, 1.0, 1.001, 1.005],
+            &[1.0001, 1.0001, 1.0011, 1.007],
+            &[0.9999, 0.9999, 1.0009, 1.004],
+            &timestamps,
+            &[1, 1, 1, 0],
+            &settings,
+        );
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].exit_time, Some(timestamps[2]));
+        assert_eq!(trades[0].exit_reason, Some(TradeExitReason::DataGap));
+        // 10 pips gross - 2 spread, at 10 currency units/pip; then 4
+        // commission, seven days of -5 carry, and 2% of 80 price gross.
+        let expected = (10.0 - 2.0) * 10.0 - 4.0 - 7.0 * 5.0 - 80.0 * 0.02;
+        assert!((trades[0].pnl - expected).abs() < 1e-8, "{}", trades[0].pnl);
     }
 }
 

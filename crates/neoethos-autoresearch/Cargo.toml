@@ -74,6 +74,8 @@ search-conditioning-set = []
 search-in-market-fitness = []
 search-t-stat-objective = []
 search-portfolio-objective = []
+# §14.7 — the asymmetric monthly-upside GA fitness (scoring::ga_fitness_monthly_upside_v1).
+search-monthly-upside-objective = []
 
 [dev-dependencies]
 # Pinned to the 3.27 already in Cargo.lock so this adds a dependency EDGE and

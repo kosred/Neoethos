@@ -141,8 +141,11 @@ extern "C" __global__ void dual_ulcer_index_finalize_f64(
         }
 
         double denom = static_cast<double>(period);
-        double long_ulcer = sqrt(long_sq_sum) / denom;
-        double short_ulcer = sqrt(short_sq_sum) / denom;
+        // A rolling square sum can round a few ulps below zero; sqrt() would
+        // return NaN there and poison the cumulative threshold permanently.
+        // Keep the CUDA lane operation-identical to the CPU reference.
+        double long_ulcer = sqrt(fmax(long_sq_sum, 0.0)) / denom;
+        double short_ulcer = sqrt(fmax(short_sq_sum, 0.0)) / denom;
         double threshold_value;
 
         if (auto_threshold != 0) {
@@ -322,8 +325,10 @@ static void dual_ulcer_index_row_f64(
         if (sq_count < period) continue;
 
         const double denom = (double)period;
-        const double long_ulcer = sqrt(long_sq_sum) / denom;
-        const double short_ulcer = sqrt(short_sq_sum) / denom;
+        // Operation-identical to the CPU reference: clamp the rounded-negative
+        // rolling square sum so one NaN cannot poison the cumulative threshold.
+        const double long_ulcer = sqrt(fmax(long_sq_sum, 0.0)) / denom;
+        const double short_ulcer = sqrt(fmax(short_sq_sum, 0.0)) / denom;
         const double diff = fabs(long_ulcer - short_ulcer);
         double threshold_value;
         if (auto_threshold) {

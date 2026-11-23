@@ -385,10 +385,13 @@ __device__ double score_prop_firm_ga_fitness_v4(const double metrics[11]) {
   const double hit = clamp_f64_v1(monthly_hit, 0.0, 1.0) * 0.45;
   const double net_return = clamp_f64_v1(net / 20000.0, -2.0, 2.0) * 0.15;
   const double sharpe_score = sharpe_component_v1(sharpe, confidence) * 0.10;
-  const double consistency_score = consistency_component_v1(consistency) * 0.10;
+  // 2026-10-20 sample-confidence revision (mirrors the CPU objective): the
+  // per-trade quality terms scale with sample size so one-trade lottery genomes
+  // can no longer outrank active strategies. At >= 100 trades confidence is 1.0.
+  const double consistency_score = consistency_component_v1(consistency) * 0.10 * confidence;
   const double profit_factor_score =
-      ga_pf_component_v1(profit_factor) * (profit_factor >= 1.0 ? 0.15 : 0.25);
-  const double win_rate_score = win_rate_component_v1(win_rate) * 0.10;
+      ga_pf_component_v1(profit_factor) * (profit_factor >= 1.0 ? 0.15 : 0.25) * confidence;
+  const double win_rate_score = win_rate_component_v1(win_rate) * 0.10 * confidence;
   const double drawdown = drawdown_penalty_v1(max_drawdown);
   const double daily_drawdown = clamp_f64_v1(max_daily_drawdown, 0.0, 1.0) * 10.0;
   return (hit + net_return + sharpe_score + consistency_score + profit_factor_score +

@@ -509,6 +509,7 @@ mod artifact_exit_policy_tests {
             trailing_be_trigger_r: 2.5,
             trailing_stop_multiplier: 0.75,
             trailing_min_lock_pips: 4.0,
+            max_hold_bars: 0,
         }
     }
 

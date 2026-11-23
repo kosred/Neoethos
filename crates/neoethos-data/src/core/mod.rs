@@ -14,6 +14,7 @@ pub mod discover;
 /// multiplies the widest object the system builds; this is what keeps peak
 /// memory a function of the machine and never of a user parameter.
 pub mod feature_budget;
+pub mod feature_frame_cache;
 pub mod feature_registry;
 pub mod feature_run_lease;
 pub mod features;

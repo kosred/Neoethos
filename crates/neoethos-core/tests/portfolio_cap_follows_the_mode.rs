@@ -155,11 +155,10 @@ fn the_shipped_default_carries_a_real_ceiling() {
          read as UNLIMITED concurrent risk by live_trading.rs, on every install",
         d.risk.max_portfolio_risk
     );
+    assert_eq!(d.system.trading_mode, "risky");
     assert!(
-        (d.risk.max_portfolio_risk - d.risk.daily_drawdown_limit).abs() < 1e-6,
-        "the default cap ({}) must equal the default daily drawdown limit ({})",
-        d.risk.max_portfolio_risk,
-        d.risk.daily_drawdown_limit
+        (d.risk.max_portfolio_risk - 0.34).abs() < 1e-9,
+        "the primary Risky default must carry the existing Risky ceiling"
     );
 }
 

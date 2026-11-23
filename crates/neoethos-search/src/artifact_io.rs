@@ -9,3 +9,28 @@ pub use neoethos_core::storage::json::temporary_path;
 // same silent-drift defect in miniature — it reads as wiring when it is none.
 pub use neoethos_core::storage::json::{read_json, stable_json_hash, write_json_atomic};
 pub use neoethos_core::utils::fnv1a64;
+
+#[derive(Default)]
+struct JsonByteCounter(u64);
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("compact JSON byte count overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn compact_json_byte_len<T: serde::Serialize + ?Sized>(
+    value: &T,
+) -> serde_json::Result<u64> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}

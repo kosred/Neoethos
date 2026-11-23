@@ -1,5 +1,47 @@
 use super::*;
 
+#[test]
+fn quote_risk_adapter_refuses_to_drop_new_risky_account_stopping_policy() {
+    let mut evaluation = EvaluationConfig {
+        account_currency: "USD".into(),
+        initial_equity: 100.0,
+        risky_account_experiment: Some(crate::eval::RiskyAccountExperimentV1 {
+            target_balance: 50_000.0,
+            continuous_exact_stop_risk: false,
+            lot_constraints: None,
+            fixed_leverage: None,
+        }),
+        ..Default::default()
+    };
+    let error = CanonicalSignalAccountRiskPolicyV3::from_evaluation(&evaluation).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to drop its bound policy")
+    );
+    evaluation.risky_account_experiment = None;
+    assert!(CanonicalSignalAccountRiskPolicyV3::from_evaluation(&evaluation).is_ok());
+}
+
+#[test]
+fn reviewed_quote_quantity_uses_shared_downward_grid_and_refuses_nonfinite_requests() {
+    let grid = QuoteReplayLotConstraintsV3::new(0.5, 2.0, 0.25, "a".repeat(64)).unwrap();
+    for (request, expected) in [
+        (0.49, None),
+        (0.99, Some(0.75)),
+        (3.0, Some(2.0)),
+        (f64::NAN, None),
+        (f64::INFINITY, None),
+        (-1.0, None),
+    ] {
+        assert_eq!(grid.normalize_down(request).ok(), expected);
+    }
+    let mut untrusted = serde_json::to_value(&grid).unwrap();
+    untrusted["source_artifact_sha256"] = "not-an-artifact".into();
+    let untrusted: QuoteReplayLotConstraintsV3 = serde_json::from_value(untrusted).unwrap();
+    assert!(untrusted.normalize_down(1.0).is_err());
+}
+
 struct Fixture {
     bars: Ohlcv,
     scope: CanonicalSearchArtifactScopeV2,
@@ -9,83 +51,91 @@ struct Fixture {
     size_multipliers: Vec<Vec<f64>>,
 }
 
+/// Synthetic cTrader identity for immutable input-contract tests only.
+pub(crate) fn explicit_broker_feature_fixture() -> neoethos_data::FeatureFrame {
+    let bars = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
+    // Explicit synthetic broker identity for INPUT-contract tests only.
+    // The shared sample feature helper deliberately has External scope;
+    // do not relax production validation or relabel a real stored receipt.
+    use neoethos_feature_contracts::{
+        DatasetFeatureArtifactProvenanceV1, FeatureNodeV1, FeatureOutputV1, FeaturePlanV1,
+        SourceArtifactBindingV1, SourceSegmentV1,
+    };
+    let identity = neoethos_data::CanonicalDatasetIdentity::ctrader(
+        neoethos_data::CTraderEnvironment::Demo,
+        "prelocked-unit-test",
+        101,
+        7,
+        "EURUSD",
+        CanonicalTimeframe::M1,
+        neoethos_data::BarTimestampConvention::BarOpen,
+    )
+    .unwrap();
+    let timestamps = bars.timestamp.as_ref().unwrap();
+    let plan = FeaturePlanV1::new(
+        vec![
+            FeatureNodeV1::source(
+                "test:source",
+                identity.clone(),
+                "test.prelocked-input-only.v1",
+                1,
+                vec![FeatureOutputV1::f64("test_signal_input", 1).unwrap()],
+                [1; 32],
+            )
+            .unwrap(),
+        ],
+        vec!["test_signal_input".to_owned()],
+    )
+    .unwrap();
+    let provenance = DatasetFeatureArtifactProvenanceV1::new(
+        &plan,
+        vec![
+            SourceArtifactBindingV1::new(
+                "test:source",
+                identity.clone(),
+                "test.prelocked-input-only.v1",
+                [1; 32],
+                "test-only-generation",
+                [2; 32],
+                neoethos_data::BarTimestampConvention::BarOpen,
+                vec![
+                    SourceSegmentV1::new(
+                        0,
+                        timestamps.len() as u64,
+                        timestamps[0],
+                        *timestamps.last().unwrap(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let features = neoethos_data::FeatureFrame::from_columns(
+        timestamps.clone(),
+        vec![
+            neoethos_data::FeatureColumnF64::new(
+                "test_signal_input",
+                vec![0.0; timestamps.len()],
+                vec![neoethos_data::FeatureCellValidity::Valid; timestamps.len()],
+            )
+            .unwrap(),
+        ],
+        plan,
+        provenance,
+    )
+    .unwrap();
+    features
+}
+
 impl Fixture {
     fn new() -> Self {
         let bars = neoethos_data::test_fixtures::ctrader_sample_ohlcv();
-        // Explicit synthetic broker identity for INPUT-contract tests only.
-        // The shared sample feature helper deliberately has External scope;
-        // do not relax production validation or relabel a real stored receipt.
-        use neoethos_feature_contracts::{
-            DatasetFeatureArtifactProvenanceV1, FeatureNodeV1, FeatureOutputV1, FeaturePlanV1,
-            SourceArtifactBindingV1, SourceSegmentV1,
-        };
-        let identity = neoethos_data::CanonicalDatasetIdentity::ctrader(
-            neoethos_data::CTraderEnvironment::Demo,
-            "prelocked-unit-test",
-            101,
-            7,
-            "EURUSD",
-            CanonicalTimeframe::M1,
-            neoethos_data::BarTimestampConvention::BarOpen,
-        )
-        .unwrap();
-        let timestamps = bars.timestamp.as_ref().unwrap();
-        let plan = FeaturePlanV1::new(
-            vec![
-                FeatureNodeV1::source(
-                    "test:source",
-                    identity.clone(),
-                    "test.prelocked-input-only.v1",
-                    1,
-                    vec![FeatureOutputV1::f64("test_signal_input", 1).unwrap()],
-                    [1; 32],
-                )
-                .unwrap(),
-            ],
-            vec!["test_signal_input".to_owned()],
-        )
-        .unwrap();
-        let provenance = DatasetFeatureArtifactProvenanceV1::new(
-            &plan,
-            vec![
-                SourceArtifactBindingV1::new(
-                    "test:source",
-                    identity.clone(),
-                    "test.prelocked-input-only.v1",
-                    [1; 32],
-                    "test-only-generation",
-                    [2; 32],
-                    neoethos_data::BarTimestampConvention::BarOpen,
-                    vec![
-                        SourceSegmentV1::new(
-                            0,
-                            timestamps.len() as u64,
-                            timestamps[0],
-                            *timestamps.last().unwrap(),
-                        )
-                        .unwrap(),
-                    ],
-                )
-                .unwrap(),
-            ],
-        )
-        .unwrap();
-        let features = neoethos_data::FeatureFrame::from_columns(
-            timestamps.clone(),
-            vec![
-                neoethos_data::FeatureColumnF64::new(
-                    "test_signal_input",
-                    vec![0.0; timestamps.len()],
-                    vec![neoethos_data::FeatureCellValidity::Valid; timestamps.len()],
-                )
-                .unwrap(),
-            ],
-            plan,
-            provenance,
-        )
-        .unwrap();
+        let features = explicit_broker_feature_fixture();
+        let identity = features.provenance().bindings()[0].dataset_identity();
         let receipt =
-            crate::CanonicalSearchInputReceiptV2::from_feature_frame(&identity, &features).unwrap();
+            crate::CanonicalSearchInputReceiptV2::from_feature_frame(identity, &features).unwrap();
         let scope = CanonicalSearchArtifactScopeV2::for_entire_receipt(
             CanonicalSearchWindowRoleV1::Holdout,
             receipt,

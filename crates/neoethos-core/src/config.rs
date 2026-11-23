@@ -6,6 +6,10 @@ use crate::domain::prop_firm::{PropFirmConstraints, PropFirmPreset, PropFirmRunt
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Concurrent-risk seed for the operator's primary Risky product. Explicit
+/// PropFirm profiles seed their own preset's daily-stop ceiling instead.
+const RISKY_PORTFOLIO_RISK_CAP: f64 = 0.34;
+
 /// Serialize a `HashMap` in SORTED key order (audit M06/M07 follow-up).
 /// HashMap iteration order is randomized per process, so `Settings::save`
 /// reshuffled these config maps on every write — dirtying config.yaml in git
@@ -85,6 +89,10 @@ pub fn validate_news_calendar_source(raw: &str) -> Result<String, String> {
 
 /// System-level configuration
 ///
+/// Search/discovery and risk framing use `trading_mode`, whose default is
+/// `risky`. An explicit `models.discovery_mode = "strict"` overrides only
+/// the discovery side.
+///
 /// **Sealed against a second load path.** `remote = "Self"` makes the derive
 /// emit an *inherent* `SystemConfig::deserialize` instead of an
 /// `impl Deserialize for SystemConfig`, so this type cannot be reached by
@@ -132,10 +140,6 @@ pub struct SystemConfig {
     ///   - `"prop_firm"` → safety / stability: pass prop-firm challenges and
     ///     bank a steady monthly return. Drives `DiscoveryMode::PropFirm` (FTMO
     ///     window-pass gate) and the active `risk.preset` constraints.
-    ///
-    /// Search/discovery + risk framing orient around this one choice. An
-    /// explicit `models.discovery_mode = "strict"` is a power-user escape hatch
-    /// that overrides the discovery side only. Default `"prop_firm"`.
     pub trading_mode: String,
     /// Risky-Mode goal — capital multiplication. The operator sets where to
     /// start, where to reach, and by when; in Risky mode these PRESSURE the
@@ -238,7 +242,9 @@ impl Default for SystemConfig {
             // value.
             account_currency: String::new(),
             data_dir: PathBuf::from("data"),
-            trading_mode: "prop_firm".to_string(),
+            // Operator's primary product: 100 -> 50,000 in 180 days. An
+            // explicitly selected PropFirm profile still overrides this.
+            trading_mode: "risky".to_string(),
             risky_start_balance_usd: 100.0,
             risky_target_balance_usd: 50000.0,
             risky_horizon_days: 180,
@@ -381,6 +387,10 @@ pub struct RiskConfig {
     /// a field-level default would instead turn an absent key into `None`.
     pub risky_min_risk_per_trade: Option<f64>,
     pub risky_max_risk_per_trade: Option<f64>,
+    /// Opt-in Risky-only execution semantics. None preserves legacy archives;
+    /// PropFirm never resolves this policy, even in the same config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risky_limits_policy: Option<crate::domain::risky_mode::RiskyLimitsPolicy>,
     pub prop_firm_min_risk_per_trade: Option<f64>,
     pub prop_firm_max_risk_per_trade: Option<f64>,
     /// Portfolio-level cap on TOTAL concurrent risk across all running live
@@ -596,6 +606,7 @@ impl Default for RiskConfig {
             // surfaces P(ruin) so this stays a visible bet, not a hidden one.
             risky_min_risk_per_trade: None,
             risky_max_risk_per_trade: Some(0.30),
+            risky_limits_policy: None,
             prop_firm_min_risk_per_trade: None,
             // Operator decision (2026-08-10): a prop-firm entry may use at
             // most 1% risk. `None` would fall back to the shared 3% band.
@@ -613,7 +624,7 @@ impl Default for RiskConfig {
             // this per preset AND per trading_mode; the risky ladder gets
             // RISKY_PORTFOLIO_RISK_CAP instead, which is a tolerance for ruin
             // rather than a rulebook.
-            max_portfolio_risk: runtime.daily_dd_stop_trading_pct,
+            max_portfolio_risk: RISKY_PORTFOLIO_RISK_CAP,
             // Internal early stop sits 20% below the firm's published
             // daily-loss ceiling so a guard-rail trips before a real
             // breach. Operators override in YAML if their firm gives
@@ -682,6 +693,17 @@ impl Default for RiskConfig {
 pub type SessionSpreadPips = [f64; 3];
 
 impl RiskConfig {
+    pub fn limits_policy_for_mode(
+        &self,
+        mode: &str,
+    ) -> Option<crate::domain::risky_mode::RiskyLimitsPolicy> {
+        if mode.eq_ignore_ascii_case("risky") || mode.eq_ignore_ascii_case("growth") {
+            self.risky_limits_policy
+        } else {
+            None
+        }
+    }
+
     /// Resolve the operator's session-spread curve.
     ///
     /// - `Ok(None)` — none of the three keys is set. The evaluator charges the
@@ -1412,6 +1434,27 @@ impl Default for SearchRuntimeConfig {
     }
 }
 
+/// Raw reviewed research inputs. Search validates their shape/source binding
+/// through its existing quote-replay quantity owner before using them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RiskyReplayLotConstraintsConfigV1 {
+    pub min_lots: f64,
+    pub max_lots: f64,
+    pub lot_step: f64,
+    pub source_artifact_sha256: String,
+    /// Optional fixed-leverage assumption for FX with a base-currency account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_leverage: Option<RiskyFixedNotionalLeverageV1>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RiskyFixedNotionalLeverageV1 {
+    pub maximum: std::num::NonZeroU32,
+    pub account_notional_per_lot: f64,
+}
+
 /// Discovery-pipeline runtime knobs — the config-driven replacement for the
 /// legacy `NEOETHOS_BOT_PREFILTER_TOP_K`, `NEOETHOS_BOT_PREFILTER_INSAMPLE`,
 /// `NEOETHOS_BOT_FUNNEL_STAGE1_PCT`, `NEOETHOS_BOT_FUNNEL_STAGE1_WINDOW`,
@@ -1423,6 +1466,34 @@ impl Default for SearchRuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiscoveryRuntimeConfig {
+    /// New Risky research policy: permit every drawdown below total capital
+    /// loss. Position risk remains an explicit searched input, and the native
+    /// confidence-sized balance path must reach the configured deadline goal.
+    /// False preserves archived runs' 60% selection ceiling and EUR10 floor.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_survival_only: bool,
+    /// CPU research v3: observe exits before later candle extremes and bank
+    /// the first realized target. Requires Risky + risky_survival_only. This
+    /// does not model broker margin/stop-out and is off for archived runs.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_account_experiment_v3: bool,
+    /// Require at least one admitted entry in every complete seven-day
+    /// period of the Risky candidate screening window.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_minimum_weekly_entries: bool,
+    /// Measure Risky weekly entries without rejecting candidates for cadence.
+    /// Used with the exact continuous Risky account policy for paired research.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub risky_weekly_entries_report_only: bool,
+    /// Optional reviewed quantity limits for new Risky CPU experiments.
+    /// The referenced artifact must supply these values; no broker defaults
+    /// or margin/stop-out authority is inferred from this configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risky_lot_constraints: Option<RiskyReplayLotConstraintsConfigV1>,
+    /// Opt-in rolling five-UTC-weekday objective for new PropFirm CPU runs.
+    /// Existing stricter frequency and financial floors remain active.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub weekly_cadence: bool,
     /// Max features kept after the in-sample correlation prefilter; `0`
     /// disables the prefilter. (was `NEOETHOS_BOT_PREFILTER_TOP_K`)
     ///
@@ -1520,6 +1591,65 @@ pub struct DiscoveryRuntimeConfig {
     /// See [`PropFirmGateConfig`]. (was the
     /// `NEOETHOS_BOT_DISCOVERY_PROP_FIRM_*` env overrides)
     pub prop_firm_gate: PropFirmGateConfig,
+    /// Opt-in DIRECTION-ONLY prefilter ranking (neo-671 volatility-decoupling
+    /// experiment, default `false` = unchanged behaviour).
+    ///
+    /// The default ranking scores each column by `max(|corr|, |corr_short|)`
+    /// of the column against the full first-passage label, whose vertical/
+    /// ambiguous rows are `0`. The label barriers are ATR-scaled by
+    /// construction, so a volatility feature correlates with whether the label
+    /// is DECIDED (wide barriers → more vertical rows) even when it carries no
+    /// directional information — and the absolute value turns that
+    /// decidedness correlation into a high rank. The GA then inherits a
+    /// volatility-state vocabulary with weak directional edge.
+    ///
+    /// When `true`, the correlation for each direction is computed on the rows
+    /// where that direction's label is decided (`+1`/`-1`) only; vertical and
+    /// ambiguous rows are excluded. The rank then answers "given a barrier is
+    /// hit, does this column predict WHICH one" instead of "does this column
+    /// predict whether a barrier is hit". Same barrier geometry, same window,
+    /// same top-K and quotas.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prefilter_direction_only_ranking: bool,
+    /// Opt-in volatility-family purge for the prefilter (default empty =
+    /// unchanged). Every column whose timeframe-stripped name starts with one
+    /// of these prefixes is excluded from the ranking AND from the per-TF
+    /// quota and seed-template force-keep — a purge, not a tie-break. Intended
+    /// for the neo-671 volatility-decoupling experiments (e.g.
+    /// `[atr, atr_percentile, natr, garman_klass_volatility,
+    /// parkinson_volatility, quant_rvol, mass, normalized_volume_true_range]`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefilter_purge_prefixes: Vec<String>,
+    /// Opt-in SYMMETRIC round-trip cost treatment for the discovery prefilter's
+    /// triple-barrier / first-passage label (neo-671 label-cost experiment,
+    /// default `false` = unchanged behaviour).
+    ///
+    /// The legacy (default) barriers charge the round-trip cost to the take
+    /// side only in PRICE terms: the take barrier sits at
+    /// `entry + take + cost` while the stop barrier sits at
+    /// `entry - stop + cost` (cost ADDED to the take distance, SUBTRACTED from
+    /// the stop distance). In net-P&L terms that is correct — a win nets
+    /// exactly `take` and a loss nets exactly `stop` — but first passage is
+    /// a race in PRICE space, so the stop (now `stop - cost` from entry) is
+    /// hit far more often than the take (`take + cost` away). At the band
+    /// midpoint the decided census is therefore ~80% losses BY CONSTRUCTION,
+    /// and the feature ranking and the GA inherit that loss tilt.
+    ///
+    /// When `true`, the cost is ADDED TO BOTH barrier distances:
+    /// `entry + take + cost` vs `entry - stop - cost` (mirrored for the
+    /// short label). Each side must clear its own distance PLUS the round trip
+    /// — the same both-ways charge the `models.label_geometry: symmetric`
+    /// mode of `neoethos_models` applies. On a driftless series the race is
+    /// fair: with `rr == 1` the decided census is ~50/50; with `rr > 1`
+    /// only the honest rr tilt remains and the cost no longer tilts it further.
+    ///
+    /// The resident GPU screening path refuses this knob for now (the
+    /// device-side label still applies the legacy tilt); use the CPU route.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub label_cost_symmetric: bool,
+    /// Explicit capacity for receipt-bound CPU research, admitted against host RAM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_research_archive_cap: Option<usize>,
 }
 
 impl Default for DiscoveryRuntimeConfig {
@@ -1527,6 +1657,12 @@ impl Default for DiscoveryRuntimeConfig {
         Self {
             // 240, matching config.yaml. See the field docs — the previous 50
             // silently contradicted the shipped config.
+            weekly_cadence: false,
+            risky_survival_only: false,
+            risky_account_experiment_v3: false,
+            risky_minimum_weekly_entries: false,
+            risky_weekly_entries_report_only: false,
+            risky_lot_constraints: None,
             prefilter_top_k: 240,
             // Discovery already receives only the training side of the outer
             // temporal split. Rank features on all of that admissible prefix;
@@ -1534,6 +1670,10 @@ impl Default for DiscoveryRuntimeConfig {
             // unnecessarily narrows the vocabulary available to the GA.
             prefilter_insample_frac: 1.0,
             prefilter_min_per_timeframe: 6,
+            prefilter_direction_only_ranking: false,
+            prefilter_purge_prefixes: Vec::new(),
+            label_cost_symmetric: false,
+            cpu_research_archive_cap: None,
             funnel_stage1_pct: 0.25,
             stage1_window: "earliest".to_string(),
             min_history_years: 0,
@@ -1758,6 +1898,11 @@ impl Default for QualityRuntimeConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct StopTargetRuntimeConfig {
+    /// Fresh gene generation uses adaptive stops unless explicitly disabled.
+    /// `None` preserves the legacy enabled policy and its serialized wire.
+    /// Existing archived genes keep their recorded per-gene stop semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_stops_enabled: Option<bool>,
     /// Hard cap on how many bars the rolling expected-shortfall series will
     /// process. `0` (the default) means NO cap — every series gets the tail
     /// term, so scoring, walk-forward and live compute the same base stop.
@@ -1785,6 +1930,7 @@ pub struct StopTargetRuntimeConfig {
 impl Default for StopTargetRuntimeConfig {
     fn default() -> Self {
         Self {
+            adaptive_stops_enabled: None,
             tail_max_bars: 0,
             tail_step: 1,
         }
@@ -1841,6 +1987,25 @@ pub struct ExitPolicyConfig {
     pub trailing_stop_multiplier: f64,
     /// Floor, in pips, on the profit the armed trail locks in.
     pub trailing_min_lock_pips: f64,
+    /// Maximum holding horizon, in bars, for the discovery evaluation's
+    /// time stop. Resolved by `DiscoveryConfig::from_settings`
+    /// (neoethos-search) into `DiscoveryConfig.max_hold_bars` and carried
+    /// through the evaluation config into `BacktestSettings.max_hold_bars`,
+    /// which closes every open position at entry + N bars.
+    ///
+    /// DEFAULT `0` = unchanged/disabled: no maximum-hold exit is armed,
+    /// byte-identical to every run produced before the knob existed. A
+    /// positive value lets the next research experiment use short holds
+    /// without editing code.
+    #[serde(skip_serializing_if = "max_hold_bars_is_disabled")]
+    pub max_hold_bars: usize,
+}
+
+/// `serde` skip predicate for [`ExitPolicyConfig::max_hold_bars`]: `0` — the
+/// shipped default — serialises as an ABSENT key, so existing artifacts and
+/// the generated desktop seed stay byte-identical.
+fn max_hold_bars_is_disabled(value: &usize) -> bool {
+    *value == 0
 }
 
 impl Default for ExitPolicyConfig {
@@ -1855,6 +2020,8 @@ impl Default for ExitPolicyConfig {
             // trail geometry, and the backtest, the CUDA kernel and live
             // trading all take it from here.
             trailing_min_lock_pips: DEFAULT_TRAILING_MIN_LOCK_PIPS,
+            // 0 = unchanged/disabled: keep the pre-knob behaviour exactly.
+            max_hold_bars: 0,
         }
     }
 }
@@ -2951,7 +3118,8 @@ pub use load_seal::{ConfigOverride, ConfigProvenance, ConfigSource, Settings};
 /// open by design, and why `ModelsConfig` is still unsealed.
 mod load_seal {
     use super::{
-        AppRuntimeConfig, ModelsConfig, NewsConfig, RiskConfig, SystemConfig, user_config_path,
+        AppRuntimeConfig, ModelsConfig, NewsConfig, RISKY_PORTFOLIO_RISK_CAP, RiskConfig,
+        SystemConfig, user_config_path,
     };
     use crate::domain::prop_firm::{PropFirmConstraints, PropFirmPreset, PropFirmRuntimeDefaults};
     use serde::{Deserialize, Deserializer, Serialize};
@@ -3726,13 +3894,6 @@ mod load_seal {
         max_trades_per_day: usize,
         max_portfolio_risk: f64,
     }
-
-    /// The concurrent-risk ceiling for the RISKY ladder, where the point is to
-    /// multiply a small balance and `risky_max_risk_per_trade` is already 0.30.
-    /// It is deliberately not derived from a daily-drawdown stop: risky mode has
-    /// no challenge to fail, so the binding constraint is the operator's
-    /// tolerance for ruin, not a firm's rulebook.
-    const RISKY_PORTFOLIO_RISK_CAP: f64 = 0.34;
 
     impl PresetSeeds {
         /// `risky_ladder` comes from `system.trading_mode`, NOT from the preset.
@@ -4894,6 +5055,132 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&settings).unwrap();
         let deserialized: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(deserialized.system.symbol, settings.system.symbol);
+    }
+
+    #[test]
+    fn exit_policy_max_hold_bars_survives_settings_serde_round_trip() {
+        // The shipped default is 0 = unchanged/disabled: the evaluation arms no
+        // maximum-hold time stop, exactly like every run before the knob.
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.models.exit_policy.max_hold_bars, 0,
+            "shipped default must keep current behaviour (0 = no max-hold exit)"
+        );
+
+        // A configured horizon must survive the YAML round trip so the next
+        // experiment can use short holds without editing code.
+        settings.models.exit_policy.max_hold_bars = 24;
+        let yaml = serde_yaml_ng::to_string(&settings).unwrap();
+        assert!(
+            yaml.contains("max_hold_bars"),
+            "a configured (non-zero) max holding horizon must be serialised: {yaml}"
+        );
+        let deserialized: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            deserialized.models.exit_policy.max_hold_bars, 24,
+            "models.exit_policy.max_hold_bars must survive the settings round trip"
+        );
+
+        // An absent key keeps the disabled default.
+        let absent: Settings = serde_yaml_ng::from_str(
+            "system:
+  symbol: EURUSD
+",
+        )
+        .unwrap();
+        assert_eq!(
+            absent.models.exit_policy.max_hold_bars, 0,
+            "an absent models.exit_policy.max_hold_bars must resolve to 0"
+        );
+    }
+
+    #[test]
+    fn prefilter_volatility_knobs_survive_settings_serde_round_trip() {
+        // Shipped defaults: both knobs OFF, so today's behaviour is unchanged.
+        let mut settings = Settings::default();
+        assert!(
+            !settings
+                .models
+                .discovery_runtime
+                .prefilter_direction_only_ranking
+        );
+        assert!(
+            settings
+                .models
+                .discovery_runtime
+                .prefilter_purge_prefixes
+                .is_empty()
+        );
+
+        // A configured knob pair must survive the YAML round trip.
+        settings
+            .models
+            .discovery_runtime
+            .prefilter_direction_only_ranking = true;
+        settings.models.discovery_runtime.prefilter_purge_prefixes =
+            vec!["atr".to_string(), "mass".to_string()];
+        let yaml = serde_yaml_ng::to_string(&settings).unwrap();
+        assert!(
+            yaml.contains("prefilter_direction_only_ranking"),
+            "an enabled direction-only knob must be serialised: {yaml}"
+        );
+        let back: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(
+            back.models
+                .discovery_runtime
+                .prefilter_direction_only_ranking
+        );
+        assert_eq!(
+            back.models.discovery_runtime.prefilter_purge_prefixes,
+            vec!["atr".to_string(), "mass".to_string()]
+        );
+
+        // Absent keys keep the disabled defaults.
+        let absent: Settings = serde_yaml_ng::from_str(
+            "system:
+  symbol: EURUSD
+",
+        )
+        .unwrap();
+        assert!(
+            !absent
+                .models
+                .discovery_runtime
+                .prefilter_direction_only_ranking
+        );
+        assert!(
+            absent
+                .models
+                .discovery_runtime
+                .prefilter_purge_prefixes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn label_cost_symmetric_survives_settings_serde_round_trip() {
+        // Shipped default: OFF, so today's label barriers are unchanged.
+        let mut settings = Settings::default();
+        assert!(!settings.models.discovery_runtime.label_cost_symmetric);
+
+        // An enabled knob must survive the YAML round trip.
+        settings.models.discovery_runtime.label_cost_symmetric = true;
+        let yaml = serde_yaml_ng::to_string(&settings).unwrap();
+        assert!(
+            yaml.contains("label_cost_symmetric"),
+            "an enabled symmetric-cost label knob must be serialised: {yaml}"
+        );
+        let back: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert!(back.models.discovery_runtime.label_cost_symmetric);
+
+        // An absent key keeps the disabled default.
+        let absent: Settings = serde_yaml_ng::from_str(
+            "system:
+  symbol: EURUSD
+",
+        )
+        .unwrap();
+        assert!(!absent.models.discovery_runtime.label_cost_symmetric);
     }
 
     #[test]

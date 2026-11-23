@@ -386,7 +386,10 @@ impl ResolvedConfig {
             s.models.discovery_mode.clone(),
             mode.to_string(),
             ResolvedSource::Config,
-            Some("config models.discovery_mode: prop_firm (default) | strict"),
+            Some(
+                "config models.discovery_mode: only strict|legacy force Strict; prop_firm|risky \
+                 are no-ops here and the regime comes from system.trading_mode",
+            ),
         );
         push_field(
             &mut display_fields,

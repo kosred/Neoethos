@@ -68,6 +68,10 @@ impl std::error::Error for StopDistanceError {}
 // `Eq` dropped 2026-08-10: `atr_stop_multiplier` is an `f64`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct StopTargetRuntimeOverrides {
+    /// An explicit false switches fresh generation to fixed-pip stops. None
+    /// preserves legacy adaptive generation and the old serialized snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_stops_enabled: Option<bool>,
     /// `0` = no cap. See [`StopDistanceError::TailCapExceeded`].
     pub tail_max_bars: usize,
     /// `1` = sample the tail every bar (position-invariant). See
@@ -89,6 +93,7 @@ pub struct StopTargetRuntimeOverrides {
 impl Default for StopTargetRuntimeOverrides {
     fn default() -> Self {
         Self {
+            adaptive_stops_enabled: None,
             tail_max_bars: 0,
             tail_step: 1,
             // Matches `RiskConfig::default().atr_stop_multiplier` (config.rs:585).
@@ -131,6 +136,11 @@ impl StopTargetRuntimeOverrides {
             d.atr_stop_multiplier
         };
         Self {
+            adaptive_stops_enabled: s
+                .models
+                .stop_target_runtime
+                .adaptive_stops_enabled
+                .filter(|enabled| !*enabled),
             tail_max_bars: s.models.stop_target_runtime.tail_max_bars,
             // `0` is meaningless for a stride; fall back to the exact default
             // rather than silently dividing by zero downstream.
@@ -324,6 +334,29 @@ impl ResolvedAdaptiveStopsPolicyV1 {
     pub fn settings(&self) -> &StopTargetSettings {
         &self.settings
     }
+
+    /// Build the archived entry series when at least one gene needs it.
+    /// Only a too-short whole slice retains the legacy fixed-pip path; missing
+    /// cells and other producer errors must never silently change geometry.
+    pub fn entry_base_pips(
+        &self,
+        needed: bool,
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        pip_size: f64,
+    ) -> Result<Option<Vec<f64>>, StopDistanceError> {
+        self.validate()?;
+        if !needed {
+            return Ok(None);
+        }
+        match adaptive_base_pips_series_with_settings(high, low, close, pip_size, &self.settings) {
+            Ok(base) => Ok(Some(base)),
+            Err(StopDistanceError::TooShort { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -868,7 +901,8 @@ fn compute_ema(values: &[f64], period: usize) -> Vec<f64> {
     out
 }
 
-fn compute_atr(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<f64> {
+/// Causal EMA of true range in price units, for aligned OHLC slices.
+pub fn compute_atr(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Vec<f64> {
     let n = close.len();
     let mut tr = vec![0.0; n];
     for i in 1..n {
@@ -1557,18 +1591,14 @@ pub fn median_atr_pips(
 
 /// Whether adaptive volatility-scaled stops are enabled for this process.
 ///
-/// ON. When on, gene generation seeds a searchable `stop_vol_mult` and the
-/// discovery backtest scales each entry's stop by the bar's volatility.
-///
-/// 2026-08-10: `NEOETHOS_ADAPTIVE_STOPS=0` was the escape hatch that turned it
-/// back off. ⚠ THAT ESCAPE HATCH IS GONE and its replacement has not landed
-/// yet: `models.stop_target_runtime.adaptive_stops_enabled` is routed to
-/// `config.rs` in the handoff, and until it lands this returns the shipped
-/// value unconditionally. What that REFUSES today is reproducing a
-/// pre-adaptive run by export. What it PERMITS is that two runs of the same
-/// config now use the same stop geometry, which they previously did not.
+/// Enabled by default. The typed
+/// `models.stop_target_runtime.adaptive_stops_enabled: false` setting makes
+/// fresh genes use fixed pips, so their TP bounds also bound executed targets.
+/// It never changes the interpretation of an archived positive multiplier.
 pub fn adaptive_stops_enabled() -> bool {
-    true
+    current_stop_target_runtime_overrides()
+        .adaptive_stops_enabled
+        .unwrap_or(true)
 }
 
 /// Resolve the reward:risk encoded by one gene's fixed stop/target pair.
@@ -1644,6 +1674,56 @@ pub fn adaptive_stops_rr() -> f64 {
 #[cfg(test)]
 mod adaptive_stop_tests {
     use super::*;
+
+    #[test]
+    fn archived_entry_series_preserves_warmup_and_refuses_non_length_errors() {
+        let settings = StopTargetSettings {
+            vol_estimator: "parkinson".into(),
+            ..Default::default()
+        };
+        let policy = ResolvedAdaptiveStopsPolicyV1::checked_new(settings, false, 2.0).unwrap();
+        assert!(
+            policy
+                .entry_base_pips(false, &[], &[], &[], f64::NAN)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            policy
+                .entry_base_pips(true, &[1.01; 3], &[0.99; 3], &[1.; 3], 0.0001)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            policy
+                .entry_base_pips(true, &[1.01; 3], &[0.99; 3], &[1.; 3], f64::NAN)
+                .is_err()
+        );
+        assert!(
+            policy
+                .entry_base_pips(true, &[1.01; 3], &[0.99; 2], &[1.; 3], 0.0001)
+                .is_err()
+        );
+        let expected = adaptive_base_pips_series_with_settings(
+            &[1.01; 200],
+            &[0.99; 200],
+            &[1.; 200],
+            0.0001,
+            policy.settings(),
+        )
+        .unwrap();
+        let actual = policy
+            .entry_base_pips(true, &[1.01; 200], &[0.99; 200], &[1.; 200], 0.0001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.len(), 200);
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
 
     #[test]
     fn shared_entry_geometry_preserves_fixed_disabled_warmup_and_exact_multiplication_order() {
@@ -2435,6 +2515,16 @@ mod adaptive_stop_tests {
     fn stop_target_from_settings_default_matches_default() {
         let s = neoethos_core::Settings::default();
         assert_eq!(
+            serde_json::to_value(s.models.stop_target_runtime).unwrap(),
+            serde_json::json!({"tail_max_bars": 0, "tail_step": 1}),
+            "omitted mode must preserve the archived Settings wire"
+        );
+        assert_eq!(
+            serde_json::to_value(StopTargetRuntimeOverrides::default()).unwrap(),
+            serde_json::json!({"tail_max_bars": 0, "tail_step": 1, "atr_stop_multiplier": 1.5}),
+            "omitted mode must preserve the archived runtime snapshot"
+        );
+        assert_eq!(
             StopTargetRuntimeOverrides::from_settings(&s),
             StopTargetRuntimeOverrides::default()
         );
@@ -2454,6 +2544,75 @@ mod adaptive_stop_tests {
         assert_eq!(
             StopTargetRuntimeOverrides::from_settings(&zeroed).tail_step,
             1
+        );
+    }
+
+    #[test]
+    fn fixed_intraday_targets_reach_generation_mutation_and_the_sealed_recipe() {
+        const CHILD: &str = "NEOETHOS_TEST_FIXED_INTRADAY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(CHILD, "1")
+                .args([
+                    "--exact",
+                    "stop_target::adaptive_stop_tests::fixed_intraday_targets_reach_generation_mutation_and_the_sealed_recipe",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "isolated fixed-target consumer failed: {}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+
+        let mut wire = serde_json::to_value(neoethos_core::Settings::default()).unwrap();
+        wire["models"]["stop_target_runtime"]["adaptive_stops_enabled"] = false.into();
+        wire["models"]["seen_signature_runtime"]["max_entries"] = 1_000_000.into();
+        wire["models"]["gene_stop_bounds"] = serde_json::json!({
+            "atr_scaled": false, "sl_min_atr": 1.0, "sl_max_atr": 4.0,
+            "sl_min_pips": 4.0, "sl_max_pips": 10.0,
+            "tp_min_pips": 5.0, "tp_max_pips": 25.0,
+            "rr_min": 1.0, "rr_max": 2.0
+        });
+        let settings: neoethos_core::Settings = serde_json::from_value(wire)
+            .expect("fixed-target mode must have a real config recipient");
+        let receipt = crate::install_and_seal_canonical_native_runtime_authority_v1(&settings)
+            .expect("the actual installed policy must match startup Settings");
+        assert!(!receipt.runtime_snapshot_sha256().is_empty());
+        let sealed = ResolvedAdaptiveStopsPolicyV1::capture_current().unwrap();
+        assert!(!sealed.enabled());
+
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(20261028);
+        let smc = crate::genetic::SmcSearchConfig::current();
+        for generation in 0..128 {
+            let gene = crate::genetic::new_random_gene(8, 3, generation, &smc, &mut rng);
+            let mutated = crate::genetic::mutate(&gene, 8, 3, generation + 1, &smc, 12, &mut rng);
+            for candidate in [&gene, &mutated] {
+                assert_eq!(candidate.stop_vol_mult, 0.0);
+                assert!((5.0..=25.0).contains(&candidate.tp_pips));
+                let executed = resolve_entry_stop_target_pips(
+                    candidate.sl_pips,
+                    candidate.tp_pips,
+                    candidate.stop_vol_mult,
+                    Some(5_000.0),
+                    true,
+                    2.0,
+                )
+                .unwrap();
+                assert_eq!(executed, (candidate.sl_pips, candidate.tp_pips));
+            }
+        }
+        // An archived adaptive gene keeps its own execution semantics even
+        // when this process generates new fixed-stop genes.
+        assert_eq!(
+            resolve_entry_stop_target_pips(4.0, 8.0, 2.0, Some(3.0), true, 2.0),
+            Some((6.0, 12.0))
         );
     }
 }

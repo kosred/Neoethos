@@ -619,3 +619,149 @@ fn outcome_with(slot: usize, e: Option<f64>, id: &str) -> SearchOutcome {
         error: None,
     }
 }
+
+#[test]
+fn run_args_default_to_no_reviewed_broker_bundle() {
+    let identity = neoethos_data::CanonicalDatasetIdentity::external(
+        "run-args-defaults",
+        "EURUSD",
+        neoethos_data::CanonicalTimeframe::M5,
+        neoethos_data::BarTimestampConvention::BarOpen,
+    )
+    .expect("valid test dataset identity");
+    let args = RunArgs::new(identity);
+    assert!(args.quote_replay_store.is_none());
+    assert!(args.quote_replay_link.is_none());
+    assert!(args.reviewed_evidence.is_none());
+}
+
+#[test]
+fn reviewed_bundle_inputs_must_be_supplied_together() {
+    let error = load_reviewed_broker_financial_truth_authority_v2(
+        Some(std::path::Path::new("store")),
+        Some(std::path::Path::new("link")),
+        None,
+        None,
+    )
+    .expect_err("partial reviewed bundle inputs must fail closed");
+    assert!(
+        error.to_string().contains("together"),
+        "unexpected partial-input refusal: {error:#}"
+    );
+}
+
+#[test]
+fn no_reviewed_bundle_inputs_keep_the_global_gate() {
+    let authority =
+        load_reviewed_broker_financial_truth_authority_v2(None, None, None, None)
+            .expect("no inputs means the global gate, not an error");
+    assert!(authority.is_none());
+}
+
+#[test]
+fn unreadable_reviewed_bundle_inputs_fail_closed() {
+    let error = load_reviewed_broker_financial_truth_authority_v2(
+        Some(std::path::Path::new("missing-store")),
+        Some(std::path::Path::new("missing-link.json")),
+        Some(std::path::Path::new("missing-reviewed.json")),
+        None,
+    )
+    .expect_err("unreadable reviewed bundle inputs must fail closed");
+    assert!(!error.to_string().is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reviewed broker bundle: the run-scoped authority is carried, not discarded
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn refusing_executor_accepts_no_authority_and_keeps_the_global_gate() {
+    // Without a reviewed bundle there is nothing to install, and the run stays
+    // governed by the global fail-closed gate (unchanged behavior).
+    let mut executor = RefusingExecutor::new(
+        (0, 800),
+        OosWindow {
+            start_ms: 801,
+            end_ms: 1000,
+        },
+        1_000,
+        100.0,
+        test_dataset_receipt(),
+    );
+    executor
+        .install_reviewed_broker_financial_truth_authority(None)
+        .expect("no reviewed bundle means the global gate, not an install error");
+}
+
+#[test]
+fn the_sweep_executor_port_carries_the_run_scoped_authority_type() {
+    // The run-scoped authority is the move-only semantic mint from the
+    // reviewed bundle. The port must carry THAT type — a string or a
+    // capability flag would let a caller fabricate admission — and an
+    // executor that cannot consume it must refuse rather than fall back to
+    // the legacy scalar adapter.
+    let source = include_str!("../runner.rs");
+    for required in [
+        "fn install_reviewed_broker_financial_truth_authority(",
+        "Option<(",
+        "BrokerFinancialTruthAuthorityV2,",
+        "ReviewedBrokerTruthRunContextV1,",
+        "canonical_run_identity_sha256()",
+        "legacy scalar adapter",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing executor-port contract {required}"
+        );
+    }
+    assert!(
+        !source.contains("_reviewed_authority"),
+        "the loaded authority must be carried into the executor, not discarded"
+    );
+}
+
+#[test]
+fn the_runner_installs_the_reviewed_authority_and_gates_only_unreviewed_runs() {
+    // Whole-file source contract: the only sweep-execution boundary in this
+    // file must load the reviewed authority, keep the global fail-closed
+    // gate for the unreviewed case, and install the authority on the
+    // executor for the reviewed case.
+    let source = include_str!("../runner.rs");
+    for required in [
+        "load_reviewed_broker_financial_truth_authority_v2(",
+        "current_broker_financial_truth_capability_v1()",
+        ".require(",
+        "install_reviewed_broker_financial_truth_authority(reviewed_authority)",
+        "if reviewed_authority.is_none()",
+    ] {
+        assert!(
+            source.contains(required),
+            "runner.rs lost the reviewed-bundle contract {required}"
+        );
+    }
+}
+
+#[test]
+fn the_runner_builds_the_reviewed_replay_context_from_the_evidence_getters_and_policy() {
+    // The runner must turn the reviewed evidence into the exact replay-binding
+    // inputs the sweep bridge needs: the public evidence getters supply the
+    // primary account/symbol ids and the reviewed quote replay-rule identity,
+    // and the capture replay policy travels with the same install.
+    let source = include_str!("../runner.rs");
+    for required in [
+        "pub struct ReviewedBrokerTruthRunContextV1",
+        "account_id: i64",
+        "symbol_id: i64",
+        "reviewed_replay_rule: ReviewedQuoteReplayRuleIdentityV2",
+        "replay_policy: QuoteValidatedResearchReplayPolicyV1",
+        "reviewed.account_id()",
+        "reviewed.symbol_id()",
+        "reviewed.reviewed_replay_rule_identity()",
+        "quote_replay_policy",
+    ] {
+        assert!(
+            source.contains(required),
+            "runner.rs lost the reviewed-replay-context contract {required}"
+        );
+    }
+}
