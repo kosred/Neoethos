@@ -995,6 +995,7 @@ mod tests {
             pnl,
             pnl_pct: None,
             duration_hours: None,
+            exit_reason: None,
             mfe: 0.0,
             mae: 0.0,
             r_multiple: 0.0,

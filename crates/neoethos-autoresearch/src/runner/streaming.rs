@@ -38,6 +38,14 @@ use neoethos_search::{
     CanonicalSearchWindowRoleV1, LockedPortfolioOuterHoldoutReplaySetV1,
 };
 
+use neoethos_core::broker_financial_truth::{
+    BrokerFinancialTruthAuthorityV2, CanonicalBarSignalResearchDecisionV1, EvidenceWindowV1,
+    LockedFinalistOosReplayScopeV1, QuoteValidatedResearchReplayBindingV1,
+    QuoteValidatedResearchReplayPlanV1, ResearchPositionDirectionV1,
+    into_sealed_historical_bid_ask_quote_replay_evidence_v2,
+    replay_sealed_quote_validated_research_v1,
+};
+
 use crate::QuoteValidatedOosTouchEvidenceV1;
 use crate::journal::{CostBandCounts, OosWindow};
 use crate::session::{DatasetReceiptV1, DirectTimeframeReceiptV1, InSampleWindowV1, SweepId};
@@ -70,6 +78,14 @@ pub struct StreamingSweepExecutor {
     /// ordinary trendbar-only `run()` route leaves this absent while preparing
     /// quote coverage. Actual OOS evaluation requires it before reading prices.
     quote_validated_oos_replay: Option<LockedPortfolioOuterHoldoutReplaySetV1>,
+    /// The run-scoped broker-financial-truth authority minted from an exact
+    /// reviewed bundle, installed by the runner when one was supplied. While
+    /// present, the sweep's financial evaluation must consume it through the
+    /// quote-replay evaluator — never the legacy scalar adapter.
+    reviewed_broker_financial_truth_authority: Option<BrokerFinancialTruthAuthorityV2>,
+    /// Exact replay-binding context (primary account/symbol, reviewed replay
+    /// rule and captured replay policy) installed together with the authority.
+    reviewed_replay_context: Option<super::ReviewedBrokerTruthRunContextV1>,
     /// Where per-search discovery ledgers are written before their matrices are
     /// copied into the session store.
     scratch_root: PathBuf,
@@ -372,8 +388,214 @@ impl StreamingSweepExecutor {
             streaming_requested: true,
             dataset_receipt,
             quote_validated_oos_replay: None,
+            reviewed_broker_financial_truth_authority: None,
+            reviewed_replay_context: None,
             scratch_root,
         })
+    }
+
+    /// Post-lock reviewed-bundle bridge for one reviewed-run search invocation.
+    ///
+    /// Consumes the run-scoped authority exactly once, seals the reviewed
+    /// historical Bid/Ask evidence against the exact locked search-holdout
+    /// binding, replays one sealed plan per locked decision through the
+    /// existing execution-replay kernel, and returns the V1 replay set for the
+    /// reviewed entrypoint's sealed evaluation. Fixed-bracket geometry only:
+    /// trailing/time-exit plans need the trader exit engine and are not built
+    /// here. Explicit per-trade economics remain separate inputs, so the money
+    /// consumer fails closed when a replayed decision closes a position.
+    #[allow(clippy::too_many_arguments)]
+    fn seal_reviewed_search_holdout_replay_set_v1(
+        authority: BrokerFinancialTruthAuthorityV2,
+        context: &super::ReviewedBrokerTruthRunContextV1,
+        symbol_name: &str,
+        bars: &neoethos_data::Ohlcv,
+        duration_ms: i64,
+        result: &neoethos_search::discovery::DiscoveryResult,
+        ordered_signals: &[Vec<i8>],
+        holdout_scope: &CanonicalSearchArtifactScopeV2,
+    ) -> Result<LockedPortfolioOuterHoldoutReplaySetV1> {
+        // ReviewedRunQuoteReplayRequired: the reviewed authority must govern
+        // this exact locked holdout receipt.
+        let receipt_identity = holdout_scope.receipt().identity_sha256()?;
+        anyhow::ensure!(
+            receipt_identity == authority.canonical_run_identity_sha256(),
+            "the reviewed run-scoped authority {} does not govern the locked search holdout \
+             receipt {}; refusing",
+            authority.canonical_run_identity_sha256(),
+            receipt_identity,
+        );
+        // Fixed-stop boundary: the reviewed entrypoint refuses adaptive stops
+        // before the provider runs, so every gene bracket is an exact fixed-pip
+        // stop/target around the decision bar's close.
+        anyhow::ensure!(
+            !result.portfolio.iter().any(|gene| gene.stop_vol_mult > 0.0),
+            "the reviewed search holdout bridge requires fixed-stop genes (stop_vol_mult = 0)"
+        );
+        let policy = &context.replay_policy;
+        let pip_size = policy.pip_size();
+
+        // Locked evaluation window: the search holdout's exact canonical bars,
+        // extended to the bar close after the last bar. The reviewed evidence
+        // window must cover exactly this window plus the non-negative seed/exit
+        // paddings of the capture.
+        let evaluated = holdout_scope.evaluated_window();
+        let locked_from = evaluated.timestamp_start_ms();
+        let locked_to = evaluated
+            .timestamp_end_ms()
+            .checked_add(duration_ms)
+            .ok_or_else(|| anyhow::anyhow!("locked holdout bar-close overflow"))?;
+        let locked_window = EvidenceWindowV1::new(locked_from, locked_to)?;
+        let evidence_window = authority.evidence_window();
+        let seed_padding_ms = locked_from
+            .checked_sub(evidence_window.from_unix_ms_inclusive())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the reviewed quote coverage starts after the locked holdout; refusing"
+                )
+            })?;
+        let exit_padding_ms = evidence_window
+            .to_unix_ms_exclusive()
+            .checked_sub(locked_to)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the reviewed quote coverage ends before the locked holdout; refusing"
+                )
+            })?;
+        anyhow::ensure!(
+            seed_padding_ms >= 0 && exit_padding_ms >= 0,
+            "the reviewed quote coverage window does not exactly cover the locked search \
+             holdout window plus non-negative paddings; refusing"
+        );
+        let replay_scope = LockedFinalistOosReplayScopeV1::new(
+            locked_window,
+            seed_padding_ms,
+            exit_padding_ms,
+        )?;
+        anyhow::ensure!(
+            replay_scope.required_quote_coverage_window() == evidence_window,
+            "the derived reviewed replay scope disagrees with the reviewed evidence window; \
+             refusing"
+        );
+
+        // Ordered locked decisions: one per eligible directional signal row,
+        // chronological across the portfolio. The V1 consumer sequences one
+        // decision per ledger by exit order; multi-lane provenance is the
+        // separately versioned V3 acquisition path.
+        let timestamps = bars
+            .timestamp
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("the search holdout bars have no timestamps"))?;
+        let row_start = usize::try_from(evaluated.row_start())
+            .context("locked holdout row start exceeds usize")?;
+        let row_end = usize::try_from(evaluated.row_end())
+            .context("locked holdout row end exceeds usize")?;
+        anyhow::ensure!(
+            row_start < row_end
+                && row_end <= timestamps.len()
+                && row_end <= bars.close.len()
+                && ordered_signals.len() == result.portfolio.len(),
+            "the locked search holdout rows/signals do not match the reviewed portfolio"
+        );
+        let mut decisions = Vec::new();
+        for (lane, gene) in result.portfolio.iter().enumerate() {
+            let signals = ordered_signals
+                .get(lane)
+                .ok_or_else(|| anyhow::anyhow!("missing holdout signals for lane {lane}"))?;
+            anyhow::ensure!(
+                signals.len() == row_end - row_start,
+                "holdout signals for lane {lane} contain {} rows instead of {}",
+                signals.len(),
+                row_end - row_start
+            );
+            for row in row_start..row_end {
+                let signal = signals[row - row_start];
+                if signal == 0 {
+                    continue;
+                }
+                let timestamp = timestamps[row];
+                let decision_at = timestamp
+                    .checked_add(duration_ms)
+                    .ok_or_else(|| anyhow::anyhow!("holdout bar-close overflow"))?;
+                if decision_at >= locked_to {
+                    continue;
+                }
+                let direction = if signal == 1 {
+                    ResearchPositionDirectionV1::Long
+                } else {
+                    ResearchPositionDirectionV1::Short
+                };
+                let sign = if signal == 1 { 1.0 } else { -1.0 };
+                let anchor = bars.close[row];
+                let stop_price = anchor - sign * gene.sl_pips * pip_size;
+                let target_price = anchor + sign * gene.tp_pips * pip_size;
+                let decision = CanonicalBarSignalResearchDecisionV1::new(
+                    timestamp,
+                    decision_at,
+                    direction,
+                    stop_price,
+                    target_price,
+                )?;
+                decisions.push((decision, gene.sl_pips));
+            }
+        }
+        decisions.sort_by_key(|(decision, _)| decision.next_canonical_bar_open_unix_ms());
+        anyhow::ensure!(
+            !decisions.is_empty(),
+            "the locked search holdout produced no directional decisions to replay"
+        );
+        let ordered_risk_pips: Vec<f64> = decisions.iter().map(|(_, risk)| *risk).collect();
+        let portfolio_identity =
+            neoethos_search::canonical_locked_portfolio_identity_sha256_v1(&result.portfolio)?;
+        let holdout_scope_identity = holdout_scope.identity_sha256()?;
+        let canonical_signal_plan_sha256 = neoethos_search::canonical_signal_plan_sha256_v1(
+            &receipt_identity,
+            &portfolio_identity,
+            &result.search_config_hash,
+            &holdout_scope_identity,
+            ordered_signals,
+            &ordered_risk_pips,
+        )?;
+        let binding = QuoteValidatedResearchReplayBindingV1::new(
+            receipt_identity,
+            canonical_signal_plan_sha256,
+            context.account_id,
+            context.symbol_id,
+            symbol_name,
+            replay_scope,
+            context.reviewed_replay_rule.clone(),
+            authority.broker_truth_manifest_sha256(),
+        )?;
+        binding.validate_replay_policy_v1(policy)?;
+        // Seal the reviewed historical Bid/Ask evidence EXACTLY ONCE.
+        let evidence =
+            into_sealed_historical_bid_ask_quote_replay_evidence_v2(authority, &binding)?;
+        // Replay one sealed plan per locked decision.
+        let mut ledgers = Vec::with_capacity(decisions.len());
+        for (decision, _risk) in &decisions {
+            let plan = QuoteValidatedResearchReplayPlanV1::new(
+                binding.clone(),
+                policy.clone(),
+                vec![decision.clone()],
+                Vec::new(),
+            )?;
+            ledgers.push(replay_sealed_quote_validated_research_v1(&plan, &evidence)?);
+        }
+        LockedPortfolioOuterHoldoutReplaySetV1::new(
+            binding.canonical_search_input_receipt_sha256(),
+            binding.canonical_signal_plan_sha256(),
+            portfolio_identity,
+            result.search_config_hash.clone(),
+            holdout_scope.clone(),
+            binding.account_id(),
+            binding.symbol_id(),
+            binding.replay_scope().locked_evaluation_window(),
+            binding.reviewed_replay_rule_identity_sha256(),
+            ordered_risk_pips,
+            ledgers,
+            Vec::new(),
+        )
+        .map_err(anyhow::Error::new)
     }
 
     /// Supply one sealed, immutable replay set for the single final OOS touch.
@@ -456,6 +678,58 @@ pub(super) fn validate_search_receipt_against_dataset_receipt(
         }
     }
     Ok(())
+}
+
+/// Which financial evaluation is authorized for one sweep search.
+///
+/// `reviewed_run_identity` is read from the installed run-scoped authority
+/// ([`BrokerFinancialTruthAuthorityV2::canonical_run_identity_sha256`]), the
+/// only source of a reviewed run identity in this crate; it cannot be
+/// fabricated anywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReviewedSweepFinancialRouteV1 {
+    /// No reviewed bundle governs this run: the global fail-closed gate
+    /// admitted it and the legacy route applies (unchanged behavior).
+    GlobalGateAdmittedLegacyRoute,
+    /// This search receipt is the exact reviewed run: its financial
+    /// evaluation must consume the run-scoped authority through the
+    /// quote-replay evaluator, never the legacy scalar adapter.
+    ReviewedRunQuoteReplayRequired,
+}
+
+/// Route one sweep search's financial evaluation under the installed
+/// run-scoped authority. A reviewed-bundle run whose search receipt is NOT
+/// the exact reviewed run is refused: the legacy scalar adapter may never
+/// evaluate a run that was admitted on a reviewed bundle.
+pub(super) fn reviewed_sweep_financial_route_v1(
+    reviewed_run_identity: Option<&str>,
+    receipt_identity: &str,
+) -> Result<ReviewedSweepFinancialRouteV1> {
+    let Some(reviewed) = reviewed_run_identity else {
+        return Ok(ReviewedSweepFinancialRouteV1::GlobalGateAdmittedLegacyRoute);
+    };
+    anyhow::ensure!(
+        receipt_identity == reviewed,
+        "the sweep search receipt {receipt_identity} is not the exact reviewed run {reviewed}; \
+         a run admitted on a reviewed bundle may not be evaluated by the legacy scalar adapter"
+    );
+    Ok(ReviewedSweepFinancialRouteV1::ReviewedRunQuoteReplayRequired)
+}
+
+/// Resolve the reviewed-bundle route for one batch receipt inside `execute`.
+/// Shared by both search invocations (native GPU and CPU) so a reviewed run
+/// can reach neither legacy discovery call unobserved: the exact reviewed run
+/// is routed through the reviewed entrypoint with the post-lock bridge, and a
+/// foreign receipt is refused.
+fn enforce_reviewed_sweep_route(
+    reviewed_authority: Option<&BrokerFinancialTruthAuthorityV2>,
+    receipt: &CanonicalSearchInputReceiptV2,
+) -> Result<ReviewedSweepFinancialRouteV1> {
+    let receipt_identity = receipt.identity_sha256()?;
+    reviewed_sweep_financial_route_v1(
+        reviewed_authority.map(|authority| authority.canonical_run_identity_sha256()),
+        &receipt_identity,
+    )
 }
 
 /// Reuse the exact same artifact-identity checks for screening and the final
@@ -596,6 +870,31 @@ fn effective_search_config_hash(
     .context("deriving the exact effective discovery/ledger config hash")
 }
 
+/// Bind one completed search result to its exact effective config identity and
+/// record the receipt/config binding the S5 collect reads back. Shared by the
+/// native GPU and CPU search invocations so the attribution tail cannot drift
+/// between the two routes.
+fn bind_completed_search_identity(
+    config: &DiscoveryConfig,
+    result: &neoethos_search::discovery::DiscoveryResult,
+    last_search_receipt: &mut Option<CanonicalSearchInputReceiptV2>,
+    last_search_config_hash: &mut Option<String>,
+) -> Result<()> {
+    let expected_effective = effective_search_config_hash(
+        config,
+        result.selection_scope()?.evaluated_window(),
+        result.effective_feature_names.len(),
+    )?;
+    anyhow::ensure!(
+        result.search_config_hash == expected_effective,
+        "discovery result effective config {} disagrees with the exact request/ledger config {expected_effective}; refusing the batch before promotion evidence is written",
+        result.search_config_hash
+    );
+    *last_search_receipt = Some(result.search_input_receipt.clone());
+    *last_search_config_hash = Some(result.search_config_hash.clone());
+    Ok(())
+}
+
 fn resolve_population_for_exact_window(
     config: &DiscoveryConfig,
     evaluated_window: &neoethos_search::CanonicalSearchEvaluatedWindowV1,
@@ -712,6 +1011,51 @@ impl SweepExecutor for StreamingSweepExecutor {
         )
     }
 
+    fn install_reviewed_broker_financial_truth_authority(
+        &mut self,
+        authority: Option<(
+            BrokerFinancialTruthAuthorityV2,
+            super::ReviewedBrokerTruthRunContextV1,
+        )>,
+    ) -> Result<()> {
+        let Some((authority, context)) = authority else {
+            // No reviewed bundle: the global gate governs this run and the
+            // legacy route applies (unchanged behavior).
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.reviewed_broker_financial_truth_authority.is_none(),
+            "a run-scoped broker-financial-truth authority is already installed; replacement \
+             is refused"
+        );
+        // Run-scope cross-check: the reviewed bundle must name THIS sweep's
+        // exact cTrader account and symbol. A bundle reviewed for another
+        // account/symbol may not govern this run's financial evaluation.
+        let neoethos_data::CanonicalDatasetScope::CTrader {
+            account_id,
+            symbol_id,
+            ..
+        } = self.dataset_receipt.anchor_identity.scope()
+        else {
+            bail!(
+                "the frozen autoresearch dataset is not an exact cTrader scope; refusing a \
+                 reviewed broker bundle"
+            );
+        };
+        anyhow::ensure!(
+            context.account_id == *account_id && context.symbol_id == *symbol_id,
+            "the reviewed broker bundle governs account {} symbol {}, but this sweep is frozen \
+             to account {} symbol {}; refusing the foreign bundle",
+            context.account_id,
+            context.symbol_id,
+            account_id,
+            symbol_id,
+        );
+        self.reviewed_replay_context = Some(context);
+        self.reviewed_broker_financial_truth_authority = Some(authority);
+        Ok(())
+    }
+
     fn execute(&mut self, request: &SearchRequest<'_>) -> Result<SearchOutcome> {
         let began = std::time::Instant::now();
         let config = Self::charge_pessimistic_edge(request.config)?;
@@ -758,6 +1102,14 @@ impl SweepExecutor for StreamingSweepExecutor {
         let in_sample_end_exclusive_ms = self.dataset_receipt.in_sample_window.end_exclusive_ms;
         let exact_anchor_identity = self.dataset_receipt.anchor_identity.clone();
         let exact_dataset_receipt = &self.dataset_receipt;
+        // The reviewed run-scoped authority is carried through the search
+        // invocation: the exact reviewed receipt consumes it through the
+        // post-lock bridge, and a search that fails without sealing restores
+        // it below so a resumed session can retry the reviewed run.
+        let mut reviewed_authority =
+            std::mem::take(&mut self.reviewed_broker_financial_truth_authority);
+        let reviewed_replay_context = self.reviewed_replay_context.clone();
+        let sweep_symbol = self.full.symbol.clone();
         let mut last_search_receipt = None;
         let mut last_search_config_hash = None;
 
@@ -800,6 +1152,14 @@ impl SweepExecutor for StreamingSweepExecutor {
                     .receipt()
                     .context("seal prepared autoresearch batch receipt")?;
                 validate_search_receipt_against_dataset_receipt(exact_dataset_receipt, &receipt)?;
+                let reviewed_route =
+                    enforce_reviewed_sweep_route(reviewed_authority.as_ref(), &receipt)?;
+                anyhow::ensure!(
+                    reviewed_route
+                        != ReviewedSweepFinancialRouteV1::ReviewedRunQuoteReplayRequired,
+                    "the prepared native GPU search invocation cannot consume the reviewed \
+                     run-scoped authority; refusing the legacy scalar adapter"
+                );
                 Ok((input, no_physical_gpu_admission))
             },
             |_batch| {
@@ -820,18 +1180,12 @@ impl SweepExecutor for StreamingSweepExecutor {
                         neoethos_search::PropFirmRiskRules::default(),
                         |_| {},
                     )?;
-                let expected_effective = effective_search_config_hash(
+                bind_completed_search_identity(
                     &config,
-                    result.selection_scope()?.evaluated_window(),
-                    result.effective_feature_names.len(),
+                    &result,
+                    &mut last_search_receipt,
+                    &mut last_search_config_hash,
                 )?;
-                anyhow::ensure!(
-                    result.search_config_hash == expected_effective,
-                    "discovery result effective config {} disagrees with the exact request/ledger config {expected_effective}; refusing the batch before promotion evidence is written",
-                    result.search_config_hash
-                );
-                last_search_receipt = Some(result.search_input_receipt.clone());
-                last_search_config_hash = Some(result.search_config_hash.clone());
                 Ok(result)
             },
         );
@@ -873,28 +1227,75 @@ impl SweepExecutor for StreamingSweepExecutor {
                     exact_dataset_receipt,
                     &search_receipt,
                 )?;
+                let reviewed_route =
+                    enforce_reviewed_sweep_route(reviewed_authority.as_ref(), &search_receipt)?;
                 let run_input =
                     CanonicalSearchRunInputV2::new(search_receipt, features, &self.in_sample_base)
                         .context(
                             "binding exact canonical search provenance to the typed OHLCV artifact",
                         )?;
-                let result = neoethos_search::run_discovery_cycle_with_holdout(
-                    &run_input,
+                let result = match reviewed_route {
+                    ReviewedSweepFinancialRouteV1::ReviewedRunQuoteReplayRequired => {
+                        // The exact reviewed run: the reviewed search entrypoint
+                        // replaces ONLY the global capability require for this
+                        // run, and the post-lock bridge seals the reviewed
+                        // evidence once and replays each locked decision.
+                        let authority = reviewed_authority.take().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "the reviewed route requires an installed run-scoped \
+                                 broker-financial-truth authority"
+                            )
+                        })?;
+                        let context = reviewed_replay_context.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "the reviewed route requires the exact reviewed \
+                                 replay-binding context"
+                            )
+                        })?;
+                        let evaluated =
+                            neoethos_search::run_reviewed_discovery_cycle_with_quote_validated_outer_holdout_and_progress(
+                                authority,
+                                &run_input,
+                                &config,
+                                neoethos_search::PropFirmRiskRules::default(),
+                                |authority, result, ordered_signals, holdout_scope| {
+                                    let duration_ms = exact_dataset_receipt
+                                        .anchor_identity
+                                        .timeframe()
+                                        .fixed_duration_ms()
+                                        .context(
+                                            "the reviewed search holdout needs the exact \
+                                             canonical bar duration",
+                                        )?;
+                                    Self::seal_reviewed_search_holdout_replay_set_v1(
+                                        authority,
+                                        context,
+                                        &sweep_symbol,
+                                        base,
+                                        duration_ms,
+                                        result,
+                                        ordered_signals,
+                                        holdout_scope,
+                                    )
+                                },
+                                |_| {},
+                            )?;
+                        evaluated.into_parts().0
+                    }
+                    ReviewedSweepFinancialRouteV1::GlobalGateAdmittedLegacyRoute => {
+                        neoethos_search::run_discovery_cycle_with_holdout(
+                            &run_input,
+                            &config,
+                            neoethos_search::PropFirmRiskRules::default(),
+                        )?
+                    }
+                };
+                bind_completed_search_identity(
                     &config,
-                    neoethos_search::PropFirmRiskRules::default(),
+                    &result,
+                    &mut last_search_receipt,
+                    &mut last_search_config_hash,
                 )?;
-                let expected_effective = effective_search_config_hash(
-                    &config,
-                    result.selection_scope()?.evaluated_window(),
-                    result.effective_feature_names.len(),
-                )?;
-                anyhow::ensure!(
-                    result.search_config_hash == expected_effective,
-                    "discovery result effective config {} disagrees with the exact request/ledger config {expected_effective}; refusing the batch before promotion evidence is written",
-                    result.search_config_hash
-                );
-                last_search_receipt = Some(result.search_input_receipt.clone());
-                last_search_config_hash = Some(result.search_config_hash.clone());
                 Ok(result)
             },
         );
@@ -907,6 +1308,12 @@ impl SweepExecutor for StreamingSweepExecutor {
                 // A per-SEARCH failure. Named, counted, and the sweep continues:
                 // one bad region must not throw away the regions already
                 // searched.
+                // A reviewed run that failed without sealing keeps its
+                // authority for a resume; the post-lock bridge consumed it
+                // only on the successful reviewed search.
+                if let Some(authority) = reviewed_authority {
+                    self.reviewed_broker_financial_truth_authority = Some(authority);
+                }
                 return Ok(SearchOutcome {
                     slot: request.slot,
                     config_hash: request.config_hash.to_string(),
@@ -932,6 +1339,9 @@ impl SweepExecutor for StreamingSweepExecutor {
                 });
             }
         };
+        if let Some(authority) = reviewed_authority {
+            self.reviewed_broker_financial_truth_authority = Some(authority);
+        }
 
         // Tie the champion to the exact batch receipt that produced its local
         // search result. In a streaming sweep every working set has a distinct
@@ -3042,6 +3452,157 @@ mod tests {
         assert!(
             !path.exists(),
             "a search that selected nothing must write nothing"
+        );
+    }
+
+    // ── reviewed-bundle routing ──────────────────────────────────────────────
+
+    #[test]
+    fn reviewed_sweep_route_keeps_the_legacy_route_when_no_bundle_governs_the_run() {
+        let route = reviewed_sweep_financial_route_v1(None, "run-a").expect(
+            "no reviewed bundle: the global gate governs and the legacy route applies",
+        );
+        assert_eq!(
+            route,
+            ReviewedSweepFinancialRouteV1::GlobalGateAdmittedLegacyRoute
+        );
+    }
+
+    #[test]
+    fn reviewed_sweep_route_admits_only_the_exact_reviewed_run_receipt() {
+        let route = reviewed_sweep_financial_route_v1(Some("run-a"), "run-a")
+            .expect("the exact reviewed run receipt is admitted to the quote-replay route");
+        assert_eq!(
+            route,
+            ReviewedSweepFinancialRouteV1::ReviewedRunQuoteReplayRequired
+        );
+    }
+
+    #[test]
+    fn reviewed_sweep_route_refuses_a_different_receipt_never_the_scalar_adapter() {
+        let error = reviewed_sweep_financial_route_v1(Some("run-a"), "run-b").expect_err(
+            "a run admitted on a reviewed bundle may not be evaluated under a different receipt",
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("run-a"), "{message}");
+        assert!(message.contains("run-b"), "{message}");
+        assert!(message.contains("legacy scalar adapter"), "{message}");
+    }
+
+    #[test]
+    fn execute_consumes_the_installed_authority_before_the_legacy_search_call() {
+        // Source-level contract: the reviewed-bundle route check reads the
+        // installed authority's reviewed run identity and runs BEFORE either
+        // legacy discovery invocation inside `execute`, so a run admitted on
+        // a reviewed bundle can never reach the scalar adapter.
+        let source = include_str!("streaming.rs");
+        for required in [
+            "reviewed_broker_financial_truth_authority: Option<BrokerFinancialTruthAuthorityV2>",
+            "fn install_reviewed_broker_financial_truth_authority(",
+            "canonical_run_identity_sha256",
+            "reviewed_sweep_financial_route_v1",
+            "refusing the legacy scalar adapter",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing reviewed-route contract {required}"
+            );
+        }
+        // Everything after the `execute` signature is that function's body:
+        // the route enforcement must appear before either legacy discovery
+        // invocation inside it.
+        let execute_at = source
+            .find("fn execute(&mut self, request: &SearchRequest<'_>)")
+            .expect("execute must exist");
+        let body = &source[execute_at..];
+        let route_check = execute_at
+            + body
+                .find("enforce_reviewed_sweep_route")
+                .expect("execute must route the installed reviewed authority");
+        let gpu_legacy = execute_at
+            + body
+                .find("run_prepared_canonical_discovery_with_holdout_and_progress_v3")
+                .expect("execute must still hold the legacy gpu discovery call");
+        let cpu_legacy = execute_at
+            + body
+                .find("run_discovery_cycle_with_holdout(")
+                .expect("execute must still hold the legacy cpu discovery call");
+        assert!(
+            route_check < gpu_legacy,
+            "the reviewed-bundle route check must precede the gpu legacy call"
+        );
+        assert!(
+            route_check < cpu_legacy,
+            "the reviewed-bundle route check must precede the cpu legacy call"
+        );
+    }
+
+    #[test]
+    fn reviewed_bridge_seals_once_and_replays_each_locked_decision_into_the_v1_set() {
+        let source = include_str!("streaming.rs");
+        // Count call sites in the production half only: this very test module
+        // repeats the function names and must not count itself.
+        let production = source
+            .split("mod tests")
+            .next()
+            .expect("the production half precedes the tests module");
+        // The post-lock bridge seals the reviewed historical Bid/Ask evidence
+        // EXACTLY ONCE (one call site in the production half) and replays one
+        // sealed plan per locked decision through the existing execution-replay
+        // kernel, then builds the V1 replay set.
+        assert_eq!(
+            production
+                .matches("into_sealed_historical_bid_ask_quote_replay_evidence_v2(")
+                .count(),
+            1,
+            "the bridge must seal the move-only authority exactly once"
+        );
+        assert_eq!(
+            production
+                .matches("replay_sealed_quote_validated_research_v1(")
+                .count(),
+            1,
+            "the bridge must replay one sealed plan per locked decision"
+        );
+        for required in [
+            "fn seal_reviewed_search_holdout_replay_set_v1(",
+            "QuoteValidatedResearchReplayPlanV1::new(",
+            "LockedPortfolioOuterHoldoutReplaySetV1::new(",
+            "canonical_run_identity_sha256()",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing reviewed-bridge contract token {required}"
+            );
+        }
+        // The old named per-search refusal is gone from the route enforcement.
+        assert!(
+            !production.contains("seam not wired"),
+            "the per-search refusal must be replaced by the post-lock bridge"
+        );
+    }
+
+    #[test]
+    fn execute_routes_the_exact_reviewed_run_through_the_reviewed_entrypoint() {
+        let source = include_str!("streaming.rs");
+        let execute_at = source
+            .find("fn execute(&mut self, request: &SearchRequest<'_>)")
+            .expect("execute must exist");
+        let body = &source[execute_at..];
+        let reviewed_call = body
+            .find("run_reviewed_discovery_cycle_with_quote_validated_outer_holdout_and_progress(")
+            .expect(
+                "the reviewed route must invoke the reviewed-run search entrypoint",
+            );
+        let legacy_cpu = body
+            .find("run_discovery_cycle_with_holdout(")
+            .expect("the legacy cpu call must remain for the global-gate route");
+        let seal = body
+            .find("seal_reviewed_search_holdout_replay_set_v1(")
+            .expect("the reviewed route must carry the post-lock bridge provider");
+        assert!(
+            reviewed_call < seal && seal < legacy_cpu,
+            "the reviewed entrypoint, its bridge provider and the legacy call must appear in that order"
         );
     }
 }

@@ -85,12 +85,80 @@ pub enum PipValueConversionOperationV1 {
     Divide,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrokerSymbolCostFactsV1 {
     pip_position: i32,
     lot_size_cents: i64,
     commission_type: i64,
     precise_trading_commission_rate: i64,
+    quantity_volume_cents: [Option<i64>; 3],
+    source_sha256: sha2::digest::Output<Sha256>,
+}
+
+impl BrokerSymbolCostFactsV1 {
+    pub fn base_units_per_lot(&self) -> f64 {
+        self.lot_size_cents as f64 / 100.0
+    }
+
+    pub fn source_sha256(&self) -> String {
+        format!("{:x}", self.source_sha256)
+    }
+
+    /// Read min, max, and step in lots from the verified broker symbol bytes.
+    pub fn lot_limits(&self) -> Result<[f64; 3]> {
+        let mut wire = [0_i64; 3];
+        for (index, name) in ["minVolume", "maxVolume", "stepVolume"].iter().enumerate() {
+            wire[index] = self.quantity_volume_cents[index]
+                .with_context(|| format!("broker lot constraints omit integer {name}"))?;
+            ensure!(
+                (1..=9_000_000_000_000_000).contains(&wire[index]),
+                "broker lot constraints {name} is outside the exact positive integer range"
+            );
+        }
+        ensure!(
+            wire[0] <= wire[1] && wire[2] <= wire[1],
+            "broker lot constraints min/step exceed maximum volume"
+        );
+        Ok(wire.map(|volume| volume as f64 / self.lot_size_cents as f64))
+    }
+
+    fn validate_risky_lot_constraints(
+        &self,
+        costs: &ScreeningCostEnvelopeWireV2,
+        settings: &neoethos_core::Settings,
+    ) -> Result<()> {
+        let Some(grid) = &settings.models.discovery_runtime.risky_lot_constraints else {
+            return Ok(());
+        };
+        ensure_canonical_sha256(&grid.source_artifact_sha256, "Risky lot constraints")?;
+        let actual_source = self.source_sha256();
+        let cost_source = costs
+            .source_components
+            .iter()
+            .find(|component| component.role == "broker_symbol_contract")
+            .context("Risky lot constraints omit broker symbol source")?;
+        ensure!(
+            grid.source_artifact_sha256 == actual_source && cost_source.sha256 == actual_source,
+            "Risky lot constraints source does not match the exact broker symbol bytes"
+        );
+        for (configured, expected) in [grid.min_lots, grid.max_lots, grid.lot_step]
+            .into_iter()
+            .zip(self.lot_limits()?)
+        {
+            ensure!(
+                configured.is_finite() && configured.to_bits() == expected.to_bits(),
+                "Risky lot constraints value differs from exact broker volume/lotSize"
+            );
+        }
+        if let Some(leverage) = grid.fixed_leverage {
+            ensure!(
+                costs.symbol.get(..3) == Some(costs.account_currency.as_str())
+                    && leverage.account_notional_per_lot == self.base_units_per_lot(),
+                "fixed-leverage Risky research requires the broker's lot size and an FX base-currency account"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -243,11 +311,7 @@ pub fn build_screening_cost_envelope_v2(
     let validated_broker =
         validate_broker_symbol_contract(&broker_symbol_contract_bytes, &costs, symbol, plan)?;
     ensure!(
-        validated_broker.pip_position == broker.facts.pip_position
-            && validated_broker.lot_size_cents == broker.facts.lot_size_cents
-            && validated_broker.commission_type == broker.facts.commission_type
-            && validated_broker.precise_trading_commission_rate
-                == broker.facts.precise_trading_commission_rate,
+        validated_broker == broker.facts,
         "broker symbol cost inputs changed during cost construction"
     );
     validate_costs(
@@ -469,6 +533,7 @@ pub fn validate_costs(
         roles.len() == 4,
         "cost assumptions contain unsupported source-component roles"
     );
+    broker_cost_facts.validate_risky_lot_constraints(costs, settings)?;
     // The explicit matrix/broker selection owns the run symbol. The file may
     // legitimately retain a different UI default; its complete original values
     // and bytes are still checked by validate_settings_source above the builder.
@@ -984,6 +1049,9 @@ fn parse_exact_broker_symbol_cost_inputs(
             lot_size_cents,
             commission_type,
             precise_trading_commission_rate,
+            quantity_volume_cents: ["minVolume", "maxVolume", "stepVolume"]
+                .map(|name| broker_symbol.get(name).and_then(serde_json::Value::as_i64)),
+            source_sha256: Sha256::digest(exact_bytes),
         },
         swap_long_pips_per_day: swap_long,
         swap_short_pips_per_day: swap_short,
@@ -1325,6 +1393,8 @@ mod tests {
             lot_size_cents: 10_000_000,
             commission_type: 1,
             precise_trading_commission_rate: 4_500_000_000,
+            quantity_volume_cents: [None; 3],
+            source_sha256: Sha256::digest(b"private-commission-arithmetic-fixture"),
         };
         let conversion = inverse_usd_to_gbp();
         let actual = derive_commission_account_per_lot_per_fill_assumption(

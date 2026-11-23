@@ -77,7 +77,8 @@ fn assert_same_evaluation_config(actual: &EvaluationConfig, expected: &Evaluatio
     // No `..`: adding an evaluation field requires extending this proof.
     compare_fields! {
         values: [symbol, account_currency, max_hold_bars, trailing_enabled,
-            kill_zones_enabled, session_spread_pips, growth_objective, growth_goal],
+            kill_zones_enabled, session_spread_pips, growth_objective, growth_goal, risky_limits_policy, risky_account_experiment, weekly_objective,
+            fitness_table],
         floats: [initial_equity, trailing_atr_multiplier, trailing_be_trigger_r,
             trailing_min_lock_pips, pip_value, spread_pips, commission_per_trade,
             pip_value_per_lot, swap_long_pips_per_day, swap_short_pips_per_day,
@@ -188,16 +189,16 @@ fn assert_same_resolved_discovery_config(actual: &DiscoveryConfig, expected: &Di
     compare_fields! {
         values: [
             timeframe_label, evaluation_symbol, evaluation_account_currency,
-            session_spread_pips, cost_band_pips, kill_zones_enabled,
+            session_spread_pips, cost_band_pips, kill_zones_enabled, max_hold_bars,
             population, population_auto, generations, max_indicators,
             candidate_count, portfolio_size, max_rows, max_rows_by_timeframe,
             target_profile, walkforward_splits, embargo_minutes, enable_cpcv,
             cpcv_n_splits, cpcv_n_test_groups, cpcv_max_rows,
-            risky_risk_band, prop_firm_risk_band, higher_timeframes,
+            risky_risk_band, risky_limits_policy, prop_firm_risk_band, higher_timeframes,
             runtime_overrides, mc_runs, mc_min_profitable, adaptive_thresholds,
             mode, prop_firm_gate_params, require_walkforward_for_export,
             discovery_ledger_enabled, discovery_ledger_cache_dir,
-            discovery_ledger_archive_top_n,
+            discovery_ledger_archive_top_n, fitness_table,
         ],
         floats: [
             evaluation_spread_pips, evaluation_commission_per_trade,
@@ -527,5 +528,156 @@ fn active_research_costs_worker() {
         assert!(mismatch.spread_pips.is_nan());
         assert!(mismatch.session_spread_pips.is_none());
     }
+    #[cfg(not(any(feature = "gpu", feature = "gpu-cuda")))]
+    {
+        let mut config = DiscoveryConfig {
+            mode: DiscoveryMode::Risky,
+            initial_balance: 100.0,
+            risky_start_balance: 100.0,
+            evaluation_symbol: "EURUSD".into(),
+            evaluation_account_currency: "USD".into(),
+            ..DiscoveryConfig::default()
+        };
+        config.runtime_overrides.risky_survival_only = true;
+        config.runtime_overrides.risky_account_experiment_v3 = true;
+        config.runtime_overrides.risky_lot_constraints =
+            Some(neoethos_core::config::RiskyReplayLotConstraintsConfigV1 {
+                min_lots: 0.01,
+                max_lots: 1.0,
+                lot_step: 0.01,
+                source_artifact_sha256: "a".repeat(64),
+                fixed_leverage: None,
+            });
+        let evaluation = config.evaluation_config(None);
+        let search_settings = crate::genetic::search_engine::evaluation_backtest_settings(
+            &evaluation,
+        )
+        .expect("sealed research monetary assumptions and the Risky controller are compatible");
+        let replay_settings =
+            PopulationTemplateResolver::new(&config, None).template(&Gene::default());
+        assert!(search_settings.risky_account_experiment.is_some());
+        assert_eq!(
+            search_settings.resolved_lot_grid(None, false).unwrap(),
+            Some(crate::eval::BarReplayLotGridV1::new(0.01, 1.0, 0.01).unwrap())
+        );
+        assert_eq!(
+            search_settings.risky_account_experiment,
+            replay_settings.risky_account_experiment
+        );
+        let outcome = risky_goal_window_outcome(
+            &[],
+            &config,
+            1_735_689_600_000,
+            1_735_689_600_000 + 180 * 86_400_000,
+        )
+        .unwrap();
+        assert_eq!(outcome["policy"], "account_experiment_v3");
+    }
     assert_eq!(contract.identity_sha256().unwrap(), identity);
+}
+
+fn eur_account_research_contract() -> CanonicalTrendbarResearchExecutionContractV3 {
+    let features = neoethos_data::test_fixtures::ctrader_sample_feature_frame();
+    let anchor = features.provenance().bindings()[0].dataset_identity();
+    let receipt = CanonicalSearchInputReceiptV2::from_feature_frame(anchor, &features)
+        .expect("receipt for the EUR sealed-basis fixture");
+    CanonicalTrendbarResearchExecutionContractV3::new(
+        receipt,
+        CanonicalTrendbarResearchCostAssumptionsV2 {
+            symbol: "EURUSD",
+            account_currency: "EUR",
+            assumption_source_id: "neoethos.test.eur-sealed-basis.v1",
+            assumption_source_sha256: &"b".repeat(64),
+            pip_size: 0.0001,
+            // 10 USD quote pip value per lot converted at the sealed D1 basis.
+            pip_value_per_lot: 10.0 / 1.16268,
+            full_spread_pips_assumption: 1.5,
+            slippage_pips_per_fill_assumption: 0.5,
+            commission_account_per_lot_per_fill_assumption: 4.5,
+            swap_long_pips_per_day: -2.445,
+            swap_short_pips_per_day: -0.105,
+            pnl_conversion_fee_rate: 0.0,
+        },
+    )
+    .expect("explicit research-only EUR cost assumptions")
+}
+
+#[test]
+fn research_replay_scope_pins_eur_contract_basis_and_clears_on_drop() {
+    // The research authority is process-wide. Run its numerical consumer in a
+    // separate copy of this test executable, so ordinary parallel tests cannot
+    // observe the temporary research scope or have their economics changed.
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "discovery::cost_consistency_tests::research_replay_scope_eur_contract_worker",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .expect("isolated replay-scope test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "isolated replay-scope worker failed:
+{stdout}
+{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the isolated worker did not run: {stdout}"
+    );
+}
+
+#[test]
+#[ignore = "invoked in an isolated process by the replay-scope contract test"]
+fn research_replay_scope_eur_contract_worker() {
+    let contract = eur_account_research_contract();
+    let sealed_pip_value = 10.0 / 1.16268;
+    let mut config = DiscoveryConfig::default();
+    config.evaluation_symbol = "EURUSD".to_owned();
+    config.evaluation_account_currency = "EUR".to_owned();
+    config.evaluation_spread_pips = 0.1;
+    config.evaluation_commission_per_trade = 0.0;
+    // Ambient resolution uses this deliberately different price hint.
+    let ambient_hint = Some(1.10);
+    let ambient = config.evaluation_config_with_smc_gate(ambient_hint, 0.5);
+    assert!(
+        (ambient.pip_value_per_lot - sealed_pip_value).abs() > 1e-6,
+        "the ambient EUR pip basis must differ from the sealed contract basis"
+    );
+    assert!(crate::historical_evaluation_authority::active_research_contract_v1().is_none());
+    {
+        let _scope = crate::discovery::install_research_replay_execution_scope(&contract)
+            .expect("install the saved research execution scope");
+        assert!(
+            crate::historical_evaluation_authority::active_research_contract_v1().is_some(),
+            "the installed scope must be visible to the evaluation path"
+        );
+        let pinned = config.evaluation_config_with_smc_gate(ambient_hint, 0.5);
+        assert!(
+            (pinned.pip_value_per_lot - sealed_pip_value).abs() < 1e-12,
+            "the sealed contract pip basis must replace the ambient basis: {} vs {}",
+            pinned.pip_value_per_lot,
+            sealed_pip_value
+        );
+        assert!(
+            (pinned.spread_pips - contract.screening_spread_and_slippage_round_trip_pips()).abs()
+                < 1e-12,
+            "the contract round-trip spread must replace the ambient scalar"
+        );
+        assert!(
+            (pinned.commission_per_trade - contract.round_trip_commission_account_per_lot()).abs()
+                < 1e-12,
+            "the contract round-trip commission must replace the ambient scalar"
+        );
+        assert_eq!(pinned.symbol, "EURUSD");
+        assert_eq!(pinned.account_currency, "EUR");
+    }
+    assert!(
+        crate::historical_evaluation_authority::active_research_contract_v1().is_none(),
+        "the RAII scope must be dropped at the end of the diagnostic replay"
+    );
 }

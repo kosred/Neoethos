@@ -502,37 +502,12 @@ fn invalid_result_v1(detail: impl Into<String>) -> CanonicalNativeGenerationZero
 }
 
 #[cfg(feature = "gpu-cuda")]
-#[derive(Default)]
-struct CompactJsonCountingWriterV1 {
-    byte_count: u64,
-}
-
-#[cfg(feature = "gpu-cuda")]
-impl Write for CompactJsonCountingWriterV1 {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.byte_count = self
-            .byte_count
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| io::Error::other("compact JSON byte count overflow"))?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(feature = "gpu-cuda")]
 fn checked_compact_json_byte_count_v1<T: Serialize + ?Sized>(
     value: &T,
 ) -> Result<u64, CanonicalNativeGenerationZeroResultErrorV1> {
-    let mut writer = CompactJsonCountingWriterV1::default();
-    value
-        .serialize(&mut serde_json::Serializer::new(&mut writer))
-        .map_err(|error| {
-            CanonicalNativeGenerationZeroResultErrorV1::Serialization(format!("{error}"))
-        })?;
-    Ok(writer.byte_count)
+    crate::artifact_io::compact_json_byte_len(value).map_err(|error| {
+        CanonicalNativeGenerationZeroResultErrorV1::Serialization(error.to_string())
+    })
 }
 
 #[cfg(feature = "gpu-cuda")]

@@ -6,6 +6,12 @@ account's asset registry, broker unrealized PnL and signed deal components.
 starting trading. It uses the exact configured environment/account and the
 existing secure token store. It sends only authentication and read requests.
 
+The desktop can display authenticated account snapshots while journal writes
+wait for the verified live broker evidence required by the release capability.
+The account bridge checks that capability before dispatching journal work and
+logs the unavailable state once per process. Successful credential loads are
+logged at debug level.
+
 ```powershell
 cargo build --locked -p neoethos-broker-history --bin neoethos-broker-account-snapshot
 & ./target/debug/neoethos-broker-account-snapshot.exe `

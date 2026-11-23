@@ -181,6 +181,9 @@ pub struct GeneticSearchRuntimeOverrides {
     /// Optional explicit archive capacity. `None` means
     /// "derive from population × generations" with audit-aligned bounds.
     pub archive_cap_override: Option<usize>,
+    /// Capacity requested for an explicitly receipt-bound CPU research run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_research_archive_cap: Option<usize>,
     /// Number of times the seen-signature memory retries to draw a unique
     /// gene before giving up.
     pub seen_retry_attempts: usize,
@@ -201,6 +204,7 @@ impl Default for GeneticSearchRuntimeOverrides {
             convergence_min_elapsed_fraction: 0.5,
             tournament_size_override: None,
             archive_cap_override: None,
+            cpu_research_archive_cap: None,
             seen_retry_attempts: 16,
             smc_gate: SmcGateOverrides::default(),
             archive_scoring: ArchiveScoringOverrides::default(),
@@ -240,6 +244,7 @@ impl GeneticSearchRuntimeOverrides {
             convergence_min_elapsed_fraction: c.convergence_min_elapsed_fraction,
             tournament_size_override: c.tournament_size_override,
             archive_cap_override: c.archive_cap_override,
+            cpu_research_archive_cap: s.models.discovery_runtime.cpu_research_archive_cap,
             seen_retry_attempts: c.seen_retry_attempts,
             smc_gate: SmcGateOverrides {
                 start: c.smc_gate_start,

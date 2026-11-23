@@ -81,6 +81,7 @@ pub enum PopulationOracleError {
         candidate_ids: Vec<u64>,
     },
     UnsupportedTrailingState,
+    UnsupportedRiskyAccountExperiment,
     FixedWidthOverflow(&'static str),
     EventCountMismatch {
         expected: usize,
@@ -155,6 +156,12 @@ impl fmt::Display for PopulationOracleError {
             ),
             Self::UnsupportedTrailingState => {
                 write!(f, "Prototype B/C oracle does not support trailing state")
+            }
+            Self::UnsupportedRiskyAccountExperiment => {
+                write!(
+                    f,
+                    "native population ABI does not support Risky account experiment v3"
+                )
             }
             Self::FixedWidthOverflow(field) => {
                 write!(f, "{field} does not fit the fixed-width population ABI")
@@ -341,6 +348,9 @@ pub(crate) fn population_settings_for_dataset(
 pub(crate) fn population_settings_for_settings(
     source: &crate::eval::BacktestSettings,
 ) -> Result<NeoPopulationSettings, PopulationOracleError> {
+    if source.risky_account_experiment.is_some() {
+        return Err(PopulationOracleError::UnsupportedRiskyAccountExperiment);
+    }
     let runtime = current_backtest_runtime_overrides();
     Ok(NeoPopulationSettings {
         abi_version: ABI_VERSION,
@@ -1769,6 +1779,7 @@ mod tests {
     fn canonical_cost_fixture() -> PrototypePopulationWorkload {
         let start = 1_700_000_000_000_i64;
         let settings = SnapshotSettingsDto {
+            risky_account_experiment: None,
             session_spread_profile: None,
             max_hold_bars: 0,
             min_hold_bars: 0,

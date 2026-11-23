@@ -297,13 +297,18 @@ fn search_input_can_be_built_only_from_the_exact_selected_series_generations() {
 fn research_evidence_identity_hashes_the_complete_serialized_discovery_result() {
     let discovery = read("src/discovery.rs");
     assert!(
-        discovery.contains("#[derive(Debug, Clone, Serialize)]\npub struct DiscoveryResult"),
+        discovery.contains("#[derive(Debug, Clone, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct DiscoveryResult"),
         "DiscoveryResult is not a serializable evidence payload"
     );
 
     let contract = read("src/canonical_trendbar_research.rs");
     let identity = function_body(&contract, "fn result_identity_sha256(");
-    for required in ["serde_json::to_vec(result)", "push_bytes(&mut bytes"] {
+    for required in [
+        "compact_json_byte_len(result)",
+        "serde_json::to_writer(&mut writer, result)",
+        "hasher.update(body_len.to_be_bytes())",
+        "prefix.extend_from_slice(&result_len.to_be_bytes())",
+    ] {
         assert!(
             identity.contains(required),
             "research result identity omits `{required}`"
@@ -320,14 +325,15 @@ fn normalization_and_holdout_use_one_exact_public_split_boundary() {
     );
     for required in [
         "DEFAULT_OOS_HOLDOUT_FRACTION",
-        "0..split_at",
-        "split_at >= 64",
+        "checked_canonical_training_prefix",
     ] {
         assert!(
             boundary.contains(required),
             "canonical normalization boundary is missing `{required}`"
         );
     }
+    let prefix = function_body(&discovery, "fn checked_canonical_training_prefix(");
+    assert!(prefix.contains("0..split_at") && prefix.contains("split_at >= 64"));
     let holdout = function_body(&discovery, "fn with_holdout(");
     assert!(
         holdout.contains("canonical_discovery_normalization_training_rows"),

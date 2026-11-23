@@ -469,19 +469,12 @@ async fn refresh_once(
     // surface in v0.4.36). This account/dashboard endpoint is the live
     // cTrader-account fetch the Flutter UI polls, so reconciling here captures
     // every closing deal on the next refresh — idempotent on `position_id`.
-    // Fire-and-forget on the blocking pool so journal disk I/O never delays
-    // this response (the journal contract: never blocks the refresh).
-    let snapshot_for_journal = snapshot.clone();
+    // The journal checks availability before dispatching disk work.
     // Thread the symbol_id→name catalog in so closed trades store the real pair
     // name (EURUSD) instead of `#<id>`. Populated from prior cycles once any
     // position/symbol has been seen; empty map falls back to `#<id>`.
     let journal_names = state.symbol_catalog_snapshot().await;
-    tokio::task::spawn_blocking(move || {
-        crate::app_services::journal_reconcile::reconcile_best_effort(
-            &snapshot_for_journal,
-            &journal_names,
-        );
-    });
+    crate::app_services::journal_reconcile::reconcile_best_effort(&snapshot, &journal_names);
 
     // Step 3: convert the broker account snapshot to the wire payload.
     // Equity is calculated only after the exact account-scoped

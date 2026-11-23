@@ -5,6 +5,7 @@
 
 pub const PROPFIRM_GA_FITNESS_V4_SEMANTICS: &str = concat!(
     "neoethos.search.objective.propfirm-v4;",
+    "rev=sample-confidence-v7;",
     "slots=net,sharpe,peak,max-dd,win-rate,pf,expectancy,monthly-hit,trades,consistency,max-daily-dd;",
     "zero-trades=-100;nonfinite-sharpe=-inf"
 );
@@ -250,7 +251,16 @@ fn ga_pf_component(profit_factor: f64) -> f64 {
     }
 }
 
-/// Current PropFirm GA objective, scoring version 4.
+/// Current PropFirm GA objective, scoring version 4 with the 2026-10-20
+/// sample-confidence revision (semantics tag `rev=sample-confidence-v7`).
+///
+/// The revision exists because the pre-revision formula gave a one-trade genome
+/// with profit factor 10 and a 100% win rate the full profit-factor and
+/// win-rate credit; the PropFirm GA therefore converged on lottery tickets that
+/// never trade a challenge window (601 of 612 windows in the 2026-10-20
+/// rule-breakdown diagnostic had zero trades). Per-trade quality terms now
+/// scale with the existing `trades_confidence`. At 100 trades the confidence is
+/// 1.0, so healthy genomes keep their exact prior scores.
 pub fn score_prop_firm_ga_fitness_v4(metrics: &[f64; 11]) -> f64 {
     let net = metrics[0];
     let sharpe = metrics[1];
@@ -272,10 +282,12 @@ pub fn score_prop_firm_ga_fitness_v4(metrics: &[f64; 11]) -> f64 {
     let hit = monthly_hit.clamp(0.0, 1.0) * 0.45;
     let net_return = (net / 20_000.0).clamp(-2.0, 2.0) * 0.15;
     let sharpe_score = sharpe.clamp(-2.0, 4.0) * confidence * 0.10;
-    let consistency_score = consistency.clamp(0.0, 1.0) * 0.10;
-    let profit_factor_score =
-        ga_pf_component(profit_factor) * if profit_factor >= 1.0 { 0.15 } else { 0.25 };
-    let win_rate_score = ((win_rate.clamp(0.0, 1.0) - 0.45) * 2.0).clamp(0.0, 0.5) * 0.10;
+    let consistency_score = consistency.clamp(0.0, 1.0) * 0.10 * confidence;
+    let profit_factor_score = ga_pf_component(profit_factor)
+        * if profit_factor >= 1.0 { 0.15 } else { 0.25 }
+        * confidence;
+    let win_rate_score =
+        ((win_rate.clamp(0.0, 1.0) - 0.45) * 2.0).clamp(0.0, 0.5) * 0.10 * confidence;
     let drawdown = (max_drawdown.max(0.0) * 15.0).min(5.0);
     let daily_drawdown = max_daily_drawdown.clamp(0.0, 1.0) * 10.0;
     (hit + net_return + sharpe_score + consistency_score + profit_factor_score + win_rate_score)
@@ -477,6 +489,28 @@ mod tests {
             checked_resident_goal_score_v6(&metrics, 100.0, 1.0, goal),
             ResidentScoringOutcomeV2::Fault(ResidentScoringFaultV2::NonFiniteMetric { slot: 6 })
         ));
+    }
+
+    #[test]
+    fn sample_confidence_keeps_one_trade_lottery_genomes_below_active_ones() {
+        // 2026-10-20 revision: identical per-trade quality (PF 10, 100% win
+        // rate, tiny drawdown) must not rank one-trade lottery genomes above
+        // the same shape measured over 100 trades. At 100 trades the confidence
+        // saturates at 1.0, which is why the legacy -0.3825 pin above survives.
+        let mut lottery = [0.0; 11];
+        lottery[0] = 40.0;
+        lottery[1] = 0.20;
+        lottery[3] = 0.002;
+        lottery[4] = 1.0;
+        lottery[5] = 10.0;
+        lottery[6] = 20.0;
+        lottery[8] = 2.0;
+        lottery[9] = 0.50;
+        let mut active = lottery;
+        active[8] = 100.0;
+        let s_lottery = score_prop_firm_ga_fitness_v4(&lottery);
+        let s_active = score_prop_firm_ga_fitness_v4(&active);
+        assert!(s_lottery < s_active, "lottery {s_lottery} must rank below active {s_active}");
     }
 
     #[test]

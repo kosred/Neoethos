@@ -270,6 +270,15 @@ pub(crate) fn prepare_resident_feature_screening_v2(
     // CPU Discovery keeps all columns when this one label-safe fit has fewer
     // than three rows. Charge the identical keep-all native allocation path.
     let prefilter_active = resolved_top_k > 0 && resolved_top_k < parent_columns && fit_rows >= 3;
+    // The symmetric-cost label barriers are CPU-only for now: the resident
+    // device-side first-passage label still applies the legacy cost tilt, so
+    // an opt-in must refuse here rather than silently run a label that
+    // contradicts what the run's config digest records.
+    anyhow::ensure!(
+        !config.runtime_overrides.label_cost_symmetric,
+        "models.discovery_runtime.label_cost_symmetric=true is not supported on the resident \
+         GPU screening path yet; use the CPU route (device=cpu) for symmetric-cost label runs"
+    );
     let semantics_sha256 =
         Sha256::digest(RESIDENT_FEATURE_SCREENING_SEMANTICS_V2.as_bytes()).into();
     let plan = ResidentFeatureScreeningPlanTemplateV2 {

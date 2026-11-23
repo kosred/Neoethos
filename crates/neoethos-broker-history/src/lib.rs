@@ -51,6 +51,7 @@ pub mod app_services {
 }
 
 pub mod account_snapshot_cli;
+pub use broker_truth_vortex::encode_broker_evidence_rows_v2;
 pub mod broker_truth_capture;
 pub mod broker_truth_ctrader;
 mod broker_truth_vortex;
